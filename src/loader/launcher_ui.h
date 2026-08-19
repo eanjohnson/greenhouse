@@ -759,10 +759,26 @@ static void LuiPresent()
 // Steam mobile app -- no PC-side qrtool. The refresh token never touches this
 // path (only the public URL + the resulting public SteamID are visible here).
 // ---------------------------------------------------------------------------
+static std::wstring LauncherQrUrlPath()
+{
+    return std::wstring(kLocalState) + L"gh_qr_url.txt";
+}
+
+static void LauncherClearQrUrl()
+{
+    DeleteFileW(LauncherQrUrlPath().c_str());
+}
+
+static bool LauncherHasCachedCred()
+{
+    return GetFileAttributesW((std::wstring(kLocalState) + L"gh_cred.txt").c_str())
+        != INVALID_FILE_ATTRIBUTES;
+}
+
 static std::string LauncherReadQrUrl()
 {
-    std::wstring path = std::wstring(kLocalState) + L"gh_qr_url.txt";
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    HANDLE h = CreateFileW(LauncherQrUrlPath().c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE,
                            nullptr, OPEN_EXISTING, 0, nullptr);
     if (h == INVALID_HANDLE_VALUE) return "";
     DWORD sz = GetFileSize(h, nullptr); std::string s(sz, 0); DWORD rd = 0;
@@ -814,7 +830,8 @@ static void LuiDrawLogin(const uint8_t* qr, bool haveQr, const std::wstring& sta
     LuiText(status.c_str(), g_lui.fmtItem.get(),
             D2D1::RectF(80, cy + boxHalf + 24, W - 80, cy + boxHalf + 84),
             g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-    LuiText(L"Scan with the Steam mobile app   ·   B to skip",
+    LuiText(haveQr ? L"Scan with the Steam mobile app   ·   B to skip"
+                   : L"B to skip",
             g_lui.fmtSmall.get(), D2D1::RectF(80, H - 70, W - 80, H - 30),
             g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
     dc->EndDraw();
@@ -835,7 +852,12 @@ static uint64_t LauncherSteamLogin(int timeoutSec)
     static uint8_t tmpbuf[qrcodegen_BUFFER_LEN_MAX];
     bool haveQr = false; std::string lastUrl;
     WORD prev = 0xFFFF; DWORD start = GetTickCount();
-    Diag("LAUNCHER steam login: screen up");
+    // Drop last session's challenge URL so a cached login does not flash a stale QR.
+    // The engine only writes a new file after cached credentials fail.
+    LauncherClearQrUrl();
+    bool tryingCache = LauncherHasCachedCred();
+    Diag(std::string("LAUNCHER steam login: screen up") +
+         (tryingCache ? " (cached cred present — QR hidden until needed)" : " (no cache — wait for QR)"));
     for (;;) {
         if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
         PollGamepadOnUi();
@@ -843,7 +865,8 @@ static uint64_t LauncherSteamLogin(int timeoutSec)
 
         uint64_t sid = g_ghLoginSteamID();
         if (sid) {
-            for (int i = 0; i < 60; ++i) { LuiDrawLogin(qrbuf, haveQr, L"Signed in ✓"); LuiPresent(); Sleep(16); }
+            LauncherClearQrUrl();
+            for (int i = 0; i < 60; ++i) { LuiDrawLogin(qrbuf, false, L"Signed in ✓"); LuiPresent(); Sleep(16); }
             Diag("LAUNCHER steam login OK sid=" + std::to_string(sid));
             return sid;
         }
@@ -861,7 +884,9 @@ static uint64_t LauncherSteamLogin(int timeoutSec)
         if (timeoutSec > 0 && (GetTickCount() - start) > (DWORD)timeoutSec * 1000) {
             Diag("LAUNCHER steam login timeout"); return 0;
         }
-        LuiDrawLogin(qrbuf, haveQr, haveQr ? L"Waiting for you to scan…" : L"Connecting to Steam…");
+        const wchar_t* st = haveQr ? L"Waiting for you to scan…"
+            : (tryingCache ? L"Signing in with saved login…" : L"Connecting to Steam…");
+        LuiDrawLogin(qrbuf, haveQr, st);
         LuiPresent();
         Sleep(30);
     }

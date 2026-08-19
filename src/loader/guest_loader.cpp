@@ -5671,6 +5671,7 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
                     // concurrent session for the same account is not serviced for Player.* calls).
                     LauncherFetchLibrary();
                     if (startQr && g_ghLoginSteamID) {
+                        LauncherClearQrUrl();
                         startQr();
                         uint64_t sid = LauncherSteamLogin(/*timeoutSec=*/600);   // up to 10 min to scan
                         loginStatus = sid ? (L"signed in · " + std::to_wstring(sid)) : L"not signed in · skipped";
