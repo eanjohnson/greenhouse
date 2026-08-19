@@ -1,0 +1,4065 @@
+[
+  {
+    "file": "corpus/bin/sqlite3.exe",
+    "machine": "0x8664",
+    "arch": "x64",
+    "import_count": 156,
+    "imports": [
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetStdHandle",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetCurrentDirectoryW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CreateFileW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FindClose",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FindFirstFileW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetFileTime",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "DebugBreak",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CloseHandle",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetCurrentProcess",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetCurrentProcessId",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetSystemTime",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetSystemTimePreciseAsFileTime",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FreeLibrary",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetProcAddress",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "LoadLibraryA",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SystemTimeToFileTime",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "MultiByteToWideChar",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "WideCharToMultiByte",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetConsoleCtrlHandler",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetConsoleScreenBufferInfo",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetConsoleTextAttribute",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FlushFileBuffers",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetTickCount",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "QueryPerformanceCounter",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "MapViewOfFile",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CreateFileMappingW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FormatMessageA",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetSystemTimeAsFileTime",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetModuleHandleW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetProcessHeap",
+        "tier": "runtime",
+        "bed": "memory",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetFileSize",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "LockFileEx",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "LocalFree",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "UnlockFile",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "HeapDestroy",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "HeapCompact",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "HeapAlloc",
+        "tier": "runtime",
+        "bed": "memory",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "LoadLibraryW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetSystemInfo",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "HeapReAlloc",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "DeleteFileW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "DeleteFileA",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "WaitForSingleObjectEx",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CreateFileA",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FlushViewOfFile",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "OutputDebugStringW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetFileAttributesExW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetFileAttributesA",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetLastError",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetDiskFreeSpaceA",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FormatMessageW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetTempPathA",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "Sleep",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "HeapSize",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "HeapValidate",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "UnmapViewOfFile",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetFileAttributesW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "WaitForSingleObject",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CreateMutexW",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetTempPathW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "UnlockFileEx",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetEndOfFile",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetFullPathNameA",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetFilePointer",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "LockFile",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "OutputDebugStringA",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetDiskFreeSpaceW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "WriteFile",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetFullPathNameW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "HeapFree",
+        "tier": "runtime",
+        "bed": "memory",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "HeapCreate",
+        "tier": "runtime",
+        "bed": "memory",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "ReadFile",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "AreFileApisANSI",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "RaiseException",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "InitializeCriticalSection",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "EnterCriticalSection",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "LeaveCriticalSection",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "TryEnterCriticalSection",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "DeleteCriticalSection",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetCurrentThreadId",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "RtlCaptureContext",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "RtlLookupFunctionEntry",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "RtlVirtualUnwind",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "UnhandledExceptionFilter",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetUnhandledExceptionFilter",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "TerminateProcess",
+        "tier": "bed",
+        "bed": "process",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "IsProcessorFeaturePresent",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "IsDebuggerPresent",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetStartupInfoW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "InitializeSListHead",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetStringTypeW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "RtlUnwindEx",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "InterlockedPushEntrySList",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "InterlockedFlushSList",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetLastError",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "InitializeCriticalSectionAndSpinCount",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "TlsAlloc",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "TlsGetValue",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "TlsSetValue",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "TlsFree",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "LoadLibraryExW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "EncodePointer",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "RtlPcToFileHeader",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "ExitProcess",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetModuleHandleExW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "DuplicateHandle",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CreateProcessW",
+        "tier": "bed",
+        "bed": "process",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetFileType",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetModuleFileNameW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "WriteConsoleW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetDriveTypeW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetFileInformationByHandle",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "PeekNamedPipe",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SystemTimeToTzSpecificLocalTime",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FileTimeToSystemTime",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetFileAttributesW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FindFirstFileExW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FindNextFileW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CreateDirectoryW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CreateThread",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "ExitThread",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "ResumeThread",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FreeLibraryAndExitThread",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetCommandLineA",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetCommandLineW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetCurrentThread",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FlsAlloc",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FlsGetValue",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FlsSetValue",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FlsFree",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetDateFormatW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetTimeFormatW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CompareStringW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "LCMapStringW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetLocaleInfoW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "IsValidLocale",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetUserDefaultLCID",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "EnumSystemLocalesW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetExitCodeProcess",
+        "tier": "bed",
+        "bed": "process",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CreatePipe",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetConsoleOutputCP",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetConsoleMode",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "ReadConsoleW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetFilePointerEx",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetFileSizeEx",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetCurrentDirectoryW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetStdHandle",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetTimeZoneInformation",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "IsValidCodePage",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetACP",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetOEMCP",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetCPInfo",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetEnvironmentStringsW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FreeEnvironmentStringsW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetEnvironmentVariableW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "RtlUnwind",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      }
+    ]
+  },
+  {
+    "file": "corpus/bin/7za.exe",
+    "machine": "0x8664",
+    "arch": "x64",
+    "import_count": 145,
+    "imports": [
+      {
+        "dll": "OLEAUT32.dll",
+        "function": "SysStringLen",
+        "tier": "runtime",
+        "bed": "com",
+        "reason": "dll default"
+      },
+      {
+        "dll": "OLEAUT32.dll",
+        "function": "VariantClear",
+        "tier": "runtime",
+        "bed": "com",
+        "reason": "dll default"
+      },
+      {
+        "dll": "OLEAUT32.dll",
+        "function": "VariantCopy",
+        "tier": "runtime",
+        "bed": "com",
+        "reason": "dll default"
+      },
+      {
+        "dll": "OLEAUT32.dll",
+        "function": "SysAllocString",
+        "tier": "runtime",
+        "bed": "com",
+        "reason": "dll default"
+      },
+      {
+        "dll": "OLEAUT32.dll",
+        "function": "SysFreeString",
+        "tier": "runtime",
+        "bed": "com",
+        "reason": "dll default"
+      },
+      {
+        "dll": "OLEAUT32.dll",
+        "function": "SysAllocStringLen",
+        "tier": "runtime",
+        "bed": "com",
+        "reason": "dll default"
+      },
+      {
+        "dll": "USER32.dll",
+        "function": "CharUpperW",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "USER32.dll",
+        "function": "CharPrevExA",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "ADVAPI32.dll",
+        "function": "OpenProcessToken",
+        "tier": "bed",
+        "bed": "registry",
+        "reason": "dll default"
+      },
+      {
+        "dll": "ADVAPI32.dll",
+        "function": "SystemFunction036",
+        "tier": "bed",
+        "bed": "registry",
+        "reason": "dll default"
+      },
+      {
+        "dll": "ADVAPI32.dll",
+        "function": "GetFileSecurityW",
+        "tier": "bed",
+        "bed": "registry",
+        "reason": "dll default"
+      },
+      {
+        "dll": "ADVAPI32.dll",
+        "function": "SetFileSecurityW",
+        "tier": "bed",
+        "bed": "registry",
+        "reason": "dll default"
+      },
+      {
+        "dll": "ADVAPI32.dll",
+        "function": "RegOpenKeyExW",
+        "tier": "bed",
+        "bed": "registry",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "ADVAPI32.dll",
+        "function": "AdjustTokenPrivileges",
+        "tier": "bed",
+        "bed": "registry",
+        "reason": "dll default"
+      },
+      {
+        "dll": "ADVAPI32.dll",
+        "function": "LookupPrivilegeValueW",
+        "tier": "bed",
+        "bed": "registry",
+        "reason": "dll default"
+      },
+      {
+        "dll": "ADVAPI32.dll",
+        "function": "RegQueryValueExW",
+        "tier": "bed",
+        "bed": "registry",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "ADVAPI32.dll",
+        "function": "RegCloseKey",
+        "tier": "bed",
+        "bed": "registry",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "_exit",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "_c_exit",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "_XcptFilter",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "_onexit",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "__dllonexit",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "?terminate@@YAXXZ",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "??1type_info@@UEAA@XZ",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "__C_specific_handler",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "_beginthreadex",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "realloc",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "_purecall",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "_isatty",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "_get_osfhandle",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "memset",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "strlen",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "_cexit",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "wcscmp",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "strcmp",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "memmove",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "fflush",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "fputc",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "fputs",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "_iob",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "fgetc",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "free",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "malloc",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "memcmp",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "__CxxFrameHandler",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "_CxxThrowException",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "memcpy",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "exit",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "__getmainargs",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "__initenv",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "_initterm",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "__setusermatherr",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "_commode",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "_fmode",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "__set_app_type",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "msvcrt.dll",
+        "function": "wcsstr",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "ResumeThread",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetThreadAffinityMask",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CreateEventW",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetEvent",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "ResetEvent",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CreateSemaphoreW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "ReleaseSemaphore",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "InitializeCriticalSection",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetVersion",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "MoveFileW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "WaitForSingleObject",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetLargePageMinimum",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "VirtualFree",
+        "tier": "runtime",
+        "bed": "memory",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "VirtualAlloc",
+        "tier": "runtime",
+        "bed": "memory",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetOEMCP",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "LocalFileTimeToFileTime",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetConsoleMode",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetFileApisToOEM",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetCommandLineW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetConsoleScreenBufferInfo",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetConsoleCtrlHandler",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetProcessTimes",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "QueryPerformanceFrequency",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "QueryPerformanceCounter",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "DeleteCriticalSection",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetProcessAffinityMask",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetConsoleMode",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "OpenEventW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "UnmapViewOfFile",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "MapViewOfFile",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "OpenFileMappingW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "WaitForMultipleObjects",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "LeaveCriticalSection",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "EnterCriticalSection",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetSystemTimeAsFileTime",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FileTimeToDosDateTime",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "DosDateTimeToFileTime",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "IsProcessorFeaturePresent",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetSystemInfo",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetProcessAffinityMask",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetModuleHandleA",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GlobalMemoryStatusEx",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FileTimeToLocalFileTime",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FileTimeToSystemTime",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CompareFileTime",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetModuleHandleW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetProcAddress",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetCurrentProcess",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetDiskFreeSpaceExW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetDiskFreeSpaceW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetLastError",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "MultiByteToWideChar",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "WideCharToMultiByte",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FreeLibrary",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "LoadLibraryW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetModuleFileNameW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "LocalFree",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FormatMessageW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CloseHandle",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetFileTime",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CreateFileW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetFileAttributesW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "RemoveDirectoryW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "MoveFileWithProgressW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CreateHardLinkW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CreateDirectoryW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "DeleteFileW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetCurrentDirectoryW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetCurrentDirectoryW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetTempPathW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetLastError",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetCurrentProcessId",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetTickCount",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetCurrentThreadId",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetFileInformationByHandle",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetStdHandle",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FindClose",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FindFirstFileW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FindNextFileW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FindFirstStreamW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FindNextStreamW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetFileAttributesW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetLogicalDriveStringsW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "DeviceIoControl",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetFileSize",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetFilePointer",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "ReadFile",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "WriteFile",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetEndOfFile",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      }
+    ]
+  },
+  {
+    "file": "corpus/bin/curl.exe",
+    "machine": "0x8664",
+    "arch": "x64",
+    "import_count": 276,
+    "imports": [
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "__acrt_iob_func",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "__p__commode",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "__p__fmode",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "__stdio_common_vfprintf",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "__stdio_common_vsprintf",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "_chsize_s",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "_close",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "_fileno",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "_fseeki64",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "_fsopen",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "_get_osfhandle",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "_isatty",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "_lseeki64",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "_read",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "_setmode",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "_sopen_s",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "_write",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "fclose",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "feof",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "ferror",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "fflush",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "fgets",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "fopen",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "fputc",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "fputs",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "fread",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "freopen_s",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "fseek",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "ftell",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "fwrite",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "getc",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "putchar",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "puts",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "rewind",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "setvbuf",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-stdio-l1-1-0.dll",
+        "function": "ungetc",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-runtime-l1-1-0.dll",
+        "function": "__p___argc",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-runtime-l1-1-0.dll",
+        "function": "__p___argv",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-runtime-l1-1-0.dll",
+        "function": "_cexit",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-runtime-l1-1-0.dll",
+        "function": "_configure_narrow_argv",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-runtime-l1-1-0.dll",
+        "function": "_crt_atexit",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-runtime-l1-1-0.dll",
+        "function": "_errno",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-runtime-l1-1-0.dll",
+        "function": "_exit",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-runtime-l1-1-0.dll",
+        "function": "_initialize_narrow_environment",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-runtime-l1-1-0.dll",
+        "function": "_initterm",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-runtime-l1-1-0.dll",
+        "function": "_initterm_e",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-runtime-l1-1-0.dll",
+        "function": "_seh_filter_exe",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-runtime-l1-1-0.dll",
+        "function": "_set_app_type",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-runtime-l1-1-0.dll",
+        "function": "_set_invalid_parameter_handler",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-runtime-l1-1-0.dll",
+        "function": "abort",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-runtime-l1-1-0.dll",
+        "function": "exit",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-runtime-l1-1-0.dll",
+        "function": "strerror",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-runtime-l1-1-0.dll",
+        "function": "strerror_s",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-locale-l1-1-0.dll",
+        "function": "_configthreadlocale",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-locale-l1-1-0.dll",
+        "function": "localeconv",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-locale-l1-1-0.dll",
+        "function": "setlocale",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-heap-l1-1-0.dll",
+        "function": "_set_new_mode",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-heap-l1-1-0.dll",
+        "function": "calloc",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-heap-l1-1-0.dll",
+        "function": "free",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-heap-l1-1-0.dll",
+        "function": "malloc",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-heap-l1-1-0.dll",
+        "function": "realloc",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-private-l1-1-0.dll",
+        "function": "memchr",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-private-l1-1-0.dll",
+        "function": "memcmp",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-private-l1-1-0.dll",
+        "function": "memcpy",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-private-l1-1-0.dll",
+        "function": "memmove",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-private-l1-1-0.dll",
+        "function": "strchr",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-private-l1-1-0.dll",
+        "function": "strrchr",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-private-l1-1-0.dll",
+        "function": "strstr",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "_strdup",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "_stricmp",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "_strnicmp",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "isalnum",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "isdigit",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "isspace",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "isxdigit",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "mbrlen",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "memset",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "strcat",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "strcmp",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "strcpy",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "strcspn",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "strlen",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "strncmp",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "strncpy_s",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "strnlen",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "strpbrk",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "strspn",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "tolower",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "wcscpy_s",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "wcslen",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "wcsncmp",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "wcsncpy_s",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-string-l1-1-0.dll",
+        "function": "wcsnlen",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-time-l1-1-0.dll",
+        "function": "_difftime64",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-time-l1-1-0.dll",
+        "function": "_gmtime64_s",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-time-l1-1-0.dll",
+        "function": "_localtime64_s",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-time-l1-1-0.dll",
+        "function": "_time64",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-time-l1-1-0.dll",
+        "function": "strftime",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-filesystem-l1-1-0.dll",
+        "function": "_findclose",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-filesystem-l1-1-0.dll",
+        "function": "_findfirst64i32",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-filesystem-l1-1-0.dll",
+        "function": "_findnext64i32",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-filesystem-l1-1-0.dll",
+        "function": "_fstat64",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-filesystem-l1-1-0.dll",
+        "function": "_fullpath",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-filesystem-l1-1-0.dll",
+        "function": "_lock_file",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-filesystem-l1-1-0.dll",
+        "function": "_mkdir",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-filesystem-l1-1-0.dll",
+        "function": "_stat64",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-filesystem-l1-1-0.dll",
+        "function": "_unlink",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-filesystem-l1-1-0.dll",
+        "function": "_unlock_file",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-math-l1-1-0.dll",
+        "function": "__setusermatherr",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-math-l1-1-0.dll",
+        "function": "_fdopen",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-utility-l1-1-0.dll",
+        "function": "_byteswap_uint64",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-utility-l1-1-0.dll",
+        "function": "_byteswap_ulong",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-utility-l1-1-0.dll",
+        "function": "_byteswap_ushort",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-utility-l1-1-0.dll",
+        "function": "bsearch",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-utility-l1-1-0.dll",
+        "function": "qsort",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-conio-l1-1-0.dll",
+        "function": "_getch",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-environment-l1-1-0.dll",
+        "function": "__p__environ",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-environment-l1-1-0.dll",
+        "function": "getenv",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "WSACleanup",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "WSACloseEvent",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "WSACreateEvent",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "WSAEnumNetworkEvents",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "WSAEventSelect",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "WSAGetLastError",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "WSAIoctl",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "WSAResetEvent",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "WSASetLastError",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "WSAStartup",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "WSAWaitForMultipleEvents",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "__WSAFDIsSet",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "accept",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "bind",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "closesocket",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "connect",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "freeaddrinfo",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "getaddrinfo",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "gethostname",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "getpeername",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "getsockname",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "getsockopt",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "htonl",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "htons",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "inet_pton",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "ioctlsocket",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "listen",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "ntohl",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "ntohs",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "recv",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "recvfrom",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "select",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "send",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "sendto",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "setsockopt",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "shutdown",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "WS2_32.dll",
+        "function": "socket",
+        "tier": "runtime",
+        "bed": "winsock",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "AcquireSRWLockExclusive",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CancelIo",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CloseHandle",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CompareFileTime",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CreateEventA",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CreateFileA",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CreateFileMappingA",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CreateMutexA",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CreateThread",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "CreateToolhelp32Snapshot",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "DeleteCriticalSection",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "DuplicateHandle",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "EnterCriticalSection",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "FormatMessageA",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetConsoleMode",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetConsoleScreenBufferInfo",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetCurrentProcess",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetCurrentThreadId",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetEnvironmentVariableA",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetFileAttributesA",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetFileTime",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetFileType",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetFullPathNameW",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetLastError",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetModuleFileNameA",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetModuleHandleA",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetOverlappedResult",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetProcAddress",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetStdHandle",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetSystemInfo",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetSystemTime",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetSystemTimeAsFileTime",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetTickCount64",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "GetTimeZoneInformation",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "InitOnceExecuteOnce",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "InitializeConditionVariable",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "InitializeCriticalSection",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "InitializeCriticalSectionEx",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "IsProcessorFeaturePresent",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "LeaveCriticalSection",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "MapViewOfFile",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "Module32First",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "Module32Next",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "MoveFileExA",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "MultiByteToWideChar",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "PeekNamedPipe",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "QueryPerformanceCounter",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "QueryPerformanceFrequency",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "ReadFile",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "ReleaseMutex",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "ReleaseSRWLockExclusive",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "RtlVirtualUnwind",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetConsoleCtrlHandler",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetConsoleMode",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetFileTime",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetHandleInformation",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetLastError",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetStdHandle",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SetUnhandledExceptionFilter",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "Sleep",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SleepConditionVariableCS",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SleepEx",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "SystemTimeToFileTime",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "TerminateProcess",
+        "tier": "bed",
+        "bed": "process",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "TerminateThread",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "TlsGetValue",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "UnmapViewOfFile",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "VerSetConditionMask",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "VerifyVersionInfoW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "VirtualAlloc",
+        "tier": "runtime",
+        "bed": "memory",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "VirtualFree",
+        "tier": "runtime",
+        "bed": "memory",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "VirtualProtect",
+        "tier": "runtime",
+        "bed": "memory",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "VirtualQuery",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "WaitForMultipleObjects",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "WaitForSingleObject",
+        "tier": "runtime",
+        "bed": "threading",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "WaitForSingleObjectEx",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "WaitNamedPipeA",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "WakeConditionVariable",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "WideCharToMultiByte",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "WriteConsoleW",
+        "tier": "runtime",
+        "bed": "memory_or_threading",
+        "reason": "dll default"
+      },
+      {
+        "dll": "KERNEL32.dll",
+        "function": "WriteFile",
+        "tier": "bed",
+        "bed": "vfs",
+        "reason": "explicit override"
+      },
+      {
+        "dll": "Secur32.dll",
+        "function": "InitSecurityInterfaceA",
+        "tier": "runtime",
+        "bed": "winsock_tls",
+        "reason": "dll default"
+      },
+      {
+        "dll": "Normaliz.dll",
+        "function": "IdnToAscii",
+        "tier": "stub",
+        "bed": "unknown",
+        "reason": "unrecognized DLL"
+      },
+      {
+        "dll": "Normaliz.dll",
+        "function": "IdnToUnicode",
+        "tier": "stub",
+        "bed": "unknown",
+        "reason": "unrecognized DLL"
+      },
+      {
+        "dll": "WLDAP32.dll",
+        "function": "ber_free",
+        "tier": "stub",
+        "bed": "unknown",
+        "reason": "unrecognized DLL"
+      },
+      {
+        "dll": "WLDAP32.dll",
+        "function": "ldap_bind_s",
+        "tier": "stub",
+        "bed": "unknown",
+        "reason": "unrecognized DLL"
+      },
+      {
+        "dll": "WLDAP32.dll",
+        "function": "ldap_err2string",
+        "tier": "stub",
+        "bed": "unknown",
+        "reason": "unrecognized DLL"
+      },
+      {
+        "dll": "WLDAP32.dll",
+        "function": "ldap_first_attribute",
+        "tier": "stub",
+        "bed": "unknown",
+        "reason": "unrecognized DLL"
+      },
+      {
+        "dll": "WLDAP32.dll",
+        "function": "ldap_first_entry",
+        "tier": "stub",
+        "bed": "unknown",
+        "reason": "unrecognized DLL"
+      },
+      {
+        "dll": "WLDAP32.dll",
+        "function": "ldap_get_dn",
+        "tier": "stub",
+        "bed": "unknown",
+        "reason": "unrecognized DLL"
+      },
+      {
+        "dll": "WLDAP32.dll",
+        "function": "ldap_get_values_len",
+        "tier": "stub",
+        "bed": "unknown",
+        "reason": "unrecognized DLL"
+      },
+      {
+        "dll": "WLDAP32.dll",
+        "function": "ldap_init",
+        "tier": "stub",
+        "bed": "unknown",
+        "reason": "unrecognized DLL"
+      },
+      {
+        "dll": "WLDAP32.dll",
+        "function": "ldap_memfree",
+        "tier": "stub",
+        "bed": "unknown",
+        "reason": "unrecognized DLL"
+      },
+      {
+        "dll": "WLDAP32.dll",
+        "function": "ldap_msgfree",
+        "tier": "stub",
+        "bed": "unknown",
+        "reason": "unrecognized DLL"
+      },
+      {
+        "dll": "WLDAP32.dll",
+        "function": "ldap_next_attribute",
+        "tier": "stub",
+        "bed": "unknown",
+        "reason": "unrecognized DLL"
+      },
+      {
+        "dll": "WLDAP32.dll",
+        "function": "ldap_next_entry",
+        "tier": "stub",
+        "bed": "unknown",
+        "reason": "unrecognized DLL"
+      },
+      {
+        "dll": "WLDAP32.dll",
+        "function": "ldap_search_s",
+        "tier": "stub",
+        "bed": "unknown",
+        "reason": "unrecognized DLL"
+      },
+      {
+        "dll": "WLDAP32.dll",
+        "function": "ldap_set_option",
+        "tier": "stub",
+        "bed": "unknown",
+        "reason": "unrecognized DLL"
+      },
+      {
+        "dll": "WLDAP32.dll",
+        "function": "ldap_simple_bind_s",
+        "tier": "stub",
+        "bed": "unknown",
+        "reason": "unrecognized DLL"
+      },
+      {
+        "dll": "WLDAP32.dll",
+        "function": "ldap_sslinit",
+        "tier": "stub",
+        "bed": "unknown",
+        "reason": "unrecognized DLL"
+      },
+      {
+        "dll": "WLDAP32.dll",
+        "function": "ldap_unbind_s",
+        "tier": "stub",
+        "bed": "unknown",
+        "reason": "unrecognized DLL"
+      },
+      {
+        "dll": "WLDAP32.dll",
+        "function": "ldap_value_free_len",
+        "tier": "stub",
+        "bed": "unknown",
+        "reason": "unrecognized DLL"
+      },
+      {
+        "dll": "IPHLPAPI.DLL",
+        "function": "if_nametoindex",
+        "tier": "stub",
+        "bed": "unknown",
+        "reason": "unrecognized DLL"
+      },
+      {
+        "dll": "bcrypt.dll",
+        "function": "BCryptGenRandom",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "CRYPT32.dll",
+        "function": "CertCloseStore",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "CRYPT32.dll",
+        "function": "CertEnumCertificatesInStore",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "CRYPT32.dll",
+        "function": "CertFreeCertificateContext",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "CRYPT32.dll",
+        "function": "CertGetEnhancedKeyUsage",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "CRYPT32.dll",
+        "function": "CertGetIntendedKeyUsage",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "CRYPT32.dll",
+        "function": "CertOpenSystemStoreA",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "dll default"
+      },
+      {
+        "dll": "api-ms-win-crt-convert-l1-1-0.dll",
+        "function": "atoi",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-convert-l1-1-0.dll",
+        "function": "mbrtowc",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-convert-l1-1-0.dll",
+        "function": "mbstowcs_s",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-convert-l1-1-0.dll",
+        "function": "strtol",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-convert-l1-1-0.dll",
+        "function": "strtoll",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-convert-l1-1-0.dll",
+        "function": "strtoul",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-convert-l1-1-0.dll",
+        "function": "strtoull",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-convert-l1-1-0.dll",
+        "function": "wcrtomb",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "api-ms-win-crt-convert-l1-1-0.dll",
+        "function": "wcstombs_s",
+        "tier": "runtime",
+        "bed": "crt",
+        "reason": "ucrt forwarder dll"
+      },
+      {
+        "dll": "USER32.dll",
+        "function": "FindWindowA",
+        "tier": "stub",
+        "bed": "gui_user32",
+        "reason": "dll default"
+      },
+      {
+        "dll": "USER32.dll",
+        "function": "SendMessageA",
+        "tier": "stub",
+        "bed": "gui_user32",
+        "reason": "dll default"
+      }
+    ]
+  }
+]

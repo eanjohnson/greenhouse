@@ -1,0 +1,1010 @@
+// launcher_ui.h -- Greenhouse launcher shell (Phase A).
+//
+// A header-only UI layer, in the gh_steam_*.h style: it is #included ONCE into
+// guest_loader.cpp (guarded by GH_LAUNCHER), AFTER the loader's own statics it
+// leans on are declared -- g_gfx (the D3D11On12 bridge), BuildBridgeOnUi(),
+// PollGamepadOnUi()/PollSyntheticPad() + g_padState/g_padMutex, kLocalState,
+// g_dispatcher, Diag()/Hex(). It draws its own on-screen UI over the existing
+// swapchain with Direct2D/DirectWrite (Appendix B rates D2D/DWrite "High"),
+// enumerates the installed game library, and returns the guest the user picked
+// so App::Run can hand it to RunGuest() -- no ghguest.txt hand-editing.
+//
+// The launcher is a PRE-GUEST phase in the SAME single-process Host: it runs on
+// the UI thread before any RunGuest() worker is spawned, using the identical
+// present path the game path uses (copy an offscreen RT into the acquired
+// wrapped back buffer, release/flush/present/acquire).
+#pragma once
+// windows.h (already included) defines DrawText as the DrawTextW macro. Left
+// active, it rewrites the D2D interface method ID2D1RenderTarget::DrawText into
+// "DrawTextW" as d2d1.h is parsed. Undo it BEFORE the D2D includes so the method
+// keeps its real name, and so our own call site resolves correctly.
+#ifdef DrawText
+#undef DrawText
+#endif
+#include <d2d1_1.h>
+#include <d2d1helper.h>
+#include <dwrite.h>
+#include <algorithm>
+#include "cm_downloader.h"   // in-process Steam depot downloader (namespace ghdl)
+extern "C" {
+#include "qrcodegen.h"       // Nayuki QR Code generator (MIT), for on-screen Steam login (Phase C)
+}
+
+// ---------------------------------------------------------------------------
+// D2D/DWrite state, built once over the existing bridge device (g_gfx.d11).
+// ---------------------------------------------------------------------------
+struct LauncherGfx {
+    com_ptr<ID2D1Factory1>        factory;
+    com_ptr<ID2D1Device>          device;
+    com_ptr<ID2D1DeviceContext>   dc;
+    com_ptr<IDWriteFactory>       dw;
+    com_ptr<IDWriteTextFormat>    fmtTitle, fmtItem, fmtSmall, fmtLog;
+    com_ptr<ID3D11Texture2D>      uiTex;      // R8G8B8A8_UNORM target D2D draws into
+    com_ptr<ID2D1Bitmap1>         uiTarget;   // D2D target wrapping uiTex
+    com_ptr<ID2D1SolidColorBrush> brFg, brDim, brBg, brSel, brAccent, brPanel, brWarn;
+    com_ptr<ID2D1SolidColorBrush> brWhite, brBlack;   // pure B/W for QR scanner contrast
+    UINT  w = 0, h = 0;
+    bool  ready = false, failed = false;
+};
+static LauncherGfx g_lui;
+
+// Steam-login state, wired by the loader from the preloaded shim (steam_api64.dll):
+//   GhLoginSteamID() -> real SteamID once the QR/cached login completes, else 0
+//   GhLoginDone()    -> true once the login attempt has finished (success OR give-up)
+// Both null when no engine is staged in this slot -> the launcher skips the login
+// screen entirely and the game path does its own login exactly as before.
+static uint64_t (*g_ghLoginSteamID)() = nullptr;
+static bool     (*g_ghLoginDone)()    = nullptr;
+
+// A single library entry: what to show, and the guest string RunGuest resolves
+// (either an absolute "E:\...\x.exe" USB path, or a "<sub>\<exe>" name resolved
+// under <LocalState>\game\, exactly like ghguest.txt).
+struct LauncherItem {
+    std::wstring display;
+    std::wstring guest;      // empty => "continue with default guest"
+    std::wstring sub;        // source hint shown dim (e.g. "installed", "USB", "configured")
+    uint32_t     app = 0;    // Steam appid for "owned" (@@lib) entries -> download-on-select
+};
+
+static std::string LuiNarrow(const std::wstring& w) { return std::string(w.begin(), w.end()); }
+
+// Decode a raw config-file byte blob to wide text, auto-detecting the encoding so
+// a hand-edited ghlibrary.txt works whether saved as UTF-8/ASCII or UTF-16LE:
+//   FF FE BOM            -> UTF-16LE
+//   EF BB BF BOM         -> UTF-8
+//   embedded NUL bytes   -> UTF-16LE without BOM
+//   otherwise            -> UTF-8/ASCII (widen byte-wise; ASCII is the common case)
+static std::wstring LuiDecode(const std::vector<uint8_t>& b)
+{
+    if (b.size() >= 2 && b[0] == 0xFF && b[1] == 0xFE)
+        return std::wstring((const wchar_t*)(b.data() + 2), (b.size() - 2) / 2);
+    size_t off = (b.size() >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) ? 3 : 0;
+    bool utf16 = false;
+    for (size_t i = off + 1; i < b.size(); i += 2) if (b[i] == 0) { utf16 = true; break; }
+    if (utf16)
+        return std::wstring((const wchar_t*)(b.data() + off), (b.size() - off) / 2);
+    std::wstring w; w.reserve(b.size() - off);
+    for (size_t i = off; i < b.size(); ++i) w.push_back((wchar_t)(unsigned char)b[i]);
+    return w;
+}
+
+// ---------------------------------------------------------------------------
+// One-time D2D device + target-bitmap + fonts + brushes.
+// ---------------------------------------------------------------------------
+static bool LuiInit()
+{
+    if (g_lui.ready)  return true;
+    if (g_lui.failed) return false;
+    if (!g_gfx.ready) { g_lui.failed = true; Diag("LAUNCHER LuiInit: no bridge"); return false; }
+
+    auto bail = [](const char* where, HRESULT hr){
+        g_lui.failed = true; Diag(std::string("LAUNCHER LuiInit FAIL ") + where + " hr=" + Hex((uint32_t)hr));
+        return false;
+    };
+    HRESULT hr;
+    g_lui.w = g_gfx.rtW ? g_gfx.rtW : 1920;
+    g_lui.h = g_gfx.rtH ? g_gfx.rtH : 1080;
+
+    D2D1_FACTORY_OPTIONS fo{};
+    hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1),
+                           &fo, g_lui.factory.put_void());
+    if (FAILED(hr)) return bail("D2D1CreateFactory", hr);
+
+    com_ptr<IDXGIDevice> dxgiDev;
+    hr = g_gfx.d11->QueryInterface(__uuidof(IDXGIDevice), dxgiDev.put_void());
+    if (FAILED(hr)) return bail("QI IDXGIDevice", hr);
+    hr = g_lui.factory->CreateDevice(dxgiDev.get(), g_lui.device.put());
+    if (FAILED(hr)) return bail("CreateDevice(D2D)", hr);
+    hr = g_lui.device->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, g_lui.dc.put());
+    if (FAILED(hr)) return bail("CreateDeviceContext", hr);
+
+    // Offscreen UNORM target D2D renders into; blitted to the back buffer on present.
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = g_lui.w; td.Height = g_lui.h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    hr = g_gfx.d11->CreateTexture2D(&td, nullptr, g_lui.uiTex.put());
+    if (FAILED(hr)) return bail("CreateTexture2D(uiTex)", hr);
+    com_ptr<IDXGISurface> surf;
+    hr = g_lui.uiTex->QueryInterface(__uuidof(IDXGISurface), surf.put_void());
+    if (FAILED(hr)) return bail("QI IDXGISurface", hr);
+    D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        D2D1::PixelFormat(DXGI_FORMAT_R8G8B8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    hr = g_lui.dc->CreateBitmapFromDxgiSurface(surf.get(), &bp, g_lui.uiTarget.put());
+    if (FAILED(hr)) return bail("CreateBitmapFromDxgiSurface", hr);
+    g_lui.dc->SetTarget(g_lui.uiTarget.get());
+
+    hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                             reinterpret_cast<IUnknown**>(g_lui.dw.put()));
+    if (FAILED(hr)) return bail("DWriteCreateFactory", hr);
+    auto mkfmt = [&](float size, DWRITE_FONT_WEIGHT wt, com_ptr<IDWriteTextFormat>& out){
+        return g_lui.dw->CreateTextFormat(L"Segoe UI", nullptr, wt, DWRITE_FONT_STYLE_NORMAL,
+                                          DWRITE_FONT_STRETCH_NORMAL, size, L"en-us", out.put());
+    };
+    mkfmt(66.f, DWRITE_FONT_WEIGHT_BOLD,      g_lui.fmtTitle);
+    mkfmt(34.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, g_lui.fmtItem);
+    mkfmt(22.f, DWRITE_FONT_WEIGHT_NORMAL,    g_lui.fmtSmall);
+    mkfmt(16.f, DWRITE_FONT_WEIGHT_NORMAL,    g_lui.fmtLog);
+
+    auto mkbr = [&](uint32_t rgb, float a, com_ptr<ID2D1SolidColorBrush>& out){
+        return g_lui.dc->CreateSolidColorBrush(D2D1::ColorF(rgb, a), out.put());
+    };
+    mkbr(0xE8EAED, 1.f, g_lui.brFg);
+    mkbr(0x8B949E, 1.f, g_lui.brDim);
+    mkbr(0x0E1116, 1.f, g_lui.brBg);
+    mkbr(0x1F6FEB, 1.f, g_lui.brSel);
+    mkbr(0x3FB950, 1.f, g_lui.brAccent);
+    mkbr(0x161B22, 1.f, g_lui.brPanel);
+    mkbr(0xF85149, 1.f, g_lui.brWarn);
+    mkbr(0xFFFFFF, 1.f, g_lui.brWhite);
+    mkbr(0x000000, 1.f, g_lui.brBlack);
+
+    g_lui.ready = true;
+    Diag("LAUNCHER LuiInit OK " + std::to_string(g_lui.w) + "x" + std::to_string(g_lui.h));
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Enumerate the library: installed games under <LocalState>\game\*, plus the
+// currently-configured ghguest.txt (so existing USB/on-device setups appear),
+// plus optional absolute paths listed one-per-line in <LocalState>\ghlibrary.txt
+// (a manual escape hatch for USB titles -- the container cannot FindFirstFile the
+// USB root, so auto-discovery there is not reliable). Always ends with a
+// "Continue" fallback that launches the default guest.
+// ---------------------------------------------------------------------------
+static std::wstring LuiExeBase(const std::wstring& path)
+{
+    size_t s = path.find_last_of(L"\\/");
+    std::wstring name = (s == std::wstring::npos) ? path : path.substr(s + 1);
+    size_t d = name.find_last_of(L'.');
+    return (d == std::wstring::npos) ? name : name.substr(0, d);
+}
+
+// Folder name of a guest path ("20XX\\20XX.exe" -> "20XX"). Used for display
+// and for de-duping the owned library against an install.
+static std::wstring LuiFolderOf(const std::wstring& guest)
+{
+    size_t s = guest.find_last_of(L"\\/");
+    return (s == std::wstring::npos) ? std::wstring() : guest.substr(0, s);
+}
+
+static DWORD LuiFileSize(const std::wstring& path)
+{
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    DWORD sz = GetFileSize(h, nullptr);
+    CloseHandle(h);
+    return (sz == INVALID_FILE_SIZE) ? 0 : sz;
+}
+
+static uint32_t LuiReadAppIdFile(const std::wstring& dir)
+{
+    std::vector<uint8_t> b;
+    if (!ReadWholeFile(dir + L"steam_appid.txt", b) || b.empty()) return 0;
+    std::string s(b.begin(), b.end());
+    return (uint32_t)strtoul(s.c_str(), nullptr, 10);
+}
+
+// Steam title for an appid from the cached library list (ASCII names).
+static std::wstring LuiOwnedName(uint32_t app)
+{
+    if (!app) return L"";
+    std::vector<uint8_t> b;
+    if (!ReadWholeFile(std::wstring(kLocalState) + L"gh_owned.txt", b) || b.empty()) return L"";
+    std::wstring all = LuiDecode(b);
+    wchar_t want[16]; swprintf(want, 16, L"%u", app);
+    size_t p = 0;
+    while (p < all.size()) {
+        size_t e = all.find_first_of(L"\r\n", p);
+        std::wstring line = all.substr(p, e == std::wstring::npos ? e : e - p);
+        p = (e == std::wstring::npos) ? all.size() : e + 1;
+        size_t tab = line.find(L'\t');
+        if (tab == std::wstring::npos) continue;
+        if (line.compare(0, tab, want) == 0) {
+            std::wstring name = line.substr(tab + 1);
+            while (!name.empty() && (name.back()==L' '||name.back()==L'\r')) name.pop_back();
+            return name;
+        }
+    }
+    return L"";
+}
+
+static std::wstring LuiFindAppFolder(const std::wstring& gameDir, uint32_t app)
+{
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((gameDir + L"*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return L"";
+    std::wstring found;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        std::wstring sub = fd.cFileName;
+        if (sub == L"." || sub == L"..") continue;
+        if (LuiReadAppIdFile(gameDir + sub + L"\\") == app) { found = gameDir + sub; break; }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return found;
+}
+
+// New downloads go to D:\DevelopmentFiles\gh_games (Dev Home scratch, ~slider size).
+// Still honor a leftover LocalState\game tree if one already has this appid.
+static std::wstring LuiInstallDir(uint32_t app, const std::wstring& nameHint)
+{
+    std::wstring scratch = std::wstring(kDevGames);
+    std::wstring legacy  = std::wstring(kLocalState) + L"game\\";
+    std::wstring found = LuiFindAppFolder(scratch, app);
+    if (found.empty()) found = LuiFindAppFolder(legacy, app);
+    if (found.empty()) {
+        wchar_t n[32]; swprintf(n, 32, L"app_%u", app);
+        found = scratch + n;
+        CreateDirectoryW(scratch.c_str(), nullptr);
+        CreateDirectoryW(found.c_str(), nullptr);
+        Diag("LAUNCHER install-dir D:\\DevelopmentFiles\\gh_games\\" + std::string(n, n+wcslen(n)));
+        (void)nameHint;
+    }
+    if (app && LuiReadAppIdFile(found + L"\\") != app) {
+        wchar_t id[16]; swprintf(id, 16, L"%u\n", app);
+        std::string a(LuiNarrow(id));
+        HANDLE hf = CreateFileW((found + L"\\steam_appid.txt").c_str(), GENERIC_WRITE, 0,
+                                nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hf != INVALID_HANDLE_VALUE) {
+            DWORD w = 0; WriteFile(hf, a.data(), (DWORD)a.size(), &w, nullptr); CloseHandle(hf);
+        }
+    }
+    return found;
+}
+
+static bool LuiIsHelperExe(const std::wstring& name)
+{
+    auto has = [&](const wchar_t* n){ return _wcsnicmp(name.c_str(), n, wcslen(n)) == 0; };
+    return has(L"CrashSender") || has(L"UnityCrashHandler") || has(L"crashpad")
+        || has(L"vcredist") || has(L"unins");
+}
+
+// Pick the game exe in a folder: prefer <folder>.exe, skip crash-reporter
+// helpers, ignore 0-byte leftovers from a failed chunk decode.
+static std::wstring LuiPickExe(const std::wstring& dir, const std::wstring& folder)
+{
+    std::wstring prefer = folder + L".exe";
+    std::wstring first, match;
+    WIN32_FIND_DATAW ef{};
+    HANDLE eh = FindFirstFileW((dir + L"*.exe").c_str(), &ef);
+    if (eh == INVALID_HANDLE_VALUE) return L"";
+    do {
+        if (ef.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        std::wstring name = ef.cFileName;
+        DWORD sz = LuiFileSize(dir + name);
+        Diag("LAUNCHER exe folder='" + LuiNarrow(folder) + "' name='" + LuiNarrow(name) +
+             "' size=" + std::to_string(sz));
+        bool empty = (sz < 64);
+        if (_wcsicmp(name.c_str(), prefer.c_str()) == 0) {
+            if (!empty || match.empty()) match = name; // prefer real bytes, else keep the name
+        } else if (first.empty() && !LuiIsHelperExe(name) && !empty) first = name;
+        else if (first.empty() && !empty) first = name;
+        else if (first.empty() && empty && !LuiIsHelperExe(name)) first = name;
+    } while (FindNextFileW(eh, &ef));
+    FindClose(eh);
+    if (!match.empty()) return match;
+    if (!first.empty()) return first;
+    return prefer;                                     // folder exists; use <folder>.exe even if missing
+}
+
+static std::vector<LauncherItem> LuiEnumerate()
+{
+    std::vector<LauncherItem> out;
+    auto seen = [&](const std::wstring& g){
+        for (auto& it : out) if (!g.empty() && it.guest == g) return true; return false;
+    };
+
+    // 1) Installed games: D:\DevelopmentFiles\gh_games (Dev scratch) then
+    // leftover <LocalState>\game. One row per steam_appid.txt. Guest is an
+    // absolute path so RunGuest uses the USB/ABSOLUTE branch.
+    auto scanRoot = [&](const std::wstring& gameDir, const wchar_t* tag) {
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW((gameDir + L"*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            std::wstring sub = fd.cFileName;
+            if (sub == L"." || sub == L"..") continue;
+            uint32_t app = LuiReadAppIdFile(gameDir + sub + L"\\");
+            if (app) {
+                bool dup = false;
+                for (auto& it : out) if (it.app == app) { dup = true; break; }
+                if (dup) {
+                    Diag(std::string("LAUNCHER merge folder='") + LuiNarrow(sub) + "' app=" + std::to_string(app));
+                    continue;
+                }
+            }
+            std::wstring exe = LuiPickExe(gameDir + sub + L"\\", sub);
+            if (exe.empty()) exe = sub + L".exe";
+            LauncherItem it;
+            it.guest = gameDir + sub + L"\\" + exe;   // absolute
+            it.app   = app;
+            it.display = LuiOwnedName(app);
+            if (it.display.empty()) it.display = sub;
+            if (it.display.empty()) {
+                wchar_t fb[32]; swprintf(fb, 32, L"App %u", app); it.display = fb;
+            }
+            it.sub = (LuiFileSize(it.guest) >= 64) ? L"installed" : L"incomplete";
+            Diag(std::string("LAUNCHER slot '") + LuiNarrow(it.display) + "' " + LuiNarrow(tag) +
+                 " folder='" + LuiNarrow(sub) + "' exe='" + LuiNarrow(exe) +
+                 "' app=" + std::to_string(app) + " sub=" + LuiNarrow(it.sub));
+            if (!seen(it.guest)) out.push_back(it);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    };
+    scanRoot(std::wstring(kDevGames), L"scratch");
+    scanRoot(std::wstring(kLocalState) + L"game\\", L"legacy");
+
+    // 2) The currently-configured guest (may be an absolute USB path).
+    std::wstring cfg = ReadCfgW(L"ghguest.txt", L"");
+    if (!cfg.empty() && !seen(cfg)) {
+        LauncherItem it;
+        it.guest = cfg;
+        it.display = LuiExeBase(cfg);
+        it.sub = (cfg.size() >= 2 && cfg[1] == L':') ? L"USB" : L"configured";
+        out.push_back(it);
+    }
+
+    // 3) Manual absolute-path list (USB titles): ghlibrary.txt, one path per line.
+    {
+        std::wstring lib = std::wstring(kLocalState) + L"ghlibrary.txt";
+        std::vector<uint8_t> b;
+        if (ReadWholeFile(lib, b) && !b.empty()) {   // ReadWholeFile: guest_loader.cpp:2821
+            std::wstring all = LuiDecode(b);
+            size_t p = 0;
+            while (p < all.size()) {
+                size_t e = all.find_first_of(L"\r\n", p);
+                std::wstring line = all.substr(p, e == std::wstring::npos ? e : e - p);
+                p = (e == std::wstring::npos) ? all.size() : e + 1;
+                while (!line.empty() && (line.back()==L' '||line.back()==L'\t')) line.pop_back();
+                while (!line.empty() && (line.front()==L' '||line.front()==L'\t')) line.erase(line.begin());
+                if (line.empty() || seen(line)) continue;
+                LauncherItem it; it.guest = line; it.display = LuiExeBase(line); it.sub = L"USB";
+                out.push_back(it);
+            }
+        }
+    }
+
+    // 4) Owned Steam library: gh_owned.txt ("<appid>\t<name>" per line), written by the
+    //    shim after login (Player.GetOwnedGames#1). These are games the account OWNS but
+    //    aren't installed on the console -- shown as "owned" entries (guest "@@lib"). Pressing
+    //    A on one resolves its depots via PICS and downloads it (LauncherRunAppDownload). Skip
+    //    any whose name already matches an installed/configured item (soft de-dup by name).
+    {
+        std::wstring owned = std::wstring(kLocalState) + L"gh_owned.txt";
+        std::vector<uint8_t> b;
+        if (ReadWholeFile(owned, b) && !b.empty()) {
+            std::wstring all = LuiDecode(b);
+            std::vector<LauncherItem> lib;
+            size_t p = 0;
+            while (p < all.size()) {
+                size_t e = all.find_first_of(L"\r\n", p);
+                std::wstring line = all.substr(p, e == std::wstring::npos ? e : e - p);
+                p = (e == std::wstring::npos) ? all.size() : e + 1;
+                size_t tab = line.find(L'\t');
+                if (tab == std::wstring::npos) continue;
+                std::wstring appid = line.substr(0, tab);
+                std::wstring name  = line.substr(tab + 1);
+                while (!name.empty() && (name.back()==L' '||name.back()==L'\r')) name.pop_back();
+                if (name.empty()) continue;
+                bool dup = false;
+                uint32_t appn = (uint32_t)wcstoul(appid.c_str(), nullptr, 10);
+                for (auto& it : out) {
+                    bool same = (appn && it.app == appn);
+                    if (_wcsicmp(it.display.c_str(), name.c_str()) == 0) same = true;
+                    std::wstring folder = LuiFolderOf(it.guest);
+                    if (!folder.empty() && _wcsicmp(folder.c_str(), name.c_str()) == 0) same = true;
+                    if (_wcsicmp(LuiExeBase(it.guest).c_str(), name.c_str()) == 0) same = true;
+                    if (same) {
+                        if (!it.app) it.app = appn;
+                        if (it.display.empty()) it.display = name;
+                        dup = true; break;
+                    }
+                }
+                if (dup) continue;
+                LauncherItem it; it.display = name; it.guest = L"@@lib"; it.sub = L"owned";
+                it.app = (uint32_t)wcstoul(appid.c_str(), nullptr, 10);
+                lib.push_back(it);
+            }
+            std::sort(lib.begin(), lib.end(), [](const LauncherItem& a, const LauncherItem& b){
+                return _wcsicmp(a.display.c_str(), b.display.c_str()) < 0; });
+            for (auto& it : lib) out.push_back(std::move(it));
+        }
+    }
+
+    // No "Continue"/default-guest fallback here: an empty guest makes RunGuest launch the
+    // dev default (7za.exe), which prints help and exits immediately -> the guest-wait loop
+    // ends and CoreApplication::Exit() closes the whole app (looked like "pressing A on the
+    // launch button closes the launcher"). The caller adds a non-launchable "No games
+    // installed" placeholder instead when the library is empty.
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Draw one frame of the menu into uiTex.
+// ---------------------------------------------------------------------------
+static void LuiText(const wchar_t* s, IDWriteTextFormat* f, D2D1_RECT_F r,
+                    ID2D1Brush* b, DWRITE_TEXT_ALIGNMENT al = DWRITE_TEXT_ALIGNMENT_LEADING)
+{
+    f->SetTextAlignment(al);
+    f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    g_lui.dc->DrawText(s, (UINT32)wcslen(s), f, r, b);
+}
+
+static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const std::wstring& status)
+{
+    auto* dc = g_lui.dc.get();
+    const float W = (float)g_lui.w, H = (float)g_lui.h;
+    dc->BeginDraw();
+    dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
+
+    // Header
+    LuiText(L"GREENHOUSE", g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
+    LuiText((L"\u25CF  " + status).c_str(), g_lui.fmtSmall.get(),
+            D2D1::RectF(84, 140, W - 80, 182), g_lui.brAccent.get());
+
+    // Item list, with a scroll window so a long (owned-library) list stays fully
+    // navigable: keep the selected row inside [top, footer). Compute how many rows fit,
+    // then a first-visible index that scrolls to follow sel.
+    const float x0 = 80, x1 = W - 80, rowH = 76, top = 220;
+    const int nfit = (int)((H - 90 - top) / rowH); if (nfit < 1) return;
+    int total = (int)items.size();
+    int first = 0;
+    if (total > nfit) {
+        first = sel - nfit / 2;                     // center the selection
+        if (first < 0) first = 0;
+        if (first > total - nfit) first = total - nfit;
+    }
+    for (int vi = 0; vi < nfit && first + vi < total; ++vi) {
+        int i = first + vi;
+        float y = top + (float)vi * rowH;
+        bool cur = (i == sel);
+        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(D2D1::RectF(x0, y, x1, y + rowH - 12), 10, 10);
+        dc->FillRoundedRectangle(rr, cur ? g_lui.brSel.get() : g_lui.brPanel.get());
+        LuiText(items[i].display.c_str(), g_lui.fmtItem.get(),
+                D2D1::RectF(x0 + 28, y, x1 - 220, y + rowH - 12), g_lui.brFg.get());
+        LuiText(items[i].sub.c_str(), g_lui.fmtSmall.get(),
+                D2D1::RectF(x1 - 240, y, x1 - 24, y + rowH - 12),
+                cur ? g_lui.brFg.get() : g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
+    // Scroll position hint (e.g. "12 / 214") when the list overflows.
+    if (total > nfit) {
+        wchar_t pos[32]; swprintf(pos, 32, L"%d / %d", sel + 1, total);
+        LuiText(pos, g_lui.fmtSmall.get(), D2D1::RectF(x0, 182, x1, 214),
+                g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
+
+    // Footer
+    LuiText(L"\u25B2 \u25BC  Move      A  Launch / Install      Dev Mode only \u00B7 games you own",
+            g_lui.fmtSmall.get(), D2D1::RectF(84, H - 70, W - 80, H - 30), g_lui.brDim.get());
+
+    dc->EndDraw();
+}
+
+// ---------------------------------------------------------------------------
+// Present uiTex to the CoreWindow, reusing the bridge's acquire/present dance.
+// ---------------------------------------------------------------------------
+static void LuiPresent()
+{
+    if (!g_gfx.ready) return;
+    ID3D11Resource* cur[] = { g_gfx.wrapped[g_gfx.cur].get() };
+    g_gfx.d11ctx->CopyResource(cur[0], g_lui.uiTex.get());
+    g_gfx.on12->ReleaseWrappedResources(cur, 1);
+    g_gfx.d11ctx->Flush();
+    g_gfx.swap->Present(1, 0);
+    g_gfx.cur = g_gfx.swap->GetCurrentBackBufferIndex();
+    ID3D11Resource* next[] = { g_gfx.wrapped[g_gfx.cur].get() };
+    g_gfx.on12->AcquireWrappedResources(next, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Phase C: on-screen Steam QR login. The shim's QR flow (gh_steam_qr.h) writes
+// the PUBLIC challenge_url to <LocalState>\gh_qr_url.txt; we encode it in-process
+// (qrcodegen) and draw the module matrix so the user scans it on the TV with the
+// Steam mobile app -- no PC-side qrtool. The refresh token never touches this
+// path (only the public URL + the resulting public SteamID are visible here).
+// ---------------------------------------------------------------------------
+static std::string LauncherReadQrUrl()
+{
+    std::wstring path = std::wstring(kLocalState) + L"gh_qr_url.txt";
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return "";
+    DWORD sz = GetFileSize(h, nullptr); std::string s(sz, 0); DWORD rd = 0;
+    ReadFile(h, &s[0], sz, &rd, nullptr); CloseHandle(h); s.resize(rd);
+    while (!s.empty() && (s.back()=='\r'||s.back()=='\n'||s.back()==' '||s.back()=='\t')) s.pop_back();
+    return s;
+}
+
+// Draw an already-encoded qrcodegen buffer, centered at (cx,cy), fit to a ~box px
+// square, on a pure-white rounded panel with the spec quiet zone. Integer module
+// scaling keeps the squares crisp for the scanner. Assumes BeginDraw is active.
+static void LuiBlitQr(const uint8_t* qr, float cx, float cy, float box)
+{
+    auto* dc = g_lui.dc.get();
+    int n = qrcodegen_getSize(qr);          // modules per side
+    const int quiet = 4;                     // required quiet zone (modules)
+    int total = n + quiet * 2;
+    int scale = (int)(box / total); if (scale < 1) scale = 1;
+    float side = (float)(total * scale);
+    float x0 = cx - side / 2, y0 = cy - side / 2;
+    D2D1_ROUNDED_RECT panel = D2D1::RoundedRect(
+        D2D1::RectF(x0 - 20, y0 - 20, x0 + side + 20, y0 + side + 20), 16, 16);
+    dc->FillRoundedRectangle(panel, g_lui.brWhite.get());
+    float mx0 = x0 + quiet * scale, my0 = y0 + quiet * scale;
+    for (int y = 0; y < n; ++y)
+        for (int x = 0; x < n; ++x)
+            if (qrcodegen_getModule(qr, x, y))
+                dc->FillRectangle(D2D1::RectF(mx0 + x*scale, my0 + y*scale,
+                                              mx0 + (x+1)*scale, my0 + (y+1)*scale),
+                                  g_lui.brBlack.get());
+}
+
+static void LuiDrawLogin(const uint8_t* qr, bool haveQr, const std::wstring& status)
+{
+    auto* dc = g_lui.dc.get();
+    const float W = (float)g_lui.w, H = (float)g_lui.h;
+    dc->BeginDraw();
+    dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
+    LuiText(L"GREENHOUSE", g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
+    LuiText(L"Sign in to Steam", g_lui.fmtItem.get(), D2D1::RectF(84, 150, W - 80, 206),
+            g_lui.brAccent.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+    const float cy = H * 0.52f, boxHalf = 300.f;
+    if (haveQr) LuiBlitQr(qr, W * 0.5f, cy, 2 * boxHalf);
+    else {
+        D2D1_ROUNDED_RECT p = D2D1::RoundedRect(
+            D2D1::RectF(W*0.5f - boxHalf, cy - boxHalf, W*0.5f + boxHalf, cy + boxHalf), 16, 16);
+        dc->FillRoundedRectangle(p, g_lui.brPanel.get());
+    }
+    LuiText(status.c_str(), g_lui.fmtItem.get(),
+            D2D1::RectF(80, cy + boxHalf + 24, W - 80, cy + boxHalf + 84),
+            g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+    LuiText(L"Scan with the Steam mobile app   ·   B to skip",
+            g_lui.fmtSmall.get(), D2D1::RectF(80, H - 70, W - 80, H - 30),
+            g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+    dc->EndDraw();
+}
+
+// Drive the on-screen login: poll the challenge URL + login state, render the QR,
+// until logged in (returns the real SteamID), the user skips (B), the attempt
+// gives up, or timeoutSec elapses (returns 0). No-op (returns 0) if the loader
+// did not wire the login hooks (no engine staged) -- the game path then logs in
+// itself, exactly as before Phase C.
+static uint64_t LauncherSteamLogin(int timeoutSec)
+{
+    if (!g_ghLoginSteamID) return 0;         // no engine in this slot -> skip screen
+    if (!g_gfx.ready) { try { BuildBridgeOnUi(); } catch (...) {} }
+    if (!LuiInit()) return 0;
+
+    static uint8_t qrbuf[qrcodegen_BUFFER_LEN_MAX];
+    static uint8_t tmpbuf[qrcodegen_BUFFER_LEN_MAX];
+    bool haveQr = false; std::string lastUrl;
+    WORD prev = 0xFFFF; DWORD start = GetTickCount();
+    Diag("LAUNCHER steam login: screen up");
+    for (;;) {
+        if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+        PollGamepadOnUi();
+        PollSyntheticPad();
+
+        uint64_t sid = g_ghLoginSteamID();
+        if (sid) {
+            for (int i = 0; i < 60; ++i) { LuiDrawLogin(qrbuf, haveQr, L"Signed in ✓"); LuiPresent(); Sleep(16); }
+            Diag("LAUNCHER steam login OK sid=" + std::to_string(sid));
+            return sid;
+        }
+        if (g_ghLoginDone && g_ghLoginDone() && !sid) { Diag("LAUNCHER steam login: finished, not signed in"); return 0; }
+
+        std::string url = LauncherReadQrUrl();
+        if (!url.empty() && url != lastUrl) {
+            if (qrcodegen_encodeText(url.c_str(), tmpbuf, qrbuf, qrcodegen_Ecc_MEDIUM,
+                                     qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX,
+                                     qrcodegen_Mask_AUTO, true)) { haveQr = true; lastUrl = url; }
+        }
+        WORD b; { std::lock_guard<std::mutex> lk(g_padMutex); b = g_padState.wButtons; }
+        WORD pressed = b & ~prev; prev = b;
+        if (pressed & XINPUT_GAMEPAD_B) { Diag("LAUNCHER steam login skipped"); return 0; }
+        if (timeoutSec > 0 && (GetTickCount() - start) > (DWORD)timeoutSec * 1000) {
+            Diag("LAUNCHER steam login timeout"); return 0;
+        }
+        LuiDrawLogin(qrbuf, haveQr, haveQr ? L"Waiting for you to scan…" : L"Connecting to Steam…");
+        LuiPresent();
+        Sleep(30);
+    }
+}
+
+// A centered full-screen status line (used while a blocking step runs, e.g. fetching
+// the library). Draws its own frame; caller Presents.
+static void LuiDrawStatus(const std::wstring& msg)
+{
+    auto* dc = g_lui.dc.get();
+    const float W = (float)g_lui.w, H = (float)g_lui.h;
+    dc->BeginDraw();
+    dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
+    LuiText(L"GREENHOUSE", g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
+    LuiText(msg.c_str(), g_lui.fmtItem.get(), D2D1::RectF(80, H * 0.5f - 40, W - 80, H * 0.5f + 40),
+            g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+    dc->EndDraw();
+}
+
+// ---------------------------------------------------------------------------
+// Owned-library fetch. Reads the on-device cached credential (gh_cred.txt: 3 lines
+// account/steamid/token) and enumerates owned games over the downloader's CM client
+// (token login -> Player.GetOwnedGames#1), caching the result to gh_owned.txt for the
+// picker. The token stays in memory here and is scrubbed after use -- never logged.
+// ---------------------------------------------------------------------------
+static bool LauncherReadCred(uint64_t& sid, std::string& token, std::string& account)
+{
+    std::wstring p = std::wstring(kLocalState) + L"gh_cred.txt";
+    HANDLE h = CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD sz = GetFileSize(h, nullptr); std::string s(sz, 0); DWORD rd = 0;
+    ReadFile(h, &s[0], sz, &rd, nullptr); CloseHandle(h); s.resize(rd);
+    size_t l1 = s.find('\n'); if (l1 == std::string::npos) return false;          // after account
+    size_t l2 = s.find('\n', l1 + 1); if (l2 == std::string::npos) return false;  // after steamid
+    account = s.substr(0, l1);
+    while (!account.empty() && (account.back()=='\r'||account.back()==' ')) account.pop_back();
+    sid = strtoull(s.substr(l1 + 1, l2 - l1 - 1).c_str(), nullptr, 10);
+    token = s.substr(l2 + 1);
+    while (!token.empty() && (token.back()=='\r'||token.back()=='\n'||token.back()==' '||token.back()=='\t')) token.pop_back();
+    bool ok = sid && !token.empty() && !account.empty();
+    if (!ok) { s.clear(); token.clear(); }
+    return ok;
+}
+
+static void LauncherFetchLibrary()
+{
+    uint64_t sid = 0; std::string token, account;
+    if (!LauncherReadCred(sid, token, account)) { Diag("LAUNCHER library: no cached credential"); return; }
+    if (g_gfx.ready && LuiInit()) { LuiDrawStatus(L"Loading your Steam library…"); LuiPresent(); }
+    std::vector<std::pair<uint32_t, std::string>> games;
+    int rc = ghdl::ListOwnedGames(sid, token, account, games);
+    token.clear();                                   // scrub token
+    Diag("LAUNCHER library: ListOwnedGames rc=" + std::to_string(rc) + " games=" + std::to_string(games.size()));
+    if (rc != 0 || games.empty()) return;
+    std::string out;
+    for (auto& g : games) {
+        char num[24]; int n = snprintf(num, sizeof(num), "%u\t", g.first); out.append(num, n);
+        for (char c : g.second) out.push_back((c=='\t'||c=='\r'||c=='\n') ? ' ' : c);
+        out.push_back('\n');
+    }
+    std::wstring p = std::wstring(kLocalState) + L"gh_owned.txt";
+    HANDLE h = CreateFileW(p.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (h != INVALID_HANDLE_VALUE) { DWORD wr = 0; WriteFile(h, out.data(), (DWORD)out.size(), &wr, nullptr); CloseHandle(h); }
+    Diag("LAUNCHER library: wrote gh_owned.txt (" + std::to_string(games.size()) + " games)");
+}
+
+// ---------------------------------------------------------------------------
+// Download flow (Phase B1c): a request dropped at <LocalState>\gh_download.txt
+// ("app depot manifest name [branch]") becomes a "Download" item in the picker.
+// Selecting it runs the in-process downloader (ghdl::DownloadDepot) on the UI
+// thread, drawing a live progress bar, into <LocalState>\game\<name>.
+// ---------------------------------------------------------------------------
+struct LauncherDlReq { uint32_t app=0, depot=0; uint64_t manifest=0; std::string name, branch="public"; bool ok=false; };
+
+static LauncherDlReq LauncherReadDlReq()
+{
+    LauncherDlReq r;
+    std::wstring path = std::wstring(kLocalState) + L"gh_download.txt";
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return r;
+    DWORD sz = GetFileSize(h, nullptr); std::string s(sz, 0); DWORD rd = 0;
+    ReadFile(h, &s[0], sz, &rd, nullptr); CloseHandle(h); s.resize(rd);
+    std::vector<std::string> tok; std::string cur;
+    for (char c : s) { if (c==' '||c=='\t'||c=='\r'||c=='\n') { if(!cur.empty()){tok.push_back(cur);cur.clear();} } else cur+=c; }
+    if (!cur.empty()) tok.push_back(cur);
+    if (tok.size() < 4) return r;
+    r.app=(uint32_t)strtoul(tok[0].c_str(),0,10); r.depot=(uint32_t)strtoul(tok[1].c_str(),0,10);
+    r.manifest=strtoull(tok[2].c_str(),0,10); r.name=tok[3]; if(tok.size()>4) r.branch=tok[4]; r.ok=true;
+    return r;
+}
+
+// Progress state shared with the download callback (same UI thread).
+struct LauncherDlProg { std::wstring name, phase; int percent=0, fdone=0, ftot=0; unsigned long long bytes=0; };
+static LauncherDlProg g_dlProg;
+
+static void LuiDrawProgress()
+{
+    auto* dc = g_lui.dc.get();
+    const float W = (float)g_lui.w, H = (float)g_lui.h;
+    dc->BeginDraw();
+    dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
+    LuiText(L"GREENHOUSE", g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
+    LuiText((L"●  Downloading " + g_dlProg.name).c_str(), g_lui.fmtSmall.get(),
+            D2D1::RectF(84, 140, W - 80, 182), g_lui.brAccent.get());
+    // progress bar
+    const float x0 = 84, x1 = W - 84, y = H * 0.5f - 20, hgt = 40;
+    D2D1_ROUNDED_RECT track = D2D1::RoundedRect(D2D1::RectF(x0, y, x1, y + hgt), 8, 8);
+    dc->FillRoundedRectangle(track, g_lui.brPanel.get());
+    float frac = g_dlProg.percent / 100.f; if (frac < 0) frac = 0; if (frac > 1) frac = 1;
+    if (frac > 0.001f) {
+        D2D1_ROUNDED_RECT fill = D2D1::RoundedRect(D2D1::RectF(x0, y, x0 + (x1 - x0) * frac, y + hgt), 8, 8);
+        dc->FillRoundedRectangle(fill, g_lui.brAccent.get());
+    }
+    wchar_t line[256];
+    swprintf(line, 256, L"%ls   %d%%   files %d/%d   %.1f MB",
+             g_dlProg.phase.c_str(), g_dlProg.percent, g_dlProg.fdone, g_dlProg.ftot,
+             g_dlProg.bytes / (1024.0 * 1024.0));
+    LuiText(line, g_lui.fmtSmall.get(), D2D1::RectF(x0, y + hgt + 16, x1, y + hgt + 60),
+            g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+    dc->EndDraw();
+}
+
+static void LauncherDlCallback(void*, const char* phase, int percent, int fdone, int ftot, unsigned long long bytes)
+{
+    g_dlProg.phase.assign(phase, phase + strlen(phase));
+    g_dlProg.percent = percent; g_dlProg.fdone = fdone; g_dlProg.ftot = ftot; g_dlProg.bytes = bytes;
+    if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+    LuiDrawProgress();
+    LuiPresent();
+}
+
+// Runs the download synchronously; returns true on success (game now in library).
+static bool LauncherRunDownload(const LauncherDlReq& req)
+{
+    g_dlProg = LauncherDlProg{};
+    g_dlProg.name.assign(req.name.begin(), req.name.end());
+    g_dlProg.phase = L"starting";
+    LuiDrawProgress(); LuiPresent();
+
+    // read an optional Steam token for owned games (never logged/echoed)
+    std::string token; uint64_t token_sid = 0;
+    std::wstring credp = std::wstring(kLocalState) + L"gh_cred.txt";
+    HANDLE hc = CreateFileW(credp.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (hc != INVALID_HANDLE_VALUE) {
+        DWORD sz = GetFileSize(hc, nullptr); std::string s(sz, 0); DWORD rd = 0;
+        ReadFile(hc, &s[0], sz, &rd, nullptr); CloseHandle(hc); s.resize(rd);
+        // gh_cred.txt format: "<steamid> <refresh_token>" (token stays in memory only)
+        size_t sp = s.find_first_of(" \t\r\n");
+        if (sp != std::string::npos) { token_sid = strtoull(s.substr(0, sp).c_str(), 0, 10);
+            size_t b = s.find_first_not_of(" \t\r\n", sp); if (b != std::string::npos) { token = s.substr(b); token.erase(token.find_last_not_of(" \t\r\n") + 1); } }
+    }
+
+    std::wstring outdir = std::wstring(kDevGames) + std::wstring(req.name.begin(), req.name.end());
+    int rc = ghdl::DownloadDepot(req.app, req.depot, req.manifest, outdir, req.branch,
+                                 token, token_sid, LauncherDlCallback, nullptr);
+    Diag("LAUNCHER download rc=" + std::to_string(rc) + " '" + req.name + "'");
+    if (rc == 0) {
+        // consume the request so it doesn't re-offer next boot
+        DeleteFileW((std::wstring(kLocalState) + L"gh_download.txt").c_str());
+        return true;
+    }
+    // leave the failure on screen briefly
+    for (int i = 0; i < 120; ++i) { LuiDrawProgress(); LuiPresent(); Sleep(16); }
+    return false;
+}
+
+// Download an OWNED library title straight from its appid (no pre-staged gh_download.txt):
+// reads the cached credential, resolves the app's depots via PICS, and runs the in-process
+// multi-depot downloader (ghdl::DownloadApp) into <LocalState>\game\<name>, drawing the same
+// live progress bar. Returns true once the game tree is written. The token stays in memory
+// and is scrubbed -- never logged.
+static bool LauncherRunAppDownload(uint32_t app, const std::wstring& name)
+{
+    uint64_t sid = 0; std::string token, account;
+    if (!LauncherReadCred(sid, token, account)) {
+        Diag("LAUNCHER app-download: no cached credential (sign in first)");
+        LuiDrawStatus(L"Sign in to Steam first to download."); LuiPresent();
+        for (int i = 0; i < 120; ++i) { LuiPresent(); Sleep(16); }
+        return false;
+    }
+    g_dlProg = LauncherDlProg{};
+    g_dlProg.name = name; g_dlProg.phase = L"starting";
+    LuiDrawProgress(); LuiPresent();
+
+    // One dest per appid. Reuse whatever folder already holds this steam_appid.txt
+    // (20XX, app_322110, ...) so A-to-repair cannot spawn a second incomplete slot.
+    std::wstring outdir = LuiInstallDir(app, name);
+
+    int rc = ghdl::DownloadApp(app, outdir, "public", token, sid, account, LauncherDlCallback, nullptr);
+    token.clear();                                   // scrub token
+    Diag("LAUNCHER app-download rc=" + std::to_string(rc) + " app=" + std::to_string(app));
+    if (rc == 0) return true;
+    for (int i = 0; i < 180; ++i) { LuiDrawProgress(); LuiPresent(); Sleep(16); }   // show error ~3s
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Post-guest crash / session-ended screen. The launcher stays up: A or B
+// dismisses back to the picker. D-pad scrolls the last Diag lines.
+// ---------------------------------------------------------------------------
+static void LauncherShowCrash(const std::wstring& title, const std::wstring& reason,
+                              const std::vector<std::string>& lines)
+{
+    if (!LuiInit()) return;
+    const float W = (float)g_lui.w, H = (float)g_lui.h;
+    const float lineH = 20.f, top = 220.f, bot = H - 80.f;
+    const int nfit = (int)((bot - top) / lineH);
+    int scroll = 0;
+    int n = (int)lines.size();
+    if (n > nfit) scroll = n - nfit;          // start at the tail (the crash)
+    WORD prev = 0xFFFF;
+    DWORD lastNav = 0;
+    auto widen = [](const std::string& s) {
+        std::wstring w; w.reserve(s.size());
+        for (unsigned char c : s) w.push_back((wchar_t)c);
+        return w;
+    };
+    for (;;) {
+        if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+        PollGamepadOnUi();
+        PollSyntheticPad();
+        WORD b, ly_hi = 0, ly_lo = 0;
+        { std::lock_guard<std::mutex> lk(g_padMutex);
+          b = g_padState.wButtons;
+          if (g_padState.sThumbLY >  16000) ly_hi = 1;
+          if (g_padState.sThumbLY < -16000) ly_lo = 1; }
+        DWORD now = GetTickCount();
+        bool navGate = (now - lastNav) > 120;
+        WORD synth = b;
+        if (ly_hi && navGate) synth |= XINPUT_GAMEPAD_DPAD_UP;
+        if (ly_lo && navGate) synth |= XINPUT_GAMEPAD_DPAD_DOWN;
+        WORD pressed = synth & ~prev;
+        prev = b;
+        if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) {
+            if (scroll > 0) { scroll--; lastNav = now; }
+        }
+        if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) {
+            int maxs = (n > nfit) ? n - nfit : 0;
+            if (scroll < maxs) { scroll++; lastNav = now; }
+        }
+        if (pressed & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B)) return;
+
+        auto* dc = g_lui.dc.get();
+        dc->BeginDraw();
+        dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
+        bool fail = (title.find(L"FAIL") != std::wstring::npos ||
+                     title.find(L"CRASH") != std::wstring::npos);
+        LuiText(title.c_str(), g_lui.fmtTitle.get(), D2D1::RectF(80, 36, W - 80, 120),
+                fail ? g_lui.brWarn.get() : g_lui.brFg.get());
+        LuiText(reason.c_str(), g_lui.fmtSmall.get(), D2D1::RectF(84, 124, W - 80, 172),
+                g_lui.brAccent.get());
+        LuiText(L"loader_diag.txt  (last lines)", g_lui.fmtSmall.get(),
+                D2D1::RectF(84, 176, W - 80, 212), g_lui.brDim.get());
+
+        g_lui.fmtLog->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        g_lui.fmtLog->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        int last = scroll + nfit;
+        if (last > n) last = n;
+        for (int i = scroll; i < last; ++i) {
+            float y = top + (float)(i - scroll) * lineH;
+            std::wstring w = widen(lines[i]);
+            dc->DrawText(w.c_str(), (UINT32)w.size(), g_lui.fmtLog.get(),
+                         D2D1::RectF(84, y, W - 80, y + lineH), g_lui.brFg.get());
+        }
+        if (n > nfit) {
+            wchar_t pos[40];
+            swprintf(pos, 40, L"%d–%d / %d", scroll + 1, last, n);
+            LuiText(pos, g_lui.fmtSmall.get(), D2D1::RectF(80, 176, W - 80, 212),
+                    g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
+        }
+        LuiText(L"A / B  Back to library      \u25B2 \u25BC  Scroll log",
+                g_lui.fmtSmall.get(), D2D1::RectF(84, H - 70, W - 80, H - 30), g_lui.brDim.get());
+        dc->EndDraw();
+        LuiPresent();
+        Sleep(16);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The picker loop. Runs on the UI thread. Returns the chosen guest string
+// (empty => launch the default guest). Falls through (returns empty) if the
+// bridge/D2D cannot init, so a bad UI never blocks launching.
+// ---------------------------------------------------------------------------
+static std::wstring LauncherPickGuest(const std::wstring& status)
+{
+    if (!g_gfx.ready) { try { BuildBridgeOnUi(); } catch (...) {} }
+    if (!LuiInit()) return L"";
+
+    std::vector<LauncherItem> items;
+    LauncherDlReq dlreq;
+    int sel = 0;
+    WORD prev = 0xFFFF;                 // ignore buttons already held on entry
+    DWORD lastNav = 0;
+
+    // (Re)build the item list: the installed/owned library plus any staged gh_download.txt
+    // request as the first item; never empty (an empty list would index items[sel] out of
+    // bounds) -- a non-launchable placeholder keeps the launcher open instead of running the
+    // default guest and exiting. Resets selection + the edge detector. Used at entry and
+    // after a download completes so the freshly-installed game appears.
+    auto rebuild = [&]() {
+        items = LuiEnumerate();
+        dlreq = LauncherReadDlReq();
+        if (dlreq.ok) {
+            LauncherItem it; it.display = L"⤓  Download: " + std::wstring(dlreq.name.begin(), dlreq.name.end());
+            it.guest = L"@@download"; it.sub = L"from Steam"; items.insert(items.begin(), it);
+        }
+        if (items.empty()) {
+            LauncherItem it; it.display = L"No games installed";
+            it.guest = L"@@none"; it.sub = L"download or add a game on USB"; items.push_back(it);
+        }
+        sel = 0; prev = 0xFFFF;
+    };
+    rebuild();
+    Diag("LAUNCHER picker items=" + std::to_string(items.size()));
+    for (;;) {
+        if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+        PollGamepadOnUi();
+        PollSyntheticPad();
+
+        WORD b, ly_hi = 0, ly_lo = 0;
+        { std::lock_guard<std::mutex> lk(g_padMutex);
+          b = g_padState.wButtons;
+          if (g_padState.sThumbLY >  16000) ly_hi = 1;
+          if (g_padState.sThumbLY < -16000) ly_lo = 1; }
+        // Treat left-stick as d-pad, with a simple repeat throttle.
+        WORD synth = b;
+        DWORD now = GetTickCount();
+        bool navGate = (now - lastNav) > 160;
+        if (ly_hi && navGate) synth |= XINPUT_GAMEPAD_DPAD_UP;
+        if (ly_lo && navGate) synth |= XINPUT_GAMEPAD_DPAD_DOWN;
+        WORD pressed = synth & ~prev;
+        prev = b;                       // edge off the raw buttons; stick uses navGate
+
+        if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) {
+            if (sel > 0) { sel--; lastNav = now; }
+        }
+        if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) {
+            if (sel < (int)items.size() - 1) { sel++; lastNav = now; }
+        }
+        if (pressed & XINPUT_GAMEPAD_A) {
+            const LauncherItem& it = items[sel];
+            Diag("LAUNCHER selected [" + std::to_string(sel) + "] '" + LuiNarrow(it.display) +
+                 "' guest='" + LuiNarrow(it.guest) + "' app=" + std::to_string(it.app));
+            if (it.guest == L"@@none") continue;      // placeholder -> stay in the picker
+            if (it.guest == L"@@lib") {
+                // Owned-but-not-installed title: resolve its depots via PICS and download it
+                // straight from the appid, then refresh so it shows as installed & launchable.
+                if (it.app) { LauncherRunAppDownload(it.app, it.display); rebuild(); }
+                continue;
+            }
+            if (it.guest == L"@@download") {
+                LauncherRunDownload(dlreq);           // pre-staged request; blocks with progress UI
+                rebuild();                            // refresh library (new game appears)
+                continue;
+            }
+            // Incomplete download (0-byte PE): repair instead of launching.
+            {
+                DWORD sz = LuiFileSize(it.guest);
+                if (sz < 64 && it.guest.size() >= 2 && it.guest[1] != L':')
+                    sz = LuiFileSize(std::wstring(kDevGames) + it.guest);
+                if (sz < 64 && it.guest.size() >= 2 && it.guest[1] != L':')
+                    sz = LuiFileSize(std::wstring(kLocalState) + L"game\\" + it.guest);
+                if (sz < 64) {
+                    Diag("LAUNCHER repair empty guest='" + LuiNarrow(it.guest) +
+                         "' app=" + std::to_string(it.app));
+                    if (it.app) { LauncherRunAppDownload(it.app, it.display); rebuild(); }
+                    continue;
+                }
+            }
+            return it.guest;
+        }
+
+        LuiDrawMenu(items, sel, status);
+        LuiPresent();
+        Sleep(16);
+    }
+}

@@ -1,0 +1,41 @@
+# generated toolchain (re-fetch with xwin)
+toolchain/xwin-sdk/
+toolchain/.xwin-cache/
+
+# build outputs / console pulls / packed MSIX
+artifacts/
+*.msix
+*.exe
+*.dll
+!corpus/shims/**
+!src/**/*.cpp
+gh_gp_harness.exe
+
+# fetched third-party binaries
+corpus/bin/
+corpus/downloads/
+
+# Microsoft MSIX packaging clone + Windows SDK bits (~600MB)
+toolchain/msix-packaging-src/
+toolchain/sdk-buildtools/
+
+# NEVER commit these
+toolchain/signing/*.pfx
+toolchain/signing/*.key
+toolchain/winvm/*ed25519
+!toolchain/winvm/*.pub
+
+# Steam / session leftovers
+**/gh_cred.txt
+**/steamclient64.dll
+**/tier0_s64.dll
+**/vstdlib_s64.dll
+
+# editor / build junk
+*.obj
+*.pdb
+*.ilk
+__pycache__/
+*.pyc
+.venv/
+.grok/
