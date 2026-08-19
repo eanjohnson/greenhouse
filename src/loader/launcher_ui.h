@@ -40,7 +40,9 @@ struct LauncherGfx {
     com_ptr<IDWriteFactory>       dw;
     com_ptr<IDWriteTextFormat>    fmtTitle, fmtItem, fmtSmall, fmtLog;
     com_ptr<ID3D11Texture2D>      uiTex;      // R8G8B8A8_UNORM target D2D draws into
-    com_ptr<ID3D11Texture2D>      ovlSnap[2]; // stable copies for guest-thread blit (ping-pong)
+    com_ptr<ID3D11Texture2D>      ovlSnap[2]; // unused leftover; blit uses baked panels
+    com_ptr<ID3D11Texture2D>      ovlPanelOn; // pre-rasterized overlay (remap ON)
+    com_ptr<ID3D11Texture2D>      ovlPanelOff;
     com_ptr<ID2D1Bitmap1>         uiTarget;   // D2D target wrapping uiTex
     com_ptr<ID2D1SolidColorBrush> brFg, brDim, brBg, brSel, brAccent, brPanel, brWarn;
     com_ptr<ID2D1SolidColorBrush> brWhite, brBlack;   // pure B/W for QR scanner contrast
@@ -88,6 +90,8 @@ static std::wstring LuiDecode(const std::vector<uint8_t>& b)
     for (size_t i = off; i < b.size(); ++i) w.push_back((wchar_t)(unsigned char)b[i]);
     return w;
 }
+
+static void OverlayBakePanels(); // defined with the overlay; called from LuiInit
 
 // ---------------------------------------------------------------------------
 // One-time D2D device + target-bitmap + fonts + brushes.
@@ -163,7 +167,9 @@ static bool LuiInit()
     mkbr(0x000000, 1.f, g_lui.brBlack);
 
     g_lui.ready = true;
-    Diag("LAUNCHER LuiInit OK " + std::to_string(g_lui.w) + "x" + std::to_string(g_lui.h));
+    OverlayBakePanels();
+    Diag("LAUNCHER LuiInit OK " + std::to_string(g_lui.w) + "x" + std::to_string(g_lui.h) +
+         (g_lui.ovlPanelOn && g_lui.ovlPanelOff ? " ovl-baked" : " ovl-bake-FAIL"));
     return true;
 }
 
@@ -971,101 +977,121 @@ static void OverlayTick()
 {
     static bool wasOpen = false;
     if (!g_overlayOpen || !g_guestRunning) { wasOpen = false; return; }
-    if (!wasOpen) { g_ovlPrev = 0xFFFF; g_ovlDirty = true; }
-    wasOpen = true;
     WORD b, ly_hi = 0, ly_lo = 0;
     { std::lock_guard<std::mutex> lk(g_padMutex);
       b = g_padState.wButtons;
       if (g_padState.sThumbLY >  16000) ly_hi = 1;
       if (g_padState.sThumbLY < -16000) ly_lo = 1; }
+    if (!wasOpen) {
+        g_ovlPrev = b;          // ignore buttons already held (the chord)
+        g_ovlDirty = true;
+    }
+    wasOpen = true;
     DWORD now = GetTickCount();
     bool navGate = (now - g_ovlLastNav) > 160;
-    WORD synth = b;
-    if (ly_hi && navGate) synth |= XINPUT_GAMEPAD_DPAD_UP;
-    if (ly_lo && navGate) synth |= XINPUT_GAMEPAD_DPAD_DOWN;
-    WORD pressed = synth & ~g_ovlPrev;
+    WORD pressed = (WORD)(b & ~g_ovlPrev);
     g_ovlPrev = b;
-    if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) {
-        g_ovlSel = 0; g_ovlLastNav = now;
-    }
-    if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) {
-        g_ovlSel = 0; g_ovlLastNav = now;
-    }
+    if (ly_hi && navGate) { g_ovlSel = 0; g_ovlLastNav = now; }
+    if (ly_lo && navGate) { g_ovlSel = 0; g_ovlLastNav = now; }
     if (pressed & XINPUT_GAMEPAD_A) {
         OverlaySetRemap(!g_kmRemapOn);
     }
     if (pressed & XINPUT_GAMEPAD_B) {
         g_overlayOpen = false;
+        g_overlayDrawn = false;
         Diag("OVERLAY close (B)");
         return;
     }
-    if (g_ovlDirty) OverlayDraw();
+    // Redraw every tick while open. A one-shot snap goes blank on the second
+    // open (D2D target vs guest Present); continuous draw keeps glyphs.
+    OverlayDraw();
+}
+
+// Rasterize one overlay panel into its own texture. Runs at LuiInit, before
+// Unity exists — live D2D DrawText during a guest Present never keeps glyphs.
+static void OverlayPaintPanel(bool remapOn)
+{
+    auto* dc = g_lui.dc.get();
+    const float W = kOvlW, H = kOvlH;
+    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    dc->BeginDraw();
+    dc->Clear(D2D1::ColorF(0x161B22, 1.f));
+    dc->FillRectangle(D2D1::RectF(0, 0, W, 6.f), g_lui.brAccent.get());
+    dc->FillRectangle(D2D1::RectF(0, 0, 3.f, H), g_lui.brAccent.get());
+    dc->FillRectangle(D2D1::RectF(W - 3.f, 0, W, H), g_lui.brAccent.get());
+    dc->FillRectangle(D2D1::RectF(0, H - 3.f, W, H), g_lui.brAccent.get());
+    LuiText(L"GREENHOUSE", g_lui.fmtTitle.get(),
+            D2D1::RectF(36, 16, W - 36, 96), g_lui.brFg.get());
+    LuiText(L"Start + Select to close", g_lui.fmtSmall.get(),
+            D2D1::RectF(40, 96, W - 40, 136), g_lui.brDim.get());
+    D2D1_RECT_F row = D2D1::RectF(28, 176, W - 28, 256);
+    dc->FillRectangle(row, g_lui.brSel.get());
+    LuiText(L"Controller as mouse", g_lui.fmtItem.get(),
+            D2D1::RectF(48, 176, W - 200, 256), g_lui.brFg.get());
+    LuiText(remapOn ? L"ON" : L"OFF", g_lui.fmtItem.get(),
+            D2D1::RectF(W - 200, 176, W - 48, 256),
+            remapOn ? g_lui.brAccent.get() : g_lui.brDim.get(),
+            DWRITE_TEXT_ALIGNMENT_TRAILING);
+    LuiText(L"A  Toggle      B  Close      Right stick moves cursor when ON",
+            g_lui.fmtSmall.get(),
+            D2D1::RectF(40, H - 64, W - 40, H - 20), g_lui.brDim.get());
+    dc->EndDraw();
+    dc->Flush();
+    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+}
+
+static bool OverlayBakeOne(bool remapOn, com_ptr<ID3D11Texture2D>& out)
+{
+    out = nullptr;
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = (UINT)kOvlW; td.Height = (UINT)kOvlH; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    HRESULT hr = g_gfx.d11->CreateTexture2D(&td, nullptr, out.put());
+    if (FAILED(hr) || !out) return false;
+    com_ptr<IDXGISurface> surf;
+    hr = out->QueryInterface(__uuidof(IDXGISurface), surf.put_void());
+    if (FAILED(hr)) { out = nullptr; return false; }
+    D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        D2D1::PixelFormat(DXGI_FORMAT_R8G8B8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    com_ptr<ID2D1Bitmap1> bmp;
+    hr = g_lui.dc->CreateBitmapFromDxgiSurface(surf.get(), &bp, bmp.put());
+    if (FAILED(hr) || !bmp) { out = nullptr; return false; }
+    g_lui.dc->SetTarget(bmp.get());
+    OverlayPaintPanel(remapOn);
+    g_lui.dc->SetTarget(g_lui.uiTarget.get());
+    return true;
+}
+
+static void OverlayBakePanels()
+{
+    if (!g_lui.dc || !g_gfx.d11) return;
+    bool on = OverlayBakeOne(true, g_lui.ovlPanelOn);
+    bool off = OverlayBakeOne(false, g_lui.ovlPanelOff);
+    Diag(std::string("OVERLAY bake on=") + (on ? "ok" : "FAIL") + " off=" + (off ? "ok" : "FAIL"));
 }
 
 static void OverlayDraw()
 {
-    if (!g_overlayOpen || !LuiInit()) return;
-    auto* dc = g_lui.dc.get();
-    const float W = (float)g_lui.w, H = (float)g_lui.h;
-    const float px = (W - kOvlW) * 0.5f, py = (H - kOvlH) * 0.5f;
-    dc->BeginDraw();
-    dc->Clear(D2D1::ColorF(0, 0.f));
-    D2D1_RECT_F panel = D2D1::RectF(px, py, px + kOvlW, py + kOvlH);
-    dc->FillRectangle(panel, g_lui.brPanel.get());
-    // 2px accent bar at the top of the panel
-    dc->FillRectangle(D2D1::RectF(px, py, px + kOvlW, py + 6.f), g_lui.brAccent.get());
-    LuiText(L"GREENHOUSE", g_lui.fmtTitle.get(),
-            D2D1::RectF(px + 36, py + 20, px + kOvlW - 36, py + 100), g_lui.brFg.get());
-    LuiText(L"Start + Select to close", g_lui.fmtSmall.get(),
-            D2D1::RectF(px + 40, py + 100, px + kOvlW - 40, py + 140), g_lui.brDim.get());
-
-    float ry = py + 180;
-    D2D1_RECT_F row = D2D1::RectF(px + 28, ry, px + kOvlW - 28, ry + 80);
-    dc->FillRectangle(row, g_lui.brSel.get());
-    LuiText(L"Controller as mouse", g_lui.fmtItem.get(),
-            D2D1::RectF(px + 48, ry, px + kOvlW - 200, ry + 80), g_lui.brFg.get());
-    LuiText(g_kmRemapOn ? L"ON" : L"OFF", g_lui.fmtItem.get(),
-            D2D1::RectF(px + kOvlW - 200, ry, px + kOvlW - 48, ry + 80),
-            g_kmRemapOn ? g_lui.brAccent.get() : g_lui.brDim.get(),
-            DWRITE_TEXT_ALIGNMENT_TRAILING);
-    LuiText(L"A  Toggle      B  Close      Right stick moves cursor when ON",
-            g_lui.fmtSmall.get(),
-            D2D1::RectF(px + 40, py + kOvlH - 64, px + kOvlW - 40, py + kOvlH - 24),
-            g_lui.brDim.get());
-    HRESULT hr = dc->EndDraw();
-    if (FAILED(hr)) { Diag("OVERLAY EndDraw hr=" + Hex((uint32_t)hr)); return; }
-    dc->Flush();
-    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
-    OverlayEnsureSnap();
-    int w = 1 - (int)g_ovlRead;
-    if (w < 0 || w > 1) w = 0;
-    if (g_lui.ovlSnap[w] && g_lui.uiTex) {
-        g_gfx.d11ctx->CopyResource(g_lui.ovlSnap[w].get(), g_lui.uiTex.get());
-        g_gfx.d11ctx->Flush();
-        InterlockedExchange(&g_ovlRead, w);
-    }
+    // Panels are pre-baked; just mark ready so Present will blit.
+    if (!g_overlayOpen) return;
+    if (g_lui.ovlPanelOn && g_lui.ovlPanelOff) g_overlayDrawn = true;
     g_ovlDirty = false;
-    g_overlayDrawn = true;
 }
 
 static void OverlayBlit(ID3D11Resource* dst)
 {
-    // Guest-thread present: copy a finished snap only. Never touch uiTex (D2D target).
-    if (!g_overlayOpen || !g_overlayDrawn || !dst || !g_gfx.ready) return;
-    int r = (int)g_ovlRead;
-    if (r < 0 || r > 1 || !g_lui.ovlSnap[r]) return;
-    const float W = (float)g_lui.w, H = (float)g_lui.h;
-    int px = (int)((W - kOvlW) * 0.5f), py = (int)((H - kOvlH) * 0.5f);
-    int pw = (int)kOvlW, ph = (int)kOvlH;
-    if (px < 0) px = 0; if (py < 0) py = 0;
-    if (px + pw > (int)g_gfx.rtW) pw = (int)g_gfx.rtW - px;
-    if (py + ph > (int)g_gfx.rtH) ph = (int)g_gfx.rtH - py;
-    if (pw <= 0 || ph <= 0) return;
-    D3D11_BOX box{};
-    box.left = (UINT)px; box.top = (UINT)py; box.front = 0;
-    box.right = (UINT)(px + pw); box.bottom = (UINT)(py + ph); box.back = 1;
-    g_gfx.d11ctx->CopySubresourceRegion(dst, 0, (UINT)px, (UINT)py, 0,
-                                        g_lui.ovlSnap[r].get(), 0, &box);
+    if (!g_overlayOpen || !dst || !g_gfx.ready) return;
+    ID3D11Texture2D* src = (g_kmRemapOn ? g_lui.ovlPanelOn : g_lui.ovlPanelOff).get();
+    if (!src) return;
+    int px = ((int)g_gfx.rtW - (int)kOvlW) / 2;
+    int py = ((int)g_gfx.rtH - (int)kOvlH) / 2;
+    if (px < 0) px = 0;
+    if (py < 0) py = 0;
+    g_gfx.d11ctx->CopySubresourceRegion(dst, 0, (UINT)px, (UINT)py, 0, src, 0, nullptr);
+    g_overlayDrawn = true;
 }
 
 // ---------------------------------------------------------------------------

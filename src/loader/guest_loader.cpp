@@ -1465,6 +1465,10 @@ struct Gfx
     bool                            cursorInit = false;
 };
 static Gfx g_gfx;
+// D3D11 immediate context is not thread-safe. Guest Present and the overlay
+// D2D draw both use g_gfx.d11ctx; serialize them or the overlay snap loses
+// glyphs (rectangles commit, DrawText does not).
+static std::mutex g_d11Mutex;
 static CoreDispatcher g_dispatcher{ nullptr };   // set on the UI thread in App::Run
 
 // Runs ON THE UI THREAD (via the dispatcher). Builds the whole bridge against the
@@ -1674,22 +1678,26 @@ static HRESULT GfxPresent(UINT sync)
         g_gfx.d11ctx->ClearRenderTargetView(g_gfx.guestRTV.get(), magenta);
     }
 #endif
-    ID3D11Resource* cur[] = { g_gfx.wrapped[g_gfx.cur].get() };
-    if (g_gfx.guestRT)
-        g_gfx.d11ctx->CopyResource(cur[0], g_gfx.guestRT.get());
+    HRESULT hr;
+    {
+        std::lock_guard<std::mutex> lk(g_d11Mutex);
+        ID3D11Resource* cur[] = { g_gfx.wrapped[g_gfx.cur].get() };
+        if (g_gfx.guestRT)
+            g_gfx.d11ctx->CopyResource(cur[0], g_gfx.guestRT.get());
 #ifdef GH_LAUNCHER
-    // In-game overlay sits on the guest frame (not the D2D-only picker). Blit a
-    // panel region; do not CopyResource the whole uiTex (that would wipe the game).
-    OverlayBlit(cur[0]);
+        // In-game overlay sits on the guest frame (not the D2D-only picker). Blit a
+        // panel region; do not CopyResource the whole uiTex (that would wipe the game).
+        OverlayBlit(cur[0]);
 #endif
-    // Composite the software mouse cursor on top of the guest frame, while the
-    // wrapped back buffer is still acquired/writable (before ReleaseWrappedResources).
-    EnsureCursorTextures();
-    DrawCursorOverlay(cur[0]);
-    g_gfx.on12->ReleaseWrappedResources(cur, 1);
-    g_gfx.d11ctx->Flush();
+        // Composite the software mouse cursor on top of the guest frame, while the
+        // wrapped back buffer is still acquired/writable (before ReleaseWrappedResources).
+        EnsureCursorTextures();
+        DrawCursorOverlay(cur[0]);
+        g_gfx.on12->ReleaseWrappedResources(cur, 1);
+        g_gfx.d11ctx->Flush();
+    }
 
-    HRESULT hr = g_gfx.swap->Present(sync, 0);
+    hr = g_gfx.swap->Present(sync, 0);
 
     // Throttled diagnostic: confirm Unity is actually driving frames through our
     // proxy. Log the first present and then every 300th (~5 s at 60 Hz).
@@ -1698,9 +1706,12 @@ static HRESULT GfxPresent(UINT sync)
         Diag("GfxPresent n=" + std::to_string(s_present_n) + " hr=" + Hex(hr));
     ++s_present_n;
 
-    g_gfx.cur = g_gfx.swap->GetCurrentBackBufferIndex();
-    ID3D11Resource* next[] = { g_gfx.wrapped[g_gfx.cur].get() };
-    g_gfx.on12->AcquireWrappedResources(next, 1);
+    {
+        std::lock_guard<std::mutex> lk(g_d11Mutex);
+        g_gfx.cur = g_gfx.swap->GetCurrentBackBufferIndex();
+        ID3D11Resource* next[] = { g_gfx.wrapped[g_gfx.cur].get() };
+        g_gfx.on12->AcquireWrappedResources(next, 1);
+    }
     return hr;
 }
 
@@ -2392,6 +2403,91 @@ static DWORD             g_padPacket = 0;
 static bool              g_wgiDead = false;      // WGI threw once; stop trying
 static bool              g_padLogged = false;
 
+// Lethal Company / Unity Input System reads Windows.Gaming.Input directly,
+// not XInputGetState. Zeroing the XInput bed does not hide the pad from the
+// game. Patch IGamepad::GetCurrentReading (inspectable + 2) so the game sees
+// a quiet pad while the overlay is open. PollGamepadOnUi always calls the
+// original so the overlay itself still sees Start/A/B.
+struct GhWgiPadReading {
+    uint64_t Timestamp;
+    uint32_t Buttons;
+    double LeftTrigger, RightTrigger;
+    double LeftThumbstickX, LeftThumbstickY;
+    double RightThumbstickX, RightThumbstickY;
+};
+struct GhWgiNavReading { uint64_t Timestamp; uint32_t RequiredButtons, OptionalButtons; };
+typedef HRESULT (STDMETHODCALLTYPE *GhWgiPadReadFn)(void*, GhWgiPadReading*);
+typedef HRESULT (STDMETHODCALLTYPE *GhWgiNavReadFn)(void*, GhWgiNavReading*);
+static GhWgiPadReadFn g_realWgiPadRead = nullptr;
+static GhWgiNavReadFn g_realWgiNavRead = nullptr;
+static void* g_wgiPadAbi = nullptr;
+
+static bool GhPatchVtblSlot(void* obj, int slot, void* hook, void** origOut)
+{
+    if (!obj || !hook || !origOut) return false;
+    void** vt = *(void***)obj;
+    if (!vt) return false;
+    DWORD old = 0;
+    if (!VirtualProtect(&vt[slot], sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) return false;
+    if (!*origOut) *origOut = vt[slot];
+    vt[slot] = hook;
+    VirtualProtect(&vt[slot], sizeof(void*), old, &old);
+    return *origOut != nullptr;
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_WgiPadRead(void* self, GhWgiPadReading* out)
+{
+    HRESULT hr = g_realWgiPadRead ? g_realWgiPadRead(self, out) : E_FAIL;
+    if (FAILED(hr) || !out) return hr;
+#ifdef GH_LAUNCHER
+    if (g_overlayOpen) {
+        uint64_t ts = out->Timestamp;
+        memset(out, 0, sizeof(*out));
+        out->Timestamp = ts;
+    }
+#endif
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE Hook_WgiNavRead(void* self, GhWgiNavReading* out)
+{
+    HRESULT hr = g_realWgiNavRead ? g_realWgiNavRead(self, out) : E_FAIL;
+    if (FAILED(hr) || !out) return hr;
+#ifdef GH_LAUNCHER
+    if (g_overlayOpen) {
+        uint64_t ts = out->Timestamp;
+        memset(out, 0, sizeof(*out));
+        out->Timestamp = ts;
+    }
+#endif
+    return hr;
+}
+
+static void GhInstallWgiSwallow()
+{
+    if (g_realWgiPadRead) return;
+    try {
+        auto pads = WGI::Gamepad::Gamepads();
+        if (pads.Size() == 0) return;
+        auto pad = pads.GetAt(0);
+        void* abi = winrt::get_abi(pad);
+        if (!abi) return;
+        // IInspectable = 6 slots; IGamepad: 6 get_Vibration, 7 put, 8 GetCurrentReading.
+        if (GhPatchVtblSlot(abi, 8, (void*)&Hook_WgiPadRead, (void**)&g_realWgiPadRead)) {
+            g_wgiPadAbi = abi;
+            Diag("OVERLAY WGI Gamepad.GetCurrentReading hooked");
+        }
+        auto navs = WGI::UINavigationController::UINavigationControllers();
+        if (navs.Size() > 0) {
+            void* nabi = winrt::get_abi(navs.GetAt(0));
+            void* norig = nullptr;
+            if (nabi && GhPatchVtblSlot(nabi, 6, (void*)&Hook_WgiNavRead, &norig)) {
+                g_realWgiNavRead = (GhWgiNavReadFn)norig;
+                Diag("OVERLAY WGI UINavigation.GetCurrentReading hooked");
+            }
+        }
+    } catch (...) {}
+}
+
 static void PollGamepadOnUi()
 {
     if (g_wgiDead) return;
@@ -2400,8 +2496,23 @@ static void PollGamepadOnUi()
         bool connected = pads.Size() > 0;
         XINPUT_GAMEPAD g{};
         if (connected){
-            auto r = pads.GetAt(0).GetCurrentReading();
-            const uint32_t bb = (uint32_t)r.Buttons;
+            GhInstallWgiSwallow();
+            uint32_t bb = 0;
+            double lt = 0, rt = 0, lx = 0, ly = 0, rx = 0, ry = 0;
+            auto pad = pads.GetAt(0);
+            void* abi = g_wgiPadAbi ? g_wgiPadAbi : winrt::get_abi(pad);
+            GhWgiPadReading raw{};
+            if (g_realWgiPadRead && abi && SUCCEEDED(g_realWgiPadRead(abi, &raw))) {
+                bb = raw.Buttons; lt = raw.LeftTrigger; rt = raw.RightTrigger;
+                lx = raw.LeftThumbstickX; ly = raw.LeftThumbstickY;
+                rx = raw.RightThumbstickX; ry = raw.RightThumbstickY;
+            } else {
+                auto r = pad.GetCurrentReading();
+                bb = (uint32_t)r.Buttons;
+                lt = r.LeftTrigger; rt = r.RightTrigger;
+                lx = r.LeftThumbstickX; ly = r.LeftThumbstickY;
+                rx = r.RightThumbstickX; ry = r.RightThumbstickY;
+            }
             auto has = [&](uint32_t f){ return (bb & f) != 0; };
             WORD w = 0;
             if (has(0x1))    w |= XINPUT_GAMEPAD_START;
@@ -2419,12 +2530,12 @@ static void PollGamepadOnUi()
             if (has(0x1000)) w |= XINPUT_GAMEPAD_LEFT_THUMB;
             if (has(0x2000)) w |= XINPUT_GAMEPAD_RIGHT_THUMB;
             g.wButtons      = w;
-            g.bLeftTrigger  = (BYTE)std::lround(r.LeftTrigger  * 255.0);
-            g.bRightTrigger = (BYTE)std::lround(r.RightTrigger * 255.0);
-            g.sThumbLX = StickToShort(r.LeftThumbstickX);
-            g.sThumbLY = StickToShort(r.LeftThumbstickY);
-            g.sThumbRX = StickToShort(r.RightThumbstickX);
-            g.sThumbRY = StickToShort(r.RightThumbstickY);
+            g.bLeftTrigger  = (BYTE)std::lround(lt * 255.0);
+            g.bRightTrigger = (BYTE)std::lround(rt * 255.0);
+            g.sThumbLX = StickToShort(lx);
+            g.sThumbLY = StickToShort(ly);
+            g.sThumbRX = StickToShort(rx);
+            g.sThumbRY = StickToShort(ry);
         }
         {
             std::lock_guard<std::mutex> lk(g_padMutex);
