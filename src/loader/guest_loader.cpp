@@ -30,6 +30,7 @@
 #include <winrt/Windows.UI.Input.h>        // PointerPoint / properties (real mouse forwarding)
 #include <winrt/Windows.Devices.Input.h>   // MouseDevice relative delta (mouse-look)
 #include <windows.h>
+#include <tlhelp32.h>
 #include <winternl.h>
 #include <d3d11on12.h>
 #include <d3d12.h>
@@ -369,6 +370,9 @@ static std::wstring CanonToWin(const std::wstring& canon)
 static std::wstring g_installDir;   // set in RunGuest: package install root
 static std::wstring g_guestDir;     // set in RunGuest: the guest's own directory
 static std::wstring g_guestDataDir; // set in RunGuest: the Unity _Data folder
+#ifdef GH_LAUNCHER
+static std::wstring g_lastGameDir;  // last launched game dir (survives ResetGuestForRelaunch)
+#endif
 static bool StartsWithNoCase(const std::wstring& s, const std::wstring& pre)
 {
     if (pre.empty() || s.size() < pre.size()) return false;
@@ -1655,6 +1659,8 @@ static void EnsureCursorTextures()
 static void DrawCursorOverlay(ID3D11Resource* dst);
 #ifdef GH_LAUNCHER
 static void OverlayBlit(ID3D11Resource* dst);   // launcher_ui.h, after LuiInit
+static volatile bool g_overlayQuitNow = false;  // set by OverlayTick; Bed_exit after mutex unlock
+static volatile bool g_guestSessionLive = false; // leftover Unity Present must no-op after quit
 #endif
 
 // Present one frame from the guest's point of view: it has rendered into the
@@ -1664,6 +1670,9 @@ static void OverlayBlit(ID3D11Resource* dst);   // launcher_ui.h, after LuiInit
 static HRESULT GfxPresent(UINT sync)
 {
     if (!g_gfx.ready) return DXGI_ERROR_DEVICE_REMOVED;
+#ifdef GH_LAUNCHER
+    if (!g_guestSessionLive) return S_OK;
+#endif
     // The guest rendered into the stable guestRT. Copy it into the live physical
     // back buffer (currently acquired), then release+flush+present. This makes
     // the guest's single cached render target land on whichever flip buffer is
@@ -1696,6 +1705,15 @@ static HRESULT GfxPresent(UINT sync)
         g_gfx.on12->ReleaseWrappedResources(cur, 1);
         g_gfx.d11ctx->Flush();
     }
+#ifdef GH_LAUNCHER
+    // OverlayBlit used to Bed_exit while this lock_guard was held; ExitThread
+    // skips the destructor and leaves g_d11Mutex locked for the next launch.
+    if (g_overlayQuitNow) {
+        g_overlayQuitNow = false;
+        Diag("OVERLAY quit: Bed_exit after Present unlock");
+        Bed_exit(0);
+    }
+#endif
 
     hr = g_gfx.swap->Present(sync, 0);
 
@@ -2067,6 +2085,10 @@ static volatile bool     g_overlayOpen  = false;
 static volatile bool     g_overlayDrawn = false;  // UI thread has painted uiTex this open
 static volatile bool     g_kmRemapOn    = false;
 static volatile bool     g_guestRunning = false;
+static volatile bool     g_guestUserQuit  = false;  // skip SESSION ENDED splash
+static volatile bool     g_ovlConfirm     = false;  // quit "Are you sure?" panel
+static DWORD             g_uiThreadId     = 0;      // App::Run — never TerminateThread this
+static std::vector<DWORD> g_hostThreadSnap;         // threads that existed before this guest
 #endif
 static LONG              g_kmRelX = 0, g_kmRelY = 0; // accumulated raw delta (mouse-look, phase 2)
 static int               g_kmPrevButtons = 0;        // bit0 L, bit1 R, bit2 M (edge detection)
@@ -2715,7 +2737,10 @@ static void OverlayPollChord()
     prev = b;
     if (now && !was) {
         g_overlayOpen = !g_overlayOpen;
-        if (!g_overlayOpen) g_overlayDrawn = false;
+        if (!g_overlayOpen) {
+            g_overlayDrawn = false;
+            g_ovlConfirm = false;
+        }
         Diag(g_overlayOpen ? "OVERLAY open (Start+Back)" : "OVERLAY close (Start+Back)");
     }
 }
@@ -3616,8 +3641,298 @@ static bool CallGuestEntry(int (*fn)(), int* rcOut)
     }
 }
 
+// Manually-mapped guest PE. Left mapped after overlay-quit Bed_exit, so the
+// next launch cannot take the preferred ImageBase (Lethal Company = 0x140000000)
+// and the relocated CRT hits STATUS_BREAKPOINT (0x80000003).
+static uint8_t*          g_guestImageBase = nullptr;
+static DWORD             g_guestImageSize = 0;
+static PRUNTIME_FUNCTION g_guestFnTable   = nullptr;
+
+static BOOL SafeVirtualFree(void* p)
+{
+    BOOL ok = FALSE;
+    __try { ok = VirtualFree(p, 0, MEM_RELEASE); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { ok = FALSE; }
+    return ok;
+}
+
+#ifdef GH_LAUNCHER
+static void SnapshotHostThreads()
+{
+    g_hostThreadSnap.clear();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        Diag("STAGE=host_thread_snap fail err=" + Hex(GetLastError()));
+        return;
+    }
+    THREADENTRY32 te{}; te.dwSize = sizeof(te);
+    DWORD pid = GetCurrentProcessId();
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID == pid)
+                g_hostThreadSnap.push_back(te.th32ThreadID);
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    Diag("STAGE=host_thread_snap n=" + std::to_string(g_hostThreadSnap.size()));
+}
+
+static bool IsSnapshottedHostThread(DWORD tid)
+{
+    for (DWORD t : g_hostThreadSnap) if (t == tid) return true;
+    return false;
+}
+
+static bool KeepGuestModuleName(const wchar_t* path)
+{
+    if (!path) return true;
+    const wchar_t* base = path;
+    for (const wchar_t* p = path; *p; ++p)
+        if (*p == L'\\' || *p == L'/') base = p + 1;
+    static const wchar_t* kKeep[] = {
+        L"steam_api64.dll", L"steamclient64.dll", L"tier0_s64.dll", L"vstdlib_s64.dll",
+        L"ghwmm.dll", L"opengl32.dll", nullptr
+    };
+    for (int i = 0; kKeep[i]; ++i)
+        if (_wcsicmp(base, kKeep[i]) == 0) return true;
+    return false;
+}
+
+// In-memory LDR entry (x64). winternl.h's LDR_DATA_TABLE_ENTRY omits BaseDllName.
+struct GhLdrEntry {
+    LIST_ENTRY InLoadOrder;
+    LIST_ENTRY InMemoryOrder;
+    LIST_ENTRY InInitOrder;
+    void* DllBase;
+    void* EntryPoint;
+    DWORD SizeOfImage;
+    DWORD pad;
+    UNICODE_STRING FullDllName;
+    UNICODE_STRING BaseDllName;
+};
+
+static bool PathIsLastGame(const std::wstring& p)
+{
+    return !g_lastGameDir.empty() && StartsWithNoCase(p, g_lastGameDir);
+}
+
+struct GhModRange { uintptr_t lo, hi; };
+static std::vector<GhModRange> g_lastGameRanges;
+
+static void CollectLastGameRanges()
+{
+    g_lastGameRanges.clear();
+    BYTE* teb = (BYTE*)NtCurrentTeb();
+    BYTE* peb = *(BYTE**)(teb + 0x60);
+    if (!peb) return;
+    BYTE* ldr = *(BYTE**)(peb + 0x18);
+    if (!ldr) return;
+    auto* head = (LIST_ENTRY*)(ldr + 0x10);   // InLoadOrderModuleList
+    int n = 0;
+    for (LIST_ENTRY* e = head->Flink; e && e != head && n < 512; e = e->Flink, ++n) {
+        auto* ent = CONTAINING_RECORD(e, GhLdrEntry, InLoadOrder);
+        if (!ent->DllBase || !ent->FullDllName.Buffer || !ent->FullDllName.Length) continue;
+        std::wstring p(ent->FullDllName.Buffer, ent->FullDllName.Length / sizeof(wchar_t));
+        if (!PathIsLastGame(p) || KeepGuestModuleName(p.c_str())) continue;
+        g_lastGameRanges.push_back({ (uintptr_t)ent->DllBase,
+                                     (uintptr_t)ent->DllBase + ent->SizeOfImage });
+    }
+    Diag("STAGE=guest_mod_ranges n=" + std::to_string(g_lastGameRanges.size()));
+}
+
+static bool PtrInLastGame(uintptr_t p)
+{
+    for (const auto& r : g_lastGameRanges)
+        if (p >= r.lo && p < r.hi) return true;
+    return false;
+}
+
+static bool ReadTebStack(void* teb, uintptr_t* baseOut, uintptr_t* limitOut)
+{
+    uintptr_t b = 0, l = 0;
+    __try {
+        b = *(uintptr_t*)((BYTE*)teb + 0x08);
+        l = *(uintptr_t*)((BYTE*)teb + 0x10);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    *baseOut = b; *limitOut = l;
+    return true;
+}
+static bool StackWord(uintptr_t addr, uintptr_t* out)
+{
+    uintptr_t v = 0;
+    __try { v = *(uintptr_t*)addr; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    *out = v;
+    return true;
+}
+
+static bool ThreadTouchesLastGame(HANDLE h)
+{
+    typedef LONG (WINAPI *NtQIT)(HANDLE, int, void*, ULONG, ULONG*);
+    static NtQIT ntqit = nullptr;
+    if (!ntqit) {
+        HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+        ntqit = ntdll ? (NtQIT)GetProcAddress(ntdll, "NtQueryInformationThread") : nullptr;
+    }
+    if (ntqit) {
+        void* start = nullptr;
+        if (ntqit(h, 9 /*ThreadQuerySetWin32StartAddress*/, &start, sizeof(start), nullptr) == 0
+            && start && PtrInLastGame((uintptr_t)start))
+            return true;
+        struct { LONG ExitStatus; void* Teb; } tbi{};
+        if (ntqit(h, 0 /*ThreadBasicInformation*/, &tbi, sizeof(tbi), nullptr) == 0 && tbi.Teb) {
+            uintptr_t stackBase = 0, stackLimit = 0;
+            if (ReadTebStack(tbi.Teb, &stackBase, &stackLimit)
+                && stackBase > stackLimit && (stackBase - stackLimit) < 0x400000) {
+                for (uintptr_t s = stackLimit; s + sizeof(uintptr_t) <= stackBase; s += sizeof(uintptr_t)) {
+                    uintptr_t v = 0;
+                    if (!StackWord(s, &v)) break;
+                    if (PtrInLastGame(v)) return true;
+                }
+            }
+        }
+    }
+    CONTEXT ctx{}; ctx.ContextFlags = CONTEXT_CONTROL;
+    if (GetThreadContext(h, &ctx) && PtrInLastGame((uintptr_t)ctx.Rip))
+        return true;
+    return false;
+}
+
+// Freeze leftover Unity/Mono threads. Do NOT TerminateThread — that deadlocked
+// 0.0.56 (from Present) and 0.0.57 (from the UI handoff).
+static void SuspendLeftoverGuestThreads()
+{
+    if (g_hostThreadSnap.empty() || g_lastGameRanges.empty()) {
+        Diag("STAGE=guest_threads_suspend skipped");
+        return;
+    }
+    DWORD self = GetCurrentThreadId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        Diag("STAGE=guest_threads_suspend snap fail err=" + Hex(GetLastError()));
+        return;
+    }
+    THREADENTRY32 te{}; te.dwSize = sizeof(te);
+    DWORD pid = GetCurrentProcessId();
+    int froze = 0, skipped = 0;
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != pid) continue;
+            if (te.th32ThreadID == self) { ++skipped; continue; }
+            if (g_uiThreadId && te.th32ThreadID == g_uiThreadId) { ++skipped; continue; }
+            if (IsSnapshottedHostThread(te.th32ThreadID)) { ++skipped; continue; }
+            HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT,
+                                  FALSE, te.th32ThreadID);
+            if (!h) continue;
+            if (SuspendThread(h) == (DWORD)-1) { CloseHandle(h); continue; }
+            if (!ThreadTouchesLastGame(h)) { ResumeThread(h); ++skipped; CloseHandle(h); continue; }
+            ++froze;
+            CloseHandle(h);
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    Diag("STAGE=guest_threads_suspended n=" + std::to_string(froze) +
+         " skipped=" + std::to_string(skipped));
+}
+
+static void MangleDllUstr(UNICODE_STRING* us)
+{
+    if (!us || !us->Buffer || us->Length < 8) return;
+    wchar_t* b = us->Buffer;
+    int n = (int)(us->Length / sizeof(wchar_t));
+    if (n >= 4 && b[n-4]==L'.' && (b[n-3]==L'd'||b[n-3]==L'D')
+        && (b[n-2]==L'l'||b[n-2]==L'L') && (b[n-1]==L'l'||b[n-1]==L'L')) {
+        DWORD old = 0;
+        VirtualProtect(b, us->Length, PAGE_READWRITE, &old);
+        b[n-3] = L'o'; b[n-2] = L'l'; b[n-1] = L'd';
+        if (old) VirtualProtect(b, us->Length, old, &old);
+    }
+}
+
+// Rename leftover Unity/Mono LDR entries so the next LoadLibrary("UnityPlayer.dll")
+// maps a fresh copy. FreeLibrary of a live UnityPlayer deadlocks in DllMain.
+static void HideLastGameModules()
+{
+    if (g_lastGameDir.empty()) {
+        Diag("STAGE=guest_modules_hide skipped (no game dir)");
+        return;
+    }
+    BYTE* teb = (BYTE*)NtCurrentTeb();
+    BYTE* peb = *(BYTE**)(teb + 0x60);
+    if (!peb) return;
+    BYTE* ldr = *(BYTE**)(peb + 0x18);
+    if (!ldr) return;
+    auto* head = (LIST_ENTRY*)(ldr + 0x10);
+    int hid = 0, n = 0;
+    for (LIST_ENTRY* e = head->Flink; e && e != head && n < 512; e = e->Flink, ++n) {
+        auto* ent = CONTAINING_RECORD(e, GhLdrEntry, InLoadOrder);
+        if (!ent->FullDllName.Buffer || !ent->FullDllName.Length) continue;
+        std::wstring p(ent->FullDllName.Buffer, ent->FullDllName.Length / sizeof(wchar_t));
+        if (!PathIsLastGame(p) || KeepGuestModuleName(p.c_str())) continue;
+        MangleDllUstr(&ent->FullDllName);
+        MangleDllUstr(&ent->BaseDllName);
+        ++hid;
+        Diag("STAGE=guest_module_hidden " + std::string(p.begin(), p.end()));
+    }
+    Diag("STAGE=guest_modules_hidden n=" + std::to_string(hid));
+}
+
+// After overlay-quit: stop leftover Unity touching D3D, freeze its threads, hide
+// its modules. Never TerminateThread / FreeLibrary — both freeze this process.
+static void NeutralizePreviousGuest()
+{
+    g_guestSessionLive = false;
+    Diag("STAGE=guest_neutralize_begin");
+    CollectLastGameRanges();
+    SuspendLeftoverGuestThreads();
+    HideLastGameModules();
+    Diag("STAGE=guest_neutralized");
+}
+#endif
+
+static void UnmapGuestImage()
+{
+    if (g_guestFnTable) {
+        RtlDeleteFunctionTable(g_guestFnTable);
+        g_guestFnTable = nullptr;
+    }
+    if (g_guestImageBase) {
+        uint64_t was = (uint64_t)g_guestImageBase;
+        BOOL ok = SafeVirtualFree(g_guestImageBase);
+        Diag(std::string("STAGE=guest_image_freed base=") + Hex(was) +
+             " size=" + Hex(g_guestImageSize) + (ok ? " ok" : " fail"));
+        g_guestImageBase = nullptr;
+        g_guestImageSize = 0;
+    }
+}
+
+#ifdef GH_LAUNCHER
+// Safe on the guest/Present thread: only drop the mapped exe so the next
+// launch can take ImageBase 0x140000000. Do NOT kill threads or FreeLibrary
+// UnityPlayer here — that deadlocks (loader lock + we are still on Unity's
+// Present stack). Heavy flush runs on the UI thread before the next spawn.
+static void FlushGuestImageOnly()
+{
+    g_guestSessionLive = false;
+    Diag("STAGE=guest_flush_image");
+    UnmapGuestImage();
+    g_tlsActive = false;
+    g_tlsTemplate = nullptr;
+    g_tlsRawSize = 0;
+    g_tlsTotalSize = 0;
+    g_tlsCallbacks = 0;
+    g_tlsMainThreadSaved = nullptr;
+}
+#endif
+
 static bool MapAndRun(const std::vector<uint8_t>& file)
 {
+#ifdef GH_LAUNCHER
+    if (g_guestImageBase) {
+        Diag("STAGE=guest_image_stale — freeing leftover before remap");
+        FlushGuestImageOnly();
+    }
+#endif
     auto* dos = (IMAGE_DOS_HEADER*)file.data();
     if (dos->e_magic != IMAGE_DOS_SIGNATURE){
         Diag("bad DOS sig");
@@ -3646,7 +3961,10 @@ static bool MapAndRun(const std::vector<uint8_t>& file)
     uint8_t* base = (uint8_t*)VirtualAlloc((void*)preferred, imageSize, MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
     if (!base) base = (uint8_t*)VirtualAlloc(nullptr, imageSize, MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
     if (!base){ Diag("VirtualAlloc image fail err=" + Hex(GetLastError())); return false; }
-    Diag("STAGE=image_alloc base=" + Hex((uint64_t)base) + " size=" + Hex(imageSize));
+    g_guestImageBase = base;
+    g_guestImageSize = imageSize;
+    Diag("STAGE=image_alloc base=" + Hex((uint64_t)base) + " size=" + Hex(imageSize) +
+         ((uint64_t)base == preferred ? " preferred" : " RELOCATED"));
 
     // Copy headers.
     std::memcpy(base, file.data(), nt->OptionalHeader.SizeOfHeaders);
@@ -3734,9 +4052,10 @@ static bool MapAndRun(const std::vector<uint8_t>& file)
     if (excDir.Size){
         PRUNTIME_FUNCTION rf = (PRUNTIME_FUNCTION)(base + excDir.VirtualAddress);
         DWORD n = excDir.Size / sizeof(RUNTIME_FUNCTION);
-        if (RtlAddFunctionTable(rf, n, (DWORD64)base))
+        if (RtlAddFunctionTable(rf, n, (DWORD64)base)) {
+            g_guestFnTable = rf;
             Diag("STAGE=seh_registered count=" + std::to_string(n));
-        else
+        } else
             Diag("WARN: RtlAddFunctionTable failed");
     }
 
@@ -4408,6 +4727,9 @@ static void FinishGuestSession()
     RestorePebCommandLine();
     RestoreCrtArgv();
     RestoreThreadTls(g_tlsMainThreadSaved);
+#ifdef GH_LAUNCHER
+    FlushGuestImageOnly();
+#endif
 
     Diag("EXITCODE=" + std::to_string(g_guestExitCode));
     Diag("CAPTURED_BYTES=" + std::to_string(g_capturedOut.size()));
@@ -4827,6 +5149,9 @@ static void RunGuest()
     {   // guest\ -- where a guest's own shipped DLLs live
         size_t slash = gp.find_last_of(L"\\/");
         if (slash != std::wstring::npos) g_guestDir = gp.substr(0, slash + 1);
+#ifdef GH_LAUNCHER
+        g_lastGameDir = g_guestDir;
+#endif
         // Derive the Unity data folder: <guestDir>\<exeBase>_Data\ . Games open
         // their data files by bare name expecting this to be the working dir;
         // MapToReal read-through resolves bare names against it.
@@ -5172,9 +5497,15 @@ static void ResetGuestForRelaunch()
     g_capturedOut.clear();
     g_overlayOpen = false;
     g_overlayDrawn = false;
+    g_overlayQuitNow = false;
+    g_guestUserQuit = false;
+    g_ovlConfirm = false;
     g_guestRunning = false;
     g_launcherSelectedApp = 0;
     InterlockedExchange(&g_vehLogged, 0);
+#ifdef GH_LAUNCHER
+    if (g_guestImageBase) FlushGuestImageOnly();
+#endif
     if (!g_launcherPkgGuest.empty()) g_guestDir = g_launcherPkgGuest;
 }
 #endif
@@ -5198,6 +5529,9 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
     void Run()
     {
         Diag("STAGE=app_activated");
+#ifdef GH_LAUNCHER
+        g_uiThreadId = GetCurrentThreadId();
+#endif
         CoreWindow window = CoreWindow::GetForCurrentThread();
         window.Activate();
         // On Xbox the gamepad B button raises a system BackRequested event; left
@@ -5300,6 +5634,7 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
             } else Diag("LAUNCHER steam shim not staged — skipping on-screen login");
         }
         OverlayLoadRemap();
+        SnapshotHostThreads();
         g_guestStarted = true;
         for (;;) {
             ResetGuestForRelaunch();
@@ -5313,6 +5648,8 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
             }
             g_launcherSelectedGuest = picked;
             Diag("LAUNCHER handoff guest='" + std::string(g_launcherSelectedGuest.begin(), g_launcherSelectedGuest.end()) + "'");
+            SnapshotHostThreads();
+            g_guestSessionLive = true;
             g_guestRunning = true;
             std::thread([]{
                 g_guestWorkerTid = GetCurrentThreadId();
@@ -5331,6 +5668,30 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
             }
             g_guestRunning = false;
             g_overlayOpen = false;
+            NeutralizePreviousGuest();
+            if (g_guestUserQuit) {
+                // Unity's allocator is process-global ("Memory manager is already
+                // initialized!" on the 0.0.58 relaunch). TerminateThread/FreeLibrary
+                // deadlock; a second UnityPlayer still trips that assert. Restart the
+                // host so the picker comes back in a clean process (Steam login is
+                // cached in LocalState).
+                Diag("STAGE=guest_done user_quit requesting_host_restart");
+                try {
+                    CoreApplication::RequestRestartAsync(L"");
+                } catch (...) {
+                    Diag("STAGE=restart_threw — staying on picker");
+                    ResetGuestForRelaunch();
+                    continue;
+                }
+                DWORD t0 = GetTickCount();
+                while (GetTickCount() - t0 < 8000) {
+                    window.Dispatcher().ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+                    Sleep(50);
+                }
+                Diag("STAGE=restart_timeout — staying on picker");
+                ResetGuestForRelaunch();
+                continue;
+            }
             Diag("STAGE=guest_done code=" + std::to_string(g_guestExitCode) +
                  (g_guestCrashed ? " crashed" : "") +
                  (g_guestFailWhy.empty() ? "" : (" why=" + g_guestFailWhy)));
