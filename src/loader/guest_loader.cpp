@@ -441,6 +441,14 @@ static std::wstring MapToReal(const wchar_t* guestPath)
             }
             return p;
         }
+        // D: is the Dev Mode DevelopmentFiles volume (games, gh_saves). It is a
+        // real writable drive. Do not dump D:\... into LocalState\vfs\D\ — ES3's
+        // "/LCGeneralSaveData" becomes D:\LCGeneralSaveData, File.Move looks at
+        // that real path, and a VFS copy is invisible to it.
+        if (p.size() >= 2) {
+            wchar_t d = (p[0] >= L'a' && p[0] <= L'z') ? (wchar_t)(p[0] - 32) : p[0];
+            if (d == L'D' && p[1] == L':') return p;
+        }
     }
     // Read-through the game's install payload. A game (Unity especially) opens
     // its data files -- boot.config, app.info, globalgamemanagers, level0,
@@ -497,9 +505,12 @@ static void VfsTrace(const char* api, const wchar_t* g, const std::wstring& r){
     Diag(std::string("VFS ")+api+" "+gg+" -> "+rr);
 }
 
+static std::wstring RedirectDriveRootSave(const std::wstring& raw); // defined with the file hooks
 static HANDLE WINAPI Bed_CreateFileW(LPCWSTR name, DWORD acc, DWORD share, LPSECURITY_ATTRIBUTES sa,
                                      DWORD disp, DWORD flags, HANDLE tmpl){
-    std::wstring real = MapToReal(name);
+    std::wstring mapped = name ? RedirectDriveRootSave(name) : L"";
+    const wchar_t* use = mapped.empty() ? name : mapped.c_str();
+    std::wstring real = MapToReal(use);
     if (disp==CREATE_ALWAYS||disp==CREATE_NEW||disp==OPEN_ALWAYS) EnsureParentOf(real);
     HANDLE h = CreateFileW(real.c_str(), acc, share, sa, disp, flags, tmpl);
     VfsTrace("CreateFileW", name, real);
@@ -541,7 +552,7 @@ static CreateFileW_t g_realCreateFileW = nullptr;   // trampoline to the untouch
 static bool IsGuestDriveRootFile(const std::wstring& p){
     if (p.size() < 4) return false;
     wchar_t d = (p[0]>=L'a'&&p[0]<=L'z') ? (wchar_t)(p[0]-32) : p[0];
-    if (d!=L'S' && d!=L'U' && d!=L'E' && d!=L'T') return false;
+    if (d!=L'S' && d!=L'U' && d!=L'E' && d!=L'T' && d!=L'Z' && d!=L'Y' && d!=L'G' && d!=L'H') return false;
     if (p[1]!=L':' || (p[2]!=L'\\' && p[2]!=L'/')) return false;
     std::wstring rest = p.substr(3);
     if (rest.empty()) return false;
@@ -577,6 +588,19 @@ static std::wstring RedirectDriveRootSave(const std::wstring& raw)
     std::wstring dos = GhNormDosPath(raw);
     std::wstring leaf = GhPathLeaf(dos);
     if (leaf.empty()) return L"";
+    // D: is the writable DevelopmentFiles volume. ES3's GetFullPath("/LCGeneralSaveData")
+    // becomes D:\LCGeneralSaveData. Remapping that leaf (or a leftover vfs\D\
+    // rewrite of it) into gamedata made Create and File.Move disagree. Leave D:
+    // and vfs\D\ alone so both APIs use the same real file.
+    if (dos.size() >= 2) {
+        wchar_t d = (dos[0] >= L'a' && dos[0] <= L'z') ? (wchar_t)(dos[0] - 32) : dos[0];
+        if (d == L'D' && dos[1] == L':') return L"";
+    }
+    {
+        std::wstring low = dos;
+        for (auto& c : low) if (c >= L'A' && c <= L'Z') c = (wchar_t)(c + 32);
+        if (low.find(L"\\vfs\\d\\") != std::wstring::npos) return L"";
+    }
     bool hit = IsEs3SaveLeaf(leaf) || IsGuestDriveRootFile(dos);
     if (!hit) return L"";
     return std::wstring(kLocalState) + L"gamedata\\" + leaf;
@@ -679,6 +703,16 @@ static void InstallOneHook(const char* fn, void* hook, void** trampOut){
         Diag(std::string("HOOK ") + fn + " installed @ " + Hex((uint64_t)p));
     else
         Diag(std::string("HOOK ") + fn + ": install FAILED (prologue) @ " + Hex((uint64_t)p));
+    // kernel32 sometimes has its own stub (not a forwarder). Hook it too if
+    // the address differs so P/Invokes bound to kernel32 still hit us.
+    if (HMODULE k = GetModuleHandleW(L"kernel32.dll")) {
+        void* p2 = (void*)GetProcAddress(k, fn);
+        if (p2 && p2 != p) {
+            void* ignore = nullptr;
+            if (InstallInlineHook(p2, hook, &ignore))
+                Diag(std::string("HOOK ") + fn + " kernel32 @ " + Hex((uint64_t)p2));
+        }
+    }
 }
 // NtCreateFile -- the ntdll syscall stub every higher-level open funnels through.
 // Mono's managed FileStream reaches it directly (bypassing CreateFileW/CreateFile2),
@@ -726,6 +760,33 @@ static LONG NTAPI Hook_NtCreateFile(PHANDLE fh, ACCESS_MASK acc, GH_OBJECT_ATTRI
     }
     return g_realNtCreateFile(fh,acc,oa,iosb,alloc,fattr,share,disp,opts,ea,ealen);
 }
+typedef LONG (NTAPI* NtOpenFile_t)(PHANDLE, ACCESS_MASK, GH_OBJECT_ATTRIBUTES*, PVOID, ULONG, ULONG);
+static NtOpenFile_t g_realNtOpenFile = nullptr;
+static LONG NTAPI Hook_NtOpenFile(PHANDLE fh, ACCESS_MASK acc, GH_OBJECT_ATTRIBUTES* oa,
+                                  PVOID iosb, ULONG share, ULONG opts){
+    if (oa && oa->ObjectName && oa->ObjectName->Buffer && oa->ObjectName->Length){
+        std::wstring nt(oa->ObjectName->Buffer, oa->ObjectName->Length/2);
+        std::wstring dos = GhNormDosPath(nt);
+        { static int dn=0; if (dn<40 && (dos.find(L"LCGeneral")!=std::wstring::npos || dos.find(L"SaveData")!=std::wstring::npos)){ ++dn; Diag("HOOK NtOF saw " + std::string(dos.begin(),dos.end())); } }
+        std::wstring real;
+        if (!oa->RootDirectory) real = RedirectDriveRootSave(dos);
+        else if (IsEs3SaveLeaf(GhPathLeaf(dos)))
+            real = std::wstring(kLocalState) + L"gamedata\\" + GhPathLeaf(dos);
+        if (!real.empty()){
+            EnsureParentOf(real);
+            std::wstring ntNew = L"\\??\\" + real;
+            GH_UNICODE_STRING us; us.Buffer=(PWSTR)ntNew.c_str();
+            us.Length=(USHORT)(ntNew.size()*2); us.MaximumLength=(USHORT)(us.Length+2);
+            GH_UNICODE_STRING* saved = oa->ObjectName;
+            HANDLE savedRoot = oa->RootDirectory;
+            oa->ObjectName = &us; oa->RootDirectory = nullptr;
+            LONG r = g_realNtOpenFile(fh,acc,oa,iosb,share,opts);
+            oa->ObjectName = saved; oa->RootDirectory = savedRoot;
+            return r;
+        }
+    }
+    return g_realNtOpenFile(fh,acc,oa,iosb,share,opts);
+}
 typedef BOOL (WINAPI* MoveFileExW_t)(LPCWSTR, LPCWSTR, DWORD);
 static MoveFileExW_t g_realMoveFileExW = nullptr;
 static BOOL WINAPI Hook_MoveFileExW(LPCWSTR a, LPCWSTR b, DWORD flags)
@@ -766,6 +827,11 @@ static void InstallFileHooks(){
             Diag("HOOK NtCreateFile installed @ " + Hex((uint64_t)p));
         else
             Diag("HOOK NtCreateFile: install FAILED (prologue) @ " + Hex((uint64_t)p));
+        void* po = GetProcAddress(nt, "NtOpenFile");
+        if (po && InstallInlineHook(po, (void*)&Hook_NtOpenFile, (void**)&g_realNtOpenFile))
+            Diag("HOOK NtOpenFile installed @ " + Hex((uint64_t)po));
+        else
+            Diag("HOOK NtOpenFile: install FAILED");
     }
     InstallOneHook("MoveFileExW", (void*)&Hook_MoveFileExW, (void**)&g_realMoveFileExW);
     InstallOneHook("DeleteFileW", (void*)&Hook_DeleteFileW, (void**)&g_realDeleteFileW);
@@ -4698,15 +4764,42 @@ static void RunGuest()
         // letter whose ROOT is the writable LocalState\gamedata folder and make it the
         // process cwd, so the game's drive-root writes land in a real writable place.
         std::wstring tgt = L"\\??\\" + savedir;
-        if (!tgt.empty() && tgt.back() == L'\\') tgt.pop_back();   // raw target: no trailing slash
-        BOOL dd = DefineDosDeviceW(DDD_RAW_TARGET_PATH, L"T:", tgt.c_str());
-        Diag(std::string("DOSDEV T: -> gamedata ") + (dd ? "ok" : ("FAIL err=" + Hex(GetLastError()))));
+        if (!tgt.empty() && tgt.back() == L'\\') tgt.pop_back();
+        // T: is ACCESS_DENIED on this container. Try other letters until one
+        // maps; ES3's "/LCGeneralSaveData" becomes "<letter>:\\LCGeneralSaveData"
+        // and must land in this folder.
+        std::wstring mapped;
+        for (const wchar_t* letter : { L"Z:", L"Y:", L"G:", L"H:", L"P:", L"T:" }) {
+            SetLastError(0);
+            DefineDosDeviceW(DDD_REMOVE_DEFINITION, letter, nullptr);
+            BOOL dd = DefineDosDeviceW(DDD_RAW_TARGET_PATH, letter, tgt.c_str());
+            Diag(std::string("DOSDEV ") + std::string(letter, letter+2) + " -> gamedata " +
+                 (dd ? "ok" : ("FAIL err=" + Hex(GetLastError()))));
+            if (dd) { mapped = std::wstring(letter) + L"\\"; break; }
+        }
         wchar_t oldcwd[MAX_PATH]; DWORD on = GetCurrentDirectoryW(MAX_PATH, oldcwd);
         std::wstring ow(oldcwd, (on && on < MAX_PATH) ? on : 0);
-        std::wstring newcwd = dd ? std::wstring(L"T:\\") : savedir;
+        std::wstring newcwd = !mapped.empty() ? mapped : savedir;
+        // Last resort: D: DevelopmentFiles is writable. "/LCGeneralSaveData"
+        // then becomes D:\LCGeneralSaveData — still a root, but often allowed.
+        if (mapped.empty()) {
+            std::wstring dsave = L"D:\\DevelopmentFiles\\gh_saves\\";
+            EnsureRealDir(dsave);
+            newcwd = dsave;
+        }
         BOOL sc = SetCurrentDirectoryW(newcwd.c_str());
         Diag("CWD real old=[" + std::string(ow.begin(), ow.end()) + "] -> [" +
              std::string(newcwd.begin(), newcwd.end()) + "]" + (sc ? " ok" : " FAIL"));
+        // Prove the drive-root write that ES3 will attempt (mapped letter, or D:\).
+        {
+            std::wstring probe = !mapped.empty() ? (mapped + L"LCGeneralSaveData.probe")
+                                                 : L"D:\\LCGeneralSaveData.probe";
+            HANDLE ph = CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+            Diag(std::string("SAVEPROBE ") + std::string(probe.begin(), probe.end()) +
+                 (ph != INVALID_HANDLE_VALUE ? " ok" : (" FAIL err=" + Hex(GetLastError()))));
+            if (ph != INVALID_HANDLE_VALUE) { CloseHandle(ph); DeleteFileW(probe.c_str()); }
+        }
     }
     // Inline-hook the real CreateFileW export so Mono's MANAGED FileStream P/Invoke
     // (which binds the real export, bypassing our IAT/GPA beds) routes drive-root
@@ -4758,6 +4851,9 @@ static void RunGuest()
                  Hex((uintptr_t)already));
             PatchModuleForGuest(already, "steam_api64.dll");
             Diag("STAGE=preload_steam_api64_ok");
+            // Do not GhRebindAppContext here. SetAppID + Advertise before Unity
+            // exists delivered engine callbacks onto the guest thread during
+            // PreInit and aborted UnityMain (0xE06D7363). SteamAPI_Init rebinds.
         } else if (!g_guestDataDir.empty()){
             std::wstring st = FindGuestSupportDll(L"steam_api64.dll");
             if (st.empty()) st = g_guestDataDir + L"Plugins\\x86_64\\steam_api64.dll";

@@ -8,7 +8,7 @@
   <Identity
     Name="Greenhouse.Launcher"
     Publisher="CN=Greenhouse"
-    Version="0.0.46.0"
+    Version="0.0.51.0"
     ProcessorArchitecture="x64" />
 
   <mp:PhoneIdentity PhoneProductId="c2d8e531-7e4b-4a29-8c3d-6b5f1e4a7d22" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>

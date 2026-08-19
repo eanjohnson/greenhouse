@@ -6,6 +6,7 @@ EXPORTS
     GhBringUpEngineNow
     GhLoginDone
     GhLoginSteamID
+    GhRebindAppContext
     GhStartQrLoginAsync
     SteamAPI_CheckCallbackRegistered_t=steam_stub
     SteamAPI_GetHSteamPipe

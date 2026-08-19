@@ -834,6 +834,27 @@ extern "C" __declspec(dllexport) void GhStartQrLoginAsync() {
 extern "C" __declspec(dllexport) unsigned long long GhLoginSteamID() { return (unsigned long long)g_gh_real_steamid; }
 extern "C" __declspec(dllexport) int GhLoginDone() { return (int)g_gh_login_done; }
 
+// Loader calls this after stamping SteamAppId for the picked guest. Launcher
+// QR login left the pipe on Cheese (3809440); lobbies/invites are app-scoped
+// and must match the running title (1966720 for Lethal Company).
+extern "C" __declspec(dllexport) int GhRebindAppContext() {
+    uint32_t want = gh_target_appid();
+    gh_logf("[gh-shim] GhRebindAppContext want=%u engine=%p state=%d real_steamid=%llu",
+            (unsigned)want, (void*)g_gh_engine, g_gh_engine_state,
+            (unsigned long long)g_gh_real_steamid);
+    if (!g_gh_engine || !g_gh_engine_dll) {
+        gh_log("[gh-shim] GhRebindAppContext: engine not up yet");
+        return 0;
+    }
+    bool ok = gh_fix_app_context(g_gh_engine_dll);
+    // Do not AdvertiseGame here. That runs before Unity/Mono exists and the
+    // engine then delivers app-scoped callbacks onto the guest thread during
+    // PreInit, which showed up as an unhandled C++ exception (0xE06D7363).
+    // SteamAPI_Init's engine thread advertises once the game is actually up.
+    gh_logf("[gh-shim] GhRebindAppContext -> %d (advertise deferred)", (int)ok);
+    return ok ? 1 : 0;
+}
+
 // Self-test: create a real Steam lobby via the engine's IClientMatchmaking and
 // pump callbacks looking for LobbyCreated_t (callback id 513: {EResult m_eResult;
 // uint64 m_ulSteamIDLobby}). Proves a session on Valve's servers end-to-end.
@@ -1138,6 +1159,10 @@ __declspec(dllexport) bool SteamAPI_Init() {
     // DIAG (2026-08-03): log EVERY entry, even when the lazy guard short-circuits.
     gh_logf("[gh-shim] SteamAPI_Init ENTER lazy=%ld state=%d", g_gh_lazy_once, g_gh_engine_state);
     gh_engine_lazy_init();
+    // Guest start may already have rebound the pipe; do it again here so a
+    // late SteamAppId stamp (Facepunch sets the env immediately before Init)
+    // still wins over the Cheese fallback from launcher login.
+    if (g_gh_engine && g_gh_engine_dll) gh_fix_app_context(g_gh_engine_dll);
     return true;
 }
 
@@ -1155,6 +1180,7 @@ __declspec(dllexport) ESteamAPIInitResult SteamInternal_SteamAPI_Init(
     gh_logf("[gh-diag] SteamInternal_SteamAPI_Init called (versions=%.120s) -> OK",
             pchInternalCheckInterfaceVersions ? pchInternalCheckInterfaceVersions : "(null)");
     gh_engine_lazy_init();
+    if (g_gh_engine && g_gh_engine_dll) gh_fix_app_context(g_gh_engine_dll);
     return k_ESteamAPIInitResult_OK;
 }
 
