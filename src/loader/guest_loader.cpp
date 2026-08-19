@@ -80,6 +80,7 @@ static const wchar_t* kDevGames = L"D:\\DevelopmentFiles\\gh_games\\";
 // the SelectGuest seam (overrides ghguest.txt). Declared here so it precedes both
 // RunGuest and the launcher_ui.h include in App::Run.
 static std::wstring g_launcherSelectedGuest;
+static uint32_t     g_launcherSelectedApp = 0;   // Steam appid of the picked row
 #endif
 
 // ---------------------------------------------------------------------------
@@ -546,15 +547,47 @@ static bool IsGuestDriveRootFile(const std::wstring& p){
     if (rest.empty()) return false;
     return rest.find(L'\\')==std::wstring::npos && rest.find(L'/')==std::wstring::npos;
 }
+
+// Strip \\?\ / \??\ and flip slashes so hook matchers see a DOS path.
+static std::wstring GhNormDosPath(std::wstring p)
+{
+    if (p.rfind(L"\\\\?\\", 0) == 0) p = p.substr(4);
+    if (p.rfind(L"\\??\\", 0) == 0) p = p.substr(4);
+    for (auto& c : p) if (c == L'/') c = L'\\';
+    return p;
+}
+static std::wstring GhPathLeaf(const std::wstring& p)
+{
+    size_t s = p.find_last_of(L"\\/");
+    return (s == std::wstring::npos) ? p : p.substr(s + 1);
+}
+// Easy Save 3 (Lethal Company) and any U: drive-root single-component file.
+// T: (DefineDosDevice) is denied in this container (err=0x5); land these in
+// LocalState\gamedata instead of the real U:\ root.
+static bool IsEs3SaveLeaf(const std::wstring& leaf)
+{
+    if (leaf.empty()) return false;
+    std::wstring l = leaf;
+    for (auto& c : l) c = (wchar_t)towlower(c);
+    return l.find(L"lcgeneral") != std::wstring::npos ||
+           l.find(L"savedata") != std::wstring::npos;
+}
+static std::wstring RedirectDriveRootSave(const std::wstring& raw)
+{
+    std::wstring dos = GhNormDosPath(raw);
+    std::wstring leaf = GhPathLeaf(dos);
+    if (leaf.empty()) return L"";
+    bool hit = IsEs3SaveLeaf(leaf) || IsGuestDriveRootFile(dos);
+    if (!hit) return L"";
+    return std::wstring(kLocalState) + L"gamedata\\" + leaf;
+}
 static HANDLE WINAPI Hook_CreateFileW(LPCWSTR name, DWORD acc, DWORD share, LPSECURITY_ATTRIBUTES sa,
                                       DWORD disp, DWORD flags, HANDLE tmpl){
     if (name){
         std::wstring p(name);
-        // [diag] confirm the hook executes + surface any LCGeneral/save-ish path,
-        // whatever its shape, so we learn which API the managed write really uses.
-        { static int dn=0; if (dn<40 && (p.find(L"LCGeneral")!=std::wstring::npos || p.find(L"SaveData")!=std::wstring::npos || p.find(L".tmp")!=std::wstring::npos)){ ++dn; Diag("HOOK CFW saw " + std::string(p.begin(),p.end())); } }
-        if (IsGuestDriveRootFile(p)){
-            std::wstring real = MapToReal(name);      // -> ...\LocalState\vfs\<drive>\<file>
+        { static int dn=0; if (dn<80 && (p.find(L"LCGeneral")!=std::wstring::npos || p.find(L"SaveData")!=std::wstring::npos)){ ++dn; Diag("HOOK CFW saw " + std::string(p.begin(),p.end())); } }
+        std::wstring real = RedirectDriveRootSave(p);
+        if (!real.empty()){
             if (disp==CREATE_ALWAYS||disp==CREATE_NEW||disp==OPEN_ALWAYS||disp==TRUNCATE_EXISTING)
                 EnsureParentOf(real);
             static int n=0; if(++n<=20) Diag("HOOK CreateFileW drive-root " + std::string(p.begin(),p.end()) +
@@ -627,9 +660,9 @@ static CreateFile2_t g_realCreateFile2 = nullptr;
 static HANDLE WINAPI Hook_CreateFile2(LPCWSTR name, DWORD acc, DWORD share, DWORD disp, LPCREATEFILE2_EXTENDED_PARAMETERS ex){
     if (name){
         std::wstring p(name);
-        { static int dn=0; if (dn<40 && (p.find(L"LCGeneral")!=std::wstring::npos || p.find(L"SaveData")!=std::wstring::npos || p.find(L".tmp")!=std::wstring::npos)){ ++dn; Diag("HOOK CF2 saw " + std::string(p.begin(),p.end())); } }
-        if (IsGuestDriveRootFile(p)){
-            std::wstring real = MapToReal(name);
+        { static int dn=0; if (dn<80 && (p.find(L"LCGeneral")!=std::wstring::npos || p.find(L"SaveData")!=std::wstring::npos)){ ++dn; Diag("HOOK CF2 saw " + std::string(p.begin(),p.end())); } }
+        std::wstring real = RedirectDriveRootSave(p);
+        if (!real.empty()){
             if (disp==CREATE_ALWAYS||disp==CREATE_NEW||disp==OPEN_ALWAYS||disp==TRUNCATE_EXISTING) EnsureParentOf(real);
             static int n=0; if(++n<=20) Diag("HOOK CreateFile2 drive-root " + std::string(p.begin(),p.end()) + " -> " + std::string(real.begin(),real.end()));
             return g_realCreateFile2(real.c_str(), acc, share, disp, ex);
@@ -664,30 +697,62 @@ static NtCreateFile_t g_realNtCreateFile = nullptr;
 static LONG NTAPI Hook_NtCreateFile(PHANDLE fh, ACCESS_MASK acc, GH_OBJECT_ATTRIBUTES* oa, PVOID iosb,
                                     PLARGE_INTEGER alloc, ULONG fattr, ULONG share, ULONG disp,
                                     ULONG opts, PVOID ea, ULONG ealen){
-    if (oa && oa->RootDirectory==nullptr && oa->ObjectName && oa->ObjectName->Buffer && oa->ObjectName->Length){
+    if (oa && oa->ObjectName && oa->ObjectName->Buffer && oa->ObjectName->Length){
         std::wstring nt(oa->ObjectName->Buffer, oa->ObjectName->Length/2);
-        std::wstring dos = nt;
-        if (dos.rfind(L"\\??\\",0)==0 || dos.rfind(L"\\\\?\\",0)==0) dos = dos.substr(4);
-        // [diag] confirm the hook executes + reveal the NT path format: log the first
-        // batch of opens unconditionally, plus any save-ish path.
-        { static int dn=0; if (dn<30){ ++dn; Diag("HOOK NtCF path[" + std::to_string(dn) + "] " + std::string(nt.begin(),nt.end())); } }
-        { static int dn=0; if (dn<40 && (dos.find(L"LCGeneral")!=std::wstring::npos || dos.find(L"SaveData")!=std::wstring::npos)){ ++dn; Diag("HOOK NtCF saw " + std::string(dos.begin(),dos.end())); } }
-        if (IsGuestDriveRootFile(dos)){
-            std::wstring real = MapToReal(dos.c_str());
+        std::wstring dos = GhNormDosPath(nt);
+        { static int dn=0; if (dn<80 && (dos.find(L"LCGeneral")!=std::wstring::npos || dos.find(L"SaveData")!=std::wstring::npos)){ ++dn; Diag("HOOK NtCF saw " + std::string(dos.begin(),dos.end()) + (oa->RootDirectory? " (rel)" : "")); } }
+        // Absolute drive-root / ES3 name, or a relative open (RootDirectory set)
+        // of an ES3 leaf — Mono FileStream often does the latter against U:\.
+        std::wstring real;
+        if (!oa->RootDirectory)
+            real = RedirectDriveRootSave(dos);
+        else if (IsEs3SaveLeaf(GhPathLeaf(dos)))
+            real = std::wstring(kLocalState) + L"gamedata\\" + GhPathLeaf(dos);
+        if (!real.empty()){
             EnsureParentOf(real);
             std::wstring ntNew = L"\\??\\" + real;
             GH_UNICODE_STRING us; us.Buffer=(PWSTR)ntNew.c_str();
             us.Length=(USHORT)(ntNew.size()*2); us.MaximumLength=(USHORT)(us.Length+2);
             GH_UNICODE_STRING* saved = oa->ObjectName;
+            HANDLE savedRoot = oa->RootDirectory;
             oa->ObjectName = &us;
+            oa->RootDirectory = nullptr;
             static int n=0; if(++n<=20) Diag("HOOK NtCreateFile drive-root " + std::string(dos.begin(),dos.end()) + " -> " + std::string(real.begin(),real.end()));
             LONG r = g_realNtCreateFile(fh,acc,oa,iosb,alloc,fattr,share,disp,opts,ea,ealen);
             oa->ObjectName = saved;
+            oa->RootDirectory = savedRoot;
             return r;
         }
     }
     return g_realNtCreateFile(fh,acc,oa,iosb,alloc,fattr,share,disp,opts,ea,ealen);
 }
+typedef BOOL (WINAPI* MoveFileExW_t)(LPCWSTR, LPCWSTR, DWORD);
+static MoveFileExW_t g_realMoveFileExW = nullptr;
+static BOOL WINAPI Hook_MoveFileExW(LPCWSTR a, LPCWSTR b, DWORD flags)
+{
+    std::wstring ra = a ? RedirectDriveRootSave(a) : L"";
+    std::wstring rb = b ? RedirectDriveRootSave(b) : L"";
+    LPCWSTR pa = ra.empty() ? a : ra.c_str();
+    LPCWSTR pb = rb.empty() ? b : rb.c_str();
+    if ((!ra.empty() || !rb.empty()) && pb) {
+        EnsureParentOf(pb);
+        static int n=0; if(++n<=10) Diag(std::string("HOOK MoveFileExW ") +
+            (a?std::string(std::wstring(a).begin(),std::wstring(a).end()):"") + " -> " +
+            (pb?std::string(std::wstring(pb).begin(),std::wstring(pb).end()):""));
+    }
+    if (!g_realMoveFileExW) return FALSE;
+    return g_realMoveFileExW(pa, pb, flags);
+}
+typedef BOOL (WINAPI* DeleteFileW_t)(LPCWSTR);
+static DeleteFileW_t g_realDeleteFileW = nullptr;
+static BOOL WINAPI Hook_DeleteFileW(LPCWSTR a)
+{
+    std::wstring ra = a ? RedirectDriveRootSave(a) : L"";
+    LPCWSTR pa = ra.empty() ? a : ra.c_str();
+    if (!g_realDeleteFileW) return FALSE;
+    return g_realDeleteFileW(pa);
+}
+
 static void InstallFileHooks(){
     if (g_realCreateFileW) return;   // already planted; a second install would hook the hook
     InstallOneHook("CreateFileW", (void*)&Hook_CreateFileW, (void**)&g_realCreateFileW);
@@ -702,6 +767,8 @@ static void InstallFileHooks(){
         else
             Diag("HOOK NtCreateFile: install FAILED (prologue) @ " + Hex((uint64_t)p));
     }
+    InstallOneHook("MoveFileExW", (void*)&Hook_MoveFileExW, (void**)&g_realMoveFileExW);
+    InstallOneHook("DeleteFileW", (void*)&Hook_DeleteFileW, (void**)&g_realDeleteFileW);
 }
 
 static BOOL WINAPI Bed_CreateDirectoryW(LPCWSTR path, LPSECURITY_ATTRIBUTES sa){
@@ -4592,6 +4659,25 @@ static void RunGuest()
         if (!g_guestDir.empty()) g_guestDataDir = g_guestDir + exeBase + L"_Data\\";
         Diag("guestDataDir=" + std::string(g_guestDataDir.begin(), g_guestDataDir.end()));
     }
+#ifdef GH_LAUNCHER
+    // Facepunch/Steamworks read SteamAppId before SteamAPI_Init. Launcher QR
+    // login left the pipe on Cheese (3809440). Stamp the picked game now so
+    // later Init rebinds matchmaking to this title.
+    {
+        uint32_t app = g_launcherSelectedApp;
+        if (!app && !g_guestDir.empty()) {
+            std::vector<uint8_t> b;
+            if (ReadWholeFile(g_guestDir + L"steam_appid.txt", b) && !b.empty())
+                app = (uint32_t)strtoul(std::string(b.begin(), b.end()).c_str(), nullptr, 10);
+        }
+        if (app) {
+            char buf[16]; std::snprintf(buf, sizeof(buf), "%u", app);
+            SetEnvironmentVariableA("SteamAppId", buf);
+            SetEnvironmentVariableA("SteamGameId", buf);
+            Diag(std::string("STAGE=steam_appid ") + buf);
+        }
+    }
+#endif
     // Relative-save redirect. The REAL process cwd is the read-only WindowsApps
     // launch drive (S:\...); we bed SetCurrentDirectoryW so the guest can never
     // change the REAL cwd, and Mono resolves RELATIVE save paths (Easy Save 3's
@@ -4880,6 +4966,7 @@ static void ResetGuestForRelaunch()
     g_overlayOpen = false;
     g_overlayDrawn = false;
     g_guestRunning = false;
+    g_launcherSelectedApp = 0;
     InterlockedExchange(&g_vehLogged, 0);
     if (!g_launcherPkgGuest.empty()) g_guestDir = g_launcherPkgGuest;
 }

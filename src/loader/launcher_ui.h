@@ -40,6 +40,7 @@ struct LauncherGfx {
     com_ptr<IDWriteFactory>       dw;
     com_ptr<IDWriteTextFormat>    fmtTitle, fmtItem, fmtSmall, fmtLog;
     com_ptr<ID3D11Texture2D>      uiTex;      // R8G8B8A8_UNORM target D2D draws into
+    com_ptr<ID3D11Texture2D>      ovlSnap[2]; // stable copies for guest-thread blit (ping-pong)
     com_ptr<ID2D1Bitmap1>         uiTarget;   // D2D target wrapping uiTex
     com_ptr<ID2D1SolidColorBrush> brFg, brDim, brBg, brSel, brAccent, brPanel, brWarn;
     com_ptr<ID2D1SolidColorBrush> brWhite, brBlack;   // pure B/W for QR scanner contrast
@@ -918,7 +919,21 @@ static const float kOvlW = 920.f, kOvlH = 420.f;
 static int   g_ovlSel = 0;
 static WORD  g_ovlPrev = 0xFFFF;
 static DWORD g_ovlLastNav = 0;
+static bool  g_ovlDirty = true;
+static volatile long g_ovlRead = 0;   // snap index Present may copy
 static void OverlayDraw();
+static void OverlayEnsureSnap()
+{
+    if (g_lui.ovlSnap[0] && g_lui.ovlSnap[1]) return;
+    if (!g_gfx.ready || !g_lui.w || !g_lui.h) return;
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = g_lui.w; td.Height = g_lui.h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    for (int i = 0; i < 2; ++i)
+        g_gfx.d11->CreateTexture2D(&td, nullptr, g_lui.ovlSnap[i].put());
+}
 
 static void OverlayLoadRemap()
 {
@@ -947,6 +962,7 @@ static void OverlaySetRemap(bool on)
         g_kmActive = true;
     }
     OverlaySaveRemap();
+    g_ovlDirty = true;
     Diag(on ? "REMAP on" : "REMAP off");
 }
 
@@ -955,7 +971,7 @@ static void OverlayTick()
 {
     static bool wasOpen = false;
     if (!g_overlayOpen || !g_guestRunning) { wasOpen = false; return; }
-    if (!wasOpen) g_ovlPrev = 0xFFFF;   // ignore buttons held on the opening chord
+    if (!wasOpen) { g_ovlPrev = 0xFFFF; g_ovlDirty = true; }
     wasOpen = true;
     WORD b, ly_hi = 0, ly_lo = 0;
     { std::lock_guard<std::mutex> lk(g_padMutex);
@@ -981,8 +997,9 @@ static void OverlayTick()
     if (pressed & XINPUT_GAMEPAD_B) {
         g_overlayOpen = false;
         Diag("OVERLAY close (B)");
+        return;
     }
-    OverlayDraw();
+    if (g_ovlDirty) OverlayDraw();
 }
 
 static void OverlayDraw()
@@ -1015,15 +1032,28 @@ static void OverlayDraw()
             g_lui.fmtSmall.get(),
             D2D1::RectF(px + 40, py + kOvlH - 64, px + kOvlW - 40, py + kOvlH - 24),
             g_lui.brDim.get());
-    dc->EndDraw();
+    HRESULT hr = dc->EndDraw();
+    if (FAILED(hr)) { Diag("OVERLAY EndDraw hr=" + Hex((uint32_t)hr)); return; }
+    dc->Flush();
+    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+    OverlayEnsureSnap();
+    int w = 1 - (int)g_ovlRead;
+    if (w < 0 || w > 1) w = 0;
+    if (g_lui.ovlSnap[w] && g_lui.uiTex) {
+        g_gfx.d11ctx->CopyResource(g_lui.ovlSnap[w].get(), g_lui.uiTex.get());
+        g_gfx.d11ctx->Flush();
+        InterlockedExchange(&g_ovlRead, w);
+    }
+    g_ovlDirty = false;
     g_overlayDrawn = true;
 }
 
 static void OverlayBlit(ID3D11Resource* dst)
 {
-    // Guest-thread present: only copy. OverlayDraw ran on the UI pump.
+    // Guest-thread present: copy a finished snap only. Never touch uiTex (D2D target).
     if (!g_overlayOpen || !g_overlayDrawn || !dst || !g_gfx.ready) return;
-    if (!g_lui.ready || !g_lui.uiTex) return;
+    int r = (int)g_ovlRead;
+    if (r < 0 || r > 1 || !g_lui.ovlSnap[r]) return;
     const float W = (float)g_lui.w, H = (float)g_lui.h;
     int px = (int)((W - kOvlW) * 0.5f), py = (int)((H - kOvlH) * 0.5f);
     int pw = (int)kOvlW, ph = (int)kOvlH;
@@ -1035,7 +1065,7 @@ static void OverlayBlit(ID3D11Resource* dst)
     box.left = (UINT)px; box.top = (UINT)py; box.front = 0;
     box.right = (UINT)(px + pw); box.bottom = (UINT)(py + ph); box.back = 1;
     g_gfx.d11ctx->CopySubresourceRegion(dst, 0, (UINT)px, (UINT)py, 0,
-                                        g_lui.uiTex.get(), 0, &box);
+                                        g_lui.ovlSnap[r].get(), 0, &box);
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,6 +1159,7 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
                     continue;
                 }
             }
+            g_launcherSelectedApp = it.app;
             return it.guest;
         }
 

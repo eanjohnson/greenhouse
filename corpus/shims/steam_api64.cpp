@@ -1559,8 +1559,8 @@ __declspec(dllexport) void SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialo
 // that ship steam_appid.txt but never set the env fall back to the compiled
 // default. Cached on first use.
 static AppId_t gh_resolve_appid() {
-    static AppId_t cached = 0;
-    if (cached) return cached;
+    // Re-read every call: the launcher sets SteamAppId when a game is picked,
+    // after QR login already ran with the Cheese fallback.
     char buf[32];
     DWORD n = GetEnvironmentVariableA("SteamAppId", buf, sizeof(buf));
     if (n == 0 || n >= sizeof(buf))
@@ -1569,8 +1569,7 @@ static AppId_t gh_resolve_appid() {
     if (n > 0 && n < sizeof(buf))
         for (DWORD i = 0; i < n && buf[i] >= '0' && buf[i] <= '9'; ++i)
             v = v * 10 + (AppId_t)(buf[i] - '0');
-    cached = v ? v : (AppId_t)3809440; // fallback: Cheese Rolling
-    return cached;
+    return v ? v : (AppId_t)3809440; // fallback: Cheese Rolling
 }
 __declspec(dllexport) uint32_t SteamAPI_ISteamUtils_GetAppID(void*) { return gh_resolve_appid(); }
 __declspec(dllexport) uint32_t SteamAPI_ISteamUtils_GetSecondsSinceAppActive(void*) { return 0; }
