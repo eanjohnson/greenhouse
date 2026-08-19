@@ -910,6 +910,135 @@ static void LauncherShowCrash(const std::wstring& title, const std::wstring& rea
 }
 
 // ---------------------------------------------------------------------------
+// In-game overlay (Phase D shell). Drawn into uiTex, then OverlayBlit copies
+// only the panel rectangle onto the guest backbuffer in GfxPresent. Input is
+// one tick per UI pump — never a blocking loop (the guest must keep rendering).
+// ---------------------------------------------------------------------------
+static const float kOvlW = 920.f, kOvlH = 420.f;
+static int   g_ovlSel = 0;
+static WORD  g_ovlPrev = 0xFFFF;
+static DWORD g_ovlLastNav = 0;
+static void OverlayDraw();
+
+static void OverlayLoadRemap()
+{
+    std::vector<uint8_t> b;
+    if (!ReadWholeFile(std::wstring(kLocalState) + L"gh_remap.txt", b) || b.empty()) return;
+    g_kmRemapOn = (b[0] == '1' || b[0] == 't' || b[0] == 'T');
+}
+
+static void OverlaySaveRemap()
+{
+    std::wstring p = std::wstring(kLocalState) + L"gh_remap.txt";
+    HANDLE h = CreateFileW(p.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    char c = g_kmRemapOn ? '1' : '0';
+    DWORD w = 0; WriteFile(h, &c, 1, &w, nullptr); CloseHandle(h);
+}
+
+static void OverlaySetRemap(bool on)
+{
+    if ((bool)g_kmRemapOn == on) return;
+    g_kmRemapOn = on;
+    if (on) {
+        std::lock_guard<std::mutex> lk(g_kmMutex);
+        g_kmCurX = (LONG)g_winW / 2; g_kmCurY = (LONG)g_winH / 2;
+        g_kmActive = true;
+    }
+    OverlaySaveRemap();
+    Diag(on ? "REMAP on" : "REMAP off");
+}
+
+// One pump tick of overlay navigation. Call only while g_overlayOpen.
+static void OverlayTick()
+{
+    static bool wasOpen = false;
+    if (!g_overlayOpen || !g_guestRunning) { wasOpen = false; return; }
+    if (!wasOpen) g_ovlPrev = 0xFFFF;   // ignore buttons held on the opening chord
+    wasOpen = true;
+    WORD b, ly_hi = 0, ly_lo = 0;
+    { std::lock_guard<std::mutex> lk(g_padMutex);
+      b = g_padState.wButtons;
+      if (g_padState.sThumbLY >  16000) ly_hi = 1;
+      if (g_padState.sThumbLY < -16000) ly_lo = 1; }
+    DWORD now = GetTickCount();
+    bool navGate = (now - g_ovlLastNav) > 160;
+    WORD synth = b;
+    if (ly_hi && navGate) synth |= XINPUT_GAMEPAD_DPAD_UP;
+    if (ly_lo && navGate) synth |= XINPUT_GAMEPAD_DPAD_DOWN;
+    WORD pressed = synth & ~g_ovlPrev;
+    g_ovlPrev = b;
+    if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) {
+        g_ovlSel = 0; g_ovlLastNav = now;
+    }
+    if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) {
+        g_ovlSel = 0; g_ovlLastNav = now;
+    }
+    if (pressed & XINPUT_GAMEPAD_A) {
+        OverlaySetRemap(!g_kmRemapOn);
+    }
+    if (pressed & XINPUT_GAMEPAD_B) {
+        g_overlayOpen = false;
+        Diag("OVERLAY close (B)");
+    }
+    OverlayDraw();
+}
+
+static void OverlayDraw()
+{
+    if (!g_overlayOpen || !LuiInit()) return;
+    auto* dc = g_lui.dc.get();
+    const float W = (float)g_lui.w, H = (float)g_lui.h;
+    const float px = (W - kOvlW) * 0.5f, py = (H - kOvlH) * 0.5f;
+    dc->BeginDraw();
+    dc->Clear(D2D1::ColorF(0, 0.f));
+    D2D1_RECT_F panel = D2D1::RectF(px, py, px + kOvlW, py + kOvlH);
+    dc->FillRectangle(panel, g_lui.brPanel.get());
+    // 2px accent bar at the top of the panel
+    dc->FillRectangle(D2D1::RectF(px, py, px + kOvlW, py + 6.f), g_lui.brAccent.get());
+    LuiText(L"GREENHOUSE", g_lui.fmtTitle.get(),
+            D2D1::RectF(px + 36, py + 20, px + kOvlW - 36, py + 100), g_lui.brFg.get());
+    LuiText(L"Start + Select to close", g_lui.fmtSmall.get(),
+            D2D1::RectF(px + 40, py + 100, px + kOvlW - 40, py + 140), g_lui.brDim.get());
+
+    float ry = py + 180;
+    D2D1_RECT_F row = D2D1::RectF(px + 28, ry, px + kOvlW - 28, ry + 80);
+    dc->FillRectangle(row, g_lui.brSel.get());
+    LuiText(L"Controller as mouse", g_lui.fmtItem.get(),
+            D2D1::RectF(px + 48, ry, px + kOvlW - 200, ry + 80), g_lui.brFg.get());
+    LuiText(g_kmRemapOn ? L"ON" : L"OFF", g_lui.fmtItem.get(),
+            D2D1::RectF(px + kOvlW - 200, ry, px + kOvlW - 48, ry + 80),
+            g_kmRemapOn ? g_lui.brAccent.get() : g_lui.brDim.get(),
+            DWRITE_TEXT_ALIGNMENT_TRAILING);
+    LuiText(L"A  Toggle      B  Close      Right stick moves cursor when ON",
+            g_lui.fmtSmall.get(),
+            D2D1::RectF(px + 40, py + kOvlH - 64, px + kOvlW - 40, py + kOvlH - 24),
+            g_lui.brDim.get());
+    dc->EndDraw();
+    g_overlayDrawn = true;
+}
+
+static void OverlayBlit(ID3D11Resource* dst)
+{
+    // Guest-thread present: only copy. OverlayDraw ran on the UI pump.
+    if (!g_overlayOpen || !g_overlayDrawn || !dst || !g_gfx.ready) return;
+    if (!g_lui.ready || !g_lui.uiTex) return;
+    const float W = (float)g_lui.w, H = (float)g_lui.h;
+    int px = (int)((W - kOvlW) * 0.5f), py = (int)((H - kOvlH) * 0.5f);
+    int pw = (int)kOvlW, ph = (int)kOvlH;
+    if (px < 0) px = 0; if (py < 0) py = 0;
+    if (px + pw > (int)g_gfx.rtW) pw = (int)g_gfx.rtW - px;
+    if (py + ph > (int)g_gfx.rtH) ph = (int)g_gfx.rtH - py;
+    if (pw <= 0 || ph <= 0) return;
+    D3D11_BOX box{};
+    box.left = (UINT)px; box.top = (UINT)py; box.front = 0;
+    box.right = (UINT)(px + pw); box.bottom = (UINT)(py + ph); box.back = 1;
+    g_gfx.d11ctx->CopySubresourceRegion(dst, 0, (UINT)px, (UINT)py, 0,
+                                        g_lui.uiTex.get(), 0, &box);
+}
+
+// ---------------------------------------------------------------------------
 // The picker loop. Runs on the UI thread. Returns the chosen guest string
 // (empty => launch the default guest). Falls through (returns empty) if the
 // bridge/D2D cannot init, so a bad UI never blocks launching.

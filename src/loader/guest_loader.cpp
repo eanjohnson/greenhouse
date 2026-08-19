@@ -1516,6 +1516,9 @@ static void EnsureCursorTextures()
 // Body defined after the g_km*/g_winW cursor-state globals (declared further down);
 // forward-declared here so GfxPresent can call it.
 static void DrawCursorOverlay(ID3D11Resource* dst);
+#ifdef GH_LAUNCHER
+static void OverlayBlit(ID3D11Resource* dst);   // launcher_ui.h, after LuiInit
+#endif
 
 // Present one frame from the guest's point of view: it has rendered into the
 // currently-acquired wrapped back buffer. Release it, flush 11on12's queued work
@@ -1541,6 +1544,11 @@ static HRESULT GfxPresent(UINT sync)
     ID3D11Resource* cur[] = { g_gfx.wrapped[g_gfx.cur].get() };
     if (g_gfx.guestRT)
         g_gfx.d11ctx->CopyResource(cur[0], g_gfx.guestRT.get());
+#ifdef GH_LAUNCHER
+    // In-game overlay sits on the guest frame (not the D2D-only picker). Blit a
+    // panel region; do not CopyResource the whole uiTex (that would wipe the game).
+    OverlayBlit(cur[0]);
+#endif
     // Composite the software mouse cursor on top of the guest frame, while the
     // wrapped back buffer is still acquired/writable (before ReleaseWrappedResources).
     EnsureCursorTextures();
@@ -1908,6 +1916,14 @@ static std::mutex        g_kmMutex;
 static bool              g_kmActive = false;         // a real KB/M event has arrived
 static bool              g_vkDown[256] = {};         // virtual-key -> pressed
 static LONG              g_kmCurX = 0, g_kmCurY = 0; // cursor, client space (== screen here)
+#ifdef GH_LAUNCHER
+// In-game overlay (Start+Back / Menu+View) and controller→mouse remap.
+// Guest-running only; the pre-guest picker does not use these.
+static volatile bool     g_overlayOpen  = false;
+static volatile bool     g_overlayDrawn = false;  // UI thread has painted uiTex this open
+static volatile bool     g_kmRemapOn    = false;
+static volatile bool     g_guestRunning = false;
+#endif
 static LONG              g_kmRelX = 0, g_kmRelY = 0; // accumulated raw delta (mouse-look, phase 2)
 static int               g_kmPrevButtons = 0;        // bit0 L, bit1 R, bit2 M (edge detection)
 static std::deque<MSG>   g_kmQueue;                  // synthetic msgs -> guest WndProc
@@ -1988,6 +2004,9 @@ static void DrawCursorOverlay(ID3D11Resource* dst)
     if (!g_gfx.ready || !g_gfx.curHBar || !g_gfx.curVBar) return;
     LONG x, y; bool active;
     { std::lock_guard<std::mutex> lk(g_kmMutex); active = g_kmActive; x = g_kmCurX; y = g_kmCurY; }
+#ifdef GH_LAUNCHER
+    if (!active && g_kmRemapOn) { active = true; }
+#endif
     if (!active) return;
     const int HBW = 21, HBH = 5, VBW = 5, VBH = 21;
     // Map window (g_winW/H) space -> render-target (rtW/H) space; normally 1:1.
@@ -2292,7 +2311,26 @@ static DWORD WINAPI Bed_XInputGetState(DWORD idx, XINPUT_STATE* state)
     std::lock_guard<std::mutex> lk(g_padMutex);
     if (!g_padConnected) return ERROR_DEVICE_NOT_CONNECTED;
     state->dwPacketNumber = g_padPacket;
-    state->Gamepad = g_padState;
+    XINPUT_GAMEPAD g = g_padState;
+#ifdef GH_LAUNCHER
+    // Overlay owns the pad. Remap steals the mouse set so the game does not
+    // also see A / right-stick (double-click / look). Chord Start+Back is
+    // always stripped so Menu+View cannot pause the title.
+    if (g_overlayOpen) {
+        g = XINPUT_GAMEPAD{};
+    } else {
+        if ((g.wButtons & XINPUT_GAMEPAD_START) && (g.wButtons & XINPUT_GAMEPAD_BACK))
+            g.wButtons = (WORD)(g.wButtons & ~(XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_BACK));
+        if (g_kmRemapOn) {
+            // v1 mouse set: A=LMB, B=RMB, RT/LT=wheel, right stick=cursor.
+            // Left stick / d-pad / shoulders stay as gamepad (walk + look).
+            g.wButtons = (WORD)(g.wButtons & ~(XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B));
+            g.sThumbRX = 0; g.sThumbRY = 0;
+            g.bLeftTrigger = 0; g.bRightTrigger = 0;
+        }
+    }
+#endif
+    state->Gamepad = g;
     return ERROR_SUCCESS;
 }
 static DWORD WINAPI Bed_XInputGetCapabilities(DWORD idx, DWORD, XINPUT_CAPABILITIES* caps)
@@ -2389,6 +2427,79 @@ static const char*          g_pcIp   = "192.0.2.11";   // PC running mouse_strea
 static const unsigned short g_pcPort = 55123;
 static unsigned             g_kmNetEvents = 0;
 
+// One mouse sample — the same contract as toolchain/mouse_stream_client.py
+// (magic 0x5A packet: buttons bit0 L / bit1 R / bit2 M, int16 dx/dy/wheel).
+// NetMouseThread and the controller remap both call this; do not fork a
+// second injection path.
+static void ApplyMouseSample(unsigned buttons, short dx, short dy, short wheel)
+{
+    bool L = (buttons & 1) != 0, R = (buttons & 2) != 0, M = (buttons & 4) != 0;
+    int btn = (L?1:0)|(R?2:0)|(M?4:0), prev; LONG x, y;
+    {
+        std::lock_guard<std::mutex> lk(g_kmMutex);
+        g_kmCurX += dx; g_kmCurY += dy;
+        if (g_kmCurX < 0) g_kmCurX = 0; if (g_kmCurX > (LONG)g_winW) g_kmCurX = (LONG)g_winW;
+        if (g_kmCurY < 0) g_kmCurY = 0; if (g_kmCurY > (LONG)g_winH) g_kmCurY = (LONG)g_winH;
+        x = g_kmCurX; y = g_kmCurY;
+        g_vkDown[VK_LBUTTON] = L; g_vkDown[VK_RBUTTON] = R; g_vkDown[VK_MBUTTON] = M;
+        prev = g_kmPrevButtons; g_kmPrevButtons = btn;
+        g_kmActive = true; ++g_kmNetEvents;
+    }
+    WPARAM mk = (L?MK_LBUTTON:0)|(R?MK_RBUTTON:0)|(M?MK_MBUTTON:0);
+    LPARAM xy = MAKELPARAM(x, y);
+    if (dx || dy)            KM_Push(WM_MOUSEMOVE,   mk, xy);
+    if ((btn&1)&&!(prev&1)) KM_Push(WM_LBUTTONDOWN, mk, xy);
+    if (!(btn&1)&&(prev&1)) KM_Push(WM_LBUTTONUP,   mk, xy);
+    if ((btn&2)&&!(prev&2)) KM_Push(WM_RBUTTONDOWN, mk, xy);
+    if (!(btn&2)&&(prev&2)) KM_Push(WM_RBUTTONUP,   mk, xy);
+    if ((btn&4)&&!(prev&4)) KM_Push(WM_MBUTTONDOWN, mk, xy);
+    if (!(btn&4)&&(prev&4)) KM_Push(WM_MBUTTONUP,   mk, xy);
+    if (wheel)               KM_Push(WM_MOUSEWHEEL, MAKEWPARAM((WORD)mk, (SHORT)wheel), xy);
+    PushRawFromButtons(btn, prev, wheel, dx, dy);
+}
+
+#ifdef GH_LAUNCHER
+static void OverlayPollChord()
+{
+    if (!g_guestRunning) return;
+    WORD b;
+    { std::lock_guard<std::mutex> lk(g_padMutex); b = g_padState.wButtons; }
+    static WORD prev = 0;
+    const WORD chord = XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_BACK;
+    bool now = (b & chord) == chord;
+    bool was = (prev & chord) == chord;
+    prev = b;
+    if (now && !was) {
+        g_overlayOpen = !g_overlayOpen;
+        if (!g_overlayOpen) g_overlayDrawn = false;
+        Diag(g_overlayOpen ? "OVERLAY open (Start+Back)" : "OVERLAY close (Start+Back)");
+    }
+}
+
+// Right stick → cursor, A/B → L/R mouse, triggers → wheel. Matches ApplyMouseSample.
+static void OverlayPadToMouse()
+{
+    if (!g_guestRunning || !g_kmRemapOn || g_overlayOpen) return;
+    XINPUT_GAMEPAD g;
+    { std::lock_guard<std::mutex> lk(g_padMutex); g = g_padState; }
+    const int dead = 8000;
+    int sx = g.sThumbRX, sy = g.sThumbRY;
+    if (sx > -dead && sx < dead) sx = 0;
+    if (sy > -dead && sy < dead) sy = 0;
+    // ~50 Hz pump; scale so a full deflection is a few hundred px/s.
+    short dx = (short)(sx * 28 / 32767);
+    short dy = (short)(-sy * 28 / 32767);   // XInput Y up, screen Y down
+    unsigned buttons = 0;
+    if (g.wButtons & XINPUT_GAMEPAD_A) buttons |= 1;
+    if (g.wButtons & XINPUT_GAMEPAD_B) buttons |= 2;
+    short wheel = 0;
+    if (g.bRightTrigger > 40) wheel = 1;
+    else if (g.bLeftTrigger > 40) wheel = -1;
+    if (dx || dy || buttons || wheel || g_kmPrevButtons)
+        ApplyMouseSample(buttons, dx, dy, wheel);
+}
+#endif
+
 static void NetMouseThread(){
     WSADATA wsa;
     if (int r = WSAStartup(MAKEWORD(2,2), &wsa)){ Diag("NETMOUSE WSAStartup FAILED r=" + std::to_string(r)); return; }
@@ -2426,33 +2537,7 @@ static void NetMouseThread(){
             if (!firstPkt){ firstPkt = true; Diag("NETMOUSE first packet (bridge alive) btn=" + std::to_string(btn)); }
             if ((dx||dy) && !firstMove){ firstMove = true; Diag("NETMOUSE first movement dx=" + std::to_string(dx) + " dy=" + std::to_string(dy)); }
 
-            bool L = (btn & 1) != 0, R = (btn & 2) != 0, M = (btn & 4) != 0;
-            int buttons = (L?1:0)|(R?2:0)|(M?4:0), prev; LONG x, y;
-            {
-                std::lock_guard<std::mutex> lk(g_kmMutex);
-                g_kmCurX += dx; g_kmCurY += dy;
-                if (g_kmCurX < 0) g_kmCurX = 0; if (g_kmCurX > (LONG)g_winW) g_kmCurX = (LONG)g_winW;
-                if (g_kmCurY < 0) g_kmCurY = 0; if (g_kmCurY > (LONG)g_winH) g_kmCurY = (LONG)g_winH;
-                x = g_kmCurX; y = g_kmCurY;
-                g_vkDown[VK_LBUTTON] = L; g_vkDown[VK_RBUTTON] = R; g_vkDown[VK_MBUTTON] = M;
-                prev = g_kmPrevButtons; g_kmPrevButtons = buttons;
-                g_kmActive = true; ++g_kmNetEvents;
-            }
-            // Post the same message stream a real pointer would, so guests that
-            // pump messages (rather than only polling GetCursorPos) also see it.
-            WPARAM mk = (L?MK_LBUTTON:0)|(R?MK_RBUTTON:0)|(M?MK_MBUTTON:0);
-            LPARAM xy = MAKELPARAM(x, y);
-            if (dx || dy)            KM_Push(WM_MOUSEMOVE,   mk, xy);
-            if ((buttons&1)&&!(prev&1)) KM_Push(WM_LBUTTONDOWN, mk, xy);
-            if (!(buttons&1)&&(prev&1)) KM_Push(WM_LBUTTONUP,   mk, xy);
-            if ((buttons&2)&&!(prev&2)) KM_Push(WM_RBUTTONDOWN, mk, xy);
-            if (!(buttons&2)&&(prev&2)) KM_Push(WM_RBUTTONUP,   mk, xy);
-            if ((buttons&4)&&!(prev&4)) KM_Push(WM_MBUTTONDOWN, mk, xy);
-            if (!(buttons&4)&&(prev&4)) KM_Push(WM_MBUTTONUP,   mk, xy);
-            if (wheel)               KM_Push(WM_MOUSEWHEEL, MAKEWPARAM((WORD)mk, (SHORT)wheel), xy);
-            // New Input System reads the mouse from raw input; mirror the same
-            // edges/motion as a WM_INPUT event so UI clicks actually register.
-            PushRawFromButtons(buttons, prev, wheel, dx, dy);
+            ApplyMouseSample(btn, dx, dy, wheel);
         }
         closesocket(s); Sleep(1000);
     }
@@ -4792,6 +4877,9 @@ static void ResetGuestForRelaunch()
     g_guestWorkerTid = 0;
     g_sessionFinished = false;
     g_capturedOut.clear();
+    g_overlayOpen = false;
+    g_overlayDrawn = false;
+    g_guestRunning = false;
     InterlockedExchange(&g_vehLogged, 0);
     if (!g_launcherPkgGuest.empty()) g_guestDir = g_launcherPkgGuest;
 }
@@ -4917,6 +5005,7 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
                 }
             } else Diag("LAUNCHER steam shim not staged — skipping on-screen login");
         }
+        OverlayLoadRemap();
         g_guestStarted = true;
         for (;;) {
             ResetGuestForRelaunch();
@@ -4930,6 +5019,7 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
             }
             g_launcherSelectedGuest = picked;
             Diag("LAUNCHER handoff guest='" + std::string(g_launcherSelectedGuest.begin(), g_launcherSelectedGuest.end()) + "'");
+            g_guestRunning = true;
             std::thread([]{
                 g_guestWorkerTid = GetCurrentThreadId();
                 RunGuest();
@@ -4939,9 +5029,14 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
                 window.Dispatcher().ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
                 PollGamepadOnUi();
                 PollSyntheticPad();
+                OverlayPollChord();
+                OverlayTick();
+                OverlayPadToMouse();
                 (void)&PollPointerOnUi;
                 Sleep(20);
             }
+            g_guestRunning = false;
+            g_overlayOpen = false;
             Diag("STAGE=guest_done code=" + std::to_string(g_guestExitCode) +
                  (g_guestCrashed ? " crashed" : "") +
                  (g_guestFailWhy.empty() ? "" : (" why=" + g_guestFailWhy)));
