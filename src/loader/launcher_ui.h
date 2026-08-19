@@ -1220,6 +1220,11 @@ static void OverlaySetRemap(bool on)
             g_kmActive = false;
         }
     }
+    if (on) {
+        LONG x, y;
+        { std::lock_guard<std::mutex> lk(g_kmMutex); x = g_kmCurX; y = g_kmCurY; }
+        KM_Push(WM_MOUSEMOVE, 0, MAKELPARAM(x, y));
+    }
     OverlaySaveRemap();
     g_ovlDirty = true;
     Diag(on ? "REMAP on" : "REMAP off");

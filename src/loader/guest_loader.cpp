@@ -2921,11 +2921,33 @@ static BOOL WINAPI Bed_EnumDisplaySettingsA(LPCSTR, DWORD iModeNum, DEVMODEA* dm
     }
     return FALSE;
 }
+#ifndef SM_MOUSEHORIZONTALWHEELPRESENT
+#define SM_MOUSEHORIZONTALWHEELPRESENT 91
+#endif
+// True when `ra` lives in UnityPlayer. Steamclient also hits GetSystemMetrics;
+// advertising a mouse there made SteamAPI_Init call a NULL input vtable
+// (VEH exec 0x0). REPO menus need the lie, Steam does not.
+static bool AddrIsUnityPlayer(void* ra)
+{
+    HMODULE u = GetModuleHandleA("UnityPlayer.dll");
+    if (!u || !ra) return false;
+    MEMORY_BASIC_INFORMATION nfo{};
+    if (!VirtualQuery(ra, &nfo, sizeof(nfo))) return false;
+    return nfo.AllocationBase == u;
+}
 static int WINAPI Bed_GetSystemMetrics(int idx){
     switch (idx){
         case SM_CXSCREEN: case SM_CXFULLSCREEN: case SM_CXVIRTUALSCREEN: return (int)g_winW;
         case SM_CYSCREEN: case SM_CYFULLSCREEN: case SM_CYVIRTUALSCREEN: return (int)g_winH;
         case SM_CMONITORS: return 1;
+        case SM_MOUSEPRESENT: case SM_MOUSEWHEELPRESENT:
+        case SM_MOUSEHORIZONTALWHEELPRESENT:
+            return AddrIsUnityPlayer(_ReturnAddress()) ? 1 : 0;
+        case SM_CMOUSEBUTTONS:
+            return AddrIsUnityPlayer(_ReturnAddress()) ? 5 : 0;
+        case SM_SWAPBUTTON: return 0;
+        case SM_CXCURSOR: case SM_CYCURSOR: return 32;
+        case SM_CXDOUBLECLK: case SM_CYDOUBLECLK: return 4;
         default: return 0;
     }
 }
@@ -3088,6 +3110,11 @@ static BOOL  WINAPI Bed_SetCursorPos(int x, int y){
 }
 static int   WINAPI Bed_ShowCursor(BOOL){ return 0; }
 static BOOL  WINAPI Bed_ClipCursor(const RECT*){ return TRUE; }
+// Client == screen for the fake HWND. UnityPlayer statically imports these and
+// does GetCursorPos + ScreenToClient to fill Input.mousePosition; the real
+// user32 fails on kFakeHwnd and the legacy mouse (REPO's MenuCursor) never moves.
+static BOOL WINAPI Bed_ScreenToClient(HWND, LPPOINT p){ RECON_ONCE("ScreenToClient"); return p ? TRUE : FALSE; }
+static BOOL WINAPI Bed_ClientToScreen(HWND, LPPOINT p){ RECON_ONCE("ClientToScreen"); return p ? TRUE : FALSE; }
 
 // CreateProcess surrogate -- defined after the PE mapper (needs ResolveImport
 // etc.); forward-declared here so the shim table can point at them.
@@ -3410,6 +3437,17 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
     };
     int n = 0;
     for (auto& r : redirs) n += PatchModuleImport(h, r.fn, r.bed);
+    // UnityPlayer only: identity ScreenToClient so Input.mousePosition tracks
+    // GetCursorPos. Do NOT apply these to steamclient — GPA/IAT stubs there
+    // crashed SteamInternal_SteamAPI_Init (exec 0x0).
+    if (tag && strstr(tag, "UnityPlayer")) {
+        static const struct { const char* fn; void* bed; } extra[] = {
+            {"ScreenToClient", (void*)&Bed_ScreenToClient},
+            {"ClientToScreen", (void*)&Bed_ClientToScreen},
+            {"SetCursorPos",   (void*)&Bed_SetCursorPos},
+        };
+        for (auto& r : extra) n += PatchModuleImport(h, r.fn, r.bed);
+    }
     if (n) Diag(std::string("STAGE=iat_patch ") + tag + " x" + std::to_string(n));
     return n;
 }
