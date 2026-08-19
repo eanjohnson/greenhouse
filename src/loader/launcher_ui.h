@@ -25,6 +25,9 @@
 #include <d2d1helper.h>
 #include <dwrite.h>
 #include <algorithm>
+#include <winrt/windows.ui.text.core.h>
+#include <winrt/windows.ui.viewmanagement.h>
+#include <winrt/windows.ui.viewmanagement.core.h>
 #include "cm_downloader.h"   // in-process Steam depot downloader (namespace ghdl)
 extern "C" {
 #include "qrcodegen.h"       // Nayuki QR Code generator (MIT), for on-screen Steam login (Phase C)
@@ -195,6 +198,57 @@ static std::wstring LuiFolderOf(const std::wstring& guest)
 {
     size_t s = guest.find_last_of(L"\\/");
     return (s == std::wstring::npos) ? std::wstring() : guest.substr(0, s);
+}
+
+static std::wstring LuiInstallFolder(const LauncherItem& it)
+{
+    if (it.guest.empty() || it.guest[0] == L'@') return L"";
+    size_t s = it.guest.find_last_of(L"\\/");
+    if (s == std::wstring::npos || s == 0) return L"";
+    return it.guest.substr(0, s);
+}
+
+// Only Greenhouse-managed trees: D:\DevelopmentFiles\gh_games\<folder>\ or
+// LocalState\game\<folder>\. Never USB roots, never the parent scratch itself.
+static bool LuiCanUninstall(const LauncherItem& it)
+{
+    std::wstring d = LuiInstallFolder(it);
+    if (d.empty()) return false;
+    if (d.back() != L'\\') d += L'\\';
+    std::wstring scratch = kDevGames;
+    std::wstring legacy  = std::wstring(kLocalState) + L"game\\";
+    auto under = [&](const std::wstring& root) {
+        return !root.empty() && StartsWithNoCase(d, root) && d.size() > root.size();
+    };
+    return under(scratch) || under(legacy);
+}
+
+static bool LuiDeleteTree(const std::wstring& dir)
+{
+    std::wstring root = dir;
+    if (root.empty()) return false;
+    if (root.back() != L'\\' && root.back() != L'/') root += L'\\';
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((root + L"*").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            std::wstring n = fd.cFileName;
+            if (n == L"." || n == L"..") continue;
+            std::wstring p = root + n;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                LuiDeleteTree(p);
+            else {
+                SetFileAttributesW(p.c_str(), FILE_ATTRIBUTE_NORMAL);
+                if (!DeleteFileW(p.c_str()))
+                    Diag("LAUNCHER uninstall file fail '" + LuiNarrow(p) + "' err=" + Hex(GetLastError()));
+            }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    SetFileAttributesW(dir.c_str(), FILE_ATTRIBUTE_NORMAL);
+    BOOL ok = RemoveDirectoryW(dir.c_str());
+    if (!ok) Diag("LAUNCHER uninstall rmdir fail '" + LuiNarrow(dir) + "' err=" + Hex(GetLastError()));
+    return ok != 0;
 }
 
 static DWORD LuiFileSize(const std::wstring& path)
@@ -462,7 +516,145 @@ static void LuiText(const wchar_t* s, IDWriteTextFormat* f, D2D1_RECT_F r,
     g_lui.dc->DrawText(s, (UINT32)wcslen(s), f, r, b);
 }
 
-static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const std::wstring& status)
+// Xbox system on-screen keyboard (gamepad). DirectX/UWP apps don't have a
+// XAML TextBox, so the OSK is summoned via CoreTextEditContext + InputPane /
+// CoreInputView — the same path Microsoft documents for custom-renderer UWP
+// on Xbox. USB keyboard still works as a side channel.
+static winrt::Windows::UI::Text::Core::CoreTextEditContext g_pickEdit{ nullptr };
+static bool g_pickOskWired = false;
+static std::wstring g_pickQuery;
+static bool g_pickQueryChanged = false;
+static int g_pickSelStart = 0, g_pickSelEnd = 0;
+
+static void PickerOskNotifyText()
+{
+    if (!g_pickEdit) return;
+    int n = (int)g_pickQuery.size();
+    if (g_pickSelStart < 0) g_pickSelStart = 0;
+    if (g_pickSelEnd < g_pickSelStart) g_pickSelEnd = g_pickSelStart;
+    if (g_pickSelStart > n) g_pickSelStart = n;
+    if (g_pickSelEnd > n) g_pickSelEnd = n;
+    winrt::Windows::UI::Text::Core::CoreTextRange mod{ 0, n };
+    winrt::Windows::UI::Text::Core::CoreTextRange sel{ g_pickSelStart, g_pickSelEnd };
+    try { g_pickEdit.NotifyTextChanged(mod, n, sel); } catch (...) {}
+}
+
+static void PickerOskEnsure()
+{
+    if (g_pickOskWired) return;
+    try {
+        using namespace winrt::Windows::UI::Text::Core;
+        auto mgr = CoreTextServicesManager::GetForCurrentView();
+        g_pickEdit = mgr.CreateEditContext();
+        g_pickEdit.Name(L"Greenhouse search");
+        g_pickEdit.InputScope(CoreTextInputScope::Search);
+        g_pickEdit.InputPaneDisplayPolicy(CoreTextInputPaneDisplayPolicy::Manual);
+        g_pickEdit.TextRequested([](auto const&, CoreTextTextRequestedEventArgs const& args) {
+            auto req = args.Request();
+            auto r = req.Range();
+            int n = (int)g_pickQuery.size();
+            int a = r.StartCaretPosition, b = r.EndCaretPosition;
+            if (a < 0) a = 0; if (b < a) b = a;
+            if (a > n) a = n; if (b > n) b = n;
+            req.Text(winrt::hstring(g_pickQuery.substr((size_t)a, (size_t)(b - a))));
+        });
+        g_pickEdit.SelectionRequested([](auto const&, CoreTextSelectionRequestedEventArgs const& args) {
+            CoreTextRange sel{ g_pickSelStart, g_pickSelEnd };
+            args.Request().Selection(sel);
+        });
+        g_pickEdit.LayoutRequested([](auto const&, CoreTextLayoutRequestedEventArgs const& args) {
+            auto bounds = args.Request().LayoutBounds();
+            float W = g_lui.w ? (float)g_lui.w : 1920.f;
+            winrt::Windows::Foundation::Rect bar{ 80.f, 182.f, W - 160.f, 36.f };
+            bounds.ControlBounds(bar);
+            bounds.TextBounds(bar);
+        });
+        g_pickEdit.TextUpdating([](auto const&, CoreTextTextUpdatingEventArgs const& args) {
+            auto r = args.Range();
+            std::wstring ins = args.Text().c_str();
+            int n = (int)g_pickQuery.size();
+            int a = r.StartCaretPosition, b = r.EndCaretPosition;
+            if (a < 0) a = 0; if (b < a) b = a;
+            if (a > n) a = n; if (b > n) b = n;
+            if (ins.empty() && a == b && a > 0) { a--; }  // some OSK backspaces are a caret-only empty update
+            g_pickQuery.replace((size_t)a, (size_t)(b - a), ins);
+            auto ns = args.NewSelection();
+            g_pickSelStart = ns.StartCaretPosition;
+            g_pickSelEnd = ns.EndCaretPosition;
+            n = (int)g_pickQuery.size();
+            if (g_pickSelStart < 0) g_pickSelStart = 0;
+            if (g_pickSelEnd < g_pickSelStart) g_pickSelEnd = g_pickSelStart;
+            if (g_pickSelStart > n) g_pickSelStart = n;
+            if (g_pickSelEnd > n) g_pickSelEnd = n;
+            args.Result(CoreTextTextUpdatingResult::Succeeded);
+            g_pickQueryChanged = true;
+        });
+        g_pickEdit.SelectionUpdating([](auto const&, CoreTextSelectionUpdatingEventArgs const& args) {
+            auto ns = args.Selection();
+            g_pickSelStart = ns.StartCaretPosition;
+            g_pickSelEnd = ns.EndCaretPosition;
+            args.Result(CoreTextSelectionUpdatingResult::Succeeded);
+        });
+        g_pickEdit.FocusRemoved([](auto const&, auto const&) {
+            g_pickOskOpen = false;
+            Diag("LAUNCHER search OSK dismissed");
+        });
+        g_pickOskWired = true;
+        Diag("LAUNCHER search OSK context ready");
+    } catch (...) {
+        Diag("LAUNCHER search OSK context failed");
+        g_pickEdit = nullptr;
+    }
+}
+
+static void PickerOskHide()
+{
+    if (!g_pickOskOpen) return;
+    g_pickOskOpen = false;
+    try { if (g_pickEdit) g_pickEdit.NotifyFocusLeave(); } catch (...) {}
+    try {
+        winrt::Windows::UI::ViewManagement::InputPane::GetForCurrentView().TryHide();
+    } catch (...) {}
+    try {
+        winrt::Windows::UI::ViewManagement::Core::CoreInputView::GetForCurrentView().TryHidePrimaryView();
+    } catch (...) {}
+}
+
+static void PickerOskShow()
+{
+    PickerOskEnsure();
+    if (!g_pickEdit) { Diag("LAUNCHER search OSK unavailable"); return; }
+    g_pickSelStart = g_pickSelEnd = (int)g_pickQuery.size();
+    g_pickOskOpen = true;
+    try { g_pickEdit.NotifyFocusEnter(); } catch (...) {}
+    bool shown = false;
+    try {
+        shown = winrt::Windows::UI::ViewManagement::InputPane::GetForCurrentView().TryShow();
+    } catch (...) {}
+    if (!shown) {
+        try {
+            shown = winrt::Windows::UI::ViewManagement::Core::CoreInputView::GetForCurrentView().TryShowPrimaryView();
+        } catch (...) {}
+    }
+    Diag(std::string("LAUNCHER search OSK show=") + (shown ? "ok" : "TryShow false (Xbox may still raise the pane)"));
+}
+
+static bool LuiContainsI(const std::wstring& hay, const std::wstring& needle)
+{
+    if (needle.empty()) return true;
+    if (hay.size() < needle.size()) return false;
+    for (size_t i = 0; i + needle.size() <= hay.size(); ++i) {
+        bool ok = true;
+        for (size_t j = 0; j < needle.size(); ++j)
+            if (towlower(hay[i + j]) != towlower(needle[j])) { ok = false; break; }
+        if (ok) return true;
+    }
+    return false;
+}
+
+static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const std::wstring& status,
+                        const std::wstring& query, int matchN, int allN,
+                        const wchar_t* uninstallName)
 {
     auto* dc = g_lui.dc.get();
     const float W = (float)g_lui.w, H = (float)g_lui.h;
@@ -474,10 +666,17 @@ static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const s
     LuiText((L"\u25CF  " + status).c_str(), g_lui.fmtSmall.get(),
             D2D1::RectF(84, 140, W - 80, 182), g_lui.brAccent.get());
 
+    std::wstring sline = query.empty()
+        ? (g_pickOskOpen ? L"Search:  _" : L"Search:  Y for on-screen keyboard")
+        : (L"Search:  " + query + L"_");
+    LuiText(sline.c_str(), g_lui.fmtSmall.get(),
+            D2D1::RectF(84, 182, W - 280, 218),
+            (query.empty() && !g_pickOskOpen) ? g_lui.brDim.get() : g_lui.brFg.get());
+
     // Item list, with a scroll window so a long (owned-library) list stays fully
     // navigable: keep the selected row inside [top, footer). Compute how many rows fit,
     // then a first-visible index that scrolls to follow sel.
-    const float x0 = 80, x1 = W - 80, rowH = 76, top = 220;
+    const float x0 = 80, x1 = W - 80, rowH = 76, top = 228;
     const int nfit = (int)((H - 90 - top) / rowH); if (nfit < 1) return;
     int total = (int)items.size();
     int first = 0;
@@ -498,16 +697,41 @@ static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const s
                 D2D1::RectF(x1 - 240, y, x1 - 24, y + rowH - 12),
                 cur ? g_lui.brFg.get() : g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
-    // Scroll position hint (e.g. "12 / 214") when the list overflows.
-    if (total > nfit) {
-        wchar_t pos[32]; swprintf(pos, 32, L"%d / %d", sel + 1, total);
-        LuiText(pos, g_lui.fmtSmall.get(), D2D1::RectF(x0, 182, x1, 214),
+    {
+        wchar_t pos[48];
+        if (query.empty())
+            swprintf(pos, 48, L"%d / %d", sel + 1, allN > 0 ? allN : total);
+        else
+            swprintf(pos, 48, L"%d / %d match", matchN > 0 ? sel + 1 : 0, matchN);
+        LuiText(pos, g_lui.fmtSmall.get(), D2D1::RectF(x0, 182, x1, 218),
                 g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
 
     // Footer
-    LuiText(L"\u25B2 \u25BC  Move      A  Launch / Install      Dev Mode only \u00B7 games you own",
+    LuiText(L"\u25B2 \u25BC  Move      \u25C0 \u25B6  Jump 5      A  Launch      X  Uninstall      Y  Search      B  Back",
             g_lui.fmtSmall.get(), D2D1::RectF(84, H - 70, W - 80, H - 30), g_lui.brDim.get());
+
+    if (uninstallName && uninstallName[0]) {
+        dc->FillRectangle(D2D1::RectF(0, 0, W, H), g_lui.brBg.get());
+        float cx = W * 0.5f, cy = H * 0.5f;
+        D2D1_ROUNDED_RECT box = D2D1::RoundedRect(D2D1::RectF(cx - 460, cy - 200, cx + 460, cy + 200), 16, 16);
+        dc->FillRoundedRectangle(box, g_lui.brPanel.get());
+        LuiText(L"UNINSTALL", g_lui.fmtTitle.get(),
+                D2D1::RectF(cx - 430, cy - 180, cx + 430, cy - 100),
+                g_lui.brWarn.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+        LuiText(L"Remove this game from the console?", g_lui.fmtItem.get(),
+                D2D1::RectF(cx - 430, cy - 90, cx + 430, cy - 30),
+                g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+        LuiText(uninstallName, g_lui.fmtItem.get(),
+                D2D1::RectF(cx - 430, cy - 20, cx + 430, cy + 40),
+                g_lui.brAccent.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+        LuiText(L"The install folder will be deleted. This cannot be undone.", g_lui.fmtSmall.get(),
+                D2D1::RectF(cx - 430, cy + 50, cx + 430, cy + 100),
+                g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+        LuiText(L"A  Yes, uninstall            B  Cancel", g_lui.fmtSmall.get(),
+                D2D1::RectF(cx - 430, cy + 110, cx + 430, cy + 170),
+                g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
 
     dc->EndDraw();
 }
@@ -1198,11 +1422,33 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
     if (!g_gfx.ready) { try { BuildBridgeOnUi(); } catch (...) {} }
     if (!LuiInit()) return L"";
 
-    std::vector<LauncherItem> items;
+    std::vector<LauncherItem> all, items;
     LauncherDlReq dlreq;
     int sel = 0;
     WORD prev = 0xFFFF;                 // ignore buttons already held on entry
     DWORD lastNav = 0;
+    g_pickQuery.clear();
+    g_pickQueryChanged = false;
+    g_pickSelStart = g_pickSelEnd = 0;
+    int matchN = 0;
+    bool uninstallAsk = false;
+    LauncherItem uninstallIt;
+
+    auto applyFilter = [&]() {
+        items.clear();
+        if (g_pickQuery.empty()) items = all;
+        else {
+            for (const auto& it : all)
+                if (LuiContainsI(it.display, g_pickQuery)) items.push_back(it);
+        }
+        matchN = (int)items.size();
+        if (items.empty()) {
+            LauncherItem it; it.display = L"No matches";
+            it.guest = L"@@none"; it.sub = L"Y search \u00B7 B clear"; items.push_back(it);
+        }
+        if (sel >= (int)items.size()) sel = (int)items.size() - 1;
+        if (sel < 0) sel = 0;
+    };
 
     // (Re)build the item list: the installed/owned library plus any staged gh_download.txt
     // request as the first item; never empty (an empty list would index items[sel] out of
@@ -1210,44 +1456,123 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
     // default guest and exiting. Resets selection + the edge detector. Used at entry and
     // after a download completes so the freshly-installed game appears.
     auto rebuild = [&]() {
-        items = LuiEnumerate();
+        all = LuiEnumerate();
         dlreq = LauncherReadDlReq();
         if (dlreq.ok) {
             LauncherItem it; it.display = L"⤓  Download: " + std::wstring(dlreq.name.begin(), dlreq.name.end());
-            it.guest = L"@@download"; it.sub = L"from Steam"; items.insert(items.begin(), it);
+            it.guest = L"@@download"; it.sub = L"from Steam"; all.insert(all.begin(), it);
         }
-        if (items.empty()) {
+        if (all.empty()) {
             LauncherItem it; it.display = L"No games installed";
-            it.guest = L"@@none"; it.sub = L"download or add a game on USB"; items.push_back(it);
+            it.guest = L"@@none"; it.sub = L"download or add a game on USB"; all.push_back(it);
         }
         sel = 0; prev = 0xFFFF;
+        applyFilter();
     };
     rebuild();
-    Diag("LAUNCHER picker items=" + std::to_string(items.size()));
+    Diag("LAUNCHER picker items=" + std::to_string(all.size()));
     for (;;) {
         if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
         PollGamepadOnUi();
         PollSyntheticPad();
 
-        WORD b, ly_hi = 0, ly_lo = 0;
+        bool qdirty = g_pickQueryChanged;
+        g_pickQueryChanged = false;
+        bool kbMut = false;
+        {
+            std::lock_guard<std::mutex> lk(g_pickKbMu);
+            if (g_pickOskOpen && qdirty) {
+                // CoreText already applied this key. Drop the synthetic Back/char
+                // so we do not delete twice if the OSK also sent VK_BACK.
+                g_pickKbBack = 0;
+                g_pickKbChars.clear();
+            }
+            if (g_pickKbClear) {
+                g_pickQuery.clear(); g_pickKbClear = false; g_pickKbChars.clear(); g_pickKbBack = 0;
+                g_pickSelStart = g_pickSelEnd = 0; qdirty = true; kbMut = true;
+            }
+            while (g_pickKbBack > 0) {
+                if (!g_pickQuery.empty()) g_pickQuery.pop_back();
+                --g_pickKbBack; qdirty = true; kbMut = true;
+            }
+            if (!g_pickKbChars.empty()) { g_pickQuery += g_pickKbChars; g_pickKbChars.clear(); qdirty = true; kbMut = true; }
+        }
+        if (kbMut) {
+            g_pickSelStart = g_pickSelEnd = (int)g_pickQuery.size();
+            if (g_pickOskOpen) PickerOskNotifyText();
+        }
+        if (qdirty) { sel = 0; applyFilter(); }
+
+        WORD b, ly_hi = 0, ly_lo = 0, lx_hi = 0, lx_lo = 0;
         { std::lock_guard<std::mutex> lk(g_padMutex);
           b = g_padState.wButtons;
           if (g_padState.sThumbLY >  16000) ly_hi = 1;
-          if (g_padState.sThumbLY < -16000) ly_lo = 1; }
+          if (g_padState.sThumbLY < -16000) ly_lo = 1;
+          if (g_padState.sThumbLX >  16000) lx_hi = 1;
+          if (g_padState.sThumbLX < -16000) lx_lo = 1; }
         // Treat left-stick as d-pad, with a simple repeat throttle.
+        // Vertical = 1 row; horizontal = jump 5 (faster scrub of a long library).
         WORD synth = b;
         DWORD now = GetTickCount();
         bool navGate = (now - lastNav) > 160;
         if (ly_hi && navGate) synth |= XINPUT_GAMEPAD_DPAD_UP;
         if (ly_lo && navGate) synth |= XINPUT_GAMEPAD_DPAD_DOWN;
+        if (lx_lo && navGate) synth |= XINPUT_GAMEPAD_DPAD_LEFT;
+        if (lx_hi && navGate) synth |= XINPUT_GAMEPAD_DPAD_RIGHT;
         WORD pressed = synth & ~prev;
         prev = b;                       // edge off the raw buttons; stick uses navGate
 
-        if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) {
-            if (sel > 0) { sel--; lastNav = now; }
+        int n = (int)items.size();
+        auto jump = [&](int d) {
+            int ns = sel + d;
+            if (ns < 0) ns = 0;
+            if (ns > n - 1) ns = n - 1;
+            if (ns != sel) { sel = ns; lastNav = now; }
+        };
+        if (uninstallAsk) {
+            if (pressed & XINPUT_GAMEPAD_B) {
+                Diag("LAUNCHER uninstall cancelled");
+                uninstallAsk = false;
+                prev = b;
+            } else if (pressed & XINPUT_GAMEPAD_A) {
+                std::wstring folder = LuiInstallFolder(uninstallIt);
+                Diag("LAUNCHER uninstall '" + LuiNarrow(uninstallIt.display) +
+                     "' dir='" + LuiNarrow(folder) + "'");
+                bool ok = false;
+                if (LuiCanUninstall(uninstallIt)) ok = LuiDeleteTree(folder);
+                Diag(std::string("LAUNCHER uninstall ") + (ok ? "ok" : "FAIL"));
+                uninstallAsk = false;
+                rebuild();
+                prev = b;
+            }
+            LuiDrawMenu(items, sel, status, g_pickQuery, matchN, (int)all.size(),
+                        uninstallIt.display.c_str());
+            LuiPresent();
+            Sleep(16);
+            continue;
         }
-        if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) {
-            if (sel < (int)items.size() - 1) { sel++; lastNav = now; }
+        if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) jump(-1);
+        if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) jump(+1);
+        if ((pressed & XINPUT_GAMEPAD_DPAD_LEFT) || (lx_lo && navGate)) jump(-5);
+        if ((pressed & XINPUT_GAMEPAD_DPAD_RIGHT) || (lx_hi && navGate)) jump(+5);
+        if (pressed & XINPUT_GAMEPAD_Y) {
+            if (g_pickOskOpen) PickerOskHide();
+            else PickerOskShow();
+        }
+        if (pressed & XINPUT_GAMEPAD_B) {
+            if (g_pickOskOpen) PickerOskHide();
+            else if (!g_pickQuery.empty()) {
+                g_pickQuery.clear();
+                g_pickSelStart = g_pickSelEnd = 0;
+                sel = 0; applyFilter();
+            }
+        }
+        if (pressed & XINPUT_GAMEPAD_X) {
+            if (!g_pickOskOpen && LuiCanUninstall(items[sel])) {
+                uninstallAsk = true;
+                uninstallIt = items[sel];
+                Diag("LAUNCHER uninstall prompt '" + LuiNarrow(uninstallIt.display) + "'");
+            }
         }
         if (pressed & XINPUT_GAMEPAD_A) {
             const LauncherItem& it = items[sel];
@@ -1280,10 +1605,11 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
                 }
             }
             g_launcherSelectedApp = it.app;
+            PickerOskHide();
             return it.guest;
         }
 
-        LuiDrawMenu(items, sel, status);
+        LuiDrawMenu(items, sel, status, g_pickQuery, matchN, (int)all.size(), nullptr);
         LuiPresent();
         Sleep(16);
     }

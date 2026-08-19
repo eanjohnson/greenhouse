@@ -2089,6 +2089,36 @@ static volatile bool     g_guestUserQuit  = false;  // skip SESSION ENDED splash
 static volatile bool     g_ovlConfirm     = false;  // quit "Are you sure?" panel
 static DWORD             g_uiThreadId     = 0;      // App::Run — never TerminateThread this
 static std::vector<DWORD> g_hostThreadSnap;         // threads that existed before this guest
+// Picker type-to-search (pre-guest only). CharacterReceived / Back / Escape.
+static std::mutex        g_pickKbMu;
+static std::wstring      g_pickKbChars;
+static int               g_pickKbBack = 0;
+static bool              g_pickKbClear = false;
+static bool              g_pickOskOpen = false;  // Xbox OSK owns printable text; Back still comes in as VK
+static void PickerOnBackspace();
+static void PickerOnChar(wchar_t ch)
+{
+    if (g_guestRunning) return;
+    if (ch == 8) { PickerOnBackspace(); return; }
+    if (g_pickOskOpen) return;          // printable keys: CoreText TextUpdating owns them
+    if (ch < 32 || ch == 127) return;
+    std::lock_guard<std::mutex> lk(g_pickKbMu);
+    if (g_pickKbChars.size() < 64) g_pickKbChars.push_back(ch);
+}
+static void PickerOnBackspace()
+{
+    if (g_guestRunning) return;
+    std::lock_guard<std::mutex> lk(g_pickKbMu);
+    if (g_pickKbBack < 1) g_pickKbBack = 1;   // coalesce KeyDown + CharacterReceived
+}
+static void PickerOnClear()
+{
+    if (g_guestRunning) return;
+    std::lock_guard<std::mutex> lk(g_pickKbMu);
+    g_pickKbClear = true;
+    g_pickKbChars.clear();
+    g_pickKbBack = 0;
+}
 #endif
 static LONG              g_kmRelX = 0, g_kmRelY = 0; // accumulated raw delta (mouse-look, phase 2)
 static int               g_kmPrevButtons = 0;        // bit0 L, bit1 R, bit2 M (edge detection)
@@ -2630,6 +2660,12 @@ static void KM_OnKey(winrt::Windows::UI::Core::KeyEventArgs const& e, bool down)
         g_vkDown[vk] = down; g_kmActive = true;
         if (++g_kmKeyEvents == 1) Diag("INPUT km: first keyboard event vk=" + std::to_string(vk));
     }
+#ifdef GH_LAUNCHER
+    if (!g_guestRunning && down) {
+        if (vk == VK_BACK) PickerOnBackspace();
+        if (vk == VK_ESCAPE) PickerOnClear();
+    }
+#endif
     // Build a faithful WM_KEY* lParam: repeat count, scan code, extended/up flags.
     LPARAM lp = (LPARAM)(st.RepeatCount ? st.RepeatCount : 1);
     lp |= (LPARAM)(st.ScanCode & 0xFF) << 16;
@@ -5561,6 +5597,11 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
         try {
             window.KeyDown([](CoreWindow const&, KeyEventArgs const& e){ KM_OnKey(e, true);  });
             window.KeyUp  ([](CoreWindow const&, KeyEventArgs const& e){ KM_OnKey(e, false); });
+#ifdef GH_LAUNCHER
+            window.CharacterReceived([](CoreWindow const&, CharacterReceivedEventArgs const& e){
+                PickerOnChar((wchar_t)e.KeyCode());
+            });
+#endif
             window.PointerMoved       ([](CoreWindow const&, PointerEventArgs const& e){ KM_OnPointer(e); });
             window.PointerPressed     ([](CoreWindow const&, PointerEventArgs const& e){ KM_OnPointer(e); });
             window.PointerReleased    ([](CoreWindow const&, PointerEventArgs const& e){ KM_OnPointer(e); });
