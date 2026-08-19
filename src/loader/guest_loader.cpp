@@ -1060,6 +1060,13 @@ static LSTATUS APIENTRY Bed_RegOpenKeyExA(HKEY r, LPCSTR sub, DWORD, REGSAM, PHK
 static LSTATUS APIENTRY Bed_RegOpenKeyA(HKEY r, LPCSTR sub, PHKEY out){ return RegOpenImpl(r, RegWiden(sub), out); }
 static LSTATUS APIENTRY Bed_RegCreateKeyExW(HKEY r, LPCWSTR sub, DWORD, LPWSTR, DWORD, REGSAM, LPSECURITY_ATTRIBUTES, PHKEY out, LPDWORD disp){ return RegCreateImpl(r, sub?sub:L"", out, disp); }
 static LSTATUS APIENTRY Bed_RegCreateKeyExA(HKEY r, LPCSTR sub, DWORD, LPSTR, DWORD, REGSAM, LPSECURITY_ATTRIBUTES, PHKEY out, LPDWORD disp){ return RegCreateImpl(r, RegWiden(sub), out, disp); }
+// Unity PlayerPrefs (Photon BestRegionSummaryInPreferences) uses the old
+// RegCreateKeyW, not Ex. Unbedded, it hits real advapi32; the handle is then
+// unknown to RegSetValueExW → ERROR_INVALID_HANDLE → PlayerPrefsException
+// aborting Photon's OnClientStateChanged (infinite lobby load).
+static LSTATUS APIENTRY Bed_RegCreateKeyW(HKEY r, LPCWSTR sub, PHKEY out){ return RegCreateImpl(r, sub?sub:L"", out, nullptr); }
+static LSTATUS APIENTRY Bed_RegCreateKeyA(HKEY r, LPCSTR sub, PHKEY out){ return RegCreateImpl(r, RegWiden(sub), out, nullptr); }
+static LSTATUS APIENTRY Bed_RegOpenKeyW(HKEY r, LPCWSTR sub, PHKEY out){ return RegOpenImpl(r, sub?sub:L"", out); }
 static LSTATUS APIENTRY Bed_RegSetValueExW(HKEY hk, LPCWSTR name, DWORD, DWORD type, const BYTE* data, DWORD cb){ return RegSetImpl(hk, name?name:L"", type, data, cb, false); }
 static LSTATUS APIENTRY Bed_RegSetValueExA(HKEY hk, LPCSTR name, DWORD, DWORD type, const BYTE* data, DWORD cb){ return RegSetImpl(hk, RegWiden(name), type, data, cb, true); }
 static LSTATUS APIENTRY Bed_RegQueryValueExW(HKEY hk, LPCWSTR name, LPDWORD, LPDWORD ptype, LPBYTE data, LPDWORD pcb){ return RegQueryImpl(hk, name?name:L"", ptype, data, pcb, false); }
@@ -3246,10 +3253,13 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"RegOpenKeyExW",              (void*)&Bed_RegOpenKeyExW},
         {"RegOpenKeyExA",              (void*)&Bed_RegOpenKeyExA},
         {"RegOpenKeyA",                (void*)&Bed_RegOpenKeyA},
+        {"RegOpenKeyW",                (void*)&Bed_RegOpenKeyW},
         {"RegQueryValueExW",           (void*)&Bed_RegQueryValueExW},
         {"RegQueryValueExA",           (void*)&Bed_RegQueryValueExA},
         {"RegCreateKeyExW",            (void*)&Bed_RegCreateKeyExW},
         {"RegCreateKeyExA",            (void*)&Bed_RegCreateKeyExA},
+        {"RegCreateKeyW",              (void*)&Bed_RegCreateKeyW},
+        {"RegCreateKeyA",              (void*)&Bed_RegCreateKeyA},
         {"RegSetValueExW",             (void*)&Bed_RegSetValueExW},
         {"RegSetValueExA",             (void*)&Bed_RegSetValueExA},
         {"RegCloseKey",                (void*)&Bed_RegCloseKey},
@@ -3316,9 +3326,10 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         // Virtual registry (Path X cold-client): steamclient reads/writes the
         // Valve\Steam ActiveProcess keys, mostly via the ANSI variants.
         {"RegOpenKeyExW", (void*)&Bed_RegOpenKeyExW}, {"RegOpenKeyExA", (void*)&Bed_RegOpenKeyExA},
-        {"RegOpenKeyA", (void*)&Bed_RegOpenKeyA},
+        {"RegOpenKeyA", (void*)&Bed_RegOpenKeyA}, {"RegOpenKeyW", (void*)&Bed_RegOpenKeyW},
         {"RegQueryValueExW", (void*)&Bed_RegQueryValueExW}, {"RegQueryValueExA", (void*)&Bed_RegQueryValueExA},
         {"RegCreateKeyExW", (void*)&Bed_RegCreateKeyExW}, {"RegCreateKeyExA", (void*)&Bed_RegCreateKeyExA},
+        {"RegCreateKeyW", (void*)&Bed_RegCreateKeyW}, {"RegCreateKeyA", (void*)&Bed_RegCreateKeyA},
         {"RegSetValueExW", (void*)&Bed_RegSetValueExW}, {"RegSetValueExA", (void*)&Bed_RegSetValueExA},
         {"RegCloseKey", (void*)&Bed_RegCloseKey},
         {"RegEnumKeyExA", (void*)&Bed_RegEnumKeyExA}, {"RegEnumValueA", (void*)&Bed_RegEnumValueA},

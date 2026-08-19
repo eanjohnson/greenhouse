@@ -930,10 +930,10 @@ EXPORTS
     SteamAPI_ISteamUser_BLoggedOn
     SteamAPI_ISteamUser_BSetDurationControlOnlineState=steam_stub
     SteamAPI_ISteamUser_BeginAuthSession=steam_stub
-    SteamAPI_ISteamUser_CancelAuthTicket=steam_stub
+    SteamAPI_ISteamUser_CancelAuthTicket
     SteamAPI_ISteamUser_DecompressVoice=steam_stub
     SteamAPI_ISteamUser_EndAuthSession=steam_stub
-    SteamAPI_ISteamUser_GetAuthSessionTicket=steam_stub
+    SteamAPI_ISteamUser_GetAuthSessionTicket
     SteamAPI_ISteamUser_GetAuthTicketForWebApi=steam_stub
     SteamAPI_ISteamUser_GetAvailableVoice=steam_stub
     SteamAPI_ISteamUser_GetDurationControl=steam_stub

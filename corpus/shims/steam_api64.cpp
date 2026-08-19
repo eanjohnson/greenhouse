@@ -1497,6 +1497,39 @@ __declspec(dllexport) int      SteamAPI_ISteamUser_GetPlayerSteamLevel(void*) { 
 __declspec(dllexport) bool     SteamAPI_ISteamUser_BIsBehindNAT(void*)    { return false; }
 __declspec(dllexport) int      SteamAPI_ISteamUser_InitiateGameConnection_DEPRECATED(void*, void*, int, uint64_steamid, uint32_t, uint16_t, bool) { return 0; }
 
+// REPO Photon Steam auth (NetworkConnect.SendSteamAuthTicket). Was steam_stub →
+// Facepunch returned a null AuthTicket → NRE on ticket.Data → CreateLobby
+// coroutine died before ConnectUsingSettings → infinite lobby loading.
+// IClientUser: 110 V1 (pTicket,cbMax,pcb), 112 V3 (+ SteamNetworkingIdentity*),
+// 117 CancelAuthTicket. Prefer V1 (4-arg P/Invoke safe); V3 if V1 yields nothing.
+typedef uint32_t HAuthTicket;
+__declspec(dllexport) HAuthTicket SteamAPI_ISteamUser_GetAuthSessionTicket(
+    void* /*self*/, void* pTicket, int cbMaxTicket, uint32_t* pcbTicket, void* pIdentity)
+{
+    if (pcbTicket) *pcbTicket = 0;
+    if (g_gh_engine_state != 2 || !g_gh_client_user || !pTicket || cbMaxTicket <= 0) {
+        gh_logf("[gh-diag] GetAuthSessionTicket skipped state=%d cu=%p cbMax=%d",
+                g_gh_engine_state, g_gh_client_user, cbMaxTicket);
+        return 0;
+    }
+    HAuthTicket h = gh_vcall<HAuthTicket>(g_gh_client_user, 110, 0, pTicket, cbMaxTicket, pcbTicket);
+    uint32_t n = pcbTicket ? *pcbTicket : 0;
+    if ((!h || !n) && pIdentity) {
+        if (pcbTicket) *pcbTicket = 0;
+        h = gh_vcall<HAuthTicket>(g_gh_client_user, 112, 0, pTicket, cbMaxTicket, pcbTicket, pIdentity);
+        n = pcbTicket ? *pcbTicket : 0;
+        gh_logf("[gh-diag] GetAuthSessionTicket V3 handle=%u pcb=%u", h, n);
+    } else {
+        gh_logf("[gh-diag] GetAuthSessionTicket V1 handle=%u pcb=%u", h, n);
+    }
+    return h;
+}
+__declspec(dllexport) void SteamAPI_ISteamUser_CancelAuthTicket(void* /*self*/, HAuthTicket ticket)
+{
+    if (g_gh_engine_state == 2 && g_gh_client_user && ticket)
+        gh_vcallv<HAuthTicket>(g_gh_client_user, 117, ticket);
+}
+
 // ---- ISteamFriends -----
 // Persona-name lookups route to the REAL ISteamFriends017 (g_gh_friends, acquired after login) so
 // the game shows the real Steam name instead of a placeholder. Without this the host label reads
