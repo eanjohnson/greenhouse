@@ -962,10 +962,14 @@ static void OverlaySetRemap(bool on)
 {
     if ((bool)g_kmRemapOn == on) return;
     g_kmRemapOn = on;
-    if (on) {
+    {
         std::lock_guard<std::mutex> lk(g_kmMutex);
-        g_kmCurX = (LONG)g_winW / 2; g_kmCurY = (LONG)g_winH / 2;
-        g_kmActive = true;
+        if (on) {
+            g_kmCurX = (LONG)g_winW / 2; g_kmCurY = (LONG)g_winH / 2;
+            g_kmActive = true;
+        } else {
+            g_kmActive = false;
+        }
     }
     OverlaySaveRemap();
     g_ovlDirty = true;

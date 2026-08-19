@@ -2171,6 +2171,10 @@ static void DrawCursorOverlay(ID3D11Resource* dst)
     LONG x, y; bool active;
     { std::lock_guard<std::mutex> lk(g_kmMutex); active = g_kmActive; x = g_kmCurX; y = g_kmCurY; }
 #ifdef GH_LAUNCHER
+    // Controller mouse mode owns this crosshair. Leaving it gated on g_kmActive
+    // alone left the cursor stamped after remap was turned off (SetRemap(true)
+    // sets g_kmActive and never cleared it).
+    if (g_guestRunning && !g_kmRemapOn) return;
     if (!active && g_kmRemapOn) { active = true; }
 #endif
     if (!active) return;
