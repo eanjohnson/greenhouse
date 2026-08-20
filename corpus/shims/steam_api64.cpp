@@ -285,6 +285,7 @@ void gh_shim_clear_credentials() {
 static uint64_t g_gh_real_steamid = 0;
 static void gh_test_create_lobby();   // fwd (defined below)
 static void gh_test_networking();     // fwd (defined below)
+static void gh_start_presence_heartbeat();  // CS(Online)+AddClientGame pump (defined below)
 static DWORD WINAPI gh_engine_thread(LPVOID) {
     // Phase C: if the LAUNCHER already logged us in as the real user (GhStartQrLoginAsync
     // completed before the game ran), the session is live in this same shared shim state.
@@ -296,8 +297,10 @@ static DWORD WINAPI gh_engine_thread(LPVOID) {
         gh_logf("[gh-shim] engine thread: already logged in via launcher (real_steamid=%llu); binding app context, no re-login",
                 (unsigned long long)g_gh_real_steamid);
         gh_acquire_game_interfaces(g_gh_engine_dll);
-        gh_logf("[gh-shim] engine thread: app-context (launcher-real) -> %d", (int)gh_fix_app_context(g_gh_engine_dll));
+        gh_logf("[gh-shim] engine thread: app-context (launcher-real) -> %d want=%u",
+                (int)gh_fix_app_context(g_gh_engine_dll), gh_target_appid());
         gh_advertise_game();
+        gh_start_presence_heartbeat();
         return 0;
     }
     // If the LOADER already created the session before Mono (g_gh_client_user set via
@@ -331,6 +334,7 @@ static DWORD WINAPI gh_engine_thread(LPVOID) {
                 // registration path (gh_register_do_call) relies on that allocation and clears the
                 // stale entry so AddClientGame can create a fresh pid'd entry into the clean array.
                 gh_advertise_game();                          // local KeyValues (NumGamesRunning)
+                gh_start_presence_heartbeat();
                 // NOTE: the real CMsgClientGamesPlayed send is driven from the heartbeat thread AFTER
                 // it has heap-scanned + cached the connected CCMInterface (the scan is too slow to run
                 // inline here on the engine thread). See the ALIVE loop below.
@@ -377,6 +381,7 @@ static DWORD WINAPI gh_engine_thread(LPVOID) {
             //   gh_test_networking();     // <-- (they pollute the game's callback state)
             gh_advertise_game();   // local KeyValues (see deferred path above); also allocates the
                                    // games-list array that the registration path reuses
+            gh_start_presence_heartbeat();
             // (real CMsgClientGamesPlayed send is driven from the heartbeat thread after it caches
             // the connected CCMInterface — see the ALIVE loop.)
         }
@@ -556,6 +561,108 @@ static uint64_t g_gh_synth_lobby = 0, g_gh_synth_friend = 0;
 static uint8_t  g_gh_synth_param[16] = {0};
 static volatile long g_gh_open_invite_dialog = 0;
 static uint64_t g_gh_open_invite_lobby = 0;
+
+// Presence pump: CS(Online) then AddClientGame. Used to live only inside
+// GhBringUpEngineNow (the per-game MSIX path). The launcher logs in via
+// GhStartQrLoginAsync and never calls that, so a launched title never
+// broadcast. Start this once from login AND from the guest engine thread.
+static DWORD WINAPI gh_presence_heartbeat_thread(LPVOID) {
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    typedef HANDLE (WINAPI *SnapFn)(DWORD, DWORD);
+    typedef BOOL (WINAPI *ModFn)(HANDLE, void*);
+    SnapFn pSnap = (SnapFn)GetProcAddress(k32, "CreateToolhelp32Snapshot");
+    ModFn pFirst = (ModFn)GetProcAddress(k32, "Module32FirstW");
+    ModFn pNext  = (ModFn)GetProcAddress(k32, "Module32NextW");
+    struct MODULEENTRY32W_LOCAL {
+        DWORD dwSize, th32ModuleID, th32ProcessID, GlblcntUsage, ProccntUsage;
+        BYTE* modBaseAddr; DWORD modBaseSize; HMODULE hModule;
+        wchar_t szModule[256]; wchar_t szExePath[260];
+    };
+    auto recon = [&]() {
+        gh_logf("[gh-shim] RECON: self GetModuleHandleA(steam_api64)=%p",
+                (void*)GetModuleHandleA("steam_api64"));
+        if (pSnap && pFirst && pNext) {
+            HANDLE snap = pSnap(0x18 /*TH32CS_SNAPMODULE|SNAPMODULE32*/, 0);
+            if (snap && snap != (HANDLE)-1) {
+                MODULEENTRY32W_LOCAL me; memset(&me, 0, sizeof(me)); me.dwSize = sizeof(me);
+                for (BOOL ok = pFirst(snap, &me); ok; ok = pNext(snap, &me)) {
+                    char name[256]; WideCharToMultiByte(CP_UTF8, 0, me.szModule, -1, name, sizeof(name), nullptr, nullptr);
+                    if (strstr(name, "steam") || strstr(name, "Steam")) {
+                        char path[260]; WideCharToMultiByte(CP_UTF8, 0, me.szExePath, -1, path, sizeof(path), nullptr, nullptr);
+                        gh_logf("[gh-shim] RECON module: %s base=%p path=%s", name, (void*)me.modBaseAddr, path);
+                    }
+                }
+                CloseHandle(snap);
+            } else gh_logf("[gh-shim] RECON: snapshot failed err=%ld", GetLastError());
+        } else gh_log("[gh-shim] RECON: toolhelp unavailable");
+        static const char* probes[] = {
+            "E:\\LethalCompany\\steam_api64.dll",
+            "E:\\LethalCompany\\Lethal Company_Data\\steam_api64.dll",
+            "E:\\LethalCompany\\Lethal Company_Data\\Plugins\\x86_64\\steam_api64.dll",
+            "E:\\LethalCompany\\Lethal Company_Data\\Managed\\steam_api64.dll",
+            "E:\\LethalCompany\\Lethal Company_Data\\MonoBleedingEdge\\steam_api64.dll",
+            "E:\\LethalCompany\\Lethal Company_Data\\Managed\\Facepunch.Steamworks.Win64.dll",
+            "E:\\LethalCompany\\Lethal Company_Data\\Managed\\Facepunch Transport for Netcode for GameObjects.dll",
+        };
+        for (const char* p : probes) {
+            HANDLE f = CreateFileA(p, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (f == INVALID_HANDLE_VALUE) { gh_logf("[gh-shim] RECON file: %s ABSENT err=%ld", p, GetLastError()); continue; }
+            LARGE_INTEGER sz; GetFileSizeEx(f, &sz);
+            uint8_t buf[8]; DWORD rd = 0; ReadFile(f, buf, 8, &rd, nullptr);
+            CloseHandle(f);
+            gh_logf("[gh-shim] RECON file: %s size=%lld mz=%02x%02x", p, (long long)sz.QuadPart, buf[0], buf[1]);
+        }
+    };
+    recon();
+    gh_diag_reset();
+    bool diagDone = false; int gpTick = 0;
+    for (int i = 1; ; ++i) {
+        Sleep(10000);
+        gh_logf("[gh-shim] ALIVE t=%ds lazy=%ld state=%d playing=%u want=%u reg=%ld",
+                i * 10, g_gh_lazy_once, g_gh_engine_state,
+                g_gh_playing_appid, gh_target_appid(), (long)g_gh_reg_state);
+        if (i == 6 || i == 18) recon();
+        if (g_gh_client_user && g_gh_real_steamid) {
+            if (!diagDone) {
+                diagDone = true;
+                gh_diag_find_ccm(g_gh_real_steamid);
+            }
+            gh_gp_rescan_tick(gh_target_appid(), (++gpTick <= 18));
+            static int s_connect_tick = 0;
+            if (g_gh_hosted_lobby && g_gh_reg_state == 3) {
+                if (s_connect_tick == 0 || (s_connect_tick % 6) == 0) {
+                    gh_logf("[gh-shim] connect %s lobby=%llu",
+                            s_connect_tick == 0 ? "re-assert (post-in-game)" : "keepalive",
+                            (unsigned long long)g_gh_hosted_lobby);
+                    gh_set_connect_richpresence((uint64_t)g_gh_hosted_lobby);
+                }
+                ++s_connect_tick;
+            }
+            if (GetFileAttributesA(gh_trigger_path()) != INVALID_FILE_ATTRIBUTES) {
+                DeleteFileA(gh_trigger_path());
+                uint64_t lob = (uint64_t)g_gh_hosted_lobby;
+                if (lob) {
+                    gh_logf("[gh-shim] invite trigger -> firing for live lobby=%llu", (unsigned long long)lob);
+                    gh_send_games_played(gh_target_appid());
+                    gh_invite_targeted(lob);
+                } else {
+                    gh_log("[gh-shim] invite trigger IGNORED: no active lobby (host first, then re-fire)");
+                }
+            }
+            if (g_gh_friends) gh_dump_friends_once();
+        }
+    }
+    return 0;
+}
+static void gh_start_presence_heartbeat() {
+    static LONG once = 0;
+    if (InterlockedCompareExchange(&once, 1, 0) != 0) return;
+    gh_log("[gh-shim] presence heartbeat starting (CS+AddClientGame after AdvertiseGame)");
+    HANDLE h = CreateThread(nullptr, 0, gh_presence_heartbeat_thread, nullptr, 0, nullptr);
+    if (h) CloseHandle(h);
+    else gh_logf("[gh-shim] presence heartbeat CreateThread failed err=%lu", GetLastError());
+}
+
 static void gh_engine_lazy_init() {
     if (InterlockedCompareExchange(&g_gh_lazy_once, 1, 0) != 0) return;
     gh_log_truncate();   // clean single-run log
@@ -593,119 +700,7 @@ extern "C" __declspec(dllexport) void GhBringUpEngineNow() {
     // pre-created session and does the DEFERRED login once the menu is up.
     int rc = gh_steam_engine_init(60000);
     gh_logf("[gh-shim] GhBringUpEngineNow done: rc=%d state=%d client_user=%p lazy=%ld", rc, g_gh_engine_state, g_gh_client_user, g_gh_lazy_once);
-    // DIAG (2026-08-03): post-bringup heartbeat. Proves gh_log still works after bring-up
-    // and reports the lazy guard/engine state over time — if the game ever calls
-    // SteamAPI_Init, lazy flips to 1 and we see it here even if the entry log were lost.
-    {
-        HANDLE at = CreateThread(nullptr, 0, [](void*) -> DWORD {
-            // On-device recon (resolved at runtime to avoid import-table churn):
-            //  1) every loaded module whose name contains "steam" (path included) —
-            //     catches a SECOND steam_api64 the game may have bound instead of us.
-            //  2) file probes for candidate steam_api64 / Facepunch paths on E:.
-            HMODULE k32 = GetModuleHandleA("kernel32.dll");
-            typedef HANDLE (WINAPI *SnapFn)(DWORD, DWORD);
-            typedef BOOL (WINAPI *ModFn)(HANDLE, void*);
-            SnapFn pSnap = (SnapFn)GetProcAddress(k32, "CreateToolhelp32Snapshot");
-            ModFn pFirst = (ModFn)GetProcAddress(k32, "Module32FirstW");
-            ModFn pNext  = (ModFn)GetProcAddress(k32, "Module32NextW");
-            struct MODULEENTRY32W_LOCAL {
-                DWORD dwSize, th32ModuleID, th32ProcessID, GlblcntUsage, ProccntUsage;
-                BYTE* modBaseAddr; DWORD modBaseSize; HMODULE hModule;
-                wchar_t szModule[256]; wchar_t szExePath[260];
-            };
-            auto recon = [&]() {
-                gh_logf("[gh-shim] RECON: self GetModuleHandleA(steam_api64)=%p",
-                        (void*)GetModuleHandleA("steam_api64"));
-                if (pSnap && pFirst && pNext) {
-                    HANDLE snap = pSnap(0x18 /*TH32CS_SNAPMODULE|SNAPMODULE32*/, 0);
-                    if (snap && snap != (HANDLE)-1) {
-                        MODULEENTRY32W_LOCAL me; memset(&me, 0, sizeof(me)); me.dwSize = sizeof(me);
-                        for (BOOL ok = pFirst(snap, &me); ok; ok = pNext(snap, &me)) {
-                            char name[256]; WideCharToMultiByte(CP_UTF8, 0, me.szModule, -1, name, sizeof(name), nullptr, nullptr);
-                            if (strstr(name, "steam") || strstr(name, "Steam")) {
-                                char path[260]; WideCharToMultiByte(CP_UTF8, 0, me.szExePath, -1, path, sizeof(path), nullptr, nullptr);
-                                gh_logf("[gh-shim] RECON module: %s base=%p path=%s", name, (void*)me.modBaseAddr, path);
-                            }
-                        }
-                        CloseHandle(snap);
-                    } else gh_logf("[gh-shim] RECON: snapshot failed err=%ld", GetLastError());
-                } else gh_log("[gh-shim] RECON: toolhelp unavailable");
-                static const char* probes[] = {
-                    "E:\\LethalCompany\\steam_api64.dll",
-                    "E:\\LethalCompany\\Lethal Company_Data\\steam_api64.dll",
-                    "E:\\LethalCompany\\Lethal Company_Data\\Plugins\\x86_64\\steam_api64.dll",
-                    "E:\\LethalCompany\\Lethal Company_Data\\Managed\\steam_api64.dll",
-                    "E:\\LethalCompany\\Lethal Company_Data\\MonoBleedingEdge\\steam_api64.dll",
-                    "E:\\LethalCompany\\Lethal Company_Data\\Managed\\Facepunch.Steamworks.Win64.dll",
-                    "E:\\LethalCompany\\Lethal Company_Data\\Managed\\Facepunch Transport for Netcode for GameObjects.dll",
-                };
-                for (const char* p : probes) {
-                    HANDLE f = CreateFileA(p, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-                    if (f == INVALID_HANDLE_VALUE) { gh_logf("[gh-shim] RECON file: %s ABSENT err=%ld", p, GetLastError()); continue; }
-                    LARGE_INTEGER sz; GetFileSizeEx(f, &sz);
-                    uint8_t buf[8]; DWORD rd = 0; ReadFile(f, buf, 8, &rd, nullptr);
-                    CloseHandle(f);
-                    gh_logf("[gh-shim] RECON file: %s size=%lld mz=%02x%02x", p, (long long)sz.QuadPart, buf[0], buf[1]);
-                }
-            };
-            recon();              // immediate scan (pre-menu)
-            gh_diag_reset();     // clean gh_ccm.txt once per session (CCM scan + games-played both append)
-            bool diagDone = false; int gpTick = 0;
-            for (int i = 1; ; ++i) {
-                Sleep(10000);
-                gh_logf("[gh-shim] ALIVE t=%ds lazy=%ld state=%d", i * 10, g_gh_lazy_once, g_gh_engine_state);
-                if (i == 6 || i == 18) recon();   // re-scan ~1min and ~3min in (post-menu)
-                // Once logged in: run the connected-CCMInterface heap scan ONCE on THIS (heartbeat)
-                // thread — it caches g_gh_ccm_list (bounded, ~1-2s) and must NOT run on the game's
-                // callback thread (froze hosting) or the engine thread (deadlocked on GetSteamID).
-                // Then fan-out games-played through the cached CMs, and re-assert ~every 30s.
-                if (g_gh_client_user && g_gh_real_steamid) {
-                    if (!diagDone) {
-                        diagDone = true;
-                        gh_diag_find_ccm(g_gh_real_steamid);       // one-time verbose topology dump
-                    }
-                    // RE-SCAN + send every tick (~10s). The persistent persona CM may only come fully up
-                    // after login settles or after a lobby host, and stale cached pointers go dead — so
-                    // re-scan and route through the highest-session CM found each time. Verbose (per-CM
-                    // session + owning-CUser vtable) for the first ~3 min so we can see which CM is stable.
-                    gh_gp_rescan_tick(gh_target_appid(), (++gpTick <= 18));
-                    // Deterministic connect re-assert: once the register (AddClientGame) has marked us
-                    // in-game (g_gh_reg_state==3), re-set the joinable "connect" rich-presence for the
-                    // hosted lobby so its server upload is guaranteed to happen WHILE in-game — closing
-                    // the host-before-presence race the LobbyCreated_t one-shot can't recover from.
-                    static int s_connect_tick = 0;
-                    if (g_gh_hosted_lobby && g_gh_reg_state == 3) {
-                        if (s_connect_tick == 0 || (s_connect_tick % 6) == 0) {
-                            gh_logf("[gh-shim] connect %s lobby=%llu",
-                                    s_connect_tick == 0 ? "re-assert (post-in-game)" : "keepalive",
-                                    (unsigned long long)g_gh_hosted_lobby);
-                            gh_set_connect_richpresence((uint64_t)g_gh_hosted_lobby);
-                        }
-                        ++s_connect_tick;
-                    }
-                    // REMOTE INVITE TRIGGER: the invite is no longer auto-sent at LobbyCreated_t
-                    // (fired too early — before the user was in a real game lobby). Instead the
-                    // user drops gh_invite_now.txt over WDP while sitting in their live lobby;
-                    // consume it (edge-trigger, one send per drop) and fire a single targeted
-                    // invite for the lobby we're actually in.
-                    if (GetFileAttributesA(gh_trigger_path()) != INVALID_FILE_ATTRIBUTES) {
-                        DeleteFileA(gh_trigger_path());   // consume immediately so it fires ONCE
-                        uint64_t lob = (uint64_t)g_gh_hosted_lobby;
-                        if (lob) {
-                            gh_logf("[gh-shim] invite trigger -> firing for live lobby=%llu", (unsigned long long)lob);
-                            gh_send_games_played(gh_target_appid());   // ensure "playing" at send time (idempotent)
-                            gh_invite_targeted(lob);                   // connect + InviteUserToLobby(target)
-                        } else {
-                            gh_log("[gh-shim] invite trigger IGNORED: no active lobby (host first, then re-fire)");
-                        }
-                    }
-                    if (g_gh_friends) gh_dump_friends_once();
-                }
-            }
-            return 0;
-        }, nullptr, 0, nullptr);
-        if (at) CloseHandle(at);
-    }
+    gh_start_presence_heartbeat();
 #else
     gh_log("[gh-shim] GhBringUpEngineNow: ENGINE DISABLED build — no-op");
 #endif
@@ -842,6 +837,9 @@ extern "C" __declspec(dllexport) void GhStartQrLoginAsync() {
     gh_log("[gh-shim] GhStartQrLoginAsync: spawning launcher login worker");
     HANDLE h = CreateThread(nullptr, 0, gh_launcher_login_thread, nullptr, 0, nullptr);
     if (h) CloseHandle(h);
+    // CS(Online) can fire as soon as login lands (picker shows you Online). AddClientGame
+    // waits for the guest's AdvertiseGame so we register the launched title, not Cheese.
+    gh_start_presence_heartbeat();
 }
 
 // Poll helpers for the launcher UI thread.
@@ -1263,6 +1261,7 @@ __declspec(dllexport) void SteamAPI_RunCallbacks() {
     // where the pump must live. Heartbeat throttled.
     static LONG rc = 0; LONG n = InterlockedIncrement(&rc);
     if (n == 1 || (n % 600) == 0) gh_logf("[gh-diag] SteamAPI_RunCallbacks (native) #%ld state=%d", n, g_gh_engine_state);
+    if (g_gh_engine_state == 2) gh_engine_frame_register_hook();
 }
 __declspec(dllexport) void SteamAPI_ReleaseCurrentThreadMemory() {}
 __declspec(dllexport) void SteamAPI_SetMiniDumpComment(const char*) {}

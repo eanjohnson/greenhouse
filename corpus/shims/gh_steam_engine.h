@@ -323,6 +323,10 @@ static uint32_t gh_target_appid() {
     if (n > 0 && n < sizeof(b)) { unsigned v = (unsigned)atoi(b); if (v) return v; }
     return 3809440;
 }
+// Set by AdvertiseGame after the guest's SteamAPI_Init rebinds the pipe to the
+// launched title. 0 while the launcher is sitting on the picker (login binds
+// Cheese 3809440 but must NOT register it as the played game).
+static volatile uint32_t g_gh_playing_appid = 0;
 // Find IClientUtils among the engine's accessor slots by RTTI NAME (robust across steamclient
 // builds — the old hardcoded vtblRVA was stale) and set the pipe's AppID to the target so app-scoped
 // matchmaking will vend this game's lobbies and the account/persona state loads. Only calls methods
@@ -451,6 +455,7 @@ static void gh_advertise_game() {
     int any = gh_call_i(cu, vt[92],  "BIsAnyGameRunning");       // no-arg bool getter
     GH_ENGINE_LOG("GHENG advertise: AdvertiseGame(appid=%u) sent; NumGamesRunning %d->%d BIsAnyGameRunning=%d\n",
                   appid, n0, n1, any);
+    g_gh_playing_appid = appid;
 }
 
 // ---- games-played broadcast (the REAL fix for joinable invites + "playing" profile) --------
@@ -915,8 +920,10 @@ static bool gh_register_do_call(void* cu, uint32_t appid)
     gh_diag_writef("REGISTER using game_pid=%u (self=%lu)", gamePid, GetCurrentProcessId());
     __try {
         // a8 = 404 is a real input, not padding: it reappears as f21 in the emitted message.
+        char appName[64];
+        snprintf(appName, sizeof(appName), "app%u", appid);
         ret = (int)(unsigned char)addGame(cu, gamePid, &gameid, &gameid,
-                                          "Lethal Company", exePath, 0, 0, 404, 0, 0, 0);
+                                          appName, exePath, 0, 0, 404, 0, 0, 0);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         ret = -2;
         gh_diag_writef("REGISTER SEH caught 0x%08lx during AddClientGame", GetExceptionCode());
@@ -1346,24 +1353,45 @@ static void gh_gp_rescan_tick(uint32_t appid, bool verbose)
             gh_diag_writef("CHANGESTATUS-ONLINE %s ok=%d", s_gh_cs_online_ok ? "re-assert" : "attempt", (int)ok);
         }
     }
+    // Launcher login leaves the pipe on Cheese (3809440) until the guest's SteamAPI_Init
+    // rebinds + AdvertiseGame. Do not AddClientGame the fallback appid — that is why a
+    // Greenhouse-launched title never showed as in-game (register ran once for Cheese, or
+    // never ran at all because the presence pump lived only in GhBringUpEngineNow).
+    uint32_t playing = g_gh_playing_appid;
+    if (playing && g_gh_reg_state != 0 && g_gh_reg_appid && playing != g_gh_reg_appid) {
+        gh_diag_writef("GP-TICK appid changed %u -> %u, reset register", g_gh_reg_appid, playing);
+        InterlockedExchange(&g_gh_reg_state, 0);
+    }
     if (s_gh_cs_online_ok && gh_register_game_enabled() && g_gh_reg_state == 0) {
-        void* cu = gh_register_pick_cuser();
-        if (cu) {
-            // Wait until AdvertiseGame's entry-0 is SETTLED (cgid == our appid) before handing off,
-            // so the frame thread never acts on a half-built entry (the cgid=0 race that produced an
-            // inconsistent crash). Retries next heartbeat tick (~10s) until settled.
-            uintptr_t arr = gh_probe_ptr((void*)((uintptr_t)cu + kGhCUserGamesArrOff));
-            uint64_t cg0 = 0; if (arr) gh_probe_read((void*)(arr + 8), &cg0, 8);
-            if (cg0 == (uint64_t)appid) {
-                g_gh_reg_cu = cu; g_gh_reg_appid = appid;
-                InterlockedExchange(&g_gh_reg_state, 1);   // hand off to the frame thread
-                gh_diag_writef("GP-TICK handed off cu=%p appid=%u (entry settled) -> frame thread", cu, appid);
-            } else {
-                gh_diag_writef("GP-TICK waiting for entry to settle: arr=0x%llx cgid=0x%llx",
-                               (unsigned long long)arr, (unsigned long long)cg0);
+        if (!playing || playing != appid) {
+            static int s_wait_adv = 0;
+            if (s_wait_adv < 8) {
+                s_wait_adv++;
+                gh_diag_writef("GP-TICK skip register: playing=%u want=%u (wait AdvertiseGame)",
+                               playing, appid);
+            }
+        } else {
+            void* cu = gh_register_pick_cuser();
+            if (cu) {
+                // Wait until AdvertiseGame's entry-0 is SETTLED (cgid == our appid) before handing off,
+                // so the frame thread never acts on a half-built entry (the cgid=0 race that produced an
+                // inconsistent crash). Retries next heartbeat tick (~10s) until settled.
+                uintptr_t arr = gh_probe_ptr((void*)((uintptr_t)cu + kGhCUserGamesArrOff));
+                uint64_t cg0 = 0; if (arr) gh_probe_read((void*)(arr + 8), &cg0, 8);
+                if (cg0 == (uint64_t)appid) {
+                    g_gh_reg_cu = cu; g_gh_reg_appid = appid;
+                    InterlockedExchange(&g_gh_reg_state, 1);   // hand off to the frame thread
+                    gh_diag_writef("GP-TICK handed off cu=%p appid=%u (entry settled) -> frame thread", cu, appid);
+                } else {
+                    gh_diag_writef("GP-TICK waiting for entry to settle: arr=0x%llx cgid=0x%llx",
+                                   (unsigned long long)arr, (unsigned long long)cg0);
+                }
             }
         }
     }
+    // Heartbeat can arm the marshal itself: ManualDispatch_RunFrame also calls this, but the
+    // launcher guest may not pump that path for several seconds after SteamAPI_Init.
+    if (g_gh_reg_state == 1) gh_engine_frame_register_hook();
     // After the one-shot registration, watch entry-0 for a few ticks: if the engine attaches our pid
     // asynchronously (cnt220 goes >0) the "playing" broadcast may follow late. Throttled + bounded.
     if (g_gh_reg_state == 3) {
