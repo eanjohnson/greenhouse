@@ -800,13 +800,15 @@ static DWORD WINAPI gh_launcher_login_thread(LPVOID) {
     int rc = gh_steam_engine_init(/*waitMs=*/60000);
     gh_logf("[gh-shim] launcher login: engine_init -> %d (client_user=%p state=%d)", rc, g_gh_client_user, g_gh_engine_state);
     if (rc == 0) {
-        gh_logf("[gh-shim] launcher login: app-context (anon) -> %d", (int)gh_fix_app_context(g_gh_engine_dll));
+        gh_logf("[gh-shim] launcher login: app-context (anon, no track) -> %d",
+                (int)gh_fix_app_context(g_gh_engine_dll, /*track=*/false));
         gh_log("[gh-shim] launcher login: starting QR upgrade (cache hit skips the scan)");
         uint64_t real = gh_qr_upgrade(/*runSeconds=*/1800);
         gh_logf("[gh-shim] launcher login: QR upgrade -> real_steamid=%llu", (unsigned long long)real);
         if (real) {
             gh_acquire_game_interfaces(g_gh_engine_dll);
-            gh_logf("[gh-shim] launcher login: app-context (real) -> %d", (int)gh_fix_app_context(g_gh_engine_dll));
+            gh_logf("[gh-shim] launcher login: app-context (real, no track) -> %d",
+                    (int)gh_fix_app_context(g_gh_engine_dll, /*track=*/false));
             // NB: owned-library enumeration is done LOADER-side over the downloader's CM
             // client (token login), not here -- the engine's own IClientUnifiedMessages path
             // for Player.GetOwnedGames#1 returns InvalidSteamID (the minimal engine doesn't

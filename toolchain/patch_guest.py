@@ -24,6 +24,9 @@ PATCHES = {
     "unityplayer.dll": {
         b"MapVirtualKeyExA":  b"CharUpperW",
         b"GetRawInputBuffer": b"CharNextW",
+        # Peak / Unity 6 — Xbox slim user32 lacks these two.
+        b"AdjustWindowRectExForDpi": b"CharLowerW",
+        b"IsMouseInPointerEnabled":  b"CharPrevW",
     },
     "mono-2.0-bdwgc.dll": {
         b"WINMM.dll": b"ghwmm.dll",

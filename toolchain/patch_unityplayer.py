@@ -19,6 +19,8 @@ import sys
 RENAMES = {
     b"MapVirtualKeyExA":  b"CharUpperW",
     b"GetRawInputBuffer": b"CharNextW",
+    b"AdjustWindowRectExForDpi": b"CharLowerW",
+    b"IsMouseInPointerEnabled":  b"CharPrevW",
 }
 
 def patch(path):

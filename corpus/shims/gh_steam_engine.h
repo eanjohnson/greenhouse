@@ -332,24 +332,24 @@ static volatile uint32_t g_gh_playing_appid = 0;
 // matchmaking will vend this game's lobbies and the account/persona state loads. Only calls methods
 // on a ClientUtils-named interface; gh_call_setappid is SEH-guarded.
 // IClientUtils slots (RE'd from IClientUtilsMap vtbl): 18=SetAppIDForCurrentPipe, 19=GetAppID.
-static bool gh_setappid_on(void* utils, const char* tag, uint32_t appid) {
+static bool gh_setappid_on(void* utils, const char* tag, uint32_t appid, bool track = true) {
     // Slots RE'd from this steamclient64 build's IClientUtilsMap vtable (RVA 0x12be390) by
     // decoding the IPC-marshalling stubs' arg shapes against the ordered method-name table:
     //   slot 18 = SetAppIDForCurrentPipe(AppId_t appid, bool bTrackProcess)  [reads edx,r8b]
     //   slot 19 = GetAppID() -> AppId_t                                       [no args]
     // Plain (this,args) convention — these Map methods are direct proxies, NOT (hUser,hPipe)-prefixed.
     uint32_t before = gh_call_u32(utils, 19);
-    uint32_t ret    = gh_call_setappid(utils, 18, appid, true);
+    uint32_t ret    = gh_call_setappid(utils, 18, appid, track);
     uint32_t after  = gh_call_u32(utils, 19);
-    GH_ENGINE_LOG("GHENG appctx: [%s] SetAppIDForCurrentPipe(%u)->%u  GetAppID %u->%u  (u=%u p=%u)\n",
-                  tag ? tag : "?", appid, ret, before, after,
+    GH_ENGINE_LOG("GHENG appctx: [%s] SetAppIDForCurrentPipe(%u,track=%d)->%u  GetAppID %u->%u  (u=%u p=%u)\n",
+                  tag ? tag : "?", appid, (int)track, ret, before, after,
                   (unsigned)g_gh_engine_user, (unsigned)g_gh_engine_pipe);
     return after == appid;
 }
 // Scan an object's first nwords members for a pointer to an IClientUtils* interface (RTTI name
 // contains "ClientUtils" — unique to IClientUtilsMap among the IClient*Map set). Every read is
 // VirtualQuery-validated. On a match, set the AppID and return true.
-static bool gh_scan_for_utils(void* obj, const char* what, int nwords, uint32_t appid) {
+static bool gh_scan_for_utils(void* obj, const char* what, int nwords, uint32_t appid, bool track = true) {
     if ((intptr_t)obj <= 0x10000) return false;
     void** words = (void**)obj;
     for (int i = 0; i < nwords; ++i) {
@@ -363,22 +363,22 @@ static bool gh_scan_for_utils(void* obj, const char* what, int nwords, uint32_t 
         const char* nm = gh_rtti_name(cand);
         if (nm[0] && strstr(nm, "IClientUtils")) {
             GH_ENGINE_LOG("GHENG appctx: IClientUtils via %s member[%d]=%p rtti=%s\n", what, i, cand, nm);
-            if (gh_setappid_on(cand, nm, appid)) return true;
+            if (gh_setappid_on(cand, nm, appid, track)) return true;
         }
     }
     return false;
 }
-static bool gh_fix_app_context(HMODULE h) {
+static bool gh_fix_app_context(HMODULE h, bool track = true) {
     if (!g_gh_engine) return false;
     const uint32_t appid = gh_target_appid();
     // IClientUtils' accessor is NOT among the safe engine-vtable accessor slots, so find the
     // IClientUtilsMap singleton by scanning object members + RTTI-matching (all reads validated).
     // 1) the engine object (IClientEngine) holds every IClient*Map singleton.
-    if (gh_scan_for_utils(g_gh_engine, "IClientEngine", 256, appid)) return true;
+    if (gh_scan_for_utils(g_gh_engine, "IClientEngine", 256, appid, track)) return true;
     // 2) the engine's public CSteamUtils wraps IClientUtilsMap.
     void* pub = gh_sc_get_iface(GH_SC_GetISteamUtils, "SteamUtils010", false);
     GH_ENGINE_LOG("GHENG appctx: public ISteamUtils=%p\n", pub);
-    if (gh_scan_for_utils(pub, "CSteamUtils", 64, appid)) return true;
+    if (gh_scan_for_utils(pub, "CSteamUtils", 64, appid, track)) return true;
     // 3) fallback: RTTI-scan the safe engine accessor slots.
     for (unsigned si = 0; si < sizeof(kGhEngineAccessorSlots)/sizeof(int); ++si) {
         void* iface = gh_engine_get_iface_wd(g_gh_engine, kGhEngineAccessorSlots[si], 2000);
@@ -387,7 +387,7 @@ static bool gh_fix_app_context(HMODULE h) {
         const char* nm = gh_rtti_name(iface);
         if (nm[0] && strstr(nm, "ClientUtils")) {
             GH_ENGINE_LOG("GHENG appctx: IClientUtils via accessor slot[%d] rtti=%s\n", kGhEngineAccessorSlots[si], nm);
-            if (gh_setappid_on(iface, nm, appid)) return true;
+            if (gh_setappid_on(iface, nm, appid, track)) return true;
         }
     }
     GH_ENGINE_LOG("GHENG appctx: IClientUtils not found / AppID not accepted\n");
@@ -1409,6 +1409,11 @@ static void gh_gp_rescan_tick(uint32_t appid, bool verbose)
         }
     }
     if (g_gh_reg_state != 0) return;   // registration owns games-played now; do not also hand-send
+
+    // Picker / pre-guest: CS(Online) is enough to show you online. A hand-sent
+    // CMsgClientGamesPlayed with the Cheese fallback (3809440) is exactly the
+    // §28 broadcast recipe, so the launcher sat "in-game, Cheese Rolling".
+    if (!playing || playing != appid) return;
 
     // Legacy fallback: hand-built CMsgClientGamesPlayed. Known not to stick on its own (the
     // client's state-sync overrides it while the games-list is empty) — kept only so a build

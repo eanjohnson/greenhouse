@@ -2281,6 +2281,18 @@ static BOOL   WINAPI Bed_GetClientRect(HWND, LPRECT r){ if(r){ r->left=r->top=0;
 static BOOL   WINAPI Bed_GetWindowRect(HWND, LPRECT r){ if(r){ r->left=r->top=0; r->right=(LONG)g_winW; r->bottom=(LONG)g_winH; } return TRUE; }
 static BOOL   WINAPI Bed_AdjustWindowRectEx(LPRECT, DWORD, BOOL, DWORD){ return TRUE; }
 static BOOL   WINAPI Bed_AdjustWindowRect(LPRECT, DWORD, BOOL){ return TRUE; }
+// Peak (Unity 6) statically imports these; Xbox slim user32 does not export them.
+// Import names are renamed to CharLowerW / CharPrevW so LoadLibrary succeeds,
+// then UnityPlayer's IAT is re-bedded here. Dpi is ignored — the fake HWND is
+// already client==screen. Pointer-as-mouse stays off so Unity uses GetCursorPos.
+static BOOL WINAPI Bed_AdjustWindowRectExForDpi(LPRECT r, DWORD style, BOOL menu, DWORD ex, UINT){
+    RECON_ONCE("AdjustWindowRectExForDpi");
+    return Bed_AdjustWindowRectEx(r, style, menu, ex);
+}
+static BOOL WINAPI Bed_IsMouseInPointerEnabled(){
+    RECON_ONCE("IsMouseInPointerEnabled");
+    return FALSE;
+}
 static LRESULT WINAPI Bed_DefWindowProcW(HWND, UINT, WPARAM, LPARAM){ return 0; }
 // One-shot activation sequence delivered through PeekMessage the first few times
 // Unity drains its queue. WM_ACTIVATEAPP(TRUE) + WM_ACTIVATE(WA_ACTIVE) +
@@ -3599,6 +3611,9 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
             {"ScreenToClient", (void*)&Bed_ScreenToClient},
             {"ClientToScreen", (void*)&Bed_ClientToScreen},
             {"SetCursorPos",   (void*)&Bed_SetCursorPos},
+            // Peak Unity 6: import-name placeholders (see PatchGuestTreeForContainer).
+            {"CharLowerW",     (void*)&Bed_AdjustWindowRectExForDpi},
+            {"CharPrevW",      (void*)&Bed_IsMouseInPointerEnabled},
         };
         for (auto& r : extra) n += PatchModuleImport(h, r.fn, r.bed);
     }
@@ -5269,11 +5284,13 @@ static void PatchGuestTreeForContainer()
     static const char* const kUnity[][2] = {
         {"MapVirtualKeyExA", "CharUpperW"},
         {"GetRawInputBuffer", "CharNextW"},
+        {"AdjustWindowRectExForDpi", "CharLowerW"},
+        {"IsMouseInPointerEnabled", "CharPrevW"},
     };
     static const char* const kMono[][2] = {
         {"WINMM.dll", "ghwmm.dll"},
     };
-    PatchOneGuestDll(g_guestDir + L"UnityPlayer.dll", kUnity, 2);
+    PatchOneGuestDll(g_guestDir + L"UnityPlayer.dll", kUnity, 4);
     const std::wstring monoRel = L"MonoBleedingEdge\\EmbedRuntime\\mono-2.0-bdwgc.dll";
     PatchOneGuestDll(g_guestDir + monoRel, kMono, 1);
     if (!g_guestDataDir.empty())
