@@ -43,15 +43,18 @@ struct LauncherGfx {
     com_ptr<ID2D1Device>          device;
     com_ptr<ID2D1DeviceContext>   dc;
     com_ptr<IDWriteFactory>       dw;
-    com_ptr<IDWriteTextFormat>    fmtTitle, fmtItem, fmtSmall, fmtLog;
+    com_ptr<IDWriteTextFormat>    fmtTitle, fmtItem, fmtSmall, fmtLog, fmtKey;
     com_ptr<ID3D11Texture2D>      uiTex;      // R8G8B8A8_UNORM target D2D draws into
     com_ptr<ID3D11Texture2D>      ovlSnap[2]; // unused leftover; blit uses baked panels
-    com_ptr<ID3D11Texture2D>      ovlMenu[3][2]; // [sel][remapOn] baked at LuiInit
+    com_ptr<ID3D11Texture2D>      ovlMenu[4][2]; // [sel][remapOn] baked at LuiInit
     com_ptr<ID3D11Texture2D>      ovlConfirm;
     com_ptr<ID3D11Texture2D>      ovlIncoming;
     com_ptr<ID3D11Texture2D>      ovlFriendsChrome[2]; // [0]=no lobby [1]=lobby live
     com_ptr<ID3D11Texture2D>      ovlFriendsEmpty;
     com_ptr<ID3D11Texture2D>      ovlStHost, ovlStSent, ovlStFail;
+    com_ptr<ID3D11Texture2D>      ovlInputHub[3];
+    com_ptr<ID3D11Texture2D>      ovlProfilesChrome, ovlLayoutChrome, ovlOptionsChrome;
+    com_ptr<ID3D11Texture2D>      ovlBindChrome, ovlDelAsk;
     com_ptr<ID2D1Bitmap1>         uiTarget;   // D2D target wrapping uiTex
     com_ptr<ID2D1SolidColorBrush> brFg, brDim, brBg, brSel, brAccent, brPanel, brWarn;
     com_ptr<ID2D1SolidColorBrush> brWhite, brBlack;   // pure B/W for QR scanner contrast
@@ -194,6 +197,7 @@ static bool LuiInit()
     mkfmt(34.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, g_lui.fmtItem);
     mkfmt(22.f, DWRITE_FONT_WEIGHT_NORMAL,    g_lui.fmtSmall);
     mkfmt(16.f, DWRITE_FONT_WEIGHT_NORMAL,    g_lui.fmtLog);
+    mkfmt(14.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, g_lui.fmtKey);
 
     auto mkbr = [&](uint32_t rgb, float a, com_ptr<ID2D1SolidColorBrush>& out){
         return g_lui.dc->CreateSolidColorBrush(D2D1::ColorF(rgb, a), out.put());
@@ -1214,9 +1218,11 @@ static const float kOvlW = 920.f, kOvlH = 540.f;
 static const float kOvlRowH = 56.f, kOvlRowX = 28.f, kOvlRowY0 = 148.f;
 static const int   kOvlFriendVis = 5;
 static const UINT  kOvlRowW = 864, kOvlRowPh = 52;
-enum { kOvlMenu = 0, kOvlFriends = 1, kOvlIncoming = 2 };
+enum { kOvlMenu = 0, kOvlFriends = 1, kOvlIncoming = 2,
+       kOvlInputHub = 3, kOvlProfiles = 4, kOvlLayout = 5,
+       kOvlOptions = 6, kOvlBind = 7 };
 enum { kOvlStNone = 0, kOvlStHostFirst, kOvlStSent, kOvlStFail };
-static volatile int  g_ovlSel = 0;       // menu: 0 remap, 1 friends, 2 quit
+static volatile int  g_ovlSel = 0;       // menu: 0 remap, 1 input, 2 friends, 3 quit
 static int   g_ovlPage = kOvlMenu;
 static int   g_ovlFriendSel = 0;
 static int   g_ovlFriendScroll = 0;
@@ -1236,7 +1242,37 @@ struct OvlFriend {
     com_ptr<ID3D11Texture2D> row, rowOn;
 };
 static std::vector<OvlFriend> g_ovlFriends;
+static int  g_ovlHubSel = 0;
+static int  g_ovlProfSel = 0, g_ovlProfScroll = 0;
+static int  g_ovlLaySel = 0,  g_ovlLayScroll = 0;
+static int  g_ovlOptSel = 0;
+static int  g_ovlBindSrc = 0;
+static int  g_ovlKeySel = 0;
+static bool g_ovlDelAsk = false;
+static bool g_ovlRename = false;
+struct OvlTexRow {
+    wchar_t text[80];
+    com_ptr<ID3D11Texture2D> off, on;
+};
+static std::vector<OvlTexRow> g_ovlProfRows;
+static std::vector<OvlTexRow> g_ovlLayRows;
+static OvlTexRow g_ovlOptRows[3];
+static const int kOvlKeyMax = 96;
+struct OvlKey {
+    float x, y, w, h;
+    int kind, vk;
+    bool analogOnly;
+    wchar_t label[12];
+    com_ptr<ID3D11Texture2D> off, on;
+};
+static OvlKey g_ovlKeys[kOvlKeyMax];
+static int g_ovlKeyN = 0;
 static void OverlayDraw();
+static void OverlayRefreshProfRows();
+static void OverlayRefreshLayRows();
+static void OverlayRefreshOptRows();
+static void OverlayOpenBind(int src);
+static void OverlayKeyNav(int dx, int dy);
 static void OverlaySetStatus(int kind, int friendIdx = -1, DWORD ms = 2500)
 {
     g_ovlStatusKind = kind;
@@ -1259,42 +1295,13 @@ static void OverlayEnsureSnap()
 
 static void OverlayLoadRemap()
 {
-    std::vector<uint8_t> b;
-    if (!ReadWholeFile(std::wstring(kLocalState) + L"gh_remap.txt", b) || b.empty()) return;
-    g_kmRemapOn = (b[0] == '1' || b[0] == 't' || b[0] == 'T');
-}
-
-static void OverlaySaveRemap()
-{
-    std::wstring p = std::wstring(kLocalState) + L"gh_remap.txt";
-    HANDLE h = CreateFileW(p.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
-                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return;
-    char c = g_kmRemapOn ? '1' : '0';
-    DWORD w = 0; WriteFile(h, &c, 1, &w, nullptr); CloseHandle(h);
+    GhInputBoot();
 }
 
 static void OverlaySetRemap(bool on)
 {
-    if ((bool)g_kmRemapOn == on) return;
-    g_kmRemapOn = on;
-    {
-        std::lock_guard<std::mutex> lk(g_kmMutex);
-        if (on) {
-            g_kmCurX = (LONG)g_winW / 2; g_kmCurY = (LONG)g_winH / 2;
-            g_kmActive = true;
-        } else {
-            g_kmActive = false;
-        }
-    }
-    if (on) {
-        LONG x, y;
-        { std::lock_guard<std::mutex> lk(g_kmMutex); x = g_kmCurX; y = g_kmCurY; }
-        KM_Push(WM_MOUSEMOVE, 0, MAKELPARAM(x, y));
-    }
-    OverlaySaveRemap();
+    GhInputSetEnabled(on);
     g_ovlDirty = true;
-    Diag(on ? "REMAP on" : "REMAP off");
 }
 
 static void OverlayClampFriends()
@@ -1354,10 +1361,12 @@ static void OverlayTick()
     if (g_ovlChordClosed) {
         g_ovlChordClosed = false;
         if (g_ovlPage == kOvlIncoming && g_ghDeclineInvite) g_ghDeclineInvite();
+        if (g_ovlRename) { PickerOskHide(); g_ovlRename = false; }
         g_ovlPage = kOvlMenu;
         g_ovlInName[0] = 0;
         g_ovlInSid = 0;
         g_ovlConfirm = false;
+        g_ovlDelAsk = false;
     }
     OverlayPollShim();
     if (!g_overlayOpen) { wasOpen = false; return; }
@@ -1471,6 +1480,246 @@ static void OverlayTick()
         return;
     }
 
+    auto clampList = [](int& sel, int& scroll, int n, int vis) {
+        if (sel >= n) sel = n ? n - 1 : 0;
+        if (sel < 0) sel = 0;
+        if (sel < scroll) scroll = sel;
+        if (sel >= scroll + vis) scroll = sel - vis + 1;
+        if (scroll < 0) scroll = 0;
+    };
+
+    if (g_ovlRename) {
+        if (!g_pickOskOpen) {
+            if (!g_pickQuery.empty()) GhInputRename(g_pickQuery.c_str());
+            g_ovlRename = false;
+            OverlayRefreshProfRows();
+            g_ovlDirty = true;
+        } else if (pressed & XINPUT_GAMEPAD_B) {
+            PickerOskHide();
+            g_ovlRename = false;
+            g_ovlDirty = true;
+        }
+        OverlayDraw();
+        return;
+    }
+
+    if (g_ovlDelAsk) {
+        if (pressed & XINPUT_GAMEPAD_A) {
+            GhInputDeleteCurrent();
+            g_ovlDelAsk = false;
+            OverlayRefreshProfRows();
+            g_ovlDirty = true;
+            Diag("OVERLAY profile deleted");
+        } else if (pressed & XINPUT_GAMEPAD_B) {
+            g_ovlDelAsk = false;
+            g_ovlDirty = true;
+        }
+        OverlayDraw();
+        return;
+    }
+
+    if (g_ovlPage == kOvlBind) {
+        if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) {
+            OverlayKeyNav(0, -1); g_ovlLastNav = now; g_ovlDirty = true;
+        }
+        if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) {
+            OverlayKeyNav(0, 1); g_ovlLastNav = now; g_ovlDirty = true;
+        }
+        WORD lx_hi = 0, lx_lo = 0;
+        { std::lock_guard<std::mutex> lk(g_padMutex);
+          if (g_padState.sThumbLX >  16000) lx_hi = 1;
+          if (g_padState.sThumbLX < -16000) lx_lo = 1; }
+        if ((pressed & XINPUT_GAMEPAD_DPAD_LEFT) || (lx_lo && navGate)) {
+            OverlayKeyNav(-1, 0); g_ovlLastNav = now; g_ovlDirty = true;
+        }
+        if ((pressed & XINPUT_GAMEPAD_DPAD_RIGHT) || (lx_hi && navGate)) {
+            OverlayKeyNav(1, 0); g_ovlLastNav = now; g_ovlDirty = true;
+        }
+        if (pressed & XINPUT_GAMEPAD_A) {
+            if (g_ovlKeySel >= 0 && g_ovlKeySel < g_ovlKeyN) {
+                const OvlKey& k = g_ovlKeys[g_ovlKeySel];
+                bool analog = GhSrcIsAnalog(g_ovlBindSrc);
+                if (k.kind == GH_TGT_NONE)
+                    GhInputSetBind(g_ovlBindSrc, GH_TGT_NONE, 0);
+                else if (k.analogOnly && !analog) {
+                    /* face buttons cannot take WASD / cursor */
+                } else if (!k.analogOnly && analog &&
+                           k.kind != GH_TGT_MOUSE && k.kind != GH_TGT_WASD &&
+                           k.kind != GH_TGT_ARROWS && k.kind != GH_TGT_NONE) {
+                    /* sticks only take analog targets */
+                } else
+                    GhInputSetBind(g_ovlBindSrc, k.kind, k.vk);
+            }
+            OverlayRefreshLayRows();
+            g_ovlPage = kOvlLayout;
+            g_ovlDirty = true;
+        }
+        if (pressed & XINPUT_GAMEPAD_X) {
+            GhInputSetBind(g_ovlBindSrc, GH_TGT_NONE, 0);
+            OverlayRefreshLayRows();
+            g_ovlPage = kOvlLayout;
+            g_ovlDirty = true;
+        }
+        if (pressed & XINPUT_GAMEPAD_B) {
+            g_ovlPage = kOvlLayout;
+            g_ovlDirty = true;
+        }
+        OverlayDraw();
+        return;
+    }
+
+    if (g_ovlPage == kOvlProfiles) {
+        int n = (int)g_ovlProfRows.size();
+        clampList(g_ovlProfSel, g_ovlProfScroll, n, kOvlFriendVis);
+        if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) {
+            if (g_ovlProfSel > 0) g_ovlProfSel--;
+            clampList(g_ovlProfSel, g_ovlProfScroll, n, kOvlFriendVis);
+            g_ovlLastNav = now; g_ovlDirty = true;
+        }
+        if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) {
+            if (n && g_ovlProfSel < n - 1) g_ovlProfSel++;
+            clampList(g_ovlProfSel, g_ovlProfScroll, n, kOvlFriendVis);
+            g_ovlLastNav = now; g_ovlDirty = true;
+        }
+        if (pressed & XINPUT_GAMEPAD_A) {
+            GhProfileInfo list[64];
+            int ln = GhInputList(list, 64);
+            if (g_ovlProfSel >= 0 && g_ovlProfSel < ln)
+                GhInputSelectId(list[g_ovlProfSel].id, true);
+            OverlayRefreshProfRows();
+            g_ovlDirty = true;
+        }
+        if (pressed & XINPUT_GAMEPAD_X) {
+            g_pickQuery = g_ghProf.name;
+            g_pickQueryChanged = false;
+            PickerOskShow();
+            g_ovlRename = true;
+            g_ovlDirty = true;
+        }
+        if (pressed & XINPUT_GAMEPAD_Y) {
+            GhInputDuplicate();
+            OverlayRefreshProfRows();
+            g_ovlDirty = true;
+        }
+        if (pressed & XINPUT_GAMEPAD_LEFT_SHOULDER) {
+            GhInputNewFrom("builtin-mouse");
+            OverlayRefreshProfRows();
+            g_ovlDirty = true;
+        }
+        if (pressed & XINPUT_GAMEPAD_BACK) {
+            if (!GhInputIsBuiltinId(g_ghProf.id)) {
+                g_ovlDelAsk = true;
+                g_ovlDirty = true;
+            }
+        }
+        if (pressed & XINPUT_GAMEPAD_B) {
+            g_ovlPage = kOvlInputHub;
+            g_ovlDirty = true;
+        }
+        OverlayDraw();
+        return;
+    }
+
+    if (g_ovlPage == kOvlLayout) {
+        int n = GH_SRC_COUNT;
+        clampList(g_ovlLaySel, g_ovlLayScroll, n, kOvlFriendVis);
+        if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) {
+            if (g_ovlLaySel > 0) g_ovlLaySel--;
+            clampList(g_ovlLaySel, g_ovlLayScroll, n, kOvlFriendVis);
+            g_ovlLastNav = now; g_ovlDirty = true;
+        }
+        if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) {
+            if (g_ovlLaySel < n - 1) g_ovlLaySel++;
+            clampList(g_ovlLaySel, g_ovlLayScroll, n, kOvlFriendVis);
+            g_ovlLastNav = now; g_ovlDirty = true;
+        }
+        if (pressed & XINPUT_GAMEPAD_A) {
+            OverlayOpenBind(g_ovlLaySel);
+            g_ovlDirty = true;
+        }
+        if (pressed & XINPUT_GAMEPAD_X) {
+            GhInputSetBind(g_ovlLaySel, GH_TGT_NONE, 0);
+            OverlayRefreshLayRows();
+            g_ovlDirty = true;
+        }
+        if (pressed & XINPUT_GAMEPAD_B) {
+            g_ovlPage = kOvlInputHub;
+            g_ovlDirty = true;
+        }
+        OverlayDraw();
+        return;
+    }
+
+    if (g_ovlPage == kOvlOptions) {
+        if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) {
+            if (g_ovlOptSel > 0) g_ovlOptSel--;
+            g_ovlLastNav = now; g_ovlDirty = true;
+        }
+        if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) {
+            if (g_ovlOptSel < 2) g_ovlOptSel++;
+            g_ovlLastNav = now; g_ovlDirty = true;
+        }
+        WORD lx_hi = 0, lx_lo = 0;
+        { std::lock_guard<std::mutex> lk(g_padMutex);
+          if (g_padState.sThumbLX >  16000) lx_hi = 1;
+          if (g_padState.sThumbLX < -16000) lx_lo = 1; }
+        bool left = (pressed & XINPUT_GAMEPAD_DPAD_LEFT) || (lx_lo && navGate);
+        bool right = (pressed & XINPUT_GAMEPAD_DPAD_RIGHT) || (lx_hi && navGate);
+        if (left || right) {
+            if (g_ovlOptSel == 0)
+                GhInputSetSens(g_ghProf.sens + (right ? 5 : -5));
+            else if (g_ovlOptSel == 1)
+                GhInputSetInvert(!g_ghProf.invertY);
+            else
+                GhInputSetDead(g_ghProf.dead + (right ? 500 : -500));
+            OverlayRefreshOptRows();
+            g_ovlLastNav = now; g_ovlDirty = true;
+        }
+        if (pressed & XINPUT_GAMEPAD_A) {
+            if (g_ovlOptSel == 1) {
+                GhInputSetInvert(!g_ghProf.invertY);
+                OverlayRefreshOptRows();
+                g_ovlDirty = true;
+            }
+        }
+        if (pressed & XINPUT_GAMEPAD_B) {
+            g_ovlPage = kOvlInputHub;
+            g_ovlDirty = true;
+        }
+        OverlayDraw();
+        return;
+    }
+
+    if (g_ovlPage == kOvlInputHub) {
+        if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) {
+            if (g_ovlHubSel > 0) g_ovlHubSel--;
+            g_ovlLastNav = now; g_ovlDirty = true;
+        }
+        if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) {
+            if (g_ovlHubSel < 2) g_ovlHubSel++;
+            g_ovlLastNav = now; g_ovlDirty = true;
+        }
+        if (pressed & XINPUT_GAMEPAD_A) {
+            if (g_ovlHubSel == 0) {
+                g_ovlPage = kOvlProfiles;
+                OverlayRefreshProfRows();
+            } else if (g_ovlHubSel == 1) {
+                g_ovlPage = kOvlLayout;
+                OverlayRefreshLayRows();
+            } else {
+                g_ovlPage = kOvlOptions;
+                OverlayRefreshOptRows();
+            }
+            g_ovlDirty = true;
+        }
+        if (pressed & XINPUT_GAMEPAD_B) {
+            g_ovlPage = kOvlMenu;
+            g_ovlDirty = true;
+        }
+        OverlayDraw();
+        return;
+    }
+
     // menu
     if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) {
         if (g_ovlSel > 0) g_ovlSel--;
@@ -1478,13 +1727,18 @@ static void OverlayTick()
         g_ovlDirty = true;
     }
     if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) {
-        if (g_ovlSel < 2) g_ovlSel++;
+        if (g_ovlSel < 3) g_ovlSel++;
         g_ovlLastNav = now;
         g_ovlDirty = true;
     }
     if (pressed & XINPUT_GAMEPAD_A) {
         if (g_ovlSel == 0) OverlaySetRemap(!g_kmRemapOn);
         else if (g_ovlSel == 1) {
+            g_ovlPage = kOvlInputHub;
+            g_ovlHubSel = 0;
+            g_ovlDirty = true;
+            Diag("OVERLAY input settings");
+        } else if (g_ovlSel == 2) {
             g_ovlPage = kOvlFriends;
             g_ovlFriendSel = 0;
             g_ovlFriendScroll = 0;
@@ -1529,7 +1783,7 @@ static void OverlayPaintMenu(int sel, bool remapOn)
     OverlayPaintChrome();
     LuiText(L"Start + Select to close", g_lui.fmtSmall.get(),
             D2D1::RectF(40, 96, W - 40, 136), g_lui.brDim.get());
-    const float rowH = 72.f;
+    const float rowH = 64.f;
     auto row = [&](float y, bool on, const wchar_t* label, const wchar_t* trail, bool accentTrail) {
         D2D1_RECT_F r = D2D1::RectF(28, y, W - 28, y + rowH);
         dc->FillRectangle(r, on ? g_lui.brSel.get() : g_lui.brPanel.get());
@@ -1543,9 +1797,10 @@ static void OverlayPaintMenu(int sel, bool remapOn)
                         : g_lui.brDim.get(),
                     DWRITE_TEXT_ALIGNMENT_TRAILING);
     };
-    row(148.f, sel == 0, L"Controller as mouse", remapOn ? L"ON" : L"OFF", remapOn);
-    row(228.f, sel == 1, L"Invite friends", nullptr, false);
-    row(308.f, sel == 2, L"Return to Greenhouse", nullptr, false);
+    row(140.f, sel == 0, L"Controller remap", remapOn ? L"ON" : L"OFF", remapOn);
+    row(208.f, sel == 1, L"Input settings", nullptr, false);
+    row(276.f, sel == 2, L"Invite friends", nullptr, false);
+    row(344.f, sel == 3, L"Return to Greenhouse", nullptr, false);
     LuiText(L"A  Select      B  Close",
             g_lui.fmtSmall.get(),
             D2D1::RectF(40, H - 64, W - 40, H - 20), g_lui.brDim.get());
@@ -1572,6 +1827,108 @@ static void OverlayPaintConfirm()
             D2D1::RectF(48, 310, W - 48, 390), g_lui.brFg.get());
     LuiText(L"B   Cancel", g_lui.fmtSmall.get(),
             D2D1::RectF(40, H - 64, W - 40, H - 20), g_lui.brDim.get());
+    dc->EndDraw();
+    dc->Flush();
+    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+}
+
+static void OverlayPaintInputHub(int sel)
+{
+    auto* dc = g_lui.dc.get();
+    const float W = kOvlW, H = kOvlH;
+    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    dc->BeginDraw();
+    dc->Clear(D2D1::ColorF(0x161B22, 1.f));
+    OverlayPaintChrome();
+    LuiText(L"Controller input", g_lui.fmtSmall.get(),
+            D2D1::RectF(40, 96, W - 40, 136), g_lui.brDim.get());
+    const float rowH = 72.f;
+    auto row = [&](float y, bool on, const wchar_t* label) {
+        dc->FillRectangle(D2D1::RectF(28, y, W - 28, y + rowH),
+                          on ? g_lui.brSel.get() : g_lui.brPanel.get());
+        LuiText(label, g_lui.fmtItem.get(),
+                D2D1::RectF(48, y, W - 48, y + rowH),
+                on ? g_lui.brFg.get() : g_lui.brDim.get());
+    };
+    row(148.f, sel == 0, L"Profiles");
+    row(228.f, sel == 1, L"Layout");
+    row(308.f, sel == 2, L"Options");
+    LuiText(L"A  Open      B  Back",
+            g_lui.fmtSmall.get(),
+            D2D1::RectF(40, H - 64, W - 40, H - 20), g_lui.brDim.get());
+    dc->EndDraw();
+    dc->Flush();
+    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+}
+
+static void OverlayPaintListChrome(const wchar_t* sub, const wchar_t* hints)
+{
+    auto* dc = g_lui.dc.get();
+    const float W = kOvlW, H = kOvlH;
+    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    dc->BeginDraw();
+    dc->Clear(D2D1::ColorF(0x161B22, 1.f));
+    OverlayPaintChrome();
+    LuiText(sub, g_lui.fmtSmall.get(),
+            D2D1::RectF(40, 96, W - 40, 136), g_lui.brDim.get());
+    LuiText(hints, g_lui.fmtSmall.get(),
+            D2D1::RectF(40, H - 64, W - 40, H - 20), g_lui.brDim.get());
+    dc->EndDraw();
+    dc->Flush();
+    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+}
+
+static void OverlayPaintDelAsk()
+{
+    auto* dc = g_lui.dc.get();
+    const float W = kOvlW, H = kOvlH;
+    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    dc->BeginDraw();
+    dc->Clear(D2D1::ColorF(0x161B22, 1.f));
+    OverlayPaintChrome();
+    LuiText(L"Delete this profile?", g_lui.fmtItem.get(),
+            D2D1::RectF(40, 160, W - 40, 230), g_lui.brFg.get());
+    LuiText(L"Games using it fall back to Mouse.", g_lui.fmtSmall.get(),
+            D2D1::RectF(40, 230, W - 40, 280), g_lui.brDim.get());
+    dc->FillRectangle(D2D1::RectF(28, 310, W - 28, 390), g_lui.brWarn.get());
+    LuiText(L"A   Delete      B   Cancel", g_lui.fmtItem.get(),
+            D2D1::RectF(48, 310, W - 48, 390), g_lui.brFg.get());
+    dc->EndDraw();
+    dc->Flush();
+    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+}
+
+static void OverlayPaintBindChrome()
+{
+    auto* dc = g_lui.dc.get();
+    const float W = kOvlW, H = kOvlH;
+    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    dc->BeginDraw();
+    dc->Clear(D2D1::ColorF(0x161B22, 1.f));
+    OverlayPaintChrome();
+    LuiText(L"Assign input", g_lui.fmtSmall.get(),
+            D2D1::RectF(40, 96, W - 40, 128), g_lui.brDim.get());
+    LuiText(L"A  Bind      B  Cancel      X  Clear      \u25C0 \u25B6 \u25B2 \u25BC  Move",
+            g_lui.fmtSmall.get(),
+            D2D1::RectF(40, H - 52, W - 40, H - 16), g_lui.brDim.get());
+    dc->EndDraw();
+    dc->Flush();
+    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+}
+
+static void OverlayPaintKeycap(const wchar_t* label, bool on, float w, float h)
+{
+    auto* dc = g_lui.dc.get();
+    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    dc->BeginDraw();
+    dc->Clear(D2D1::ColorF(0, 0.f));
+    dc->FillRectangle(D2D1::RectF(0, 0, w, h),
+                      on ? g_lui.brSel.get() : g_lui.brPanel.get());
+    IDWriteTextFormat* fmt = g_lui.fmtKey.get() ? g_lui.fmtKey.get() : g_lui.fmtSmall.get();
+    LuiText(label ? label : L"?", fmt,
+            D2D1::RectF(1, 0, w - 1, h),
+            on ? g_lui.brFg.get() : g_lui.brDim.get(),
+            DWRITE_TEXT_ALIGNMENT_CENTER);
     dc->EndDraw();
     dc->Flush();
     if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
@@ -1900,11 +2257,234 @@ static void OverlayBakeFriendsSnapshot()
     g_lui.dc->SetTarget(g_lui.uiTarget.get());
 }
 
+static bool OverlayKeyVisible(const OvlKey& k)
+{
+    bool analog = GhSrcIsAnalog(g_ovlBindSrc);
+    if (k.analogOnly) return analog;
+    if (analog && k.kind != GH_TGT_NONE && k.kind != GH_TGT_MOUSE &&
+        k.kind != GH_TGT_WASD && k.kind != GH_TGT_ARROWS)
+        return false;
+    return true;
+}
+
+static void OverlayAddKey(float x, float y, float w, float h, const wchar_t* lab,
+                          int kind, int vk, bool analogOnly)
+{
+    if (g_ovlKeyN >= kOvlKeyMax) return;
+    OvlKey& k = g_ovlKeys[g_ovlKeyN++];
+    k.x = x; k.y = y; k.w = w; k.h = h;
+    k.kind = kind; k.vk = vk; k.analogOnly = analogOnly;
+    wcsncpy(k.label, lab ? lab : L"?", 11);
+    k.label[11] = 0;
+}
+
+static void OverlayBuildKeyLayout()
+{
+    g_ovlKeyN = 0;
+    const float x0 = 16.f, width = 888.f;
+    auto rowEq = [&](float y, float h, float gap, int n, auto fill) {
+        float w = (width - gap * (float)(n - 1)) / (float)n;
+        for (int i = 0; i < n; ++i)
+            fill(i, x0 + (float)i * (w + gap), y, w, h);
+    };
+
+    rowEq(112.f, 30.f, 4.f, 9, [&](int i, float x, float y, float w, float h) {
+        static const struct { const wchar_t* l; int k; int vk; bool a; } s[] = {
+            { L"Clear", GH_TGT_NONE, 0, false },
+            { L"LMB",   GH_TGT_MOUSE_LEFT, 0, false },
+            { L"RMB",   GH_TGT_MOUSE_RIGHT, 0, false },
+            { L"MMB",   GH_TGT_MOUSE_MIDDLE, 0, false },
+            { L"Whl+",  GH_TGT_WHEEL_UP, 0, false },
+            { L"Whl-",  GH_TGT_WHEEL_DOWN, 0, false },
+            { L"Cursor",GH_TGT_MOUSE, 0, true },
+            { L"WASD",  GH_TGT_WASD, 0, true },
+            { L"Arrows",GH_TGT_ARROWS, 0, true },
+        };
+        OverlayAddKey(x, y, w, h, s[i].l, s[i].k, s[i].vk, s[i].a);
+    });
+
+    rowEq(148.f, 28.f, 3.f, 13, [&](int i, float x, float y, float w, float h) {
+        if (i == 0) OverlayAddKey(x, y, w, h, L"Esc", GH_TGT_KEY, VK_ESCAPE, false);
+        else {
+            wchar_t lab[4]; swprintf(lab, 4, L"F%d", i);
+            OverlayAddKey(x, y, w, h, lab, GH_TGT_KEY, VK_F1 + i - 1, false);
+        }
+    });
+
+    static const int numVk[] = {
+        VK_OEM_3,'1','2','3','4','5','6','7','8','9','0',VK_OEM_MINUS,VK_OEM_PLUS,VK_BACK
+    };
+    static const wchar_t* numLab[] = {
+        L"`",L"1",L"2",L"3",L"4",L"5",L"6",L"7",L"8",L"9",L"0",L"-",L"=",L"Bksp"
+    };
+    rowEq(182.f, 30.f, 3.f, 14, [&](int i, float x, float y, float w, float h) {
+        OverlayAddKey(x, y, w, h, numLab[i], GH_TGT_KEY, numVk[i], false);
+    });
+
+    static const int qVk[] = {
+        VK_TAB,'Q','W','E','R','T','Y','U','I','O','P',VK_OEM_4,VK_OEM_6
+    };
+    static const wchar_t* qLab[] = {
+        L"Tab",L"Q",L"W",L"E",L"R",L"T",L"Y",L"U",L"I",L"O",L"P",L"[",L"]"
+    };
+    rowEq(216.f, 30.f, 3.f, 13, [&](int i, float x, float y, float w, float h) {
+        OverlayAddKey(x, y, w, h, qLab[i], GH_TGT_KEY, qVk[i], false);
+    });
+
+    static const int aVk[] = {
+        VK_CAPITAL,'A','S','D','F','G','H','J','K','L',VK_OEM_1,VK_OEM_7,VK_RETURN
+    };
+    static const wchar_t* aLab[] = {
+        L"Caps",L"A",L"S",L"D",L"F",L"G",L"H",L"J",L"K",L"L",L";",L"'",L"Enter"
+    };
+    rowEq(250.f, 30.f, 3.f, 13, [&](int i, float x, float y, float w, float h) {
+        OverlayAddKey(x, y, w, h, aLab[i], GH_TGT_KEY, aVk[i], false);
+    });
+
+    static const int zVk[] = {
+        VK_SHIFT,'Z','X','C','V','B','N','M',VK_OEM_COMMA,VK_OEM_PERIOD,VK_OEM_2,VK_SHIFT
+    };
+    static const wchar_t* zLab[] = {
+        L"Shift",L"Z",L"X",L"C",L"V",L"B",L"N",L"M",L",",L".",L"/",L"Shift"
+    };
+    rowEq(284.f, 30.f, 3.f, 12, [&](int i, float x, float y, float w, float h) {
+        OverlayAddKey(x, y, w, h, zLab[i], GH_TGT_KEY, zVk[i], false);
+    });
+
+    // Bottom: Ctrl Alt  Space  Left Up Down Right
+    {
+        float y = 318.f, h = 32.f, gap = 4.f;
+        float sm = 70.f, arr = 48.f;
+        float x = x0;
+        OverlayAddKey(x, y, sm, h, L"Ctrl", GH_TGT_KEY, VK_CONTROL, false); x += sm + gap;
+        OverlayAddKey(x, y, sm, h, L"Alt",  GH_TGT_KEY, VK_MENU, false);    x += sm + gap;
+        float sp = width - (x - x0) - 4.f * arr - 3.f * gap;
+        OverlayAddKey(x, y, sp, h, L"Space", GH_TGT_KEY, VK_SPACE, false);  x += sp + gap;
+        OverlayAddKey(x, y, arr, h, L"\u2190", GH_TGT_KEY, VK_LEFT, false);  x += arr + gap;
+        OverlayAddKey(x, y, arr, h, L"\u2191", GH_TGT_KEY, VK_UP, false);    x += arr + gap;
+        OverlayAddKey(x, y, arr, h, L"\u2193", GH_TGT_KEY, VK_DOWN, false);  x += arr + gap;
+        OverlayAddKey(x, y, arr, h, L"\u2192", GH_TGT_KEY, VK_RIGHT, false);
+    }
+}
+
+static void OverlayBakeKeys()
+{
+    OverlayBuildKeyLayout();
+    int baked = 0;
+    for (int i = 0; i < g_ovlKeyN; ++i) {
+        OvlKey& k = g_ovlKeys[i];
+        UINT w = (UINT)(k.w + 0.5f), h = (UINT)(k.h + 0.5f);
+        if (w < 8) w = 8;
+        if (h < 8) h = 8;
+        if (OverlayBakeTo(w, h, k.off)) { OverlayPaintKeycap(k.label, false, (float)w, (float)h); ++baked; }
+        if (OverlayBakeTo(w, h, k.on))  { OverlayPaintKeycap(k.label, true,  (float)w, (float)h); ++baked; }
+    }
+    g_lui.dc->SetTarget(g_lui.uiTarget.get());
+    Diag("OVERLAY bake keys=" + std::to_string(g_ovlKeyN) + " tex=" + std::to_string(baked));
+}
+
+static void OverlayKeyNav(int dx, int dy)
+{
+    if (g_ovlKeyN <= 0) return;
+    if (g_ovlKeySel < 0 || g_ovlKeySel >= g_ovlKeyN) g_ovlKeySel = 0;
+    const OvlKey& cur = g_ovlKeys[g_ovlKeySel];
+    float cx = cur.x + cur.w * 0.5f, cy = cur.y + cur.h * 0.5f;
+    int best = -1;
+    float bestS = 1e12f;
+    for (int i = 0; i < g_ovlKeyN; ++i) {
+        if (i == g_ovlKeySel) continue;
+        const OvlKey& k = g_ovlKeys[i];
+        if (!OverlayKeyVisible(k)) continue;
+        float kx = k.x + k.w * 0.5f, ky = k.y + k.h * 0.5f;
+        float ddx = kx - cx, ddy = ky - cy;
+        if (dx > 0 && ddx < 4.f) continue;
+        if (dx < 0 && ddx > -4.f) continue;
+        if (dy > 0 && ddy < 4.f) continue;
+        if (dy < 0 && ddy > -4.f) continue;
+        float along = (dx != 0) ? (dx > 0 ? ddx : -ddx) : (dy > 0 ? ddy : -ddy);
+        float side  = (dx != 0) ? (ddy < 0 ? -ddy : ddy) : (ddx < 0 ? -ddx : ddx);
+        float score = along + side * 2.5f;
+        if (score < bestS) { bestS = score; best = i; }
+    }
+    if (best >= 0) g_ovlKeySel = best;
+}
+
+static void OverlayFocusBindKey()
+{
+    const GhBind& b = g_ghProf.bind[g_ovlBindSrc];
+    int hit = 0;
+    for (int i = 0; i < g_ovlKeyN; ++i) {
+        if (!OverlayKeyVisible(g_ovlKeys[i])) continue;
+        if (g_ovlKeys[i].kind == b.kind &&
+            (b.kind != GH_TGT_KEY || g_ovlKeys[i].vk == b.vk)) {
+            g_ovlKeySel = i;
+            return;
+        }
+        if (g_ovlKeys[i].kind == GH_TGT_NONE) hit = i;
+    }
+    g_ovlKeySel = hit;
+}
+
+static void OverlayOpenBind(int src)
+{
+    g_ovlBindSrc = src;
+    g_ovlPage = kOvlBind;
+    OverlayFocusBindKey();
+}
+
+static void OverlayRefreshProfRows()
+{
+    GhProfileInfo list[64];
+    int n = GhInputList(list, 64);
+    g_ovlProfRows.clear();
+    for (int i = 0; i < n; ++i) {
+        OvlTexRow r{};
+        bool cur = (strcmp(list[i].id, g_ghProf.id) == 0);
+        swprintf(r.text, 80, L"%s%s%s", list[i].name,
+                 cur ? L"   \u25CF" : L"",
+                 (cur && g_kmRemapOn) ? L"  on" : L"");
+        OverlayBakeRowAny(r.text, false, r.off);
+        OverlayBakeRowAny(r.text, true,  r.on);
+        g_ovlProfRows.push_back(std::move(r));
+    }
+    if (g_ovlProfSel >= (int)g_ovlProfRows.size())
+        g_ovlProfSel = g_ovlProfRows.empty() ? 0 : (int)g_ovlProfRows.size() - 1;
+}
+
+static void OverlayRefreshLayRows()
+{
+    g_ovlLayRows.clear();
+    for (int i = 0; i < GH_SRC_COUNT; ++i) {
+        OvlTexRow r{};
+        wchar_t tgt[32];
+        GhTgtLabel(g_ghProf.bind[i], tgt, 32);
+        swprintf(r.text, 80, L"%s   %s", GhSrcLabel(i), tgt);
+        OverlayBakeRowAny(r.text, false, r.off);
+        OverlayBakeRowAny(r.text, true,  r.on);
+        g_ovlLayRows.push_back(std::move(r));
+    }
+}
+
+static void OverlayRefreshOptRows()
+{
+    wchar_t a[80], b[80], c[80];
+    swprintf(a, 80, L"Mouse speed          %d", g_ghProf.sens);
+    swprintf(b, 80, L"Invert look Y        %s", g_ghProf.invertY ? L"ON" : L"OFF");
+    swprintf(c, 80, L"Stick deadzone       %d", g_ghProf.dead);
+    const wchar_t* labs[3] = { a, b, c };
+    for (int i = 0; i < 3; ++i) {
+        wcsncpy(g_ovlOptRows[i].text, labs[i], 79);
+        g_ovlOptRows[i].text[79] = 0;
+        OverlayBakeRowAny(labs[i], false, g_ovlOptRows[i].off);
+        OverlayBakeRowAny(labs[i], true,  g_ovlOptRows[i].on);
+    }
+}
+
 static void OverlayBakePanels()
 {
     if (!g_lui.dc || !g_gfx.d11) return;
     int ok = 0;
-    for (int sel = 0; sel < 3; ++sel) {
+    for (int sel = 0; sel < 4; ++sel) {
         for (int on = 0; on < 2; ++on) {
             if (!OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlMenu[sel][on])) continue;
             OverlayPaintMenu(sel, on != 0);
@@ -1945,8 +2525,38 @@ static void OverlayBakePanels()
         OverlayPaintStatus(L"Invite failed", true);
         ++ok;
     }
+    for (int i = 0; i < 3; ++i) {
+        if (OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlInputHub[i])) {
+            OverlayPaintInputHub(i);
+            ++ok;
+        }
+    }
+    if (OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlProfilesChrome)) {
+        OverlayPaintListChrome(L"Profiles  ·  remembered per game",
+            L"A  Use      X  Rename      Y  Duplicate      LB  New      View  Delete      B  Back");
+        ++ok;
+    }
+    if (OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlLayoutChrome)) {
+        OverlayPaintListChrome(L"Layout  ·  A binds   X clears",
+            L"A  Assign      X  Clear      B  Back      \u25B2 \u25BC  Scroll");
+        ++ok;
+    }
+    if (OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlOptionsChrome)) {
+        OverlayPaintListChrome(L"Options  ·  \u25C0 \u25B6  adjust",
+            L"A  Toggle      B  Back");
+        ++ok;
+    }
+    if (OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlBindChrome)) {
+        OverlayPaintBindChrome();
+        ++ok;
+    }
+    if (OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlDelAsk)) {
+        OverlayPaintDelAsk();
+        ++ok;
+    }
+    OverlayBakeKeys();
     g_lui.dc->SetTarget(g_lui.uiTarget.get());
-    Diag("OVERLAY bake panels=" + std::to_string(ok) + "/13 (friends deferred until login)");
+    Diag("OVERLAY bake panels=" + std::to_string(ok) + " (keys+" + std::to_string(g_ovlKeyN) + ")");
 }
 
 static bool OvlNameReady(const char* n)
@@ -1991,7 +2601,8 @@ static void OverlayBlit(ID3D11Resource* dst)
     if (py < 0) py = 0;
 
     ID3D11Texture2D* src = nullptr;
-    if (g_ovlConfirm) src = g_lui.ovlConfirm.get();
+    if (g_ovlDelAsk) src = g_lui.ovlDelAsk.get();
+    else if (g_ovlConfirm) src = g_lui.ovlConfirm.get();
     else if (g_ovlPage == kOvlIncoming) src = g_lui.ovlIncoming.get();
     else if (g_ovlPage == kOvlFriends) {
         if (g_ovlFriends.empty()) src = g_lui.ovlFriendsEmpty.get();
@@ -1999,10 +2610,17 @@ static void OverlayBlit(ID3D11Resource* dst)
             unsigned long long lob = g_ghHostedLobby ? g_ghHostedLobby() : 0;
             src = g_lui.ovlFriendsChrome[lob ? 1 : 0].get();
         }
-    } else {
+    } else if (g_ovlPage == kOvlInputHub) {
+        int s = g_ovlHubSel; if (s < 0) s = 0; if (s > 2) s = 2;
+        src = g_lui.ovlInputHub[s].get();
+    } else if (g_ovlPage == kOvlProfiles) src = g_lui.ovlProfilesChrome.get();
+    else if (g_ovlPage == kOvlLayout)   src = g_lui.ovlLayoutChrome.get();
+    else if (g_ovlPage == kOvlOptions)  src = g_lui.ovlOptionsChrome.get();
+    else if (g_ovlPage == kOvlBind)     src = g_lui.ovlBindChrome.get();
+    else {
         int sel = g_ovlSel;
         if (sel < 0) sel = 0;
-        if (sel > 2) sel = 2;
+        if (sel > 3) sel = 3;
         src = g_lui.ovlMenu[sel][g_kmRemapOn ? 1 : 0].get();
     }
     if (!src) return;
@@ -2034,6 +2652,42 @@ static void OverlayBlit(ID3D11Resource* dst)
             g_gfx.d11ctx->CopySubresourceRegion(dst, 0,
                 (UINT)(px + (int)kOvlRowX), (UINT)(py + 168), 0, f.rowOn.get(), 0, nullptr);
             break;
+        }
+    }
+
+    auto blitRows = [&](const std::vector<OvlTexRow>& rows, int sel, int scroll) {
+        int n = (int)rows.size();
+        int last = scroll + kOvlFriendVis;
+        if (last > n) last = n;
+        for (int i = scroll; i < last; ++i) {
+            ID3D11Texture2D* row = (i == sel) ? rows[(size_t)i].on.get() : rows[(size_t)i].off.get();
+            if (!row) continue;
+            int y = py + (int)kOvlRowY0 + (i - scroll) * (int)kOvlRowH;
+            g_gfx.d11ctx->CopySubresourceRegion(dst, 0,
+                (UINT)(px + (int)kOvlRowX), (UINT)y, 0, row, 0, nullptr);
+        }
+    };
+    if (!g_ovlConfirm && !g_ovlDelAsk && g_ovlPage == kOvlProfiles)
+        blitRows(g_ovlProfRows, g_ovlProfSel, g_ovlProfScroll);
+    if (!g_ovlConfirm && !g_ovlDelAsk && g_ovlPage == kOvlLayout)
+        blitRows(g_ovlLayRows, g_ovlLaySel, g_ovlLayScroll);
+    if (!g_ovlConfirm && !g_ovlDelAsk && g_ovlPage == kOvlOptions) {
+        for (int i = 0; i < 3; ++i) {
+            ID3D11Texture2D* row = (i == g_ovlOptSel) ? g_ovlOptRows[i].on.get() : g_ovlOptRows[i].off.get();
+            if (!row) continue;
+            int y = py + (int)kOvlRowY0 + i * (int)kOvlRowH;
+            g_gfx.d11ctx->CopySubresourceRegion(dst, 0,
+                (UINT)(px + (int)kOvlRowX), (UINT)y, 0, row, 0, nullptr);
+        }
+    }
+    if (!g_ovlConfirm && !g_ovlDelAsk && g_ovlPage == kOvlBind) {
+        for (int i = 0; i < g_ovlKeyN; ++i) {
+            const OvlKey& k = g_ovlKeys[i];
+            if (!OverlayKeyVisible(k)) continue;
+            ID3D11Texture2D* t = (i == g_ovlKeySel) ? k.on.get() : k.off.get();
+            if (!t) continue;
+            g_gfx.d11ctx->CopySubresourceRegion(dst, 0,
+                (UINT)(px + (int)k.x), (UINT)(py + (int)k.y), 0, t, 0, nullptr);
         }
     }
     g_overlayDrawn = true;

@@ -2094,6 +2094,9 @@ static volatile bool     g_overlayDrawn = false;  // UI thread has painted uiTex
 static volatile bool     g_ovlChordClosed = false; // Start+Back closed; OverlayTick may decline
 static volatile bool     g_kmRemapOn    = false;
 static volatile bool     g_guestRunning = false;
+static void GhInputApply();
+static void GhInputReleaseAll();
+static void GhInputOnGuestStart(uint32_t app, const wchar_t* guestDir);
 static volatile bool     g_guestUserQuit  = false;  // skip SESSION ENDED splash
 static volatile bool     g_ovlConfirm     = false;  // quit "Are you sure?" panel
 static DWORD             g_uiThreadId     = 0;      // App::Run — never TerminateThread this
@@ -2486,6 +2489,10 @@ typedef HRESULT (STDMETHODCALLTYPE *GhWgiNavReadFn)(void*, GhWgiNavReading*);
 static GhWgiPadReadFn g_realWgiPadRead = nullptr;
 static GhWgiNavReadFn g_realWgiNavRead = nullptr;
 static void* g_wgiPadAbi = nullptr;
+#ifdef GH_LAUNCHER
+static void GhInputMaskXInput(XINPUT_GAMEPAD* g);
+static void GhInputMaskWgi(GhWgiPadReading* out);
+#endif
 
 static bool GhPatchVtblSlot(void* obj, int slot, void* hook, void** origOut)
 {
@@ -2509,6 +2516,8 @@ static HRESULT STDMETHODCALLTYPE Hook_WgiPadRead(void* self, GhWgiPadReading* ou
         uint64_t ts = out->Timestamp;
         memset(out, 0, sizeof(*out));
         out->Timestamp = ts;
+    } else if (g_kmRemapOn) {
+        GhInputMaskWgi(out);
     }
 #endif
     return hr;
@@ -2630,13 +2639,8 @@ static DWORD WINAPI Bed_XInputGetState(DWORD idx, XINPUT_STATE* state)
     } else {
         if ((g.wButtons & XINPUT_GAMEPAD_START) && (g.wButtons & XINPUT_GAMEPAD_BACK))
             g.wButtons = (WORD)(g.wButtons & ~(XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_BACK));
-        if (g_kmRemapOn) {
-            // v1 mouse set: A=LMB, B=RMB, RT/LT=wheel, right stick=cursor.
-            // Left stick / d-pad / shoulders stay as gamepad (walk + look).
-            g.wButtons = (WORD)(g.wButtons & ~(XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B));
-            g.sThumbRX = 0; g.sThumbRY = 0;
-            g.bLeftTrigger = 0; g.bRightTrigger = 0;
-        }
+        if (g_kmRemapOn)
+            GhInputMaskXInput(&g);
     }
 #endif
     state->Gamepad = g;
@@ -2791,31 +2795,15 @@ static void OverlayPollChord()
             g_ovlConfirm = false;
             g_ovlChordClosed = true;
         }
+        if (g_overlayOpen) GhInputReleaseAll();
         Diag(g_overlayOpen ? "OVERLAY open (Start+Back)" : "OVERLAY close (Start+Back)");
     }
 }
 
-// Right stick → cursor, A/B → L/R mouse, triggers → wheel. Matches ApplyMouseSample.
+// Profile interpreter (gh_input.h). Forward-declared; defined after ReadWholeFile.
 static void OverlayPadToMouse()
 {
-    if (!g_guestRunning || !g_kmRemapOn || g_overlayOpen) return;
-    XINPUT_GAMEPAD g;
-    { std::lock_guard<std::mutex> lk(g_padMutex); g = g_padState; }
-    const int dead = 8000;
-    int sx = g.sThumbRX, sy = g.sThumbRY;
-    if (sx > -dead && sx < dead) sx = 0;
-    if (sy > -dead && sy < dead) sy = 0;
-    // ~50 Hz pump; scale so a full deflection is a few hundred px/s.
-    short dx = (short)(sx * 28 / 32767);
-    short dy = (short)(-sy * 28 / 32767);   // XInput Y up, screen Y down
-    unsigned buttons = 0;
-    if (g.wButtons & XINPUT_GAMEPAD_A) buttons |= 1;
-    if (g.wButtons & XINPUT_GAMEPAD_B) buttons |= 2;
-    short wheel = 0;
-    if (g.bRightTrigger > 40) wheel = 1;
-    else if (g.bLeftTrigger > 40) wheel = -1;
-    if (dx || dy || buttons || wheel || g_kmPrevButtons)
-        ApplyMouseSample(buttons, dx, dy, wheel);
+    GhInputApply();
 }
 #endif
 
@@ -5271,6 +5259,7 @@ static void RunGuest()
             Diag(std::string("STAGE=steam_appid ") + buf);
         }
     }
+    GhInputOnGuestStart(g_launcherSelectedApp, g_guestDir.c_str());
 #endif
     // Relative-save redirect. The REAL process cwd is the read-only WindowsApps
     // launch drive (S:\...); we bed SetCurrentDirectoryW so the guest can never
@@ -5611,6 +5600,7 @@ static void ResetGuestForRelaunch()
 // all declared above. Only compiled into the Greenhouse.Launcher slot.
 // (g_launcherSelectedGuest is declared far above, before RunGuest, which reads it.)
 #ifdef GH_LAUNCHER
+#include "gh_input.h"
 #include "launcher_ui.h"
 #endif
 

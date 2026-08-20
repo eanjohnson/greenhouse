@@ -352,8 +352,12 @@ static bool gh_scan_for_utils(void* obj, const char* what, int nwords, uint32_t 
         if (!gh_readable(words + i, sizeof(void*))) break;   // end of mapped object
         void* cand = words[i];
         if ((intptr_t)cand <= 0x10000) continue;
+        if ((uintptr_t)cand & 7) continue;                 // misaligned = leftover / packed junk
+        if (!gh_readable(cand, 16)) continue;
+        void** vt = *(void***)cand;
+        if (!vt || ((uintptr_t)vt & 7) || !gh_readable(vt, 16)) continue;
         const char* nm = gh_rtti_name(cand);
-        if (nm[0] && strstr(nm, "ClientUtils")) {
+        if (nm[0] && strstr(nm, "IClientUtils")) {
             GH_ENGINE_LOG("GHENG appctx: IClientUtils via %s member[%d]=%p rtti=%s\n", what, i, cand, nm);
             if (gh_setappid_on(cand, nm, appid)) return true;
         }

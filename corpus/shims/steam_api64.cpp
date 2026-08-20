@@ -1219,10 +1219,11 @@ __declspec(dllexport) bool SteamAPI_Init() {
     // DIAG (2026-08-03): log EVERY entry, even when the lazy guard short-circuits.
     gh_logf("[gh-shim] SteamAPI_Init ENTER lazy=%ld state=%d", g_gh_lazy_once, g_gh_engine_state);
     gh_engine_lazy_init();
-    // Guest start may already have rebound the pipe; do it again here so a
-    // late SteamAppId stamp (Facepunch sets the env immediately before Init)
-    // still wins over the Cheese fallback from launcher login.
-    if (g_gh_engine && g_gh_engine_dll) gh_fix_app_context(g_gh_engine_dll);
+    // Do NOT gh_fix_app_context here. That scan vcalls untrusted pointers;
+    // clang-cl /O2 does not reliably SEH-guard those loads, and the launcher
+    // VEH treats any AV on the guest worker as fatal (Bed_exit). The engine
+    // thread already rebinds the pipe to SteamAppId (set by RunGuest / Facepunch
+    // before Init).
     return true;
 }
 
@@ -1240,7 +1241,9 @@ __declspec(dllexport) ESteamAPIInitResult SteamInternal_SteamAPI_Init(
     gh_logf("[gh-diag] SteamInternal_SteamAPI_Init called (versions=%.120s) -> OK",
             pchInternalCheckInterfaceVersions ? pchInternalCheckInterfaceVersions : "(null)");
     gh_engine_lazy_init();
-    if (g_gh_engine && g_gh_engine_dll) gh_fix_app_context(g_gh_engine_dll);
+    // App-context rebind is the engine thread's job. Running the CSteamUtils
+    // member scan on Unity's thread (SteamManager.Awake) AVs the guest worker
+    // and the launcher VEH kills REPO — see 0.0.76 loader_diag.
     return k_ESteamAPIInitResult_OK;
 }
 
