@@ -29,6 +29,16 @@
 #include <winrt/Windows.System.h>          // VirtualKey (real keyboard forwarding)
 #include <winrt/Windows.UI.Input.h>        // PointerPoint / properties (real mouse forwarding)
 #include <winrt/Windows.Devices.Input.h>   // MouseDevice relative delta (mouse-look)
+#ifdef GH_LAUNCHER
+#include <winrt/windows.devices.enumeration.h>
+#include <winrt/windows.media.h>
+#include <winrt/windows.media.audio.h>
+#include <winrt/windows.media.capture.h>
+#include <winrt/windows.media.capture.frames.h>
+#include <winrt/windows.media.devices.h>
+#include <winrt/windows.media.mediaproperties.h>
+#include <winrt/windows.media.render.h>
+#endif
 #include <windows.h>
 #include <tlhelp32.h>
 #include <winternl.h>
@@ -42,6 +52,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
 #include <cctype>
 #include <string>
 #include <vector>
@@ -3114,6 +3125,123 @@ static BOOL  WINAPI Bed_ClipCursor(const RECT*){ return TRUE; }
 static BOOL WINAPI Bed_ScreenToClient(HWND, LPPOINT p){ RECON_ONCE("ScreenToClient"); return p ? TRUE : FALSE; }
 static BOOL WINAPI Bed_ClientToScreen(HWND, LPPOINT p){ RECON_ONCE("ClientToScreen"); return p ? TRUE : FALSE; }
 
+#ifdef GH_LAUNCHER
+#include "gh_audio.h"
+static UINT WINAPI Bed_waveInGetNumDevs()
+{
+    RECON_ONCE("waveInGetNumDevs");
+    return 1;
+}
+static MMRESULT WINAPI Bed_waveInGetDevCapsA(UINT id, WAVEINCAPSA* c, UINT cb)
+{
+    RECON_ONCE("waveInGetDevCapsA");
+    if (id != 0 && id != (UINT)WAVE_MAPPER) return MMSYSERR_BADDEVICEID;
+    if (!c || cb < sizeof(WAVEINCAPSA)) return MMSYSERR_INVALPARAM;
+    memset(c, 0, sizeof(*c));
+    c->wChannels = 2;
+    c->dwFormats = WAVE_FORMAT_1M16 | WAVE_FORMAT_1S16 | WAVE_FORMAT_2M16 | WAVE_FORMAT_2S16 |
+                   WAVE_FORMAT_4M16 | WAVE_FORMAT_4S16 | WAVE_FORMAT_48M16 | WAVE_FORMAT_48S16;
+    memcpy(c->szPname, "Headset", 8);
+    return MMSYSERR_NOERROR;
+}
+static MMRESULT WINAPI Bed_waveInGetDevCapsW(UINT id, WAVEINCAPSW* c, UINT cb)
+{
+    RECON_ONCE("waveInGetDevCapsW");
+    if (id != 0 && id != (UINT)WAVE_MAPPER) return MMSYSERR_BADDEVICEID;
+    if (!c || cb < sizeof(WAVEINCAPSW)) return MMSYSERR_INVALPARAM;
+    memset(c, 0, sizeof(*c));
+    c->wChannels = 2;
+    c->dwFormats = WAVE_FORMAT_1M16 | WAVE_FORMAT_1S16 | WAVE_FORMAT_2M16 | WAVE_FORMAT_2S16 |
+                   WAVE_FORMAT_4M16 | WAVE_FORMAT_4S16 | WAVE_FORMAT_48M16 | WAVE_FORMAT_48S16;
+    memcpy(c->szPname, L"Headset", 16);
+    return MMSYSERR_NOERROR;
+}
+static MMRESULT WINAPI Bed_waveInOpen(HWAVEIN* phwi, UINT id, const WAVEFORMATEX* fmt,
+                                     DWORD_PTR cb, DWORD_PTR inst, DWORD flags)
+{
+    RECON_ONCE("waveInOpen");
+    if (id != 0 && id != (UINT)WAVE_MAPPER) return MMSYSERR_BADDEVICEID;
+    if (!fmt) return MMSYSERR_INVALPARAM;
+    if (fmt->wFormatTag != WAVE_FORMAT_PCM) return WAVERR_BADFORMAT;
+    if (fmt->nChannels < 1 || fmt->nChannels > 2) return WAVERR_BADFORMAT;
+    if (fmt->wBitsPerSample != 8 && fmt->wBitsPerSample != 16) return WAVERR_BADFORMAT;
+    if (fmt->nSamplesPerSec < 8000 || fmt->nSamplesPerSec > 96000) return WAVERR_BADFORMAT;
+    {
+        std::lock_guard<std::mutex> lk(g_audioMu);
+        g_winFmt = *fmt;
+        g_winFlags = flags;
+        g_winCb = cb;
+        g_winInst = inst;
+        g_winOpen = true;
+        g_winStarted = false;
+        g_winQ.clear();
+    }
+    if (phwi) *phwi = kGhWaveIn;
+    GhAudioWant();
+    Diag(std::string("AUDIO waveInOpen ") + std::to_string(fmt->nSamplesPerSec) + "Hz ch=" +
+         std::to_string(fmt->nChannels) + " bits=" + std::to_string(fmt->wBitsPerSample) +
+         " cb=" + Hex((uint32_t)(flags & CALLBACK_TYPEMASK)));
+    GhAudioFire(WIM_OPEN, 0, 0);
+    return MMSYSERR_NOERROR;
+}
+static MMRESULT WINAPI Bed_waveInPrepareHeader(HWAVEIN h, WAVEHDR* hdr, UINT)
+{
+    if (h != kGhWaveIn || !hdr) return MMSYSERR_INVALHANDLE;
+    hdr->dwFlags |= WHDR_PREPARED;
+    return MMSYSERR_NOERROR;
+}
+static MMRESULT WINAPI Bed_waveInUnprepareHeader(HWAVEIN h, WAVEHDR* hdr, UINT)
+{
+    if (h != kGhWaveIn || !hdr) return MMSYSERR_INVALHANDLE;
+    if (hdr->dwFlags & WHDR_INQUEUE) return WAVERR_STILLPLAYING;
+    hdr->dwFlags &= ~WHDR_PREPARED;
+    return MMSYSERR_NOERROR;
+}
+static MMRESULT WINAPI Bed_waveInAddBuffer(HWAVEIN h, WAVEHDR* hdr, UINT)
+{
+    if (h != kGhWaveIn || !hdr || !hdr->lpData) return MMSYSERR_INVALPARAM;
+    hdr->dwFlags = (hdr->dwFlags | WHDR_INQUEUE | WHDR_PREPARED) & ~WHDR_DONE;
+    hdr->dwBytesRecorded = 0;
+    std::lock_guard<std::mutex> lk(g_audioMu);
+    g_winQ.push_back(hdr);
+    return MMSYSERR_NOERROR;
+}
+static MMRESULT WINAPI Bed_waveInStart(HWAVEIN h)
+{
+    RECON_ONCE("waveInStart");
+    if (h != kGhWaveIn) return MMSYSERR_INVALHANDLE;
+    g_winStarted = true;
+    GhAudioWant();
+    return MMSYSERR_NOERROR;
+}
+static MMRESULT WINAPI Bed_waveInReset(HWAVEIN h)
+{
+    if (h != kGhWaveIn) return MMSYSERR_INVALHANDLE;
+    std::deque<WAVEHDR*> q;
+    {
+        std::lock_guard<std::mutex> lk(g_audioMu);
+        q.swap(g_winQ);
+        g_winStarted = false;
+    }
+    for (auto* hdr : q) {
+        if (!hdr) continue;
+        hdr->dwBytesRecorded = 0;
+        hdr->dwFlags = (hdr->dwFlags | WHDR_DONE) & ~WHDR_INQUEUE;
+        GhAudioFire(WIM_DATA, (DWORD_PTR)hdr, 0);
+    }
+    return MMSYSERR_NOERROR;
+}
+static MMRESULT WINAPI Bed_waveInClose(HWAVEIN h)
+{
+    RECON_ONCE("waveInClose");
+    if (h != kGhWaveIn) return MMSYSERR_INVALHANDLE;
+    Bed_waveInReset(h);
+    g_winOpen = false;
+    GhAudioFire(WIM_CLOSE, 0, 0);
+    return MMSYSERR_NOERROR;
+}
+#endif
+
 // CreateProcess surrogate -- defined after the PE mapper (needs ResolveImport
 // etc.); forward-declared here so the shim table can point at them.
 static BOOL WINAPI Bed_CreateProcessW(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES,
@@ -3206,6 +3334,18 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"XInputSetState",         (void*)&Bed_XInputSetState},
         {"XInputGetCapabilities",  (void*)&Bed_XInputGetCapabilities},
         {"XInputEnable",           (void*)&Bed_XInputEnable},
+#ifdef GH_LAUNCHER
+        {"waveInGetNumDevs",       (void*)&Bed_waveInGetNumDevs},
+        {"waveInGetDevCapsA",      (void*)&Bed_waveInGetDevCapsA},
+        {"waveInGetDevCapsW",      (void*)&Bed_waveInGetDevCapsW},
+        {"waveInOpen",             (void*)&Bed_waveInOpen},
+        {"waveInPrepareHeader",    (void*)&Bed_waveInPrepareHeader},
+        {"waveInUnprepareHeader",  (void*)&Bed_waveInUnprepareHeader},
+        {"waveInAddBuffer",        (void*)&Bed_waveInAddBuffer},
+        {"waveInStart",            (void*)&Bed_waveInStart},
+        {"waveInReset",            (void*)&Bed_waveInReset},
+        {"waveInClose",            (void*)&Bed_waveInClose},
+#endif
         // Child processes: in-process PE surrogate.
         {"CreateProcessW",     (void*)&Bed_CreateProcessW},
         {"CreateProcessA",     (void*)&Bed_CreateProcessA},
@@ -3406,6 +3546,18 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"XInputGetState",         (void*)&Bed_XInputGetState},
         {"XInputSetState",         (void*)&Bed_XInputSetState},
         {"XInputGetCapabilities",  (void*)&Bed_XInputGetCapabilities},
+#ifdef GH_LAUNCHER
+        {"waveInGetNumDevs",       (void*)&Bed_waveInGetNumDevs},
+        {"waveInGetDevCapsA",      (void*)&Bed_waveInGetDevCapsA},
+        {"waveInGetDevCapsW",      (void*)&Bed_waveInGetDevCapsW},
+        {"waveInOpen",             (void*)&Bed_waveInOpen},
+        {"waveInPrepareHeader",    (void*)&Bed_waveInPrepareHeader},
+        {"waveInUnprepareHeader",  (void*)&Bed_waveInUnprepareHeader},
+        {"waveInAddBuffer",        (void*)&Bed_waveInAddBuffer},
+        {"waveInStart",            (void*)&Bed_waveInStart},
+        {"waveInReset",            (void*)&Bed_waveInReset},
+        {"waveInClose",            (void*)&Bed_waveInClose},
+#endif
         {"GetAsyncKeyState",   (void*)&Bed_GetAsyncKeyState},
         {"GetKeyState",        (void*)&Bed_GetKeyState},
         {"GetKeyboardState",   (void*)&Bed_GetKeyboardState},
@@ -5664,6 +5816,9 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
         // and capture the display size for the windowing bed's GetClientRect.
         g_dispatcher = window.Dispatcher();
         { auto bd = window.Bounds(); if (bd.Width && bd.Height){ g_winW = (UINT)bd.Width; g_winH = (UINT)bd.Height; } }
+#ifdef GH_LAUNCHER
+        GhAudioProbe();
+#endif
         // Networked mouse source (the only way a hardware mouse reaches a
         // sideloaded Xbox app). Connects out to the LAN PC and feeds the beds.
         std::thread(NetMouseThread).detach();
@@ -5755,11 +5910,15 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
                 OverlayPollChord();
                 OverlayTick();
                 OverlayPadToMouse();
+                GhAudioTick();
                 (void)&PollPointerOnUi;
                 Sleep(20);
             }
             g_guestRunning = false;
             g_overlayOpen = false;
+#ifdef GH_LAUNCHER
+            GhAudioStopCapture();
+#endif
             NeutralizePreviousGuest();
             if (g_guestUserQuit) {
                 // Unity's allocator is process-global ("Memory manager is already

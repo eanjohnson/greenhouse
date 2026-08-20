@@ -2757,6 +2757,7 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
         if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
         PollGamepadOnUi();
         PollSyntheticPad();
+        GhAudioTick();
 
         bool qdirty = g_pickQueryChanged;
         g_pickQueryChanged = false;
