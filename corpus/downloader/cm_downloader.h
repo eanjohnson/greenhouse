@@ -619,13 +619,27 @@ inline Bytes http_fetch(const std::wstring& host,const std::wstring& path){
             }
             WinHttpCloseHandle(hR);} WinHttpCloseHandle(hC);} WinHttpCloseHandle(hS); return out;
 }
+// 3 tries per CDN host, then the next host. Empty body = timeout / 404 / connect fail.
+inline Bytes http_fetch_retry(const std::vector<std::string>& servers, const char* path){
+    if(!path || servers.empty()) return Bytes();
+    std::wstring wp=towide(path);
+    for(const auto& host: servers){
+        if(host.empty()) continue;
+        std::wstring wh=towide(host);
+        for(int a=0;a<3;a++){
+            Bytes b=http_fetch(wh,wp);
+            if(!b.empty()) return b;
+        }
+    }
+    return Bytes();
+}
 inline uint32_t adler32_buf(const uint8_t* d,size_t n){
     uint32_t a=1,b=0;
     for(size_t i=0;i<n;i++){ a=(a+d[i])%65521; b=(b+a)%65521; }
     return (b<<16)|a;
 }
 struct Chunk { Bytes sha; uint64_t offset=0; uint32_t cb_original=0,cb_compressed=0,crc=0; };
-struct FileEntry { std::string name; uint64_t size=0; uint32_t flags=0; std::string linktarget; std::vector<Chunk> chunks; };
+struct FileEntry { std::string name; uint64_t size=0; uint32_t flags=0; std::string linktarget; Bytes sha_content; std::vector<Chunk> chunks; };
 inline bool parse_manifest(const Bytes& man,std::vector<FileEntry>& files,bool& filenames_encrypted){
     filenames_encrypted=false; size_t off=0;
     while(off+4<=man.size()){
@@ -635,6 +649,7 @@ inline bool parse_manifest(const Bytes& man,std::vector<FileEntry>& files,bool& 
             while(pr.next(f,w)){ if(f==1&&w==2){ Bytes mp=pr.lendelim(); PbReader mr(mp.data(),mp.size()); uint32_t mf,mw; FileEntry fe;
                 while(mr.next(mf,mw)){ if(mf==1&&mw==2){Bytes b=mr.lendelim();fe.name.assign(b.begin(),b.end());}
                     else if(mf==2&&mw==0)fe.size=mr.varint(); else if(mf==3&&mw==0)fe.flags=(uint32_t)mr.varint();
+                    else if(mf==5&&mw==2)fe.sha_content=mr.lendelim();
                     else if(mf==7&&mw==2){Bytes b=mr.lendelim();fe.linktarget.assign(b.begin(),b.end());}
                     else if(mf==6&&mw==2){ Bytes ck=mr.lendelim(); PbReader cr(ck.data(),ck.size()); uint32_t cf,cw; Chunk c;
                         while(cr.next(cf,cw)){
@@ -676,6 +691,203 @@ inline void merge_file_entries(std::vector<FileEntry>& files){
     files.swap(out);
 }
 
+typedef void(*ShaTickFn)(void* ctx, uint64_t hashed, uint64_t total);
+inline bool sha1_handle_range(HANDLE h, uint64_t off, uint64_t len, uint8_t out[20],
+                              ShaTickFn tick=nullptr, void* tctx=nullptr){
+    if(h==INVALID_HANDLE_VALUE || !len) return false;
+    BCRYPT_ALG_HANDLE hAlg=0; BCRYPT_HASH_HANDLE hH=0; bool ok=false;
+    if(BCryptOpenAlgorithmProvider(&hAlg,BCRYPT_SHA1_ALGORITHM,NULL,0)!=GHDL_STATUS_SUCCESS) return false;
+    if(BCryptCreateHash(hAlg,&hH,NULL,0,NULL,0,0)==GHDL_STATUS_SUCCESS){
+        LARGE_INTEGER li; li.QuadPart=(LONGLONG)off;
+        if(SetFilePointerEx(h,li,NULL,FILE_BEGIN)){
+            uint8_t buf[1<<16];
+            uint64_t left=len, since=0;
+            bool fail=false;
+            while(left){
+                DWORD n=(DWORD)((left>sizeof(buf))?sizeof(buf):left);
+                DWORD got=0;
+                if(!ReadFile(h,buf,n,&got,NULL) || got!=n){ fail=true; break; }
+                if(BCryptHashData(hH,buf,got,0)!=GHDL_STATUS_SUCCESS){ fail=true; break; }
+                left-=got; since+=got;
+                if(tick && since>=(8u<<20)){ tick(tctx, len-left, len); since=0; }
+            }
+            if(!fail && BCryptFinishHash(hH,out,20,0)==GHDL_STATUS_SUCCESS) ok=true;
+        }
+        BCryptDestroyHash(hH);
+    }
+    BCryptCloseAlgorithmProvider(hAlg,0);
+    return ok;
+}
+inline bool sha1_path_range(const std::wstring& path, uint64_t off, uint64_t len, uint8_t out[20],
+                            ShaTickFn tick=nullptr, void* tctx=nullptr){
+    HANDLE h=CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
+    if(h==INVALID_HANDLE_VALUE) return false;
+    bool ok=sha1_handle_range(h,off,len,out,tick,tctx);
+    CloseHandle(h);
+    return ok;
+}
+inline void write_install_marker(const std::wstring& outdir, uint32_t app, bool complete){
+    std::wstring dir=outdir;
+    if(!dir.empty() && dir.back()!=L'\\' && dir.back()!=L'/') dir+=L'\\';
+    std::wstring p=dir+L"gh_install.txt";
+    char buf[80]; int n=sprintf(buf,"app=%u\ncomplete=%u\n",app, complete?1u:0u);
+    HANDLE h=CreateFileW(p.c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(h!=INVALID_HANDLE_VALUE){ DWORD w=0; WriteFile(h,buf,(DWORD)n,&w,nullptr); CloseHandle(h); }
+}
+
+struct RepairCtx {
+    uint32_t depot=0;
+    const Bytes* key=nullptr;
+    const std::vector<std::string>* servers=nullptr;
+    bool verify=false;
+    ProgressFn cb=nullptr;
+    void* cbctx=nullptr;
+    int totalChunks=0;
+    int totalFiles=0;
+    int* nchunks=nullptr;
+    int* nfiles=nullptr;
+    int* failures=nullptr;
+    unsigned long long* totbytes=nullptr;
+    bool* disk_full=nullptr;
+};
+inline int repair_pct(const RepairCtx& x){
+    if(!x.nchunks || !x.totalChunks) return 99;
+    int pct=2 + ((*x.nchunks)*97)/x.totalChunks;
+    if(pct<2) pct=2; if(pct>99) pct=99;
+    return pct;
+}
+inline void repair_cb(const RepairCtx& x, const char* ph){
+    if(x.cb) x.cb(x.cbctx, ph, repair_pct(x), x.nfiles?*x.nfiles:0, x.totalFiles, x.totbytes?*x.totbytes:0);
+}
+inline void sha_tick_repair(void* p, uint64_t, uint64_t){
+    RepairCtx* x=(RepairCtx*)p;
+    repair_cb(*x, x->verify ? "checking files" : "downloading");
+}
+inline bool fetch_decode_chunk(uint32_t depot, const Bytes& key, const Chunk& ck,
+                               const std::vector<std::string>& servers, Bytes& raw){
+    if(key.size()!=32 || ck.sha.empty()) return false;
+    char sh[64]={0}; for(size_t i=0;i<ck.sha.size() && i<20;i++) sprintf(sh+i*2,"%02x",ck.sha[i]);
+    char cp[128]; sprintf(cp,"/depot/%u/chunk/%s",depot,sh);
+    Bytes enc=http_fetch_retry(servers,cp);
+    if(enc.empty()||!decode_chunk(enc,key.data(),ck.cb_original,raw)) return false;
+    uint8_t dg[20]; bool shaOk=sha1_hash(raw,dg)&&ck.sha.size()==20&&memcmp(dg,ck.sha.data(),20)==0;
+    uint32_t ad=adler32_buf(raw.data(),raw.size());
+    bool adlerOk=ck.crc && ad==ck.crc;
+    return shaOk || adlerOk;
+}
+
+// Resume: skip files whose size already matches. Partial / missing files keep
+// good on-disk chunks (SHA1 of [offset, cb_original)) and only CDN-fetch the rest.
+// Verify: hash size-matching files against sha_content (else every chunk) and
+// repair mismatches in place. Never CREATE_ALWAYS — that discarded a partial
+// multi-GB asset on the next pass.
+inline bool write_or_repair_file(const FileEntry& fe, const std::wstring& full, RepairCtx& x, bool trace){
+    if(x.disk_full && *x.disk_full) return false;
+    uint64_t before=existing_size(full);
+    bool missing=(before==(uint64_t)-1);
+    uint64_t have=missing?0:before;
+    const char* busy = x.verify ? "checking files" : "downloading";
+    const char* fetch_ph = x.verify ? "repairing" : "downloading";
+
+    if(!x.verify && fe.size && have==fe.size){
+        if(x.nfiles) (*x.nfiles)++;
+        if(x.totbytes) *x.totbytes += fe.size;
+        if(x.nchunks) *x.nchunks += (int)fe.chunks.size();
+        if(trace) trace_exe("SKIP complete");
+        repair_cb(x, fetch_ph);
+        return true;
+    }
+    if(x.verify && fe.size && have==fe.size && fe.sha_content.size()==20){
+        repair_cb(x, busy);
+        uint8_t dg[20];
+        if(sha1_path_range(full,0,fe.size,dg,&sha_tick_repair,&x) && memcmp(dg,fe.sha_content.data(),20)==0){
+            if(x.nfiles) (*x.nfiles)++;
+            if(x.totbytes) *x.totbytes += fe.size;
+            if(x.nchunks) *x.nchunks += (int)fe.chunks.size();
+            if(trace) trace_exe("SKIP sha_content");
+            repair_cb(x, busy);
+            return true;
+        }
+        if(trace) trace_exe("sha_content mismatch, repairing");
+        ghlog(std::string("verify mismatch ")+fe.name);
+    }
+    if(fe.chunks.empty()){
+        ghlog(std::string("no-chunks ")+fe.name+" size="+std::to_string(fe.size));
+        if(trace) trace_exe("SKIP no-chunks");
+        return true;
+    }
+
+    HANDLE h=CreateFileW(full.c_str(),GENERIC_READ|GENERIC_WRITE,0,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+    if(h==INVALID_HANDLE_VALUE){
+        DWORD err=GetLastError();
+        if(x.failures) (*x.failures)++;
+        if(trace) trace_exe(std::string("OPEN fail err=")+std::to_string(err));
+        return false;
+    }
+    int file_fail=0;
+    uint64_t wrote_new=0;
+    for(size_t ci=0;ci<fe.chunks.size();ci++){
+        if(x.disk_full && *x.disk_full) break;
+        const Chunk& ck=fe.chunks[ci];
+        uint32_t orig=ck.cb_original;
+        bool on_disk = !missing && orig>0 && have>=ck.offset+(uint64_t)orig;
+        bool chunk_ok=false;
+        if(on_disk && ck.sha.size()==20){
+            uint8_t dg[20];
+            if(sha1_handle_range(h,ck.offset,orig,dg) && memcmp(dg,ck.sha.data(),20)==0) chunk_ok=true;
+        }
+        if(chunk_ok){
+            if(x.nchunks) (*x.nchunks)++;
+            if(x.totbytes) *x.totbytes += orig;
+            if(trace) trace_exe(std::string("  SKIP chunk i=")+std::to_string(ci)+" off="+std::to_string(ck.offset));
+            continue;
+        }
+        Bytes raw;
+        if(!x.key || !x.servers || !fetch_decode_chunk(x.depot,*x.key,ck,*x.servers,raw)){
+            if(x.failures) (*x.failures)++;
+            file_fail++;
+            if(x.nchunks) (*x.nchunks)++;
+            ghlog(std::string("chunk fail ")+fe.name+" off="+std::to_string(ck.offset)+" want="+std::to_string(orig));
+            if(trace) trace_exe(std::string("  CKfail i=")+std::to_string(ci)+" orig="+std::to_string(orig)+
+                               " off="+std::to_string(ck.offset));
+            continue;
+        }
+        LARGE_INTEGER li; li.QuadPart=(LONGLONG)ck.offset;
+        SetFilePointerEx(h,li,NULL,FILE_BEGIN);
+        DWORD w=0; BOOL wok=WriteFile(h,raw.data(),(DWORD)raw.size(),&w,NULL); DWORD werr=wok?0:GetLastError();
+        if(x.totbytes) *x.totbytes += w;
+        wrote_new+=w;
+        if(have < ck.offset+(uint64_t)w) have=ck.offset+(uint64_t)w;
+        if(x.nchunks) (*x.nchunks)++;
+        if(trace) trace_exe(std::string("  CKok i=")+std::to_string(ci)+" raw="+std::to_string(raw.size())+
+                            " w="+std::to_string(w)+" off="+std::to_string(ck.offset));
+        if(!wok || w!=(DWORD)raw.size()){
+            if(x.failures) (*x.failures)++;
+            file_fail++;
+            ghlog_always(std::string("write fail ")+fe.name+" err="+std::to_string(werr)+" w="+std::to_string(w)+" raw="+std::to_string(raw.size()));
+            if(werr==ERROR_DISK_FULL || werr==39){
+                if(x.disk_full) *x.disk_full=true;
+                if(x.cb) x.cb(x.cbctx,"storage full",repair_pct(x),x.nfiles?*x.nfiles:0,x.totalFiles,x.totbytes?*x.totbytes:0);
+            }
+            break;
+        }
+        repair_cb(x, fetch_ph);
+    }
+    if(file_fail==0 && fe.size){
+        LARGE_INTEGER end; end.QuadPart=(LONGLONG)fe.size;
+        if(SetFilePointerEx(h,end,NULL,FILE_BEGIN)) SetEndOfFile(h);
+    }
+    CloseHandle(h);
+    if(x.disk_full && *x.disk_full && wrote_new==0 && missing) DeleteFileW(full.c_str());
+    if(trace) trace_exe(std::string("FILE done wrote_new=")+std::to_string(wrote_new)+" want="+std::to_string(fe.size)+
+                        " fail="+std::to_string(file_fail));
+    if(file_fail && fe.size && wrote_new<fe.size)
+        ghlog(std::string("short file ")+fe.name+" wrote="+std::to_string(wrote_new)+" want="+std::to_string(fe.size));
+    if(x.nfiles) (*x.nfiles)++;
+    repair_cb(x, fetch_ph);
+    return file_fail==0;
+}
+
 // ==================== the library entry point ====================
 // outdir = full destination path for the game tree (e.g. <LocalState>\game\<name>).
 // token empty => anonymous logon. cb may be null. Returns 0 on success, >0 chunk
@@ -695,43 +907,32 @@ inline int DownloadDepot(uint32_t app,uint32_t depot,uint64_t manifest,const std
     std::vector<std::string> servers; if(!c.get_content_servers(servers)){ GHDL_CB("error-servers",0,0,0,0); closesocket(c.s); return -4; }
     GHDL_CB("fetching-manifest",2,0,0,0);
     uint64_t mcode; if(!c.get_manifest_code(app,depot,manifest,branch,mcode)){ GHDL_CB("error-manifest",0,0,0,0); closesocket(c.s); return -5; }
-    std::wstring whost=towide(servers[0]);
     char mp[256]; sprintf(mp,"/depot/%u/manifest/%llu/5/%llu",depot,(unsigned long long)manifest,(unsigned long long)mcode);
-    Bytes zip=http_fetch(whost,towide(mp)); Bytes man; if(!unzip_first(zip,man)){ GHDL_CB("error-manifest-dl",0,0,0,0); closesocket(c.s); return -6; }
+    Bytes zip=http_fetch_retry(servers,mp); Bytes man; if(!unzip_first(zip,man)){ GHDL_CB("error-manifest-dl",0,0,0,0); closesocket(c.s); return -6; }
     std::vector<FileEntry> files; bool fenc=false; if(!parse_manifest(man,files,fenc)){ GHDL_CB("error-parse",0,0,0,0); closesocket(c.s); return -7; }
     if(fenc){ for(auto& fe:files){ Bytes p; if(sym_decrypt(depotkey.data(),b64decode(fe.name),p)){ fe.name.assign(p.begin(),p.end()); while(!fe.name.empty()&&fe.name.back()=='\0')fe.name.pop_back(); } } }
     int total_chunks=0; for(auto& fe:files) total_chunks+=(int)fe.chunks.size();
     GHDL_CB("downloading",2,0,(int)files.size(),0);
     mkdirs(outdir+L"\\");
-    int nfiles=0,nchunks=0,failures=0; unsigned long long totbytes=0;
+    int nfiles=0,nchunks=0,failures=0; unsigned long long totbytes=0; bool disk_full=false;
+    RepairCtx rx; rx.depot=depot; rx.key=&depotkey; rx.servers=&servers; rx.verify=false;
+    rx.cb=cb; rx.cbctx=ctx; rx.totalChunks=total_chunks; rx.totalFiles=(int)files.size();
+    rx.nchunks=&nchunks; rx.nfiles=&nfiles; rx.failures=&failures; rx.totbytes=&totbytes; rx.disk_full=&disk_full;
     for(auto& fe:files){
         std::string rel=fe.name; for(char& ch:rel) if(ch=='/')ch='\\';
         std::wstring full=outdir+L"\\"+towide(rel);
         if(fe.flags&FLAG_DIRECTORY){ mkdirs(full+L"\\"); continue; }
         if(fe.flags&FLAG_SYMLINK) continue;
         size_t sl=full.find_last_of(L"\\/"); if(sl!=std::wstring::npos) mkdirs(full.substr(0,sl+1));
-        if(fe.size && existing_size(full)==fe.size){ nfiles++; totbytes+=fe.size; continue; }
-        HANDLE h=CreateFileW(full.c_str(),GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
-        if(h==INVALID_HANDLE_VALUE){ failures++; continue; }
-        for(auto& ck:fe.chunks){
-            char sh[64]={0}; for(size_t i=0;i<ck.sha.size();i++)sprintf(sh+i*2,"%02x",ck.sha[i]);
-            char cp[128]; sprintf(cp,"/depot/%u/chunk/%s",depot,sh);
-            Bytes enc=http_fetch(whost,towide(cp)); Bytes raw;
-            if(enc.empty()||!decode_chunk(enc,depotkey.data(),ck.cb_original,raw)){ failures++; continue; }
-            uint8_t dg[20]; if(sha1_hash(raw,dg)&&ck.sha.size()==20&&memcmp(dg,ck.sha.data(),20)!=0){ failures++; continue; }
-            LARGE_INTEGER li; li.QuadPart=(LONGLONG)ck.offset; SetFilePointerEx(h,li,NULL,FILE_BEGIN);
-            DWORD w; WriteFile(h,raw.data(),(DWORD)raw.size(),&w,NULL); totbytes+=w; nchunks++;
-        }
-        CloseHandle(h); nfiles++;
-        int pct = total_chunks? (2 + (nchunks*97)/total_chunks) : 99;
-        GHDL_CB("downloading",pct,nfiles,(int)files.size(),totbytes);
+        write_or_repair_file(fe,full,rx,false);
+        if(disk_full) break;
     }
     DeleteFileW(gh_tmp(L"_ghdl_in.zst").c_str()); DeleteFileW(gh_tmp(L"_ghdl_in.lzma").c_str());
     DeleteFileW(gh_tmp(L"_ghdl_out.bin").c_str());
-    GHDL_CB(failures?"error-chunks":"done",100,nfiles,(int)files.size(),totbytes);
+    GHDL_CB(disk_full?"storage full":(failures?"error-chunks":"done"), disk_full?99:100, nfiles,(int)files.size(),totbytes);
     closesocket(c.s); WSACleanup();
     #undef GHDL_CB
-    return failures;
+    return disk_full ? (failures?failures:1) : failures;
 }
 
 // ==================== whole-app download (appid -> all depots) ====================
@@ -739,16 +940,18 @@ inline int DownloadDepot(uint32_t app,uint32_t depot,uint64_t manifest,const std
 // windows-branch depot the account can obtain a key for, into <outdir> as one game tree.
 // Reuses ONE CM connection for all depots. Two passes: (1) fetch each depot's key+manifest
 // to count total chunks so the progress bar is accurate; (2) fetch/decode/verify/write all
-// chunks. Requires a token login (owned depots need the user's session). Returns 0 on full
-// success, >0 = chunk failures, <0 = a setup failure (negated phase).
+// chunks. verify=true hashes size-matching files (Steam "verify integrity") and repairs
+// mismatches in place; verify=false skips size-matching files and only fills holes
+// (resume). Requires a token login (owned depots need the user's session). Returns 0 on
+// full success, >0 = chunk failures, <0 = a setup failure (negated phase).
 inline int DownloadApp(uint32_t app,const std::wstring& outdir,const std::string& branch,
                        const std::string& token,uint64_t token_sid,const std::string& account,
-                       ProgressFn cb,void* ctx){
+                       ProgressFn cb,void* ctx,bool verify=false){
     #define GHDL_CB(ph,pc,fd,ft,by) do{ if(cb) cb(ctx,ph,pc,fd,ft,by); }while(0)
     GHDL_CB("connecting",0,0,0,0);
     trace_exe_reset();
     { std::string dest(outdir.begin(), outdir.end());
-      trace_exe(std::string("BEGIN dest=")+dest+" app="+std::to_string(app)); }
+      trace_exe(std::string("BEGIN dest=")+dest+" app="+std::to_string(app)+" verify="+std::to_string((int)verify)); }
     CmClient c;
     if(!c.connect_and_secure()){ GHDL_CB("error-connect",0,0,0,0); trace_exe("END rc=-1 connect"); return -1; }
     GHDL_CB("signing in",1,0,0,0);
@@ -758,7 +961,6 @@ inline int DownloadApp(uint32_t app,const std::wstring& outdir,const std::string
     std::vector<DepotInfo> depots;
     if(!c.get_app_depots(app,branch,depots)){ GHDL_CB("error-appinfo",0,0,0,0); closesocket(c.s); return -3; }
     std::vector<std::string> servers; if(!c.get_content_servers(servers)){ GHDL_CB("error-servers",0,0,0,0); closesocket(c.s); return -4; }
-    std::wstring whost=towide(servers[0]);
 
     // Pass 1: per-depot key + manifest; build the work list and count chunks.
     struct DW { uint32_t depot; Bytes key; std::vector<FileEntry> files; };
@@ -767,7 +969,7 @@ inline int DownloadApp(uint32_t app,const std::wstring& outdir,const std::string
         Bytes key; if(!c.get_depot_key(app,d.depot,key)||key.size()!=32){ ghlog("skip depot(no key) "+std::to_string(d.depot)); continue; }
         uint64_t mcode; if(!c.get_manifest_code(app,d.depot,d.manifest,branch,mcode)){ ghlog("skip depot(no mcode) "+std::to_string(d.depot)); continue; }
         char mp[256]; sprintf(mp,"/depot/%u/manifest/%llu/5/%llu",d.depot,(unsigned long long)d.manifest,(unsigned long long)mcode);
-        Bytes zip=http_fetch(whost,towide(mp)); Bytes man; if(!unzip_first(zip,man)){ ghlog("skip depot(no manifest) "+std::to_string(d.depot)); continue; }
+        Bytes zip=http_fetch_retry(servers,mp); Bytes man; if(!unzip_first(zip,man)){ ghlog("skip depot(no manifest) "+std::to_string(d.depot)); continue; }
         std::vector<FileEntry> files; bool fenc=false; if(!parse_manifest(man,files,fenc)) continue;
         if(fenc){ for(auto& fe:files){ Bytes p; if(sym_decrypt(key.data(),b64decode(fe.name),p)){ fe.name.assign(p.begin(),p.end()); while(!fe.name.empty()&&fe.name.back()=='\0')fe.name.pop_back(); } } }
         merge_file_entries(files);
@@ -808,115 +1010,40 @@ inline int DownloadApp(uint32_t app,const std::wstring& outdir,const std::string
             return a.name<b.name;
         });
     }
-    GHDL_CB("downloading",2,0,totalFiles,0);
+    GHDL_CB(verify?"checking files":"downloading",2,0,totalFiles,0);
     mkdirs(outdir+L"\\");
+    write_install_marker(outdir, app, false);
     int nchunks=0,nfiles=0,failures=0; unsigned long long totbytes=0;
     bool disk_full=false;
     for(auto& dw:work){
         if(disk_full) break;
+        RepairCtx rx; rx.depot=dw.depot; rx.key=&dw.key; rx.servers=&servers; rx.verify=verify;
+        rx.cb=cb; rx.cbctx=ctx; rx.totalChunks=totalChunks; rx.totalFiles=totalFiles;
+        rx.nchunks=&nchunks; rx.nfiles=&nfiles; rx.failures=&failures; rx.totbytes=&totbytes; rx.disk_full=&disk_full;
         for(auto& fe:dw.files){
+            if(disk_full) break;
             std::string rel=fe.name; for(char& ch:rel) if(ch=='/')ch='\\';
             std::wstring full=outdir+L"\\"+towide(rel);
             if(fe.flags&FLAG_DIRECTORY){ mkdirs(full+L"\\"); continue; }
             if(fe.flags&FLAG_SYMLINK) continue;
             size_t sl=full.find_last_of(L"\\/"); if(sl!=std::wstring::npos) mkdirs(full.substr(0,sl+1));
-            // Repair path: a previous pass may have left a 0-byte dest after
-            // decode failures. Skip files that already match the manifest size.
-            uint64_t before=existing_size(full);
             bool trace=is_20xx_exe(rel);
             if(trace){
+                uint64_t before=existing_size(full);
                 std::string dp(full.begin(), full.end());
                 trace_exe(std::string("FILE dest=")+dp+" existing="+(before==(uint64_t)-1?"missing":std::to_string(before))+
                           " size="+std::to_string(fe.size)+" flags="+std::to_string(fe.flags)+
                           " nchunks="+std::to_string(fe.chunks.size()));
             }
-            if(fe.size && before==fe.size){ nfiles++; totbytes+=fe.size; if(trace) trace_exe("SKIP complete"); continue; }
-            if(fe.chunks.empty()){
-                // Do not CREATE_ALWAYS a stub over a real file (or leave a new 0-byte PE).
-                ghlog(std::string("no-chunks ")+rel+" size="+std::to_string(fe.size));
-                if(trace) trace_exe("SKIP no-chunks");
-                continue;
-            }
-            HANDLE h=CreateFileW(full.c_str(),GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
-            if(h==INVALID_HANDLE_VALUE){
-                DWORD err=GetLastError(); failures++;
-                if(trace) trace_exe(std::string("CREATE fail err=")+std::to_string(err));
-                continue;
-            }
-            uint64_t wrote=0;
-            static bool dumped_chunk=false;
-            for(size_t ci=0;ci<fe.chunks.size();ci++){
-                auto& ck=fe.chunks[ci];
-                char sh[64]={0}; for(size_t i=0;i<ck.sha.size();i++)sprintf(sh+i*2,"%02x",ck.sha[i]);
-                char cp[128]; sprintf(cp,"/depot/%u/chunk/%s",dw.depot,sh);
-                Bytes enc=http_fetch(whost,towide(cp)); Bytes raw; nchunks++;
-                Bytes cont; bool dec= !enc.empty() && sym_decrypt(dw.key.data(),enc,cont);
-                std::string mag = (!dec||cont.size()<4) ? std::string("n=")+std::to_string(cont.size())
-                    : hex_bytes(cont.data(),4);
-                bool dok=dec && decode_chunk(enc,dw.key.data(),ck.cb_original,raw);
-                if(!dok){
-                    failures++;
-                    ghlog(std::string("chunk fail ")+rel+" off="+std::to_string(ck.offset)+" enc="+std::to_string(enc.size())+" want="+std::to_string(ck.cb_original));
-                    if(trace){
-                        trace_exe(std::string("  CKfail i=")+std::to_string(ci)+" enc="+std::to_string(enc.size())+
-                                  " dec="+std::to_string(dec)+" mag="+mag+" orig="+std::to_string(ck.cb_original)+
-                                  " off="+std::to_string(ck.offset));
-                        if(!dumped_chunk && !enc.empty()){
-                            std::wstring bp=gh_tmp(L"gh_chunk.bin");
-                            HANDLE hb=CreateFileW(bp.c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
-                            if(hb!=INVALID_HANDLE_VALUE){ DWORD ww=0; WriteFile(hb,enc.data(),(DWORD)enc.size(),&ww,nullptr); CloseHandle(hb);
-                                trace_exe(std::string("  dumped gh_chunk.bin bytes=")+std::to_string(enc.size())); }
-                            dumped_chunk=true;
-                        }
-                    }
-                    continue;
-                }
-                uint8_t dg[20]; bool shaOk=sha1_hash(raw,dg)&&ck.sha.size()==20&&memcmp(dg,ck.sha.data(),20)==0;
-                uint32_t ad=adler32_buf(raw.data(),raw.size());
-                bool adlerOk=ck.crc && ad==ck.crc;
-                if(!shaOk && !adlerOk){
-                    failures++;
-                    ghlog(std::string("hash fail ")+rel+" off="+std::to_string(ck.offset)+" raw="+std::to_string(raw.size())+" sha="+std::to_string(ck.sha.size())+" ad="+std::to_string(ad)+" crc="+std::to_string(ck.crc));
-                    if(trace) trace_exe(std::string("  CKhash i=")+std::to_string(ci)+" raw="+std::to_string(raw.size())+
-                                        " mag="+mag+" shaOk=0 adlerOk=0 ad="+std::to_string(ad)+" crc="+std::to_string(ck.crc)+
-                                        " shasz="+std::to_string(ck.sha.size()));
-                    continue;
-                }
-                LARGE_INTEGER li; li.QuadPart=(LONGLONG)ck.offset; SetFilePointerEx(h,li,NULL,FILE_BEGIN);
-                DWORD w=0; BOOL wok=WriteFile(h,raw.data(),(DWORD)raw.size(),&w,NULL); DWORD werr=wok?0:GetLastError();
-                totbytes+=w; wrote+=w;
-                if(trace) trace_exe(std::string("  CKok i=")+std::to_string(ci)+" raw="+std::to_string(raw.size())+
-                                    " mag="+mag+" shaOk="+std::to_string(shaOk)+" adlerOk="+std::to_string(adlerOk)+
-                                    " wok="+std::to_string((int)wok)+" w="+std::to_string(w)+" werr="+std::to_string(werr)+
-                                    " off="+std::to_string(ck.offset));
-                if(!wok || w!=(DWORD)raw.size()){
-                    failures++;
-                    ghlog_always(std::string("write fail ")+rel+" err="+std::to_string(werr)+" w="+std::to_string(w)+" raw="+std::to_string(raw.size()));
-                    if(werr==ERROR_DISK_FULL || werr==39/*ERROR_HANDLE_DISK_FULL*/){
-                        disk_full=true;
-                        int pct = totalChunks? (2 + (nchunks*97)/totalChunks) : 99;
-                        GHDL_CB("storage full",pct,nfiles,totalFiles,totbytes);
-                    }
-                    break;
-                }
-            }
-            CloseHandle(h);
-            if(trace) trace_exe(std::string("FILE done wrote=")+std::to_string(wrote)+" want="+std::to_string(fe.size));
-            if(disk_full){
-                if(wrote==0) DeleteFileW(full.c_str());   // do not keep a 0-byte PE as "incomplete"
-                break;
-            }
-            if(fe.size && wrote<fe.size){ ghlog(std::string("short file ")+rel+" wrote="+std::to_string(wrote)+" want="+std::to_string(fe.size)+" nck="+std::to_string(fe.chunks.size())); }
-            nfiles++;
-            int pct = totalChunks? (2 + (nchunks*97)/totalChunks) : 99;
-            GHDL_CB("downloading",pct,nfiles,totalFiles,totbytes);
+            write_or_repair_file(fe,full,rx,trace);
         }
     }
+    if(!disk_full && failures==0) write_install_marker(outdir, app, true);
     GHDL_CB(disk_full?"storage full":(failures?"error-chunks":"done"), disk_full?99:100, nfiles,totalFiles,totbytes);
     closesocket(c.s); WSACleanup();
-    trace_exe(std::string("END rc=")+std::to_string(failures)+" nfiles="+std::to_string(nfiles)+" nchunks="+std::to_string(nchunks)+" disk_full="+std::to_string(disk_full));
+    trace_exe(std::string("END rc=")+std::to_string(failures)+" nfiles="+std::to_string(nfiles)+" nchunks="+std::to_string(nchunks)+" disk_full="+std::to_string(disk_full)+" verify="+std::to_string((int)verify));
     #undef GHDL_CB
-    return failures;
+    return disk_full ? (failures?failures:1) : failures;
 }
 
 } // namespace ghdl

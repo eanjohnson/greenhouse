@@ -109,6 +109,7 @@ struct LauncherItem {
     std::wstring guest;      // empty => "continue with default guest"
     std::wstring sub;        // source hint shown dim (e.g. "installed", "USB", "configured")
     uint32_t     app = 0;    // Steam appid for "owned" (@@lib) entries -> download-on-select
+    bool         incomplete = false;  // gh_install.txt complete=0, or <64-byte PE
 };
 
 static std::string LuiNarrow(const std::wstring& w) { return std::string(w.begin(), w.end()); }
@@ -264,6 +265,32 @@ static bool LuiCanUninstall(const LauncherItem& it)
         return !root.empty() && StartsWithNoCase(d, root) && d.size() > root.size();
     };
     return under(scratch) || under(legacy);
+}
+
+// Steam-style verify needs an appid and a Greenhouse-managed tree (manifest + CDN).
+static bool LuiCanVerify(const LauncherItem& it)
+{
+    if (!it.app) return false;
+    if (it.guest.empty() || it.guest[0] == L'@') return false;
+    return LuiCanUninstall(it);
+}
+
+// gh_install.txt: 1 = complete, 0 = incomplete, -1 = no marker (legacy trees).
+static int LuiInstallComplete(const std::wstring& folder)
+{
+    std::wstring p = folder;
+    if (!p.empty() && p.back() != L'\\' && p.back() != L'/') p += L'\\';
+    p += L"gh_install.txt";
+    HANDLE h = CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    DWORD sz = GetFileSize(h, nullptr);
+    if (sz == INVALID_FILE_SIZE || sz > 4096) { CloseHandle(h); return -1; }
+    std::string s(sz ? sz : 0, 0); DWORD rd = 0;
+    if (sz) ReadFile(h, &s[0], sz, &rd, nullptr);
+    CloseHandle(h); s.resize(rd);
+    if (s.find("complete=0") != std::string::npos) return 0;
+    if (s.find("complete=1") != std::string::npos) return 1;
+    return -1;
 }
 
 static bool LuiDeleteTree(const std::wstring& dir)
@@ -452,7 +479,10 @@ static std::vector<LauncherItem> LuiEnumerate()
             if (it.display.empty()) {
                 wchar_t fb[32]; swprintf(fb, 32, L"App %u", app); it.display = fb;
             }
-            it.sub = (LuiFileSize(it.guest) >= 64) ? L"installed" : L"incomplete";
+            int inst = LuiInstallComplete(gameDir + sub + L"\\");
+            DWORD gsz = LuiFileSize(it.guest);
+            if (inst == 0 || gsz < 64) { it.sub = L"incomplete"; it.incomplete = true; }
+            else it.sub = L"installed";
             Diag(std::string("LAUNCHER slot '") + LuiNarrow(it.display) + "' " + LuiNarrow(tag) +
                  " folder='" + LuiNarrow(sub) + "' exe='" + LuiNarrow(exe) +
                  "' app=" + std::to_string(app) + " sub=" + LuiNarrow(it.sub));
@@ -557,6 +587,31 @@ static void LuiText(const wchar_t* s, IDWriteTextFormat* f, D2D1_RECT_F r,
     f->SetTextAlignment(al);
     f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     g_lui.dc->DrawText(s, (UINT32)wcslen(s), f, r, b);
+}
+
+static float LuiMeasure(const wchar_t* s, IDWriteTextFormat* f)
+{
+    if (!s || !f || !g_lui.dw) return 0;
+    com_ptr<IDWriteTextLayout> tl;
+    if (FAILED(g_lui.dw->CreateTextLayout(s, (UINT32)wcslen(s), f, 8000.f, 200.f, tl.put())) || !tl)
+        return 0;
+    DWRITE_TEXT_METRICS m{};
+    tl->GetMetrics(&m);
+    return m.widthIncludingTrailingWhitespace;
+}
+
+// Physical Xbox View button (two overlapping rounded squares). Segoe UI has no
+// letter for it, so a one-line "View  Verify" looked like two unlabeled actions.
+static float LuiDrawViewBtn(float x, float cy, ID2D1Brush* br)
+{
+    auto* dc = g_lui.dc.get();
+    const float s = 10.f, r = 1.8f, dx = 4.f, dy = 4.f;
+    float y = cy - s * 0.5f - dy * 0.35f;
+    D2D1_ROUNDED_RECT back  = D2D1::RoundedRect(D2D1::RectF(x, y, x + s, y + s), r, r);
+    D2D1_ROUNDED_RECT front = D2D1::RoundedRect(D2D1::RectF(x + dx, y + dy, x + dx + s, y + dy + s), r, r);
+    dc->DrawRoundedRectangle(back, br, 1.7f);
+    dc->DrawRoundedRectangle(front, br, 1.7f);
+    return dx + s;
 }
 
 // Xbox system on-screen keyboard (gamepad). DirectX/UWP apps don't have a
@@ -697,7 +752,7 @@ static bool LuiContainsI(const std::wstring& hay, const std::wstring& needle)
 
 static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const std::wstring& status,
                         const std::wstring& query, int matchN, int allN,
-                        const wchar_t* uninstallName)
+                        int promptKind, const wchar_t* promptName)
 {
     auto* dc = g_lui.dc.get();
     const float W = (float)g_lui.w, H = (float)g_lui.h;
@@ -750,30 +805,60 @@ static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const s
                 g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
 
-    // Footer
-    LuiText(L"\u25B2 \u25BC  Move      \u25C0 \u25B6  Jump 5      A  Launch      X  Uninstall      Y  Search      B  Back",
-            g_lui.fmtSmall.get(), D2D1::RectF(84, H - 70, W - 80, H - 30), g_lui.brDim.get());
+    // Footer. View has no face-button letter, so draw the two-square glyph
+    // (same motif as the physical button) and keep the "X  Action" rhythm.
+    {
+        const float y0 = H - 70.f, y1 = H - 30.f, cy = (y0 + y1) * 0.5f;
+        float x = 84.f;
+        IDWriteTextFormat* fs = g_lui.fmtSmall.get();
+        ID2D1Brush* dim = g_lui.brDim.get();
+        const wchar_t* left = L"\u25B2 \u25BC  Move      \u25C0 \u25B6  Jump 5      A  Launch      X  Uninstall      ";
+        const wchar_t* right = L"  Verify      Y  Search      B  Back";
+        float wl = LuiMeasure(left, fs);
+        LuiText(left, fs, D2D1::RectF(x, y0, x + wl + 2.f, y1), dim);
+        x += wl;
+        x += LuiDrawViewBtn(x, cy, dim);
+        LuiText(right, fs, D2D1::RectF(x, y0, W - 80.f, y1), dim);
+    }
 
-    if (uninstallName && uninstallName[0]) {
+    if (promptName && promptName[0] && promptKind != 0) {
         dc->FillRectangle(D2D1::RectF(0, 0, W, H), g_lui.brBg.get());
         float cx = W * 0.5f, cy = H * 0.5f;
         D2D1_ROUNDED_RECT box = D2D1::RoundedRect(D2D1::RectF(cx - 460, cy - 200, cx + 460, cy + 200), 16, 16);
         dc->FillRoundedRectangle(box, g_lui.brPanel.get());
-        LuiText(L"UNINSTALL", g_lui.fmtTitle.get(),
-                D2D1::RectF(cx - 430, cy - 180, cx + 430, cy - 100),
-                g_lui.brWarn.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-        LuiText(L"Remove this game from the console?", g_lui.fmtItem.get(),
-                D2D1::RectF(cx - 430, cy - 90, cx + 430, cy - 30),
-                g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-        LuiText(uninstallName, g_lui.fmtItem.get(),
-                D2D1::RectF(cx - 430, cy - 20, cx + 430, cy + 40),
-                g_lui.brAccent.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-        LuiText(L"The install folder will be deleted. This cannot be undone.", g_lui.fmtSmall.get(),
-                D2D1::RectF(cx - 430, cy + 50, cx + 430, cy + 100),
-                g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-        LuiText(L"A  Yes, uninstall            B  Cancel", g_lui.fmtSmall.get(),
-                D2D1::RectF(cx - 430, cy + 110, cx + 430, cy + 170),
-                g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+        if (promptKind == 2) {
+            LuiText(L"VERIFY FILES", g_lui.fmtTitle.get(),
+                    D2D1::RectF(cx - 430, cy - 180, cx + 430, cy - 100),
+                    g_lui.brAccent.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            LuiText(L"Check this install against Steam and repair it?", g_lui.fmtItem.get(),
+                    D2D1::RectF(cx - 430, cy - 90, cx + 430, cy - 30),
+                    g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            LuiText(promptName, g_lui.fmtItem.get(),
+                    D2D1::RectF(cx - 430, cy - 20, cx + 430, cy + 40),
+                    g_lui.brAccent.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            LuiText(L"Matching files are hashed, not re-downloaded. This can take a while.", g_lui.fmtSmall.get(),
+                    D2D1::RectF(cx - 430, cy + 50, cx + 430, cy + 100),
+                    g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            LuiText(L"A  Verify            B  Cancel", g_lui.fmtSmall.get(),
+                    D2D1::RectF(cx - 430, cy + 110, cx + 430, cy + 170),
+                    g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+        } else {
+            LuiText(L"UNINSTALL", g_lui.fmtTitle.get(),
+                    D2D1::RectF(cx - 430, cy - 180, cx + 430, cy - 100),
+                    g_lui.brWarn.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            LuiText(L"Remove this game from the console?", g_lui.fmtItem.get(),
+                    D2D1::RectF(cx - 430, cy - 90, cx + 430, cy - 30),
+                    g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            LuiText(promptName, g_lui.fmtItem.get(),
+                    D2D1::RectF(cx - 430, cy - 20, cx + 430, cy + 40),
+                    g_lui.brAccent.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            LuiText(L"The install folder will be deleted. This cannot be undone.", g_lui.fmtSmall.get(),
+                    D2D1::RectF(cx - 430, cy + 50, cx + 430, cy + 100),
+                    g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            LuiText(L"A  Yes, uninstall            B  Cancel", g_lui.fmtSmall.get(),
+                    D2D1::RectF(cx - 430, cy + 110, cx + 430, cy + 170),
+                    g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
     }
 
     dc->EndDraw();
@@ -1022,7 +1107,7 @@ static LauncherDlReq LauncherReadDlReq()
 }
 
 // Progress state shared with the download callback (same UI thread).
-struct LauncherDlProg { std::wstring name, phase; int percent=0, fdone=0, ftot=0; unsigned long long bytes=0; };
+struct LauncherDlProg { std::wstring name, phase; int percent=0, fdone=0, ftot=0; unsigned long long bytes=0; bool verify=false; };
 static LauncherDlProg g_dlProg;
 
 static void LuiDrawProgress()
@@ -1032,7 +1117,7 @@ static void LuiDrawProgress()
     dc->BeginDraw();
     dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
     LuiText(L"GREENHOUSE", g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
-    LuiText((L"●  Downloading " + g_dlProg.name).c_str(), g_lui.fmtSmall.get(),
+    LuiText((std::wstring(g_dlProg.verify ? L"●  Verifying " : L"●  Downloading ") + g_dlProg.name).c_str(), g_lui.fmtSmall.get(),
             D2D1::RectF(84, 140, W - 80, 182), g_lui.brAccent.get());
     // progress bar
     const float x0 = 84, x1 = W - 84, y = H * 0.5f - 20, hgt = 40;
@@ -1101,7 +1186,7 @@ static bool LauncherRunDownload(const LauncherDlReq& req)
 // multi-depot downloader (ghdl::DownloadApp) into <LocalState>\game\<name>, drawing the same
 // live progress bar. Returns true once the game tree is written. The token stays in memory
 // and is scrubbed -- never logged.
-static bool LauncherRunAppDownload(uint32_t app, const std::wstring& name)
+static bool LauncherRunAppDownload(uint32_t app, const std::wstring& name, bool verify=false)
 {
     uint64_t sid = 0; std::string token, account;
     if (!LauncherReadCred(sid, token, account)) {
@@ -1111,16 +1196,17 @@ static bool LauncherRunAppDownload(uint32_t app, const std::wstring& name)
         return false;
     }
     g_dlProg = LauncherDlProg{};
-    g_dlProg.name = name; g_dlProg.phase = L"starting";
+    g_dlProg.name = name; g_dlProg.phase = L"starting"; g_dlProg.verify = verify;
     LuiDrawProgress(); LuiPresent();
 
     // One dest per appid. Reuse whatever folder already holds this steam_appid.txt
     // (20XX, app_322110, ...) so A-to-repair cannot spawn a second incomplete slot.
     std::wstring outdir = LuiInstallDir(app, name);
 
-    int rc = ghdl::DownloadApp(app, outdir, "public", token, sid, account, LauncherDlCallback, nullptr);
+    int rc = ghdl::DownloadApp(app, outdir, "public", token, sid, account, LauncherDlCallback, nullptr, verify);
     token.clear();                                   // scrub token
-    Diag("LAUNCHER app-download rc=" + std::to_string(rc) + " app=" + std::to_string(app));
+    Diag(std::string("LAUNCHER ") + (verify ? "verify" : "app-download") +
+         " rc=" + std::to_string(rc) + " app=" + std::to_string(app));
     if (rc == 0) return true;
     for (int i = 0; i < 180; ++i) { LuiDrawProgress(); LuiPresent(); Sleep(16); }   // show error ~3s
     return false;
@@ -2715,6 +2801,8 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
     int matchN = 0;
     bool uninstallAsk = false;
     LauncherItem uninstallIt;
+    bool verifyAsk = false;
+    LauncherItem verifyIt;
 
     auto applyFilter = [&]() {
         items.clear();
@@ -2812,24 +2900,33 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
             if (ns > n - 1) ns = n - 1;
             if (ns != sel) { sel = ns; lastNav = now; }
         };
-        if (uninstallAsk) {
+        if (uninstallAsk || verifyAsk) {
             if (pressed & XINPUT_GAMEPAD_B) {
-                Diag("LAUNCHER uninstall cancelled");
-                uninstallAsk = false;
+                Diag(uninstallAsk ? "LAUNCHER uninstall cancelled" : "LAUNCHER verify cancelled");
+                uninstallAsk = false; verifyAsk = false;
                 prev = b;
             } else if (pressed & XINPUT_GAMEPAD_A) {
-                std::wstring folder = LuiInstallFolder(uninstallIt);
-                Diag("LAUNCHER uninstall '" + LuiNarrow(uninstallIt.display) +
-                     "' dir='" + LuiNarrow(folder) + "'");
-                bool ok = false;
-                if (LuiCanUninstall(uninstallIt)) ok = LuiDeleteTree(folder);
-                Diag(std::string("LAUNCHER uninstall ") + (ok ? "ok" : "FAIL"));
-                uninstallAsk = false;
-                rebuild();
+                if (uninstallAsk) {
+                    std::wstring folder = LuiInstallFolder(uninstallIt);
+                    Diag("LAUNCHER uninstall '" + LuiNarrow(uninstallIt.display) +
+                         "' dir='" + LuiNarrow(folder) + "'");
+                    bool ok = false;
+                    if (LuiCanUninstall(uninstallIt)) ok = LuiDeleteTree(folder);
+                    Diag(std::string("LAUNCHER uninstall ") + (ok ? "ok" : "FAIL"));
+                    uninstallAsk = false;
+                    rebuild();
+                } else {
+                    Diag("LAUNCHER verify '" + LuiNarrow(verifyIt.display) +
+                         "' app=" + std::to_string(verifyIt.app));
+                    if (verifyIt.app) LauncherRunAppDownload(verifyIt.app, verifyIt.display, true);
+                    verifyAsk = false;
+                    rebuild();
+                }
                 prev = b;
             }
             LuiDrawMenu(items, sel, status, g_pickQuery, matchN, (int)all.size(),
-                        uninstallIt.display.c_str());
+                        uninstallAsk ? 1 : 2,
+                        uninstallAsk ? uninstallIt.display.c_str() : verifyIt.display.c_str());
             LuiPresent();
             Sleep(16);
             continue;
@@ -2857,6 +2954,14 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
                 Diag("LAUNCHER uninstall prompt '" + LuiNarrow(uninstallIt.display) + "'");
             }
         }
+        if (pressed & XINPUT_GAMEPAD_BACK) {
+            if (!g_pickOskOpen && LuiCanVerify(items[sel])) {
+                verifyAsk = true;
+                verifyIt = items[sel];
+                Diag("LAUNCHER verify prompt '" + LuiNarrow(verifyIt.display) +
+                     "' app=" + std::to_string(verifyIt.app));
+            }
+        }
         if (pressed & XINPUT_GAMEPAD_A) {
             const LauncherItem& it = items[sel];
             Diag("LAUNCHER selected [" + std::to_string(sel) + "] '" + LuiNarrow(it.display) +
@@ -2873,17 +2978,20 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
                 rebuild();                            // refresh library (new game appears)
                 continue;
             }
-            // Incomplete download (0-byte PE): repair instead of launching.
+            // Incomplete install (marker or <64-byte PE): resume instead of launching
+            // a half-tree whose exe happened to land first.
             {
                 DWORD sz = LuiFileSize(it.guest);
                 if (sz < 64 && it.guest.size() >= 2 && it.guest[1] != L':')
                     sz = LuiFileSize(std::wstring(kDevGames) + it.guest);
                 if (sz < 64 && it.guest.size() >= 2 && it.guest[1] != L':')
                     sz = LuiFileSize(std::wstring(kLocalState) + L"game\\" + it.guest);
-                if (sz < 64) {
-                    Diag("LAUNCHER repair empty guest='" + LuiNarrow(it.guest) +
-                         "' app=" + std::to_string(it.app));
-                    if (it.app) { LauncherRunAppDownload(it.app, it.display); rebuild(); }
+                bool resume = it.incomplete || sz < 64;
+                if (resume) {
+                    Diag("LAUNCHER resume guest='" + LuiNarrow(it.guest) +
+                         "' app=" + std::to_string(it.app) + " incomplete=" +
+                         std::to_string((int)it.incomplete) + " sz=" + std::to_string(sz));
+                    if (it.app) { LauncherRunAppDownload(it.app, it.display, false); rebuild(); }
                     continue;
                 }
             }
@@ -2892,7 +3000,7 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
             return it.guest;
         }
 
-        LuiDrawMenu(items, sel, status, g_pickQuery, matchN, (int)all.size(), nullptr);
+        LuiDrawMenu(items, sel, status, g_pickQuery, matchN, (int)all.size(), 0, nullptr);
         LuiPresent();
         Sleep(16);
     }

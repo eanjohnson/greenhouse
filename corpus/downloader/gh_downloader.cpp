@@ -38,15 +38,17 @@ int main(int argc,char** argv){
     setvbuf(stdout,NULL,_IONBF,0);
     // App mode: resolve depots via PICS and download the whole app.
     //   gh_downloader.exe app <appid> [outdir] [branch]
+    //   gh_downloader.exe verify <appid> [outdir] [branch]
     // Uses GH_STEAM_TOKEN/GH_STEAM_STEAMID if set (owned games), else anonymous (public apps).
-    if(argc>=3 && std::string(argv[1])=="app"){
+    if(argc>=3 && (std::string(argv[1])=="app" || std::string(argv[1])=="verify")){
+        bool verify=std::string(argv[1])=="verify";
         uint32_t a=(uint32_t)strtoul(argv[2],0,10); std::string nm=argc>3?argv[3]:"gamedir"; std::string br=argc>4?argv[4]:"public";
         g_dl_name=nm; std::wstring od=ghdl::towide(nm);
         char tk[4096]={0}, sd[64]={0}; DWORD tl=GetEnvironmentVariableA("GH_STEAM_TOKEN",tk,sizeof(tk));
         GetEnvironmentVariableA("GH_STEAM_STEAMID",sd,sizeof(sd)); char ac[128]={0}; GetEnvironmentVariableA("GH_STEAM_ACCOUNT",ac,sizeof(ac));
         std::string tok=(tl>0)?tk:""; uint64_t sid=sd[0]?strtoull(sd,0,10):0;
         ghdl::g_logFn=[](const char* m){ printf("%s\n",m); }; ghdl::g_logBudget=200;
-        int rc=ghdl::DownloadApp(a,od,br,tok,sid,ac,on_progress,nullptr);
+        int rc=ghdl::DownloadApp(a,od,br,tok,sid,ac,on_progress,nullptr,verify);
         printf(rc==0?"\nSUCCESS\n":"\nFAILED rc=%d\n",rc); return rc?1:0;
     }
     uint32_t app,depot; uint64_t manifest; std::string branch,name; std::wstring outdir;
@@ -55,7 +57,7 @@ int main(int argc,char** argv){
         name=argc>4?argv[4]:"gamedir"; branch=argc>5?argv[5]:"public"; outdir=ghdl::towide(name);
     } else if(read_request("gh_download.txt",app,depot,manifest,name,branch)){
         outdir=ghdl::towide("game\\"+name);
-    } else { printf("usage: gh_downloader.exe <app> <depot> <manifest> [outdir] [branch]\n   or provide gh_download.txt\n"); return 2; }
+    } else { printf("usage: gh_downloader.exe <app> <depot> <manifest> [outdir] [branch]\n       gh_downloader.exe app|verify <appid> [outdir] [branch]\n   or provide gh_download.txt\n"); return 2; }
     g_dl_name=name;
 
     char tok[4096]={0}, sid[64]={0}; DWORD tl=GetEnvironmentVariableA("GH_STEAM_TOKEN",tok,sizeof(tok));
