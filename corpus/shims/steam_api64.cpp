@@ -539,10 +539,23 @@ static LONG g_gh_lazy_once = 0;   // file-scope so GhBringUpEngineNow can pre-se
 static void gh_invite_targeted(uint64_t lobby);  // fwd
 static void gh_set_connect_richpresence(uint64_t lobby);  // fwd (defined below, used by the heartbeat re-assert)
 static const char* gh_trigger_path();  // fwd (defined below, polled by the heartbeat invite trigger)
+static void gh_dump_friends_once();    // fwd (needs gh_vcall / gh_safe_cstr, defined below)
 // Hosted lobby id (set in the LobbyCreated_t handler). The heartbeat re-asserts the joinable "connect"
 // rich-presence for it ONCE the register marks us in-game — so the connect upload can't be lost to a
 // host-before-presence race (Steam rejects a connect upload while not in-game and never retries it).
 static volatile uint64_t g_gh_hosted_lobby = 0;
+// Overlay invite plumbing (Phase D). Immediate-friend enum + one pending inbound
+// LobbyInvite_t + a synthetic GameLobbyJoinRequested_t we inject on accept.
+static const int kGhFriendImmediate = 0x04;
+static volatile long g_gh_pend_invite = 0;
+static uint64_t g_gh_pend_from = 0, g_gh_pend_lobby = 0, g_gh_pend_game = 0;
+static char g_gh_pend_name[64] = {0};
+static volatile long g_gh_synth_333 = 0;   // 1 = queued, 2 = delivered (await FreeLast)
+static volatile long g_gh_synth_live = 0;  // FreeLast should skip the engine
+static uint64_t g_gh_synth_lobby = 0, g_gh_synth_friend = 0;
+static uint8_t  g_gh_synth_param[16] = {0};
+static volatile long g_gh_open_invite_dialog = 0;
+static uint64_t g_gh_open_invite_lobby = 0;
 static void gh_engine_lazy_init() {
     if (InterlockedCompareExchange(&g_gh_lazy_once, 1, 0) != 0) return;
     gh_log_truncate();   // clean single-run log
@@ -686,6 +699,7 @@ extern "C" __declspec(dllexport) void GhBringUpEngineNow() {
                             gh_log("[gh-shim] invite trigger IGNORED: no active lobby (host first, then re-fire)");
                         }
                     }
+                    if (g_gh_friends) gh_dump_friends_once();
                 }
             }
             return 0;
@@ -1131,25 +1145,71 @@ static void gh_set_connect_richpresence(uint64_t lobby) {
                 gh_safe_cstr(rb, rbbuf, sizeof(rbbuf)));
     }
 }
-static void gh_invite_targeted(uint64_t lobby) {
-    gh_logf("[gh-shim] targeted invite(lobby=%llu)", (unsigned long long)lobby);
-    if (g_gh_engine_state != 2 || !g_gh_matchmaking) {
-        gh_logf("[gh-shim]   NOT READY: state=%d mm=%p", g_gh_engine_state, (void*)g_gh_matchmaking);
-        return;
+static void gh_dump_friends_once() {
+    static LONG once = 0;
+    if (InterlockedCompareExchange(&once, 1, 0) != 0) return;
+    if (!g_gh_friends) { InterlockedExchange(&once, 0); return; }
+    int n = gh_vcall<int>(g_gh_friends, 3, 0, kGhFriendImmediate);
+    gh_logf("[gh-shim] friends Immediate count=%d", n);
+    int lim = n; if (lim > 80) lim = 80;
+    for (int i = 0; i < lim; ++i) {
+        uint64_steamid sid = gh_vcall_sid(g_gh_friends, 4, i, kGhFriendImmediate);
+        const char* nm = gh_vcall<const char*>(g_gh_friends, 7, nullptr, sid);
+        char nbuf[64];
+        gh_logf("[gh-shim]   friend[%d] sid=%llu name=\"%s\"",
+                i, (unsigned long long)sid, gh_safe_cstr(nm, nbuf, sizeof(nbuf)));
     }
-    // Advertise the lobby as joinable BEFORE sending any invite, so the invite carries a
-    // "Join Game" action. Fires whether or not there is an invite target on file.
+}
+
+static bool gh_invite_sid(uint64_t lobby, uint64_t sid) {
+    if (g_gh_engine_state != 2 || !g_gh_matchmaking || !lobby || !sid) {
+        gh_logf("[gh-shim]   invite NOT READY: state=%d mm=%p lobby=%llu sid=%llu",
+                g_gh_engine_state, (void*)g_gh_matchmaking,
+                (unsigned long long)lobby, (unsigned long long)sid);
+        return false;
+    }
     gh_set_connect_richpresence(lobby);
-    uint64_t sid = gh_read_invite_target();
-    if (!sid) { gh_log("[gh-shim]   no target -> NO invites sent"); return; }
-    // Log the target's persona name/state for the record (best-effort; not a filter).
     if (g_gh_friends) {
         const char* name = gh_vcall<const char*>(g_gh_friends, 7, nullptr, (uint64_steamid)sid);
         int state = gh_vcall<int>(g_gh_friends, 8, 0, (uint64_steamid)sid);
-        gh_logf("[gh-shim]   target sid=%llu name=%s state=%d", (unsigned long long)sid, name ? name : "", state);
+        char nbuf[64];
+        gh_logf("[gh-shim]   target sid=%llu name=%s state=%d",
+                (unsigned long long)sid, gh_safe_cstr(name, nbuf, sizeof(nbuf)), state);
     }
     bool ok = gh_vcall<bool>(g_gh_matchmaking, 16, false, (uint64_steamid)lobby, (uint64_steamid)sid);
     gh_logf("[gh-shim]   InviteUserToLobby(%llu) -> %s", (unsigned long long)sid, ok ? "OK" : "FAIL");
+    return ok;
+}
+
+static void gh_invite_targeted(uint64_t lobby) {
+    gh_logf("[gh-shim] targeted invite(lobby=%llu)", (unsigned long long)lobby);
+    uint64_t sid = gh_read_invite_target();
+    if (!sid) { gh_log("[gh-shim]   no target -> NO invites sent"); return; }
+    gh_invite_sid(lobby, sid);
+}
+
+static void gh_note_lobby_invite(uint64_t from, uint64_t lobby, uint64_t game) {
+    uint32_t app = (uint32_t)(game & 0xFFFFFFu);
+    uint32_t want = gh_target_appid();
+    gh_logf("[gh-shim] LobbyInvite_t from=%llu lobby=%llu game=%llu app=%u want=%u",
+            (unsigned long long)from, (unsigned long long)lobby,
+            (unsigned long long)game, app, want);
+    if (app && want && app != want) {
+        gh_log("[gh-shim]   invite IGNORED: wrong app");
+        return;
+    }
+    g_gh_pend_from = from;
+    g_gh_pend_lobby = lobby;
+    g_gh_pend_game = game;
+    g_gh_pend_name[0] = 0;
+    if (g_gh_friends && from) {
+        const char* nm = gh_vcall<const char*>(g_gh_friends, 7, nullptr, (uint64_steamid)from);
+        gh_safe_cstr(nm, g_gh_pend_name, sizeof(g_gh_pend_name));
+    }
+    if (!g_gh_pend_name[0])
+        _snprintf(g_gh_pend_name, sizeof(g_gh_pend_name) - 1, "%llu", (unsigned long long)from);
+    InterlockedExchange(&g_gh_pend_invite, 1);
+    gh_logf("[gh-shim]   pending invite name=\"%s\"", g_gh_pend_name);
 }
 
 extern "C" {
@@ -1276,6 +1336,21 @@ __declspec(dllexport) bool SteamAPI_ManualDispatch_GetNextCallback(HSteamPipe pi
     if (g_gh_engine_state != 2) return false;
     gh_resolve_dispatch();
     if (!g_fnBGetCallback) return false;
+    // Overlay accepted an inbound invite: deliver GameLobbyJoinRequested_t (333)
+    // into Facepunch/Steamworks.NET's ManualDispatch pump BEFORE the engine
+    // queue. Steam overlay would have posted this after the user clicked Join.
+    if (pCallbackMsg && InterlockedCompareExchange(&g_gh_synth_333, 2, 1) == 1) {
+        memcpy(g_gh_synth_param + 0, &g_gh_synth_lobby, 8);
+        memcpy(g_gh_synth_param + 8, &g_gh_synth_friend, 8);
+        *(int32_t*)((char*)pCallbackMsg + 0) = (int32_t)g_gh_engine_user;
+        *(int32_t*)((char*)pCallbackMsg + 4) = 333;
+        *(void**)((char*)pCallbackMsg + 8) = g_gh_synth_param;
+        *(int32_t*)((char*)pCallbackMsg + 16) = 16;
+        InterlockedExchange(&g_gh_synth_live, 1);
+        gh_logf("[gh-shim] inject GameLobbyJoinRequested_t lobby=%llu friend=%llu",
+                (unsigned long long)g_gh_synth_lobby, (unsigned long long)g_gh_synth_friend);
+        return true;
+    }
     bool got = false;
     __try { got = g_fnBGetCallback(pipe ? pipe : g_gh_engine_pipe, pCallbackMsg); }
     __except (EXCEPTION_EXECUTE_HANDLER) { got = false; }
@@ -1286,9 +1361,9 @@ __declspec(dllexport) bool SteamAPI_ManualDispatch_GetNextCallback(HSteamPipe pi
         gh_bcf("cb-deliver id=%d cub=%d", icb, cub);
         { char b[64]; _snprintf(b, sizeof(b)-1, "cb id=%d cub=%d", icb, cub); b[sizeof(b)-1]=0; gh_trace(b); }
         // DIAG: always log lobby-relevant callbacks (703=SteamAPICallCompleted_t,
-        // 510=LobbyMatchList_t, 513=LobbyCreated_t, 504=LobbyEnter_t) — the deduped gh_trace
-        // above can hide repeats; this shows every occurrence so we can see the chain.
-        if (icb==703 || icb==510 || icb==513 || icb==504 || icb==500 || icb==502) {
+        // 510=LobbyMatchList_t, 513=LobbyCreated_t, 504=LobbyEnter_t, 503=LobbyInvite_t,
+        // 333=GameLobbyJoinRequested_t).
+        if (icb==703 || icb==510 || icb==513 || icb==504 || icb==503 || icb==333 || icb==500 || icb==502) {
             gh_logf("[gh-diag] cb-deliver id=%d cub=%d", icb, cub);
             if (icb==703 && cub>=sizeof(SteamAPICall_t)+8) {
                 // SteamAPICallCompleted_t { uint64 hAsyncCall; int iCallback; uint32 cubParam }
@@ -1305,37 +1380,47 @@ __declspec(dllexport) bool SteamAPI_ManualDispatch_GetNextCallback(HSteamPipe pi
                     int res = *(int*)p;
                     unsigned long long lobby = *(unsigned long long*)((char*)p + 8);
                     gh_logf("[gh-diag]   LobbyCreated_t result=%d lobby=%llu", res, lobby);
-                    // TRACE-A: unconditional to prove we reach here
                     gh_log("[gh-shim]   TRACE-A: inside LobbyCreated inner block");
-                    // Lobby is live: make it JOINABLE now, but DO NOT auto-send any invite.
-                    // The invite is now a deliberate REMOTE trigger (gh_invite_now.txt, polled by
-                    // the heartbeat loop) so it goes out only when the user is actually in their
-                    // game lobby with friends — not on this early lobby-created event. One-shot
-                    // latch keeps the connect setup to once per lobby.
-                    static LONG s_invite_latch = 0;
-                    LONG prev = InterlockedCompareExchange(&s_invite_latch, 1, 0);
-                    gh_logf("[gh-shim]   TRACE-B: res=%d lobby=%llu latch_prev=%ld", res, lobby, prev);
-                    if (res == 1 /*k_EResultOK*/ && lobby && prev == 0) {
-                        g_gh_hosted_lobby = lobby;   // heartbeat re-asserts connect + services the remote trigger
-                        gh_logf("[gh-shim]   lobby created -> advertise joinable, await remote invite trigger (lobby=%llu)", lobby);
-                        // Re-assert games-played at the hosting moment so the CM has us "playing"
-                        // (rich-presence connect upload is gated on this). Idempotent.
+                    // Record every successful host lobby (re-host after leave must update
+                    // the id). Do NOT auto-send; overlay / gh_invite_now.txt fire the send.
+                    if (res == 1 /*k_EResultOK*/ && lobby) {
+                        g_gh_hosted_lobby = lobby;
+                        gh_logf("[gh-shim]   lobby created -> advertise joinable (lobby=%llu)", lobby);
                         gh_send_games_played(gh_target_appid());
-                        // Advertise the lobby as joinable WITHOUT sending an invite (no recipient here).
                         gh_set_connect_richpresence(lobby);
                     }
                 }
             } else if (icb==504 && cub>=20) {
                 // LobbyEnter_t { uint64 lobby; uint32 perms; bool locked; uint32 EChatRoomEnterResponse }
                 void* p = *(void**)((char*)pCallbackMsg + 8);
-                if (p) gh_logf("[gh-diag]   LobbyEnter_t lobby=%llu response=%u",
-                               *(unsigned long long*)p, *(unsigned*)((char*)p + 16));
+                if (p) {
+                    unsigned long long lobby = *(unsigned long long*)p;
+                    unsigned resp = *(unsigned*)((char*)p + 16);
+                    gh_logf("[gh-diag]   LobbyEnter_t lobby=%llu response=%u", lobby, resp);
+                    if (lobby && resp == 1) g_gh_hosted_lobby = lobby;
+                }
+            } else if (icb==503 && cub>=24) {
+                void* p = *(void**)((char*)pCallbackMsg + 8);
+                if (p) {
+                    uint64_t from  = *(uint64_t*)((char*)p + 0);
+                    uint64_t lobby = *(uint64_t*)((char*)p + 8);
+                    uint64_t game  = *(uint64_t*)((char*)p + 16);
+                    gh_note_lobby_invite(from, lobby, game);
+                }
+            } else if (icb==333 && cub>=16) {
+                void* p = *(void**)((char*)pCallbackMsg + 8);
+                if (p) gh_logf("[gh-diag]   GameLobbyJoinRequested_t lobby=%llu friend=%llu",
+                               *(unsigned long long*)p, *(unsigned long long*)((char*)p + 8));
             }
         }
     }
     return got;
 }
 __declspec(dllexport) void SteamAPI_ManualDispatch_FreeLastCallback(HSteamPipe pipe) {
+    if (InterlockedCompareExchange(&g_gh_synth_live, 0, 1) == 1) {
+        InterlockedExchange(&g_gh_synth_333, 0);
+        return;
+    }
     if (g_gh_engine_state != 2 || !g_fnFreeLast) return;
     __try { g_fnFreeLast(pipe ? pipe : g_gh_engine_pipe); } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
@@ -1562,9 +1647,8 @@ __declspec(dllexport) uint64_steamid SteamAPI_ISteamFriends_GetFriendByIndex(voi
         return gh_vcall_sid(g_gh_friends, 4, i, flags);
     return 0;
 }
-__declspec(dllexport) int SteamAPI_ISteamFriends_GetFriendPersonaState(void*, uint64_steamid id) {
-    if (g_gh_engine_state == 2 && g_gh_friends)
-        return gh_vcall<int>(g_gh_friends, 8, 0, id);
+__declspec(dllexport) int SteamAPI_ISteamFriends_GetFriendPersonaState(void*, uint64_steamid) {
+    // Slot 8 AV'd steamclient (VEH #2, 0.0.72). Persona states never populate here anyway.
     return 0; // k_EPersonaStateOffline
 }
 __declspec(dllexport) const char* SteamAPI_ISteamFriends_GetFriendPersonaName(void*, uint64_steamid id) {
@@ -1602,12 +1686,111 @@ __declspec(dllexport) const char* SteamAPI_ISteamFriends_GetFriendRichPresence(v
     return "";
 }
 
-// LC's "Invite Friends" button calls SteamFriends.OpenGameInviteOverlay(lobbyId) which
-// P/Invokes into this export. Since we don't ship the Steam overlay (Path X — no CEF),
-// and per user directive there is NO automatic fanout, this performs the same targeted
-// single-recipient invite as the LobbyCreated_t hook (only if gh_invite_target.txt exists).
+// LC's "Invite Friends" button calls SteamFriends.OpenGameInviteOverlay(lobbyId).
+// We have no CEF overlay: latch the lobby and let the Greenhouse overlay open the
+// friends page (one A-press = one InviteUserToLobby). No automatic fanout.
 __declspec(dllexport) void SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialog(void*, uint64_steamid lobby) {
-    gh_invite_targeted(lobby);
+    gh_logf("[gh-shim] ActivateGameOverlayInviteDialog lobby=%llu", (unsigned long long)lobby);
+    if (lobby) g_gh_hosted_lobby = lobby;
+    g_gh_open_invite_lobby = lobby;
+    InterlockedExchange(&g_gh_open_invite_dialog, 1);
+}
+
+// ---- Overlay / loader exports (GetProcAddress from guest_loader) -----------
+// Copy into caller buffers — engine persona-name pointers are transient.
+__declspec(dllexport) void GhPumpCallbacks() {}
+// Call ONLY after the game is pumping Steam (overlay open in-guest). Slot 37 =
+// RequestUserInformation. Do not call this from the pre-guest picker.
+__declspec(dllexport) int GhPrimeFriends() {
+    if (g_gh_engine_state != 2 || !g_gh_friends) return 0;
+    int n = gh_vcall<int>(g_gh_friends, 3, 0, kGhFriendImmediate);
+    int primed = 0;
+    int lim = n; if (lim > 256) lim = 256;
+    for (int i = 0; i < lim; ++i) {
+        uint64_steamid id = gh_vcall_sid(g_gh_friends, 4, i, kGhFriendImmediate);
+        if (!id) continue;
+        gh_vcall<bool>(g_gh_friends, 37, false, id, (bool)true);
+        ++primed;
+    }
+    gh_logf("[gh-shim] GhPrimeFriends n=%d primed=%d (in-game)", n, primed);
+    return primed;
+}
+__declspec(dllexport) int GhFriendCount() {
+    if (g_gh_engine_state != 2 || !g_gh_friends) return 0;
+    gh_dump_friends_once();
+    int n = gh_vcall<int>(g_gh_friends, 3, 0, kGhFriendImmediate);
+    return n > 0 ? n : 0;
+}
+__declspec(dllexport) int GhFriendAt(int i, unsigned long long* sid, char* name, int name_cb, int* state) {
+    if (sid) *sid = 0;
+    if (state) *state = 0;
+    if (name && name_cb > 0) name[0] = 0;
+    if (g_gh_engine_state != 2 || !g_gh_friends || i < 0) return 0;
+    uint64_steamid id = gh_vcall_sid(g_gh_friends, 4, i, kGhFriendImmediate);
+    if (!id) return 0;
+    if (sid) *sid = (unsigned long long)id;
+    if (state) *state = 0; // GetFriendPersonaState (slot 8) AV'd this session; do not call
+    if (name && name_cb > 0) {
+        const char* nm = gh_vcall<const char*>(g_gh_friends, 7, nullptr, id);
+        char tmp[64];
+        gh_safe_cstr(nm, tmp, sizeof(tmp));
+        if (!tmp[0] && g_gh_real_steamid && id == g_gh_real_steamid) {
+            const char* self = gh_vcall<const char*>(g_gh_friends, 0, nullptr);
+            gh_safe_cstr(self, tmp, sizeof(tmp));
+        }
+        strncpy(name, tmp, (size_t)name_cb - 1);
+        name[name_cb - 1] = 0;
+    }
+    return 1;
+}
+__declspec(dllexport) unsigned long long GhHostedLobby() {
+    return (unsigned long long)g_gh_hosted_lobby;
+}
+__declspec(dllexport) int GhInviteFriend(unsigned long long sid) {
+    uint64_t lob = (uint64_t)g_gh_hosted_lobby;
+    gh_logf("[gh-shim] GhInviteFriend sid=%llu lobby=%llu", sid, (unsigned long long)lob);
+    if (!sid || !lob) return 0;
+    gh_send_games_played(gh_target_appid());
+    return gh_invite_sid(lob, (uint64_t)sid) ? 1 : 0;
+}
+__declspec(dllexport) int GhPeekInvite(unsigned long long* from, unsigned long long* lobby,
+                                      unsigned long long* gameid, char* name, int name_cb) {
+    if (!g_gh_pend_invite) return 0;
+    if (from) *from = g_gh_pend_from;
+    if (lobby) *lobby = g_gh_pend_lobby;
+    if (gameid) *gameid = g_gh_pend_game;
+    if (name && name_cb > 0) {
+        strncpy(name, g_gh_pend_name, (size_t)name_cb - 1);
+        name[name_cb - 1] = 0;
+    }
+    return 1;
+}
+__declspec(dllexport) int GhAcceptInvite() {
+    if (!g_gh_pend_invite || !g_gh_pend_lobby) {
+        gh_log("[gh-shim] GhAcceptInvite: nothing pending");
+        return 0;
+    }
+    g_gh_synth_lobby = g_gh_pend_lobby;
+    g_gh_synth_friend = g_gh_pend_from;
+    InterlockedExchange(&g_gh_pend_invite, 0);
+    InterlockedExchange(&g_gh_synth_333, 1);
+    gh_logf("[gh-shim] GhAcceptInvite queued 333 lobby=%llu from=%llu",
+            (unsigned long long)g_gh_synth_lobby, (unsigned long long)g_gh_synth_friend);
+    return 1;
+}
+__declspec(dllexport) int GhDeclineInvite() {
+    if (!g_gh_pend_invite) return 0;
+    gh_logf("[gh-shim] GhDeclineInvite from=%llu lobby=%llu",
+            (unsigned long long)g_gh_pend_from, (unsigned long long)g_gh_pend_lobby);
+    InterlockedExchange(&g_gh_pend_invite, 0);
+    return 1;
+}
+__declspec(dllexport) int GhConsumeOpenInviteDialog(unsigned long long* lobby) {
+    if (InterlockedCompareExchange(&g_gh_open_invite_dialog, 0, 1) != 1) return 0;
+    if (lobby) *lobby = g_gh_open_invite_lobby;
+    gh_logf("[gh-shim] GhConsumeOpenInviteDialog lobby=%llu",
+            (unsigned long long)g_gh_open_invite_lobby);
+    return 1;
 }
 
 // ---- ISteamUtils -----

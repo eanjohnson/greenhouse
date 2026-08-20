@@ -1666,6 +1666,7 @@ static void EnsureCursorTextures()
 static void DrawCursorOverlay(ID3D11Resource* dst);
 #ifdef GH_LAUNCHER
 static void OverlayBlit(ID3D11Resource* dst);   // launcher_ui.h, after LuiInit
+static void GhResolveOverlayExports(HMODULE stm);
 static volatile bool g_overlayQuitNow = false;  // set by OverlayTick; Bed_exit after mutex unlock
 static volatile bool g_guestSessionLive = false; // leftover Unity Present must no-op after quit
 #endif
@@ -2090,6 +2091,7 @@ static LONG              g_kmCurX = 0, g_kmCurY = 0; // cursor, client space (==
 // Guest-running only; the pre-guest picker does not use these.
 static volatile bool     g_overlayOpen  = false;
 static volatile bool     g_overlayDrawn = false;  // UI thread has painted uiTex this open
+static volatile bool     g_ovlChordClosed = false; // Start+Back closed; OverlayTick may decline
 static volatile bool     g_kmRemapOn    = false;
 static volatile bool     g_guestRunning = false;
 static volatile bool     g_guestUserQuit  = false;  // skip SESSION ENDED splash
@@ -2787,6 +2789,7 @@ static void OverlayPollChord()
         if (!g_overlayOpen) {
             g_overlayDrawn = false;
             g_ovlConfirm = false;
+            g_ovlChordClosed = true;
         }
         Diag(g_overlayOpen ? "OVERLAY open (Start+Back)" : "OVERLAY close (Start+Back)");
     }
@@ -5398,6 +5401,9 @@ static void RunGuest()
             Diag(std::string("STAGE=preload_steam_api64 stm=") + Hex((uintptr_t)stm) +
                  " by_name=" + Hex((uintptr_t)by_name) + " by_dll=" + Hex((uintptr_t)by_dll));
             if (stm) {
+#ifdef GH_LAUNCHER
+                GhResolveOverlayExports(stm);
+#endif
                 // Bed the shim's imports so its LoadLibraryA("steamclient64.dll")
                 // routes through LoadGuestDll (finds the DLL in g_guestDir), and
                 // its VFS calls (CreateFile/MoveFile) reach the writable overlay.
@@ -5715,6 +5721,7 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
                     g_ghLoginSteamID = (uint64_t(*)())GetProcAddress(lstm, "GhLoginSteamID");
                     g_ghLoginDone    = (bool(*)())GetProcAddress(lstm, "GhLoginDone");
                     auto startQr     = (void(*)())GetProcAddress(lstm, "GhStartQrLoginAsync");
+                    GhResolveOverlayExports(lstm);
                     // Enumerate the owned library from the cached token FIRST, BEFORE the engine
                     // logs in — so our CM connection is the account's SOLE session (a second
                     // concurrent session for the same account is not serviced for Player.* calls).

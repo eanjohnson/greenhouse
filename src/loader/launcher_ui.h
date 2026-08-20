@@ -24,7 +24,9 @@
 #include <d2d1_1.h>
 #include <d2d1helper.h>
 #include <dwrite.h>
+#include <wincodec.h>
 #include <algorithm>
+#include <vector>
 #include <winrt/windows.ui.text.core.h>
 #include <winrt/windows.ui.viewmanagement.h>
 #include <winrt/windows.ui.viewmanagement.core.h>
@@ -44,8 +46,12 @@ struct LauncherGfx {
     com_ptr<IDWriteTextFormat>    fmtTitle, fmtItem, fmtSmall, fmtLog;
     com_ptr<ID3D11Texture2D>      uiTex;      // R8G8B8A8_UNORM target D2D draws into
     com_ptr<ID3D11Texture2D>      ovlSnap[2]; // unused leftover; blit uses baked panels
-    com_ptr<ID3D11Texture2D>      ovlMenu[2][2]; // [sel 0=remap/1=quit][remapOn]
-    com_ptr<ID3D11Texture2D>      ovlConfirm;    // "Are you sure?" quit prompt
+    com_ptr<ID3D11Texture2D>      ovlMenu[3][2]; // [sel][remapOn] baked at LuiInit
+    com_ptr<ID3D11Texture2D>      ovlConfirm;
+    com_ptr<ID3D11Texture2D>      ovlIncoming;
+    com_ptr<ID3D11Texture2D>      ovlFriendsChrome[2]; // [0]=no lobby [1]=lobby live
+    com_ptr<ID3D11Texture2D>      ovlFriendsEmpty;
+    com_ptr<ID3D11Texture2D>      ovlStHost, ovlStSent, ovlStFail;
     com_ptr<ID2D1Bitmap1>         uiTarget;   // D2D target wrapping uiTex
     com_ptr<ID2D1SolidColorBrush> brFg, brDim, brBg, brSel, brAccent, brPanel, brWarn;
     com_ptr<ID2D1SolidColorBrush> brWhite, brBlack;   // pure B/W for QR scanner contrast
@@ -61,6 +67,36 @@ static LauncherGfx g_lui;
 // screen entirely and the game path does its own login exactly as before.
 static uint64_t (*g_ghLoginSteamID)() = nullptr;
 static bool     (*g_ghLoginDone)()    = nullptr;
+// Overlay invite exports (steam_api64.dll). Resolved after the shim preload.
+static int      (*g_ghFriendCount)() = nullptr;
+static int      (*g_ghFriendAt)(int, unsigned long long*, char*, int, int*) = nullptr;
+static int      (*g_ghPrimeFriends)() = nullptr;
+static void     (*g_ghPumpCallbacks)() = nullptr;
+static unsigned long long (*g_ghHostedLobby)() = nullptr;
+static int      (*g_ghInviteFriend)(unsigned long long) = nullptr;
+static int      (*g_ghPeekInvite)(unsigned long long*, unsigned long long*, unsigned long long*, char*, int) = nullptr;
+static int      (*g_ghAcceptInvite)() = nullptr;
+static int      (*g_ghDeclineInvite)() = nullptr;
+static int      (*g_ghConsumeOpenInviteDialog)(unsigned long long*) = nullptr;
+
+static void GhResolveOverlayExports(HMODULE stm)
+{
+    if (!stm) return;
+    g_ghFriendCount = (int(*)())GetProcAddress(stm, "GhFriendCount");
+    g_ghFriendAt    = (int(*)(int, unsigned long long*, char*, int, int*))GetProcAddress(stm, "GhFriendAt");
+    g_ghPrimeFriends = (int(*)())GetProcAddress(stm, "GhPrimeFriends");
+    g_ghPumpCallbacks = (void(*)())GetProcAddress(stm, "GhPumpCallbacks");
+    g_ghHostedLobby = (unsigned long long(*)())GetProcAddress(stm, "GhHostedLobby");
+    g_ghInviteFriend = (int(*)(unsigned long long))GetProcAddress(stm, "GhInviteFriend");
+    g_ghPeekInvite  = (int(*)(unsigned long long*, unsigned long long*, unsigned long long*, char*, int))GetProcAddress(stm, "GhPeekInvite");
+    g_ghAcceptInvite = (int(*)())GetProcAddress(stm, "GhAcceptInvite");
+    g_ghDeclineInvite = (int(*)())GetProcAddress(stm, "GhDeclineInvite");
+    g_ghConsumeOpenInviteDialog = (int(*)(unsigned long long*))GetProcAddress(stm, "GhConsumeOpenInviteDialog");
+    Diag(std::string("OVERLAY gh exports friends=") + (g_ghFriendCount && g_ghFriendAt ? "ok" : "MISS") +
+         " prime=" + (g_ghPrimeFriends ? "ok" : "MISS") +
+         " invite=" + (g_ghInviteFriend && g_ghHostedLobby ? "ok" : "MISS") +
+         " peek=" + (g_ghPeekInvite && g_ghAcceptInvite ? "ok" : "MISS"));
+}
 
 // A single library entry: what to show, and the guest string RunGuest resolves
 // (either an absolute "E:\...\x.exe" USB path, or a "<sub>\<exe>" name resolved
@@ -95,6 +131,9 @@ static std::wstring LuiDecode(const std::vector<uint8_t>& b)
 }
 
 static void OverlayBakePanels(); // defined with the overlay; called from LuiInit
+static void OverlayBakeFriendsNow(bool wait = true); // after Steam login, still pre-guest
+static void OverlayRefreshFriendRows();
+static bool OvlNameReady(const char* n);
 
 // ---------------------------------------------------------------------------
 // One-time D2D device + target-bitmap + fonts + brushes.
@@ -172,7 +211,7 @@ static bool LuiInit()
     g_lui.ready = true;
     OverlayBakePanels();
     Diag("LAUNCHER LuiInit OK " + std::to_string(g_lui.w) + "x" + std::to_string(g_lui.h) +
-         (g_lui.ovlConfirm ? " ovl-baked" : " ovl-bake-FAIL"));
+         (g_lui.ovlMenu[0][0] && g_lui.ovlConfirm ? " ovl-baked" : " ovl-bake-FAIL"));
     return true;
 }
 
@@ -1166,17 +1205,45 @@ static void LauncherShowCrash(const std::wstring& title, const std::wstring& rea
 }
 
 // ---------------------------------------------------------------------------
-// In-game overlay (Phase D shell). Drawn into uiTex, then OverlayBlit copies
-// only the panel rectangle onto the guest backbuffer in GfxPresent. Input is
-// one tick per UI pump — never a blocking loop (the guest must keep rendering).
+// In-game overlay (Phase D). ALL glyphs are rasterized at LuiInit, before
+// Unity exists. After the guest starts, D2D DrawText on this device keeps
+// no glyphs (FillRectangle still works). OverlayBlit only copies baked
+// textures — same backend as 636029d.
 // ---------------------------------------------------------------------------
 static const float kOvlW = 920.f, kOvlH = 540.f;
-static volatile int  g_ovlSel = 0;       // 0 = remap, 1 = quit
+static const float kOvlRowH = 56.f, kOvlRowX = 28.f, kOvlRowY0 = 148.f;
+static const int   kOvlFriendVis = 5;
+static const UINT  kOvlRowW = 864, kOvlRowPh = 52;
+enum { kOvlMenu = 0, kOvlFriends = 1, kOvlIncoming = 2 };
+enum { kOvlStNone = 0, kOvlStHostFirst, kOvlStSent, kOvlStFail };
+static volatile int  g_ovlSel = 0;       // menu: 0 remap, 1 friends, 2 quit
+static int   g_ovlPage = kOvlMenu;
+static int   g_ovlFriendSel = 0;
+static int   g_ovlFriendScroll = 0;
 static WORD  g_ovlPrev = 0xFFFF;
 static DWORD g_ovlLastNav = 0;
 static bool  g_ovlDirty = true;
-static volatile long g_ovlRead = 0;   // snap index Present may copy
+static volatile long g_ovlRead = 0;
+static wchar_t g_ovlInName[64] = L"";
+static uint64_t g_ovlInSid = 0;
+static int   g_ovlStatusKind = kOvlStNone;
+static int   g_ovlStatusFriend = -1;
+static DWORD g_ovlStatusUntil = 0;
+struct OvlFriend {
+    uint64_t sid;
+    int state;
+    wchar_t name[64];
+    com_ptr<ID3D11Texture2D> row, rowOn;
+};
+static std::vector<OvlFriend> g_ovlFriends;
 static void OverlayDraw();
+static void OverlaySetStatus(int kind, int friendIdx = -1, DWORD ms = 2500)
+{
+    g_ovlStatusKind = kind;
+    g_ovlStatusFriend = friendIdx;
+    g_ovlStatusUntil = GetTickCount() + ms;
+    g_ovlDirty = true;
+}
 static void OverlayEnsureSnap()
 {
     if (g_lui.ovlSnap[0] && g_lui.ovlSnap[1]) return;
@@ -1230,11 +1297,70 @@ static void OverlaySetRemap(bool on)
     Diag(on ? "REMAP on" : "REMAP off");
 }
 
-// One pump tick of overlay navigation. Call only while g_overlayOpen.
+static void OverlayClampFriends()
+{
+    int n = (int)g_ovlFriends.size();
+    if (g_ovlFriendSel >= n) g_ovlFriendSel = n ? n - 1 : 0;
+    if (g_ovlFriendSel < 0) g_ovlFriendSel = 0;
+    if (g_ovlFriendSel < g_ovlFriendScroll) g_ovlFriendScroll = g_ovlFriendSel;
+    if (g_ovlFriendSel >= g_ovlFriendScroll + kOvlFriendVis)
+        g_ovlFriendScroll = g_ovlFriendSel - kOvlFriendVis + 1;
+    if (g_ovlFriendScroll < 0) g_ovlFriendScroll = 0;
+}
+
+static void OverlayPollShim()
+{
+    if (!g_guestRunning) return;
+    if (g_ghConsumeOpenInviteDialog) {
+        unsigned long long lob = 0;
+        if (g_ghConsumeOpenInviteDialog(&lob)) {
+            g_overlayOpen = true;
+            g_ovlPage = kOvlFriends;
+            g_ovlConfirm = false;
+            g_ovlDirty = true;
+            OverlayRefreshFriendRows();
+            Diag("OVERLAY open (game invite dialog)");
+        }
+    }
+    if (g_ghPeekInvite) {
+        unsigned long long from = 0, lobby = 0, game = 0;
+        char name[64] = {0};
+        if (g_ghPeekInvite(&from, &lobby, &game, name, 64)) {
+            wchar_t wname[64] = {};
+            if (name[0]) MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, 64);
+            if (!wname[0]) swprintf(wname, 64, L"%llu", from);
+            if (g_ovlInSid != from) {
+                g_ovlInSid = from;
+                wcsncpy(g_ovlInName, wname, 63);
+                g_ovlInName[63] = 0;
+                g_ovlDirty = true;
+            }
+            if (!g_overlayOpen || g_ovlPage != kOvlIncoming) {
+                g_overlayOpen = true;
+                g_ovlPage = kOvlIncoming;
+                g_ovlConfirm = false;
+                g_ovlDirty = true;
+                Diag("OVERLAY open (incoming invite)");
+            }
+        }
+    }
+}
+
+// One pump tick. Polls inbound invites even while the overlay is closed.
 static void OverlayTick()
 {
     static bool wasOpen = false;
-    if (!g_overlayOpen || !g_guestRunning) { wasOpen = false; return; }
+    if (!g_guestRunning) { wasOpen = false; return; }
+    if (g_ovlChordClosed) {
+        g_ovlChordClosed = false;
+        if (g_ovlPage == kOvlIncoming && g_ghDeclineInvite) g_ghDeclineInvite();
+        g_ovlPage = kOvlMenu;
+        g_ovlInName[0] = 0;
+        g_ovlInSid = 0;
+        g_ovlConfirm = false;
+    }
+    OverlayPollShim();
+    if (!g_overlayOpen) { wasOpen = false; return; }
     WORD b, ly_hi = 0, ly_lo = 0;
     { std::lock_guard<std::mutex> lk(g_padMutex);
       b = g_padState.wButtons;
@@ -1242,15 +1368,23 @@ static void OverlayTick()
       if (g_padState.sThumbLY < -16000) ly_lo = 1; }
     if (!wasOpen) {
         g_ovlPrev = b;          // ignore buttons already held (the chord)
-        g_ovlConfirm = false;
-        g_ovlSel = 0;
+        if (g_ovlPage == kOvlMenu) {
+            g_ovlConfirm = false;
+            g_ovlSel = 0;
+        }
         g_ovlDirty = true;
     }
     wasOpen = true;
     DWORD now = GetTickCount();
+    if (g_ovlStatusKind && now > g_ovlStatusUntil) {
+        g_ovlStatusKind = kOvlStNone;
+        g_ovlStatusFriend = -1;
+        g_ovlDirty = true;
+    }
     bool navGate = (now - g_ovlLastNav) > 160;
     WORD pressed = (WORD)(b & ~g_ovlPrev);
     g_ovlPrev = b;
+
     if (g_ovlConfirm) {
         if (pressed & XINPUT_GAMEPAD_A) {
             g_guestUserQuit = true;
@@ -1264,20 +1398,104 @@ static void OverlayTick()
         if (pressed & XINPUT_GAMEPAD_B) {
             g_ovlConfirm = false;
             g_ovlPrev = b;
+            g_ovlDirty = true;
             Diag("OVERLAY quit cancelled");
         }
         OverlayDraw();
         return;
     }
+
+    if (g_ovlPage == kOvlIncoming) {
+        if (pressed & XINPUT_GAMEPAD_A) {
+            int ok = g_ghAcceptInvite ? g_ghAcceptInvite() : 0;
+            Diag(ok ? "OVERLAY invite accepted" : "OVERLAY invite accept FAIL");
+            g_overlayOpen = false;
+            g_overlayDrawn = false;
+            g_ovlPage = kOvlMenu;
+            g_ovlInName[0] = 0;
+            g_ovlInSid = 0;
+            return;
+        }
+        if (pressed & XINPUT_GAMEPAD_B) {
+            if (g_ghDeclineInvite) g_ghDeclineInvite();
+            Diag("OVERLAY invite declined");
+            g_overlayOpen = false;
+            g_overlayDrawn = false;
+            g_ovlPage = kOvlMenu;
+            g_ovlInName[0] = 0;
+            g_ovlInSid = 0;
+            return;
+        }
+        OverlayDraw();
+        return;
+    }
+
+    if (g_ovlPage == kOvlFriends) {
+        static DWORD lastNameTry = 0;
+        if (now - lastNameTry > 2000) {
+            lastNameTry = now;
+            OverlayRefreshFriendRows();
+            g_ovlDirty = true;
+        }
+        OverlayClampFriends();
+        int n = (int)g_ovlFriends.size();
+        if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) {
+            if (g_ovlFriendSel > 0) g_ovlFriendSel--;
+            OverlayClampFriends();
+            g_ovlLastNav = now;
+            g_ovlDirty = true;
+        }
+        if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) {
+            if (n && g_ovlFriendSel < n - 1) g_ovlFriendSel++;
+            OverlayClampFriends();
+            g_ovlLastNav = now;
+            g_ovlDirty = true;
+        }
+        if (pressed & XINPUT_GAMEPAD_A) {
+            unsigned long long lob = g_ghHostedLobby ? g_ghHostedLobby() : 0;
+            if (!lob) {
+                OverlaySetStatus(kOvlStHostFirst);
+            } else if (n && g_ovlFriendSel >= 0 && g_ovlFriendSel < n) {
+                const OvlFriend& f = g_ovlFriends[(size_t)g_ovlFriendSel];
+                int ok = g_ghInviteFriend ? g_ghInviteFriend(f.sid) : 0;
+                OverlaySetStatus(ok ? kOvlStSent : kOvlStFail, g_ovlFriendSel, 3000);
+                Diag(ok ? "OVERLAY invite sent" : "OVERLAY invite send FAIL");
+            }
+        }
+        if (pressed & XINPUT_GAMEPAD_B) {
+            g_ovlPage = kOvlMenu;
+            g_ovlDirty = true;
+            Diag("OVERLAY friends back");
+        }
+        OverlayDraw();
+        return;
+    }
+
+    // menu
     if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) {
-        g_ovlSel = 0; g_ovlLastNav = now;
+        if (g_ovlSel > 0) g_ovlSel--;
+        g_ovlLastNav = now;
+        g_ovlDirty = true;
     }
     if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) {
-        g_ovlSel = 1; g_ovlLastNav = now;
+        if (g_ovlSel < 2) g_ovlSel++;
+        g_ovlLastNav = now;
+        g_ovlDirty = true;
     }
     if (pressed & XINPUT_GAMEPAD_A) {
         if (g_ovlSel == 0) OverlaySetRemap(!g_kmRemapOn);
-        else { g_ovlConfirm = true; Diag("OVERLAY quit prompt"); }
+        else if (g_ovlSel == 1) {
+            g_ovlPage = kOvlFriends;
+            g_ovlFriendSel = 0;
+            g_ovlFriendScroll = 0;
+            OverlayRefreshFriendRows();
+            g_ovlDirty = true;
+            Diag("OVERLAY friends");
+        } else {
+            g_ovlConfirm = true;
+            g_ovlDirty = true;
+            Diag("OVERLAY quit prompt");
+        }
     }
     if (pressed & XINPUT_GAMEPAD_B) {
         g_overlayOpen = false;
@@ -1289,8 +1507,6 @@ static void OverlayTick()
     OverlayDraw();
 }
 
-// Rasterize overlay panels at LuiInit, before Unity exists. Live D2D DrawText
-// during a guest Present never keeps glyphs.
 static void OverlayPaintChrome()
 {
     auto* dc = g_lui.dc.get();
@@ -1313,9 +1529,8 @@ static void OverlayPaintMenu(int sel, bool remapOn)
     OverlayPaintChrome();
     LuiText(L"Start + Select to close", g_lui.fmtSmall.get(),
             D2D1::RectF(40, 96, W - 40, 136), g_lui.brDim.get());
-    const float rowH = 80.f;
-    float y0 = 160.f, y1 = 252.f;
-    auto row = [&](float y, bool on, const wchar_t* label, const wchar_t* trail) {
+    const float rowH = 72.f;
+    auto row = [&](float y, bool on, const wchar_t* label, const wchar_t* trail, bool accentTrail) {
         D2D1_RECT_F r = D2D1::RectF(28, y, W - 28, y + rowH);
         dc->FillRectangle(r, on ? g_lui.brSel.get() : g_lui.brPanel.get());
         LuiText(label, g_lui.fmtItem.get(),
@@ -1324,12 +1539,13 @@ static void OverlayPaintMenu(int sel, bool remapOn)
         if (trail)
             LuiText(trail, g_lui.fmtItem.get(),
                     D2D1::RectF(W - 210, y, W - 48, y + rowH),
-                    on ? (remapOn ? g_lui.brAccent.get() : g_lui.brDim.get())
+                    on ? (accentTrail ? g_lui.brAccent.get() : g_lui.brDim.get())
                         : g_lui.brDim.get(),
                     DWRITE_TEXT_ALIGNMENT_TRAILING);
     };
-    row(y0, sel == 0, L"Controller as mouse", remapOn ? L"ON" : L"OFF");
-    row(y1, sel == 1, L"Return to Greenhouse", nullptr);
+    row(148.f, sel == 0, L"Controller as mouse", remapOn ? L"ON" : L"OFF", remapOn);
+    row(228.f, sel == 1, L"Invite friends", nullptr, false);
+    row(308.f, sel == 2, L"Return to Greenhouse", nullptr, false);
     LuiText(L"A  Select      B  Close",
             g_lui.fmtSmall.get(),
             D2D1::RectF(40, H - 64, W - 40, H - 20), g_lui.brDim.get());
@@ -1361,84 +1577,465 @@ static void OverlayPaintConfirm()
     if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
 }
 
+static void OverlayPaintFriendsChrome(bool lobbyLive, int nfriends)
+{
+    auto* dc = g_lui.dc.get();
+    const float W = kOvlW, H = kOvlH;
+    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    dc->BeginDraw();
+    dc->Clear(D2D1::ColorF(0x161B22, 1.f));
+    OverlayPaintChrome();
+    wchar_t sub[96];
+    if (lobbyLive) swprintf(sub, 96, L"%d friends  ·  A invites", nfriends);
+    else swprintf(sub, 96, L"%d friends  ·  host a lobby to invite", nfriends);
+    LuiText(sub, g_lui.fmtSmall.get(),
+            D2D1::RectF(40, 96, W - 40, 136), g_lui.brDim.get());
+    LuiText(L"A  Invite      B  Back      \u25B2 \u25BC  Scroll",
+            g_lui.fmtSmall.get(),
+            D2D1::RectF(40, H - 64, W - 40, H - 20), g_lui.brDim.get());
+    dc->EndDraw();
+    dc->Flush();
+    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+}
+
+static void OverlayPaintFriendsEmpty(const wchar_t* msg)
+{
+    OverlayPaintFriendsChrome(false, 0);
+    auto* dc = g_lui.dc.get();
+    dc->BeginDraw();
+    LuiText(msg, g_lui.fmtItem.get(),
+            D2D1::RectF(48, 200, kOvlW - 48, 280), g_lui.brDim.get());
+    dc->EndDraw();
+    dc->Flush();
+    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+}
+
+static void OverlayPaintIncoming()
+{
+    auto* dc = g_lui.dc.get();
+    const float W = kOvlW, H = kOvlH;
+    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    dc->BeginDraw();
+    dc->Clear(D2D1::ColorF(0x161B22, 1.f));
+    OverlayPaintChrome();
+    LuiText(L"Lobby invite", g_lui.fmtSmall.get(),
+            D2D1::RectF(40, 96, W - 40, 136), g_lui.brDim.get());
+    LuiText(L"A friend invited you", g_lui.fmtItem.get(),
+            D2D1::RectF(40, 160, W - 40, 240), g_lui.brFg.get());
+    D2D1_RECT_F yes = D2D1::RectF(28, 280, W - 28, 360);
+    dc->FillRectangle(yes, g_lui.brSel.get());
+    LuiText(L"A   Accept and join", g_lui.fmtItem.get(),
+            D2D1::RectF(48, 280, W - 48, 360), g_lui.brFg.get());
+    LuiText(L"B   Decline", g_lui.fmtSmall.get(),
+            D2D1::RectF(40, H - 64, W - 40, H - 20), g_lui.brDim.get());
+    dc->EndDraw();
+    dc->Flush();
+    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+}
+
+static void OverlayPaintFriendRow(const wchar_t* name, bool on)
+{
+    auto* dc = g_lui.dc.get();
+    const float W = (float)kOvlRowW, H = (float)kOvlRowPh;
+    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    dc->BeginDraw();
+    dc->Clear(D2D1::ColorF(0, 0.f));
+    dc->FillRectangle(D2D1::RectF(0, 0, W, H),
+                      on ? g_lui.brSel.get() : g_lui.brPanel.get());
+    LuiText(name ? name : L"?", g_lui.fmtItem.get(),
+            D2D1::RectF(20, 0, W - 16, H),
+            on ? g_lui.brFg.get() : g_lui.brDim.get());
+    dc->EndDraw();
+    dc->Flush();
+    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+}
+
+static void OverlayPaintStatus(const wchar_t* s, bool accent)
+{
+    auto* dc = g_lui.dc.get();
+    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    dc->BeginDraw();
+    dc->Clear(D2D1::ColorF(0x161B22, 1.f));
+    LuiText(s, g_lui.fmtSmall.get(),
+            D2D1::RectF(0, 0, (float)kOvlRowW, 40.f),
+            accent ? g_lui.brAccent.get() : g_lui.brDim.get());
+    dc->EndDraw();
+    dc->Flush();
+    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+}
+
+// Rasterize into a dedicated texture. Must run at LuiInit, before Unity.
+static bool OverlayBakeTo(UINT w, UINT h, com_ptr<ID3D11Texture2D>& out)
+{
+    out = nullptr;
+    if (!g_lui.dc || !g_gfx.d11) return false;
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(g_gfx.d11->CreateTexture2D(&td, nullptr, out.put())) || !out)
+        return false;
+    com_ptr<IDXGISurface> surf;
+    if (FAILED(out->QueryInterface(__uuidof(IDXGISurface), surf.put_void()))) {
+        out = nullptr; return false;
+    }
+    D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        D2D1::PixelFormat(DXGI_FORMAT_R8G8B8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    com_ptr<ID2D1Bitmap1> bmp;
+    if (FAILED(g_lui.dc->CreateBitmapFromDxgiSurface(surf.get(), &bp, bmp.put())) || !bmp) {
+        out = nullptr; return false;
+    }
+    g_lui.dc->SetTarget(bmp.get());
+    return true;
+}
+
+// Offscreen GDI — independent of Unity's D3D device, so it still has glyphs
+// after the guest starts (D2D DrawText on g_gfx.d11 does not).
+static bool OverlayGdiBakeRow(const wchar_t* name, bool on, com_ptr<ID3D11Texture2D>& out)
+{
+    out = nullptr;
+    if (!g_gfx.d11 || !name) return false;
+    const int W = (int)kOvlRowW, H = (int)kOvlRowPh;
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = W;
+    bi.bmiHeader.biHeight = -H;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC hdc = CreateCompatibleDC(nullptr);
+    if (!hdc) return false;
+    HBITMAP hbmp = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!hbmp || !bits) { DeleteDC(hdc); return false; }
+    HGDIOBJ oldb = SelectObject(hdc, hbmp);
+    COLORREF bg = on ? RGB(0x1F, 0x6F, 0xEB) : RGB(0x16, 0x1B, 0x22);
+    COLORREF fg = on ? RGB(0xE8, 0xEA, 0xED) : RGB(0x8B, 0x94, 0x9E);
+    HBRUSH br = CreateSolidBrush(bg);
+    RECT rc{0, 0, W, H};
+    FillRect(hdc, &rc, br);
+    DeleteObject(br);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, fg);
+    HFONT font = CreateFontW(-26, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    HGDIOBJ oldf = SelectObject(hdc, font);
+    RECT tr{20, 0, W - 16, H};
+    DrawTextW(hdc, name, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    SelectObject(hdc, oldf);
+    if (font) DeleteObject(font);
+    GdiFlush();
+    // GDI DIB is BGRA; the guest backbuffer is RGBA. CopySubresourceRegion
+    // requires matching formats, so swizzle in place.
+    uint8_t* p = (uint8_t*)bits;
+    for (int i = 0; i < W * H; ++i, p += 4) {
+        uint8_t b = p[0]; p[0] = p[2]; p[2] = b; p[3] = 255;
+    }
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = (UINT)W; td.Height = (UINT)H; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA sd{};
+    sd.pSysMem = bits;
+    sd.SysMemPitch = (UINT)(W * 4);
+    HRESULT hr = g_gfx.d11->CreateTexture2D(&td, &sd, out.put());
+    SelectObject(hdc, oldb);
+    DeleteObject(hbmp);
+    DeleteDC(hdc);
+    return SUCCEEDED(hr) && out;
+}
+
+// D2D → WIC bitmap (CPU), not the Unity D3D device. Glyphs stay valid in-game.
+static bool OverlayWicBakeRow(const wchar_t* name, bool on, com_ptr<ID3D11Texture2D>& out)
+{
+    out = nullptr;
+    if (!g_lui.factory || !g_gfx.d11 || !name) return false;
+    const UINT W = kOvlRowW, H = kOvlRowPh;
+    static com_ptr<IWICImagingFactory> s_wic;
+    if (!s_wic) {
+        HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                      __uuidof(IWICImagingFactory), s_wic.put_void());
+        if (FAILED(hr) || !s_wic) {
+            Diag("OVERLAY WIC factory FAIL hr=" + Hex((uint32_t)hr));
+            return false;
+        }
+    }
+    com_ptr<IWICBitmap> wb;
+    HRESULT hr = s_wic->CreateBitmap(W, H, GUID_WICPixelFormat32bppPBGRA,
+                                     WICBitmapCacheOnLoad, wb.put());
+    if (FAILED(hr) || !wb) return false;
+    D2D1_RENDER_TARGET_PROPERTIES rtp = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+        96.f, 96.f);
+    com_ptr<ID2D1RenderTarget> rt;
+    hr = g_lui.factory->CreateWicBitmapRenderTarget(wb.get(), rtp, rt.put());
+    if (FAILED(hr) || !rt) {
+        Diag("OVERLAY WIC RT FAIL hr=" + Hex((uint32_t)hr));
+        return false;
+    }
+    com_ptr<ID2D1SolidColorBrush> brBg, brFg;
+    rt->CreateSolidColorBrush(D2D1::ColorF(on ? 0x1F6FEBu : 0x161B22u), brBg.put());
+    rt->CreateSolidColorBrush(D2D1::ColorF(on ? 0xE8EAEDu : 0x8B949Eu), brFg.put());
+    if (!brBg || !brFg) return false;
+    rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    rt->BeginDraw();
+    rt->FillRectangle(D2D1::RectF(0, 0, (float)W, (float)H), brBg.get());
+    g_lui.fmtItem->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    g_lui.fmtItem->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    rt->DrawText(name, (UINT32)wcslen(name), g_lui.fmtItem.get(),
+                 D2D1::RectF(20.f, 0.f, (float)W - 16.f, (float)H), brFg.get());
+    if (FAILED(rt->EndDraw())) return false;
+
+    WICRect wr{0, 0, (INT)W, (INT)H};
+    com_ptr<IWICBitmapLock> lk;
+    if (FAILED(wb->Lock(&wr, WICBitmapLockRead, lk.put())) || !lk) return false;
+    UINT stride = 0, cb = 0;
+    BYTE* data = nullptr;
+    lk->GetStride(&stride);
+    lk->GetDataPointer(&cb, &data);
+    if (!data || !stride) return false;
+
+    std::vector<uint8_t> rgba((size_t)W * H * 4);
+    for (UINT y = 0; y < H; ++y) {
+        const uint8_t* s = data + (size_t)y * stride;
+        uint8_t* d = rgba.data() + (size_t)y * W * 4;
+        for (UINT x = 0; x < W; ++x, s += 4, d += 4) {
+            d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = s[3] ? s[3] : 255;
+        }
+    }
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = W; td.Height = H; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA sd{};
+    sd.pSysMem = rgba.data();
+    sd.SysMemPitch = W * 4;
+    hr = g_gfx.d11->CreateTexture2D(&td, &sd, out.put());
+    return SUCCEEDED(hr) && out;
+}
+
+static bool OverlayBakeRowAny(const wchar_t* name, bool on, com_ptr<ID3D11Texture2D>& out)
+{
+    if (OverlayWicBakeRow(name, on, out)) return true;
+    return OverlayGdiBakeRow(name, on, out);
+}
+
+static void OverlayRefreshFriendRows()
+{
+    // After the guest is pumping Steam, persona names fill in. Rasterize via
+    // WIC (not Unity D3D). Never drop existing pre-guest rows on failure.
+    if (!g_ghFriendCount || !g_ghFriendAt) return;
+    if (g_guestRunning && g_ghPrimeFriends) {
+        static LONG primed = 0;
+        if (InterlockedCompareExchange(&primed, 1, 0) == 0)
+            g_ghPrimeFriends();
+    }
+    int n = g_ghFriendCount();
+    if (n < 0) n = 0;
+    if (n > 256) n = 256;
+    int named = 0, baked = 0;
+    for (int i = 0; i < n; ++i) {
+        unsigned long long sid = 0; int st = 0; char name[64] = {0};
+        if (!g_ghFriendAt(i, &sid, name, 64, &st) || !sid) continue;
+        if (!OvlNameReady(name)) continue;
+        wchar_t wname[64] = {};
+        MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, 64);
+        ++named;
+        for (auto& f : g_ovlFriends) {
+            if (f.sid != sid) continue;
+            if (wcscmp(f.name, wname) == 0 && f.row && f.rowOn) break;
+            com_ptr<ID3D11Texture2D> a, b;
+            if (OverlayBakeRowAny(wname, false, a) && OverlayBakeRowAny(wname, true, b)) {
+                wcsncpy(f.name, wname, 63); f.name[63] = 0;
+                f.row = a; f.rowOn = b;
+                ++baked;
+                if (baked <= 3)
+                    Diag(std::string("OVERLAY named '") + name + "'");
+            }
+            break;
+        }
+    }
+    OverlayClampFriends();
+    Diag("OVERLAY friends refresh named=" + std::to_string(named) +
+         " baked=" + std::to_string(baked) +
+         " have=" + std::to_string(g_ovlFriends.size()));
+}
+
+static void OverlayBakeFriendsSnapshot()
+{
+    // Pre-guest D2D rows (same format as chrome). Unity kills live DrawText,
+    // so this is the last moment glyphs will rasterize on g_gfx.d11.
+    if (!g_ghFriendCount || !g_ghFriendAt) return;
+    int n = g_ghFriendCount();
+    if (n < 0) n = 0;
+    if (n > 256) n = 256;
+    g_ovlFriends.clear();
+    for (int i = 0; i < n; ++i) {
+        unsigned long long sid = 0; int st = 0; char name[64] = {0};
+        if (!g_ghFriendAt(i, &sid, name, 64, &st) || !sid) continue;
+        OvlFriend f{};
+        f.sid = sid;
+        if (OvlNameReady(name))
+            MultiByteToWideChar(CP_UTF8, 0, name, -1, f.name, 64);
+        else
+            swprintf(f.name, 64, L"Friend %llu", sid % 100000ull);
+        if (OverlayBakeTo(kOvlRowW, kOvlRowPh, f.row))
+            OverlayPaintFriendRow(f.name, false);
+        if (OverlayBakeTo(kOvlRowW, kOvlRowPh, f.rowOn))
+            OverlayPaintFriendRow(f.name, true);
+        g_ovlFriends.push_back(std::move(f));
+    }
+    std::sort(g_ovlFriends.begin(), g_ovlFriends.end(),
+              [](const OvlFriend& a, const OvlFriend& b) {
+                  return _wcsicmp(a.name, b.name) < 0;
+              });
+    g_lui.dc->SetTarget(g_lui.uiTarget.get());
+}
+
 static void OverlayBakePanels()
 {
     if (!g_lui.dc || !g_gfx.d11) return;
     int ok = 0;
-    for (int sel = 0; sel < 2; ++sel) {
+    for (int sel = 0; sel < 3; ++sel) {
         for (int on = 0; on < 2; ++on) {
-            com_ptr<ID3D11Texture2D> tex;
-            D3D11_TEXTURE2D_DESC td{};
-            td.Width = (UINT)kOvlW; td.Height = (UINT)kOvlH; td.MipLevels = 1; td.ArraySize = 1;
-            td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
-            td.Usage = D3D11_USAGE_DEFAULT;
-            td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-            if (FAILED(g_gfx.d11->CreateTexture2D(&td, nullptr, tex.put())) || !tex) continue;
-            com_ptr<IDXGISurface> surf;
-            if (FAILED(tex->QueryInterface(__uuidof(IDXGISurface), surf.put_void()))) continue;
-            D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
-                D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                D2D1::PixelFormat(DXGI_FORMAT_R8G8B8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-            com_ptr<ID2D1Bitmap1> bmp;
-            if (FAILED(g_lui.dc->CreateBitmapFromDxgiSurface(surf.get(), &bp, bmp.put())) || !bmp)
-                continue;
-            g_lui.dc->SetTarget(bmp.get());
+            if (!OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlMenu[sel][on])) continue;
             OverlayPaintMenu(sel, on != 0);
-            g_lui.ovlMenu[sel][on] = tex;
             ++ok;
         }
     }
-    {
-        com_ptr<ID3D11Texture2D> tex;
-        D3D11_TEXTURE2D_DESC td{};
-        td.Width = (UINT)kOvlW; td.Height = (UINT)kOvlH; td.MipLevels = 1; td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-        if (SUCCEEDED(g_gfx.d11->CreateTexture2D(&td, nullptr, tex.put())) && tex) {
-            com_ptr<IDXGISurface> surf;
-            if (SUCCEEDED(tex->QueryInterface(__uuidof(IDXGISurface), surf.put_void()))) {
-                D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
-                    D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                    D2D1::PixelFormat(DXGI_FORMAT_R8G8B8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-                com_ptr<ID2D1Bitmap1> bmp;
-                if (SUCCEEDED(g_lui.dc->CreateBitmapFromDxgiSurface(surf.get(), &bp, bmp.put())) && bmp) {
-                    g_lui.dc->SetTarget(bmp.get());
-                    OverlayPaintConfirm();
-                    g_lui.ovlConfirm = tex;
-                    ++ok;
-                }
-            }
-        }
+    if (OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlConfirm)) {
+        OverlayPaintConfirm();
+        ++ok;
+    }
+    if (OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlIncoming)) {
+        OverlayPaintIncoming();
+        ++ok;
+    }
+    int nf = 0;
+    if (OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlFriendsChrome[0])) {
+        OverlayPaintFriendsChrome(false, nf);
+        ++ok;
+    }
+    if (OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlFriendsChrome[1])) {
+        OverlayPaintFriendsChrome(true, nf);
+        ++ok;
+    }
+    if (OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlFriendsEmpty)) {
+        OverlayPaintFriendsEmpty(g_ghFriendCount ? L"No friends on this account"
+                                                 : L"Friends list unavailable");
+        ++ok;
+    }
+    if (OverlayBakeTo(kOvlRowW, 40, g_lui.ovlStHost)) {
+        OverlayPaintStatus(L"Host a lobby first", true);
+        ++ok;
+    }
+    if (OverlayBakeTo(kOvlRowW, 40, g_lui.ovlStSent)) {
+        OverlayPaintStatus(L"Invite sent", true);
+        ++ok;
+    }
+    if (OverlayBakeTo(kOvlRowW, 40, g_lui.ovlStFail)) {
+        OverlayPaintStatus(L"Invite failed", true);
+        ++ok;
     }
     g_lui.dc->SetTarget(g_lui.uiTarget.get());
-    Diag("OVERLAY bake panels=" + std::to_string(ok) + "/5");
+    Diag("OVERLAY bake panels=" + std::to_string(ok) + "/13 (friends deferred until login)");
+}
+
+static bool OvlNameReady(const char* n)
+{
+    if (!n || !n[0]) return false;
+    if (_stricmp(n, "[unknown]") == 0) return false;
+    if (_stricmp(n, "unknown") == 0) return false;
+    return true;
+}
+
+static void OverlayBakeFriendsNow(bool /*wait*/)
+{
+    if (!g_lui.ready || !g_lui.dc) return;
+    OverlayBakeFriendsSnapshot();
+    int nf = (int)g_ovlFriends.size();
+    if (OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlFriendsChrome[0]))
+        OverlayPaintFriendsChrome(false, nf);
+    if (OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlFriendsChrome[1]))
+        OverlayPaintFriendsChrome(true, nf);
+    if (OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlFriendsEmpty))
+        OverlayPaintFriendsEmpty(nf ? L"No friends on this account"
+                                    : (g_ghFriendCount ? L"No friends on this account"
+                                                       : L"Friends list unavailable"));
+    g_lui.dc->SetTarget(g_lui.uiTarget.get());
+    Diag("OVERLAY bake friends=" + std::to_string(nf) + " (names GDI-refreshed in-game)");
 }
 
 static void OverlayDraw()
 {
     if (!g_overlayOpen) return;
-    if (g_lui.ovlConfirm) g_overlayDrawn = true;
+    if (g_lui.ovlMenu[0][0] || g_lui.ovlConfirm) g_overlayDrawn = true;
     g_ovlDirty = false;
 }
 
 static void OverlayBlit(ID3D11Resource* dst)
 {
-    // Quit is handled in GfxPresent AFTER g_d11Mutex is released. Exiting from
-    // here used to ExitThread while the lock_guard was live.
     if (g_overlayQuitNow) return;
     if (!g_overlayOpen || !dst || !g_gfx.ready) return;
-    int sel = g_ovlSel; if (sel < 0) sel = 0; if (sel > 1) sel = 1;
-    int on = g_kmRemapOn ? 1 : 0;
-    ID3D11Texture2D* src = g_ovlConfirm
-        ? g_lui.ovlConfirm.get()
-        : g_lui.ovlMenu[sel][on].get();
-    if (!src) return;
     int px = ((int)g_gfx.rtW - (int)kOvlW) / 2;
     int py = ((int)g_gfx.rtH - (int)kOvlH) / 2;
     if (px < 0) px = 0;
     if (py < 0) py = 0;
+
+    ID3D11Texture2D* src = nullptr;
+    if (g_ovlConfirm) src = g_lui.ovlConfirm.get();
+    else if (g_ovlPage == kOvlIncoming) src = g_lui.ovlIncoming.get();
+    else if (g_ovlPage == kOvlFriends) {
+        if (g_ovlFriends.empty()) src = g_lui.ovlFriendsEmpty.get();
+        else {
+            unsigned long long lob = g_ghHostedLobby ? g_ghHostedLobby() : 0;
+            src = g_lui.ovlFriendsChrome[lob ? 1 : 0].get();
+        }
+    } else {
+        int sel = g_ovlSel;
+        if (sel < 0) sel = 0;
+        if (sel > 2) sel = 2;
+        src = g_lui.ovlMenu[sel][g_kmRemapOn ? 1 : 0].get();
+    }
+    if (!src) return;
     g_gfx.d11ctx->CopySubresourceRegion(dst, 0, (UINT)px, (UINT)py, 0, src, 0, nullptr);
+
+    if (!g_ovlConfirm && g_ovlPage == kOvlFriends && !g_ovlFriends.empty()) {
+        int n = (int)g_ovlFriends.size();
+        int last = g_ovlFriendScroll + kOvlFriendVis;
+        if (last > n) last = n;
+        for (int i = g_ovlFriendScroll; i < last; ++i) {
+            const OvlFriend& f = g_ovlFriends[(size_t)i];
+            ID3D11Texture2D* row = (i == g_ovlFriendSel) ? f.rowOn.get() : f.row.get();
+            if (!row) continue;
+            int y = py + (int)kOvlRowY0 + (i - g_ovlFriendScroll) * (int)kOvlRowH;
+            g_gfx.d11ctx->CopySubresourceRegion(dst, 0,
+                (UINT)(px + (int)kOvlRowX), (UINT)y, 0, row, 0, nullptr);
+        }
+        ID3D11Texture2D* st = nullptr;
+        if (g_ovlStatusKind == kOvlStHostFirst) st = g_lui.ovlStHost.get();
+        else if (g_ovlStatusKind == kOvlStSent) st = g_lui.ovlStSent.get();
+        else if (g_ovlStatusKind == kOvlStFail) st = g_lui.ovlStFail.get();
+        if (st)
+            g_gfx.d11ctx->CopySubresourceRegion(dst, 0,
+                (UINT)(px + 40), (UINT)(py + 96), 0, st, 0, nullptr);
+    }
+    if (!g_ovlConfirm && g_ovlPage == kOvlIncoming && g_ovlInSid) {
+        for (const auto& f : g_ovlFriends) {
+            if (f.sid != g_ovlInSid || !f.rowOn) continue;
+            g_gfx.d11ctx->CopySubresourceRegion(dst, 0,
+                (UINT)(px + (int)kOvlRowX), (UINT)(py + 168), 0, f.rowOn.get(), 0, nullptr);
+            break;
+        }
+    }
     g_overlayDrawn = true;
 }
 
@@ -1451,6 +2048,7 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
 {
     if (!g_gfx.ready) { try { BuildBridgeOnUi(); } catch (...) {} }
     if (!LuiInit()) return L"";
+    OverlayBakeFriendsNow();
 
     std::vector<LauncherItem> all, items;
     LauncherDlReq dlreq;

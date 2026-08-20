@@ -3,9 +3,19 @@ EXPORTS
     steam_stub PRIVATE
     GetHSteamPipe
     GetHSteamUser
+    GhAcceptInvite
     GhBringUpEngineNow
+    GhConsumeOpenInviteDialog
+    GhDeclineInvite
+    GhFriendAt
+    GhFriendCount
+    GhHostedLobby
+    GhInviteFriend
     GhLoginDone
     GhLoginSteamID
+    GhPeekInvite
+    GhPrimeFriends
+    GhPumpCallbacks
     GhRebindAppContext
     GhStartQrLoginAsync
     SteamAPI_CheckCallbackRegistered_t=steam_stub

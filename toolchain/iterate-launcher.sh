@@ -20,7 +20,7 @@ FAM="Greenhouse.Launcher_mgw46vk3ppz9w"
 STAGE="$GH/artifacts/msix_stage_launcher"
 SRC="${3:-$GH/src/loader/guest_loader.cpp}"
 # downloader (cm_downloader.h) needs winhttp/bcrypt + a zlib inflate subset.
-EXTRALIBS="${EXTRALIBS:-d3d11.lib d3d12.lib dxgi.lib ws2_32.lib d2d1.lib dwrite.lib winhttp.lib bcrypt.lib}"
+EXTRALIBS="${EXTRALIBS:-d3d11.lib d3d12.lib dxgi.lib ws2_32.lib d2d1.lib dwrite.lib gdi32.lib user32.lib windowscodecs.lib winhttp.lib bcrypt.lib}"
 EXTRACL="${EXTRACL:-}"
 XBOX="${GH_XBOX:-192.0.2.12:11443}"
 ZLIB="$GH/toolchain/msix-packaging-src/lib/zlib"
