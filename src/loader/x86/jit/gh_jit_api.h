@@ -73,7 +73,8 @@ constexpr uint32_t kX87InstLast  = 631;
 // normal interpreter's per-op prologue, so a meaningful trace wants `jitemu`
 // (compilation off) -- compiled code does not stop per instruction, and asking
 // it to would change the thing being measured.
-void set_eip_trace(uint32_t from, uint32_t to, uint64_t every, uint32_t max);
+void set_eip_trace(uint32_t from, uint32_t to, uint64_t every, uint32_t max,
+                   bool fpu);
 
 // Per-green-thread JIT context. Greenhouse owns the lifetime.
 void* thread_new(uint32_t tid);

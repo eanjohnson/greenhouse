@@ -72,6 +72,7 @@ inline uint32_t g_eipt_from  = 0;
 inline uint32_t g_eipt_to    = 0;
 inline uint64_t g_eipt_every = 0;
 inline uint32_t g_eipt_max   = 6000;
+inline bool     g_eipt_fpu   = false;   // add the x87 columns to each sample
 
 
 // The interpreter identity-maps the guest, so a guest pointer that escapes the
@@ -178,13 +179,15 @@ inline bool RunPe32Guest(const std::vector<uint8_t>& file, uint32_t& result, std
     if (g_eipt_to || g_eipt_every) {
         g_eip_from = g_eipt_from; g_eip_to = g_eipt_to;
         g_eip_every = g_eipt_every; g_eip_max = g_eipt_max; g_eip_seen = 0;
+        g_eip_fpu = g_eipt_fpu;
         g_eip_sink = [](const char* line) { log(std::string(line)); };
         log("X86 eip trace armed: range " + hex(g_eipt_from) + ".." + hex(g_eipt_to) +
             ", every " + std::to_string(g_eipt_every) + ", cap " +
             std::to_string(g_eipt_max) + " lines");
     }
 #endif
-    if (m.jit_on) ghjit::set_eip_trace(g_eipt_from, g_eipt_to, g_eipt_every, g_eipt_max);
+    if (m.jit_on) ghjit::set_eip_trace(g_eipt_from, g_eipt_to, g_eipt_every,
+                                      g_eipt_max, g_eipt_fpu);
     if (m.jit_on && !ghjit::init(m.region_base, m.region_size,
                                  [](const char* line) { log(std::string(line)); })) {
         why = "JIT engine failed to start";

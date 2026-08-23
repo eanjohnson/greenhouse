@@ -83,6 +83,7 @@ extern U32 gh_bw_eip_to;
 extern U64 gh_bw_eip_every;
 extern U32 gh_bw_eip_max;
 extern U32 gh_bw_eip_seen;
+extern bool gh_bw_eip_fpu;
 void gh_bw_eip_hit(CPU* cpu);
 
 static INLINE void gh_bw_sample(CPU* cpu) {

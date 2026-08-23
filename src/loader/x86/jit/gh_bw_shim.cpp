@@ -324,13 +324,14 @@ static const U32 kBackEdgeQuantum = 8192;
 
 // Set by `jitemu=lo-hi`; see JitCodeGen::compileOps.
 
-void set_eip_trace(uint32_t from, uint32_t to, uint64_t every, uint32_t max)
+void set_eip_trace(uint32_t from, uint32_t to, uint64_t every, uint32_t max, bool fpu)
 {
     gh_bw_eip_from  = from;
     gh_bw_eip_to    = to;
     gh_bw_eip_every = every;
     gh_bw_eip_max   = max;
     gh_bw_eip_seen  = 0;
+    gh_bw_eip_fpu   = fpu;
     if (to || every)
         gh_bw_log("X86 JIT eip trace: range %08X..%08X, every %llu, cap %u lines",
                   from, to, (unsigned long long)every, max);
@@ -380,6 +381,13 @@ void* thread_new(uint32_t tid)
     t->cpu = CPU::allocCPU(g_mem);
     t->cpu->thread = t;
     t->cpu->setIsBig(1);
+    // CPU::CPU() calls reset() (which runs FNINIT) and then fpu.reset(), which
+    // memsets the FPU straight back to zero -- so a CPU arrives here with a
+    // control word of 0x0000 and every x87 exception unmasked. Put the unit
+    // back into the state a real 32-bit Windows thread starts in. See
+    // gh_x86_cpuid.h for what a zero control word costs.
+    t->cpu->fpu.FINIT();
+    t->cpu->fpu.SetCW(kGhX87InitCW);
     return t;
 }
 
@@ -514,6 +522,7 @@ U32  gh_bw_eip_to    = 0;
 U64  gh_bw_eip_every = 0;
 U32  gh_bw_eip_max   = 6000;
 U32  gh_bw_eip_seen  = 0;
+bool gh_bw_eip_fpu   = false;
 
 void gh_bw_eip_hit(CPU* cpu)
 {
@@ -524,6 +533,18 @@ void gh_bw_eip_hit(CPU* cpu)
         return;
     ++gh_bw_eip_seen;
     // Byte-identical to ghx86::eip_sample, so the two logs diff directly.
+    if (gh_bw_eip_fpu) {
+        // getF64 mutates the register cache, which is exactly what a normal
+        // read of the register would do; this path only runs when armed.
+        FPU& f = cpu->fpu;
+        gh_bw_log("X86 EIP %llu %08X esp=%08X eax=%08X "
+                  "cw=%04X sw=%04X top=%u st0=%.17g st1=%.17g",
+                  (unsigned long long)gh_bw_icount, eip,
+                  cpu->reg[4].u32, cpu->reg[0].u32,
+                  f.CW() & 0xFFFF, f.SW() & 0xFFFF, f.GetTop(),
+                  f.getF64(f.STV(0)), f.getF64(f.STV(1)));
+        return;
+    }
     gh_bw_log("X86 EIP %llu %08X esp=%08X eax=%08X",
               (unsigned long long)gh_bw_icount, eip, cpu->reg[4].u32, cpu->reg[0].u32);
 }

@@ -52,6 +52,22 @@ inline GhCpuid gh_cpuid(uint32_t leaf)
 // engines must scale it the same way, for the same reason CPUID must agree --
 // a guest that calibrates against QueryPerformanceCounter gets a different
 // answer per engine otherwise.
+// The x87 control word a fresh 32-bit Windows THREAD starts with. This is not
+// the FNINIT value (0x037F, all masks set, 64-bit precision) -- FNINIT stays
+// architectural in both engines. Windows hands a new thread 0x027F: the same
+// six exception masks, but 53-bit precision, and the MSVC CRT knows it. Its
+// math routines literally `cmp ax, 0x27f` on the saved control word and skip
+// their error path when it matches.
+//
+// Getting this wrong is not subtle and does not fail near the mistake.
+// BoxedWine's CPU constructor calls reset() -- which runs FNINIT -- and then
+// calls fpu.reset(), which memsets the whole FPU back to zero. A zero control
+// word has every exception UNMASKED, so the first `pow` in Unity's startup that
+// overflows makes the CRT raise STATUS_FLOAT_OVERFLOW at the guest, with no
+// handler to take it (#116). It also leaves BoxedWine's divExceptionsUnmasked
+// true, which routes every x87 divide down the slow guarded path.
+constexpr uint16_t kGhX87InitCW = 0x027F;
+
 inline uint64_t gh_rdtsc(uint64_t insns) { return insns * 20; }
 
 #endif

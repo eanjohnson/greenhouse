@@ -165,14 +165,29 @@ inline uint32_t g_eip_seen  = 0;      // cannot fill the log with itself
 // compiled by the native test harness, which has no loader log at all.
 inline void (*g_eip_sink)(const char*) = nullptr;
 
+// With eipfpu=1 the sample carries the x87 unit as well. That is the one piece
+// of state the two engines model differently on purpose -- we hold doubles, the
+// BoxedWine cut holds SoftFloat extF80 -- so it is where a numeric divergence
+// shows up, and reading it costs nothing on a path that is already off.
+inline bool g_eip_fpu = false;
+
 // Both engines emit this exact shape so a diff is mechanical -- the BoxedWine
 // half is gh_bw_eip_hit in the shim. The eip column is the one being compared;
 // the counts are advisory, because the two engines do not count identically.
-inline void eip_sample(uint64_t count, uint32_t eip, uint32_t esp, uint32_t eax)
+inline void eip_sample(uint64_t count, uint32_t eip, uint32_t esp, uint32_t eax,
+                       uint32_t cw, uint32_t sw, uint32_t top,
+                       double st0, double st1)
 {
-    char b[96];
-    std::snprintf(b, sizeof(b), "X86 EIP %llu %08X esp=%08X eax=%08X",
-                  (unsigned long long)count, eip, esp, eax);
+    char b[224];
+    if (g_eip_fpu)
+        std::snprintf(b, sizeof(b),
+                      "X86 EIP %llu %08X esp=%08X eax=%08X "
+                      "cw=%04X sw=%04X top=%u st0=%.17g st1=%.17g",
+                      (unsigned long long)count, eip, esp, eax,
+                      cw & 0xFFFF, sw & 0xFFFF, top, st0, st1);
+    else
+        std::snprintf(b, sizeof(b), "X86 EIP %llu %08X esp=%08X eax=%08X",
+                      (unsigned long long)count, eip, esp, eax);
     g_eip_sink(b);
 }
 #endif
@@ -201,7 +216,7 @@ struct Cpu {
     // differential tests are built for SSE rather than x87.
     double   st[8] = {};
     int      st_top = 0;                   // ST(0) is st[st_top]
-    uint16_t fpu_cw = 0x037F, fpu_sw = 0;
+    uint16_t fpu_cw = kGhX87InitCW, fpu_sw = 0;   // a fresh Windows thread, not FNINIT
 
     // Address space. mem_base is 0 in production (identity) and non-zero in the
     // native test harness. mem_limit bounds every access so a guest bug surfaces
@@ -773,7 +788,9 @@ inline Status Cpu::step()
         ((g_eip_to && eip >= g_eip_from && eip < g_eip_to) ||
          (g_eip_every && insn_count % g_eip_every == 0))) {
         ++g_eip_seen;
-        eip_sample(insn_count, eip, gpr[REG_ESP], gpr[REG_EAX]);
+        eip_sample(insn_count, eip, gpr[REG_ESP], gpr[REG_EAX],
+                   fpu_cw, (uint32_t)((fpu_sw & ~0x3800u) | (st_top << 11)),
+                   st_top, st[st_top & 7], st[(st_top + 1) & 7]);
     }
 #endif
 

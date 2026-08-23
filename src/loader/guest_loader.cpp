@@ -4278,6 +4278,11 @@ static bool MapAndRun32(const std::vector<uint8_t>& file)
             const size_t em = o.find("eipmax=");
             if (em != std::string::npos)
                 ghx86::g_eipt_max = (uint32_t)std::strtoul(o.c_str() + em + 7, nullptr, 10);
+            // eipfpu -- add cw/sw/top/st0/st1 to every sample. The x87 unit is
+            // the one place the two engines model state differently on purpose
+            // (doubles here, SoftFloat extF80 there), so it is where a numeric
+            // divergence is visible at all.
+            if (o.find("eipfpu") != std::string::npos) ghx86::g_eipt_fpu = true;
             // Parsed last of the four: "eips=" is a prefix of nothing else, but
             // "eip" is a prefix of all of them, so order is the cheap guard.
             const size_t es = o.find("eips=");
