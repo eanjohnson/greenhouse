@@ -43,6 +43,17 @@ toolchain/winvm/*ed25519
 **/tier0_s64.dll
 **/vstdlib_s64.dll
 
+# Claude Code session-local state: a runtime lock holding a pid/sessionId, and
+# machine-local tool permissions. Neither is repo content.
+.claude/
+
+# scratch pull of the Windows Device Portal reference page
+.wdp_ref.html
+
+# vmdiff build outputs -- toolchain/vmdiff/build.sh regenerates all of it
+# (kernel32.def is generated from the SDK, kernel32.lib by llvm-dlltool).
+toolchain/vmdiff/build/
+
 # editor / build junk
 *.obj
 *.pdb

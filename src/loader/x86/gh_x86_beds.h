@@ -162,10 +162,16 @@ inline void crit_enter(Machine& m, uint32_t p)
     // Held by somebody else: park and let the call be re-executed. It cannot
     // spin here -- the owner is a guest thread on this same host thread, so a
     // spin inside the bed would be the deadlock it is trying to avoid.
-    if (c->owner && c->owner != me) { m.block_for_retry(); return; }
+    //
+    // Handing the section to block_for_retry is what keeps the PARKING from
+    // becoming a spin of its own. The scheduler can read `owner` directly, so
+    // it leaves this thread Blocked until the lock is genuinely free instead
+    // of promoting it every pass to re-discover that it is not.
+    if (c->owner && c->owner != me) { m.block_for_retry(p); return; }
 
     // Recursive acquisition by the owner never blocks -- that is the whole
     // difference between a critical section and a mutex.
+    m.cur_thread().wait_crit = 0;
     c->owner = me;
     c->recursion++;
 }
@@ -296,6 +302,32 @@ inline void fill_startupinfo32(uint32_t p)
     // table, which is what makes the CRT's lowio init open fresh ones.
 }
 
+// How many processors the guest is told it has, and it is ONE.
+//
+// This is not a conservative fudge, it is the truth about this execution model:
+// Greenhouse runs every guest thread as a cooperative green thread on a SINGLE
+// host thread, so exactly one guest instruction stream is live at a time.
+//
+// Reporting the host's real count (the console has eight) is a lie with teeth.
+// Unity sizes its spin-wait limits from this number, and a spin-wait on a
+// cooperative scheduler is not merely wasteful -- it is a deadlock generator.
+// The spinning thread OWNS the single execution resource, so the producer it is
+// waiting for physically cannot run until the spinner's 200,000-instruction
+// slice expires, and ThreadedStreamBuffer's wait loop (exe+0x5E6180) resets its
+// spin counter every time its progress callback returns true, so it can spin
+// without ever reaching the blocking path that would hand the turn over.
+//
+// Measured, not assumed: the win11 differential trace (toolchain/vmdiff) has
+// Stick Fight's t5 doing WaitForSingleObjectEx(INFINITE, alertable) at exactly
+// the point our run skips it, and real Windows makes 307 WaitForSingleObject
+// calls during startup against our 11, 156 ResetEvent against our 2, and zero
+// TryEnterCriticalSection against our 827. See #119.
+//
+// One processor makes the guest choose the block-immediately paths, and
+// blocking is the operation this scheduler models WELL: it is a yield.
+inline constexpr uint32_t kGuestProcessorCount = 1;
+inline constexpr uint32_t kGuestAffinityMask   = 1;
+
 // SYSTEM_INFO is 36 bytes on x86 and 48 on x64, and two of its fields are
 // addresses the host cannot answer honestly -- its application address range
 // does not fit in 32 bits. The guest is told about its own address space, which
@@ -313,9 +345,10 @@ inline void fill_sysinfo32(uint32_t p)
     uint32_t lo = 0x00010000u, hi = 0xFFFE0000u;
     std::memcpy(d + 8,  &lo, 4);                     // lpMinimumApplicationAddress
     std::memcpy(d + 12, &hi, 4);                     // lpMaximumApplicationAddress
-    uint32_t mask = (uint32_t)si.dwActiveProcessorMask;
+    // Not the host's mask or count -- see kGuestProcessorCount above.
+    uint32_t mask = kGuestAffinityMask, ncpu = kGuestProcessorCount;
     std::memcpy(d + 16, &mask, 4);
-    std::memcpy(d + 20, &si.dwNumberOfProcessors, 4);
+    std::memcpy(d + 20, &ncpu, 4);
     uint32_t ptype = PROCESSOR_INTEL_PENTIUM;
     std::memcpy(d + 24, &ptype, 4);
     std::memcpy(d + 28, &si.dwAllocationGranularity, 4);
@@ -687,9 +720,11 @@ inline void RegisterPtrToPtrBeds(ThunkRegistry& R)
     static_assert(thunk_bytes_of(&::GetProcessAffinityMask) == 12, "GetProcessAffinityMask");
     GH_X86_BED(R, "kernel32.dll", "GetProcessAffinityMask", 12,
         [](Machine&, const uint32_t* a) -> uint64_t {
-            DWORD_PTR proc = 0, sys = 0;
-            const BOOL rc = GetProcessAffinityMask((HANDLE)(intptr_t)(int32_t)a[0], &proc, &sys);
-            if (!rc) return 0;
+            // The guest's affinity is one processor, matching what
+            // GetSystemInfo tells it -- a guest that saw eight here and one
+            // there would be entitled to believe either. See
+            // kGuestProcessorCount.
+            DWORD_PTR proc = kGuestAffinityMask, sys = kGuestAffinityMask;
             // Four bytes each, and the two slots are adjacent -- which is the
             // whole reason this bed exists.
             const bool ok = put_ptr_out(a[1], proc, "GetProcessAffinityMask") &&
@@ -2439,7 +2474,7 @@ inline void RegisterStdBeds(Machine& m)
         env_set(m, L"SystemDrive", L"C:");
         env_set(m, L"SystemRoot", L"C:\\Windows");
         env_set(m, L"OS", L"Windows_NT");
-        env_set(m, L"NUMBER_OF_PROCESSORS", L"4");
+        env_set(m, L"NUMBER_OF_PROCESSORS", L"1");   // see kGuestProcessorCount
         env_set(m, L"PROCESSOR_ARCHITECTURE", L"x86");
     }
     GH_X86_BED(R, "kernel32.dll", "GetEnvironmentVariableW", 12,

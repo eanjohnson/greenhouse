@@ -358,6 +358,13 @@ struct GuestThread {
     bool     wait_pending = false;
     uint64_t wake_at     = 0;         // GetTickCount64 deadline when wait_timed
 
+    // Guest pointer to the critical section this thread is blocked trying to
+    // take, 0 when it is not. A lock is the one wait whose readiness the
+    // scheduler CAN evaluate cheaply and exactly -- the owning tid is a dword
+    // in guest memory -- so unlike a handle wait it does not have to be
+    // re-asked by re-running the bed. See could_proceed.
+    uint32_t wait_crit = 0;
+
     // Set only while this thread is parked inside a nested guest call
     // (call_guest32). Such a thread DOES have live host C++ frames, so nobody
     // else's run loop may resume it -- that is the one case the retry design
@@ -728,6 +735,23 @@ struct Machine {
     bool could_proceed(GuestThread& t)
     {
         if (t.suspend_count > 0) return false;
+
+        // Blocked on a critical section. This is the same trap the Sleep note
+        // below describes, and it was live until v0.0.260.0: block_for_retry
+        // recorded no reason at all, so wait_on was empty, wait_timed was
+        // false, and the test below answered "yes, proceed" on the very next
+        // scheduler pass. A thread waiting on a held lock was therefore
+        // promoted, re-ran EnterCriticalSection, found the lock still held and
+        // blocked again -- one full guest->host crossing per turn, burned to
+        // re-ask a question whose answer had not changed.
+        //
+        // The owner is a dword in guest memory (GuestCrit::owner, first field;
+        // the type lives in gh_x86_beds.h, which this header precedes), so the
+        // scheduler can just read it. Free, or already ours, means go.
+        if (t.wait_crit) {
+            const uint32_t owner = *(const uint32_t*)(uintptr_t)t.wait_crit;
+            return owner == 0 || owner == t.id;
+        }
         // Nothing to wait ON is not the same as nothing to wait FOR. A Sleep is
         // a wait on the clock with an empty handle set, and answering "yes,
         // proceed" for it turns every Sleep(n) into a busy spin: wake_ready
@@ -823,7 +847,9 @@ struct Machine {
                  t.state == GuestThread::St::Running ? " RUNNING" : " ready") +
                 (t.parked ? " parked" : "") +
                 (t.suspend_count > 0 ? " suspended" : "") +
-                (w.empty() ? "" : (t.wait_all ? " waiting-all on" : " waiting-any on") + w);
+                (w.empty() ? "" : (t.wait_all ? " waiting-all on" : " waiting-any on") + w) +
+                (t.wait_crit ? " waiting-crit " + hex(t.wait_crit) +
+                               " owner " + hex(*(const uint32_t*)(uintptr_t)t.wait_crit) : "");
             if (t.wait_timed && t.state == GuestThread::St::Blocked) {
                 const uint64_t now = GetTickCount64();
                 line += " timed, " + (now >= t.wake_at
@@ -1557,6 +1583,43 @@ struct Machine {
 
     // Remaining host calls to log as they happen; see dispatch_hostcall.
     int                     trace_budget = 0;
+
+    // synctrace -- log EVERY call to the synchronisation and threading surface,
+    // uncapped, and nothing else.
+    //
+    // The ordinary call trace is capped at 400 because startup is where the
+    // interesting calls are. That is the wrong shape for a differential run
+    // against real Windows (toolchain/vmdiff): the two engines disagree about
+    // WHEN things happen, so a fixed prefix of one does not line up with a
+    // fixed prefix of the other, and the answer being looked for -- a wakeup
+    // that never arrives -- is by definition late. Filtering by NAME instead of
+    // by count keeps the volume survivable while leaving the whole run visible:
+    // this guest makes ~10.1M host calls, of which the set below is a small
+    // fraction.
+    //
+    // The name list mirrors kHooks in toolchain/vmdiff/ghtrace32.c. They have to
+    // agree or the two logs are not comparable; if one grows, so does the other.
+    bool                    sync_trace = false;
+    static bool is_sync_call(const std::string& n)
+    {
+        static const char* kNames[] = {
+            "WaitForSingleObject", "WaitForSingleObjectEx",
+            "WaitForMultipleObjects", "WaitForMultipleObjectsEx",
+            "Sleep", "SleepEx",
+            "EnterCriticalSection", "LeaveCriticalSection", "TryEnterCriticalSection",
+            "InitializeCriticalSection", "InitializeCriticalSectionAndSpinCount",
+            "DeleteCriticalSection",
+            "SetEvent", "ResetEvent", "PulseEvent", "CreateEventA", "CreateEventW",
+            "CreateSemaphoreA", "CreateSemaphoreW", "ReleaseSemaphore",
+            "CreateMutexA", "CreateMutexW", "ReleaseMutex",
+            "SleepConditionVariableCS", "SleepConditionVariableSRW",
+            "WakeConditionVariable", "WakeAllConditionVariable",
+            "SwitchToThread", "CreateThread", "ResumeThread", "SuspendThread",
+            "SetThreadPriority",
+        };
+        for (const char* k : kNames) if (n == k) return true;
+        return false;
+    }
 
     // The last kRingSize calls, kept whether or not they were logged. A prefix
     // trace answers "how did startup go"; this answers "what was it doing when
@@ -3228,10 +3291,11 @@ struct Machine {
         }
 
         const uint32_t* av = (const uint32_t*)argp;
-        bool logging = trace_budget > 0;
+        const bool synced  = sync_trace && is_sync_call(t.name);
+        bool logging = trace_budget > 0 || synced;
         std::string tr;
         if (logging || ring_on) {
-            if (logging) --trace_budget;
+            if (trace_budget > 0) --trace_budget;
             // Four arguments, not two: the interesting one is often third
             // (HeapAlloc's size, CreateFile's access) and a trace that stops at
             // two hides exactly the value being investigated. How many are
@@ -3289,8 +3353,12 @@ struct Machine {
         if (!tr.empty()) {
             tr += " = " + hex((uint32_t)r);
             if (logging) {
-                log("X86 > " + tr);
-                if (trace_budget == 0) log("X86 (call trace budget exhausted; ring still recording)");
+                // The instruction clock is the x-axis every other x86 diagnostic
+                // uses, and it is what lets a synctrace line be placed against a
+                // timing checkpoint, a GfxPresent or an eip sample.
+                log("X86 > " + tr + (synced ? "  @" + std::to_string(cpu.insn_count) : ""));
+                if (!synced && trace_budget == 0)
+                    log("X86 (call trace budget exhausted; ring still recording)");
             }
             if (ring_slot != (size_t)-1) trace_ring[ring_slot] = std::move(tr);
         }
@@ -3534,6 +3602,7 @@ struct Machine {
         GuestThread& t = cur_thread();
 
         // First attempt sets the deadline; retries must not restart the clock.
+        t.wait_crit = 0;
         if (!t.wait_pending) {
             t.wait_on.assign(handles, handles + (count > 0 ? count : 0));
             t.wait_all     = wait_all;
@@ -3563,6 +3632,7 @@ struct Machine {
     void yield_current(uint32_t ms)
     {
         GuestThread& t = cur_thread();
+        t.wait_crit = 0;
         if (!ms) {
             // A pure yield: runnable immediately, but somebody else goes first.
             t.state = GuestThread::St::Ready;
@@ -3584,9 +3654,16 @@ struct Machine {
     // Blocks the caller until it can take a lock it does not currently hold.
     // Same re-execution contract as a wait, and no wait_pending bookkeeping
     // because there is no deadline to preserve.
-    void block_for_retry()
+    //
+    // `crit` is the critical section being waited for, and it is what keeps
+    // this from becoming a spin: could_proceed reads the owner out of it and
+    // leaves the thread Blocked until the lock is actually free. Passing 0
+    // means "wake me on the next pass", the old unconditional behaviour.
+    void block_for_retry(uint32_t crit = 0)
     {
-        cur_thread().state = GuestThread::St::Blocked;
+        GuestThread& t = cur_thread();
+        t.wait_crit = crit;
+        t.state     = GuestThread::St::Blocked;
         retry_hostcall();
     }
 

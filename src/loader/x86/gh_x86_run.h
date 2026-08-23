@@ -30,6 +30,7 @@ inline unsigned g_stall_secs = 15;
 // Host calls to re-log at every timing checkpoint; see Machine::trace_resume.
 // Off by default -- it is an investigation tool, not a standing cost.
 inline int g_trace_resume = 0;
+inline bool g_sync_trace  = false;
 
 // Windowed host-call profile at every checkpoint (`wprof` in ghx86opts.txt),
 // and which thread the per-thread column counts (`ptid=<n>`, default the main
@@ -153,6 +154,7 @@ inline bool RunPe32Guest(const std::vector<uint8_t>& file, uint32_t& result, std
 
     m.trace_budget = g_quiet ? 0 : 400;   // startup, logged as it happens
     m.trace_resume = g_quiet ? 0 : g_trace_resume;
+    m.sync_trace   = g_sync_trace;
     m.window_prof  = g_quiet ? false : g_window_prof;
     m.prof_tid     = g_prof_tid;
     m.bed_timing_on        = g_bed_timing;

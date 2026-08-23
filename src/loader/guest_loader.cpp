@@ -4269,6 +4269,15 @@ static bool MapAndRun32(const std::vector<uint8_t>& file)
                      " calls at each checkpoint");
             }
 
+            // synctrace -- uncapped trace of the sync/threading surface only,
+            // for a differential run against the real-Windows trace produced by
+            // toolchain/vmdiff. See Machine::is_sync_call for why the filter is
+            // by name rather than by count.
+            if (o.find("synctrace") != std::string::npos) {
+                ghx86::g_sync_trace = true;
+                Diag("X86 sync trace on: every sync/threading host call, uncapped");
+            }
+
             // btime -- time every host call, and report where the boundary
             // cost goes at each checkpoint. Off by default: it is four clock
             // reads per host call, and on this console a clock read is not
