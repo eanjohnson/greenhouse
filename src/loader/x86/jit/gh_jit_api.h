@@ -87,6 +87,13 @@ Exit run(void* ctx, Regs& regs, uint64_t budget, uint64_t* insns,
          uint32_t thunk_base, uint32_t thunk_end, uint32_t host_return,
          uint32_t callback_return, uint32_t* stop_addr, const char** why);
 
+// Name the guest block behind a host code address -- for the crash observer,
+// which otherwise reports a bare host RIP that resolves to no module because
+// JIT-emitted code is not in one. Returns 0 if the address is not compiled guest
+// code (so the fault was in a bed or the loader), or 1 if it is compiled code
+// belonging to no guest block (a JIT helper compiled at startup).
+uint32_t host_rip_to_guest(const void* rip);
+
 // Self-modifying code. Greenhouse calls this from the beds that can make a
 // guest address hold different code than it did before -- VirtualProtect to an
 // executable protection, VirtualFree, UnmapViewOfFile, FlushInstructionCache.

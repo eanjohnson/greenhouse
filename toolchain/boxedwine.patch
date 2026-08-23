@@ -174,7 +174,7 @@ index f040cfc3..ecded333 100644
  #define FMASK_TEST (CF | PF | AF | ZF | SF | OF)    
  
 diff --git a/source/emulation/cpu/jit/jitCodeGen.cpp b/source/emulation/cpu/jit/jitCodeGen.cpp
-index ad3bcc3f..5276c731 100644
+index ad3bcc3f..093a85d8 100644
 --- a/source/emulation/cpu/jit/jitCodeGen.cpp
 +++ b/source/emulation/cpu/jit/jitCodeGen.cpp
 @@ -23,7 +23,9 @@
@@ -222,7 +222,20 @@ index ad3bcc3f..5276c731 100644
          
          if (skipToOp) {
              nextOp = skipToOp;
-@@ -852,6 +870,9 @@ void JitCodeGen::doJIT(U32 address, DecodedOp* op) {
+@@ -841,6 +859,12 @@ void JitCodeGen::doJIT(U32 address, DecodedOp* op) {
+     }    
+     this->currentEip = address;
+     this->startingEip = address;
++#ifdef GH_BW_SHIM
++    // Greenhouse: remember which guest block is being compiled, so the code
++    // memory handed out below can be mapped back to it. A host fault inside
++    // JIT-emitted code otherwise names nothing at all -- no module, no symbol.
++    gh_bw_cur_block_eip = address;
++#endif
+     this->firstOp = op;
+ 
+     initDynamicOps();
+@@ -852,6 +876,9 @@ void JitCodeGen::doJIT(U32 address, DecodedOp* op) {
          return;    
      }    
      onBlockPreCommit(op);
@@ -232,7 +245,7 @@ index ad3bcc3f..5276c731 100644
      commitJIT(op);
  }
  
-@@ -887,7 +908,11 @@ void OPCALL firstDynamicOp(CPU* cpu, DecodedOp* op) {
+@@ -887,7 +914,11 @@ void OPCALL firstDynamicOp(CPU* cpu, DecodedOp* op) {
          // done check is for long blocks that get broken up, affects f-22/f-16
          bool shouldStartJit = op->runCount == JIT_RUN_COUNT && op->inst != Done && !(op->flags & OP_FLAG_JIT);
  #endif
@@ -245,7 +258,7 @@ index ad3bcc3f..5276c731 100644
              startNewJIT(cpu, cpu->getEipAddress(), op);
          }
      }
-@@ -941,7 +966,7 @@ void JitCodeGen::jumpEip(RegPtr reg) {
+@@ -941,7 +972,7 @@ void JitCodeGen::jumpEip(RegPtr reg) {
  }
  
  void JitCodeGen::exitToRunLoopIfPendingSignal(U32 eip) {
@@ -254,7 +267,7 @@ index ad3bcc3f..5276c731 100644
      RegPtr guestEip = getTmpReg();
      movValue(JitWidth::b32, guestEip, eip - cpu->seg[CS].address);
      exitToRunLoopIfPendingSignal(guestEip);
-@@ -949,7 +974,45 @@ void JitCodeGen::exitToRunLoopIfPendingSignal(U32 eip) {
+@@ -949,7 +980,45 @@ void JitCodeGen::exitToRunLoopIfPendingSignal(U32 eip) {
  }
  
  void JitCodeGen::exitToRunLoopIfPendingSignal(RegPtr eip) {
@@ -301,7 +314,7 @@ index ad3bcc3f..5276c731 100644
      RegPtr pendingSignal = readCPU(JitWidth::b32, offsetof(CPU, jitSignalPending));
      If(JitWidth::b32, pendingSignal); {
          writeEip(eip);
-@@ -1280,6 +1343,38 @@ void JitCodeGen::orCPUFlags(RegPtr flags) {
+@@ -1280,6 +1349,38 @@ void JitCodeGen::orCPUFlags(RegPtr flags) {
  }
  
  RegPtr JitCodeGen::read(JitWidth width, RegPtr addressReg, std::function<void(MemPtr address)> customMemoryOp, std::function<void()> failedMemoryOp, RegPtr tmp, bool checkAlignment) {
@@ -340,7 +353,7 @@ index ad3bcc3f..5276c731 100644
      if (!tmp) {
          tmp = getTmpReg8();
      }
-@@ -1415,6 +1510,43 @@ static bool doesSpanPage(JitWidth width, U32 offset) {
+@@ -1415,6 +1516,43 @@ static bool doesSpanPage(JitWidth width, U32 offset) {
  }
  
  RegPtr JitCodeGen::read(JitWidth width, MemPtr mem, RegPtr result) {
@@ -384,7 +397,7 @@ index ad3bcc3f..5276c731 100644
      if (!mem->emulatedAddress) {
          if (!result) {
              result = getTmpReg8();
-@@ -1469,6 +1601,39 @@ RegPtr JitCodeGen::read(JitWidth width, MemPtr mem, RegPtr result) {
+@@ -1469,6 +1607,39 @@ RegPtr JitCodeGen::read(JitWidth width, MemPtr mem, RegPtr result) {
  }
  
  void JitCodeGen::write(JitWidth width, MemPtr mem, RegPtr src) {
@@ -424,7 +437,7 @@ index ad3bcc3f..5276c731 100644
      if (!mem->emulatedAddress) {
          writeHost(width, mem, src);
          return;
-@@ -1514,6 +1679,35 @@ void JitCodeGen::write(JitWidth width, MemPtr mem, RegPtr src) {
+@@ -1514,6 +1685,35 @@ void JitCodeGen::write(JitWidth width, MemPtr mem, RegPtr src) {
  }
  
  void JitCodeGen::write(JitWidth width, RegPtr addressReg, RegPtr src, std::function<void(MemPtr address)> customMemoryOp, std::function<void()> failedMemoryOp, bool checkAlignment) {
@@ -460,7 +473,7 @@ index ad3bcc3f..5276c731 100644
      RegPtr tmp = getTmpReg();
  
      shrValueWithDest(JitWidth::b32, tmp, addressReg, K_PAGE_SHIFT);
-@@ -1608,6 +1802,35 @@ void JitCodeGen::write(JitWidth width, RegPtr addressReg, RegPtr src, std::funct
+@@ -1608,6 +1808,35 @@ void JitCodeGen::write(JitWidth width, RegPtr addressReg, RegPtr src, std::funct
  }
  
  void JitCodeGen::write(JitWidth width, MemPtr mem, U32 imm) {
@@ -496,7 +509,7 @@ index ad3bcc3f..5276c731 100644
      if (!mem->emulatedAddress) {
          writeHost(width, mem, imm);
          return;
-@@ -1672,6 +1895,34 @@ void JitCodeGen::write(JitWidth width, MemPtr mem, U32 imm) {
+@@ -1672,6 +1901,34 @@ void JitCodeGen::write(JitWidth width, MemPtr mem, U32 imm) {
  }
  
  RegPtr JitCodeGen::readWriteMem(JitWidth width, RegPtr addressReg, std::function<void(RegPtr value)> prepareWrite, S8 hint) {

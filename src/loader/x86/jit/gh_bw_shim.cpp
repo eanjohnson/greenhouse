@@ -276,6 +276,14 @@ void KMemory::synchronizeDecodedOpCache(CPU*, U32) {}
 
 // Executable memory for compiled blocks, handed out of 1MB slabs. Nothing is
 // ever given back: see removeCode.
+// host code range -> the guest block it was compiled from. One entry per
+// compiled block; a few thousand at Stick Fight's first frame, so a linear scan
+// on the fault path is free and nothing else touches it.
+struct GhCodeSpan { U8* host; U32 len; U32 guest_eip; };
+static std::vector<GhCodeSpan> g_codeMap;
+
+U32 gh_bw_cur_block_eip = 0;
+
 void* KMemory::allocCodeMemory(U32 len)
 {
     len = (len + 15) & ~15u;
@@ -288,8 +296,22 @@ void* KMemory::allocCodeMemory(U32 len)
     }
     U8* r = codeCur;
     codeCur += len; codeLeft -= len;
+    g_codeMap.push_back({ r, len, gh_bw_cur_block_eip });
     return r;
 }
+
+namespace ghjit {
+// Name the guest block behind a host address. Returns 0 when the address is not
+// JIT-emitted code -- which is itself the answer, because it means the fault was
+// in a bed or in the loader, not in compiled guest code.
+uint32_t host_rip_to_guest(const void* rip)
+{
+    const U8* p = (const U8*)rip;
+    for (const auto& s : g_codeMap)
+        if (p >= s.host && p < s.host + s.len) return s.guest_eip ? s.guest_eip : 1;
+    return 0;
+}
+}   // namespace ghjit
 
 bool KMemory::isCode(void* p)
 {

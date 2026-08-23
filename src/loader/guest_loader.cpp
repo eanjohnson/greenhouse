@@ -59,6 +59,18 @@
 #include <deque>
 #include <unordered_map>
 
+#ifdef GH_X86_GUEST
+// The x86 track's guest instruction clock, forward-declared so the graphics
+// proxy -- which sits ~2500 lines above the point where x86/gh_x86_run.h is
+// included -- can timestamp a present against guest work rather than wall time.
+// Defined in that header; see the comment on GfxPresent for why the distinction
+// matters.
+namespace ghx86 { inline uint64_t guest_clock(); }
+#ifdef GH_X86_JIT
+namespace ghjit { uint32_t host_rip_to_guest(const void* rip); }
+#endif
+#endif
+
 using namespace winrt;
 using namespace winrt::Windows::ApplicationModel::Core;
 using namespace winrt::Windows::UI::Core;
@@ -1737,10 +1749,33 @@ static HRESULT GfxPresent(UINT sync)
     hr = g_gfx.swap->Present(sync, 0);
 
     // Throttled diagnostic: confirm Unity is actually driving frames through our
-    // proxy. Log the first present and then every 300th (~5 s at 60 Hz).
+    // proxy, and -- the part that decides whether a guest is playable at all --
+    // how much guest work one frame costs.
+    //
+    // The metric is instructions BETWEEN presents, not wall clock. A game that
+    // has reached its frame limiter sleeps for whatever is left of its 16.7 ms,
+    // so throughput measured during the player loop measures the Sleep and not
+    // the work, and flatters or damns the engine for no reason. Instructions per
+    // frame against the engine's measured ceiling is the honest comparison.
+    //
+    // The first 20 frames are logged individually because the interesting
+    // question is answered in the first second and the guest has historically
+    // not survived much longer; after that every 300th (~5 s at 60 Hz) is enough
+    // to show frames are still moving. The clock is sampled on EVERY present, so
+    // every delta printed is exactly one frame.
     static uint64_t s_present_n = 0;
+#ifdef GH_X86_GUEST
+    static uint64_t s_present_clock = 0;
+    const uint64_t  now_insns = ghx86::guest_clock();
+    if (s_present_n < 20 || (s_present_n % 300) == 0)
+        Diag("GfxPresent n=" + std::to_string(s_present_n) + " hr=" + Hex(hr) +
+             " insns=" + std::to_string(now_insns) +
+             " frame=" + std::to_string(now_insns - s_present_clock));
+    s_present_clock = now_insns;
+#else
     if (s_present_n == 0 || (s_present_n % 300) == 0)
         Diag("GfxPresent n=" + std::to_string(s_present_n) + " hr=" + Hex(hr));
+#endif
     ++s_present_n;
 
     {
@@ -3855,6 +3890,18 @@ static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
         std::string base = std::string(mw.begin()+(sl==std::wstring::npos?0:sl+1), mw.end());
         line += " (" + base + "+" + Hex((uint64_t)addr - (uint64_t)mod) + ")";
     }
+#if defined(GH_X86_GUEST) && defined(GH_X86_JIT)
+    else {
+        // No module owns the faulting address. Under the JIT that is the normal
+        // case for a guest fault: compiled code lives in VirtualAlloc'd pages, so
+        // it resolves to nothing and the log names an ASLR'd number that differs
+        // every run. Ask the JIT which guest block emitted it -- that is the only
+        // form of this address anyone can act on.
+        uint32_t gblk = ghjit::host_rip_to_guest(addr);
+        if (gblk == 1)      line += " (JIT helper, no guest block)";
+        else if (gblk)      line += " (JIT code for guest block " + Hex(gblk) + ")";
+    }
+#endif
     if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2){
         auto* p = ep->ExceptionRecord->ExceptionInformation;
         line += p[0]==0 ? " read " : p[0]==1 ? " write " : p[0]==8 ? " exec " : " ? ";

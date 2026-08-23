@@ -960,12 +960,39 @@ struct Machine {
     uint32_t alloc(uint32_t bytes, uint32_t align = 0x1000)
     {
         if (align < 0x1000) align = 0x1000;
+        // See heap_alloc: the page round wraps for the top 4095 values of a
+        // uint32_t, and would hand back a one-page block for a 4GB request.
+        if (bytes > 0xFFFFF000u) {
+            err = "allocation size overflows the page round";
+            if (arena_oom_reports++ < 4)
+                log("X86 guest ALLOCATION FAILED: " + std::to_string(bytes) +
+                    " bytes -- " + err);
+            return 0;
+        }
         uint32_t base = (brk + align - 1) & ~(align - 1);
         uint32_t size = (bytes + 0xFFF) & ~0xFFFu;
         if ((uint64_t)base + size > (uint64_t)region_base + region_size) {
             err = "guest address space exhausted";
+            // Say so, loudly and at most a few times. Returning 0 here is what a
+            // guest sees as a failed VirtualAlloc, and a well-written one then
+            // prints its own message and carries on to dereference the null --
+            // which arrives as a HOST access violation from inside compiled
+            // code, a hundred lines and a second later, naming nothing. The
+            // guest's own "allocator returned NULL" is not evidence about WHICH
+            // allocator; this is.
+            if (arena_oom_reports++ < 4)
+                log("X86 guest ADDRESS SPACE EXHAUSTED: wanted " + std::to_string(size) +
+                    " bytes at " + hex(base) + ", brk=" + hex(brk) + ", region " +
+                    hex(region_base) + ".." + hex((uint32_t)(region_base + region_size)) +
+                    " (" + std::to_string((brk - region_base) >> 20) + " MB of " +
+                    std::to_string(region_size >> 20) + " MB used)");
             return 0;
         }
+        // Report the arena crossing each 128 MB mark, so exhaustion is something
+        // that was visibly coming rather than something that happened.
+        if (brk && ((base + size - region_base) >> 27) != ((brk - region_base) >> 27))
+            log("X86 guest arena at " + std::to_string((base + size - region_base) >> 20) +
+                " MB of " + std::to_string(region_size >> 20) + " MB (brk " + hex(base + size) + ")");
         // Commit from the OLD brk, not from `base`. Aligning up leaves a gap
         // between them, and the moment brk moves past that gap it is inside
         // [region_base, brk) -- the interval every piece of bookkeeping here
@@ -1276,9 +1303,33 @@ struct Machine {
             "allocator never handed out");
     }
 
+    int alloc_fail_reports = 0;
+    uint32_t heap_alloc_failed(uint32_t bytes, const char* why)
+    {
+        // Returning 0 is a correct answer to an impossible request, and the
+        // guest is entitled to handle it. What is not acceptable is doing it
+        // silently: a guest that checks the result prints its own message and
+        // carries on into a null dereference, which lands as a HOST access
+        // violation inside compiled code a second later, naming nothing. This
+        // line is the difference between "something returned NULL" and knowing
+        // which allocator, for how many bytes, and why.
+        if (alloc_fail_reports++ < 8)
+            log("X86 guest ALLOCATION FAILED: " + std::to_string(bytes) +
+                " bytes -- " + why);
+        return 0;
+    }
+
     uint32_t heap_alloc(uint32_t bytes, bool zero)
     {
-        if (heap_segs.empty()) return 0;
+        if (heap_segs.empty()) return heap_alloc_failed(bytes, "no heap segments");
+        // Round up BEFORE anything relies on the rounded value, and refuse a
+        // size that cannot survive it. (bytes + 7) & ~7 wraps to a small number
+        // for the top seven values of a uint32_t, and the block handed back for
+        // a 0xFFFFFFFF request would then be eight bytes long -- an
+        // under-allocation the caller has no way to detect and every way to
+        // overrun. The same trap exists in alloc() with a page-sized round.
+        if (bytes > 0xFFFFFFF8u)
+            return heap_alloc_failed(bytes, "size overflows the 8-byte round");
         bytes = (bytes + 7) & ~7u;
         if (bytes == 0) bytes = 8;
 
@@ -1294,12 +1345,14 @@ struct Machine {
         if (!add_heap_seg(want)) {
             log("X86 guest heap cannot grow past " + std::to_string(heap_segs.size()) +
                 " segments (" + err + ")");
-            return 0;
+            return heap_alloc_failed(bytes, "heap could not grow");
         }
         if (heap_next_seg < (256u << 20)) heap_next_seg *= 2;
         log("X86 guest heap grew to " + std::to_string(heap_segs.size()) +
             " segments, " + hex(heap_segs.back().base) + " +" + hex(heap_segs.back().size));
-        return scan_seg(heap_segs.size() - 1, heap_segs.back().base, bytes, zero);
+        if (uint32_t p = scan_seg(heap_segs.size() - 1, heap_segs.back().base, bytes, zero))
+            return p;
+        return heap_alloc_failed(bytes, "fresh segment could not satisfy it");
     }
 
     // Which segment owns this pointer. Linear over segments, but there are a
@@ -1311,6 +1364,7 @@ struct Machine {
         return nullptr;
     }
 
+    int arena_oom_reports = 0;
     int heap_bad_free_reports = 0;
     bool heap_bad_free(uint32_t ptr, const char* why)
     {

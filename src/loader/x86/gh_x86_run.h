@@ -71,6 +71,9 @@ inline uint32_t g_jit_emu_hi = 0;
 inline uint32_t g_eipt_from  = 0;
 inline uint32_t g_eipt_to    = 0;
 inline uint64_t g_eipt_every = 0;
+inline const uint64_t* g_clock = nullptr;   // see the assignment in RunPe32Guest
+inline uint64_t guest_clock() { return g_clock ? *g_clock : 0; }
+
 inline uint32_t g_eipt_max   = 6000;
 inline bool     g_eipt_fpu   = false;   // add the x87 columns to each sample
 
@@ -154,6 +157,13 @@ inline bool RunPe32Guest(const std::vector<uint8_t>& file, uint32_t& result, std
     m.prof_tid     = g_prof_tid;
     m.bed_timing_on        = g_bed_timing;
     m.jit_on               = g_jit;
+    // Publish the guest clock so code outside the CPU can timestamp itself
+    // against guest instructions instead of wall time. The graphics proxy uses
+    // it to count instructions BETWEEN presents, which is the only honest
+    // measure of frame cost: a game sitting in its frame limiter idles, so
+    // wall-clock throughput during the player loop measures the Sleep, not the
+    // work. A pointer rather than a copy, so nothing is paid per instruction.
+    g_clock = &m.cpu.insn_count;
     m.spin_policy          = g_spin_yield;
     m.cpu.spin_yield_every = g_spin_yield;
     m.prof_tids    = g_prof_tids;

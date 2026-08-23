@@ -84,6 +84,12 @@ extern U64 gh_bw_eip_every;
 extern U32 gh_bw_eip_max;
 extern U32 gh_bw_eip_seen;
 extern bool gh_bw_eip_fpu;
+
+// The guest address of the block currently being compiled. Set by jitCodeGen
+// before it asks for code memory, so KMemory::allocCodeMemory can record which
+// guest block each range of host code belongs to. Without it a host fault
+// inside JIT-emitted code resolves to no module and no symbol at all.
+extern U32 gh_bw_cur_block_eip;
 void gh_bw_eip_hit(CPU* cpu);
 
 static INLINE void gh_bw_sample(CPU* cpu) {
