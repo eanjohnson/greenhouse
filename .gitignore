@@ -34,6 +34,11 @@ toolchain/winvm/*ed25519
 
 # Steam / session leftovers
 **/gh_cred.txt
+# Steam QR LOGIN images. Scanning one authorises a session on the account, so
+# these are credentials with a short fuse, not screenshots. They are written
+# wherever a login run happens to be driven from, hence the loose glob.
+**/steam_qr*.png
+**/gh_qr*.png
 **/steamclient64.dll
 **/tier0_s64.dll
 **/vstdlib_s64.dll
