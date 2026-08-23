@@ -3419,10 +3419,15 @@ static const std::unordered_map<std::string, void*>& ShimTable()
 // ---------------------------------------------------------------------------
 struct LoadedImage { uint8_t* base=nullptr; size_t size=0; uint32_t entryRva=0; PRUNTIME_FUNCTION pdata=nullptr; DWORD pdataCount=0; };
 
-static bool ReadWholeFile(const std::wstring& path, std::vector<uint8_t>& out)
+// `optional` is for the files we POLL rather than require. ghpad.txt is checked
+// five times a second and is absent almost always, and each miss was writing a
+// "READFILE fail err=0x2" line -- a file open, an append and a close, forever,
+// for a condition that is the normal case. It buried the guest's own log under
+// thousands of lines of nothing.
+static bool ReadWholeFile(const std::wstring& path, std::vector<uint8_t>& out, bool optional = false)
 {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE){ Diag("READFILE fail err=" + Hex(GetLastError()) ); return false; }
+    if (h == INVALID_HANDLE_VALUE){ if (!optional) Diag("READFILE fail err=" + Hex(GetLastError()) ); return false; }
     LARGE_INTEGER sz; GetFileSizeEx(h, &sz);
     out.resize((size_t)sz.QuadPart);
     DWORD rd=0; BOOL ok = ReadFile(h, out.data(), (DWORD)out.size(), &rd, nullptr);
@@ -4172,6 +4177,176 @@ static void FlushGuestImageOnly()
 }
 #endif
 
+#ifdef GH_X86_GUEST
+#include "x86/gh_x86_run.h"
+
+// 32-bit (PE32/i386) guests. Everything x64 above this line runs natively; a
+// PE32 cannot, so it is mapped into a sub-4GB region and interpreted instead.
+// See src/loader/x86/ and GREENHOUSE.md's 32-bit track.
+static bool MapAndRun32(const std::vector<uint8_t>& file)
+{
+    ghx86::g_log = [](const std::string& s) { Diag(s); };
+
+    // ghx86opts.txt = "quiet" strips the interpreter's diagnostics for a run
+    // that exists to measure throughput. Delivered the same way as ghguest.txt
+    // (WDP fsupload into LocalState), so switching modes costs an upload and a
+    // relaunch rather than a rebuild and a redeploy.
+    {
+        std::vector<uint8_t> ob;
+        if (ReadWholeFile(std::wstring(kLocalState) + L"ghx86opts.txt", ob, true)) {
+            // Accepts UTF-16LE (what WDP fsupload of an iconv'd file gives)
+            // and plain ASCII alike: drop the NULs and the BOM, keep letters.
+            std::string o;
+            for (uint8_t c : ob)
+                if (c >= 'A' && c <= 'Z')                        o += (char)(c - 'A' + 'a');
+                else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                         c == '=' || c == '-' || c == ',' ||
+                         c == '+')                               o += (char)c;
+            ghx86::g_quiet = o.find("quiet") != std::string::npos;
+
+            // stall=<seconds> -- how long the instruction clock may stand still
+            // before the watchdog reports. 0 disarms it.
+            const size_t sp = o.find("stall=");
+            if (sp != std::string::npos) {
+                ghx86::g_stall_secs = (unsigned)std::strtoul(o.c_str() + sp + 6, nullptr, 10);
+                Diag("X86 stall threshold set to " + std::to_string(ghx86::g_stall_secs) + "s");
+            }
+
+            // resume=<n> -- re-open the call trace for n calls at every timing
+            // checkpoint, so a guest that has reached its frame loop can be
+            // read as well as counted.
+            const size_t rp = o.find("resume=");
+            if (rp != std::string::npos) {
+                ghx86::g_trace_resume = (int)std::strtoul(o.c_str() + rp + 7, nullptr, 10);
+                Diag("X86 trace resume: " + std::to_string(ghx86::g_trace_resume) +
+                     " calls at each checkpoint");
+            }
+
+            // btime -- time every host call, and report where the boundary
+            // cost goes at each checkpoint. Off by default: it is four clock
+            // reads per host call, and on this console a clock read is not
+            // free (the "X86 clock:" line says what it costs).
+            if (o.find("btime") != std::string::npos) {
+                ghx86::g_bed_timing = true;
+                Diag("X86 per-host-call timing on (4 QPC reads per call)");
+            }
+
+            // jit -- run the guest on the BoxedWine x86->x64 JIT instead of
+            // the interpreter. Opt-in: the interpreter is the build that is
+            // known to reach a rendered frame and stays the reference.
+            if (o.find("jit") != std::string::npos) {
+#ifdef GH_X86_JIT
+                ghx86::g_jit = true;
+                Diag("X86 execution engine: BoxedWine JIT (identity addressing)");
+#else
+                Diag("X86 jit ignored: this build has no GH_X86_JIT. "
+                     "Rebuild with GHX86DEF=/DGH_X86_JIT and link the bwjit objects");
+#endif
+            }
+
+            // jitemu[=lo-hi] -- see ghx86::g_jit_emu. Parsed after `jit`
+            // because "jitemu" contains "jit"; the range form is optional.
+            const size_t je = o.find("jitemu");
+            if (je != std::string::npos) {
+                ghx86::g_jit_emu = true;
+                if (o[je + 6] == '=') {
+                    char* end = nullptr;
+                    ghx86::g_jit_emu_lo = (uint32_t)std::strtoul(o.c_str() + je + 7, &end, 10);
+                    ghx86::g_jit_emu_hi = (end && *end == '-')
+                                        ? (uint32_t)std::strtoul(end + 1, nullptr, 10)
+                                        : ghx86::g_jit_emu_lo;
+                    Diag("X86 jit bisect: interpret instruction kinds " +
+                         std::to_string(ghx86::g_jit_emu_lo) + ".." +
+                         std::to_string(ghx86::g_jit_emu_hi) + ", compile the rest");
+                } else {
+                    Diag("X86 jit bisect: compilation OFF, BoxedWine's interpreter only");
+                }
+            }
+
+            // spin=<n> -- yield the turn once every n PAUSE instructions.
+            const size_t yp = o.find("spin=");
+            if (yp != std::string::npos) {
+                ghx86::g_spin_yield = (uint32_t)std::strtoul(o.c_str() + yp + 5, nullptr, 10);
+#ifdef GH_X86_SPIN_YIELD
+                Diag("X86 spin-wait yield every " + std::to_string(ghx86::g_spin_yield) +
+                     " PAUSE instructions");
+#else
+                Diag("X86 spin= ignored: this build has no GH_X86_SPIN_YIELD. "
+                     "Rebuild with GHX86DEF=/DGH_X86_SPIN_YIELD to sweep it");
+#endif
+            }
+
+            // wprof [+ ptid=<n>] -- at every checkpoint, the host calls made
+            // since the previous one, by name, with a separate column for one
+            // thread. The cumulative profile answers "where did startup go";
+            // this answers "what is it asking for right now".
+            if (o.find("wprof") != std::string::npos) {
+                ghx86::g_window_prof = true;
+                const size_t tp = o.find("ptid=");
+                if (tp != std::string::npos) {
+                    // `ptid=1+39` -- '+' rather than ',' because the options
+                    // string is already comma-separated. The first is the one
+                    // the per-thread call column counts; all of them get a
+                    // stack.
+                    const char* q = o.c_str() + tp + 5;
+                    ghx86::g_prof_tids.clear();
+                    while (*q >= '0' && *q <= '9') {
+                        ghx86::g_prof_tids.push_back((uint32_t)std::strtoul(q, nullptr, 10));
+                        while (*q >= '0' && *q <= '9') ++q;
+                        if (*q == '+') ++q;
+                    }
+                    if (!ghx86::g_prof_tids.empty())
+                        ghx86::g_prof_tid = ghx86::g_prof_tids[0];
+                }
+                Diag("X86 window profile on, per-thread column = tid " +
+                     std::to_string(ghx86::g_prof_tid));
+            }
+
+            // watch=<lo>-<hi>[,<lo>-<hi>] -- guest addresses in hex. Every
+            // access that lands in a range is logged with the instruction that
+            // made it and the watched bytes as they were, which turns "what
+            // zeroed this object" into one relaunch instead of one rebuild.
+            const size_t w = o.find("watch=");
+            if (w != std::string::npos) {
+                const char* p = o.c_str() + w + 6;
+                for (int k = 0; k < 2; ++k) {
+                    char* e = nullptr;
+                    const unsigned long lo = std::strtoul(p, &e, 16);
+                    if (e == p || *e != '-') break;
+                    p = e + 1;
+                    const unsigned long hi = std::strtoul(p, &e, 16);
+                    if (e == p || hi <= lo) break;
+                    ghx86::g_watch[k].lo = (uint32_t)lo;
+                    ghx86::g_watch[k].hi = (uint32_t)hi;
+                    Diag("X86 watchpoint armed on " + Hex((uint32_t)lo) + "-" + Hex((uint32_t)hi));
+                    if (*e != ',') break;
+                    p = e + 1;
+                }
+            }
+        }
+    }
+
+    Diag("STAGE=x86_guest_begin size=" + std::to_string(file.size()));
+
+    uint32_t result = 0;
+    std::string why;
+    bool ok = ghx86::RunPe32Guest(file, result, why, g_guestExePath);
+
+    if (!ok) {
+        Diag("STAGE=x86_guest_failed " + why);
+        g_guestFailWhy = "32-bit guest: " + why;
+        g_guestExited = true;
+        g_guestExitCode = -1;
+        return false;
+    }
+
+    Diag("STAGE=x86_guest_done PASS result=" + std::to_string(result));
+    g_guestExitCode = (int)result;
+    g_guestExited = true;
+    return true;
+}
+#endif
+
 static bool MapAndRun(const std::vector<uint8_t>& file)
 {
 #ifdef GH_LAUNCHER
@@ -4193,6 +4368,14 @@ static bool MapAndRun(const std::vector<uint8_t>& file)
         return false;
     }
     if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC){
+#ifdef GH_X86_GUEST
+        // A 32-bit guest is not a failure any more -- it takes the other path.
+        if (nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC &&
+            nt->FileHeader.Machine == IMAGE_FILE_MACHINE_I386) {
+            Diag("STAGE=guest_is_pe32 routing to the x86 interpreter");
+            return MapAndRun32(file);
+        }
+#endif
         Diag("not PE32+");
         char b[96];
         std::snprintf(b, sizeof(b), "not PE32+ (machine=0x%X opt=0x%X) — x64 guests only",
@@ -4637,7 +4820,7 @@ static std::wstring ReadCfgW(const wchar_t* file, const std::wstring& dflt)
 {
     std::wstring p = std::wstring(kLocalState) + file;
     std::vector<uint8_t> b;
-    if (!ReadWholeFile(p, b) || b.size() < 2) return dflt;
+    if (!ReadWholeFile(p, b, true) || b.size() < 2) return dflt;
     size_t off = (b.size()>=2 && b[0]==0xFF && b[1]==0xFE) ? 2 : 0;
     std::wstring s((wchar_t*)(b.data()+off), (b.size()-off)/2);
     while (!s.empty() && (s.back()==L'\r' || s.back()==L'\n' || s.back()==0)) s.pop_back();
@@ -4675,7 +4858,7 @@ static void PollSyntheticPad()
         lastCheck = now;
         std::wstring p = std::wstring(kLocalState) + L"ghpad.txt";
         std::vector<uint8_t> b;
-        if (ReadWholeFile(p, b) && !b.empty()){
+        if (ReadWholeFile(p, b, true) && !b.empty()){
             DeleteFileW(p.c_str());                 // one upload == one pulse
             // Accept ASCII or UTF-16LE: drop NUL/BOM bytes, keep the ASCII tokens.
             std::string s;
@@ -5418,7 +5601,7 @@ static void RunGuest()
         uint32_t app = g_launcherSelectedApp;
         if (!app && !g_guestDir.empty()) {
             std::vector<uint8_t> b;
-            if (ReadWholeFile(g_guestDir + L"steam_appid.txt", b) && !b.empty())
+            if (ReadWholeFile(g_guestDir + L"steam_appid.txt", b, true) && !b.empty())
                 app = (uint32_t)strtoul(std::string(b.begin(), b.end()).c_str(), nullptr, 10);
         }
         if (app) {

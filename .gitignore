@@ -19,6 +19,13 @@ corpus/downloads/
 toolchain/msix-packaging-src/
 toolchain/sdk-buildtools/
 
+# BoxedWine clone (~173MB, GPL-2.0). Not vendored: our entire divergence from
+# upstream is toolchain/boxedwine.patch (311 lines, 8 files), and
+# toolchain/build_bwjit.sh clones the pinned commit and applies it. Keeps the
+# repo small and keeps the licence line honest -- the patch is ours, the tree
+# is theirs.
+toolchain/boxedwine/
+
 # NEVER commit these
 toolchain/signing/*.pfx
 toolchain/signing/*.key

@@ -1,0 +1,562 @@
+diff --git a/include/boxedwine.h b/include/boxedwine.h
+index 31152f7..73edaf1 100644
+--- a/include/boxedwine.h
++++ b/include/boxedwine.h
+@@ -120,6 +120,17 @@ typedef std::weak_ptr<KProcess> KProcessWeakPtr;
+ #include "../source/util/vectorutils.h"
+ #include "../source/util/fileutils.h"
+ 
++// GH_BW_SHIM: Greenhouse builds the JIT and the CPU core out of this tree and
++// nothing else. Its guest memory is identity-mapped (guest pointer == host
++// pointer) and its kernel is Greenhouse's own loader, so BoxedWine's process,
++// thread, filesystem and soft-MMU layers are replaced wholesale rather than
++// ported. gh_bw_kernel.h declares the slim stand-ins for the handful of kernel
++// types the CPU actually reaches. See toolchain/boxedwine.patch.
++#ifdef GH_BW_SHIM
++#include "gh_bw_kernel.h"
++#include "../source/emulation/cpu/common/cpu.h"
++#include "gh_bw_kernel_post.h"
++#else
+ #include "kmemory.h"
+ #include "../source/emulation/cpu/common/cpu.h"
+ #include "kpoll.h"
+@@ -137,6 +148,7 @@ typedef std::weak_ptr<KProcess> KProcessWeakPtr;
+ #include "kscheduler.h"
+ #include "recorder.h"
+ #include "player.h"
++#endif
+ 
+ #include "log.h"
+ #include "kerror.h"
+diff --git a/source/emulation/cpu/common/common_sse.cpp b/source/emulation/cpu/common/common_sse.cpp
+index c8167c0..a388b2d 100644
+--- a/source/emulation/cpu/common/common_sse.cpp
++++ b/source/emulation/cpu/common/common_sse.cpp
+@@ -18,7 +18,9 @@
+ 
+ #include "boxedwine.h"
+ #include "common_sse.h"
+-#include "ksignal.h"
++#ifndef GH_BW_SHIM
++#include "ksignal.h"
++#endif
+ #include <math.h>
+ 
+ static U32 commonSseRoundToI32(double value, U32 mxcsr, bool truncate) {
+diff --git a/source/emulation/cpu/common/cpu.cpp b/source/emulation/cpu/common/cpu.cpp
+index bb49cd6..9f41748 100644
+--- a/source/emulation/cpu/common/cpu.cpp
++++ b/source/emulation/cpu/common/cpu.cpp
+@@ -1,9 +1,11 @@
+ #include "boxedwine.h"
+ 
++#ifndef GH_BW_SHIM
+ #include "ksignal.h"
+ #include "bufferaccess.h"
+ #include "kstat.h"
+-#include "../../softmmu/kmemory_soft.h"
++#include "../../softmmu/kmemory_soft.h"
++#endif
+ #include "../normal/normalCPU.h"
+ 
+ #if defined(BOXEDWINE_WASM_JIT) && defined(BOXEDWINE_MULTI_THREADED)
+@@ -44,7 +46,11 @@ CPU::CPU(KMemory* memory) : memory(memory) {
+     this->reset();
+     this->fpu.reset();
+ 
+-    opCache = (DecodedOp***)&getMemData(memory)->opCache.pageData[0];
++#ifdef GH_BW_SHIM
++    opCache = memory->opCache;
++#else
++    opCache = (DecodedOp***)&getMemData(memory)->opCache.pageData[0];
++#endif
+ #ifdef BOXEDWINE_MULTI_THREADED
+     decodedOpCacheGlobalEpoch = getMemData(memory)->opCache.getEpochAddress();
+ #endif
+@@ -285,7 +291,11 @@ void CPU::jmp(U32 big, U32 selector, U32 offset, U32 oldEip) {
+     }
+ }
+ 
+-void CPU::prepareFpuException(int code, int trapNo, int error) {
++void CPU::prepareFpuException(int code, int trapNo, int error) {
++#ifdef GH_BW_SHIM
++    gh_bw_cpu_fpu_exception(this, code, trapNo, error);
++}
++#else
+     const KProcessPtr& process = this->thread->process;
+ 
+     // blocking signals, signalfd can't handle these
+@@ -302,8 +312,13 @@ void CPU::prepareFpuException(int code, int trapNo, int error) {
+         kpanic_fmt("unhandled exception: code=%d error=%d", code, error);
+     }
+ }
++#endif
+ 
+ void CPU::prepareException(int code, int error) {
++#ifdef GH_BW_SHIM
++    gh_bw_cpu_exception(this, code, error);
++}
++#else
+     const KProcessPtr& process = this->thread->process;
+ 
+      // blocking signals, signalfd can't handle these
+@@ -348,7 +363,9 @@ void CPU::prepareException(int code, int error) {
+         kpanic_fmt("unhandled exception: code=%d error=%d", code, error);
+     }
+ }
++#endif
+ 
++#ifndef GH_BW_SHIM
+ class TTYBufferAccess : public BufferAccess {
+ public:
+     TTYBufferAccess(const std::shared_ptr<FsNode>& node, U32 flags, BString buffer) : BufferAccess(node, flags, buffer) {}
+@@ -409,6 +426,11 @@ BString getFunctionName(BString name, U32 moduleEip) {
+     return tty9Buffer;
+ }
+ 
++#endif
++
++#ifdef GH_BW_SHIM
++void CPU::walkStack(U32 eip, U32 ebp, U32 indent) { gh_bw_walk_stack(this, eip, ebp, indent); }
++#else
+ void CPU::walkStack(U32 eip, U32 ebp, U32 indent) {
+     U32 moduleEip = this->thread->process->getModuleEip(this->seg[CS].address+eip);
+     BString name = this->thread->process->getModuleName(this->seg[CS].address+eip);
+@@ -436,6 +458,8 @@ void CPU::walkStack(U32 eip, U32 ebp, U32 indent) {
+     }
+ }
+ 
++#endif
++
+ void CPU::cpuid() {
+     CPU* cpu = this;
+     switch (EAX) {
+diff --git a/source/emulation/cpu/common/fpu.cpp b/source/emulation/cpu/common/fpu.cpp
+index f040cfc..ecded33 100644
+--- a/source/emulation/cpu/common/fpu.cpp
++++ b/source/emulation/cpu/common/fpu.cpp
+@@ -19,7 +19,9 @@
+ #include "boxedwine.h"
+ #include <math.h>
+ #include "fpu.h"
++#ifndef GH_BW_SHIM
+ #include "ksignal.h"
++#endif
+ 
+ #define FMASK_TEST (CF | PF | AF | ZF | SF | OF)    
+ 
+diff --git a/source/emulation/cpu/jit/jitCodeGen.cpp b/source/emulation/cpu/jit/jitCodeGen.cpp
+index ad3bcc3..5276c73 100644
+--- a/source/emulation/cpu/jit/jitCodeGen.cpp
++++ b/source/emulation/cpu/jit/jitCodeGen.cpp
+@@ -23,7 +23,9 @@
+ #include "jitCodeLifecycle.h"
+ #include "../normal/normalCPU.h"
+ #include "jitFlags.h"
++#ifndef GH_BW_SHIM
+ #include "../../softmmu/kmemory_soft.h"
++#endif
+ 
+ #ifdef BOXEDWINE_WASM_JIT
+ void wasmJitHandlePendingHit(CPU* cpu, DecodedOp* op);
+@@ -743,6 +745,7 @@ bool JitCodeGen::compileOps(DecodedOp* op) {
+     DecodedOp* nextOp = op;
+     this->emulatedLen = 0;
+     this->blockOpCount = 0;
++    this->countedOps = 0;
+ 
+     while (nextOp) {
+         if (nextOp->flags & OP_FLAG_NO_JIT) {
+@@ -767,11 +770,26 @@ bool JitCodeGen::compileOps(DecodedOp* op) {
+         // 
+         // 911 = AddpsXmm 
+         // 1282 = ShufpdXmmE128
++#ifdef GH_BW_SHIM
++        // Greenhouse drives upstream's own bisection hook from a runtime
++        // option (`jitemu=lo-hi` in ghx86opts.txt) rather than a recompile.
++        // A wrong result 5.8 million instructions into a real game is not
++        // findable by reading generated assembly; it IS findable by halving the
++        // set of instruction kinds that are allowed to be compiled and asking
++        // the console which half breaks. The normal interpreter is the oracle,
++        // and it is already linked in because the JIT needs it for warm-up.
++        if (nextOp->inst >= gh_bw_emu_lo && nextOp->inst <= gh_bw_emu_hi) {
++            emulateSingleOp();
++        } else {
++            compile(nextOp);
++        }
++#else
+         //if (nextOp->inst >= 911 && nextOp->inst <= 1282) {
+          //   emulateSingleOp();
+         //} else {
+             compile(nextOp);
+         //}
++#endif
+         
+         if (skipToOp) {
+             nextOp = skipToOp;
+@@ -852,6 +870,9 @@ void JitCodeGen::doJIT(U32 address, DecodedOp* op) {
+         return;    
+     }    
+     onBlockPreCommit(op);
++#ifdef GH_BW_SHIM
++    gh_bw_block_compiled(blockOpCount, emulatedLen);
++#endif
+     commitJIT(op);
+ }
+ 
+@@ -887,7 +908,11 @@ void OPCALL firstDynamicOp(CPU* cpu, DecodedOp* op) {
+         // done check is for long blocks that get broken up, affects f-22/f-16
+         bool shouldStartJit = op->runCount == JIT_RUN_COUNT && op->inst != Done && !(op->flags & OP_FLAG_JIT);
+ #endif
+-        if (shouldStartJit) {
++        if (shouldStartJit
++#ifdef GH_BW_SHIM
++            && !gh_bw_jit_disabled
++#endif
++            ) {
+             startNewJIT(cpu, cpu->getEipAddress(), op);
+         }
+     }
+@@ -941,7 +966,7 @@ void JitCodeGen::jumpEip(RegPtr reg) {
+ }
+ 
+ void JitCodeGen::exitToRunLoopIfPendingSignal(U32 eip) {
+-#ifdef BOXEDWINE_MULTI_THREADED
++#if defined(GH_BW_SHIM) || defined(BOXEDWINE_MULTI_THREADED)
+     RegPtr guestEip = getTmpReg();
+     movValue(JitWidth::b32, guestEip, eip - cpu->seg[CS].address);
+     exitToRunLoopIfPendingSignal(guestEip);
+@@ -949,7 +974,45 @@ void JitCodeGen::exitToRunLoopIfPendingSignal(U32 eip) {
+ }
+ 
+ void JitCodeGen::exitToRunLoopIfPendingSignal(RegPtr eip) {
+-#ifdef BOXEDWINE_MULTI_THREADED
++#if defined(GH_BW_SHIM)
++    // J3 -- cooperative preemption.
++    //
++    // Upstream runs each guest thread on its own host thread and only needs to
++    // leave compiled code when a signal is posted, so this is a load and a
++    // branch on a flag someone else sets. Greenhouse runs guest threads as
++    // cooperative green threads on ONE host thread: nobody else is running, so
++    // nobody can post anything, and a compiled loop that never leaves is not a
++    // slow turn -- it is a deadlock. Unity's ThreadedStreamBuffer::WaitForData
++    // is exactly that loop, and it is 13.5% of the profile.
++    //
++    // So the flag becomes a countdown, decremented here -- at every backward
++    // branch and every block boundary, which is the same set of places upstream
++    // checks -- and the turn ends when it reaches zero. The run loop reloads it.
++    // Counting back-edges rather than instructions is deliberate: it costs three
++    // host instructions per loop iteration instead of three per guest
++    // instruction, and what a scheduler actually needs to bound is progress, not
++    // arithmetic.
++    // While we are here, keep the retired-instruction count honest. Compiled
++    // blocks chain into one another without returning, so the run loop's own
++    // `blockInstructionCount += blockOpCount` only ever sees the first block of
++    // a chain. Adding the ops compiled since the last check point costs one
++    // add-to-memory per back edge and makes the count usable for the throughput
++    // report and for the timing checkpoints Greenhouse drives off it.
++    if (blockOpCount > countedOps) {
++        RegPtr retired = readCPU(JitWidth::b32, offsetof(CPU, blockInstructionCount));
++        addValue(JitWidth::b32, retired, blockOpCount - countedOps);
++        writeCPU(JitWidth::b32, offsetof(CPU, blockInstructionCount), retired);
++        countedOps = blockOpCount;
++    }
++    RegPtr countdown = readCPU(JitWidth::b32, offsetof(CPU, jitSignalPending));
++    addValue(JitWidth::b32, countdown, 0xFFFFFFFF);
++    writeCPU(JitWidth::b32, offsetof(CPU, jitSignalPending), countdown);
++    IfNot(JitWidth::b32, countdown); {
++        writeEip(eip);
++        writeCPUValue(DYN_PTR, offsetof(CPU, nextOp), 0);
++        blockExit();
++    } EndIf();
++#elif defined(BOXEDWINE_MULTI_THREADED)
+     RegPtr pendingSignal = readCPU(JitWidth::b32, offsetof(CPU, jitSignalPending));
+     If(JitWidth::b32, pendingSignal); {
+         writeEip(eip);
+@@ -1280,6 +1343,38 @@ void JitCodeGen::orCPUFlags(RegPtr flags) {
+ }
+ 
+ RegPtr JitCodeGen::read(JitWidth width, RegPtr addressReg, std::function<void(MemPtr address)> customMemoryOp, std::function<void()> failedMemoryOp, RegPtr tmp, bool checkAlignment) {
++#ifdef GH_BW_SHIM
++    // J2 -- identity addressing.
++    //
++    // Upstream emits, for every single guest memory access: shift the address
++    // down to a page number, load that page's host base out of the soft MMU,
++    // test the permission bit in the low bits of the entry, branch out to the
++    // interpreter if it is clear, mask the bits back off, and only then touch
++    // memory. Greenhouse reserves the guest's entire address space below 4GB
++    // with VirtualAlloc2, so a guest pointer already IS a host pointer and that
++    // whole sequence collapses to a 32-bit register move -- the `mov r32, r32`
++    // is not redundant, it is the truncation that makes the guest's address
++    // space wrap at 4GB the way the hardware would.
++    //
++    // The page-span special cases go with it. They exist because upstream's
++    // pages have unrelated host bases, so a read crossing a page boundary is
++    // two reads; here consecutive guest pages are consecutive host pages and an
++    // access that spans one is just an unaligned host access, which x86 does.
++    {
++    if (!tmp) {
++        tmp = getTmpReg8();
++    }
++    mov(JitWidth::b32, tmp, addressReg);
++    if (customMemoryOp) {
++        addressReg = nullptr;
++        customMemoryOp(createMemPtr(tmp));
++    } else {
++        readHost(width, createMemPtr(tmp), tmp);
++    }
++    return tmp;
++    }
++#endif
++
+     if (!tmp) {
+         tmp = getTmpReg8();
+     }
+@@ -1415,6 +1510,43 @@ static bool doesSpanPage(JitWidth width, U32 offset) {
+ }
+ 
+ RegPtr JitCodeGen::read(JitWidth width, MemPtr mem, RegPtr result) {
++#ifdef GH_BW_SHIM
++    // J2 -- identity addressing.
++    //
++    // Upstream emits, for every single guest memory access: shift the address
++    // down to a page number, load that page's host base out of the soft MMU,
++    // test the permission bit in the low bits of the entry, branch out to the
++    // interpreter if it is clear, mask the bits back off, and only then touch
++    // memory. Greenhouse reserves the guest's entire address space below 4GB
++    // with VirtualAlloc2, so a guest pointer already IS a host pointer and that
++    // whole sequence collapses to a 32-bit register move -- the `mov r32, r32`
++    // is not redundant, it is the truncation that makes the guest's address
++    // space wrap at 4GB the way the hardware would.
++    //
++    // The page-span special cases go with it. They exist because upstream's
++    // pages have unrelated host bases, so a read crossing a page boundary is
++    // two reads; here consecutive guest pages are consecutive host pages and an
++    // access that spans one is just an unaligned host access, which x86 does.
++    {
++    if (!mem->emulatedAddress) {
++        if (!result) {
++            result = getTmpReg8();
++        }
++        readHost(width, mem, result);
++        return result;
++    }
++    if (mem->rm || mem->sib) {
++        return read(width, calculateAddress(mem), nullptr, nullptr, result);
++    }
++    if (!result) {
++        result = getTmpReg8();
++    }
++    movValue(JitWidth::b32, result, mem->offset);
++    readHost(width, createMemPtr(result), result);
++    return result;
++    }
++#endif
++
+     if (!mem->emulatedAddress) {
+         if (!result) {
+             result = getTmpReg8();
+@@ -1469,6 +1601,39 @@ RegPtr JitCodeGen::read(JitWidth width, MemPtr mem, RegPtr result) {
+ }
+ 
+ void JitCodeGen::write(JitWidth width, MemPtr mem, RegPtr src) {
++#ifdef GH_BW_SHIM
++    // J2 -- identity addressing.
++    //
++    // Upstream emits, for every single guest memory access: shift the address
++    // down to a page number, load that page's host base out of the soft MMU,
++    // test the permission bit in the low bits of the entry, branch out to the
++    // interpreter if it is clear, mask the bits back off, and only then touch
++    // memory. Greenhouse reserves the guest's entire address space below 4GB
++    // with VirtualAlloc2, so a guest pointer already IS a host pointer and that
++    // whole sequence collapses to a 32-bit register move -- the `mov r32, r32`
++    // is not redundant, it is the truncation that makes the guest's address
++    // space wrap at 4GB the way the hardware would.
++    //
++    // The page-span special cases go with it. They exist because upstream's
++    // pages have unrelated host bases, so a read crossing a page boundary is
++    // two reads; here consecutive guest pages are consecutive host pages and an
++    // access that spans one is just an unaligned host access, which x86 does.
++    {
++    if (!mem->emulatedAddress) {
++        writeHost(width, mem, src);
++        return;
++    }
++    if (mem->rm || mem->sib) {
++        write(width, calculateAddress(mem), src);
++        return;
++    }
++    RegPtr tmp = getTmpReg();
++    movValue(JitWidth::b32, tmp, mem->offset);
++    writeHost(width, createMemPtr(tmp), src);
++    return;
++    }
++#endif
++
+     if (!mem->emulatedAddress) {
+         writeHost(width, mem, src);
+         return;
+@@ -1514,6 +1679,35 @@ void JitCodeGen::write(JitWidth width, MemPtr mem, RegPtr src) {
+ }
+ 
+ void JitCodeGen::write(JitWidth width, RegPtr addressReg, RegPtr src, std::function<void(MemPtr address)> customMemoryOp, std::function<void()> failedMemoryOp, bool checkAlignment) {
++#ifdef GH_BW_SHIM
++    // J2 -- identity addressing.
++    //
++    // Upstream emits, for every single guest memory access: shift the address
++    // down to a page number, load that page's host base out of the soft MMU,
++    // test the permission bit in the low bits of the entry, branch out to the
++    // interpreter if it is clear, mask the bits back off, and only then touch
++    // memory. Greenhouse reserves the guest's entire address space below 4GB
++    // with VirtualAlloc2, so a guest pointer already IS a host pointer and that
++    // whole sequence collapses to a 32-bit register move -- the `mov r32, r32`
++    // is not redundant, it is the truncation that makes the guest's address
++    // space wrap at 4GB the way the hardware would.
++    //
++    // The page-span special cases go with it. They exist because upstream's
++    // pages have unrelated host bases, so a read crossing a page boundary is
++    // two reads; here consecutive guest pages are consecutive host pages and an
++    // access that spans one is just an unaligned host access, which x86 does.
++    {
++    RegPtr tmp = getTmpReg();
++    mov(JitWidth::b32, tmp, addressReg);
++    if (customMemoryOp) {
++        customMemoryOp(createMemPtr(tmp));
++    } else {
++        writeHost(width, createMemPtr(tmp), src);
++    }
++    return;
++    }
++#endif
++
+     RegPtr tmp = getTmpReg();
+ 
+     shrValueWithDest(JitWidth::b32, tmp, addressReg, K_PAGE_SHIFT);
+@@ -1608,6 +1802,35 @@ void JitCodeGen::write(JitWidth width, RegPtr addressReg, RegPtr src, std::funct
+ }
+ 
+ void JitCodeGen::write(JitWidth width, MemPtr mem, U32 imm) {
++#ifdef GH_BW_SHIM
++    // J2 -- identity addressing.
++    //
++    // Upstream emits, for every single guest memory access: shift the address
++    // down to a page number, load that page's host base out of the soft MMU,
++    // test the permission bit in the low bits of the entry, branch out to the
++    // interpreter if it is clear, mask the bits back off, and only then touch
++    // memory. Greenhouse reserves the guest's entire address space below 4GB
++    // with VirtualAlloc2, so a guest pointer already IS a host pointer and that
++    // whole sequence collapses to a 32-bit register move -- the `mov r32, r32`
++    // is not redundant, it is the truncation that makes the guest's address
++    // space wrap at 4GB the way the hardware would.
++    //
++    // The page-span special cases go with it. They exist because upstream's
++    // pages have unrelated host bases, so a read crossing a page boundary is
++    // two reads; here consecutive guest pages are consecutive host pages and an
++    // access that spans one is just an unaligned host access, which x86 does.
++    {
++    if (!mem->emulatedAddress) {
++        writeHost(width, mem, imm);
++        return;
++    }
++    RegPtr tmp = getTmpReg();
++    mov(JitWidth::b32, tmp, calculateAddress(mem));
++    writeHost(width, createMemPtr(tmp), imm);
++    return;
++    }
++#endif
++
+     if (!mem->emulatedAddress) {
+         writeHost(width, mem, imm);
+         return;
+@@ -1672,6 +1895,34 @@ void JitCodeGen::write(JitWidth width, MemPtr mem, U32 imm) {
+ }
+ 
+ RegPtr JitCodeGen::readWriteMem(JitWidth width, RegPtr addressReg, std::function<void(RegPtr value)> prepareWrite, S8 hint) {
++#ifdef GH_BW_SHIM
++    // J2 -- identity addressing.
++    //
++    // Upstream emits, for every single guest memory access: shift the address
++    // down to a page number, load that page's host base out of the soft MMU,
++    // test the permission bit in the low bits of the entry, branch out to the
++    // interpreter if it is clear, mask the bits back off, and only then touch
++    // memory. Greenhouse reserves the guest's entire address space below 4GB
++    // with VirtualAlloc2, so a guest pointer already IS a host pointer and that
++    // whole sequence collapses to a 32-bit register move -- the `mov r32, r32`
++    // is not redundant, it is the truncation that makes the guest's address
++    // space wrap at 4GB the way the hardware would.
++    //
++    // The page-span special cases go with it. They exist because upstream's
++    // pages have unrelated host bases, so a read crossing a page boundary is
++    // two reads; here consecutive guest pages are consecutive host pages and an
++    // access that spans one is just an unaligned host access, which x86 does.
++    {
++    RegPtr addr = getTmpReg();
++    mov(JitWidth::b32, addr, addressReg);
++    RegPtr value = getTmpRegWithHint(hint);
++    readHost(width, createMemPtr(addr), value);
++    prepareWrite(value);
++    writeHost(width, createMemPtr(addr), value);
++    return value;
++    }
++#endif
++
+     RegPtr tmp = getTmpRegWithHint(hint);
+ 
+ #ifdef BOXEDWINE_MEM_CACHE
+diff --git a/source/emulation/cpu/jit/jitCodeGen.h b/source/emulation/cpu/jit/jitCodeGen.h
+index b2e4b2c..a94a3cd 100644
+--- a/source/emulation/cpu/jit/jitCodeGen.h
++++ b/source/emulation/cpu/jit/jitCodeGen.h
+@@ -34,6 +34,7 @@ public:
+     U32 lastOpEip = 0;
+     U32 emulatedLen = 0;
+     U32 blockOpCount = 0;
++    U32 countedOps = 0;   // GH_BW_SHIM: ops already added to CPU::blockInstructionCount
+     
+     // per instruction, not per block.  
+     bool canJumpInBlock(DecodedOp* op) override {
+diff --git a/source/emulation/cpu/normal/normalCPU.cpp b/source/emulation/cpu/normal/normalCPU.cpp
+index 1ab845f..56e22ae 100644
+--- a/source/emulation/cpu/normal/normalCPU.cpp
++++ b/source/emulation/cpu/normal/normalCPU.cpp
+@@ -20,8 +20,12 @@
+ 
+ #include "../decoder.h"
+ #include "normalCPU.h"
+-#include "../../softmmu/soft_code_page.h"
+-#include "../../softmmu/kmemory_soft.h"
++#ifndef GH_BW_SHIM
++#include "../../softmmu/soft_code_page.h"
++#endif
++#ifndef GH_BW_SHIM
++#include "../../softmmu/kmemory_soft.h"
++#endif
+ #include "../armv7/armv7CPU.h"
+ #include "../armv8/armv8CPU.h"
+ #include "../../../util/ptrpool.h"
+diff --git a/source/emulation/cpu/x32/jitX86CodeGen.cpp b/source/emulation/cpu/x32/jitX86CodeGen.cpp
+index 377ea5e..1a710c8 100644
+--- a/source/emulation/cpu/x32/jitX86CodeGen.cpp
++++ b/source/emulation/cpu/x32/jitX86CodeGen.cpp
+@@ -2168,7 +2168,9 @@ void JitX86CodeGen::idivRegRegWithRemainder(JitWidth regWidth, RegPtr dest, RegP
+     }
+ }
+ 
++#ifndef GH_BW_SHIM
+ #include "../../softmmu/kmemory_soft.h"
++#endif
+ void JitX86CodeGen::readMMU(RegPtr dest, RegPtr index, U32 offset) {
+ #ifdef BOXEDWINE_64
+     compiler.mov(R64(dest), Mem(HOST_MMU, RN(index), 3, offset));
+@@ -5612,7 +5614,11 @@ U8* JitX86CodeGen::createStartJITCode() {
+     IfNot(JitWidth::b32, tmpReg); {
+         compiler.push(asmjit::x86::rax);
+     } EndIf();    
++#ifndef GH_BW_SHIM
++    // J2: with identity addressing there is no page table to point at, so r15
++    // is simply never loaded -- and is free for the register allocator.
+     compiler.mov(HOST_MMU, (U64)getMemData(KThread::currentThread()->memory)->mmu);
++#endif
+     
+     compiler.mov(HOST_CPU, params[0]);
+     compiler.mov(RN(tmpReg), Mem(params[1], offsetof(DecodedOp, pfnJitCode)));
