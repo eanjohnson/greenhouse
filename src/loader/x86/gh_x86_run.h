@@ -64,6 +64,15 @@ inline bool     g_jit_emu    = false;
 inline uint32_t g_jit_emu_lo = 0xFFFFFFFFu;
 inline uint32_t g_jit_emu_hi = 0;
 
+// `eips=<n>`, `eipfrom=<hex>`, `eipto=<hex>`, `eipmax=<n>` -- J4's differential
+// sampler, armed identically on both engines so their logs diff directly.
+// See gh_x86_cpu.h for what each mode is for and why it is behind
+// GH_X86_EIPTRACE rather than always compiled.
+inline uint32_t g_eipt_from  = 0;
+inline uint32_t g_eipt_to    = 0;
+inline uint64_t g_eipt_every = 0;
+inline uint32_t g_eipt_max   = 6000;
+
 
 // The interpreter identity-maps the guest, so a guest pointer that escapes the
 // bounds check is a HOST access violation -- and an unhandled one kills the
@@ -153,8 +162,29 @@ inline bool RunPe32Guest(const std::vector<uint8_t>& file, uint32_t& result, std
     log(std::string("X86 diagnostics ") +
         (g_quiet ? "OFF (perf run: no trace, no ring, no callee-saved audit)"
                  : "on (trace 400, ring 192, callee-saved audit)"));
+    // With no explicit `jitemu`, the JIT still does not compile x87 -- see
+    // ghjit::kX87InstFirst for the two hangs that buys off. An explicit
+    // `jitemu` is a bisection run and means exactly what it says, including
+    // "compile x87 after all".
+    if (m.jit_on && !g_jit_emu) {
+        g_jit_emu_lo = ghjit::kX87InstFirst;
+        g_jit_emu_hi = ghjit::kX87InstLast;
+        log("X86 JIT: x87 interpreted, everything else compiled "
+            "(jitemu=<lo>-<hi> overrides)");
+    }
     if (m.jit_on) ghjit::set_emulate_range(g_jit_emu_lo, g_jit_emu_hi,
                                           g_jit_emu && g_jit_emu_lo > g_jit_emu_hi);
+#ifdef GH_X86_EIPTRACE
+    if (g_eipt_to || g_eipt_every) {
+        g_eip_from = g_eipt_from; g_eip_to = g_eipt_to;
+        g_eip_every = g_eipt_every; g_eip_max = g_eipt_max; g_eip_seen = 0;
+        g_eip_sink = [](const char* line) { log(std::string(line)); };
+        log("X86 eip trace armed: range " + hex(g_eipt_from) + ".." + hex(g_eipt_to) +
+            ", every " + std::to_string(g_eipt_every) + ", cap " +
+            std::to_string(g_eipt_max) + " lines");
+    }
+#endif
+    if (m.jit_on) ghjit::set_eip_trace(g_eipt_from, g_eipt_to, g_eipt_every, g_eipt_max);
     if (m.jit_on && !ghjit::init(m.region_base, m.region_size,
                                  [](const char* line) { log(std::string(line)); })) {
         why = "JIT engine failed to start";

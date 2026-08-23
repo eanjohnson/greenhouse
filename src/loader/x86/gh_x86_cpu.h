@@ -27,7 +27,10 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+
+#include "gh_x86_cpuid.h"
 #include <string>
 #include <vector>
 
@@ -122,6 +125,56 @@ enum class Status {
 // across all threads. Deliberately not a Cpu member -- see the use site.
 #ifdef GH_X86_SPIN_YIELD
 inline uint64_t g_x86_pauses = 0;
+#endif
+
+// ---------------------------------------------------------------------------
+// The differential sampler (J4).
+//
+// Two engines now execute this guest -- our interpreter and BoxedWine's -- and
+// when they disagree, the only useful question is "at which instruction did
+// they stop agreeing". Host-call traces answer it to within a function, which
+// is where #114 got stuck: both engines made the same 321 calls and then took
+// different paths inside ONE function, with no host call in between to say
+// which branch went where.
+//
+// So sample the thing that actually diverges. Two modes, either or both:
+//
+//   eips=<n>          every n instructions, log (count, eip, esp). ~90 lines
+//                     over 5.8M instructions brackets a divergence to a window.
+//   eipfrom=/eipto=   log EVERY instruction executed inside [from, to). This is
+//                     the mode that names the instruction, and it needs no
+//                     count alignment at all -- which matters, because the two
+//                     engines do NOT count identically (we retire one `rep
+//                     movsb` iteration per instruction; BoxedWine retires the
+//                     whole rep as one op).
+//
+// Compiled in only under GH_X86_EIPTRACE. The check is cheap, but this is the
+// interpreter's innermost loop, where a single per-instruction branch has
+// measured 20% on the console before -- and a throughput number that includes
+// its own instrumentation is worth nothing.
+#ifdef GH_X86_EIPTRACE
+inline uint32_t g_eip_from  = 0;      // inclusive
+inline uint32_t g_eip_to    = 0;      // exclusive; 0 disables the range mode
+inline uint64_t g_eip_every = 0;      // 0 disables the sampling mode
+inline uint32_t g_eip_max   = 6000;   // hard cap on lines, so a hot range
+inline uint32_t g_eip_seen  = 0;      // cannot fill the log with itself
+
+// The sink doubles as the arm flag, so the hot path is one null test against a
+// pointer that is null on every normal run. Set by gh_x86_run.h; a function
+// pointer rather than a direct call because this header is portable and is
+// compiled by the native test harness, which has no loader log at all.
+inline void (*g_eip_sink)(const char*) = nullptr;
+
+// Both engines emit this exact shape so a diff is mechanical -- the BoxedWine
+// half is gh_bw_eip_hit in the shim. The eip column is the one being compared;
+// the counts are advisory, because the two engines do not count identically.
+inline void eip_sample(uint64_t count, uint32_t eip, uint32_t esp, uint32_t eax)
+{
+    char b[96];
+    std::snprintf(b, sizeof(b), "X86 EIP %llu %08X esp=%08X eax=%08X",
+                  (unsigned long long)count, eip, esp, eax);
+    g_eip_sink(b);
+}
 #endif
 
 struct Cpu {
@@ -714,6 +767,15 @@ inline Status Cpu::step()
     // is the architecturally correct behaviour and keeps step() to one
     // instruction's worth of work.
     const uint32_t insn_start = insn_eip = eip;
+
+#ifdef GH_X86_EIPTRACE
+    if (g_eip_sink && g_eip_seen < g_eip_max &&
+        ((g_eip_to && eip >= g_eip_from && eip < g_eip_to) ||
+         (g_eip_every && insn_count % g_eip_every == 0))) {
+        ++g_eip_seen;
+        eip_sample(insn_count, eip, gpr[REG_ESP], gpr[REG_EAX]);
+    }
+#endif
 
     // -- prefixes ----------------------------------------------------------
     uint8_t op = 0;
@@ -1564,33 +1626,17 @@ inline Status Cpu::step()
                 // __isa_available_init reads these bits and will happily select
                 // an AVX memcpy, which would fault on the first instruction.
                 case 0xA2: {                                 // cpuid
-                    uint32_t leaf = gpr[REG_EAX];
-                    if (leaf == 0) {
-                        gpr[REG_EAX] = 1;                    // highest basic leaf
-                        gpr[REG_EBX] = 0x756E6547;           // "Genu"
-                        gpr[REG_EDX] = 0x49656E69;           // "ineI"
-                        gpr[REG_ECX] = 0x6C65746E;           // "ntel"
-                    } else if (leaf == 1) {
-                        gpr[REG_EAX] = 0x000006F0;           // family 6, model 15
-                        gpr[REG_EBX] = 0x00000800;           // CLFLUSH line size 8*8
-                        gpr[REG_ECX] = 0;                    // no SSE3 and nothing above it
-                        gpr[REG_EDX] = (1u << 0)  |          // FPU
-                                       (1u << 4)  |          // TSC
-                                       (1u << 8)  |          // CMPXCHG8B
-                                       (1u << 15) |          // CMOV
-                                       (1u << 23) |          // MMX
-                                       (1u << 24) |          // FXSR
-                                       (1u << 25) |          // SSE
-                                       (1u << 26);           // SSE2
-                    } else {
-                        gpr[REG_EAX] = gpr[REG_EBX] = gpr[REG_ECX] = gpr[REG_EDX] = 0;
-                    }
+                    // The answer lives in gh_x86_cpuid.h because the BoxedWine
+                    // engine has to give the identical one; see that header.
+                    const GhCpuid c = gh_cpuid(gpr[REG_EAX]);
+                    gpr[REG_EAX] = c.eax; gpr[REG_EBX] = c.ebx;
+                    gpr[REG_ECX] = c.ecx; gpr[REG_EDX] = c.edx;
                     insn_count++; return Status::Ok;
                 }
                 case 0x31: {                                 // rdtsc
                     // Monotonic and roughly proportional to work done. Zero
                     // would be worse than wrong: timing code divides by deltas.
-                    uint64_t t = insn_count * 20;
+                    uint64_t t = gh_rdtsc(insn_count);
                     gpr[REG_EAX] = (uint32_t)t;
                     gpr[REG_EDX] = (uint32_t)(t >> 32);
                     insn_count++; return Status::Ok;

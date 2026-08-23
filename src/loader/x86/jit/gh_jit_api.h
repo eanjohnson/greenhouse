@@ -45,6 +45,36 @@ bool init(uint32_t region_base, uint32_t region_size,
 // interpreter instead of compiling, and whether to compile at all.
 void set_emulate_range(uint32_t lo, uint32_t hi, bool disableJit);
 
+// The x87 block of BoxedWine's Instruction enum (decoder.h): FADD_ST0_STj
+// through FISTP_QWORD_INTEGER, contiguous. Greenhouse interprets all of it
+// rather than compiling it, because the compiled form is WRONG on this guest
+// and wrong in a way that does not fail -- it hangs.
+//
+// Measured on Stick Fight, one console run per range: compiling x87 makes
+// Unity's hash-table growth function at guest 0x00B0AB65 (a `fild`/`fmul
+// st,st(2)`/`fcomip` loop that doubles a capacity until count < capacity *
+// loadFactor) never satisfy its exit test, so ECX doubles until it wraps to
+// zero and the loop runs forever at 270 M instructions a second. Interpreting
+// just 566..598 makes that loop terminate but return a wrong capacity, and the
+// hash probe loop at 0x007710A0 spins instead; interpreting 499..631 runs
+// clean. So there are at least two defects here, one around FILD_DWORD_INTEGER
+// (574) / FLD_DOUBLE_REAL (598) and one at or near FCOMI_ST0_STj_Pop (623).
+//
+// The cost of interpreting them is small and the alternative is a hang: this
+// guest's hot floating-point work is SSE, and x87 appears only in scalar CRT
+// and container code. `jitemu=<lo>-<hi>` still overrides, which is how the two
+// sites above were found and is how they will be fixed.
+constexpr uint32_t kX87InstFirst = 499;
+constexpr uint32_t kX87InstLast  = 631;
+
+// J4's differential sampler, the BoxedWine half. Same two modes and the same
+// output line as ghx86::eip_sample: `every` samples one instruction in n,
+// [`from`, `to`) logs every instruction inside a range. Sampling happens in the
+// normal interpreter's per-op prologue, so a meaningful trace wants `jitemu`
+// (compilation off) -- compiled code does not stop per instruction, and asking
+// it to would change the thing being measured.
+void set_eip_trace(uint32_t from, uint32_t to, uint64_t every, uint32_t max);
+
 // Per-green-thread JIT context. Greenhouse owns the lifetime.
 void* thread_new(uint32_t tid);
 void  thread_free(void* ctx);

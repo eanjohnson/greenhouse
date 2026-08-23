@@ -66,7 +66,7 @@ char* platform_strcasestr(const char*, const char*) { return nullptr; }
 // Identity addressing removes every reason to care whether an access stays
 // inside one page, which is what this flag gates.
 bool KSystem::canJitUse4KPage = true;
-U32  KSystem::pentiumLevel    = 6;      // report a Pentium Pro: CMOV, no SSE4
+U32  KSystem::pentiumLevel    = 4;      // unused now: see gh_bw_cpuid
 bool KSystem::useF64          = false;
 bool KSystem::shutingDown     = false;
 
@@ -324,6 +324,18 @@ static const U32 kBackEdgeQuantum = 8192;
 
 // Set by `jitemu=lo-hi`; see JitCodeGen::compileOps.
 
+void set_eip_trace(uint32_t from, uint32_t to, uint64_t every, uint32_t max)
+{
+    gh_bw_eip_from  = from;
+    gh_bw_eip_to    = to;
+    gh_bw_eip_every = every;
+    gh_bw_eip_max   = max;
+    gh_bw_eip_seen  = 0;
+    if (to || every)
+        gh_bw_log("X86 JIT eip trace: range %08X..%08X, every %llu, cap %u lines",
+                  from, to, (unsigned long long)every, max);
+}
+
 void set_emulate_range(uint32_t lo, uint32_t hi, bool disableJit)
 {
     gh_bw_emu_lo = lo;
@@ -422,6 +434,12 @@ Exit run(void* ctx, Regs& r, uint64_t budget, uint64_t* insns,
         c->blockInstructionCount = 0;
         c->run();
         retired += c->blockInstructionCount;
+        // RDTSC reads instructionCount + blockInstructionCount, and the loop
+        // zeroes blockInstructionCount before every block -- so without this the
+        // guest's clock sits near zero forever and jumps backwards at every
+        // block boundary. Nothing upstream maintains instructionCount because
+        // upstream's scheduler does; ours is this loop.
+        c->instructionCount += c->blockInstructionCount;
 
         if (gh_bw_fault_kind) {
             *stop_addr = gh_bw_fault_addr;
@@ -470,6 +488,42 @@ BWriteFile::~BWriteFile() {}
 
 void gh_bw_block_compiled(U32 opCount, U32 guestBytes) { ghjit::note_block(opCount, guestBytes); }
 
+// CPUID for both engines; see gh_x86_cpuid.h for why it is shared rather than
+// duplicated. Upstream's CPU::cpuid still exists and is still correct for
+// upstream -- this replaces it only under GH_BW_SHIM.
+void gh_bw_cpuid(CPU* cpu)
+{
+    const GhCpuid c = gh_cpuid(cpu->reg[0].u32);
+    cpu->reg[0].u32 = c.eax;
+    cpu->reg[3].u32 = c.ebx;
+    cpu->reg[1].u32 = c.ecx;
+    cpu->reg[2].u32 = c.edx;
+}
+
 U32  gh_bw_emu_lo = 0xFFFFFFFF;   // empty range: compile everything
 U32  gh_bw_emu_hi = 0;
 bool gh_bw_jit_disabled = false;
+
+// J4's sampler. Fed from normalCPU.cpp's START_OP, which is the only place in
+// BoxedWine that runs once per guest instruction with eip still pointing AT
+// that instruction -- NEXT() advances eip only after the op body. Compiled code
+// never reaches here, which is exactly why a differential run wants `jitemu`.
+U64  gh_bw_icount    = 0;
+U32  gh_bw_eip_from  = 0;
+U32  gh_bw_eip_to    = 0;
+U64  gh_bw_eip_every = 0;
+U32  gh_bw_eip_max   = 6000;
+U32  gh_bw_eip_seen  = 0;
+
+void gh_bw_eip_hit(CPU* cpu)
+{
+    const U32 eip = cpu->eip.u32;
+    if (gh_bw_eip_seen >= gh_bw_eip_max) return;
+    if (!((gh_bw_eip_to && eip >= gh_bw_eip_from && eip < gh_bw_eip_to) ||
+          (gh_bw_eip_every && gh_bw_icount % gh_bw_eip_every == 0)))
+        return;
+    ++gh_bw_eip_seen;
+    // Byte-identical to ghx86::eip_sample, so the two logs diff directly.
+    gh_bw_log("X86 EIP %llu %08X esp=%08X eax=%08X",
+              (unsigned long long)gh_bw_icount, eip, cpu->reg[4].u32, cpu->reg[0].u32);
+}

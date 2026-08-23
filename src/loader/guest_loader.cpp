@@ -4263,6 +4263,42 @@ static bool MapAndRun32(const std::vector<uint8_t>& file)
                 }
             }
 
+            // eips=<n> / eipfrom=<hex> / eipto=<hex> / eipmax=<n> -- J4's
+            // differential sampler, armed the same way on both engines so the
+            // two logs diff directly. The range form is the one that names an
+            // instruction; the sampling form is the one that finds the range.
+            // Hex, because every address in this codebase is hex and the
+            // options string is already lowercased for us.
+            const size_t ef = o.find("eipfrom=");
+            if (ef != std::string::npos)
+                ghx86::g_eipt_from = (uint32_t)std::strtoul(o.c_str() + ef + 8, nullptr, 16);
+            const size_t et = o.find("eipto=");
+            if (et != std::string::npos)
+                ghx86::g_eipt_to = (uint32_t)std::strtoul(o.c_str() + et + 6, nullptr, 16);
+            const size_t em = o.find("eipmax=");
+            if (em != std::string::npos)
+                ghx86::g_eipt_max = (uint32_t)std::strtoul(o.c_str() + em + 7, nullptr, 10);
+            // Parsed last of the four: "eips=" is a prefix of nothing else, but
+            // "eip" is a prefix of all of them, so order is the cheap guard.
+            const size_t es = o.find("eips=");
+            if (es != std::string::npos)
+                ghx86::g_eipt_every = std::strtoull(o.c_str() + es + 5, nullptr, 10);
+            if (ghx86::g_eipt_to || ghx86::g_eipt_every) {
+#ifdef GH_X86_EIPTRACE
+                Diag("X86 eip trace: range " + std::to_string(ghx86::g_eipt_from) + ".." +
+                     std::to_string(ghx86::g_eipt_to) + " (hex in), every " +
+                     std::to_string(ghx86::g_eipt_every) + ", cap " +
+                     std::to_string(ghx86::g_eipt_max));
+#else
+                // The BoxedWine half is always compiled (its cost lands only
+                // on interpreted ops), so a `jit`+`jitemu` run still traces --
+                // it is OUR interpreter, the reference side of the comparison,
+                // that needs the rebuild.
+                Diag("X86 eip trace: interpreter half OFF (no GH_X86_EIPTRACE); "
+                     "rebuild with EIPTRACE=1 (iterate-x86spike.sh) for the reference run");
+#endif
+            }
+
             // spin=<n> -- yield the turn once every n PAUSE instructions.
             const size_t yp = o.find("spin=");
             if (yp != std::string::npos) {

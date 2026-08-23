@@ -1734,6 +1734,7 @@ struct Machine {
     uint64_t hostcalls  = 0;
     uint64_t last_hostcalls = 0;
     uint64_t next_checkpoint = 0;
+    uint64_t last_jit_blocks = (uint64_t)-1;
     uint64_t checkpoint_step = 0;
     // Two cadences. The first 10M instructions of this guest take 13 of the 30
     // seconds -- eleven times slower than everything after them -- so that
@@ -1814,19 +1815,25 @@ struct Machine {
         std::snprintf(b, sizeof(b),
                       "X86 timing %s: %llu insns in %.0f ms (%.2f M insn/s); "
                       "last %llu in %.0f ms = %.2f M insn/s, "
-                      "%llu hostcalls (%llu insns/call)",
+                      "%llu hostcalls (%llu insns/call), t%u at %08X",
                       what.c_str(), (unsigned long long)ins, ms, rate,
                       (unsigned long long)d_in, d_ms, d_rate,
                       (unsigned long long)d_hc,
-                      (unsigned long long)(d_hc ? d_in / d_hc : d_in));
+                      (unsigned long long)(d_hc ? d_in / d_hc : d_in),
+                      cur_tid(), cpu.eip);
         log(b);
 
         // Under the JIT the instruction count above is approximate (see
         // run_jit), so say what the code generator itself did -- those numbers
         // are exact, and "how much did it compile" is the first thing to check
         // when a JIT run is slower than expected.
+        // Only when it moved. A guest that is stuck compiles nothing new, and
+        // the unchanged line repeated once per checkpoint buried a 5700-line
+        // log in 2600 copies of itself.
         if (jit_on) {
             ghjit::Stats js = ghjit::stats();
+            if (js.blocks_compiled != last_jit_blocks) {
+            last_jit_blocks = js.blocks_compiled;
             std::snprintf(b, sizeof(b),
                           "X86   jit: %llu blocks compiled, %llu bytes of host code, "
                           "%llu code invalidations",
@@ -1834,6 +1841,7 @@ struct Machine {
                           (unsigned long long)js.compile_bytes,
                           (unsigned long long)js.invalidations);
             log(b);
+            }
         }
 
         last_ms = ms;

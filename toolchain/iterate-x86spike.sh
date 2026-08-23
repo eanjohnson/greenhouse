@@ -46,6 +46,14 @@ if [ "${GHJIT:-0}" = "1" ]; then
   GHX86DEF="${GHX86DEF:-} /DGH_X86_JIT"
 fi
 
+# EIPTRACE=1 compiles in the J4 differential sampler (`eips=`, `eipfrom=`,
+# `eipto=` in ghx86opts.txt). Opt-in because it puts one branch in the
+# interpreter's innermost loop, and a throughput run must not carry its own
+# instrumentation -- see gh_x86_cpu.h. The BoxedWine half is always compiled.
+if [ "${EIPTRACE:-0}" = "1" ]; then
+  GHX86DEF="${GHX86DEF:-} /DGH_X86_EIPTRACE"
+fi
+
 echo "== build loader (GH_X86_GUEST${GHX86DEF:+ $GHX86DEF}, no launcher) =="
 clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \
   /std:c++20 /EHsc /MT /O2 "/DGH_PKG_FAMILY=\"$FAM\"" /DGH_X86_GUEST $GHX86DEF \

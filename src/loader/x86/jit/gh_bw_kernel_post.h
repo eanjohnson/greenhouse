@@ -53,6 +53,13 @@ bool platformHasBMI2();
 // int 0x80 -- BoxedWine's Linux syscall entry. A Windows guest never issues it.
 void ksyscall(CPU* cpu, U32 len);
 
+// CPUID. Answered from gh_x86_cpuid.h so that this engine and Greenhouse's own
+// interpreter describe the same machine; upstream's CPU::cpuid is keyed to
+// KSystem::pentiumLevel and omits the SSE2 bit unless that is exactly 4, which
+// is what made Stick Fight print "This product requires an SSE2 capable CPU to
+// run." and exit(1) six million instructions in.
+void gh_bw_cpuid(CPU* cpu);
+
 // Called once per successfully compiled block, for the throughput report.
 void gh_bw_block_compiled(U32 opCount, U32 guestBytes);
 
@@ -65,6 +72,23 @@ extern U32 gh_bw_emu_hi;
 // interpreter runs everything. This is the control that separates "the code
 // generator is wrong" from "the port around it is wrong".
 extern bool gh_bw_jit_disabled;
+
+// J4's differential sampler. `gh_bw_sample` is what normalCPU.cpp's START_OP
+// calls, so it has to be an inline nothing when disarmed: one increment and one
+// test of a global that is zero on every normal run. The real work lives in
+// gh_bw_eip_hit so the hot path holds no formatting.
+extern U64 gh_bw_icount;
+extern U32 gh_bw_eip_from;
+extern U32 gh_bw_eip_to;
+extern U64 gh_bw_eip_every;
+extern U32 gh_bw_eip_max;
+extern U32 gh_bw_eip_seen;
+void gh_bw_eip_hit(CPU* cpu);
+
+static INLINE void gh_bw_sample(CPU* cpu) {
+    gh_bw_icount++;
+    if (gh_bw_eip_to || gh_bw_eip_every) gh_bw_eip_hit(cpu);
+}
 void OPCALL onExitSignal(CPU* cpu, DecodedOp* op);
 
 #endif

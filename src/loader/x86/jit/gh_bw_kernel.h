@@ -26,6 +26,9 @@
 #ifndef __GH_BW_KERNEL_H__
 #define __GH_BW_KERNEL_H__
 
+// The CPU both engines claim to be. No dependencies; safe on either side.
+#include "../gh_x86_cpuid.h"
+
 #include <vector>
 #include <functional>
 #include <atomic>

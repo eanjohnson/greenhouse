@@ -1,5 +1,5 @@
 diff --git a/include/boxedwine.h b/include/boxedwine.h
-index 31152f7..73edaf1 100644
+index 31152f74..73edaf1f 100644
 --- a/include/boxedwine.h
 +++ b/include/boxedwine.h
 @@ -120,6 +120,17 @@ typedef std::weak_ptr<KProcess> KProcessWeakPtr;
@@ -29,7 +29,7 @@ index 31152f7..73edaf1 100644
  #include "log.h"
  #include "kerror.h"
 diff --git a/source/emulation/cpu/common/common_sse.cpp b/source/emulation/cpu/common/common_sse.cpp
-index c8167c0..a388b2d 100644
+index c8167c07..a388b2db 100644
 --- a/source/emulation/cpu/common/common_sse.cpp
 +++ b/source/emulation/cpu/common/common_sse.cpp
 @@ -18,7 +18,9 @@
@@ -44,7 +44,7 @@ index c8167c0..a388b2d 100644
  
  static U32 commonSseRoundToI32(double value, U32 mxcsr, bool truncate) {
 diff --git a/source/emulation/cpu/common/cpu.cpp b/source/emulation/cpu/common/cpu.cpp
-index bb49cd6..9f41748 100644
+index bb49cd6d..0fc3346f 100644
 --- a/source/emulation/cpu/common/cpu.cpp
 +++ b/source/emulation/cpu/common/cpu.cpp
 @@ -1,9 +1,11 @@
@@ -122,7 +122,7 @@ index bb49cd6..9f41748 100644
  void CPU::walkStack(U32 eip, U32 ebp, U32 indent) {
      U32 moduleEip = this->thread->process->getModuleEip(this->seg[CS].address+eip);
      BString name = this->thread->process->getModuleName(this->seg[CS].address+eip);
-@@ -436,6 +458,8 @@ void CPU::walkStack(U32 eip, U32 ebp, U32 indent) {
+@@ -436,8 +458,20 @@ void CPU::walkStack(U32 eip, U32 ebp, U32 indent) {
      }
  }
  
@@ -130,9 +130,37 @@ index bb49cd6..9f41748 100644
 +
  void CPU::cpuid() {
      CPU* cpu = this;
++#ifdef GH_BW_SHIM
++    // One CPU, two engines. Greenhouse runs this guest under its own
++    // interpreter as well, and a guest reads CPUID once and then dispatches
++    // on the answer forever -- so the two engines answering differently is
++    // not a detail, it is a different program. The shared answer is in
++    // gh_x86_cpuid.h. (Upstream's answer here is keyed to
++    // KSystem::pentiumLevel and omits SSE2 unless that is exactly 4.)
++    gh_bw_cpuid(this);
++    return;
++#endif
      switch (EAX) {
+         case 0:	/* Vendor ID String and maximum level? */
+             EAX=2;  /* Maximum level */
+@@ -1680,7 +1714,15 @@ void common_enter(CPU* cpu, U32 big, U32 bytes, U32 level) {
+ }
+ 
+ void common_rdtsc(CPU* cpu, U32 extra) {
++#ifdef GH_BW_SHIM
++    // Same reasoning as CPUID: a monotonic count of work done, scaled the
++    // same way Greenhouse's interpreter scales it, so a guest that
++    // calibrates the TSC against QueryPerformanceCounter gets the same
++    // answer whichever engine it is running on.
++    U64 t = gh_rdtsc(cpu->instructionCount + cpu->blockInstructionCount + extra);
++#else
+     U64 t = cpu->instructionCount+cpu->blockInstructionCount+extra;
++#endif
+     EAX = (U32)t;
+     EDX = (U32)(t >> 32);
+ }
 diff --git a/source/emulation/cpu/common/fpu.cpp b/source/emulation/cpu/common/fpu.cpp
-index f040cfc..ecded33 100644
+index f040cfc3..ecded333 100644
 --- a/source/emulation/cpu/common/fpu.cpp
 +++ b/source/emulation/cpu/common/fpu.cpp
 @@ -19,7 +19,9 @@
@@ -146,7 +174,7 @@ index f040cfc..ecded33 100644
  #define FMASK_TEST (CF | PF | AF | ZF | SF | OF)    
  
 diff --git a/source/emulation/cpu/jit/jitCodeGen.cpp b/source/emulation/cpu/jit/jitCodeGen.cpp
-index ad3bcc3..5276c73 100644
+index ad3bcc3f..5276c731 100644
 --- a/source/emulation/cpu/jit/jitCodeGen.cpp
 +++ b/source/emulation/cpu/jit/jitCodeGen.cpp
 @@ -23,7 +23,9 @@
@@ -504,7 +532,7 @@ index ad3bcc3..5276c73 100644
  
  #ifdef BOXEDWINE_MEM_CACHE
 diff --git a/source/emulation/cpu/jit/jitCodeGen.h b/source/emulation/cpu/jit/jitCodeGen.h
-index b2e4b2c..a94a3cd 100644
+index b2e4b2cb..a94a3cdd 100644
 --- a/source/emulation/cpu/jit/jitCodeGen.h
 +++ b/source/emulation/cpu/jit/jitCodeGen.h
 @@ -34,6 +34,7 @@ public:
@@ -516,7 +544,7 @@ index b2e4b2c..a94a3cd 100644
      // per instruction, not per block.  
      bool canJumpInBlock(DecodedOp* op) override {
 diff --git a/source/emulation/cpu/normal/normalCPU.cpp b/source/emulation/cpu/normal/normalCPU.cpp
-index 1ab845f..56e22ae 100644
+index 1ab845ff..b8c89120 100644
 --- a/source/emulation/cpu/normal/normalCPU.cpp
 +++ b/source/emulation/cpu/normal/normalCPU.cpp
 @@ -20,8 +20,12 @@
@@ -534,8 +562,30 @@ index 1ab845f..56e22ae 100644
  #include "../armv7/armv7CPU.h"
  #include "../armv8/armv8CPU.h"
  #include "../../../util/ptrpool.h"
+@@ -30,6 +34,13 @@
+ thread_local U32 normalWaitCallCount = 0;
+ #endif
+ 
++// J4 -- Greenhouse's differential sampler. START_OP is the only per-guest-
++// instruction hook in the whole interpreter, and it runs with eip still
++// pointing AT the instruction (NEXT() advances it afterwards), which is
++// exactly what a trace has to record to be comparable with another engine.
++#ifdef GH_BW_SHIM
++#define START_OP(cpu, op) cpu->blockInstructionCount++; gh_bw_sample(cpu)
++#else
+ #ifdef BOXEDWINE_MULTI_THREADED
+ #ifdef _DEBUG
+ //#define START_OP(cpu, op) op->log(cpu)
+@@ -45,6 +56,7 @@ thread_local U32 normalWaitCallCount = 0;
+ #define START_OP(cpu, op) cpu->blockInstructionCount++
+ #endif
+ #endif
++#endif
+ 
+ // Direct-dispatch builds use normalDispatch so the switch generates direct
+ // return_call instructions per opcode rather than one return_call_indirect.
 diff --git a/source/emulation/cpu/x32/jitX86CodeGen.cpp b/source/emulation/cpu/x32/jitX86CodeGen.cpp
-index 377ea5e..1a710c8 100644
+index 377ea5ef..1a710c8c 100644
 --- a/source/emulation/cpu/x32/jitX86CodeGen.cpp
 +++ b/source/emulation/cpu/x32/jitX86CodeGen.cpp
 @@ -2168,7 +2168,9 @@ void JitX86CodeGen::idivRegRegWithRemainder(JitWidth regWidth, RegPtr dest, RegP
