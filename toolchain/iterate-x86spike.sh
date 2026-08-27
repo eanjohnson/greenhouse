@@ -38,6 +38,12 @@ fi
 # a shipped build is the shipped build.
 # GHJIT=1 builds and links the BoxedWine JIT (see toolchain/build_bwjit.sh).
 # It adds ~150 objects to the link, so it is opt-in rather than always on.
+#
+# Default it here rather than relying on ${GHX86DEF:-} at each use: the script
+# runs under `set -u`, and the plain x64-guest path (no GHJIT) referenced it
+# unguarded on the clang-cl line, so any run without GHJIT=1 died with
+# "GHX86DEF: unbound variable" before compiling anything.
+GHX86DEF="${GHX86DEF:-}"
 BWOBJ=""
 if [ "${GHJIT:-0}" = "1" ]; then
   echo "== build BoxedWine JIT =="
@@ -64,7 +70,9 @@ clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \
   "$GH/src/loader/guest_loader.cpp" $BWOBJ -o "$S/p0_spike_host.exe" \
   /link /libpath:"$SDK/crt/lib/x86_64" /libpath:"$SDK/sdk/lib/um/x86_64" /libpath:"$SDK/sdk/lib/ucrt/x86_64" \
   WindowsApp.lib d3d11.lib d3d12.lib dxgi.lib ws2_32.lib gdi32.lib user32.lib windowscodecs.lib \
-  /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup /APPCONTAINER 2>&1 | grep -E 'error' || true
+  /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup /APPCONTAINER > "$TMP/build.log" 2>&1 || {
+    echo "BUILD FAILED:"; grep -E 'error' "$TMP/build.log" | head -20; exit 1; }
+grep -E 'error' "$TMP/build.log" || true
 # A `| grep || true` once swallowed a link failure and packed a stage with no
 # host exe; the console then answered LAUNCH 400 / 0x80070002 and the hour went
 # into the wrong place entirely. Never pack what did not build.
@@ -79,9 +87,18 @@ NEWEST=$(find "$GH/src/loader" -type f \( -name '*.cpp' -o -name '*.h' \) -newer
 mkdir -p "$S/guest"
 [ "$ONDEVICE" = 1 ] || cp "$GUEST" "$S/guest/$GUESTNAME"
 
-echo "== manifest $OLD -> $NEW =="
-sed -i "s/Version=\"$OLD\"/Version=\"$NEW\"/" "$GH/src/host/AppxManifest.xml"
-cp "$GH/src/host/AppxManifest.xml" "$S/AppxManifest.xml"
+# Bump from whatever the manifest ACTUALLY says, not from $OLD. $OLD is the
+# version installed on the console (used for the uninstall below); the manifest
+# can be on a different version entirely after an aborted run. Conflating the
+# two silently no-ops the sed -- which then packs under the stale version, so
+# the registration poll, the ghguest.txt upload and the diag pull all key on a
+# package that was never built. One missed substitution, four downstream lies.
+MAN="$GH/src/host/AppxManifest.xml"
+MANOLD=$(grep -oP 'Version="\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$MAN" | head -1)
+echo "== manifest $MANOLD -> $NEW (console has $OLD) =="
+sed -i "s/Version=\"$MANOLD\"/Version=\"$NEW\"/" "$MAN"
+grep -q "Version=\"$NEW\"" "$MAN" || { echo "FATAL: manifest bump to $NEW did not take"; exit 1; }
+cp "$MAN" "$S/AppxManifest.xml"
 
 echo "== pack + sign =="
 LIBDIR="$GH/toolchain/msix-packaging-src/.vs/lib"
@@ -100,13 +117,17 @@ python3 wdp.py install "$GH/artifacts/Probe32.signed.msix" 2>&1 | tail -1
 # 0x80070002 -- which reads exactly like a missing exe and is not.
 for i in $(seq 1 30); do
   sleep 3
-  python3 - <<PYEOF && break
+  python3 - <<PYEOF && REGISTERED=1 && break
 import wdp, sys
 st, d = wdp.req('GET', '/api/app/packagemanager/packages')
 names = [p.get('PackageFullName','') for p in (d or {}).get('InstalledPackages', [])]
 sys.exit(0 if "$PFN_NEW" in names else 1)
 PYEOF
 done
+# INSTALL answers 202 "accepted and being processed", never "installed". If the
+# poll times out the package is simply not there, and launching by FAMILY name
+# happily starts whatever stale version still is -- green output, stale binary.
+[[ -n "${REGISTERED:-}" ]] || { echo "FATAL: $PFN_NEW never registered after 90s"; python3 wdp.py status 2>&1 | tail -2; exit 1; }
 
 # First launch creates LocalState; the guest selection lands on the second.
 python3 wdp.py launch "${FAM}!App" "$FAM" 2>&1 | tail -1
@@ -119,6 +140,13 @@ python3 wdp.py fsupload "$PFN_NEW" '\LocalState' ghguest.txt 2>&1 | tail -1
 if [[ -f "$TMP/ghx86opts.txt" ]]; then
   echo "== ghx86opts.txt: $(iconv -f UTF-16LE -t UTF-8 < "$TMP/ghx86opts.txt") =="
   python3 wdp.py fsupload "$PFN_NEW" '\LocalState' ghx86opts.txt 2>&1 | tail -1
+fi
+# ghdenydll.txt: one DLL basename per line, made to look ABSENT to the guest.
+# Same delivery as ghx86opts.txt -- uninstall wipes LocalState, so it is re-sent
+# every deploy rather than left on the console.
+if [[ -f "$TMP/ghdenydll.txt" ]]; then
+  echo "== ghdenydll.txt: $(iconv -f UTF-16LE -t UTF-8 < "$TMP/ghdenydll.txt" | tr '\n' ' ') =="
+  python3 wdp.py fsupload "$PFN_NEW" '\LocalState' ghdenydll.txt 2>&1 | tail -1
 fi
 sleep 2
 python3 wdp.py launch "${FAM}!App" "$FAM" 2>&1 | tail -1

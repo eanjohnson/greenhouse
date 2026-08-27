@@ -54,6 +54,10 @@ static const int kGhNetMsgReleaseOff = 0xB8;
 // interface addresses so debugger stacks are readable if something ever inspects
 // which interface a call routed through.
 static char g_iface_client;
+// Bumped by SteamAPI_Shutdown so a guest-side interface context re-initialises.
+// Declared up here rather than beside SteamInternal_ContextInit because Shutdown
+// (far above it) is the one thing that writes it.
+static uintptr_t g_gh_ctx_counter = 1;   // != a fresh context's 0, so init runs once
 static char g_iface_user;
 static char g_iface_friends;
 static char g_iface_utils;
@@ -1074,7 +1078,14 @@ static void gh_direct_ls_path(const char* fname, char* out) {
     char lad[MAX_PATH]; DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", lad, MAX_PATH);
     if (n > 0 && n < MAX_PATH) {
         char* p = strstr(lad, "\\Packages\\"); if (p) *p = 0;   // -> ...\AppData\Local
-        snprintf(out, MAX_PATH, "%s\\Packages\\Greenhouse.LethalCo_mgw46vk3ppz9w\\LocalState\\%s", lad, fname);
+        // Was hardcoded to Greenhouse.LethalCo_mgw46vk3ppz9w -- a leftover from the
+        // Lethal Company co-op work. Every OTHER path helper here already resolves
+        // GH_PKG_FAMILY (passed by each slot's iterate script), and the point of this
+        // one is "MY package's real LocalState", which is exactly the current family.
+        // In the launcher slot the hardcoded name pointed at a package that no longer
+        // exists after the storage resize, so the open failed and the caller retried:
+        // 1001 identical lines in one run.
+        snprintf(out, MAX_PATH, "%s\\Packages\\%s\\LocalState\\%s", lad, GH_PKG_FAMILY, fname);
     } else { strcpy_s(out, MAX_PATH, fname); }
 }
 static const char* gh_target_path() {
@@ -1252,7 +1263,12 @@ __declspec(dllexport) bool SteamAPI_InitAnonymousUser() { gh_engine_lazy_init();
 __declspec(dllexport) bool SteamAPI_IsSteamRunning() { return true; }
 __declspec(dllexport) bool SteamAPI_RestartApp() { return false; }
 
-__declspec(dllexport) void SteamAPI_Shutdown() {}
+__declspec(dllexport) void SteamAPI_Shutdown() {
+    // Invalidate every guest-side interface context: their cached counter no longer
+    // matches, so the next accessor call re-runs its init thunk instead of handing
+    // back a pointer from the previous session.
+    ++g_gh_ctx_counter;
+}
 
 __declspec(dllexport) bool SteamAPI_RestartAppIfNecessary(AppId_t /*unOwnAppID*/) {
     return false; // stay in-process, do not relaunch through Steam
@@ -1510,11 +1526,189 @@ __declspec(dllexport) HSteamUser SteamGameServer_GetHSteamUser() { return (HStea
 __declspec(dllexport) void SteamGameServer_RunCallbacks() {}
 __declspec(dllexport) void SteamGameServer_ReleaseCurrentThreadMemory() {}
 
+// ---- Native C++ Steamworks: real interfaces, not sentinels ------------------
+// The flat C API (SteamAPI_ISteamApps_*) hands the interface pointer back as an
+// opaque first argument that our wrappers ignore, so a one-byte sentinel is all
+// it ever needed. A native C++ consumer does the opposite: it dereferences the
+// pointer as a vtable and calls through it. Spider-Man Remastered is one (ten
+// Steamworks imports, no flat wrappers anywhere), and so is every other Nixxes /
+// id / Bethesda PC port -- for them a sentinel reads a vtable out of whatever
+// static happens to follow it in .bss.
+//
+// So hand those callers Valve's OWN object out of the engine we are already
+// running. That gets the method order right by construction -- no version-by-
+// version vtable transcription to get one slot wrong in -- and puts real data
+// behind it. The flat exports are untouched and keep returning sentinels.
+
+// Bring-up runs on a background thread (SteamAPI_Init returns fast because Unity
+// blocks its main thread on it). A native C++ game asks for its interfaces in the
+// very next breath, so give the engine a bounded moment to finish rather than
+// racing it. Under the launcher the session is already live and this returns
+// immediately.
+static bool gh_engine_wait_ready(DWORD ms) {
+    if (g_gh_engine_state == 2) return true;
+    DWORD t0 = GetTickCount();
+    while (g_gh_engine_state == 1 && (GetTickCount() - t0) < ms) Sleep(10);
+    return g_gh_engine_state == 2;
+}
+
+// Which ISteamClient021 accessor serves a given version string, and what this
+// shim's legacy sentinel for that family is. Matched by PREFIX: the numeric
+// suffix moves with whichever SDK the game was built against (SteamUser023 today,
+// SteamUser021 in a 2019 build) while the accessor slot does not. Order matters --
+// longer prefixes first, since "SteamUser" also prefixes "SteamUserStats".
+// Anything without a dedicated slot goes through GetISteamGenericInterface, which
+// is what the real steam_api does with it too.
+struct GhIfaceRoute { const char* prefix; int slot; bool useUser; void* sentinel; };
+static const GhIfaceRoute kGhIfaceRoutes[] = {
+    { "SteamUserStats",                       GH_SC_GetISteamGenericInterface, true,  &g_iface_stats },
+    { "STEAMUSERSTATS_INTERFACE_VERSION",     GH_SC_GetISteamGenericInterface, true,  &g_iface_stats },
+    { "SteamUser",                            GH_SC_GetISteamUser,             true,  &g_iface_user },
+    { "SteamFriends",                         GH_SC_GetISteamFriends,          true,  &g_iface_friends },
+    { "SteamUtils",                           GH_SC_GetISteamUtils,            false, &g_iface_utils },
+    { "SteamMatchMakingServers",              GH_SC_GetISteamGenericInterface, true,  &g_iface_mmservers },
+    { "SteamMatchMaking",                     GH_SC_GetISteamMatchmaking,      true,  &g_iface_matchmaking },
+    { "STEAMAPPS_INTERFACE_VERSION",          GH_SC_GetISteamApps,             true,  &g_iface_apps },
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION", GH_SC_GetISteamGenericInterface, true,  &g_iface_remotestorage },
+    { "STEAMSCREENSHOTS_INTERFACE_VERSION",   GH_SC_GetISteamGenericInterface, true,  &g_iface_screenshots },
+    { "SteamInput",                           GH_SC_GetISteamGenericInterface, true,  &g_iface_input },
+    { "SteamController",                      GH_SC_GetISteamGenericInterface, true,  &g_iface_input },
+    { "STEAMINVENTORY_INTERFACE_V",           GH_SC_GetISteamGenericInterface, true,  &g_iface_inventory },
+    { "STEAMUGC_INTERFACE_VERSION",           GH_SC_GetISteamGenericInterface, true,  &g_iface_ugc },
+    { "STEAMHTTP_INTERFACE_VERSION",          GH_SC_GetISteamGenericInterface, true,  &g_iface_http },
+    { "STEAMMUSIC_INTERFACE_VERSION",         GH_SC_GetISteamGenericInterface, true,  &g_iface_music },
+    { "STEAMVIDEO_INTERFACE_V",               GH_SC_GetISteamGenericInterface, true,  &g_iface_video },
+    { "STEAMPARENTALSETTINGS_INTERFACE_VERSION", GH_SC_GetISteamGenericInterface, true, &g_iface_parental },
+    { "SteamNetworkingSockets",               GH_SC_GetISteamGenericInterface, true,  &g_iface_netsockets },
+    { "SteamNetworkingUtils",                 GH_SC_GetISteamGenericInterface, true,  &g_iface_netutils },
+    { "SteamNetworkingMessages",              GH_SC_GetISteamGenericInterface, true,  &g_iface_netmessages },
+    { "SteamNetworking",                      GH_SC_GetISteamGenericInterface, true,  &g_iface_networking },
+    { "SteamParties",                         GH_SC_GetISteamGenericInterface, true,  &g_iface_parties },
+    { "SteamRemotePlay",                      GH_SC_GetISteamGenericInterface, true,  &g_iface_remoteplay },
+    { "SteamGameSearch",                      GH_SC_GetISteamGenericInterface, true,  &g_iface_gamesearch },
+    { "STEAMAPPLIST_INTERFACE_VERSION",       GH_SC_GetISteamGenericInterface, true,  &g_iface_applist },
+    { "STEAMHTMLSURFACE_INTERFACE_VERSION",   GH_SC_GetISteamGenericInterface, true,  &g_iface_html },
+    { "STEAMTIMELINE_INTERFACE_V",            GH_SC_GetISteamGenericInterface, true,  &g_iface_timeline },
+};
+
+// Resolved interfaces are cached by version string: the engine hands back the
+// same object for the same (user, pipe, version), and a native consumer calls the
+// accessor on every single Steamworks use.
+struct GhIfaceCache { const char* ver; void* iface; };
+static GhIfaceCache g_gh_iface_cache[48];
+static int          g_gh_iface_cache_n = 0;
+static CRITICAL_SECTION g_gh_iface_cs;
+static LONG             g_gh_iface_cs_init = 0;
+static void gh_iface_cs_ensure() {
+    if (InterlockedCompareExchange(&g_gh_iface_cs_init, 1, 0) == 0) {
+        InitializeCriticalSection(&g_gh_iface_cs);
+        InterlockedExchange(&g_gh_iface_cs_init, 2);
+    }
+    while (InterlockedCompareExchange(&g_gh_iface_cs_init, 2, 2) != 2) Sleep(0);
+}
+
+// The one place that turns a version string into something callable.
+// Returns the real engine interface when we can get one; otherwise the legacy
+// sentinel, so every flat-C consumer (LethalCo, REPO, Cheese) behaves exactly as
+// it did before this existed.
+static void* gh_iface_for_version(const char* ver) {
+    if (!ver || !*ver) return &g_iface_client;
+
+    gh_iface_cs_ensure();
+    EnterCriticalSection(&g_gh_iface_cs);
+    for (int i = 0; i < g_gh_iface_cache_n; ++i) {
+        if (strcmp(g_gh_iface_cache[i].ver, ver) == 0) {
+            void* hit = g_gh_iface_cache[i].iface;
+            LeaveCriticalSection(&g_gh_iface_cs);
+            return hit;
+        }
+    }
+    LeaveCriticalSection(&g_gh_iface_cs);
+
+    const GhIfaceRoute* route = nullptr;
+    for (size_t i = 0; i < sizeof(kGhIfaceRoutes)/sizeof(kGhIfaceRoutes[0]); ++i) {
+        size_t n = strlen(kGhIfaceRoutes[i].prefix);
+        if (strncmp(ver, kGhIfaceRoutes[i].prefix, n) == 0) { route = &kGhIfaceRoutes[i]; break; }
+    }
+
+    void* real = nullptr;
+    if (route) {
+        // Matchmaking has its own acquisition path (app context has to be bound
+        // first or RequestLobbyList comes back empty); keep using it.
+        if (route->slot == GH_SC_GetISteamMatchmaking && g_gh_engine_state == 2 &&
+            !g_gh_matchmaking && g_gh_real_steamid)
+            gh_try_acquire_matchmaking();
+        if (gh_engine_wait_ready(15000) && g_gh_isteamclient)
+            real = gh_sc_get_iface(route->slot, ver, route->useUser);
+    }
+
+    void* out = real ? real : (route ? route->sentinel : (void*)&g_iface_client);
+    gh_logf("[gh-shim] iface \"%s\" -> %s %p (slot=%d state=%d)", ver,
+            real ? "ENGINE" : "sentinel", out, route ? route->slot : -1, g_gh_engine_state);
+
+    // Only cache a real interface. A sentinel handed out while the engine was
+    // still coming up must not become the permanent answer for that version.
+    if (real) {
+        gh_iface_cs_ensure();
+        EnterCriticalSection(&g_gh_iface_cs);
+        if (g_gh_iface_cache_n < (int)(sizeof(g_gh_iface_cache)/sizeof(g_gh_iface_cache[0]))) {
+            size_t n = strlen(ver);
+            char* dup = (char*)malloc(n + 1);
+            if (dup) {
+                memcpy(dup, ver, n + 1);
+                g_gh_iface_cache[g_gh_iface_cache_n].ver   = dup;
+                g_gh_iface_cache[g_gh_iface_cache_n].iface = real;
+                ++g_gh_iface_cache_n;
+            }
+        }
+        LeaveCriticalSection(&g_gh_iface_cs);
+    }
+    return out;
+}
+
 // SteamInternal
 __declspec(dllexport) HSteamUser SteamAPI_GetHSteamUser_Version() { return (HSteamUser)1; }
-__declspec(dllexport) void* SteamInternal_ContextInit(void*) { return &g_iface_client; }
-__declspec(dllexport) void* SteamInternal_CreateInterface(const char*) { return &g_iface_client; }
-__declspec(dllexport) void* SteamInternal_FindOrCreateUserInterface(HSteamUser, const char*) { return &g_iface_client; }
+
+// The accessor macro in steam_api_internal.h expands to
+//   static void* s_ctx[3] = { &SteamInternal_Init_SteamApps, 0, 0 };
+//   return *(ISteamApps**)SteamInternal_ContextInit( s_ctx );
+// i.e. { init fn, counter, context }, and the CALLER dereferences what we return.
+// Returning a sentinel made that read whatever byte followed it -- zero, which is
+// why Spider-Man reported "Failed to initialize Steam." instead of crashing.
+// Honour the contract: run the game's own init thunk against &a[2] once, then
+// return &a[2] so the deref yields the pointer that thunk stored there. The thunk
+// calls straight back into SteamInternal_FindOrCreateUserInterface below, which is
+// why these two had to land together -- fixing this one alone would have turned a
+// clean error message into a crash on the first virtual call.
+__declspec(dllexport) void* SteamInternal_ContextInit(void* p) {
+    if (!p) return &g_iface_client;
+    void** a = (void**)p;
+    __try {
+        if (a[1] != (void*)g_gh_ctx_counter) {
+            a[1] = (void*)g_gh_ctx_counter;
+            if (a[0]) ((void (*)(void*))a[0])(&a[2]);
+        }
+        return &a[2];
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        gh_logf("[gh-shim] SteamInternal_ContextInit FAULTED on ctx %p", p);
+        return &g_iface_client;
+    }
+}
+
+// Deliberately NOT routed to the engine's ISteamClient: a game holding the real
+// one would call CreateSteamPipe/CreateLocalUser on it, and a second local user
+// is exactly the wild write into Mono's heap that took months to pin down. Every
+// other name goes through the shared resolver.
+__declspec(dllexport) void* SteamInternal_CreateInterface(const char* ver) {
+    if (!ver || strncmp(ver, "SteamClient", 11) == 0) return &g_iface_client;
+    return gh_iface_for_version(ver);
+}
+
+__declspec(dllexport) void* SteamInternal_FindOrCreateUserInterface(HSteamUser, const char* ver) {
+    // The guest's HSteamUser is our own fake 1 (SteamAPI_GetHSteamUser); the
+    // engine's real user/pipe are the ones that can actually vend an interface.
+    return gh_iface_for_version(ver);
+}
 __declspec(dllexport) void* SteamInternal_FindOrCreateGameServerInterface(HSteamUser, const char*) { return &g_iface_gameserver; }
 __declspec(dllexport) SteamAPICall_t SteamAPI_ISteamClient_ConnectToGlobalUser(void*, HSteamPipe) { return 1; }
 __declspec(dllexport) HSteamPipe SteamAPI_ISteamClient_CreateSteamPipe(void*) { return (HSteamPipe)1; }

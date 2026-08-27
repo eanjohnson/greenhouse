@@ -45,8 +45,16 @@ clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \
   /link /libpath:"$SDK/crt/lib/x86_64" /libpath:"$SDK/sdk/lib/um/x86_64" /libpath:"$SDK/sdk/lib/ucrt/x86_64" \
         WindowsApp.lib $EXTRALIBS /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup /APPCONTAINER
 
-echo "== manifest $OLD -> $NEW =="
-sed -i "s/Version=\"$OLD\"/Version=\"$NEW\"/" "$GH/src/host/AppxManifest.launcher.xml"
+# Bump from what the manifest ACTUALLY says, not from $OLD. $OLD is the version
+# on the CONSOLE (used for the GH_CLEAN uninstall); the manifest can be on a
+# different version after any aborted run, and a non-matching sed is a SILENT
+# no-op that exits 0 -- which then packs under the stale version and makes every
+# version-keyed step afterwards operate on a package that was never built.
+MANL="$GH/src/host/AppxManifest.launcher.xml"
+MANOLD=$(grep -oP 'Version="\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$MANL" | head -1)
+echo "== manifest $MANOLD -> $NEW (console has $OLD) =="
+sed -i "s/Version=\"$MANOLD\"/Version=\"$NEW\"/" "$MANL"
+grep -q "Version=\"$NEW\"" "$MANL" || { echo "FATAL: manifest bump to $NEW did not take"; exit 1; }
 cp "$GH/src/host/AppxManifest.launcher.xml" "$STAGE/AppxManifest.xml"
 
 # Stage decompression tools the in-process downloader shells (zstd VSZa, 7za VZ),
@@ -116,11 +124,47 @@ if [ "${GH_CLEAN:-0}" = "1" ]; then
   sleep 2
 fi
 python3 "$TMP/wdp.py" install "$GH/artifacts/GreenhouseLauncher.signed.msix"
-sleep 8
 PFN="Greenhouse.Launcher_${NEW}_x64__mgw46vk3ppz9w"
+# INSTALL answers 202 "accepted and being processed", never "installed", and a
+# fixed sleep cannot tell a slow registration from a failed one. Poll for the new
+# PackageFullName and make a timeout FATAL: launching by FAMILY name starts
+# whatever version IS registered, so without this a failed update runs the OLD
+# loader and reports success.
+REGISTERED=""
+for i in $(seq 1 30); do
+  sleep 3
+  python3 - <<PYEOF && REGISTERED=1 && break
+import sys; sys.path.insert(0, "$TMP")
+import wdp
+st, d = wdp.req('GET', '/api/app/packagemanager/packages')
+names = [p.get('PackageFullName','') for p in (d or {}).get('InstalledPackages', [])]
+sys.exit(0 if "$PFN" in names else 1)
+PYEOF
+done
+[ -n "$REGISTERED" ] || { echo "FATAL: $PFN never registered after 90s"; exit 1; }
 CSRF=$(python3 "$TMP/wdp.py" csrf | awk '{print $2}')
 curl -sk -b "$TMP/wdp_cookies.txt" -H "X-CSRF-Token: $CSRF" -H "Content-Length: 0" -X POST \
   "https://${XBOX}/api/debug/dump/usermode/crashcontrol?packageFullName=$PFN" >/dev/null 2>&1 || true
+# LocalState PERSISTS across in-place updates and loader_diag.txt is APPEND-only,
+# so without this the log mixes runs and you cannot tell which VERSION wrote which
+# lines -- exactly how a "the fix did not take" conclusion gets drawn from the
+# previous build's output. Delete it so each run's log is unambiguous.
+python3 - <<PYEOF || true
+import sys, urllib.parse; sys.path.insert(0, "$TMP")
+import wdp
+st,_ = wdp.req('DELETE','/api/filesystem/apps/file?knownfolderid=LocalAppData&packagefullname='
+    + "$PFN" + '&path=' + urllib.parse.quote('\\LocalState') + '&filename=loader_diag.txt')
+print("  cleared loader_diag.txt ->", st)
+PYEOF
+
 echo "== launch =="
-python3 "$TMP/wdp.py" launch "${FAM}!App" "$FAM"
+# A launch immediately after registration can answer 400 even though the package
+# IS registered (seen: -2147024321 ERROR_PROC_NOT_FOUND). Retry rather than
+# reporting a launch that never happened.
+for i in 1 2 3 4 5; do
+  OUT=$(python3 "$TMP/wdp.py" launch "${FAM}!App" "$FAM" 2>&1 | tail -1)
+  echo "$OUT"
+  case "$OUT" in *"LAUNCH 200"*) break;; esac
+  sleep 5
+done
 echo "done: PFN=$PFN"

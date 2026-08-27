@@ -1192,7 +1192,12 @@ static void gh_diag_path(char* out) {
     char lad[MAX_PATH]; DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", lad, MAX_PATH);
     if (n > 0 && n < MAX_PATH) {
         char* p = strstr(lad, "\\Packages\\"); if (p) *p = 0;   // -> ...\AppData\Local
-        snprintf(out, MAX_PATH, "%s\\Packages\\Greenhouse.LethalCo_mgw46vk3ppz9w\\LocalState\\gh_ccm.txt", lad);
+        // Was hardcoded to the LethalCo family. This helper means "MY package's real
+        // LocalState", so it must follow GH_PKG_FAMILY like every other path helper --
+        // otherwise a non-LethalCo slot writes into a package that may not even be
+        // installed. After the storage resize it was not, so the open failed and the
+        // caller retried forever: 1001 identical lines in a single launcher run.
+        snprintf(out, MAX_PATH, "%s\\Packages\\%s\\LocalState\\gh_ccm.txt", lad, GH_PKG_FAMILY);
     } else { strcpy_s(out, MAX_PATH, "gh_ccm.txt"); }
 }
 static void gh_diag_reset() {   // truncate for a clean single-scan capture

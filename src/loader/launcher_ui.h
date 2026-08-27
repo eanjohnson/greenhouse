@@ -411,7 +411,12 @@ static bool LuiIsHelperExe(const std::wstring& name)
 {
     auto has = [&](const wchar_t* n){ return _wcsnicmp(name.c_str(), n, wcslen(n)) == 0; };
     return has(L"CrashSender") || has(L"UnityCrashHandler") || has(L"crashpad")
-        || has(L"vcredist") || has(L"unins");
+        || has(L"vcredist") || has(L"unins")
+        // Nixxes' crash/video helpers, shipped beside the game in their PC ports
+        // (Spider-Man, Miles Morales, Ratchet & Clank...). crs-handler.exe sorts
+        // before Spider-Man.exe, so the old first-alphabetical fallback launched
+        // the CRASH REPORTER and the game never started.
+        || has(L"crs-");
 }
 
 // Pick the game exe in a folder: prefer <folder>.exe, skip crash-reporter
@@ -419,7 +424,8 @@ static bool LuiIsHelperExe(const std::wstring& name)
 static std::wstring LuiPickExe(const std::wstring& dir, const std::wstring& folder)
 {
     std::wstring prefer = folder + L".exe";
-    std::wstring first, match;
+    std::wstring first, match, any;
+    DWORD bestSz = 0, anySz = 0;
     WIN32_FIND_DATAW ef{};
     HANDLE eh = FindFirstFileW((dir + L"*.exe").c_str(), &ef);
     if (eh == INVALID_HANDLE_VALUE) return L"";
@@ -432,13 +438,25 @@ static std::wstring LuiPickExe(const std::wstring& dir, const std::wstring& fold
         bool empty = (sz < 64);
         if (_wcsicmp(name.c_str(), prefer.c_str()) == 0) {
             if (!empty || match.empty()) match = name; // prefer real bytes, else keep the name
-        } else if (first.empty() && !LuiIsHelperExe(name) && !empty) first = name;
-        else if (first.empty() && !empty) first = name;
-        else if (first.empty() && empty && !LuiIsHelperExe(name)) first = name;
+        }
+        // Fall back to the BIGGEST candidate, not the first one the directory
+        // enumeration happens to return. `prefer` is <folder>.exe, and for a Steam
+        // install the folder is "app_<id>", so prefer NEVER matches and this
+        // fallback is what actually decides. Alphabetical order is meaningless
+        // here; size is not -- a game exe dwarfs the helpers shipped beside it
+        // (Spider-Man.exe 121MB vs crs-handler.exe 1.2MB). Helpers still win only
+        // if there is nothing else, so a genuinely tiny game is not broken by this.
+        if (!empty && !LuiIsHelperExe(name) && sz > bestSz){ first = name; bestSz = sz; }
+        else if (!empty && first.empty() && sz > anySz){ any = name; anySz = sz; }
     } while (FindNextFileW(eh, &ef));
     FindClose(eh);
     if (!match.empty()) return match;
-    if (!first.empty()) return first;
+    if (!first.empty()){
+        Diag("LAUNCHER exe picked '" + LuiNarrow(first) + "' (largest non-helper, " +
+             std::to_string(bestSz) + " bytes)");
+        return first;
+    }
+    if (!any.empty()) return any;                      // helpers only -- better than nothing
     return prefer;                                     // folder exists; use <folder>.exe even if missing
 }
 

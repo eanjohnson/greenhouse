@@ -41,10 +41,13 @@
 #endif
 #include <windows.h>
 #include <tlhelp32.h>
+#include <atomic>
 #include <winternl.h>
 #include <d3d11on12.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
+#include <delayimp.h>   // DelayLoadInfo, for decoding 0xC06D007E
+#include <setupapi.h>   // SP_DEVINFO_DATA / SPDRP_*, for the synthetic display adapter
 #include <intrin.h>
 #include <setjmp.h>
 #include <thread>
@@ -126,12 +129,28 @@ static void Diag(const std::string& s)
         g_diagRing.push_back(s);
         while (g_diagRing.size() > 80) g_diagRing.pop_front();
     }
+    // HARD CAP. A guest stuck in a retry loop logs one line per attempt: a
+    // steamclient CreateDirectory retry produced 944MB in about a minute and made
+    // the log unreadable over WDP (a whole-file GET simply hangs). The cap keeps
+    // the failure diagnosable and, more importantly, keeps a debug session from
+    // filling the console's storage. Counted, not stat()ed, so it costs nothing.
+    static std::atomic<uint64_t> written{0};
+    static std::atomic<bool>     capped{false};
+    const uint64_t kCap = 64ull * 1024 * 1024;
+    if (capped.load(std::memory_order_relaxed)){ SetLastError(savedErr); return; }
+    if (written.fetch_add(s.size() + 2, std::memory_order_relaxed) > kCap){
+        capped.store(true, std::memory_order_relaxed);
+        // fall through once to write the notice below
+    }
     static const std::wstring kPath = std::wstring(kLocalState) + L"loader_diag.txt";
     HANDLE h = CreateFileW(kPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h != INVALID_HANDLE_VALUE)
     {
-        std::string line = s + "\r\n";
+        std::string line = capped.load(std::memory_order_relaxed)
+            ? ("DIAG CAPPED at 64MB -- suppressing further output (guest is likely "
+               "in a retry loop; the lines above it repeat)\r\n")
+            : (s + "\r\n");
         SetFilePointer(h, 0, nullptr, FILE_END);
         DWORD w = 0; WriteFile(h, line.data(), (DWORD)line.size(), &w, nullptr);
         CloseHandle(h);
@@ -278,6 +297,9 @@ static int __cdecl Bed_fflush(FILE*){ return 0; }
 // Process exit -- never let the guest tear down the host; flush its CRT then
 // unwind back to us. Covers exit/_exit/_cexit/abort and TerminateProcess.
 static void FinishGuestSession();          // defined with RunGuest, below
+static void DiagGuestBacktrace(const char* who);   // defined with the module ranges, below
+static std::string NameForCodeAddr(uintptr_t a);
+static bool HandleGuestTracepoint(EXCEPTION_POINTERS* ep);   // defined with them too
 extern volatile bool g_guestDone;
 
 // A guest's exit() terminates the guest WORKER THREAD rather than longjmp-ing
@@ -299,6 +321,14 @@ extern volatile bool g_guestDone;
     g_guestExitCode = code; g_guestExited = true;
     FlushGuestCrt();
     Diag("STAGE=guest_exit code=" + std::to_string(code));
+    // A nonzero exit is a DECISION the guest made, and the decision site is the
+    // only datum that matters. Take the backtrace before FinishGuestSession --
+    // that tears the image down, and an unwind through freed pages reports
+    // nothing.
+    // Code 0 gets one too. For a game that should be running, a CLEAN exit is just
+    // as much a decision as a failing one, and the decision site is the only datum
+    // that matters either way.
+    DiagGuestBacktrace("exit");
     FinishGuestSession();
     g_guestDone = true;             // set last: the host may exit once it sees this
     ExitThread((DWORD)code);
@@ -416,8 +446,27 @@ static bool IsRelativeGuestPath(const std::wstring& p)
     return true;
 }
 
+// The package install root, computed on demand. It USED to be set only as a side
+// effect of GuestPath(), so whether the read-only-package overlay below was armed
+// depended on whether some unrelated function had happened to run first. With a
+// guest outside the package (launcher slot: a game on D:\) nothing called it, so
+// g_installDir stayed empty, the overlay branch was skipped, and steamclient's
+// writes into its own staged directory hit the read-only WindowsApps path. It
+// retried forever -- one Diag line per attempt, 944MB of log in ~a minute.
+static void EnsureInstallDir()
+{
+    if (!g_installDir.empty()) return;
+    wchar_t buf[MAX_PATH]; DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (!n) return;
+    std::wstring p(buf, n);
+    size_t slash = p.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) p.resize(slash + 1);
+    g_installDir = p;
+}
+
 static std::wstring MapToReal(const wchar_t* guestPath)
 {
+    EnsureInstallDir();
     // Pass through paths already rooted in a real container location.
     if (guestPath){
         std::wstring p(guestPath);
@@ -959,17 +1008,40 @@ static HRESULT WINAPI Bed_SHGetKnownFolderPath(const GUID& rfid, DWORD flags, HA
     // in this app container (ntdll patching is blocked), so we fix it at the source:
     // point the profile at a WRITABLE LocalState folder so persistentDataPath resolves
     // under LocalState and every managed save just works.
-    if (out && rfid.Data1 == 0x5E6C858F){          // FOLDERID_Profile
-        std::wstring home = std::wstring(kLocalState) + L"ghhome";
-        EnsureRealDir(home);
-        size_t bytes = (home.size() + 1) * sizeof(wchar_t);
+    //
+    // FOLDERID_ProgramData: the real C:\ProgramData is outside the container and
+    // shell32 answers E_ACCESSDENIED, handing the guest an EMPTY path. Games treat
+    // that as "machine-wide data dir" and build crash-dump / config / telemetry
+    // paths from it; an empty root is how an early clean exit(1) happens, the same
+    // shape as the FOLDERID_Profile bug above.
+    //
+    // FOLDERID_Documents and FOLDERID_SavedGames fail the same way and matter for the
+    // same reason: they are where a PC game puts its SAVES. Spider-Man Remastered asks
+    // for Documents, gets E_ACCESSDENIED and an empty string, and reports "Unable to
+    // create save directory, the game will not be saved" -- with an empty folder in the
+    // message, which is the tell.
+    //
+    // Each redirect gets its OWN LocalState folder rather than sharing one, because on a
+    // real machine these are distinct directories and a guest that keys off two of them
+    // must not find them aliased.
+    static const struct { DWORD d1; const wchar_t* sub; const char* name; } kRedirects[] = {
+        { 0x5E6C858F, L"ghhome",        "FOLDERID_Profile"     },
+        { 0x62AB5D82, L"ghprogramdata", "FOLDERID_ProgramData" },
+        { 0xFDD39AD0, L"ghdocuments",   "FOLDERID_Documents"   },
+        { 0x4C5C32FF, L"ghsavedgames",  "FOLDERID_SavedGames"  },
+    };
+    for (const auto& r : kRedirects){
+        if (!out || rfid.Data1 != r.d1) continue;
+        std::wstring dir = std::wstring(kLocalState) + r.sub;
+        EnsureRealDir(dir);
+        size_t bytes = (dir.size() + 1) * sizeof(wchar_t);
         PWSTR buf = (PWSTR)CoTaskMemAlloc(bytes);
-        if (buf){
-            std::memcpy(buf, home.c_str(), bytes);
-            *out = buf;
-            Diag("SHGetKnownFolderPath FOLDERID_Profile -> " + std::string(home.begin(), home.end()));
-            return S_OK;
-        }
+        if (!buf) break;                      // fall through to the real API
+        std::memcpy(buf, dir.c_str(), bytes);
+        *out = buf;
+        Diag(std::string("SHGetKnownFolderPath ") + r.name + " -> " +
+             std::string(dir.begin(), dir.end()));
+        return S_OK;
     }
     using Fn = HRESULT(WINAPI*)(const GUID&, DWORD, HANDLE, PWSTR*);
     static Fn real = nullptr;
@@ -981,6 +1053,55 @@ static HRESULT WINAPI Bed_SHGetKnownFolderPath(const GUID& rfid, DWORD flags, HA
     std::string p;
     if (SUCCEEDED(hr) && out && *out){ std::wstring w(*out); p.assign(w.begin(), w.end()); }
     Diag("SHGetKnownFolderPath fid.d1=" + Hex(rfid.Data1) + " hr=" + Hex((uint32_t)hr) + " -> " + p);
+    return hr;
+}
+
+// Recursive directory creation, as shell32 spells it. Spider-Man makes its save
+// directory this way, and in the container the real one fails without ever reaching
+// CreateDirectoryW -- so nothing in the log named the path, and the guest's own
+// message showed it garbled. EnsureRealDir already walks and creates the chain, so
+// do that and say what happened.
+static int WINAPI Bed_SHCreateDirectoryExW(HWND, LPCWSTR path, const SECURITY_ATTRIBUTES*)
+{
+    if (!path || !*path) return ERROR_BAD_PATHNAME;
+    std::wstring w(path);
+    EnsureRealDir(w);
+    DWORD attr = GetFileAttributesW(w.c_str());
+    bool ok = (attr != INVALID_FILE_ATTRIBUTES) && (attr & FILE_ATTRIBUTE_DIRECTORY);
+    Diag("BED SHCreateDirectoryExW [" + std::string(w.begin(), w.end()) + "] -> " +
+         (ok ? "ok" : "FAILED err=" + std::to_string(GetLastError())));
+    return ok ? ERROR_SUCCESS : ERROR_ACCESS_DENIED;
+}
+
+// The older CSIDL form of the same question, which plenty of shipping games still
+// use as a fallback when SHGetKnownFolderPath fails. Redirect the same folders to
+// the same places, or the two APIs would disagree about where saves live.
+static HRESULT WINAPI Bed_SHGetFolderPathW(HWND hwnd, int csidl, HANDLE token, DWORD flags, LPWSTR out)
+{
+    // Strip SHGFP_TYPE / CSIDL_FLAG_CREATE and friends; only the folder id matters.
+    static const struct { int csidl; const wchar_t* sub; const char* name; } kCsidl[] = {
+        { 0x05, L"ghdocuments",   "CSIDL_PERSONAL"      },
+        { 0x28, L"ghhome",        "CSIDL_PROFILE"       },
+        { 0x23, L"ghprogramdata", "CSIDL_COMMON_APPDATA"},
+    };
+    int id = csidl & 0xFF;
+    for (const auto& c : kCsidl){
+        if (id != c.csidl || !out) continue;
+        std::wstring dir = std::wstring(kLocalState) + c.sub;
+        EnsureRealDir(dir);
+        if (dir.size() >= MAX_PATH) break;    // caller's buffer is MAX_PATH by contract
+        std::memcpy(out, dir.c_str(), (dir.size() + 1) * sizeof(wchar_t));
+        Diag(std::string("SHGetFolderPathW ") + c.name + " -> " + std::string(dir.begin(), dir.end()));
+        return S_OK;
+    }
+    using Fn = HRESULT(WINAPI*)(HWND, int, HANDLE, DWORD, LPWSTR);
+    static Fn real = nullptr;
+    if (!real){
+        if (HMODULE h = GetModuleHandleA("shell32.dll")) real = (Fn)GetProcAddress(h, "SHGetFolderPathW");
+        if (!real){ if (HMODULE h = LoadLibraryA("shell32.dll")) real = (Fn)GetProcAddress(h, "SHGetFolderPathW"); }
+    }
+    HRESULT hr = real ? real(hwnd, csidl, token, flags, out) : E_NOTIMPL;
+    Diag("SHGetFolderPathW csidl=" + Hex((uint32_t)csidl) + " hr=" + Hex((uint32_t)hr));
     return hr;
 }
 // ===========================================================================
@@ -1143,6 +1264,7 @@ static BOOL WINAPI Bed_SetFileSecurityW(LPCWSTR, SECURITY_INFORMATION, PSECURITY
 // ---------------------------------------------------------------------------
 static const std::unordered_map<std::string, void*>& ShimTable();   // fwd
 static HMODULE LoadGuestDll(const char* dll);                       // fwd
+static void    RepublishGuestTls(const char* why);                  // fwd (see TLS section)
 
 // Runtime library loads get the same guest-directory fallback as the IAT ones.
 // DIAG (2026-08-03): trace steam* loads — hunting who resolves "steam_api64" for Mono.
@@ -1158,6 +1280,20 @@ static HMODULE WINAPI Bed_LoadLibraryW(LPCWSTR n)
     if (!WideCharToMultiByte(CP_ACP, 0, n, -1, a, MAX_PATH, nullptr, nullptr)) return LoadLibraryW(n);
     if (strstr(a, "steam")) Diag(std::string("BED LoadLibraryW(") + a + ")");
     return LoadGuestDll(a);
+}
+// MSVC's delay-load helper (__delayLoadHelper2, linked into every module built
+// with /DELAYLOAD) resolves the DLL with LoadLibraryExA -- the ONE variant that
+// was not bedded. Spider-Man delay-loads amd_fidelityfx_dx12.dll: our loader had
+// already mapped it (GUESTDLL loaded, IAT patched), but the helper's unbedded
+// LoadLibraryExA went to the real OS loader, which has never heard of a module we
+// mapped ourselves and returned ERROR_MOD_NOT_FOUND. The helper then raised
+// 0xC06D007E, which took the guest down. Same body as Bed_LoadLibraryA: the flags
+// the helper passes are 0, and LoadGuestDll already dedups against both the guest
+// module table and the real loader.
+static HMODULE WINAPI Bed_LoadLibraryExA(LPCSTR n, HANDLE, DWORD){
+    if (!n) return nullptr;
+    if (strstr(n, "steam")) Diag(std::string("BED LoadLibraryExA(") + n + ")");
+    return LoadGuestDll(n);
 }
 static bool IsGuestOwnedModule(LPCWSTR path);                       // fwd
 static int  PatchModuleForGuest(HMODULE h, const char* tag);        // fwd
@@ -1190,6 +1326,7 @@ static HMODULE WINAPI Bed_LoadLibraryExW(LPCWSTR n, HANDLE f, DWORD flags)
                      " err=" + Hex(GetLastError()));
                 if (m0){
                     if (IsGuestOwnedModule(n)) PatchModuleForGuest(m0, "pyd/ext");
+                    RepublishGuestTls("LoadLibraryExW(steam)");
                     return m0;
                 }
                 return Bed_LoadLibraryW(n);
@@ -1199,6 +1336,7 @@ static HMODULE WINAPI Bed_LoadLibraryExW(LPCWSTR n, HANDLE f, DWORD flags)
     if (HMODULE m = LoadLibraryExW(n, f, flags)){
         // Python loads its .pyd extension modules this way, by full path.
         if (IsGuestOwnedModule(n)) PatchModuleForGuest(m, "pyd/ext");
+        RepublishGuestTls("LoadLibraryExW");
         return m;
     }
     return Bed_LoadLibraryW(n);          // bare name -> try the guest directory
@@ -1325,6 +1463,36 @@ static size_t   g_tlsTotalSize = 0;          // raw + SizeOfZeroFill
 static uint64_t g_tlsCallbacks = 0;          // VA of the callback array (or 0)
 static void**   g_tlsMainThreadSaved = nullptr;   // guest worker's original array
 
+// The guest TLS block published for the CALLING thread. Kept per-thread so the
+// array can be re-published without reallocating the block -- the guest has
+// already written thread-locals into it, and handing it a fresh zeroed block
+// would silently lose them.
+static thread_local uint8_t* t_guestTlsBlock = nullptr;
+
+// [DIAG] Every TLS array/block we hand ntdll, recorded so a fault can be
+// ATTRIBUTED rather than guessed at. RepublishGuestTls substitutes our own array
+// for ntdll's, and its documented limit is that ntdll fixes up TLS for EVERY
+// existing thread while we repair only the caller -- so "did this AV land inside
+// something we published?" is the question that decides whether that limit is
+// theoretical or is actively breaking this guest. Correlating a fault with a
+// code change cannot answer it; an address range can.
+struct TlsSpan { uintptr_t lo, hi; const char* what; };
+static std::mutex              g_tlsSpanMu;
+static std::vector<TlsSpan>    g_tlsSpans;
+static void NoteTlsSpan(const void* p, size_t bytes, const char* what)
+{
+    if (!p) return;
+    std::lock_guard<std::mutex> lk(g_tlsSpanMu);
+    g_tlsSpans.push_back({ (uintptr_t)p, (uintptr_t)p + bytes, what });
+}
+static const char* TlsSpanFor(uintptr_t a, uintptr_t* off)
+{
+    std::lock_guard<std::mutex> lk(g_tlsSpanMu);
+    for (auto& s : g_tlsSpans)
+        if (a >= s.lo && a < s.hi){ if (off) *off = a - s.lo; return s.what; }
+    return nullptr;
+}
+
 // How many pointer-sized entries starting at `p` are safe to read.
 static size_t ReadableEntries(void* p, size_t want)
 {
@@ -1365,6 +1533,9 @@ static bool InstallGuestTlsForThread(void*** savedOld = nullptr)
 
     arr[kGuestTlsIndex] = blk;
     teb[0x58 / sizeof(void*)] = arr;
+    t_guestTlsBlock = blk;
+    NoteTlsSpan(arr, kTlsSlots * sizeof(void*), "our TLS array (install)");
+    NoteTlsSpan(blk, g_tlsTotalSize ? g_tlsTotalSize : 1, "our TLS block");
     if (savedOld) *savedOld = old;
 
     Diag("STAGE=tls_installed tid=" + std::to_string(GetCurrentThreadId()) +
@@ -1380,6 +1551,51 @@ static void RestoreThreadTls(void** old)
 {
     if (!g_tlsActive || !old) return;
     ((void**)NtCurrentTeb())[0x58 / sizeof(void*)] = old;
+}
+
+// ntdll owns ThreadLocalStoragePointer and reallocates it whenever a module with
+// its own IMAGE_TLS_DIRECTORY is loaded. The replacement array carries only the
+// slots the real loader knows about -- kGuestTlsIndex is not one of them -- so
+// the guest's `mov rcx,[rax+_tls_index*8]` starts returning NULL and the next
+// access faults on a small absolute address (the TLS offset itself).
+//
+// That is exactly how Spider-Man died: the exe has TLS, and so does gattaca.dll,
+// so the guest's slot vanished the moment the second one loaded and the game
+// read [0xA0A0] through a null base.
+//
+// Re-publish our slot over whatever the loader just swapped in, REUSING the same
+// block so nothing the guest already stored is lost. Cheap and idempotent: the
+// common case is one comparison.
+//
+// KNOWN LIMIT: ntdll allocates TLS for every EXISTING thread when a module with
+// TLS loads, but this only repairs the thread that called LoadLibrary. Other
+// guest threads stay broken until they next pass through here. The real fix is
+// per-module TLS indices instead of the single kGuestTlsIndex; this is the cheap
+// version, deliberately.
+static void RepublishGuestTls(const char* why)
+{
+    if (!g_tlsActive || !t_guestTlsBlock) return;
+    void** teb = (void**)NtCurrentTeb();
+    void** cur = (void**)teb[0x58 / sizeof(void*)];
+
+    // Still ours? Nothing to do. Note the bounds check: a shorter replacement
+    // array is the whole failure mode, so indexing it blind would fault here
+    // instead of in the guest.
+    if (cur && ReadableEntries(cur, kGuestTlsIndex + 1) > kGuestTlsIndex &&
+        cur[kGuestTlsIndex] == t_guestTlsBlock) return;
+
+    void** arr = (void**)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, kTlsSlots * sizeof(void*));
+    if (!arr){ Diag("TLS: republish array alloc failed"); return; }
+    size_t copied = ReadableEntries(cur, kTlsSlots);
+    if (copied) std::memcpy(arr, cur, copied * sizeof(void*));
+    arr[kGuestTlsIndex] = t_guestTlsBlock;
+    teb[0x58 / sizeof(void*)] = arr;
+    NoteTlsSpan(arr, kTlsSlots * sizeof(void*), "our TLS array (republish)");
+
+    Diag(std::string("STAGE=tls_republished after ") + why +
+         " tid=" + std::to_string(GetCurrentThreadId()) +
+         " block=" + Hex((uint64_t)t_guestTlsBlock) +
+         " inherited=" + std::to_string(copied));
 }
 
 // Guest-created threads need the same treatment before they touch guest code,
@@ -1491,6 +1707,29 @@ struct Gfx
     UINT                            cur = 0;      // currently-acquired buffer index
     bool                            ready = false;
     bool                            failed = false;
+    // --- native D3D12 guest ------------------------------------------------
+    // Spider-Man is the first guest that is D3D12 itself rather than D3D11: it
+    // calls D3D12CreateDevice, hands its command queue to CreateSwapChainForHwnd
+    // and then asks GetBuffer for an ID3D12Resource. The bridge answered that
+    // with guestRT (an ID3D11Texture2D) and E_NOINTERFACE came back, so the
+    // renderer never finished constructing.
+    //
+    // The fix keeps the proven shape and only changes what the stable buffer IS:
+    // the guest is handed OUR d12 device (so its resources and our swap-chain
+    // buffers share one device), renders into guestRT12, and Present blits that
+    // into the live back buffer. The blit goes through an 11on12 wrapper rather
+    // than a raw D3D12 copy so it stays inside the existing D3D11 present path --
+    // a second, separately state-tracked D3D12 route into the same back buffer
+    // would fight the acquire/release dance the overlay and cursor rely on.
+    com_ptr<ID3D12Resource>         guestRT12;
+    com_ptr<ID3D11Resource>         guestRT12Wrapped;
+    com_ptr<ID3D12CommandQueue>     guestQueue;   // guest's queue, from CreateSwapChainForHwnd
+    com_ptr<ID3D12Fence>            guestFence;   // guest's frame -> our copy
+    com_ptr<ID3D12Fence>            copyFence;    // our copy -> guest's next frame
+    uint64_t                        guestFenceV = 0;
+    uint64_t                        copyFenceV  = 0;
+    D3D_FEATURE_LEVEL               d12Level = (D3D_FEATURE_LEVEL)0;
+    bool                            guest12 = false;
     // Software mouse-cursor overlay: two tiny solid bars forming a "+", copied into
     // the live back buffer each Present at g_kmCurX/Y. There is no hardware cursor
     // in a sideloaded Xbox app, so a mouse-driven guest (e.g. a Unity menu) shows
@@ -1537,6 +1776,23 @@ static void BuildBridgeOnUi()
         }
     }
     if (!g_gfx.d12) return fail("no_d3d12_device", E_FAIL);
+
+    // The FL passed to D3D12CreateDevice is a MINIMUM, so the device we just made
+    // at 11_0 may well support more. A native D3D12 guest asks for its own minimum
+    // and we hand it this same device, so we need the real ceiling to answer that
+    // honestly rather than refusing a guest the hardware could actually serve.
+    {
+        D3D_FEATURE_LEVEL want[] = { D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0,
+                                     D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+        D3D12_FEATURE_DATA_FEATURE_LEVELS fld{};
+        fld.NumFeatureLevels = (UINT)(sizeof(want)/sizeof(want[0]));
+        fld.pFeatureLevelsRequested = want;
+        if (SUCCEEDED(g_gfx.d12->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &fld, sizeof(fld))))
+            g_gfx.d12Level = fld.MaxSupportedFeatureLevel;
+        else
+            g_gfx.d12Level = D3D_FEATURE_LEVEL_11_0;
+        Diag("GFX d12 max feature level=" + Hex((uint32_t)g_gfx.d12Level));
+    }
 
     D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     hr = g_gfx.d12->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), g_gfx.queue.put_void());
@@ -1647,6 +1903,56 @@ static bool EnsureBridge()
     return g_gfx.ready;
 }
 
+// Bring up the stable D3D12 render target a native D3D12 guest treats as its back
+// buffer, plus the two fences that order the guest's frame against our copy.
+// Called from the guest thread the first time a D3D12 command queue turns up at
+// CreateSwapChainForHwnd, so a D3D11 guest never pays for any of it.
+static bool EnsureGuestRT12(UINT w, UINT h)
+{
+    std::lock_guard<std::mutex> lk(g_d11Mutex);
+    if (g_gfx.guestRT12) return true;
+    if (!g_gfx.d12 || !g_gfx.on12){ Diag("GFX12 no bridge device"); return false; }
+
+    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width            = w;
+    rd.Height           = h;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels        = 1;
+    // Typed UNORM, not TYPELESS. TYPELESS is the PC flip-model trick that lets a
+    // guest build either an _UNORM or an _UNORM_SRGB RTV over the same resource.
+    // On this console wrapping a TYPELESS D3D12 texture with 11on12 and then
+    // letting the guest compile PSOs against it took SC_DLL.dll (the UMD shader
+    // compiler) into a NULL vtable -- VEH exec 0x0, stack in SC_DLL + umd12ddi,
+    // immediately after the first GetBuffer. The swapchain the guest asked for
+    // is R8G8B8A8_UNORM (fmt=28); match that.
+    rd.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rd.SampleDesc.Count = 1;
+    rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    HRESULT hr = g_gfx.d12->CreateCommittedResource(
+        &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON,
+        nullptr, __uuidof(ID3D12Resource), g_gfx.guestRT12.put_void());
+    if (FAILED(hr)){ Diag("GFX12 CreateCommittedResource hr=" + Hex((uint32_t)hr)); return false; }
+
+    // Do NOT CreateWrappedResource here. 11on12 associating this resource with the
+    // D3D11 device at GetBuffer time is the other half of the SC_DLL crash: the
+    // guest still owns the ID3D12Resource and will create RTVs and PSOs on it
+    // before any Present. Wrap lazily in GfxPresent, which is the first moment
+    // we actually need a D3D11 view of it.
+
+    hr = g_gfx.d12->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                __uuidof(ID3D12Fence), g_gfx.guestFence.put_void());
+    if (SUCCEEDED(hr))
+        hr = g_gfx.d12->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                    __uuidof(ID3D12Fence), g_gfx.copyFence.put_void());
+    if (FAILED(hr)){ Diag("GFX12 CreateFence hr=" + Hex((uint32_t)hr)); return false; }
+
+    Diag("GFX12 guest RT " + std::to_string(w) + "x" + std::to_string(h) + " ready");
+    return true;
+}
+
 // Build a WxH RGBA8 buffer: 1-px black border, white interior, fully opaque. The
 // baked border keeps the crosshair visible on both dark and light UI.
 static std::vector<uint8_t> GhBarPixels(int w, int h)
@@ -1718,12 +2024,34 @@ static HRESULT GfxPresent(UINT sync)
         g_gfx.d11ctx->ClearRenderTargetView(g_gfx.guestRTV.get(), magenta);
     }
 #endif
+    // A D3D12 guest rendered on ITS OWN command queue. That queue and ours are on
+    // the same device, so ordering the two is an ordinary fence pair -- but it is
+    // not optional: without it the copy below races the frame it is copying.
+    if (g_gfx.guest12 && g_gfx.guestQueue && g_gfx.guestFence){
+        g_gfx.guestQueue->Signal(g_gfx.guestFence.get(), ++g_gfx.guestFenceV);
+        g_gfx.queue->Wait(g_gfx.guestFence.get(), g_gfx.guestFenceV);
+    }
+
     HRESULT hr;
     {
         std::lock_guard<std::mutex> lk(g_d11Mutex);
         ID3D11Resource* cur[] = { g_gfx.wrapped[g_gfx.cur].get() };
-        if (g_gfx.guestRT)
+        if (g_gfx.guest12 && g_gfx.guestRT12 && !g_gfx.guestRT12Wrapped){
+            D3D11_RESOURCE_FLAGS rf{};
+            rf.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            HRESULT wr = g_gfx.on12->CreateWrappedResource(g_gfx.guestRT12.get(), &rf,
+                     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON,
+                     __uuidof(ID3D11Resource), g_gfx.guestRT12Wrapped.put_void());
+            Diag(std::string("GFX12 wrap-for-present hr=") + Hex((uint32_t)wr));
+        }
+        if (g_gfx.guest12 && g_gfx.guestRT12Wrapped){
+            ID3D11Resource* src[] = { g_gfx.guestRT12Wrapped.get() };
+            g_gfx.on12->AcquireWrappedResources(src, 1);
+            g_gfx.d11ctx->CopyResource(cur[0], src[0]);
+            g_gfx.on12->ReleaseWrappedResources(src, 1);
+        } else if (g_gfx.guestRT){
             g_gfx.d11ctx->CopyResource(cur[0], g_gfx.guestRT.get());
+        }
 #ifdef GH_LAUNCHER
         // In-game overlay sits on the guest frame (not the D2D-only picker). Blit a
         // panel region; do not CopyResource the whole uiTex (that would wipe the game).
@@ -1747,6 +2075,13 @@ static HRESULT GfxPresent(UINT sync)
 #endif
 
     hr = g_gfx.swap->Present(sync, 0);
+
+    // The mirror of the wait above: the guest must not start drawing the next
+    // frame into guestRT12 until our queue has finished reading it.
+    if (g_gfx.guest12 && g_gfx.guestQueue && g_gfx.copyFence){
+        g_gfx.queue->Signal(g_gfx.copyFence.get(), ++g_gfx.copyFenceV);
+        g_gfx.guestQueue->Wait(g_gfx.copyFence.get(), g_gfx.copyFenceV);
+    }
 
     // Throttled diagnostic: confirm Unity is actually driving frames through our
     // proxy, and -- the part that decides whether a guest is playable at all --
@@ -1824,19 +2159,54 @@ struct SwapProxy : winrt::implements<SwapProxy,
     { return g_gfx.swap ? g_gfx.swap->GetParent(riid, out) : E_NOINTERFACE; }
     // IDXGIDeviceSubObject
     HRESULT __stdcall GetDevice(REFIID riid, void** out) noexcept override
-    { return g_gfx.d11 ? g_gfx.d11->QueryInterface(riid, out) : E_NOINTERFACE; }
+    {
+        // A D3D12 guest asks the swapchain for ID3D12Device. Handing it the
+        // D3D11-on-12 device made that QI fail, and the next virtual call was
+        // a candidate for the NULL RIP. Prefer the device the guest actually
+        // created resources on.
+        HRESULT hr = E_NOINTERFACE;
+        if (g_gfx.guest12 && g_gfx.d12)
+            hr = g_gfx.d12->QueryInterface(riid, out);
+        if (FAILED(hr) && g_gfx.d11)
+            hr = g_gfx.d11->QueryInterface(riid, out);
+        static LONG n = 0;
+        if (InterlockedIncrement(&n) <= 8)
+            Diag("SwapProxy::GetDevice iid=" + Hex(riid.Data1) + " hr=" + Hex((uint32_t)hr) +
+                 (g_gfx.guest12 ? " d12" : " d11"));
+        return hr;
+    }
     // IDXGISwapChain
     HRESULT __stdcall Present(UINT sync, UINT) noexcept override { return GfxPresent(sync); }
     HRESULT __stdcall GetBuffer(UINT idx, REFIID riid, void** out) noexcept override
     {
-        if (idx != 0 || !g_gfx.ready || !g_gfx.guestRT) return DXGI_ERROR_INVALID_CALL;
-        static uint64_t s_getbuf_n = 0;
-        if (s_getbuf_n == 0 || (s_getbuf_n % 300) == 0)
-            Diag("SwapProxy::GetBuffer n=" + std::to_string(s_getbuf_n));
-        ++s_getbuf_n;
+        if (!g_gfx.ready) return DXGI_ERROR_INVALID_CALL;
         // Always the stable off-screen RT, never a rotating physical buffer -- the
         // guest may cache this pointer/RTV across frames (Unity does).
-        return g_gfx.guestRT->QueryInterface(riid, out);
+        //
+        // A D3D12 guest builds one RTV per buffer during init, so refusing every
+        // idx != 0 fails its renderer outright. GetCurrentBackBufferIndex below
+        // always answers 0, so it only ever renders into -- and transitions -- the
+        // resource handed out here; giving every index the same stable RT is the
+        // same rule as the D3D11 path, not a second one.
+        IUnknown* src = nullptr;
+        if (g_gfx.guest12 && g_gfx.guestRT12){
+            if (desc1.BufferCount && idx >= desc1.BufferCount) return DXGI_ERROR_INVALID_CALL;
+            src = g_gfx.guestRT12.get();
+        } else {
+            if (idx != 0 || !g_gfx.guestRT) return DXGI_ERROR_INVALID_CALL;
+            src = g_gfx.guestRT.get();
+        }
+        HRESULT hr = src->QueryInterface(riid, out);
+        // The riid and the hr are the point of this line. A D3D12 guest asking a
+        // D3D11 texture for ID3D12Resource is exactly how this went wrong, and a
+        // bare "GetBuffer n=0" made the E_NOINTERFACE invisible.
+        static uint64_t s_getbuf_n = 0;
+        if (s_getbuf_n == 0 || FAILED(hr) || (s_getbuf_n % 300) == 0)
+            Diag("SwapProxy::GetBuffer n=" + std::to_string(s_getbuf_n) +
+                 " idx=" + std::to_string(idx) + " iid=" + Hex(riid.Data1) +
+                 " hr=" + Hex((uint32_t)hr));
+        ++s_getbuf_n;
+        return hr;
     }
     HRESULT __stdcall SetFullscreenState(BOOL, IDXGIOutput*) noexcept override { return S_OK; }
     HRESULT __stdcall GetFullscreenState(BOOL* fs, IDXGIOutput** o) noexcept override
@@ -1905,6 +2275,20 @@ static void FillSwapProxyDescs(SwapProxy* p, const DXGI_SWAP_CHAIN_DESC1* d1,
 {
     if (d1){
         p->desc1 = *d1;
+        // Spider-Man asks for 37x1. Where that comes from is still open (it is not
+        // from our beds -- the CoreWindow really is 1920x1080 and every size bed
+        // answers from g_winW/g_winH), but a back buffer that size makes every
+        // downstream viewport nonsense. Clamp, report the clamped size back through
+        // GetDesc/GetDesc1 so the guest's own viewport math agrees with the buffer
+        // it was given, and say so loudly in the log.
+        if (p->desc1.Width < 64 || p->desc1.Height < 64){
+            Diag("  SC size " + std::to_string(p->desc1.Width) + "x" +
+                 std::to_string(p->desc1.Height) + " implausible -> clamped to " +
+                 std::to_string(g_winW) + "x" + std::to_string(g_winH));
+            p->desc1.Width  = g_winW;
+            p->desc1.Height = g_winH;
+        }
+        d1 = &p->desc1;
         p->desc.BufferDesc.Width        = d1->Width;
         p->desc.BufferDesc.Height       = d1->Height;
         p->desc.BufferDesc.Format       = d1->Format;
@@ -1921,16 +2305,441 @@ static void FillSwapProxyDescs(SwapProxy* p, const DXGI_SWAP_CHAIN_DESC1* d1,
     else    p->fsDesc.Windowed = TRUE;
 }
 
+// The first argument of CreateSwapChainFor{Hwnd,CoreWindow} is the guest's device:
+// an ID3D11Device for a D3D11 guest, an ID3D12CommandQueue for a D3D12 one. Nothing
+// ever looked at it, which is why a native D3D12 title went unnoticed until its
+// GetBuffer(IID_ID3D12Resource) came back E_NOINTERFACE from a D3D11 texture. Latch
+// which world the guest lives in here, before any buffer is handed out.
+static void GfxNoteSwapChainDevice(IUnknown* dev, const DXGI_SWAP_CHAIN_DESC1* d)
+{
+    if (!dev){ Diag("  SC device=null"); return; }
+
+    com_ptr<ID3D12CommandQueue> q;
+    if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D12CommandQueue), q.put_void()))){
+        Diag("  SC device=ID3D12CommandQueue -> native D3D12 guest");
+        if (!EnsureBridge()){ Diag("  SC D3D12 guest but no bridge"); return; }
+        // Everything below assumes one device: the fence pair in GfxPresent and the
+        // 11on12 wrapper over guestRT12 are only valid if the guest's queue belongs
+        // to the device we handed it from Bed_D3D12CreateDevice.
+        com_ptr<ID3D12Device> qdev;
+        if (SUCCEEDED(q->GetDevice(__uuidof(ID3D12Device), qdev.put_void())) &&
+            qdev.get() != g_gfx.d12.get()){
+            Diag("  SC D3D12 queue is on a FOREIGN device -- refusing the D3D12 path");
+            return;
+        }
+        UINT w = (d && d->Width  >= 64) ? d->Width  : g_winW;
+        UINT h = (d && d->Height >= 64) ? d->Height : g_winH;
+        g_gfx.guestQueue = q;
+        if (EnsureGuestRT12(w, h)) g_gfx.guest12 = true;
+        else Diag("  SC D3D12 guest RT unavailable -- GetBuffer will still fail");
+        return;
+    }
+
+    com_ptr<ID3D11Device> d11;
+    if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D11Device), d11.put_void()))){
+        Diag(std::string("  SC device=ID3D11Device") +
+             (d11.get() == g_gfx.d11.get() ? " (ours)" : " (NOT ours)"));
+        return;
+    }
+    Diag("  SC device=unrecognised");
+}
+
 // ------------------------------------------------------------------
+// [DIAG] Adapter enumeration was a silent passthrough, which is why the log
+// simply ended after CreateDXGIFactory: everything the guest learned about the
+// GPU crossed this boundary unlogged. A title that rejects the adapter (or spins
+// looking for one it likes) is indistinguishable from a hang without this.
+static void DiagAdapter(const char* who, UINT i, HRESULT hr, IDXGIAdapter* a)
+{
+    std::string m = std::string("DXGI ") + who + " i=" + std::to_string(i) + " hr=" + Hex((uint32_t)hr);
+    if (SUCCEEDED(hr) && a){
+        DXGI_ADAPTER_DESC d{};
+        if (SUCCEEDED(a->GetDesc(&d))){
+            std::wstring w(d.Description);
+            m += " [" + std::string(w.begin(), w.end()) + "]"
+               + " vendor=" + Hex(d.VendorId) + " device=" + Hex(d.DeviceId)
+               + " vram=" + std::to_string((uint64_t)d.DedicatedVideoMemory >> 20) + "MB";
+        }
+    }
+    Diag(m);
+}
+
+// DXGI output/adapter wrappers. FactoryProxy used to hand the guest the REAL
+// IDXGIAdapter from EnumAdapters*, and those adapters' EnumOutputs returned
+// REAL IDXGIOutput objects. GetDesc on those is sane (the DXGI probe logs
+// `\\.\DISPLAY1 1920x1080 attached=1`), but GetDisplayModeList on this console
+// answers a single 0x0 @ 60 Hz mode. Spider-Man takes that as the monitor size
+// (`Fake monitor used (0x0)`, `Mode 0 : 0 x 0 @ 60 Hz`), derives a 37x1 window
+// from the NaN aspect ratio, and then fails swap-chain creation. Wrapping the
+// adapters we hand out is what lets us intercept EnumOutputs; wrapping the
+// outputs is what lets us replace that mode list.
+static bool GhModeDegenerate(UINT w, UINT h) { return w < 64 || h < 64; }
+
+static void GhFillModeDesc(DXGI_MODE_DESC* m, DXGI_FORMAT fmt)
+{
+    if (!m) return;
+    *m = {};
+    m->Width  = g_winW ? g_winW : 1920;
+    m->Height = g_winH ? g_winH : 1080;
+    m->RefreshRate = { 60, 1 };
+    m->Format = (fmt == DXGI_FORMAT_UNKNOWN) ? DXGI_FORMAT_R8G8B8A8_UNORM : fmt;
+    m->ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_PROGRESSIVE;
+    m->Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
+}
+
+static void GhFillModeDesc1(DXGI_MODE_DESC1* m, DXGI_FORMAT fmt)
+{
+    if (!m) return;
+    DXGI_MODE_DESC d{};
+    GhFillModeDesc(&d, fmt);
+    *m = {};
+    m->Width = d.Width; m->Height = d.Height;
+    m->RefreshRate = d.RefreshRate;
+    m->Format = d.Format;
+    m->ScanlineOrdering = d.ScanlineOrdering;
+    m->Scaling = d.Scaling;
+    m->Stereo = FALSE;
+}
+
+static void GhSanitizeOutputDesc(DXGI_OUTPUT_DESC* d)
+{
+    if (!d) return;
+    LONG w = d->DesktopCoordinates.right - d->DesktopCoordinates.left;
+    LONG h = d->DesktopCoordinates.bottom - d->DesktopCoordinates.top;
+    if (GhModeDegenerate((UINT)(w < 0 ? 0 : w), (UINT)(h < 0 ? 0 : h))) {
+        d->DesktopCoordinates = { 0, 0,
+            (LONG)(g_winW ? g_winW : 1920), (LONG)(g_winH ? g_winH : 1080) };
+        d->AttachedToDesktop = TRUE;
+        d->Rotation = DXGI_MODE_ROTATION_IDENTITY;
+        if (d->DeviceName[0] == 0)
+            wcscpy_s(d->DeviceName, L"\\\\.\\DISPLAY1");
+    }
+}
+
+struct OutputProxy : winrt::implements<OutputProxy,
+                                       IDXGIOutput6, IDXGIOutput5, IDXGIOutput4,
+                                       IDXGIOutput3, IDXGIOutput2, IDXGIOutput1,
+                                       IDXGIOutput, IDXGIObject>
+{
+    com_ptr<IDXGIOutput>  real;
+    com_ptr<IDXGIOutput1> real1;
+    com_ptr<IDXGIOutput2> real2;
+    com_ptr<IDXGIOutput3> real3;
+    com_ptr<IDXGIOutput4> real4;
+    com_ptr<IDXGIOutput5> real5;
+    com_ptr<IDXGIOutput6> real6;
+
+    HRESULT __stdcall SetPrivateData(REFGUID k, UINT s, const void* d) noexcept override
+    { return real->SetPrivateData(k, s, d); }
+    HRESULT __stdcall SetPrivateDataInterface(REFGUID k, const IUnknown* u) noexcept override
+    { return real->SetPrivateDataInterface(k, u); }
+    HRESULT __stdcall GetPrivateData(REFGUID k, UINT* s, void* d) noexcept override
+    { return real->GetPrivateData(k, s, d); }
+    HRESULT __stdcall GetParent(REFIID r, void** o) noexcept override
+    { return real->GetParent(r, o); }
+
+    HRESULT __stdcall GetDesc(DXGI_OUTPUT_DESC* d) noexcept override
+    {
+        if (!d) return DXGI_ERROR_INVALID_CALL;
+        HRESULT hr = real->GetDesc(d);
+        if (FAILED(hr)) return hr;
+        GhSanitizeOutputDesc(d);
+        return hr;
+    }
+    HRESULT __stdcall GetDisplayModeList(DXGI_FORMAT fmt, UINT flags, UINT* num,
+                                         DXGI_MODE_DESC* desc) noexcept override
+    {
+        if (!num) return DXGI_ERROR_INVALID_CALL;
+        UINT realN = 0;
+        DXGI_MODE_DESC real0{};
+        if (real) {
+            UINT n = 0;
+            HRESULT rhr = real->GetDisplayModeList(fmt, flags, &n, nullptr);
+            if (SUCCEEDED(rhr) || rhr == DXGI_ERROR_MORE_DATA) realN = n;
+            if (realN >= 1) {
+                n = 1;
+                if (SUCCEEDED(real->GetDisplayModeList(fmt, flags, &n, &real0)) && n >= 1)
+                    realN = n;
+            }
+        }
+        static LONG logged = 0;
+        if (InterlockedIncrement(&logged) <= 8)
+            Diag("OutputProxy GetDisplayModeList fmt=" + std::to_string((int)fmt) +
+                 " flags=" + Hex(flags) + " realN=" + std::to_string(realN) +
+                 (realN ? " real0=" + std::to_string(real0.Width) + "x" +
+                              std::to_string(real0.Height) + "@" +
+                              std::to_string(real0.RefreshRate.Numerator) + "/" +
+                              std::to_string(real0.RefreshRate.Denominator)
+                        : std::string()) +
+                 (desc ? " fill" : " count"));
+        if (!desc) { *num = 1; return S_OK; }
+        if (*num < 1) return DXGI_ERROR_MORE_DATA;
+        if (realN >= 1 && !GhModeDegenerate(real0.Width, real0.Height)) {
+            desc[0] = real0;
+            *num = 1;
+            return S_OK;
+        }
+        GhFillModeDesc(&desc[0], fmt);
+        *num = 1;
+        return S_OK;
+    }
+    HRESULT __stdcall FindClosestMatchingMode(const DXGI_MODE_DESC* in, DXGI_MODE_DESC* out,
+                                              IUnknown* dev) noexcept override
+    {
+        if (!out) return DXGI_ERROR_INVALID_CALL;
+        if (real) {
+            HRESULT hr = real->FindClosestMatchingMode(in, out, dev);
+            if (SUCCEEDED(hr) && !GhModeDegenerate(out->Width, out->Height)) return hr;
+        }
+        GhFillModeDesc(out, in ? in->Format : DXGI_FORMAT_UNKNOWN);
+        if (in && in->RefreshRate.Denominator) out->RefreshRate = in->RefreshRate;
+        return S_OK;
+    }
+    HRESULT __stdcall WaitForVBlank() noexcept override
+    { return real->WaitForVBlank(); }
+    HRESULT __stdcall TakeOwnership(IUnknown*, BOOL) noexcept override { return S_OK; }
+    void    __stdcall ReleaseOwnership() noexcept override {}
+    HRESULT __stdcall GetGammaControlCapabilities(DXGI_GAMMA_CONTROL_CAPABILITIES* c) noexcept override
+    { return real->GetGammaControlCapabilities(c); }
+    HRESULT __stdcall SetGammaControl(const DXGI_GAMMA_CONTROL* c) noexcept override
+    { return real->SetGammaControl(c); }
+    HRESULT __stdcall GetGammaControl(DXGI_GAMMA_CONTROL* c) noexcept override
+    { return real->GetGammaControl(c); }
+    HRESULT __stdcall SetDisplaySurface(IDXGISurface* s) noexcept override
+    { return real->SetDisplaySurface(s); }
+    HRESULT __stdcall GetDisplaySurfaceData(IDXGISurface* s) noexcept override
+    { return real->GetDisplaySurfaceData(s); }
+    HRESULT __stdcall GetFrameStatistics(DXGI_FRAME_STATISTICS* s) noexcept override
+    { return real->GetFrameStatistics(s); }
+
+    HRESULT __stdcall GetDisplayModeList1(DXGI_FORMAT fmt, UINT flags, UINT* num,
+                                          DXGI_MODE_DESC1* desc) noexcept override
+    {
+        if (!num) return DXGI_ERROR_INVALID_CALL;
+        DXGI_MODE_DESC1 real0{};
+        UINT realN = 0;
+        if (real1) {
+            UINT n = 0;
+            HRESULT rhr = real1->GetDisplayModeList1(fmt, flags, &n, nullptr);
+            if (SUCCEEDED(rhr) || rhr == DXGI_ERROR_MORE_DATA) realN = n;
+            if (realN >= 1) {
+                n = 1;
+                if (SUCCEEDED(real1->GetDisplayModeList1(fmt, flags, &n, &real0)) && n >= 1)
+                    realN = n;
+            }
+        }
+        static LONG logged = 0;
+        if (InterlockedIncrement(&logged) <= 8)
+            Diag("OutputProxy GetDisplayModeList1 fmt=" + std::to_string((int)fmt) +
+                 " realN=" + std::to_string(realN) +
+                 (realN ? " real0=" + std::to_string(real0.Width) + "x" +
+                              std::to_string(real0.Height)
+                        : std::string()) +
+                 (desc ? " fill" : " count"));
+        if (!desc) { *num = 1; return S_OK; }
+        if (*num < 1) return DXGI_ERROR_MORE_DATA;
+        if (realN >= 1 && !GhModeDegenerate(real0.Width, real0.Height)) {
+            desc[0] = real0;
+            *num = 1;
+            return S_OK;
+        }
+        GhFillModeDesc1(&desc[0], fmt);
+        *num = 1;
+        return S_OK;
+    }
+    HRESULT __stdcall FindClosestMatchingMode1(const DXGI_MODE_DESC1* in, DXGI_MODE_DESC1* out,
+                                               IUnknown* dev) noexcept override
+    {
+        if (!out) return DXGI_ERROR_INVALID_CALL;
+        if (real1) {
+            HRESULT hr = real1->FindClosestMatchingMode1(in, out, dev);
+            if (SUCCEEDED(hr) && !GhModeDegenerate(out->Width, out->Height)) return hr;
+        }
+        GhFillModeDesc1(out, in ? in->Format : DXGI_FORMAT_UNKNOWN);
+        if (in && in->RefreshRate.Denominator) out->RefreshRate = in->RefreshRate;
+        return S_OK;
+    }
+    HRESULT __stdcall GetDisplaySurfaceData1(IDXGIResource* r) noexcept override
+    { return real1 ? real1->GetDisplaySurfaceData1(r) : E_NOINTERFACE; }
+    HRESULT __stdcall DuplicateOutput(IUnknown*, IDXGIOutputDuplication** o) noexcept override
+    { if (o) *o = nullptr; return DXGI_ERROR_UNSUPPORTED; }
+
+    BOOL __stdcall SupportsOverlays() noexcept override
+    { return real2 ? real2->SupportsOverlays() : FALSE; }
+
+    HRESULT __stdcall CheckOverlaySupport(DXGI_FORMAT f, IUnknown* d, UINT* s) noexcept override
+    { return real3 ? real3->CheckOverlaySupport(f, d, s) : DXGI_ERROR_UNSUPPORTED; }
+
+    HRESULT __stdcall CheckOverlayColorSpaceSupport(DXGI_FORMAT f, DXGI_COLOR_SPACE_TYPE c,
+                                                    IUnknown* d, UINT* s) noexcept override
+    { return real4 ? real4->CheckOverlayColorSpaceSupport(f, c, d, s) : DXGI_ERROR_UNSUPPORTED; }
+
+    HRESULT __stdcall DuplicateOutput1(IUnknown*, UINT, UINT, const DXGI_FORMAT*,
+                                       IDXGIOutputDuplication** o) noexcept override
+    { if (o) *o = nullptr; return DXGI_ERROR_UNSUPPORTED; }
+
+    HRESULT __stdcall GetDesc1(DXGI_OUTPUT_DESC1* d) noexcept override
+    {
+        if (!d) return DXGI_ERROR_INVALID_CALL;
+        HRESULT hr = real6 ? real6->GetDesc1(d) : E_NOINTERFACE;
+        if (FAILED(hr) && !real6) {
+            DXGI_OUTPUT_DESC d0{};
+            hr = GetDesc(&d0);
+            if (FAILED(hr)) return hr;
+            *d = {};
+            wcscpy_s(d->DeviceName, d0.DeviceName);
+            d->DesktopCoordinates = d0.DesktopCoordinates;
+            d->AttachedToDesktop = d0.AttachedToDesktop;
+            d->Rotation = d0.Rotation;
+            d->Monitor = d0.Monitor;
+            d->BitsPerColor = 8;
+            d->ColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+            return S_OK;
+        }
+        if (FAILED(hr)) return hr;
+        DXGI_OUTPUT_DESC tmp{};
+        wcscpy_s(tmp.DeviceName, d->DeviceName);
+        tmp.DesktopCoordinates = d->DesktopCoordinates;
+        tmp.AttachedToDesktop = d->AttachedToDesktop;
+        tmp.Rotation = d->Rotation;
+        tmp.Monitor = d->Monitor;
+        GhSanitizeOutputDesc(&tmp);
+        wcscpy_s(d->DeviceName, tmp.DeviceName);
+        d->DesktopCoordinates = tmp.DesktopCoordinates;
+        d->AttachedToDesktop = tmp.AttachedToDesktop;
+        d->Rotation = tmp.Rotation;
+        d->Monitor = tmp.Monitor;
+        return S_OK;
+    }
+    HRESULT __stdcall CheckHardwareCompositionSupport(UINT* s) noexcept override
+    { return real6 ? real6->CheckHardwareCompositionSupport(s) : DXGI_ERROR_UNSUPPORTED; }
+};
+
+static HRESULT WrapOutput(IDXGIOutput* raw, IDXGIOutput** out)
+{
+    if (!raw || !out) return E_POINTER;
+    auto proxy = winrt::make_self<OutputProxy>();
+    proxy->real.copy_from(raw);
+    raw->QueryInterface(__uuidof(IDXGIOutput1), proxy->real1.put_void());
+    raw->QueryInterface(__uuidof(IDXGIOutput2), proxy->real2.put_void());
+    raw->QueryInterface(__uuidof(IDXGIOutput3), proxy->real3.put_void());
+    raw->QueryInterface(__uuidof(IDXGIOutput4), proxy->real4.put_void());
+    raw->QueryInterface(__uuidof(IDXGIOutput5), proxy->real5.put_void());
+    raw->QueryInterface(__uuidof(IDXGIOutput6), proxy->real6.put_void());
+    *out = proxy.as<IDXGIOutput>().detach();
+    return S_OK;
+}
+
+struct AdapterProxy : winrt::implements<AdapterProxy,
+                                        IDXGIAdapter4, IDXGIAdapter3, IDXGIAdapter2,
+                                        IDXGIAdapter1, IDXGIAdapter, IDXGIObject>
+{
+    com_ptr<IDXGIAdapter>  real;
+    com_ptr<IDXGIAdapter1> real1;
+    com_ptr<IDXGIAdapter2> real2;
+    com_ptr<IDXGIAdapter3> real3;
+    com_ptr<IDXGIAdapter4> real4;
+
+    HRESULT __stdcall SetPrivateData(REFGUID k, UINT s, const void* d) noexcept override
+    { return real->SetPrivateData(k, s, d); }
+    HRESULT __stdcall SetPrivateDataInterface(REFGUID k, const IUnknown* u) noexcept override
+    { return real->SetPrivateDataInterface(k, u); }
+    HRESULT __stdcall GetPrivateData(REFGUID k, UINT* s, void* d) noexcept override
+    { return real->GetPrivateData(k, s, d); }
+    HRESULT __stdcall GetParent(REFIID r, void** o) noexcept override
+    { return real->GetParent(r, o); }
+
+    HRESULT __stdcall EnumOutputs(UINT i, IDXGIOutput** o) noexcept override
+    {
+        if (!o) return E_POINTER;
+        com_ptr<IDXGIOutput> raw;
+        HRESULT hr = real->EnumOutputs(i, raw.put());
+        if (FAILED(hr)) {
+            static LONG n = 0;
+            if (InterlockedIncrement(&n) <= 6)
+                Diag("AdapterProxy EnumOutputs i=" + std::to_string(i) + " hr=" + Hex((uint32_t)hr));
+            *o = nullptr;
+            return hr;
+        }
+        hr = WrapOutput(raw.get(), o);
+        static LONG n = 0;
+        if (InterlockedIncrement(&n) <= 6)
+            Diag("AdapterProxy EnumOutputs i=" + std::to_string(i) + " wrapped hr=" + Hex((uint32_t)hr));
+        return hr;
+    }
+    HRESULT __stdcall GetDesc(DXGI_ADAPTER_DESC* d) noexcept override
+    { return real->GetDesc(d); }
+    HRESULT __stdcall CheckInterfaceSupport(REFGUID n, LARGE_INTEGER* u) noexcept override
+    { return real->CheckInterfaceSupport(n, u); }
+
+    HRESULT __stdcall GetDesc1(DXGI_ADAPTER_DESC1* d) noexcept override
+    { return real1 ? real1->GetDesc1(d) : E_NOINTERFACE; }
+    HRESULT __stdcall GetDesc2(DXGI_ADAPTER_DESC2* d) noexcept override
+    { return real2 ? real2->GetDesc2(d) : E_NOINTERFACE; }
+
+    HRESULT __stdcall RegisterHardwareContentProtectionTeardownStatusEvent(HANDLE h, DWORD* c) noexcept override
+    { return real3 ? real3->RegisterHardwareContentProtectionTeardownStatusEvent(h, c) : E_NOTIMPL; }
+    void __stdcall UnregisterHardwareContentProtectionTeardownStatus(DWORD c) noexcept override
+    { if (real3) real3->UnregisterHardwareContentProtectionTeardownStatus(c); }
+    HRESULT __stdcall QueryVideoMemoryInfo(UINT node, DXGI_MEMORY_SEGMENT_GROUP g,
+                                           DXGI_QUERY_VIDEO_MEMORY_INFO* i) noexcept override
+    { return real3 ? real3->QueryVideoMemoryInfo(node, g, i) : E_NOTIMPL; }
+    HRESULT __stdcall SetVideoMemoryReservation(UINT node, DXGI_MEMORY_SEGMENT_GROUP g, UINT64 v) noexcept override
+    { return real3 ? real3->SetVideoMemoryReservation(node, g, v) : E_NOTIMPL; }
+    HRESULT __stdcall RegisterVideoMemoryBudgetChangeNotificationEvent(HANDLE h, DWORD* c) noexcept override
+    { return real3 ? real3->RegisterVideoMemoryBudgetChangeNotificationEvent(h, c) : E_NOTIMPL; }
+    void __stdcall UnregisterVideoMemoryBudgetChangeNotification(DWORD c) noexcept override
+    { if (real3) real3->UnregisterVideoMemoryBudgetChangeNotification(c); }
+
+    HRESULT __stdcall GetDesc3(DXGI_ADAPTER_DESC3* d) noexcept override
+    { return real4 ? real4->GetDesc3(d) : E_NOINTERFACE; }
+};
+
+static HRESULT WrapAdapter(IUnknown* raw, REFIID riid, void** out)
+{
+    if (!raw || !out) return E_POINTER;
+    auto proxy = winrt::make_self<AdapterProxy>();
+    raw->QueryInterface(__uuidof(IDXGIAdapter),  proxy->real.put_void());
+    raw->QueryInterface(__uuidof(IDXGIAdapter1), proxy->real1.put_void());
+    raw->QueryInterface(__uuidof(IDXGIAdapter2), proxy->real2.put_void());
+    raw->QueryInterface(__uuidof(IDXGIAdapter3), proxy->real3.put_void());
+    raw->QueryInterface(__uuidof(IDXGIAdapter4), proxy->real4.put_void());
+    if (!proxy->real) { *out = nullptr; return E_NOINTERFACE; }
+    return proxy->QueryInterface(riid, out);
+}
+
+static HRESULT WrapAdapterTake(HRESULT hr, IUnknown* raw, REFIID riid, void** out)
+{
+    if (FAILED(hr) || !raw) {
+        if (out) *out = nullptr;
+        return hr;
+    }
+    HRESULT wr = WrapAdapter(raw, riid, out);
+    raw->Release();
+    return wr;
+}
+
 // IDXGIFactory{,1,2} proxy. Unity gets one of these back from Bed_CreateDXGIFactory*
 // and uses it to (a) enumerate adapters -- delegated to a real factory the proxy
 // wraps, (b) create its swapchain against its fake HWND -- intercepted and routed
 // to a CoreWindow-backed SwapProxy.
 // ------------------------------------------------------------------
 struct FactoryProxy : winrt::implements<FactoryProxy,
+                                        IDXGIFactory7, IDXGIFactory6, IDXGIFactory5,
+                                        IDXGIFactory4, IDXGIFactory3,
                                         IDXGIFactory2, IDXGIFactory1, IDXGIFactory, IDXGIObject>
 {
     com_ptr<IDXGIFactory2> real;   // real underlying factory for pass-throughs
+    // The console's own dxgi may be older than the interface a game asks for, so
+    // each of these is optional and every method that needs one has a fallback.
+    // Answering IDXGIFactory4 with a proxy whose EnumAdapterByLuid returns
+    // E_NOTIMPL is still strictly better than refusing the QI: the guest reads a
+    // refusal as "this machine has no DXGI" and gives up on the spot.
+    com_ptr<IDXGIFactory3> real3;
+    com_ptr<IDXGIFactory4> real4;
+    com_ptr<IDXGIFactory5> real5;
+    com_ptr<IDXGIFactory6> real6;
+    com_ptr<IDXGIFactory7> real7;
 
     // IDXGIObject
     HRESULT __stdcall SetPrivateData(REFGUID k, UINT s, const void* d) noexcept override
@@ -1944,7 +2753,14 @@ struct FactoryProxy : winrt::implements<FactoryProxy,
 
     // IDXGIFactory
     HRESULT __stdcall EnumAdapters(UINT i, IDXGIAdapter** a) noexcept override
-    { return real->EnumAdapters(i, a); }
+    {
+        if (!a) return E_POINTER;
+        IDXGIAdapter* raw = nullptr;
+        HRESULT hr = real->EnumAdapters(i, &raw);
+        hr = WrapAdapterTake(hr, raw, __uuidof(IDXGIAdapter), (void**)a);
+        DiagAdapter("EnumAdapters", i, hr, a ? *a : nullptr);
+        return hr;
+    }
     HRESULT __stdcall MakeWindowAssociation(HWND, UINT) noexcept override { return S_OK; }
     HRESULT __stdcall GetWindowAssociation(HWND* h) noexcept override
     { if (h) *h = kFakeHwnd; return S_OK; }
@@ -1961,21 +2777,34 @@ struct FactoryProxy : winrt::implements<FactoryProxy,
         return S_OK;
     }
     HRESULT __stdcall CreateSoftwareAdapter(HMODULE m, IDXGIAdapter** a) noexcept override
-    { return real->CreateSoftwareAdapter(m, a); }
+    {
+        if (!a) return E_POINTER;
+        IDXGIAdapter* raw = nullptr;
+        HRESULT hr = real->CreateSoftwareAdapter(m, &raw);
+        return WrapAdapterTake(hr, raw, __uuidof(IDXGIAdapter), (void**)a);
+    }
 
     // IDXGIFactory1
     HRESULT __stdcall EnumAdapters1(UINT i, IDXGIAdapter1** a) noexcept override
-    { return real->EnumAdapters1(i, a); }
+    {
+        if (!a) return E_POINTER;
+        IDXGIAdapter1* raw = nullptr;
+        HRESULT hr = real->EnumAdapters1(i, &raw);
+        hr = WrapAdapterTake(hr, raw, __uuidof(IDXGIAdapter1), (void**)a);
+        DiagAdapter("EnumAdapters1", i, hr, a ? *a : nullptr);
+        return hr;
+    }
     BOOL __stdcall IsCurrent() noexcept override { return real->IsCurrent(); }
 
     // IDXGIFactory2
     BOOL __stdcall IsWindowedStereoEnabled() noexcept override
     { return real->IsWindowedStereoEnabled(); }
-    HRESULT __stdcall CreateSwapChainForHwnd(IUnknown*, HWND,
+    HRESULT __stdcall CreateSwapChainForHwnd(IUnknown* dev, HWND,
         const DXGI_SWAP_CHAIN_DESC1* d, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs,
         IDXGIOutput*, IDXGISwapChain1** out) noexcept override
     {
         Diag("FactoryProxy CreateSwapChainForHwnd");
+        GfxNoteSwapChainDevice(dev, d);
         if (d)
             Diag("  SC req " + std::to_string(d->Width) + "x" + std::to_string(d->Height) +
                  " fmt=" + std::to_string((int)d->Format) +
@@ -1991,10 +2820,11 @@ struct FactoryProxy : winrt::implements<FactoryProxy,
         *out = proxy.as<IDXGISwapChain1>().detach();
         return S_OK;
     }
-    HRESULT __stdcall CreateSwapChainForCoreWindow(IUnknown*, IUnknown*,
+    HRESULT __stdcall CreateSwapChainForCoreWindow(IUnknown* dev, IUnknown*,
         const DXGI_SWAP_CHAIN_DESC1* d, IDXGIOutput*, IDXGISwapChain1** out) noexcept override
     {
         Diag("FactoryProxy CreateSwapChainForCoreWindow");
+        GfxNoteSwapChainDevice(dev, d);
         if (!out) return E_POINTER;
         if (!EnsureBridge()) return E_FAIL;
         auto proxy = winrt::make_self<SwapProxy>();
@@ -2025,7 +2855,303 @@ struct FactoryProxy : winrt::implements<FactoryProxy,
         *out = proxy.as<IDXGISwapChain1>().detach();
         return S_OK;
     }
+
+    // IDXGIFactory3
+    UINT __stdcall GetCreationFlags() noexcept override
+    { return real3 ? real3->GetCreationFlags() : 0; }
+
+    // IDXGIFactory4 -- the pair a D3D12 title actually needs. Spider-Man asks for
+    // this interface by IID before it will believe the machine has a GPU.
+    HRESULT __stdcall EnumAdapterByLuid(LUID luid, REFIID riid, void** out) noexcept override
+    {
+        if (real4) {
+            IUnknown* raw = nullptr;
+            HRESULT hr = real4->EnumAdapterByLuid(luid, riid, (void**)&raw);
+            hr = WrapAdapterTake(hr, raw, riid, out);
+            Diag("FactoryProxy EnumAdapterByLuid luid=" + Hex((uint32_t)luid.HighPart) + ":" +
+                 Hex((uint32_t)luid.LowPart) + " hr=" + Hex((uint32_t)hr) + " wrapped");
+            return hr;
+        }
+        // No IDXGIFactory4 underneath: do by hand what it does, since EnumAdapters1
+        // and DXGI_ADAPTER_DESC1::AdapterLuid are all the information it needs.
+        if (!out) return E_POINTER;
+        for (UINT i = 0;; ++i) {
+            com_ptr<IDXGIAdapter1> a;
+            if (FAILED(real->EnumAdapters1(i, a.put()))) break;
+            DXGI_ADAPTER_DESC1 d{};
+            if (FAILED(a->GetDesc1(&d))) continue;
+            if (d.AdapterLuid.LowPart == luid.LowPart &&
+                d.AdapterLuid.HighPart == luid.HighPart)
+                return WrapAdapter(a.get(), riid, out);
+        }
+        return DXGI_ERROR_NOT_FOUND;
+    }
+    HRESULT __stdcall EnumWarpAdapter(REFIID riid, void** out) noexcept override
+    {
+        if (real4) {
+            IUnknown* raw = nullptr;
+            HRESULT hr = real4->EnumWarpAdapter(riid, (void**)&raw);
+            hr = WrapAdapterTake(hr, raw, riid, out);
+            Diag("FactoryProxy EnumWarpAdapter hr=" + Hex((uint32_t)hr));
+            return hr;
+        }
+        // There is no WARP on this console; say so rather than handing back the
+        // hardware adapter under a name that promises software rasterisation.
+        Diag("FactoryProxy EnumWarpAdapter -> NOT_FOUND (no WARP here)");
+        return DXGI_ERROR_NOT_FOUND;
+    }
+
+    // IDXGIFactory5
+    HRESULT __stdcall CheckFeatureSupport(DXGI_FEATURE f, void* data, UINT cb) noexcept override
+    {
+        if (real5) {
+            HRESULT hr = real5->CheckFeatureSupport(f, data, cb);
+            Diag("FactoryProxy CheckFeatureSupport feature=" + std::to_string((int)f) +
+                 " cb=" + std::to_string(cb) + " hr=" + Hex((uint32_t)hr) +
+                 (SUCCEEDED(hr) && data && cb >= sizeof(BOOL)
+                    ? std::string(" value=") + std::to_string(*(BOOL*)data) : std::string()));
+            return hr;
+        }
+        // The only feature anyone queries here is PRESENT_ALLOW_TEARING, and the
+        // answer for us is no in any case -- the guest's swapchain is a SwapProxy
+        // and never reaches a real present path where tearing would mean anything.
+        if (f == DXGI_FEATURE_PRESENT_ALLOW_TEARING && data && cb >= sizeof(BOOL)) {
+            *(BOOL*)data = FALSE;
+            return S_OK;
+        }
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+
+    // IDXGIFactory6
+    HRESULT __stdcall EnumAdapterByGpuPreference(UINT i, DXGI_GPU_PREFERENCE pref,
+                                                 REFIID riid, void** out) noexcept override
+    {
+        if (real6) {
+            IUnknown* raw = nullptr;
+            HRESULT hr = real6->EnumAdapterByGpuPreference(i, pref, riid, (void**)&raw);
+            hr = WrapAdapterTake(hr, raw, riid, out);
+            // This is the enumeration a modern D3D12 title actually uses, so it is the
+            // one whose result has to be visible -- EnumAdapters1 logging says nothing
+            // about a game that never calls it.
+            com_ptr<IDXGIAdapter1> a;
+            if (SUCCEEDED(hr) && out && *out)
+                ((IUnknown*)*out)->QueryInterface(__uuidof(IDXGIAdapter1), a.put_void());
+            DiagAdapter(("EnumAdapterByGpuPreference(pref=" + std::to_string((int)pref) + ")").c_str(),
+                        i, hr, a.get());
+            return hr;
+        }
+        // One adapter, so the preference has nothing to order. Enumerate plainly.
+        if (!out) return E_POINTER;
+        com_ptr<IDXGIAdapter1> a;
+        HRESULT hr = real->EnumAdapters1(i, a.put());
+        if (FAILED(hr)) {
+            DiagAdapter("EnumAdapterByGpuPreference", i, hr, nullptr);
+            return hr;
+        }
+        hr = WrapAdapter(a.get(), riid, out);
+        com_ptr<IDXGIAdapter1> w;
+        if (SUCCEEDED(hr) && out && *out)
+            ((IUnknown*)*out)->QueryInterface(__uuidof(IDXGIAdapter1), w.put_void());
+        DiagAdapter("EnumAdapterByGpuPreference", i, hr, w.get());
+        return hr;
+    }
+
+    // IDXGIFactory7
+    HRESULT __stdcall RegisterAdaptersChangedEvent(HANDLE h, DWORD* cookie) noexcept override
+    {
+        if (real7) return real7->RegisterAdaptersChangedEvent(h, cookie);
+        // The adapter set on a console does not change. Accept the registration and
+        // never signal, which is exactly the observable behaviour either way.
+        if (cookie) *cookie = 0;
+        return S_OK;
+    }
+    HRESULT __stdcall UnregisterAdaptersChangedEvent(DWORD cookie) noexcept override
+    { return real7 ? real7->UnregisterAdaptersChangedEvent(cookie) : S_OK; }
 };
+
+// ---------------------------------------------------------------------------
+// Synthetic display adapter for SetupAPI.
+//
+// Spider-Man's NxAppImpl::QueryGPUDriverInfo does not ask DXGI who the GPU is. It
+// runs SetupDiGetClassDevsW(NULL, L"PCI", NULL, DIGCF_ALLCLASSES), walks the devices
+// for one whose SPDRP_CLASS is "Display", matches that device's instance id against
+// "PCI\VEN_%04X&DEV_%04X&SUBSYS_%08X&REV_%02X" built (uppercase, zero-padded, via an
+// ostringstream with hex|uppercase and setw) from the DXGI adapter description, and
+// then reads DriverVersion out of
+//   HKLM\SYSTEM\CurrentControlSet\Control\Class\<SPDRP_DRIVER>.
+// It keeps the device description and the driver version in two std::strings, and if
+// BOTH are empty it puts up Launcher_NoGpuInstalledDesc -- "No installed graphics card
+// has been detected on this PC."
+//
+// Inside an app container SetupAPI enumerates nothing, so both strings stay empty. The
+// adapter is right there in DXGI (SraKmd, vendor 0x1414) and D3D12CreateDevice succeeds
+// on it; only this one enumeration disagrees. So answer it ourselves, with the ids read
+// back out of DXGI rather than written down here -- the game builds its id from the same
+// DXGI_ADAPTER_DESC1, so generating ours from that source is what keeps the two from
+// drifting apart.
+// ---------------------------------------------------------------------------
+static const HDEVINFO kGhSynthDevInfo = (HDEVINFO)(uintptr_t)0x67480001;
+// {4d36e968-e325-11ce-bfc1-08002be10318} -- GUID_DEVCLASS_DISPLAY, spelled out rather
+// than pulled from devguid.h so this does not depend on an INITGUID translation unit.
+static const GUID kGhDisplayClassGuid =
+    { 0x4d36e968, 0xe325, 0x11ce, { 0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18 } };
+static const wchar_t* kGhDisplayClassGuidStr = L"{4d36e968-e325-11ce-bfc1-08002be10318}";
+
+static std::wstring g_synthDevDesc, g_synthDevInstId, g_synthDevDriver;
+static LONG         g_synthDevBuilt = 0;
+
+static void GhBuildSyntheticDisplayDevice()
+{
+    if (InterlockedCompareExchange(&g_synthDevBuilt, 1, 0) != 0) return;
+
+    DXGI_ADAPTER_DESC1 d{};
+    bool got = false;
+    {
+        com_ptr<IDXGIFactory1> f;
+        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), f.put_void()))) {
+            com_ptr<IDXGIAdapter1> a;
+            if (SUCCEEDED(f->EnumAdapters1(0, a.put())) && SUCCEEDED(a->GetDesc1(&d)))
+                got = true;
+        }
+    }
+    if (!got) {
+        // Never leave the strings empty -- empty is the exact state that makes the guest
+        // conclude there is no GPU, which is the thing this exists to prevent.
+        d.VendorId = 0x1414; d.DeviceId = 0xD000; d.SubSysId = 0; d.Revision = 0;
+        wcscpy_s(d.Description, L"Basic Render Driver");
+    }
+
+    wchar_t buf[128];
+    // No instance-path suffix after the REV_ field. The guest may compare the whole id
+    // or search for its prefix inside it; without a suffix both readings match, with one
+    // only the second does.
+    swprintf_s(buf, L"PCI\\VEN_%04X&DEV_%04X&SUBSYS_%08X&REV_%02X",
+               d.VendorId, d.DeviceId, d.SubSysId, d.Revision);
+    g_synthDevInstId = buf;
+    g_synthDevDesc   = d.Description[0] ? std::wstring(d.Description) : std::wstring(L"Display Adapter");
+    g_synthDevDriver = std::wstring(kGhDisplayClassGuidStr) + L"\\0000";
+
+    {
+        std::lock_guard<std::mutex> lk(g_regMutex);
+        std::wstring k = L"hklm\\system\\currentcontrolset\\control\\class\\" +
+                         RegLower(g_synthDevDriver);
+        auto& key = g_regKeys[k];
+        { GhRegVal v; RegPutString(v, REG_SZ, L"31.0.101.4502"); key.values[L"driverversion"] = v; }
+        { GhRegVal v; RegPutString(v, REG_SZ, g_synthDevDesc);   key.values[L"driverdesc"]    = v; }
+        { GhRegVal v; RegPutString(v, REG_SZ, L"Microsoft");     key.values[L"providername"]  = v; }
+        // The parent keys, so a guest that walks down to it does not stop one level up.
+        g_regKeys[L"hklm\\system"];
+        g_regKeys[L"hklm\\system\\currentcontrolset"];
+        g_regKeys[L"hklm\\system\\currentcontrolset\\control"];
+        g_regKeys[L"hklm\\system\\currentcontrolset\\control\\class"];
+        g_regKeys[L"hklm\\system\\currentcontrolset\\control\\class\\" + RegLower(kGhDisplayClassGuidStr)];
+    }
+    Diag("SETUPAPI synthetic display device [" + RegNarrow(g_synthDevDesc) + "] " +
+         RegNarrow(g_synthDevInstId) + " driver=" + RegNarrow(g_synthDevDriver));
+}
+
+// Real setupapi, resolved lazily: the host never imports it, and everything that is
+// not our one synthetic PCI enumeration has to keep reaching the OS (the guest also
+// uses SetupAPI for HID device interfaces, which do work in the container).
+template <class Fn> static Fn GhRealSetupApi(const char* name)
+{
+    static HMODULE h = nullptr;
+    if (!h) h = LoadLibraryExW(L"setupapi.dll", nullptr, 0);
+    return h ? (Fn)GetProcAddress(h, name) : nullptr;
+}
+
+static HDEVINFO WINAPI Bed_SetupDiGetClassDevsW(const GUID* cls, PCWSTR enumr, HWND hwnd, DWORD flags)
+{
+    // Trigger narrowly: the PCI enumerator is the GPU query. HID and every other
+    // device-interface lookup passes a class GUID with a null enumerator and must
+    // still see the real device tree.
+    if (enumr && _wcsicmp(enumr, L"PCI") == 0) {
+        GhBuildSyntheticDisplayDevice();
+        Diag("BED SetupDiGetClassDevsW(PCI) -> synthetic set");
+        return kGhSynthDevInfo;
+    }
+    auto fn = GhRealSetupApi<HDEVINFO (WINAPI*)(const GUID*, PCWSTR, HWND, DWORD)>("SetupDiGetClassDevsW");
+    return fn ? fn(cls, enumr, hwnd, flags) : INVALID_HANDLE_VALUE;
+}
+
+static BOOL WINAPI Bed_SetupDiEnumDeviceInfo(HDEVINFO h, DWORD i, PSP_DEVINFO_DATA out)
+{
+    if (h == kGhSynthDevInfo) {
+        if (!out || out->cbSize != sizeof(SP_DEVINFO_DATA)) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+        if (i != 0) { SetLastError(ERROR_NO_MORE_ITEMS); return FALSE; }
+        out->ClassGuid = kGhDisplayClassGuid;
+        out->DevInst   = 1;
+        out->Reserved  = 0;
+        return TRUE;
+    }
+    auto fn = GhRealSetupApi<BOOL (WINAPI*)(HDEVINFO, DWORD, PSP_DEVINFO_DATA)>("SetupDiEnumDeviceInfo");
+    return fn ? fn(h, i, out) : FALSE;
+}
+
+// Shared tail for the two "copy a wide string out, honouring the caller's buffer"
+// SetupAPI shapes. cbOut is in BYTES; pass the character count times sizeof(wchar_t).
+static BOOL GhSetupReturnString(const std::wstring& s, PBYTE buf, DWORD cbOut, DWORD* required)
+{
+    DWORD need = (DWORD)((s.size() + 1) * sizeof(wchar_t));
+    if (required) *required = need;
+    if (!buf || cbOut < need) { SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+    memcpy(buf, s.c_str(), need);
+    return TRUE;
+}
+
+static BOOL WINAPI Bed_SetupDiGetDeviceRegistryPropertyW(HDEVINFO h, PSP_DEVINFO_DATA dev,
+    DWORD prop, PDWORD ptype, PBYTE buf, DWORD cb, PDWORD required)
+{
+    if (h == kGhSynthDevInfo) {
+        const std::wstring* v = nullptr;
+        std::wstring cls = L"Display";
+        switch (prop) {
+            case SPDRP_CLASS:                          v = &cls; break;
+            case SPDRP_CLASSGUID:                      { static std::wstring g = kGhDisplayClassGuidStr; v = &g; } break;
+            case SPDRP_DEVICEDESC:
+            case SPDRP_FRIENDLYNAME:                   v = &g_synthDevDesc; break;
+            case SPDRP_HARDWAREID:                     v = &g_synthDevInstId; break;
+            case SPDRP_DRIVER:                         v = &g_synthDevDriver; break;
+            case SPDRP_MFG:                            { static std::wstring m = L"Microsoft"; v = &m; } break;
+            default:
+                Diag("BED SetupDiGetDeviceRegistryPropertyW prop=" + std::to_string(prop) + " unsupported");
+                SetLastError(ERROR_INVALID_DATA);
+                return FALSE;
+        }
+        if (ptype) *ptype = REG_SZ;
+        BOOL ok = GhSetupReturnString(*v, buf, cb, required);
+        Diag("BED SetupDiGetDeviceRegistryPropertyW prop=" + std::to_string(prop) +
+             " -> " + (ok ? RegNarrow(*v) : std::string("BUFFER TOO SMALL")));
+        return ok;
+    }
+    auto fn = GhRealSetupApi<BOOL (WINAPI*)(HDEVINFO, PSP_DEVINFO_DATA, DWORD, PDWORD, PBYTE, DWORD, PDWORD)>(
+        "SetupDiGetDeviceRegistryPropertyW");
+    return fn ? fn(h, dev, prop, ptype, buf, cb, required) : FALSE;
+}
+
+static BOOL WINAPI Bed_SetupDiGetDeviceInstanceIdW(HDEVINFO h, PSP_DEVINFO_DATA dev,
+    PWSTR buf, DWORD cch, PDWORD required)
+{
+    if (h == kGhSynthDevInfo) {
+        // NB: this one sizes in CHARACTERS, unlike the registry-property call above.
+        DWORD need = (DWORD)(g_synthDevInstId.size() + 1);
+        if (required) *required = need;
+        if (!buf || cch < need) { SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+        memcpy(buf, g_synthDevInstId.c_str(), need * sizeof(wchar_t));
+        Diag("BED SetupDiGetDeviceInstanceIdW -> " + RegNarrow(g_synthDevInstId));
+        return TRUE;
+    }
+    auto fn = GhRealSetupApi<BOOL (WINAPI*)(HDEVINFO, PSP_DEVINFO_DATA, PWSTR, DWORD, PDWORD)>(
+        "SetupDiGetDeviceInstanceIdW");
+    return fn ? fn(h, dev, buf, cch, required) : FALSE;
+}
+
+static BOOL WINAPI Bed_SetupDiDestroyDeviceInfoList(HDEVINFO h)
+{
+    if (h == kGhSynthDevInfo) return TRUE;
+    auto fn = GhRealSetupApi<BOOL (WINAPI*)(HDEVINFO)>("SetupDiDestroyDeviceInfoList");
+    return fn ? fn(h) : FALSE;
+}
 
 // Build a FactoryProxy backed by a real IDXGIFactory2. Used by all three
 // Bed_CreateDXGIFactory* variants.
@@ -2037,7 +3163,258 @@ static HRESULT MakeFactoryProxy(REFIID riid, void** out)
     if (FAILED(hr)) return hr;
     auto proxy = winrt::make_self<FactoryProxy>();
     proxy->real = real;
-    return proxy->QueryInterface(riid, out);
+    // Best-effort: whichever of these the console's dxgi actually has, the proxy
+    // delegates to; the rest it answers itself. QI failures here are expected and
+    // not errors.
+    real->QueryInterface(__uuidof(IDXGIFactory3), proxy->real3.put_void());
+    real->QueryInterface(__uuidof(IDXGIFactory4), proxy->real4.put_void());
+    real->QueryInterface(__uuidof(IDXGIFactory5), proxy->real5.put_void());
+    real->QueryInterface(__uuidof(IDXGIFactory6), proxy->real6.put_void());
+    real->QueryInterface(__uuidof(IDXGIFactory7), proxy->real7.put_void());
+    // One-shot: does this container's DXGI report any OUTPUTS? The guest's "no
+    // installed graphics card ... ensure your monitor is connected to it correctly"
+    // is gated on two empty containers, and an app-container adapter having zero
+    // outputs is the obvious candidate. Measure it instead of assuming it.
+    // Probe on every factory creation, not once. The one-shot version answered for
+    // the LAUNCHER's factory at startup; Spider-Man's own log says it sees a 0x0
+    // monitor, so the question is what an output looks like from the GUEST's factory
+    // at the guest's point in time -- which the one-shot probe could never show.
+    static LONG probeN = 0;
+    if (InterlockedIncrement(&probeN) <= 6) {
+        for (UINT ai = 0;; ++ai) {
+            com_ptr<IDXGIAdapter1> a;
+            if (FAILED(real->EnumAdapters1(ai, a.put()))) break;
+            UINT outs = 0;
+            for (UINT oi = 0;; ++oi) {
+                com_ptr<IDXGIOutput> o;
+                HRESULT ohr = a->EnumOutputs(oi, o.put());
+                if (FAILED(ohr)) {
+                    Diag("DXGI probe adapter " + std::to_string(ai) + " output " +
+                         std::to_string(oi) + " hr=" + Hex((uint32_t)ohr));
+                    break;
+                }
+                ++outs;
+                DXGI_OUTPUT_DESC od{};
+                if (SUCCEEDED(o->GetDesc(&od))) {
+                    std::wstring w(od.DeviceName);
+                    Diag("DXGI probe adapter " + std::to_string(ai) + " output " +
+                         std::to_string(oi) + " [" + std::string(w.begin(), w.end()) + "] " +
+                         std::to_string(od.DesktopCoordinates.right - od.DesktopCoordinates.left) + "x" +
+                         std::to_string(od.DesktopCoordinates.bottom - od.DesktopCoordinates.top) +
+                         " attached=" + std::to_string((int)od.AttachedToDesktop));
+                }
+            }
+            Diag("DXGI probe#" + std::to_string(probeN) + " adapter " + std::to_string(ai) +
+                 " outputs=" + std::to_string(outs));
+        }
+    }
+    Diag(std::string("BED CreateDXGIFactory real supports:") +
+         (proxy->real3 ? " f3" : "") + (proxy->real4 ? " f4" : "") +
+         (proxy->real5 ? " f5" : "") + (proxy->real6 ? " f6" : "") +
+         (proxy->real7 ? " f7" : ""));
+    HRESULT qi = proxy->QueryInterface(riid, out);
+    // FactoryProxy implements IDXGIFactory7 and below. Anything still refused here
+    // is an interface we have never seen asked for -- log the IID, because the guest
+    // reads a refusal as "this machine has no DXGI" and the failure then surfaces
+    // somewhere else entirely.
+    if (FAILED(qi))
+        Diag("BED CreateDXGIFactory QI REFUSED hr=" + Hex((uint32_t)qi) + " iid=" +
+             Hex(riid.Data1) + "-" + Hex(riid.Data2) + "-" + Hex(riid.Data3));
+    return qi;
+}
+
+// D3D12 device bed. This started as pure logging -- the bridge is D3D11-on-D3D12
+// for the Unity titles, so a NATIVE D3D12 guest's device creation had never been
+// observed -- and became load-bearing with the first such guest.
+//
+// A guest that creates its OWN D3D12 device cannot be presented: its resources and
+// our swap-chain back buffers would live on two different devices, and nothing can
+// copy between those. So hand it OURS. Both then share one device, its command
+// queue can be fenced against ours, and the stable render target it draws into is
+// a resource we can blit from (see GfxNoteSwapChainDevice / GfxPresent).
+//
+// dev == nullptr is the documented capability probe ("does this adapter support
+// this feature level?"), never a request for a device; that one must still go to
+// the real runtime.
+// Log the D3D12 calls that feed SC_DLL (the UMD shader compiler). The exec-0x0
+// after GetBuffer returns in SC_DLL.dll+0x630C with umd12ddi on the stack; these
+// hooks tell us whether that was CreateGraphicsPipelineState, a compute PSO, a
+// root signature, or a feature query. Vtable-patched on OUR device object after
+// 11on12 has already been created, so the guest is the only new caller.
+static void* g_d12vtOrig[21];
+static LONG  g_d12vtHooked = 0;
+
+static const char* GhFourCC(const void* p, SIZE_T n)
+{
+    static thread_local char buf[8];
+    if (!p || n < 4){ buf[0] = '?'; buf[1] = 0; return buf; }
+    const unsigned char* b = (const unsigned char*)p;
+    for (int i = 0; i < 4; ++i) buf[i] = (b[i] >= 32 && b[i] < 127) ? (char)b[i] : '.';
+    buf[4] = 0;
+    return buf;
+}
+static ID3D12Device* GhCompileOnlyDevice()
+{
+    static com_ptr<ID3D12Device> d;
+    static LONG once = 0;
+    if (InterlockedCompareExchange(&once, 1, 0) == 0) {
+        HRESULT hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+                                       __uuidof(ID3D12Device), d.put_void());
+        Diag(std::string("D3D12 compile-only device hr=") + Hex((uint32_t)hr) +
+             (d ? " ok" : " FAIL"));
+    }
+    return d.get();
+}
+static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** pp)
+{
+    auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*,
+                                      REFIID, void**))g_d12vtOrig[10];
+    static thread_local int depth = 0;
+    if (depth) return orig(self, d, riid, pp);
+
+    std::string m = "D3D12 CreateGraphicsPipelineState";
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC local{};
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC* use = d;
+    if (d){
+        m += " VS=" + std::to_string((unsigned)d->VS.BytecodeLength)
+           + " PS=" + std::to_string((unsigned)d->PS.BytecodeLength)
+           + " GS=" + std::to_string((unsigned)d->GS.BytecodeLength)
+           + " HS=" + std::to_string((unsigned)d->HS.BytecodeLength)
+           + " DS=" + std::to_string((unsigned)d->DS.BytecodeLength)
+           + " nRT=" + std::to_string(d->NumRenderTargets)
+           + " rtv0=" + std::to_string((int)d->RTVFormats[0])
+           + " dsv=" + std::to_string((int)d->DSVFormat)
+           + " samples=" + std::to_string(d->SampleDesc.Count)
+           + " topo=" + std::to_string((int)d->PrimitiveTopologyType)
+           + " il=" + std::to_string(d->InputLayout.NumElements)
+           + " cached=" + std::to_string((unsigned)d->CachedPSO.CachedBlobSizeInBytes)
+           + " flags=" + Hex((uint32_t)d->Flags);
+        m += std::string(" VSmag=") + GhFourCC(d->VS.pShaderBytecode, d->VS.BytecodeLength);
+        m += std::string(" PSmag=") + GhFourCC(d->PS.pShaderBytecode, d->PS.BytecodeLength);
+        if (d->InputLayout.pInputElementDescs){
+            for (UINT i = 0; i < d->InputLayout.NumElements && i < 6; ++i){
+                auto& e = d->InputLayout.pInputElementDescs[i];
+                m += " [" + std::string(e.SemanticName ? e.SemanticName : "?")
+                   + std::to_string(e.SemanticIndex) + " f=" + std::to_string((int)e.Format) + "]";
+            }
+        }
+        if (d->CachedPSO.pCachedBlob && d->CachedPSO.CachedBlobSizeInBytes){
+            local = *d;
+            local.CachedPSO = {};
+            use = &local;
+            m += " (stripped PC PSO cache)";
+        }
+    }
+    Diag(m);
+
+    // SC_DLL.dll+0x630C crashes with a NULL vtable compiling this DXBC, on BOTH
+    // the 11on12 bridge device and a fresh D3D12CreateDevice (v0.0.118.0). Do
+    // not call the runtime -- it takes the process down. The guest seeing E_FAIL
+    // tells us whether this PSO is optional.
+    (void)orig; (void)self; (void)use; (void)riid; (void)depth;
+    if (pp) *pp = nullptr;
+    Diag("  CreateGraphicsPipelineState skipped (SC_DLL crash); returning E_FAIL");
+    return E_FAIL;
+}
+static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
+    const D3D12_COMPUTE_PIPELINE_STATE_DESC* d, REFIID riid, void** pp)
+{
+    auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*,
+                                      REFIID, void**))g_d12vtOrig[11];
+    Diag(std::string("D3D12 CreateComputePipelineState CS=") +
+         (d ? std::to_string((unsigned)d->CS.BytecodeLength) : "?"));
+    HRESULT hr = orig(self, d, riid, pp);
+    Diag("  CreateComputePipelineState -> hr=" + Hex((uint32_t)hr));
+    return hr;
+}
+static HRESULT __stdcall Hook_D12CheckFeature(ID3D12Device* self, D3D12_FEATURE f,
+                                              void* data, UINT sz)
+{
+    auto orig = (HRESULT (__stdcall*)(ID3D12Device*, D3D12_FEATURE, void*, UINT))g_d12vtOrig[13];
+    HRESULT hr = orig(self, f, data, sz);
+    std::string extra;
+    if (SUCCEEDED(hr) && data){
+        if (f == D3D12_FEATURE_SHADER_MODEL && sz >= sizeof(D3D12_FEATURE_DATA_SHADER_MODEL))
+            extra = " SM=" + Hex((uint32_t)((D3D12_FEATURE_DATA_SHADER_MODEL*)data)->HighestShaderModel);
+        else if (f == D3D12_FEATURE_FEATURE_LEVELS && sz >= sizeof(D3D12_FEATURE_DATA_FEATURE_LEVELS))
+            extra = " maxFL=" + Hex((uint32_t)((D3D12_FEATURE_DATA_FEATURE_LEVELS*)data)->MaxSupportedFeatureLevel);
+    }
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) <= 16 || f == D3D12_FEATURE_SHADER_MODEL)
+        Diag("D3D12 CheckFeatureSupport f=" + std::to_string((int)f) +
+             " hr=" + Hex((uint32_t)hr) + extra);
+    return hr;
+}
+static HRESULT __stdcall Hook_D12CreateRS(ID3D12Device* self, UINT node,
+    const void* blob, SIZE_T len, REFIID riid, void** pp)
+{
+    auto orig = (HRESULT (__stdcall*)(ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**))g_d12vtOrig[16];
+    Diag("D3D12 CreateRootSignature bytes=" + std::to_string((unsigned)len));
+    HRESULT hr = orig(self, node, blob, len, riid, pp);
+    Diag("  CreateRootSignature -> hr=" + Hex((uint32_t)hr));
+    return hr;
+}
+static void __stdcall Hook_D12CreateRTV(ID3D12Device* self, ID3D12Resource* res,
+    const D3D12_RENDER_TARGET_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE dest)
+{
+    auto orig = (void (__stdcall*)(ID3D12Device*, ID3D12Resource*,
+                                   const D3D12_RENDER_TARGET_VIEW_DESC*,
+                                   D3D12_CPU_DESCRIPTOR_HANDLE))g_d12vtOrig[20];
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) <= 8)
+        Diag(std::string("D3D12 CreateRenderTargetView res=") +
+             (res == g_gfx.guestRT12.get() ? "guestRT12" : "other") +
+             " fmt=" + (d ? std::to_string((int)d->Format) : "null"));
+    orig(self, res, d, dest);
+}
+static void GhHookD12Device(ID3D12Device* dev)
+{
+    if (!dev || InterlockedCompareExchange(&g_d12vtHooked, 1, 0) != 0) return;
+    void** vt = *(void***)dev;
+    DWORD old = 0;
+    if (!VirtualProtect(vt, sizeof(void*) * 21, PAGE_READWRITE, &old)){
+        Diag("D3D12 vtable hook protect failed err=" + Hex(GetLastError()));
+        return;
+    }
+    g_d12vtOrig[10] = vt[10]; vt[10] = (void*)&Hook_D12CreateGPS;
+    g_d12vtOrig[11] = vt[11]; vt[11] = (void*)&Hook_D12CreateCPS;
+    g_d12vtOrig[13] = vt[13]; vt[13] = (void*)&Hook_D12CheckFeature;
+    g_d12vtOrig[16] = vt[16]; vt[16] = (void*)&Hook_D12CreateRS;
+    g_d12vtOrig[20] = vt[20]; vt[20] = (void*)&Hook_D12CreateRTV;
+    VirtualProtect(vt, sizeof(void*) * 21, old, &old);
+    Diag("D3D12 vtable hooked GPS/CPS/CFS/RS/RTV");
+}
+
+static HRESULT WINAPI Bed_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL fl,
+                                            REFIID riid, void** dev)
+{
+    using Fn = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+    static Fn real = nullptr;
+    if (!real){
+        if (HMODULE h = GetModuleHandleA("d3d12.dll")) real = (Fn)GetProcAddress(h, "D3D12CreateDevice");
+        if (!real){ if (HMODULE h = LoadLibraryA("d3d12.dll")) real = (Fn)GetProcAddress(h, "D3D12CreateDevice"); }
+    }
+
+    if (dev && EnsureBridge() && g_gfx.d12 && fl <= g_gfx.d12Level){
+        GhHookD12Device(g_gfx.d12.get());
+        HRESULT qi = g_gfx.d12->QueryInterface(riid, dev);
+        Diag("BED D3D12CreateDevice fl=" + Hex((uint32_t)fl) + " adapter=" +
+             (adapter ? "given" : "default") + " iid=" + Hex(riid.Data1) +
+             " -> BRIDGE device hr=" + Hex((uint32_t)qi));
+        if (SUCCEEDED(qi)) return S_OK;
+        // An interface our device does not implement (a newer ID3D12DeviceN than the
+        // container's runtime has). Falling through gives the guest a real device --
+        // which we then cannot present -- but that is strictly better than E_NOINTERFACE,
+        // and the line above says exactly what happened.
+    }
+
+    HRESULT hr = real ? real(adapter, fl, riid, dev) : E_NOTIMPL;
+    Diag("BED D3D12CreateDevice fl=" + Hex((uint32_t)fl) + " adapter=" +
+         (adapter ? "given" : "default") + " hr=" + Hex((uint32_t)hr) +
+         " dev=" + ((dev && *dev) ? "ok" : "null") +
+         (dev ? " (REAL device -- not presentable)" : " (probe)"));
+    return hr;
 }
 
 static HRESULT WINAPI Bed_CreateDXGIFactory(REFIID riid, void** out)
@@ -2305,15 +3682,42 @@ static ATOM   WINAPI Bed_RegisterClassW(const WNDCLASSW* wc){
     return (ATOM)1;
 }
 static ATOM   WINAPI Bed_RegisterClassExA(const void*){ return (ATOM)1; }
-static HWND   WINAPI Bed_CreateWindowExW(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int,
-                                         HWND, HMENU, HINSTANCE, LPVOID){ Diag("BED CreateWindowExW"); return kFakeHwnd; }
-static HWND   WINAPI Bed_CreateWindowExA(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int,
-                                         HWND, HMENU, HINSTANCE, LPVOID){ Diag("BED CreateWindowExA"); return kFakeHwnd; }
+// The requested rect is logged, not honoured -- there is one CoreWindow and the
+// guest always gets kFakeHwnd. It is logged because it is the cheapest way to tell
+// a guest that asked for a sane window (and derived a bad swap-chain size from
+// somewhere else) from one whose own window math was already wrong.
+static HWND   WINAPI Bed_CreateWindowExW(DWORD, LPCWSTR cls, LPCWSTR, DWORD style,
+                                         int x, int y, int w, int h,
+                                         HWND, HMENU, HINSTANCE, LPVOID){
+    std::wstring c = (cls && (uintptr_t)cls > 0xFFFF) ? cls : L"(atom)";
+    Diag("BED CreateWindowExW cls=" + std::string(c.begin(), c.end()) +
+         " style=" + Hex((uint32_t)style) + " at " + std::to_string(x) + "," + std::to_string(y) +
+         " size " + std::to_string(w) + "x" + std::to_string(h));
+    return kFakeHwnd;
+}
+static HWND   WINAPI Bed_CreateWindowExA(DWORD, LPCSTR cls, LPCSTR, DWORD style,
+                                         int x, int y, int w, int h,
+                                         HWND, HMENU, HINSTANCE, LPVOID){
+    Diag(std::string("BED CreateWindowExA cls=") +
+         ((cls && (uintptr_t)cls > 0xFFFF) ? cls : "(atom)") +
+         " style=" + Hex((uint32_t)style) + " at " + std::to_string(x) + "," + std::to_string(y) +
+         " size " + std::to_string(w) + "x" + std::to_string(h));
+    return kFakeHwnd;
+}
 static BOOL   WINAPI Bed_DestroyWindow(HWND){ return TRUE; }
 static BOOL   WINAPI Bed_ShowWindow(HWND, int){ return TRUE; }
 static BOOL   WINAPI Bed_UpdateWindow(HWND){ return TRUE; }
-static BOOL   WINAPI Bed_GetClientRect(HWND, LPRECT r){ if(r){ r->left=r->top=0; r->right=(LONG)g_winW; r->bottom=(LONG)g_winH; } return TRUE; }
-static BOOL   WINAPI Bed_GetWindowRect(HWND, LPRECT r){ if(r){ r->left=r->top=0; r->right=(LONG)g_winW; r->bottom=(LONG)g_winH; } return TRUE; }
+// Both answer the CoreWindow size. Logged a handful of times because "the guest
+// asked us and we told it 1920x1080" and "the guest never asked" are different
+// bugs with the same symptom, and the log could not tell them apart.
+static void DiagWinRect(const char* who, LPRECT r){
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) > 8) return;
+    Diag(std::string("BED ") + who + " -> " + std::to_string(r->right - r->left) + "x" +
+         std::to_string(r->bottom - r->top));
+}
+static BOOL   WINAPI Bed_GetClientRect(HWND, LPRECT r){ if(r){ r->left=r->top=0; r->right=(LONG)g_winW; r->bottom=(LONG)g_winH; DiagWinRect("GetClientRect", r); } return TRUE; }
+static BOOL   WINAPI Bed_GetWindowRect(HWND, LPRECT r){ if(r){ r->left=r->top=0; r->right=(LONG)g_winW; r->bottom=(LONG)g_winH; DiagWinRect("GetWindowRect", r); } return TRUE; }
 static BOOL   WINAPI Bed_AdjustWindowRectEx(LPRECT, DWORD, BOOL, DWORD){ return TRUE; }
 static BOOL   WINAPI Bed_AdjustWindowRect(LPRECT, DWORD, BOOL){ return TRUE; }
 // Peak (Unity 6) statically imports these; Xbox slim user32 does not export them.
@@ -2417,6 +3821,31 @@ static BOOL   WINAPI Bed_SetForegroundWindow(HWND){ return TRUE; }
 static BOOL   WINAPI Bed_MoveWindow(HWND, int, int, int, int, BOOL){ return TRUE; }
 static BOOL   WINAPI Bed_SetWindowPos(HWND, HWND, int, int, int, int, UINT){ return TRUE; }
 static HWND   WINAPI Bed_GetForegroundWindow(){ return kFakeHwnd; }
+// A program that quits early almost always says why first, and MessageBox is
+// where it says it. In this container that channel is a dead end -- the slim
+// Xbox user32 has nowhere to draw and no one to click -- so the one string the
+// developer wrote for exactly this moment is discarded unread. Capture it.
+// Returning IDOK keeps the guest on its "user acknowledged" path rather than a
+// cancel path, which is what a real dismissed dialog would have done.
+static int WINAPI Bed_MessageBoxW(HWND, const wchar_t* text, const wchar_t* cap, UINT type)
+{
+    std::wstring t(text ? text : L""), c(cap ? cap : L"");
+    Diag("BED MessageBoxW type=" + Hex(type) + " [" + std::string(c.begin(), c.end()) +
+         "] " + std::string(t.begin(), t.end()));
+    // A game that puts up a message box has already made the decision behind it,
+    // and the caller is the decision site. That is worth more than the text: this
+    // title's user-visible strings are not in the exe (localisation data files), so
+    // the message cannot be traced back to code by searching for it.
+    DiagGuestBacktrace("MessageBoxW");
+    return 1;   // IDOK
+}
+static int WINAPI Bed_MessageBoxA(HWND, const char* text, const char* cap, UINT type)
+{
+    Diag("BED MessageBoxA type=" + Hex(type) + " [" + std::string(cap ? cap : "") +
+         "] " + std::string(text ? text : ""));
+    DiagGuestBacktrace("MessageBoxA");
+    return 1;   // IDOK
+}
 // Focus/visibility queries Unity cross-checks when deciding gAppActive. All
 // report the game window as the active, focused, visible, non-minimized one so
 // the activation we inject is not immediately re-cleared.
@@ -2426,6 +3855,11 @@ static BOOL   WINAPI Bed_IsWindowVisible(HWND){ return TRUE; }
 static BOOL   WINAPI Bed_IsIconic(HWND){ return FALSE; }
 
 extern std::wstring g_guestExePath;   // defined near the PE mapper, below
+// Where the guest image is mapped. Declared here rather than beside the PE
+// mapper because IsMainModule (just below) needs it: the guest's own hInstance
+// IS its main module, and that is a fact several beds have to agree on.
+static uint8_t*          g_guestImageBase = nullptr;
+static DWORD             g_guestImageSize = 0;
 
 // True when `h` refers to the process's main executable. Games ask for the main
 // module's path two ways: GetModuleFileNameW(NULL, ...) OR
@@ -2433,7 +3867,20 @@ extern std::wstring g_guestExePath;   // defined near the PE mapper, below
 // Both must return the guest's path (not the host p0_spike_host.exe), so we
 // treat null and the cached real main-module handle identically.
 static HMODULE g_mainModule = nullptr;   // GetModuleHandleW(nullptr), cached in RunGuest
-static bool IsMainModule(HMODULE h){ return h == nullptr || (g_mainModule && h == g_mainModule); }
+// ...and a THIRD way, which is the one a native C++ game actually uses: its own
+// hInstance. The CRT hands WinMain the guest's ImageBase, and the guest passes
+// that straight back to GetModuleFileNameW. It is neither null nor the host's
+// module handle, so it used to fall through to the real API -- which fails,
+// because our guest is VirtualAlloc'd memory that ntdll has never heard of.
+// The caller then works with an EMPTY path. Spider-Man's NxAppImpl reads its own
+// version resource this way at startup; an empty path made GetFileVersionInfoSizeW
+// return 0, which the engine reported as a failed init, all the way up to exit(1).
+static bool IsMainModule(HMODULE h)
+{
+    return h == nullptr
+        || (g_mainModule && h == g_mainModule)
+        || (g_guestImageBase && h == (HMODULE)g_guestImageBase);
+}
 
 // Unity (and many games) call GetModuleFileNameW to find the running exe --
 // they strip the filename and append "_Data" to locate assets. The REAL call
@@ -2451,7 +3898,13 @@ static DWORD WINAPI Bed_GetModuleFileNameW(HMODULE h, LPWSTR buf, DWORD cch)
         std::memcpy(buf, g_guestExePath.c_str(), (n + 1) * sizeof(wchar_t));
         return n;
     }
-    return GetModuleFileNameW(h, buf, cch);
+    DWORD n = GetModuleFileNameW(h, buf, cch);
+    // A zero here means the guest asked about a module the OS does not know --
+    // almost always one WE mapped. The caller gets an empty string and usually
+    // treats it as a data-driven failure far from the cause, so say it out loud.
+    if (!n) Diag("BED GetModuleFileNameW UNKNOWN module " + Hex((uint64_t)h) +
+                 " -> 0 (err " + std::to_string(GetLastError()) + ")");
+    return n;
 }
 static DWORD WINAPI Bed_GetModuleFileNameA(HMODULE h, LPSTR buf, DWORD cch)
 {
@@ -2465,7 +3918,10 @@ static DWORD WINAPI Bed_GetModuleFileNameA(HMODULE h, LPSTR buf, DWORD cch)
         WideCharToMultiByte(CP_ACP, 0, g_guestExePath.c_str(), -1, buf, n, nullptr, nullptr);
         return (DWORD)(n - 1);   // exclude trailing NUL as Win32 convention
     }
-    return GetModuleFileNameA(h, buf, cch);
+    DWORD n2 = GetModuleFileNameA(h, buf, cch);
+    if (!n2) Diag("BED GetModuleFileNameA UNKNOWN module " + Hex((uint64_t)h) +
+                  " -> 0 (err " + std::to_string(GetLastError()) + ")");
+    return n2;
 }
 
 // ===========================================================================
@@ -2966,7 +4422,14 @@ static void FillDevMode(DEVMODEW* dm){
 }
 static BOOL WINAPI Bed_EnumDisplaySettingsW(LPCWSTR, DWORD iModeNum, DEVMODEW* dm){
     // One mode at index 0; ENUM_CURRENT_SETTINGS(-1)/ENUM_REGISTRY_SETTINGS(-2) also valid.
-    if (iModeNum == 0 || iModeNum == (DWORD)-1 || iModeNum == (DWORD)-2){ FillDevMode(dm); return TRUE; }
+    if (iModeNum == 0 || iModeNum == (DWORD)-1 || iModeNum == (DWORD)-2){
+        FillDevMode(dm);
+        static LONG n = 0;
+        if (InterlockedIncrement(&n) <= 4)
+            Diag("BED EnumDisplaySettingsW mode=" + std::to_string((int)iModeNum) + " -> " +
+                 std::to_string(g_winW) + "x" + std::to_string(g_winH));
+        return TRUE;
+    }
     return FALSE;   // ends the game's mode-enumeration loop after one entry
 }
 static BOOL WINAPI Bed_EnumDisplaySettingsA(LPCSTR, DWORD iModeNum, DEVMODEA* dm){
@@ -3007,16 +4470,149 @@ static int WINAPI Bed_GetSystemMetrics(int idx){
         default: return 0;
     }
 }
-static LONG WINAPI Bed_GetDisplayConfigBufferSizes(UINT32, UINT32* nPath, UINT32* nMode){
-    if (nPath) *nPath = 0; if (nMode) *nMode = 0; return 0 /*ERROR_SUCCESS*/;
+// CCD used to answer "zero paths" so Unity would skip the modern path and fall
+// back to EnumDisplaySettings (a garbage *count* from the real API made Unity
+// allocate ~100 GB). Spider-Man does the opposite: zero paths means "no
+// monitors", it synthesises a 0x0 fake monitor, and 37x1 is the NaN aspect
+// ratio of that. One well-formed 1920x1080 path is small enough for Unity and
+// real enough for Spider-Man. DisplayConfigGetDeviceInfo is the other half --
+// the exe imports it, we never bedded it, and a 0x0 preferred mode from the
+// real user32 is exactly the fake-monitor size the game log prints.
+static LUID GhCcdAdapterLuid()
+{
+    static LUID id{};
+    static LONG once = 0;
+    if (InterlockedCompareExchange(&once, 1, 0) == 0) {
+        com_ptr<IDXGIFactory1> f;
+        com_ptr<IDXGIAdapter1> a;
+        DXGI_ADAPTER_DESC1 d{};
+        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), f.put_void())) &&
+            SUCCEEDED(f->EnumAdapters1(0, a.put())) &&
+            SUCCEEDED(a->GetDesc1(&d)))
+            id = d.AdapterLuid;
+        if (id.LowPart == 0 && id.HighPart == 0) id.LowPart = 1;
+    }
+    return id;
 }
-static LONG WINAPI Bed_QueryDisplayConfig(UINT32, UINT32* nPath, void*, UINT32* nMode, void*, void*){
-    if (nPath) *nPath = 0; if (nMode) *nMode = 0; return 0 /*ERROR_SUCCESS*/;
+static void GhFillVideoSignal(DISPLAYCONFIG_VIDEO_SIGNAL_INFO* v, UINT w, UINT h)
+{
+    if (!v) return;
+    *v = {};
+    v->pixelRate = (UINT64)w * (UINT64)h * 60ull;
+    v->hSyncFreq = { w * 60, 1 };
+    v->vSyncFreq = { 60, 1 };
+    v->activeSize = { w, h };
+    v->totalSize  = { w, h };
+    v->scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
+}
+static LONG WINAPI Bed_GetDisplayConfigBufferSizes(UINT32, UINT32* nPath, UINT32* nMode){
+    if (nPath) *nPath = 1;
+    if (nMode) *nMode = 2;
+    return ERROR_SUCCESS;
+}
+static LONG WINAPI Bed_QueryDisplayConfig(UINT32, UINT32* nPath, DISPLAYCONFIG_PATH_INFO* paths,
+                                          UINT32* nMode, DISPLAYCONFIG_MODE_INFO* modes,
+                                          DISPLAYCONFIG_TOPOLOGY_ID* topo)
+{
+    if (!nPath || !nMode) return ERROR_INVALID_PARAMETER;
+    if (*nPath < 1 || *nMode < 2) {
+        *nPath = 1; *nMode = 2;
+        return ERROR_INSUFFICIENT_BUFFER;
+    }
+    if (!paths || !modes) return ERROR_INVALID_PARAMETER;
+    UINT w = g_winW ? g_winW : 1920, h = g_winH ? g_winH : 1080;
+    LUID luid = GhCcdAdapterLuid();
+    paths[0] = {};
+    paths[0].sourceInfo.adapterId = luid;
+    paths[0].sourceInfo.id = 0;
+    paths[0].sourceInfo.modeInfoIdx = 0;
+    paths[0].sourceInfo.statusFlags = DISPLAYCONFIG_SOURCE_IN_USE;
+    paths[0].targetInfo.adapterId = luid;
+    paths[0].targetInfo.id = 0;
+    paths[0].targetInfo.modeInfoIdx = 1;
+    paths[0].targetInfo.outputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL;
+    paths[0].targetInfo.rotation = DISPLAYCONFIG_ROTATION_IDENTITY;
+    paths[0].targetInfo.scaling = DISPLAYCONFIG_SCALING_IDENTITY;
+    paths[0].targetInfo.refreshRate = { 60, 1 };
+    paths[0].targetInfo.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
+    paths[0].targetInfo.targetAvailable = TRUE;
+    paths[0].targetInfo.statusFlags = DISPLAYCONFIG_TARGET_IN_USE;
+    paths[0].flags = DISPLAYCONFIG_PATH_ACTIVE;
+    modes[0] = {};
+    modes[0].infoType = DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE;
+    modes[0].id = 0;
+    modes[0].adapterId = luid;
+    modes[0].sourceMode.width = w;
+    modes[0].sourceMode.height = h;
+    modes[0].sourceMode.pixelFormat = DISPLAYCONFIG_PIXELFORMAT_32BPP;
+    modes[0].sourceMode.position = { 0, 0 };
+    modes[1] = {};
+    modes[1].infoType = DISPLAYCONFIG_MODE_INFO_TYPE_TARGET;
+    modes[1].id = 0;
+    modes[1].adapterId = luid;
+    GhFillVideoSignal(&modes[1].targetMode.targetVideoSignalInfo, w, h);
+    *nPath = 1;
+    *nMode = 2;
+    if (topo) *topo = DISPLAYCONFIG_TOPOLOGY_INTERNAL;
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) <= 4)
+        Diag("BED QueryDisplayConfig -> 1 path " + std::to_string(w) + "x" + std::to_string(h));
+    return ERROR_SUCCESS;
+}
+static LONG WINAPI Bed_DisplayConfigGetDeviceInfo(DISPLAYCONFIG_DEVICE_INFO_HEADER* hdr)
+{
+    if (!hdr) return ERROR_INVALID_PARAMETER;
+    UINT w = g_winW ? g_winW : 1920, h = g_winH ? g_winH : 1080;
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) <= 8)
+        Diag("BED DisplayConfigGetDeviceInfo type=" + std::to_string((int)hdr->type) +
+             " size=" + std::to_string(hdr->size) + " id=" + std::to_string(hdr->id));
+    switch (hdr->type) {
+    case DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME: {
+        if (hdr->size < sizeof(DISPLAYCONFIG_SOURCE_DEVICE_NAME)) return ERROR_INSUFFICIENT_BUFFER;
+        auto* p = (DISPLAYCONFIG_SOURCE_DEVICE_NAME*)hdr;
+        wcscpy_s(p->viewGdiDeviceName, L"\\\\.\\DISPLAY1");
+        return ERROR_SUCCESS;
+    }
+    case DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME: {
+        if (hdr->size < sizeof(DISPLAYCONFIG_TARGET_DEVICE_NAME)) return ERROR_INSUFFICIENT_BUFFER;
+        auto* p = (DISPLAYCONFIG_TARGET_DEVICE_NAME*)hdr;
+        p->flags = {};
+        p->outputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL;
+        p->edidManufactureId = 0;
+        p->edidProductCodeId = 0;
+        p->connectorInstance = 0;
+        wcscpy_s(p->monitorFriendlyDeviceName, L"Greenhouse Display");
+        wcscpy_s(p->monitorDevicePath, L"\\\\.\\DISPLAY1");
+        return ERROR_SUCCESS;
+    }
+    case DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_PREFERRED_MODE: {
+        if (hdr->size < sizeof(DISPLAYCONFIG_TARGET_PREFERRED_MODE)) return ERROR_INSUFFICIENT_BUFFER;
+        auto* p = (DISPLAYCONFIG_TARGET_PREFERRED_MODE*)hdr;
+        p->width = w;
+        p->height = h;
+        p->targetMode = {};
+        GhFillVideoSignal(&p->targetMode.targetVideoSignalInfo, w, h);
+        return ERROR_SUCCESS;
+    }
+    case DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME: {
+        if (hdr->size < sizeof(DISPLAYCONFIG_ADAPTER_NAME)) return ERROR_INSUFFICIENT_BUFFER;
+        auto* p = (DISPLAYCONFIG_ADAPTER_NAME*)hdr;
+        wcscpy_s(p->adapterDevicePath, L"\\\\?\\PCI#VEN_1414&DEV_D000");
+        return ERROR_SUCCESS;
+    }
+    default:
+        return ERROR_NOT_SUPPORTED;
+    }
 }
 static HMONITOR WINAPI Bed_MonitorFromWindow(HWND, DWORD){ return kFakeMonitor; }
 static HMONITOR WINAPI Bed_MonitorFromPoint(POINT, DWORD){ return kFakeMonitor; }
 static HMONITOR WINAPI Bed_MonitorFromRect(LPCRECT, DWORD){ return kFakeMonitor; }
-static BOOL WINAPI Bed_GetMonitorInfoW(HMONITOR, LPMONITORINFO mi){
+static BOOL WINAPI Bed_GetMonitorInfoW(HMONITOR h, LPMONITORINFO mi){
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) <= 4)
+        Diag("BED GetMonitorInfoW hmon=" + Hex((uint32_t)(uintptr_t)h) + " -> " +
+             std::to_string(g_winW) + "x" + std::to_string(g_winH));
     if (!mi || mi->cbSize < sizeof(MONITORINFO)) return FALSE;
     mi->rcMonitor = {0,0,(LONG)g_winW,(LONG)g_winH};
     mi->rcWork    = {0,0,(LONG)g_winW,(LONG)g_winH};
@@ -3035,7 +4631,22 @@ static BOOL WINAPI Bed_GetMonitorInfoA(HMONITOR, LPMONITORINFO mi){
     return TRUE;
 }
 static BOOL WINAPI Bed_EnumDisplayMonitors(HDC, LPCRECT, MONITORENUMPROC proc, LPARAM lp){
+    Diag("BED EnumDisplayMonitors -> 1 monitor " + std::to_string(g_winW) + "x" + std::to_string(g_winH));
     if (proc){ RECT r = {0,0,(LONG)g_winW,(LONG)g_winH}; proc(kFakeMonitor, nullptr, &r, lp); }
+    return TRUE;
+}
+// The Unicode twin of Bed_EnumDisplayDevicesA. It was missing, and that is not a
+// cosmetic gap: a game enumerating monitors in Unicode -- which is every modern one
+// -- fell through to the real slim Xbox user32, which has no desktop and therefore
+// no display devices, and concluded it had no monitors at all.
+static BOOL WINAPI Bed_EnumDisplayDevicesW(LPCWSTR, DWORD iDevNum, PDISPLAY_DEVICEW dd, DWORD){
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) <= 4)
+        Diag("BED EnumDisplayDevicesW i=" + std::to_string(iDevNum));
+    if (iDevNum != 0 || !dd) return FALSE;
+    wcscpy_s(dd->DeviceName, 32, L"\\\\.\\DISPLAY1");
+    wcscpy_s(dd->DeviceString, 128, L"Greenhouse Display");
+    dd->StateFlags = DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE;
     return TRUE;
 }
 static BOOL WINAPI Bed_EnumDisplayDevicesA(LPCSTR, DWORD iDevNum, PDISPLAY_DEVICEA dd, DWORD){
@@ -3300,6 +4911,23 @@ static BOOL WINAPI Bed_GetExitCodeProcess(HANDLE, LPDWORD);
 // ---------------------------------------------------------------------------
 // Shim table keyed by function name (dll-agnostic is fine for this surface).
 // ---------------------------------------------------------------------------
+// Nixxes' crash reporter (crs-client.dll, shipped with their PC ports).
+// crs_start_handler runs into an `int3; ud2` abort inside crs-client at
+// +0x187A9 (via +0x5BBA -> +0xD11E -> +0x56495) in this container, and the
+// loader can only report that as a guest breakpoint exception that kills the
+// game. Its whole job is to stand up an OUT-OF-PROCESS reporter, which we could
+// not host anyway -- CreateProcess here is an in-process surrogate -- and
+// Greenhouse already observes guest crashes itself.
+//
+// Refusing is cheap: the call site does `test al,al; setne bl`, and bl gates
+// exactly one optional follow-up crs call before being zeroed, so the game
+// carries on with crash reporting simply switched off.
+static bool Bed_crs_start_handler()
+{
+    Diag("BED crs_start_handler -> false (crash reporter not started)");
+    return false;
+}
+
 static const std::unordered_map<std::string, void*>& ShimTable()
 {
     static const std::unordered_map<std::string, void*> t = {
@@ -3333,6 +4961,7 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         // consulting ShimTable is the interception point.
         {"D3D11CreateDevice",             (void*)&Bed_D3D11CreateDevice},
         {"D3D11CreateDeviceAndSwapChain", (void*)&Bed_D3D11CreateDeviceAndSwapChain},
+        {"D3D12CreateDevice",             (void*)&Bed_D3D12CreateDevice},
         {"CreateDXGIFactory",             (void*)&Bed_CreateDXGIFactory},
         {"CreateDXGIFactory1",            (void*)&Bed_CreateDXGIFactory1},
         {"CreateDXGIFactory2",            (void*)&Bed_CreateDXGIFactory2},
@@ -3376,6 +5005,31 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"GetModuleFileNameA", (void*)&Bed_GetModuleFileNameA},
         {"MoveWindow",         (void*)&Bed_MoveWindow},
         {"SetWindowPos",       (void*)&Bed_SetWindowPos},
+        {"MessageBoxW",        (void*)&Bed_MessageBoxW},
+        {"MessageBoxA",        (void*)&Bed_MessageBoxA},
+        {"crs_start_handler",  (void*)&Bed_crs_start_handler},
+        // Display surrogate. MUST live here, not only in PatchModuleForGuest.
+        // The guest exe is mapped by our loader and resolves imports through
+        // ShimTable; PatchModuleForGuest only rewrites modules the HOST loaded.
+        // v0.0.110–113 put these in the wrong table, so EnumDisplayMonitors /
+        // GetMonitorInfoW / EnumDisplayDevicesW went to the real slim user32,
+        // which has no desktop. Spider-Man logged `Fake monitor used (0x0)` and
+        // opened a 37x1 window. The exe's own IAT has all of these.
+        {"EnumDisplayMonitors",  (void*)&Bed_EnumDisplayMonitors},
+        {"EnumDisplayDevicesW",  (void*)&Bed_EnumDisplayDevicesW},
+        {"EnumDisplayDevicesA",  (void*)&Bed_EnumDisplayDevicesA},
+        {"EnumDisplaySettingsW", (void*)&Bed_EnumDisplaySettingsW},
+        {"EnumDisplaySettingsA", (void*)&Bed_EnumDisplaySettingsA},
+        {"MonitorFromWindow",    (void*)&Bed_MonitorFromWindow},
+        {"MonitorFromPoint",     (void*)&Bed_MonitorFromPoint},
+        {"MonitorFromRect",      (void*)&Bed_MonitorFromRect},
+        {"GetMonitorInfoW",      (void*)&Bed_GetMonitorInfoW},
+        {"GetMonitorInfoA",      (void*)&Bed_GetMonitorInfoA},
+        {"GetSystemMetrics",     (void*)&Bed_GetSystemMetrics},
+        {"GetDisplayConfigBufferSizes", (void*)&Bed_GetDisplayConfigBufferSizes},
+        {"QueryDisplayConfig",   (void*)&Bed_QueryDisplayConfig},
+        {"DisplayConfigGetDeviceInfo", (void*)&Bed_DisplayConfigGetDeviceInfo},
+        {"GetDeviceCaps",        (void*)&Bed_GetDeviceCaps},
         // Input: gamepad via Windows.Gaming.Input, plus neutral keyboard/mouse.
         {"XInputGetState",         (void*)&Bed_XInputGetState},
         {"XInputSetState",         (void*)&Bed_XInputSetState},
@@ -3407,6 +5061,12 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"LoadLibraryA",               (void*)&Bed_LoadLibraryA},
         {"LoadLibraryW",               (void*)&Bed_LoadLibraryW},
         {"LoadLibraryExW",             (void*)&Bed_LoadLibraryExW},
+        {"LoadLibraryExA",             (void*)&Bed_LoadLibraryExA},
+        {"SetupDiGetClassDevsW",              (void*)&Bed_SetupDiGetClassDevsW},
+        {"SetupDiEnumDeviceInfo",             (void*)&Bed_SetupDiEnumDeviceInfo},
+        {"SetupDiGetDeviceRegistryPropertyW", (void*)&Bed_SetupDiGetDeviceRegistryPropertyW},
+        {"SetupDiGetDeviceInstanceIdW",       (void*)&Bed_SetupDiGetDeviceInstanceIdW},
+        {"SetupDiDestroyDeviceInfoList",      (void*)&Bed_SetupDiDestroyDeviceInfoList},
         {"ExitProcess",                (void*)&Bed_ExitProcess},
         // VFS
         {"CreateFileW",                (void*)&Bed_CreateFileW},
@@ -3518,6 +5178,8 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"RegEnumKeyExA", (void*)&Bed_RegEnumKeyExA}, {"RegEnumValueA", (void*)&Bed_RegEnumValueA},
         {"RegDeleteValueA", (void*)&Bed_RegDeleteValueA}, {"RegDeleteTreeA", (void*)&Bed_RegDeleteTreeA},
         {"SHGetKnownFolderPath", (void*)&Bed_SHGetKnownFolderPath},      // [DIAG] log persistent-data path build
+        {"SHGetFolderPathW", (void*)&Bed_SHGetFolderPathW},              // the CSIDL fallback for the same folders
+        {"SHCreateDirectoryExW", (void*)&Bed_SHCreateDirectoryExW},      // shell32's recursive mkdir
         {"DeleteFileW", (void*)&Bed_DeleteFileW}, {"MoveFileW", (void*)&Bed_MoveFileW},
         {"MoveFileExW", (void*)&Bed_MoveFileExW}, {"ReplaceFileW", (void*)&Bed_ReplaceFileW},
         {"CreateDirectoryW", (void*)&Bed_CreateDirectoryW}, {"RemoveDirectoryW", (void*)&Bed_RemoveDirectoryW},
@@ -3526,6 +5188,12 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"GetProcAddress", (void*)&Bed_GetProcAddress},
         {"LoadLibraryA", (void*)&Bed_LoadLibraryA},
         {"LoadLibraryW", (void*)&Bed_LoadLibraryW}, {"LoadLibraryExW", (void*)&Bed_LoadLibraryExW},
+        {"LoadLibraryExA", (void*)&Bed_LoadLibraryExA},
+        {"SetupDiGetClassDevsW", (void*)&Bed_SetupDiGetClassDevsW},
+        {"SetupDiEnumDeviceInfo", (void*)&Bed_SetupDiEnumDeviceInfo},
+        {"SetupDiGetDeviceRegistryPropertyW", (void*)&Bed_SetupDiGetDeviceRegistryPropertyW},
+        {"SetupDiGetDeviceInstanceIdW", (void*)&Bed_SetupDiGetDeviceInstanceIdW},
+        {"SetupDiDestroyDeviceInfoList", (void*)&Bed_SetupDiDestroyDeviceInfoList},
         // Guest CRTs call ExitProcess/TerminateProcess through their OWN IAT
         // when main returns -- without these two the process dies bypassing every
         // exit bed, and the loader never sees an exit code (cmd.exe was the
@@ -3587,10 +5255,37 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"IsIconic",           (void*)&Bed_IsIconic},
         {"MoveWindow",         (void*)&Bed_MoveWindow},
         {"SetWindowPos",       (void*)&Bed_SetWindowPos},
+        {"MessageBoxW",        (void*)&Bed_MessageBoxW},
+        {"MessageBoxA",        (void*)&Bed_MessageBoxA},
+        {"crs_start_handler",  (void*)&Bed_crs_start_handler},
+        // Display surrogate. These beds already existed, but only in
+        // PatchModuleForGuest -- which patches modules the HOST loaded (steamclient,
+        // UnityPlayer, guest-owned DLLs). The guest exe is mapped by our own loader
+        // and resolves its imports here, so for the guest itself every one of these
+        // went to the real slim Xbox user32, which has no desktop and answers
+        // "no monitors". Spider-Man believed it, fell back to a 0x0 "fake monitor"
+        // (its own log: `Fake monitor used (0x0), aspect ratio = -nan(ind)`), and
+        // derived a 37x1 window and a 37x1 swap chain from that NaN before quitting.
+        {"EnumDisplayMonitors",  (void*)&Bed_EnumDisplayMonitors},
+        {"EnumDisplayDevicesW",  (void*)&Bed_EnumDisplayDevicesW},
+        {"EnumDisplayDevicesA",  (void*)&Bed_EnumDisplayDevicesA},
+        {"EnumDisplaySettingsW", (void*)&Bed_EnumDisplaySettingsW},
+        {"EnumDisplaySettingsA", (void*)&Bed_EnumDisplaySettingsA},
+        {"MonitorFromWindow",    (void*)&Bed_MonitorFromWindow},
+        {"MonitorFromPoint",     (void*)&Bed_MonitorFromPoint},
+        {"MonitorFromRect",      (void*)&Bed_MonitorFromRect},
+        {"GetMonitorInfoW",      (void*)&Bed_GetMonitorInfoW},
+        {"GetMonitorInfoA",      (void*)&Bed_GetMonitorInfoA},
+        {"GetSystemMetrics",     (void*)&Bed_GetSystemMetrics},
+        {"GetDisplayConfigBufferSizes", (void*)&Bed_GetDisplayConfigBufferSizes},
+        {"QueryDisplayConfig",   (void*)&Bed_QueryDisplayConfig},
+        {"DisplayConfigGetDeviceInfo", (void*)&Bed_DisplayConfigGetDeviceInfo},
+        {"GetDeviceCaps",        (void*)&Bed_GetDeviceCaps},
         // Graphics: also patch the IAT path in case a guest imports D3D11 or
         // DXGI statically (Unity resolves both dynamically, but be safe).
         {"D3D11CreateDevice",             (void*)&Bed_D3D11CreateDevice},
         {"D3D11CreateDeviceAndSwapChain", (void*)&Bed_D3D11CreateDeviceAndSwapChain},
+        {"D3D12CreateDevice",             (void*)&Bed_D3D12CreateDevice},
         {"CreateDXGIFactory",             (void*)&Bed_CreateDXGIFactory},
         {"CreateDXGIFactory1",            (void*)&Bed_CreateDXGIFactory1},
         {"CreateDXGIFactory2",            (void*)&Bed_CreateDXGIFactory2},
@@ -3632,6 +5327,7 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"GetSystemMetrics",         (void*)&Bed_GetSystemMetrics},
         {"GetDisplayConfigBufferSizes",(void*)&Bed_GetDisplayConfigBufferSizes},
         {"QueryDisplayConfig",       (void*)&Bed_QueryDisplayConfig},
+        {"DisplayConfigGetDeviceInfo",(void*)&Bed_DisplayConfigGetDeviceInfo},
         {"MonitorFromWindow",        (void*)&Bed_MonitorFromWindow},
         {"MonitorFromPoint",         (void*)&Bed_MonitorFromPoint},
         {"MonitorFromRect",          (void*)&Bed_MonitorFromRect},
@@ -3639,6 +5335,7 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"GetMonitorInfoA",          (void*)&Bed_GetMonitorInfoA},
         {"EnumDisplayMonitors",      (void*)&Bed_EnumDisplayMonitors},
         {"EnumDisplayDevicesA",      (void*)&Bed_EnumDisplayDevicesA},
+        {"EnumDisplayDevicesW",      (void*)&Bed_EnumDisplayDevicesW},
         {"GetDeviceCaps",            (void*)&Bed_GetDeviceCaps},
     };
     int n = 0;
@@ -3668,8 +5365,45 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
 // by bare name. Fall back to an explicit full path in the guest directory, with
 // LOAD_WITH_ALTERED_SEARCH_PATH so that DLL's *own* dependencies resolve from
 // there too.
+// [PROBE] Deny-list, one basename per line in LocalState\ghdenydll.txt. Makes a
+// guest DLL look ABSENT rather than editing the game directory -- the game tree
+// is the user's Steam install and should stay pristine. Optional middleware
+// (NVIDIA Streamline, overlays) is normally guarded by a load check, so refusing
+// the load is the cheapest way to test whether it is on the critical path.
+// Delivered like ghguest.txt (WDP fsupload), so toggling costs an upload, not a
+// rebuild. Empty/missing file = deny nothing, i.e. no effect on any other title.
+static bool GuestDllDenied(const char* dll)
+{
+    static std::vector<std::string> deny;
+    static bool loaded = false;
+    if (!loaded){
+        loaded = true;
+        std::vector<uint8_t> ob;
+        if (ReadWholeFile(std::wstring(kLocalState) + L"ghdenydll.txt", ob, true)){
+            std::string cur;
+            for (uint8_t c : ob){                      // UTF-16LE or ASCII alike
+                if (c == 0 || c == '\r') continue;
+                if (c == '\n'){ if (!cur.empty()) deny.push_back(cur); cur.clear(); continue; }
+                cur += (char)((c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c);
+            }
+            if (!cur.empty()) deny.push_back(cur);
+            for (auto& d : deny) Diag("DENYDLL entry " + d);
+        }
+    }
+    if (deny.empty()) return false;
+    const char* b1 = strrchr(dll, '\\'); const char* b2 = strrchr(dll, '/');
+    const char* base = (b1 && b2) ? (b1 > b2 ? b1 : b2) : (b1 ? b1 : b2);
+    base = base ? base + 1 : dll;
+    std::string lb; for (const char* q = base; *q; ++q)
+        lb += (char)((*q >= 'A' && *q <= 'Z') ? *q - 'A' + 'a' : *q);
+    for (auto& d : deny)
+        if (lb == d){ Diag(std::string("DENYDLL refusing ") + base); return true; }
+    return false;
+}
+
 static HMODULE LoadGuestDll(const char* dll)
 {
+    if (GuestDllDenied(dll)){ SetLastError(ERROR_MOD_NOT_FOUND); return nullptr; }
     if (HMODULE m = GetModuleHandleA(dll)) return m;
     // SINGLETON FIX (2026-08-03): basename lookup too — a full-path request like
     // "E:\...\Plugins\x86_64\steam_api64.dll" must not bypass the already-loaded
@@ -3725,6 +5459,10 @@ static HMODULE LoadGuestDll(const char* dll)
     if (!m && !isAbs) m = LoadLibraryA(dll);   // last resort: normal search by bare name
     Diag(std::string(m ? "GUESTDLL loaded " : "GUESTDLL FAILED ") + dll +
          (m ? "" : " err=" + Hex(GetLastError())));
+    // A loaded module may have brought its own TLS directory with it, in which
+    // case ntdll just replaced our array. Put our slot back before the guest
+    // touches a thread-local again.
+    if (m) RepublishGuestTls(dll);
     if (!m){
         // Load the DLL as a plain file (no dep resolution) and walk its imports
         // ourselves to pinpoint the SPECIFIC procedure Windows can't resolve.
@@ -3868,9 +5606,63 @@ static int PatchModuleImport(HMODULE mod, const char* target, void* repl)
 // diagnostic; it changes no control flow. We log only the first few faults to
 // avoid flooding the diag on a fault storm.
 static volatile long g_vehLogged = 0;
+// Decode the DelayLoadInfo an MSVC delay-load failure carries.
+// VcppException(ERROR_SEVERITY_ERROR, ERROR_MOD_NOT_FOUND) is 0xC06D007E and
+// ...PROC_NOT_FOUND is 0xC06D007F; both put a DelayLoadInfo* in
+// ExceptionInformation[0]. Kept in its own function with no C++ objects so the
+// __try guarding those reads is legal -- the pointers come from a guest module's
+// stack and are not ours to trust. Rate-limited: a failing delay-load import can
+// be retried on every call site.
+static void DiagDelayLoadFailure(DWORD code, const void* raw)
+{
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) > 8) return;
+    char buf[512];
+    buf[0] = 0;
+    __try {
+        auto* dli = (const DelayLoadInfo*)raw;
+        const char* dll  = dli->szDll ? dli->szDll : "?";
+        const char* proc = (dli->dlp.fImportByName && dli->dlp.szProcName)
+                             ? dli->dlp.szProcName : nullptr;
+        if (proc)
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                        "DELAYLOAD FAILED code=%08lX dll=%s proc=%s hmod=%p err=%lu",
+                        code, dll, proc, (void*)dli->hmodCur, dli->dwLastError);
+        else
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                        "DELAYLOAD FAILED code=%08lX dll=%s ordinal=%lu hmod=%p err=%lu",
+                        code, dll, (unsigned long)dli->dlp.dwOrdinal,
+                        (void*)dli->hmodCur, dli->dwLastError);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "DELAYLOAD FAILED code=%08lX (DelayLoadInfo at %p unreadable)", code, raw);
+    }
+    Diag(buf);
+    // The delay-load helper runs on the importing module's own call stack, so the
+    // backtrace names WHICH module wanted the missing DLL -- the part the exception
+    // itself does not carry.
+    DiagGuestBacktrace("delayload");
+}
+
 static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
 {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
+    // Our own tracepoints come through here first. Check them before the fault
+    // filter below, which would otherwise drop EXCEPTION_BREAKPOINT on the floor
+    // as "a debug exception, not a genuine fault".
+    if (code == EXCEPTION_BREAKPOINT && HandleGuestTracepoint(ep))
+        return EXCEPTION_CONTINUE_EXECUTION;
+    // A delay-load failure carries the answer inside it. The MSVC helper raises
+    // these with a DelayLoadInfo in ExceptionInformation[0], naming the DLL and the
+    // export it could not find -- so decode it rather than reporting the bare
+    // 0xC06D007E, which says only "something, somewhere, failed to load". We do not
+    // handle it (a guest may have its own __pfnDliFailureHook); we just say what it
+    // was, then let it continue on its way.
+    if ((code == 0xC06D007Eu || code == 0xC06D007Fu) &&
+        ep->ExceptionRecord->NumberParameters >= 1) {
+        DiagDelayLoadFailure(code, (const void*)ep->ExceptionRecord->ExceptionInformation[0]);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     // Only care about genuine faults, not C++/debug/scripting exceptions.
     if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
         code != EXCEPTION_PRIV_INSTRUCTION && code != EXCEPTION_IN_PAGE_ERROR &&
@@ -3880,6 +5672,15 @@ static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
 
     void* addr = ep->ExceptionRecord->ExceptionAddress;
     std::string line = "VEH fault code=" + Hex(code) + " at=" + Hex((uint64_t)addr);
+    // Is the FAULTING TARGET inside something we published? This is the whole
+    // point of the span registry -- it turns "the AV is in ntdll and our TLS hack
+    // is suspicious" into a yes or a no.
+    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2){
+        uintptr_t tgt = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+        uintptr_t off = 0;
+        if (const char* w = TlsSpanFor(tgt, &off))
+            line += " [TARGET IS " + std::string(w) + " +" + Hex(off) + "]";
+    }
     // Resolve to module + offset so the address is meaningful across ASLR.
     HMODULE mod = nullptr;
     if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -3915,6 +5716,12 @@ static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
          " rsp=" + Hex(c->Rsp));
     Diag("  r8=" + Hex(c->R8) + " r9=" + Hex(c->R9) + " r12=" + Hex(c->R12) +
          " r14=" + Hex(c->R14) + " r15=" + Hex(c->R15));
+    Diag("  tid=" + std::to_string(GetCurrentThreadId()) + " rip=" + Hex(c->Rip));
+    uintptr_t ret = 0;
+    __try { ret = *(uintptr_t*)c->Rsp; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { ret = 0; }
+    Diag("  ret=" + NameForCodeAddr(ret));
+    DiagGuestBacktrace("VEH");
 #ifdef GH_LAUNCHER
     // Dedicated slots still let the game's handler run (it may print a Unity
     // stack, then TerminateProcess which we already bed). The launcher must
@@ -3943,8 +5750,6 @@ static bool CallGuestEntry(int (*fn)(), int* rcOut)
 // Manually-mapped guest PE. Left mapped after overlay-quit Bed_exit, so the
 // next launch cannot take the preferred ImageBase (Lethal Company = 0x140000000)
 // and the relocated CRT hits STATUS_BREAKPOINT (0x80000003).
-static uint8_t*          g_guestImageBase = nullptr;
-static DWORD             g_guestImageSize = 0;
 static PRUNTIME_FUNCTION g_guestFnTable   = nullptr;
 
 static BOOL SafeVirtualFree(void* p)
@@ -4044,6 +5849,293 @@ static bool PtrInLastGame(uintptr_t p)
     for (const auto& r : g_lastGameRanges)
         if (p >= r.lo && p < r.hi) return true;
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// "Who called exit()?" -- a guest that quits cleanly with a nonzero code has
+// already concluded something is wrong; the site of that conclusion is the whole
+// answer. There is no debugger on the console, so a raw return address buys
+// nothing -- an IMAGE-RELATIVE offset buys everything, because it drops straight
+// into an objdump of the same file on the dev box.
+//
+// This can unwind through the guest at all only because MapAndRun registers the
+// guest's .pdata with RtlAddFunctionTable; without it the walk would stop at the
+// first guest frame and report only our own bed, which is the one thing we
+// already know.
+// ---------------------------------------------------------------------------
+static std::string NameForCodeAddr(uintptr_t a)
+{
+    if (!a) return "0";
+    std::string s = Hex((uint64_t)a);
+
+    // The guest EXE is mapped by us, not by ntdll, so it is not on the PEB list.
+    if (g_guestImageBase && a >= (uintptr_t)g_guestImageBase &&
+        a <  (uintptr_t)g_guestImageBase + g_guestImageSize)
+        return s + " GUEST+" + Hex((uint32_t)(a - (uintptr_t)g_guestImageBase));
+
+    BYTE* teb = (BYTE*)NtCurrentTeb();
+    BYTE* peb = *(BYTE**)(teb + 0x60);
+    BYTE* ldr = peb ? *(BYTE**)(peb + 0x18) : nullptr;
+    if (!ldr) return s;
+    auto* head = (LIST_ENTRY*)(ldr + 0x10);   // InLoadOrderModuleList
+    int n = 0;
+    for (LIST_ENTRY* e = head->Flink; e && e != head && n < 512; e = e->Flink, ++n){
+        auto* ent = CONTAINING_RECORD(e, GhLdrEntry, InLoadOrder);
+        uintptr_t lo = (uintptr_t)ent->DllBase;
+        if (!lo || a < lo || a >= lo + ent->SizeOfImage) continue;
+        std::wstring w(ent->FullDllName.Buffer ? ent->FullDllName.Buffer : L"",
+                       ent->FullDllName.Buffer ? ent->FullDllName.Length / sizeof(wchar_t) : 0);
+        size_t sl = w.find_last_of(L"\\/");
+        if (sl != std::wstring::npos) w = w.substr(sl + 1);
+        return s + " " + std::string(w.begin(), w.end()) + "+" + Hex((uint32_t)(a - lo));
+    }
+    return s;
+}
+
+// ---------------------------------------------------------------------------
+// Guest tracepoints -- the debugger we do not have.
+//
+// There is no way to attach to a guest running inside the app container, so
+// every question of the form "which of these two branches was taken?" has been
+// answered by adding a bed, rebuilding, redeploying and reading a log: about
+// six minutes per bit of information, and only for code paths that happen to
+// cross an API boundary. A branch INSIDE the guest cannot be observed that way
+// at all.
+//
+// A tracepoint is one 0xCC written over a guest instruction. The VEH catches
+// EXCEPTION_BREAKPOINT, logs the register file, puts the original byte back and
+// resumes at the same address -- so the guest re-executes the real instruction
+// and never notices. One-shot on purpose: the interesting questions so far are
+// all "what was in AL the first time control reached here", and a one-shot
+// needs no single-step re-arm, which is the part that would be fragile across
+// threads.
+//
+// Addresses come from <LocalState>\ghtrace.txt, one per line, hex, with an
+// optional label after whitespace. A value inside the mapped guest image is
+// taken as an absolute VA (which is what an objdump of the same file prints);
+// anything smaller is taken as an RVA. Nothing is armed if the file is absent,
+// so this costs nothing when unused.
+// ---------------------------------------------------------------------------
+// A dump spec: ">**rcx+0x18:4" = take rcx, add 0x18, dereference twice, print 4
+// qwords. Deref depth is what makes this worth having -- guest state is reached
+// through chains of vtable and singleton pointers, and without it each link in
+// the chain costs a full build-deploy-launch round trip.
+struct GhTpDump {
+    std::string reg;      // register name, or empty when base is a literal
+    uintptr_t   lit = 0;  // literal base when reg is empty
+    intptr_t    off = 0;
+    int         deref = 0;
+    int         count = 4;
+    std::string text;     // the spec as written, for the log
+};
+struct GhTracepoint {
+    uintptr_t addr; uint8_t orig; std::string label; bool armed;
+    std::vector<GhTpDump> dumps;
+};
+static std::mutex                     g_tpMu;
+static std::vector<GhTracepoint>      g_tracepoints;
+
+static bool RegByName(const CONTEXT* c, const std::string& n, uintptr_t* out)
+{
+    static const struct { const char* n; size_t off; } kRegs[] = {
+        {"rax", offsetof(CONTEXT,Rax)}, {"rbx", offsetof(CONTEXT,Rbx)},
+        {"rcx", offsetof(CONTEXT,Rcx)}, {"rdx", offsetof(CONTEXT,Rdx)},
+        {"rsi", offsetof(CONTEXT,Rsi)}, {"rdi", offsetof(CONTEXT,Rdi)},
+        {"rbp", offsetof(CONTEXT,Rbp)}, {"rsp", offsetof(CONTEXT,Rsp)},
+        {"r8",  offsetof(CONTEXT,R8)},  {"r9",  offsetof(CONTEXT,R9)},
+        {"r10", offsetof(CONTEXT,R10)}, {"r11", offsetof(CONTEXT,R11)},
+        {"r12", offsetof(CONTEXT,R12)}, {"r13", offsetof(CONTEXT,R13)},
+        {"r14", offsetof(CONTEXT,R14)}, {"r15", offsetof(CONTEXT,R15)},
+        {"rip", offsetof(CONTEXT,Rip)},
+    };
+    for (auto& r : kRegs)
+        if (n == r.n){ *out = *(const uintptr_t*)((const BYTE*)c + r.off); return true; }
+    return false;
+}
+
+// Read one qword without trusting the pointer -- everything here comes from a
+// guest that may be halfway through initialising the very structure we walk.
+static bool SafeQword(uintptr_t a, uintptr_t* out)
+{
+    __try { *out = *(uintptr_t*)a; return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static GhTpDump ParseTpDump(const std::string& spec)
+{
+    GhTpDump d; d.text = spec;
+    size_t i = 0;
+    while (i < spec.size() && spec[i] == '*'){ ++d.deref; ++i; }
+    size_t end = spec.find_first_of("+-:", i);
+    std::string base = spec.substr(i, end == std::string::npos ? std::string::npos : end - i);
+    if (base.rfind("0x", 0) == 0 || base.rfind("0X", 0) == 0)
+        d.lit = (uintptr_t)strtoull(base.c_str() + 2, nullptr, 16);
+    else
+        d.reg = base;
+    if (end != std::string::npos && (spec[end] == '+' || spec[end] == '-')){
+        bool neg = spec[end] == '-';
+        size_t j = end + 1;
+        size_t stop = spec.find(':', j);
+        std::string o = spec.substr(j, stop == std::string::npos ? std::string::npos : stop - j);
+        uintptr_t v = (o.rfind("0x",0)==0 || o.rfind("0X",0)==0)
+                        ? (uintptr_t)strtoull(o.c_str()+2, nullptr, 16)
+                        : (uintptr_t)strtoull(o.c_str(), nullptr, 10);
+        d.off = neg ? -(intptr_t)v : (intptr_t)v;
+        end = stop;
+    }
+    if (end != std::string::npos && spec[end] == ':')
+        d.count = (int)strtoul(spec.c_str() + end + 1, nullptr, 10);
+    if (d.count < 1) d.count = 1;
+    if (d.count > 16) d.count = 16;
+    return d;
+}
+
+static void RunTpDump(const CONTEXT* c, const GhTpDump& d)
+{
+    uintptr_t a = d.lit;
+    if (!d.reg.empty() && !RegByName(c, d.reg, &a)){
+        Diag("    " + d.text + " -> unknown register '" + d.reg + "'");
+        return;
+    }
+    std::string trail = Hex((uint64_t)a);
+    for (int k = 0; k < d.deref; ++k){
+        uintptr_t v = 0;
+        if (!SafeQword(a, &v)){ Diag("    " + d.text + " -> " + trail + " UNREADABLE"); return; }
+        a = v; trail += " -> " + Hex((uint64_t)a);
+    }
+    a += d.off;
+    std::string line = "    " + d.text + " = " + trail +
+                       (d.off ? " (+" + Hex((uint64_t)(intptr_t)d.off) + " = " + Hex((uint64_t)a) + ")" : "") + " :";
+    for (int k = 0; k < d.count; ++k){
+        uintptr_t v = 0;
+        line += SafeQword(a + k*8, &v) ? " " + Hex((uint64_t)v) : " ??";
+    }
+    Diag(line);
+}
+
+static void ArmGuestTracepoints(uint8_t* base, size_t imageSize)
+{
+    std::vector<uint8_t> ob;
+    if (!ReadWholeFile(std::wstring(kLocalState) + L"ghtrace.txt", ob, true)) return;
+    std::string text;
+    for (uint8_t c : ob) if (c) text += (char)c;      // UTF-16LE or ASCII alike
+
+    size_t pos = 0;
+    while (pos <= text.size()){
+        size_t eol = text.find('\n', pos);
+        std::string line = text.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+        pos = (eol == std::string::npos) ? text.size() + 1 : eol + 1;
+        while (!line.empty() && (line.back()=='\r' || line.back()==' ')) line.pop_back();
+        if (line.empty() || line[0]=='#') continue;
+
+        // Split off any ">spec" dump requests before the label.
+        std::vector<GhTpDump> dumps;
+        for (;;){
+            size_t gt = line.find_last_of('>');
+            if (gt == std::string::npos) break;
+            std::string spec = line.substr(gt + 1);
+            size_t sp2 = spec.find_first_of(" \t");
+            if (sp2 != std::string::npos) spec.resize(sp2);
+            if (spec.empty()) break;
+            dumps.insert(dumps.begin(), ParseTpDump(spec));
+            line.resize(gt);
+            while (!line.empty() && (line.back()==' ' || line.back()=='\t')) line.pop_back();
+        }
+        size_t sp = line.find_first_of(" \t");
+        std::string num = line.substr(0, sp);
+        std::string label = (sp == std::string::npos) ? std::string() : line.substr(sp + 1);
+        uintptr_t v = (uintptr_t)strtoull(num.c_str(), nullptr, 16);
+        if (!v) continue;
+        uintptr_t a = (v >= (uintptr_t)base && v < (uintptr_t)base + imageSize)
+                        ? v : (uintptr_t)base + v;
+        if (a < (uintptr_t)base || a >= (uintptr_t)base + imageSize){
+            Diag("TRACE skip " + num + " (outside the guest image)");
+            continue;
+        }
+        DWORD old = 0;
+        if (!VirtualProtect((void*)a, 1, PAGE_EXECUTE_READWRITE, &old)){
+            Diag("TRACE arm FAILED " + Hex((uint64_t)a) + " protect err=" + std::to_string(GetLastError()));
+            continue;
+        }
+        GhTracepoint tp{ a, *(uint8_t*)a, label, true, dumps };
+        *(uint8_t*)a = 0xCC;
+        VirtualProtect((void*)a, 1, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), (void*)a, 1);
+        {
+            std::lock_guard<std::mutex> lk(g_tpMu);
+            g_tracepoints.push_back(tp);
+        }
+        Diag("TRACE armed " + Hex((uint64_t)a) + " (orig=" + Hex(tp.orig) + ")" +
+             (label.empty() ? "" : " " + label));
+    }
+}
+
+// Returns true if the breakpoint was ours and the context has been fixed up.
+static bool HandleGuestTracepoint(EXCEPTION_POINTERS* ep)
+{
+    // int3 leaves RIP one past the 0xCC -- but accept RIP itself too, so a
+    // breakpoint reported with RIP already rolled back still matches instead of
+    // silently falling through to "not ours".
+    uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+    GhTracepoint tp{};
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lk(g_tpMu);
+        for (auto& t : g_tracepoints)
+            if (t.armed && (t.addr == rip - 1 || t.addr == rip)){
+                t.armed = false; tp = t; found = true; break;
+            }
+    }
+    if (!found){
+        // Not one of ours. Say so, with the address -- an unattributed int3 that
+        // silently kills the guest is exactly the kind of thing that costs an
+        // afternoon. Rate-limited: an anti-debug loop could spin on this.
+        static LONG n = 0;
+        if (InterlockedIncrement(&n) <= 4){
+            Diag("TRACE int3 NOT ours at=" + Hex((uint64_t)ep->ExceptionRecord->ExceptionAddress) +
+                 " rip=" + Hex((uint64_t)rip) + " tid=" + std::to_string(GetCurrentThreadId()) +
+                 " armed=" + std::to_string(g_tracepoints.size()));
+            DiagGuestBacktrace("int3");
+        }
+        return false;
+    }
+    DWORD old = 0;
+    if (VirtualProtect((void*)tp.addr, 1, PAGE_EXECUTE_READWRITE, &old)){
+        *(uint8_t*)tp.addr = tp.orig;               // put the real instruction back
+        VirtualProtect((void*)tp.addr, 1, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), (void*)tp.addr, 1);
+    }
+    CONTEXT* c = ep->ContextRecord;
+    Diag("TRACE hit " + Hex((uint64_t)tp.addr) + (tp.label.empty() ? "" : " " + tp.label) +
+         " tid=" + std::to_string(GetCurrentThreadId()));
+    Diag("  rax=" + Hex(c->Rax) + " rbx=" + Hex(c->Rbx) + " rcx=" + Hex(c->Rcx) +
+         " rdx=" + Hex(c->Rdx) + " rsi=" + Hex(c->Rsi) + " rdi=" + Hex(c->Rdi));
+    Diag("  r8=" + Hex(c->R8) + " r9=" + Hex(c->R9) + " r10=" + Hex(c->R10) +
+         " r11=" + Hex(c->R11) + " rbp=" + Hex(c->Rbp) + " rsp=" + Hex(c->Rsp));
+    Diag("  r12=" + Hex(c->R12) + " r13=" + Hex(c->R13) + " r14=" + Hex(c->R14) +
+         " r15=" + Hex(c->R15));
+    for (const auto& d : tp.dumps) RunTpDump(c, d);
+    c->Rip = (DWORD64)tp.addr;                      // re-execute the real instruction
+    return true;
+}
+
+static void DiagGuestBacktrace(const char* who)
+{
+    using Fn = USHORT (NTAPI*)(ULONG, ULONG, PVOID*, PULONG);
+    static Fn cap = nullptr;
+    if (!cap){
+        if (HMODULE nt = GetModuleHandleW(L"ntdll.dll"))
+            cap = (Fn)GetProcAddress(nt, "RtlCaptureStackBackTrace");
+    }
+    if (!cap){ Diag(std::string("BT ") + who + " unavailable"); return; }
+    void* fr[48] = {};
+    USHORT n = 0;
+    __try { n = cap(0, 48, fr, nullptr); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { Diag(std::string("BT ") + who + " faulted"); return; }
+    Diag(std::string("BT ") + who + " tid=" + std::to_string(GetCurrentThreadId()) +
+         " frames=" + std::to_string(n));
+    for (USHORT i = 0; i < n; ++i)
+        Diag("  BT#" + std::to_string(i) + " " + NameForCodeAddr((uintptr_t)fr[i]));
 }
 
 static bool ReadTebStack(void* teb, uintptr_t* baseOut, uintptr_t* limitOut)
@@ -4574,6 +6666,10 @@ static bool MapAndRun(const std::vector<uint8_t>& file)
     }
     Diag("STAGE=protections_set");
 
+    // After protections, before the entry point: the image is final and nothing
+    // guest-side has run yet.
+    ArmGuestTracepoints(base, imageSize);
+
     // Register SEH unwind info for the guest's code range.
     auto& excDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
     if (excDir.Size){
@@ -4587,6 +6683,7 @@ static bool MapAndRun(const std::vector<uint8_t>& file)
     }
 
     RunGuestTlsCallbacks(base);
+
 
     // Call the entry point, guarded so guest exit() returns here. SEH lives in
     // CallGuestEntry (no C++ unwind objects) so an AV cannot kill the process.
@@ -4913,6 +7010,38 @@ static BOOL WINAPI Bed_GetExitCodeProcess(HANDLE h, LPDWORD ec)
 // ---------------------------------------------------------------------------
 // Small UTF-16 config files in LocalState let us switch guest/args over WDP
 // with no rebuild. ghguest.txt -> guest exe name; ghcmd.txt -> command line.
+// Switches a specific guest needs, keyed by exe basename.
+//
+// These are the game's own documented flags, not Greenhouse settings, and they are
+// here rather than in ghcmd.txt because ghcmd.txt REPLACES the whole command line:
+// setting it pins the launcher slot to one title, so the next game the picker starts
+// gets the previous game's argv[0]. Matched on basename so a title works from any
+// install path.
+//
+// Spider-Man Remastered: without -nolauncher, NxAppImpl runs Nixxes' pre-game
+// settings window (nx::NxLauncherImpl, vtable slot 3) before the game. That window
+// needs a real desktop, gets nothing here, returns 3 ("closed") where the caller
+// requires 2 ("play"), and the game exits cleanly with code 0 having never started.
+// Verified on the console: with the flag it skips straight past and reaches
+// RegisterClassEx / CreateWindowEx / CreateSwapChainForHwnd.
+static std::wstring GuestExtraArgs(const std::wstring& exePath)
+{
+    static const struct { const wchar_t* exe; const wchar_t* args; } kExtra[] = {
+        { L"spider-man.exe", L" -nolauncher" },
+    };
+    size_t sl = exePath.find_last_of(L"\\/");
+    std::wstring base = (sl == std::wstring::npos) ? exePath : exePath.substr(sl + 1);
+    for (auto& c : base) if (c >= L'A' && c <= L'Z') c = (wchar_t)(c + 32);
+    for (const auto& e : kExtra){
+        if (base != e.exe) continue;
+        std::wstring args(e.args);
+        Diag("CMDLINE extra args for " + std::string(base.begin(), base.end()) + ":" +
+             std::string(args.begin(), args.end()));
+        return e.args;
+    }
+    return L"";
+}
+
 static std::wstring ReadCfgW(const wchar_t* file, const std::wstring& dflt)
 {
     std::wstring p = std::wstring(kLocalState) + file;
@@ -5910,6 +8039,7 @@ static void RunGuest()
     g_guestCmdLineW = ReadCfgW(L"ghcmd.txt", gp);
     if (g_guestCmdLineW == L"7za" || g_guestCmdLineW == L"7za.exe")
         g_guestCmdLineW = gp;
+    g_guestCmdLineW += GuestExtraArgs(gp);
 #else
     g_guestCmdLineW = ReadCfgW(L"ghcmd.txt", L"7za");
 #endif
