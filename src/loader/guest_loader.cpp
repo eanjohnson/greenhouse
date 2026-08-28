@@ -2642,6 +2642,13 @@ static HRESULT GfxPresent(UINT sync)
 // SwapProxy / FactoryProxy below can reference them: SwapProxy::GetHwnd returns
 // kFakeHwnd, and CreateSwapChainForHwnd stores it into the legacy DESC.
 static UINT g_winW = 1920, g_winH = 1080;
+// #149: the visual-compromise knobs. g_winW/g_winH above is the single point
+// every display bed answers from, so setting it is how the guest is told it is
+// rendering at 720p; g_vramCapMb is the budget AdapterProxy advertises, which is
+// what the guest sizes its D3D12 heap pools against. Both are resolved once from
+// LocalState just before the guest starts (GhInitGuestDisplay), because
+// AdapterProxy::VramCap is defined long before GhCfgNum is.
+static unsigned g_vramCapMb = 0;               // 0 = keep the built-in 2048
 static const HWND kFakeHwnd = (HWND)0x00477A01;
 
 // ------------------------------------------------------------------
@@ -3245,14 +3252,23 @@ struct AdapterProxy : IDXGIAdapter4
     // the guest then sizes itself to fit. GH_VRAM_MB overrides the number.
     static UINT64 VramCap()
     {
-        static UINT64 cap = 0;
-        if (!cap){
+        // Re-resolve whenever the override changes. The launcher's OWN graphics
+        // init queries the adapter long before the guest starts, so a plain
+        // one-shot static latches 2048 MB before GhInitGuestDisplay has read
+        // gh_vram_mb.txt and the knob silently does nothing (#149).
+        static UINT64   cap = 0;
+        static unsigned seen = ~0u;
+        if (!cap || seen != g_vramCapMb){
+            seen = g_vramCapMb;
             cap = 2048ull << 20;
             char buf[32] = {};
             if (GetEnvironmentVariableA("GH_VRAM_MB", buf, sizeof buf) > 0){
                 unsigned long mb = strtoul(buf, nullptr, 10);
                 if (mb >= 256 && mb <= 16384) cap = (UINT64)mb << 20;
             }
+            // gh_vram_mb.txt wins over the env: it is the knob a sweep can turn
+            // between runs without a rebuild (#149).
+            if (g_vramCapMb >= 256 && g_vramCapMb <= 16384) cap = (UINT64)g_vramCapMb << 20;
             Diag("VRAM cap advertised to the guest = " + Hex(cap));
         }
         return cap;
@@ -6346,6 +6362,163 @@ static void GhMemProbeReport(const char* where)
     Diag(ln);
 }
 
+// ---------------------------------------------------------------------------
+// #148: is there memory in this container that is not commit-charged?
+//
+// AWE (AllocateUserPhysicalPages) hands back PHYSICAL pages. They are not
+// charged against commit -- and commit is exactly what AppMemoryUsageLimit
+// counts (#143). If the app container grants it, the pager could back its
+// granules with AWE pages instead of MEM_COMMIT and the 5 GB ceiling would stop
+// applying to guest CPU allocations altogether.
+//
+// It wants SeLockMemoryPrivilege, which an app container almost certainly
+// refuses, so this is a yes/no probe and not a design. Two things make it worth
+// running anyway: it is cheap, and the question it answers is not "does the
+// call succeed" but "does the memory cost budget" -- so it touches every page
+// and reports the budget either side. A flat reading is the whole prize.
+//
+// Every entry point is resolved by name. None of these are in the UWP API set,
+// and a static import would fail the entire loader rather than answer anything.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// #149: the visual compromises, made once, just before the guest starts.
+//
+// Resolution is not something we ask the OS for and pass on -- every display
+// answer the guest ever gets is ours: EnumDisplaySettingsW/A, GetSystemMetrics,
+// GetMonitorInfoW/A, GetClientRect, GetWindowRect, OutputProxy::GetDesc and
+// GetDisplayModeList, and the swapchain DESC. All of them read g_winW/g_winH.
+// So telling the guest it is on a 1280x720 display is one assignment, and the
+// game then sizes its own back buffer, G-buffer, shadow maps and post chain to
+// match -- which is where the D3D12 heap memory actually goes.
+//
+// The present path does not care: EnsureGuestRT12 takes the swapchain size it
+// is given, and GfxPresent already scales render-target space to window space,
+// so the real CoreWindow swapchain stays 1920x1080 and the console still
+// outputs 1080p. The guest simply renders fewer pixels into it.
+//
+// Deliberately read HERE and not at static-init time: the launcher's own picker
+// has already drawn by now, and AdapterProxy::VramCap is defined far above
+// GhCfgNum so it cannot read a config file itself.
+// ---------------------------------------------------------------------------
+static void GhInitGuestDisplay()
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+
+    unsigned w = GhCfgNum(L"gh_disp_w.txt", "GH_DISP_W", 0);
+    unsigned h = GhCfgNum(L"gh_disp_h.txt", "GH_DISP_H", 0);
+    if (w >= 320 && w <= 7680 && h >= 240 && h <= 4320){
+        g_winW = w; g_winH = h;
+        Diag("DISPLAY guest told " + std::to_string(w) + "x" + std::to_string(h) +
+             " (CoreWindow stays 1920x1080; GfxPresent scales)");
+    } else {
+        if (w || h) Diag("DISPLAY gh_disp_w/h out of range (" + std::to_string(w) +
+                         "x" + std::to_string(h) + ") -- keeping " +
+                         std::to_string(g_winW) + "x" + std::to_string(g_winH));
+    }
+
+    g_vramCapMb = GhCfgNum(L"gh_vram_mb.txt", "GH_VRAM_MB_FILE", 0);
+    if (g_vramCapMb) Diag("DISPLAY vram budget override " + std::to_string(g_vramCapMb) + " MB");
+}
+
+static void GhProbeAwe()
+{
+    if (!GhCfgNum(L"gh_awe.txt", "GH_AWE", 0)) return;
+    Diag("AWE ==== physical-page probe (#148) ====");
+    GhMemProbeReport("awe-baseline");
+
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    HMODULE kb  = GetModuleHandleW(L"kernelbase.dll");
+    auto sym = [&](const char* n) -> void* {
+        void* p = kb ? (void*)GetProcAddress(kb, n) : nullptr;
+        if (!p && k32) p = (void*)GetProcAddress(k32, n);
+        return p;
+    };
+    using AllocFn = BOOL (WINAPI*)(HANDLE, PULONG_PTR, PULONG_PTR);
+    using MapFn   = BOOL (WINAPI*)(PVOID,  ULONG_PTR,  PULONG_PTR);
+    using FreeFn  = BOOL (WINAPI*)(HANDLE, PULONG_PTR, PULONG_PTR);
+    auto pAlloc = (AllocFn)sym("AllocateUserPhysicalPages");
+    auto pMap   = (MapFn)  sym("MapUserPhysicalPages");
+    auto pFree  = (FreeFn) sym("FreeUserPhysicalPages");
+    Diag("AWE exports alloc=" + Hex((uintptr_t)pAlloc) +
+         " map=" + Hex((uintptr_t)pMap) + " free=" + Hex((uintptr_t)pFree));
+    if (!pAlloc || !pMap || !pFree){ Diag("AWE VERDICT: exports missing"); return; }
+
+    // advapi32 is likewise not guaranteed inside the container: its absence is
+    // data, not an error, and the allocation below is attempted either way.
+    {
+        HMODULE ad = LoadLibraryW(L"advapi32.dll");
+        using OpenFn   = BOOL (WINAPI*)(HANDLE, DWORD, PHANDLE);
+        using LookupFn = BOOL (WINAPI*)(LPCWSTR, LPCWSTR, PLUID);
+        using AdjFn    = BOOL (WINAPI*)(HANDLE, BOOL, PTOKEN_PRIVILEGES, DWORD,
+                                        PTOKEN_PRIVILEGES, PDWORD);
+        auto pOpen   = ad ? (OpenFn)  GetProcAddress(ad, "OpenProcessToken")      : nullptr;
+        auto pLookup = ad ? (LookupFn)GetProcAddress(ad, "LookupPrivilegeValueW") : nullptr;
+        auto pAdj    = ad ? (AdjFn)   GetProcAddress(ad, "AdjustTokenPrivileges") : nullptr;
+        if (!pOpen || !pLookup || !pAdj){
+            Diag("AWE privilege: advapi32 entry points unavailable");
+        } else {
+            HANDLE tok = nullptr;
+            if (!pOpen(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)){
+                Diag("AWE privilege: OpenProcessToken err=" + Hex(GetLastError()));
+            } else {
+                TOKEN_PRIVILEGES tp{};
+                tp.PrivilegeCount = 1;
+                tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                if (!pLookup(nullptr, L"SeLockMemoryPrivilege", &tp.Privileges[0].Luid)){
+                    Diag("AWE privilege: LookupPrivilegeValue err=" + Hex(GetLastError()));
+                } else {
+                    SetLastError(0);
+                    BOOL  ok = pAdj(tok, FALSE, &tp, sizeof tp, nullptr, nullptr);
+                    DWORD e  = GetLastError();
+                    Diag(std::string("AWE privilege: AdjustTokenPrivileges -> ") +
+                         (ok ? "TRUE" : "FALSE") + " err=" + Hex(e) +
+                         (e == ERROR_NOT_ALL_ASSIGNED
+                            ? " (SeLockMemoryPrivilege NOT held -- the container does not grant it)" : ""));
+                }
+                CloseHandle(tok);
+            }
+        }
+    }
+
+    SYSTEM_INFO si{}; GetSystemInfo(&si);
+    const SIZE_T page  = si.dwPageSize ? si.dwPageSize : 4096;
+    const SIZE_T bytes = 64ull << 20;
+    ULONG_PTR want = (ULONG_PTR)(bytes / page), got = want;
+    std::vector<ULONG_PTR> pfn((size_t)want, 0);
+    if (!pAlloc(GetCurrentProcess(), &got, pfn.data())){
+        Diag("AWE VERDICT: AllocateUserPhysicalPages FAILED err=" + Hex(GetLastError()) +
+             " (asked " + std::to_string((uint64_t)want) + " pages of " +
+             std::to_string((uint64_t)page) + ")");
+        return;
+    }
+    Diag("AWE allocated pages=" + std::to_string((uint64_t)got) +
+         " of " + std::to_string((uint64_t)want));
+    GhMemProbeReport("awe-allocated");
+
+    void* win = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_PHYSICAL, PAGE_READWRITE);
+    if (!win){
+        Diag("AWE MEM_PHYSICAL reserve failed err=" + Hex(GetLastError()));
+    } else if (!pMap(win, got, pfn.data())){
+        Diag("AWE MapUserPhysicalPages failed err=" + Hex(GetLastError()));
+    } else {
+        volatile uint8_t* q = (volatile uint8_t*)win;
+        const SIZE_T span = (SIZE_T)got * page;
+        for (SIZE_T o = 0; o < span; o += page) q[o] = 0xA5;
+        int bad = 0;
+        for (SIZE_T o = 0; o < span; o += page) if (q[o] != 0xA5) ++bad;
+        Diag("AWE mapped and touched " + Hex((uint64_t)span) +
+             " readback-bad=" + std::to_string(bad));
+        GhMemProbeReport("awe-touched");
+        pMap(win, got, nullptr);                 // unmap before releasing the window
+    }
+    if (win) VirtualFree(win, 0, MEM_RELEASE);
+    pFree(GetCurrentProcess(), &got, pfn.data());
+    GhMemProbeReport("awe-freed");
+    Diag("AWE VERDICT: physical pages ARE available -- read awe-baseline vs awe-touched");
+}
+
 static void GhProbeFileBackedArena()
 {
     if (!GhCfgNum(L"gh_memprobe.txt", "GH_MEMPROBE", 0)) return;
@@ -8539,6 +8712,7 @@ static void SnapshotHostThreads()
             // #143. Off its own thread: it writes and dirties gigabytes and must
             // not stall activation. Opt-in, so an ordinary launch never sees it.
             std::thread([]{ GhProbeFileBackedArena(); }).detach();
+            std::thread([]{ GhProbeAwe(); }).detach();          // #148
         }
     }
 }
@@ -11159,6 +11333,7 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
             g_launcherSelectedGuest = picked;
             Diag("LAUNCHER handoff guest='" + std::string(g_launcherSelectedGuest.begin(), g_launcherSelectedGuest.end()) + "'");
             SnapshotHostThreads();
+            GhInitGuestDisplay();               // #149: 720p / VRAM knobs, before any bed answers
             g_guestSessionLive = true;
             g_guestRunning = true;
             std::thread([]{
