@@ -3496,12 +3496,39 @@ struct AdapterProxy : IDXGIAdapter4
         if (!real3) return E_NOTIMPL;
         HRESULT hr = real3->QueryVideoMemoryInfo(node, g, i);
         if (SUCCEEDED(hr) && i && g == DXGI_MEMORY_SEGMENT_GROUP_LOCAL){
-            if (i->Budget > VramCap())                  i->Budget = VramCap();
-            if (i->AvailableForReservation > VramCap()) i->AvailableForReservation = VramCap();
+            const UINT64 cap        = VramCap();
+            const UINT64 realBudget = i->Budget;
+            const UINT64 realUsage  = i->CurrentUsage;
+            if (i->Budget > cap)                  i->Budget = cap;
+            if (i->AvailableForReservation > cap) i->AvailableForReservation = cap;
+            // #157: CurrentUsage arrived straight from the real adapter and counts
+            // the whole process -- the launcher's own D3D included -- while Budget
+            // is a number we invented. Handing both through unchanged gives the
+            // guest an impossible state whenever the cap is below real usage:
+            // 2.57 GiB used against a 1 GiB budget. Spider-Man reads exactly that
+            // and puts up "The game has crashed due to using more video memory than
+            // your system can currently support", then writes through a null in its
+            // own crash path (GUEST+0x1CBDD53).
+            //
+            // Keep the pair self-consistent by reporting usage in the same units as
+            // the budget we advertise: the real fraction of the real budget, scaled
+            // onto ours, and never closer than 1/16 to the top so a guest that
+            // computes headroom always has some. This preserves the pressure signal
+            // -- if the machine really is filling up, the fraction still climbs --
+            // without inventing a shortage that does not exist at our scale.
+            if (realBudget){
+                UINT64 scaled = (UINT64)((double)realUsage * (double)cap / (double)realBudget);
+                const UINT64 ceiling = cap - cap / 16;
+                if (scaled > ceiling) scaled = ceiling;
+                i->CurrentUsage = scaled;
+            } else if (i->CurrentUsage > cap - cap / 16){
+                i->CurrentUsage = cap - cap / 16;
+            }
             static LONG n = 0;
-            if (InterlockedIncrement(&n) <= 4)
+            if (InterlockedIncrement(&n) <= 6)
                 Diag("AdapterProxy QueryVideoMemoryInfo -> budget=" + Hex((uint64_t)i->Budget) +
-                     " use=" + Hex((uint64_t)i->CurrentUsage));
+                     " use=" + Hex((uint64_t)i->CurrentUsage) +
+                     " (real budget=" + Hex(realBudget) + " use=" + Hex(realUsage) + ")");
         }
         return hr;
     }
