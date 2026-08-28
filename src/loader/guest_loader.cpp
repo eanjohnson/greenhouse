@@ -41,6 +41,7 @@
 #endif
 #include <windows.h>
 #include <tlhelp32.h>
+#include <xmmintrin.h>   // _mm_getcsr/_mm_setcsr, for the #154 invalid-op trap
 #include <functional>
 #include <atomic>
 #include <winternl.h>
@@ -1893,6 +1894,35 @@ static void RepublishGuestTls(const char* why)
          " inherited=" + std::to_string(copied));
 }
 
+// ---------------------------------------------------------------------------
+// #154: make the CPU name the instruction that manufactures the NaN.
+//
+// Spider-Man's main thread spins forever comparing a NaN, and the projection it
+// reads has 0xFFC00000 -- x86's "real indefinite" -- in exactly its vertical
+// terms. That value is not garbage memory; it is what the CPU produces for an
+// INVALID OPERATION (0/0, inf-inf, inf*0, sqrt of a negative). Three rounds of
+// guessing which display API supplied the zero were all wrong -- the mode list,
+// the registry, and finally GetContainingOutput, which the game never even calls
+// -- so stop guessing and let the faulting instruction report itself.
+//
+// MXCSR bit 7 (IM) masks invalid-operation. Cleared, the offending divss raises
+// #XM precisely: reported AT the instruction, with its result not yet written.
+// The handler logs RIP, clears the sticky flags (bits 0-5) so the instruction can
+// retry, and once the budget is spent sets IM again so the retry completes with
+// the ordinary masked result. The guest therefore ends up with exactly the same
+// NaN it always had; the only difference is that we now know where it was born.
+//
+// Off unless gh_fptrap.txt / GH_FPTRAP asks for it. This is a debugging trap, and
+// a guest that legitimately makes NaNs would pay an exception for every one.
+static volatile LONG g_fpTrapMax  = 0;   // how many to report; 0 = feature off
+static volatile LONG g_fpTrapHits = 0;
+
+static void GhFpTrapArmThisThread()
+{
+    if (!g_fpTrapMax) return;
+    _mm_setcsr(_mm_getcsr() & ~0x003Fu & ~0x0080u);   // clear sticky flags, unmask IM
+}
+
 // Guest-created threads need the same treatment before they touch guest code,
 // so CreateThread is shimmed to install TLS inside the new thread's stub.
 struct GuestThreadStart { LPTHREAD_START_ROUTINE fn; LPVOID arg; };
@@ -1902,6 +1932,7 @@ static DWORD WINAPI GuestThreadStub(LPVOID p)
     delete (GuestThreadStart*)p;
     void** old = nullptr;
     InstallGuestTlsForThread(&old);
+    GhFpTrapArmThisThread();
     DWORD rc = s.fn(s.arg);
     RestoreThreadTls(old);
     return rc;
@@ -6279,14 +6310,45 @@ static BOOL WINAPI Bed_EnumDisplayDevicesA(LPCSTR, DWORD iDevNum, PDISPLAY_DEVIC
     dd->StateFlags = DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE;
     return TRUE;
 }
+// #154: this bed answered the pixel questions and returned 0 for everything
+// else, and that silent 0 is what hung Spider-Man for weeks.
+//
+// The game asks GetDeviceCaps for HORZSIZE/VERTSIZE -- the screen's PHYSICAL size
+// in millimetres -- and divides one by the other to recover the display's true
+// aspect ratio (the standard way to spot non-square pixels). We answered 0 for
+// both, so at GUEST+0x1CEF501 it computed 0/0, got 0xFFC00000 (x86's real
+// indefinite), and propagated it into the vertical terms of its projection
+// matrix. The horizontal terms were always clean because only the vertical ones
+// are scaled by aspect; the main thread then spun forever comparing the NaN.
+//
+// So report a physical size consistent with the resolution we already claim, at
+// the standard 96 DPI: mm = px * 25.4 / 96. The integer rounding is the same
+// quantisation real hardware reports, and leaves the ratio well inside any
+// sane tolerance (1280x720 -> 338x190 -> 1.7789 against a true 1.7778).
+//
+// And do NOT answer an unknown index with a silent 0 ever again: name it once in
+// the log. A bed that invents a plausible-looking zero is indistinguishable from
+// a correct answer at the call site, and the damage surfaces arbitrarily far away.
 static int WINAPI Bed_GetDeviceCaps(HDC, int idx){
     switch (idx){
         case HORZRES:   return (int)g_winW;
         case VERTRES:   return (int)g_winH;
+        case HORZSIZE:  return (int)((g_winW * 254 + 480) / 960);   // mm, 96 DPI
+        case VERTSIZE:  return (int)((g_winH * 254 + 480) / 960);   // mm, 96 DPI
         case BITSPIXEL: return 32;
         case PLANES:    return 1;
+        case COLORRES:  return 24;
+        case VREFRESH:  return 60;
         case LOGPIXELSX: case LOGPIXELSY: return 96;
-        default: return 0;
+        default: {
+            static std::atomic<uint64_t> seen{0};
+            if (idx >= 0 && idx < 64){
+                uint64_t bit = 1ull << idx;
+                if (!(seen.fetch_or(bit) & bit))
+                    Diag("BED GetDeviceCaps UNANSWERED index " + std::to_string(idx) + " -> 0");
+            }
+            return 0;
+        }
     }
 }
 
@@ -8609,6 +8671,57 @@ static void GhWatchReport(EXCEPTION_POINTERS* ep)
 static DWORD g_vehTls = TLS_OUT_OF_INDEXES;
 static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep);
 
+// Separate from the handler because a function using __try may not also need
+// C++ object unwinding, and the caller builds std::strings. RIP is by definition
+// executing, so this is reading mapped memory -- unlike the gh_peek probes.
+static bool GhSafeReadCode(const void* p, unsigned char* out, int n)
+{
+    __try {
+        for (int i = 0; i < n; ++i) out[i] = ((const unsigned char*)p)[i];
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// True if this was an unmasked SSE invalid-operation that we consumed.
+static bool GhFpTrapHandle(EXCEPTION_POINTERS* ep)
+{
+    if (!g_fpTrapMax) return false;
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != (DWORD)EXCEPTION_FLT_INVALID_OPERATION &&
+        code != (DWORD)STATUS_FLOAT_MULTIPLE_TRAPS &&
+        code != (DWORD)STATUS_FLOAT_MULTIPLE_FAULTS) return false;
+
+    CONTEXT* cx = ep->ContextRecord;
+    LONG n = InterlockedIncrement(&g_fpTrapHits);
+    if (n <= g_fpTrapMax){
+        uintptr_t rip = (uintptr_t)cx->Rip;
+        // The opcode bytes matter as much as the address: divss says 0/0, subss
+        // says inf-inf, sqrtss says a negative radicand, and comiss says someone
+        // is merely COMPARING a NaN that already existed. The address alone
+        // cannot tell those apart, and only the first of them is the culprit.
+        unsigned char op[12];
+        std::string bytes;
+        if (GhSafeReadCode((const void*)rip, op, 12)){
+            char b[8];
+            for (int i = 0; i < 12; ++i){ std::snprintf(b, sizeof(b), "%02X ", op[i]); bytes += b; }
+        } else bytes = "(unreadable) ";
+        Diag("FPTRAP #" + std::to_string(n) + " invalid-op tid=" +
+             std::to_string(GetCurrentThreadId()) + " at " + Hex((uint64_t)rip) +
+             " " + NameForCodeAddr(rip) + " [" + bytes + "] mxcsr=" + Hex((uint32_t)cx->MxCsr));
+    }
+    // Write BOTH copies. On x64 the CONTEXT carries MXCSR twice -- a copy at
+    // +0x034 and the authoritative word at +0x118 inside FltSave (the SDK names
+    // them AMD64_MxCsr_copy and AMD64_MxCsr). NtContinue restores the FltSave
+    // one, so setting only the copy would leave the mask unchanged, the faulting
+    // instruction would raise #XM again on retry, and the trap meant to diagnose
+    // a hang would itself become an unbreakable one.
+    DWORD mx = (cx->MxCsr & ~0x003Fu);            // clear sticky flags so it can retry
+    if (n >= g_fpTrapMax) mx |= 0x0080u;          // budget spent: re-mask; retry completes
+    cx->MxCsr = mx;
+    cx->FltSave.MxCsr = mx;
+    return true;
+}
+
 static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
 {
     // #145 demand-commit, first and cheapest. It has to run ahead of the
@@ -8618,6 +8731,9 @@ static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
         ep->ExceptionRecord->NumberParameters >= 2 &&
         GhLazyFault((void*)ep->ExceptionRecord->ExceptionInformation[1]))
         return EXCEPTION_CONTINUE_EXECUTION;
+    // #154, also ahead of the reentrancy guard: an invalid-op trap is not a
+    // crash, and it returns the thread straight back to the faulting instruction.
+    if (GhFpTrapHandle(ep)) return EXCEPTION_CONTINUE_EXECUTION;
     if (g_vehTls == TLS_OUT_OF_INDEXES) g_vehTls = TlsAlloc();
     if (g_vehTls == TLS_OUT_OF_INDEXES) return CrashObserverVehInner(ep);
     if (TlsGetValue(g_vehTls)) return EXCEPTION_CONTINUE_SEARCH;   // our own probe
@@ -9116,6 +9232,48 @@ static void GhForEachRequestLine(const wchar_t* name,
     }
 }
 
+// Arming a thread once at its start is not enough on its own: MXCSR is
+// per-thread state that the guest's OWN CRT startup may reset to the default
+// all-masked 0x1F80 the moment it runs, which would leave us waiting for a trap
+// that can never fire. So re-apply it from the poller until the first one lands,
+// then stop -- once we have hit, the trap is demonstrably live and suspending
+// forty threads every tick is pure perturbation.
+static void GhFpTrapArmAllThreads()
+{
+    DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te{}; te.dwSize = sizeof(te);
+    int armed = 0;
+    if (Thread32First(snap, &te)) do {
+        if (te.th32OwnerProcessID != pid) continue;
+        if (te.th32ThreadID == self) continue;
+        HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                               THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
+        if (!th) continue;
+        if (SuspendThread(th) != (DWORD)-1){
+            CONTEXT c{};
+            c.ContextFlags = CONTEXT_CONTROL | CONTEXT_FLOATING_POINT;
+            if (GetThreadContext(th, &c)){
+                c.ContextFlags = CONTEXT_CONTROL | CONTEXT_FLOATING_POINT;
+                // FltSave.MxCsr is the word SetThreadContext actually restores;
+                // the top-level MxCsr is only a copy. Read and write both.
+                DWORD cur  = c.FltSave.MxCsr;
+                DWORD want = (cur & ~0x003Fu) & ~0x0080u;
+                if (want != cur){
+                    c.MxCsr = want; c.FltSave.MxCsr = want;
+                    if (SetThreadContext(th, &c)) ++armed;
+                }
+            }
+            ResumeThread(th);
+        }
+        CloseHandle(th);
+    } while (Thread32Next(snap, &te));
+    CloseHandle(snap);
+    static int said = 0;
+    if (armed && said < 4){ ++said; Diag("FPTRAP re-armed " + std::to_string(armed) + " thread(s)"); }
+}
+
 static void GhPollWatchRequest()
 {
     int n = 0;
@@ -9205,6 +9363,7 @@ static void SnapshotHostThreads()
                     GhPollThreadDumpRequest();
                     GhPollWatchRequest();
                     GhPollPokeRequest();
+                    if (g_fpTrapMax && g_fpTrapHits == 0) GhFpTrapArmAllThreads();
                     GhPollPeekRequest();
                     Sleep(3000);
                 }
@@ -10144,6 +10303,7 @@ static bool MapAndRun(std::vector<uint8_t>& file)
     if (setjmp(g_guestReturn) == 0){
         auto fn = reinterpret_cast<int(*)()>(entry);
         int rc = 0;
+        GhFpTrapArmThisThread();     // #154: this thread is the guest's main thread
         if (!CallGuestEntry(fn, &rc)) {
             Diag("STAGE=guest_seh code=" + Hex((uint32_t)rc));
             g_guestCrashed = true;
@@ -11834,6 +11994,10 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
             Diag("LAUNCHER handoff guest='" + std::string(g_launcherSelectedGuest.begin(), g_launcherSelectedGuest.end()) + "'");
             SnapshotHostThreads();
             GhInitGuestDisplay();               // #149: 720p / VRAM knobs, before any bed answers
+            g_fpTrapMax = (LONG)GhCfgNum(L"gh_fptrap.txt", "GH_FPTRAP", 0);
+            if (g_fpTrapMax)
+                Diag("FPTRAP on: will report the first " + std::to_string(g_fpTrapMax) +
+                     " SSE invalid-operation faults, then re-mask and run on");
             g_guestSessionLive = true;
             g_guestRunning = true;
             std::thread([]{
