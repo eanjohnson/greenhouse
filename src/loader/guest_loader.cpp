@@ -8393,6 +8393,111 @@ static BOOL SafeVirtualFree(void* p)
     return ok;
 }
 
+// ---------------------------------------------------------------------------
+// All-thread stack dump (#147).
+//
+// The guest can now go quiet without crashing: no exception, no exit, just
+// every counter frozen and Present never called. A crash names its own site;
+// a deadlock names nothing, so ask every thread where it is.
+//
+// The hard constraint is that a suspended thread may be holding the CRT heap
+// lock or our own Diag lock. Allocating or logging while it is suspended
+// deadlocks the very process we are trying to diagnose. So the shape is
+// strictly: suspend -> capture into a fixed-size array, touching nothing but
+// memory -> resume -> only then symbolise and log.
+// ---------------------------------------------------------------------------
+static bool IsSnapshottedHostThread(DWORD tid);                 // fwd
+
+static bool GhCaptureStack(HANDLE h, uintptr_t* out, int cap, int* nOut,
+                           DWORD64* ripOut, DWORD64* rspOut)
+{
+    CONTEXT ctx{}; ctx.ContextFlags = CONTEXT_FULL;
+    if (!GetThreadContext(h, &ctx)) return false;
+    *ripOut = ctx.Rip; *rspOut = ctx.Rsp;
+    int n = 0;
+    __try {
+        while (n < cap && ctx.Rip){
+            out[n++] = (uintptr_t)ctx.Rip;
+            DWORD64 prevRsp = ctx.Rsp, imgBase = 0;
+            PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(ctx.Rip, &imgBase, nullptr);
+            if (!rf){
+                // No unwind info: treat it as a leaf and take [rsp] as the
+                // return address. True for our own stubs and for hand-written
+                // thunks; wrong occasionally, which is why the frame is still
+                // printed and the walk stops the moment rsp stops rising.
+                DWORD64 r = *(DWORD64*)ctx.Rsp;
+                if (!r) break;
+                ctx.Rip = r; ctx.Rsp += 8;
+            } else {
+                PVOID hd = nullptr; DWORD64 est = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, imgBase, ctx.Rip, rf,
+                                 &ctx, &hd, &est, nullptr);
+            }
+            if (!ctx.Rip || ctx.Rsp <= prevRsp) break;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    *nOut = n;
+    return true;
+}
+
+static void GhDumpAllThreads(const char* why)
+{
+    DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+    Diag(std::string("THREADS dump (") + why + ") self=" + std::to_string(self));
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE){
+        Diag("THREADS snap fail err=" + Hex(GetLastError()));
+        return;
+    }
+    THREADENTRY32 te{}; te.dwSize = sizeof(te);
+    int dumped = 0;
+    if (Thread32First(snap, &te)) do {
+        if (te.th32OwnerProcessID != pid) continue;
+        DWORD tid = te.th32ThreadID;
+        if (tid == self) continue;
+        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                              THREAD_QUERY_INFORMATION, FALSE, tid);
+        if (!h){
+            Diag("THREADS tid=" + std::to_string(tid) + " open failed err=" + Hex(GetLastError()));
+            continue;
+        }
+        uintptr_t frames[40] = {};
+        int      nf   = 0;
+        DWORD64  rip  = 0, rsp = 0;
+        bool     ok   = false;
+        DWORD    susp = SuspendThread(h);
+        if (susp != (DWORD)-1){
+            ok = GhCaptureStack(h, frames, 40, &nf, &rip, &rsp);
+            ResumeThread(h);
+        }
+        CloseHandle(h);
+        // Everything below here runs with the thread RUNNING again.
+        std::string tag = std::to_string(tid);
+        if (tid == g_guestWorkerTid) tag += " GUEST-MAIN";
+        if (g_uiThreadId && tid == g_uiThreadId) tag += " UI";
+        if (IsSnapshottedHostThread(tid)) tag += " host";
+        if (!ok){ Diag("THREADS tid=" + tag + " context unavailable"); continue; }
+        Diag("THREADS tid=" + tag + " rip=" + NameForCodeAddr((uintptr_t)rip) +
+             " rsp=" + Hex((uint64_t)rsp) + " frames=" + std::to_string(nf));
+        for (int i = 0; i < nf; ++i)
+            Diag("  #" + std::to_string(i) + " " + NameForCodeAddr(frames[i]));
+        ++dumped;
+    } while (Thread32Next(snap, &te));
+    CloseHandle(snap);
+    Diag("THREADS dumped n=" + std::to_string(dumped));
+}
+
+// One upload of gh_dumpthreads.txt into LocalState == one dump. Consumed on
+// read, exactly like ghpad.txt, so the trigger is a single WDP fsupload and the
+// same file can be uploaded again for a second look.
+static void GhPollThreadDumpRequest()
+{
+    std::wstring p = std::wstring(kLocalState) + L"gh_dumpthreads.txt";
+    if (GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+    DeleteFileW(p.c_str());
+    GhDumpAllThreads("requested");
+}
+
 #ifdef GH_LAUNCHER
 static void SnapshotHostThreads()
 {
@@ -8421,8 +8526,13 @@ static void SnapshotHostThreads()
         if (!started){
             started = true;
             std::thread([]{
-                for (int i = 0; i < 240 && !g_guestDone; ++i){
+                // 240 samples was 12 minutes, which is shorter than Spider-Man's
+                // shader compile. The loop also carries the #147 dump trigger,
+                // so it needs to still be alive when the guest goes quiet.
+                unsigned lim = GhCfgNum(L"gh_memsample_n.txt", "GH_MEMSAMPLE_N", 4800);
+                for (unsigned i = 0; i < lim && !g_guestDone; ++i){
                     GhLogMemoryBudget("sample");
+                    GhPollThreadDumpRequest();
                     Sleep(3000);
                 }
             }).detach();
