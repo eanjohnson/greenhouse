@@ -258,14 +258,36 @@ __declspec(noinline) static uint64_t gh_qr_upgrade(int runSeconds){
                         GH_ENGINE_LOG("GHQR *** approved: account=\"%s\" steamid=%llu — completing login ***\n",acct,(unsigned long long)realID);
                         // Login-completion: drop anon, reconnect, feed cached creds, LogOn real.
                         ghq_iu_logoff(clientUser);
-                        for(int w=0;w<40;++w){ if(gh_call_i(clientUser,cuvt[5],"GetLogonState")==0) break; Sleep(100); }
-                        int ec=gh_call_i(clientUser,cuvt[8],"EConnect"); (void)ec;
-                        for(int w=0;w<100;++w){ if(gh_call_i(clientUser,cuvt[6],"BConnected")==1) break; Sleep(100); }
+                        // Each wait below reports whether it finished or ran out. Before this,
+                        // all four could time out and the only evidence was "did not reach
+                        // BLoggedOn" -- an outcome, not a step. A silent EConnect that never
+                        // connects and a LogOn the CM is simply slow to answer looked identical.
+                        int wOff=0; for(;wOff<40;++wOff){ if(gh_call_i(clientUser,cuvt[5],"GetLogonState")==0) break; Sleep(100); }
+                        GH_ENGINE_LOG("GHQR step logoff -> state=%d after %dms%s\n",
+                                      gh_call_i(clientUser,cuvt[5],"GetLogonState"),wOff*100,wOff>=40?" (TIMED OUT)":"");
+                        int ec=gh_call_i(clientUser,cuvt[8],"EConnect");
+                        int wCon=0; for(;wCon<100;++wCon){ if(gh_call_i(clientUser,cuvt[6],"BConnected")==1) break; Sleep(100); }
+                        GH_ENGINE_LOG("GHQR step EConnect=%d connected=%d after %dms%s\n",
+                                      ec,gh_call_i(clientUser,cuvt[6],"BConnected"),wCon*100,wCon>=100?" (TIMED OUT)":"");
                         ghq_iu_set_acct(clientUser,acct,true);
                         ghq_iu_set_token(clientUser,tok,acct);   // (token, account) — verified order
                         gh_iu_logon(clientUser,realID);
-                        uint64_t got=0;
-                        for(int w=0;w<150;++w){ if(gh_call_i(clientUser,cuvt[4],"BLoggedOn")==1){ got=gh_iu_getsteamid(clientUser); break; } Sleep(100); }
+                        // Waiting longer is NOT the fix, and 2026-08-28 proved it: when the
+                        // CM refuses the logon it closes the socket ("not auto reconnecting
+                        // due to Invalid Password" in the engine's own logs/connection_log.txt)
+                        // and BConnected goes 1 -> 0 for good. So bail the moment the
+                        // connection drops -- BLoggedOn can never arrive after that, and a
+                        // 90s stare at a dead socket only hides the reason.
+                        uint64_t got=0; int wOn=0; bool dropped=false;
+                        for(;wOn<600;++wOn){ if(gh_call_i(clientUser,cuvt[4],"BLoggedOn")==1){ got=gh_iu_getsteamid(clientUser); break; }
+                                            if(wOn>=5 && gh_call_i(clientUser,cuvt[6],"BConnected")==0){ dropped=true; break; }
+                                            if(wOn && wOn%100==0) GH_ENGINE_LOG("GHQR step logon still waiting %ds (state=%d)\n",
+                                                                                wOn/10,gh_call_i(clientUser,cuvt[5],"GetLogonState"));
+                                            Sleep(100); }
+                        GH_ENGINE_LOG("GHQR step logon -> %s after %dms%s\n",
+                                      got?"BLoggedOn":"(no)",wOn*100,
+                                      dropped?" -- CM DROPPED the connection; see logs/connection_log.txt for the EResult"
+                                             :"");
                         // Persist for cached login BEFORE scrubbing, so the next launch needs no scan.
                         // Authorised by the user 2026-08-11; the token still never reaches a log.
                         if (got) gh_shim_save_credentials(acct,(unsigned long long)got,tok);

@@ -41,6 +41,7 @@
 #endif
 #include <windows.h>
 #include <tlhelp32.h>
+#include <functional>
 #include <atomic>
 #include <winternl.h>
 #include <d3d11on12.h>
@@ -2678,6 +2679,10 @@ static const HWND kFakeHwnd = (HWND)0x00477A01;
 // IDXGISwapChain1 is implemented too because IDXGIFactory2::CreateSwapChainForHwnd
 // (the modern path Unity takes) hands back an IDXGISwapChain1 by contract.
 // ------------------------------------------------------------------
+// Defined down with the DXGI output wrappers; SwapProxy is declared above them
+// and GetContainingOutput needs it.
+static HRESULT GhContainingOutput(IDXGIOutput** out);
+
 struct SwapProxy : winrt::implements<SwapProxy,
                                      IDXGISwapChain4, IDXGISwapChain3, IDXGISwapChain2,
                                      IDXGISwapChain1, IDXGISwapChain,
@@ -2755,7 +2760,14 @@ struct SwapProxy : winrt::implements<SwapProxy,
     { if (!d) return E_INVALIDARG; *d = desc; return S_OK; }
     HRESULT __stdcall ResizeBuffers(UINT, UINT, UINT, DXGI_FORMAT, UINT) noexcept override { return S_OK; }
     HRESULT __stdcall ResizeTarget(const DXGI_MODE_DESC*) noexcept override { return S_OK; }
-    HRESULT __stdcall GetContainingOutput(IDXGIOutput** o) noexcept override { if (o) *o = nullptr; return DXGI_ERROR_NOT_FOUND; }
+    HRESULT __stdcall GetContainingOutput(IDXGIOutput** o) noexcept override
+    {
+        HRESULT hr = GhContainingOutput(o);
+        static LONG n = 0;
+        if (InterlockedIncrement(&n) <= 6)
+            Diag("SwapProxy::GetContainingOutput -> hr=" + Hex((uint32_t)hr));
+        return hr;
+    }
     HRESULT __stdcall GetFrameStatistics(DXGI_FRAME_STATISTICS*) noexcept override { return E_NOTIMPL; }
     HRESULT __stdcall GetLastPresentCount(UINT* c) noexcept override { if (c) *c = (UINT)g_gfx.cur; return S_OK; }
 
@@ -3168,6 +3180,48 @@ static HRESULT WrapOutput(IDXGIOutput* raw, IDXGIOutput** out)
     raw->QueryInterface(__uuidof(IDXGIOutput6), proxy->real6.put_void());
     *out = proxy.as<IDXGIOutput>().detach();
     return S_OK;
+}
+
+// #154: the swapchain's "which display am I on?" answer.
+//
+// This used to return DXGI_ERROR_NOT_FOUND with a null output -- the one display
+// question in the whole bridge we answered with nothing, while EnumDisplaySettings,
+// GetMonitorInfo, GetClientRect, OutputProxy::GetDesc and the mode list all answer
+// a clean g_winW x g_winH. A caller that asks the swapchain for its output and then
+// measures that output's desktop rect gets a 0x0 monitor, and 0/0 is exactly where
+// Spider-Man's vertical field of view becomes the x86 real indefinite (0xFFC00000)
+// that poisons m11/m21 of its projection and hangs the main thread in an infinite
+// NaN compare. Its horizontal terms stay clean precisely because only the vertical
+// ones divide by the aspect ratio -- which is the shape of the corruption observed:
+// hFOV=1.13446 rad and m00=1.56969 correct, vFOV and m11 the indefinite.
+//
+// The console really does have one output on adapter 0 ("DXGI probe adapter 0
+// outputs=1"), so there is a truthful answer to give. It goes back through the same
+// OutputProxy wrapper EnumOutputs hands out, which is what applies
+// GhSanitizeOutputDesc and the replaced mode list -- returning the raw output here
+// would just reintroduce the 0x0 desktop rect this is meant to cure.
+static HRESULT GhContainingOutput(IDXGIOutput** out)
+{
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static com_ptr<IDXGIOutput> cached;   // already wrapped
+    AcquireSRWLockExclusive(&lock);
+    if (!cached) {
+        com_ptr<IDXGIFactory1> f;
+        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), f.put_void()))) {
+            com_ptr<IDXGIAdapter1> a;
+            if (SUCCEEDED(f->EnumAdapters1(0, a.put()))) {
+                com_ptr<IDXGIOutput> raw;
+                if (SUCCEEDED(a->EnumOutputs(0, raw.put())))
+                    WrapOutput(raw.get(), cached.put());
+            }
+        }
+    }
+    HRESULT hr = DXGI_ERROR_NOT_FOUND;
+    if (cached) { *out = cached.get(); (*out)->AddRef(); hr = S_OK; }
+    ReleaseSRWLockExclusive(&lock);
+    return hr;
 }
 
 // AdapterProxy is a plain single-vtable COM object, NOT a cppwinrt
@@ -8974,6 +9028,138 @@ static void GhPollPeekRequest()
     }
 }
 
+// #154: a hardware WRITE watchpoint on an arbitrary GUEST address, plus a poke.
+// The #139 machinery could only ever watch code patterns inside our own module,
+// and only armed threads that happened to reach a graphics entry point. A NaN
+// written into a guest camera object is neither of those things: the address is
+// guest heap, and the writer can be any thread. Both files below are consumed on
+// read, exactly like gh_dumpthreads.txt, so one upload == one arming.
+//
+//   gh_watchw.txt : "<hexaddr> <label>" per line, up to kGhWatchMax lines. An
+//                   eight-byte data write watch, so the address must be
+//                   eight-byte aligned -- x86 silently ignores a misaligned one.
+//   gh_poke.txt   : "<hexaddr> <hexdword>" per line. Guarded the same way the
+//                   peek is; a typo here must not take the app down.
+//
+// Labels have to outlive the call because g_watchWhat holds a bare const char*.
+static std::string g_watchLabel[kGhWatchMax];
+
+static void GhArmWatchAllThreads()
+{
+    DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE){
+        Diag("WATCHALL snap fail err=" + Hex(GetLastError()));
+        return;
+    }
+    THREADENTRY32 te{}; te.dwSize = sizeof(te);
+    int armed = 0, failed = 0;
+    if (Thread32First(snap, &te)) do {
+        if (te.th32OwnerProcessID != pid) continue;
+        DWORD tid = te.th32ThreadID;
+        if (tid == self) continue;
+        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                              THREAD_SET_CONTEXT, FALSE, tid);
+        if (!h){ ++failed; continue; }
+        if (SuspendThread(h) != (DWORD)-1){
+            CONTEXT c{};
+            c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (GetThreadContext(h, &c)){
+                // Set ContextFlags again: GetThreadContext overwrites it with
+                // what it actually filled in, and SetThreadContext only writes
+                // back the classes still named here.
+                c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                c.Dr0 = (DWORD64)g_watchAddr[0];
+                c.Dr1 = (DWORD64)g_watchAddr[1];
+                c.Dr2 = (DWORD64)g_watchAddr[2];
+                c.Dr3 = (DWORD64)g_watchAddr[3];
+                c.Dr6 = 0;
+                c.Dr7 = GhWatchDr7();
+                if (SetThreadContext(h, &c)) ++armed; else ++failed;
+            } else ++failed;
+            ResumeThread(h);
+        } else ++failed;
+        CloseHandle(h);
+    } while (Thread32Next(snap, &te));
+    CloseHandle(snap);
+    Diag("WATCHALL armed=" + std::to_string(armed) + " failed=" + std::to_string(failed) +
+         " dr7=" + Hex((uint64_t)GhWatchDr7()));
+}
+
+// Split a "<hex> <rest>" line the way the peek does. Returns 0 on a blank or
+// commented line, which the callers skip.
+static uintptr_t GhParseAddrLine(const std::string& line, std::string* rest)
+{
+    if (line.empty() || line[0] == '#') return 0;
+    size_t sp = line.find_first_of(" \t");
+    if (rest) *rest = (sp == std::string::npos) ? std::string() : line.substr(sp + 1);
+    return (uintptr_t)strtoull(line.substr(0, sp).c_str(), nullptr, 16);
+}
+
+static void GhForEachRequestLine(const wchar_t* name,
+                                 const std::function<void(const std::string&)>& fn)
+{
+    std::wstring p = std::wstring(kLocalState) + name;
+    std::vector<uint8_t> ob;
+    if (!ReadWholeFile(p, ob, true)) return;
+    DeleteFileW(p.c_str());                       // one upload == one action
+    std::string text;
+    for (uint8_t c : ob) if (c) text += (char)c;  // UTF-16LE or ASCII alike
+    size_t pos = 0;
+    while (pos <= text.size()){
+        size_t eol = text.find('\n', pos);
+        std::string line = text.substr(pos, eol == std::string::npos
+                                            ? std::string::npos : eol - pos);
+        pos = (eol == std::string::npos) ? text.size() + 1 : eol + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        fn(line);
+    }
+}
+
+static void GhPollWatchRequest()
+{
+    int n = 0;
+    GhForEachRequestLine(L"gh_watchw.txt", [&](const std::string& line){
+        std::string label;
+        uintptr_t a = GhParseAddrLine(line, &label);
+        if (!a) return;
+        if (n >= kGhWatchMax){ Diag("WATCHW ignored (full): " + line); return; }
+        if (a & 7) Diag("WATCHW " + Hex((uint64_t)a) + " is NOT 8-byte aligned -- x86 will not trap it");
+        g_watchLabel[n] = label.empty() ? Hex((uint64_t)a) : label;
+        GhWatchAdd((const void*)a, /*write=*/true, g_watchLabel[n].c_str());
+        Diag("WATCHW slot=" + std::to_string(n) + " addr=" + Hex((uint64_t)a) +
+             " label=" + g_watchLabel[n]);
+        ++n;
+    });
+    if (n) GhArmWatchAllThreads();
+}
+
+static void GhPollPokeRequest()
+{
+    GhForEachRequestLine(L"gh_poke.txt", [](const std::string& line){
+        std::string val;
+        uintptr_t a = GhParseAddrLine(line, &val);
+        if (!a || val.empty()) return;
+        uint32_t want = (uint32_t)strtoull(val.c_str(), nullptr, 16);
+        uintptr_t probe = 0;
+        if (!GhReadableQword(a & ~(uintptr_t)7, &probe)){
+            Diag("POKE " + Hex((uint64_t)a) + " unreadable -- skipped");
+            return;
+        }
+        DWORD old = 0;
+        if (!VirtualProtect((void*)a, 4, PAGE_READWRITE, &old)){
+            Diag("POKE " + Hex((uint64_t)a) + " protect failed err=" + Hex(GetLastError()));
+            return;
+        }
+        uint32_t before = 0;
+        memcpy(&before, (const void*)a, 4);
+        memcpy((void*)a, &want, 4);
+        DWORD tmp = 0;
+        VirtualProtect((void*)a, 4, old, &tmp);
+        Diag("POKE " + Hex((uint64_t)a) + " " + Hex(before) + " -> " + Hex(want));
+    });
+}
+
 static void GhPollThreadDumpRequest()
 {
     std::wstring p = std::wstring(kLocalState) + L"gh_dumpthreads.txt";
@@ -9017,6 +9203,8 @@ static void SnapshotHostThreads()
                 for (unsigned i = 0; i < lim && !g_guestDone; ++i){
                     GhLogMemoryBudget("sample");
                     GhPollThreadDumpRequest();
+                    GhPollWatchRequest();
+                    GhPollPokeRequest();
                     GhPollPeekRequest();
                     Sleep(3000);
                 }
