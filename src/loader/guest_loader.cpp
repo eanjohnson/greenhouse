@@ -1905,14 +1905,31 @@ static DWORD WINAPI GuestThreadStub(LPVOID p)
     RestoreThreadTls(old);
     return rc;
 }
+// #150: a guest whose main thread polls forever while one worker sits idle is a
+// story about threads, so count them and name their start routines. A pool that
+// asked for eight workers and got one, or a CreateThread that failed, both show
+// up here -- and both look identical from the outside otherwise.
+static volatile LONG g_guestThreadN = 0;
 static HANDLE WINAPI Bed_CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stack,
                                       LPTHREAD_START_ROUTINE fn, LPVOID arg,
                                       DWORD flags, LPDWORD tid)
 {
-    if (!g_tlsActive) return CreateThread(sa, stack, fn, arg, flags, tid);
-    auto* s = new GuestThreadStart{ fn, arg };
-    HANDLE h = CreateThread(sa, stack, &GuestThreadStub, s, flags, tid);
-    if (!h) delete s;
+    LONG  n = InterlockedIncrement(&g_guestThreadN);
+    DWORD id = 0;
+    HANDLE h;
+    if (!g_tlsActive){
+        h = CreateThread(sa, stack, fn, arg, flags, &id);
+    } else {
+        auto* s = new GuestThreadStart{ fn, arg };
+        h = CreateThread(sa, stack, &GuestThreadStub, s, flags, &id);
+        if (!h) delete s;
+    }
+    DWORD e = h ? 0 : GetLastError();
+    if (tid) *tid = id;
+    Diag("GUESTTHREAD #" + std::to_string(n) + " fn=" + NameForCodeAddr((uintptr_t)fn) +
+         " stack=" + Hex((uint64_t)stack) + " flags=" + Hex((uint32_t)flags) +
+         (h ? " -> tid=" + std::to_string(id)
+            : " -> FAILED err=" + Hex(e)));
     return h;
 }
 
@@ -2649,6 +2666,7 @@ static UINT g_winW = 1920, g_winH = 1080;
 // LocalState just before the guest starts (GhInitGuestDisplay), because
 // AdapterProxy::VramCap is defined long before GhCfgNum is.
 static unsigned g_vramCapMb = 0;               // 0 = keep the built-in 2048
+static unsigned g_cpuCount   = 0;              // #150: 0 = report the container's real count
 static const HWND kFakeHwnd = (HWND)0x00477A01;
 
 // ------------------------------------------------------------------
@@ -3953,6 +3971,36 @@ static const char* GhFourCC(const void* p, SIZE_T n)
     buf[4] = 0;
     return buf;
 }
+// #151: a PSO that the runtime refuses tells us nothing by itself. Write the
+// rejected bytecode out to LocalState so it can be pulled off the console and
+// disassembled, and record what the device thinks happened.
+static void GhDumpFailedShader(const char* tag, const void* code, SIZE_T n,
+                               ID3D12Device* dev)
+{
+    static volatile LONG seq = 0;
+    LONG i = InterlockedIncrement(&seq);
+    std::string ln = std::string("SHADERFAIL ") + tag + " #" + std::to_string(i) +
+                     " bytes=" + std::to_string((unsigned)n) +
+                     " magic=" + GhFourCC(code, n);
+    if (dev) ln += " removedreason=" + Hex((uint32_t)dev->GetDeviceRemovedReason());
+    if (code && n){
+        wchar_t name[64];
+        std::swprintf(name, 64, L"gh_failed_%hs%ld.bin", tag, (long)i);
+        std::wstring path = std::wstring(kLocalState) + name;
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE){
+            DWORD wrote = 0;
+            BOOL ok = WriteFile(h, code, (DWORD)n, &wrote, nullptr);
+            CloseHandle(h);
+            ln += ok ? " dumped=" + std::to_string((unsigned)wrote)
+                     : " dumpfailed=" + Hex(GetLastError());
+        } else {
+            ln += " dumpopenfailed=" + Hex(GetLastError());
+        }
+    }
+    Diag(ln);
+}
 static ID3D12Device* GhCompileOnlyDevice()
 {
     static com_ptr<ID3D12Device> d;
@@ -4233,6 +4281,66 @@ static HRESULT GhTryCreateGPS(GhGpsFn fn, ID3D12Device* dev,
     return hr;
 }
 
+static unsigned GhCfgNum(const wchar_t* file, const char* envName, unsigned dflt);  // defined with the config helpers
+
+// Shader Model 6 containers still carry the 'DXBC' fourcc -- what changes is the
+// payload chunk, which is 'DXIL' instead of 'SHEX'/'SHDR'. That is the only
+// reliable way to tell an SM6 blob from an SM5 one at the API boundary.
+static bool GhIsDxil(const void* p, SIZE_T n)
+{
+    if (!p || n < 0x24) return false;
+    const uint8_t* b = (const uint8_t*)p;
+    if (memcmp(b, "DXBC", 4) != 0) return false;
+    uint32_t cnt = 0; memcpy(&cnt, b + 0x1C, 4);
+    if (cnt > 64 || (SIZE_T)0x20 + (SIZE_T)cnt * 4 > n) return false;
+    for (uint32_t i = 0; i < cnt; ++i){
+        uint32_t off = 0; memcpy(&off, b + 0x20 + i * 4, 4);
+        if ((SIZE_T)off + 4 > n) continue;
+        if (memcmp(b + off, "DXIL", 4) == 0) return true;
+    }
+    return false;
+}
+
+// A compute shader that declares nothing and does nothing, compiled on-device at
+// cs_5_0. Declaring nothing is the point: a shader with no resource bindings
+// satisfies ANY root signature the guest hands us, so it can stand in for one
+// the driver refuses without knowing anything about the guest's layout.
+// d3dcompiler_47.dll is present in the container (proven by the M0 probe), so
+// this needs no embedded blob and no hand-assembled DXBC.
+static bool GhNoopComputeShader(D3D12_SHADER_BYTECODE* out)
+{
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static com_ptr<ID3DBlob> blob;
+    static bool tried = false;
+    AcquireSRWLockExclusive(&lock);
+    if (!tried){
+        tried = true;
+        HMODULE dc = GetModuleHandleA("d3dcompiler_47.dll");
+        if (!dc) dc = LoadLibraryA("d3dcompiler_47.dll");
+        using CompileFn = HRESULT (WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const void*, void*,
+                                            LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+        auto compile = dc ? (CompileFn)GetProcAddress(dc, "D3DCompile") : nullptr;
+        if (!compile){
+            Diag("DXILSTUB no D3DCompile err=" + Hex(GetLastError()));
+        } else {
+            static const char kHlsl[] =
+                "[numthreads(1,1,1)] void csmain(uint3 t : SV_DispatchThreadID) { }\n";
+            com_ptr<ID3DBlob> err;
+            HRESULT hr = compile(kHlsl, sizeof(kHlsl) - 1, "ghnoop.hlsl", nullptr, nullptr,
+                                 "csmain", "cs_5_0", 0, 0, blob.put(), err.put());
+            Diag("DXILSTUB compile hr=" + Hex((uint32_t)hr) + " bytes=" +
+                 std::to_string(blob ? (unsigned)blob->GetBufferSize() : 0u));
+        }
+    }
+    bool ok = (bool)blob;
+    if (ok){
+        out->pShaderBytecode = blob->GetBufferPointer();
+        out->BytecodeLength  = blob->GetBufferSize();
+    }
+    ReleaseSRWLockExclusive(&lock);
+    return ok;
+}
+
 // Compile a trivial VS/PS on-device and build the simplest legal PSO over them.
 // If THIS succeeds, the driver compiles DXBC fine and the fault is something in
 // the guest's desc; if it crashes too, the D3D12 path really is unusable and the
@@ -4245,6 +4353,22 @@ static void GhProbePSO(ID3D12Device* dev, GhGpsFn orig)
     if (!dev || !orig || InterlockedCompareExchange(&once, 1, 0) != 0) return;
 
     if (!GhPreloadScDxil()) GhPatchScDllDxilQuery();
+
+    // Walk the shader models down until one is accepted. This is the only way to
+    // learn the device's real ceiling: the guest's own queries clamp to whatever
+    // the guest asked for, so they never prove an upper bound.
+    {
+        static const uint32_t kSm[] = { 0x69, 0x68, 0x67, 0x66, 0x65, 0x64,
+                                        0x63, 0x62, 0x61, 0x60, 0x51, 0x50 };
+        std::string ladder;
+        for (uint32_t v : kSm){
+            D3D12_FEATURE_DATA_SHADER_MODEL sm{ (D3D_SHADER_MODEL)v };
+            HRESULT h = dev->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof sm);
+            ladder += " " + Hex(v) + "->" + (SUCCEEDED(h) ? Hex((uint32_t)sm.HighestShaderModel)
+                                                          : "hr" + Hex((uint32_t)h));
+        }
+        Diag("SMPROBE" + ladder);
+    }
 
     HMODULE dc = GetModuleHandleA("d3dcompiler_47.dll");
     if (!dc) dc = LoadLibraryA("d3dcompiler_47.dll");
@@ -4440,6 +4564,10 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     }
     Diag("  CreateGraphicsPipelineState -> hr=" + Hex((uint32_t)hr) +
          (pp && *pp ? " CREATED" : ""));
+    if (FAILED(hr) && d){
+        GhDumpFailedShader("vs", d->VS.pShaderBytecode, d->VS.BytecodeLength, self);
+        GhDumpFailedShader("ps", d->PS.pShaderBytecode, d->PS.BytecodeLength, self);
+    }
     return hr;
 }
 static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
@@ -4447,21 +4575,63 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
 {
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*,
                                       REFIID, void**))g_d12vtOrig[11];
-    Diag(std::string("D3D12 CreateComputePipelineState CS=") +
-         (d ? std::to_string((unsigned)d->CS.BytecodeLength) : "?"));
+    std::string m = std::string("D3D12 CreateComputePipelineState CS=") +
+                    (d ? std::to_string((unsigned)d->CS.BytecodeLength) : "?");
+    if (d){
+        m += std::string(" CSmag=") + GhFourCC(d->CS.pShaderBytecode, d->CS.BytecodeLength);
+        m += std::string(" rootsig=") + (d->pRootSignature ? "yes" : "no");
+        m += " nodemask=" + Hex((uint32_t)d->NodeMask);
+        m += " flags=" + Hex((uint32_t)d->Flags);
+        m += " cached=" + std::to_string((unsigned)d->CachedPSO.CachedBlobSizeInBytes);
+    }
+    Diag(m);
     HRESULT hr = orig(self, d, riid, pp);
     Diag("  CreateComputePipelineState -> hr=" + Hex((uint32_t)hr));
+    if (FAILED(hr) && d){
+        GhDumpFailedShader("cs", d->CS.pShaderBytecode, d->CS.BytecodeLength, self);
+        if (GhIsDxil(d->CS.pShaderBytecode, d->CS.BytecodeLength)){
+            // Shader Model 6. This console's D3D12 tops out below that, so the
+            // refusal is permanent and retrying is pointless. Optionally stand a
+            // no-op shader in its place so the guest gets a valid PSO object and
+            // keeps going -- whatever this pass computes will simply not happen.
+            Diag("  CS is DXIL (Shader Model 6)");
+            if (GhCfgNum(L"gh_stub_dxil.txt", "GH_STUB_DXIL", 0)){
+                D3D12_SHADER_BYTECODE nop{};
+                if (GhNoopComputeShader(&nop)){
+                    D3D12_COMPUTE_PIPELINE_STATE_DESC sd = *d;
+                    sd.CS = nop;
+                    sd.CachedPSO = D3D12_CACHED_PIPELINE_STATE{};
+                    HRESULT hs = orig(self, &sd, riid, pp);
+                    Diag("  DXILSTUB substitute PSO -> hr=" + Hex((uint32_t)hs));
+                    if (SUCCEEDED(hs)) hr = hs;
+                }
+            }
+        } else {
+            // Not a shader-model problem. If a second identical call succeeds the
+            // refusal was transient (state, not content) and that is worth knowing.
+            HRESULT hr2 = orig(self, d, riid, pp);
+            Diag("  CreateComputePipelineState RETRY -> hr=" + Hex((uint32_t)hr2));
+            if (SUCCEEDED(hr2)) hr = hr2;
+        }
+    }
     return hr;
 }
 static HRESULT __stdcall Hook_D12CheckFeature(ID3D12Device* self, D3D12_FEATURE f,
                                               void* data, UINT sz)
 {
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, D3D12_FEATURE, void*, UINT))g_d12vtOrig[13];
+    // SHADER_MODEL is in/out: the caller writes the model it wants and the
+    // runtime clamps DOWN. Reading only the answer cannot tell "the device is
+    // capped at 5.1" apart from "the caller only asked for 5.1".
+    uint32_t askedSm = 0;
+    if (f == D3D12_FEATURE_SHADER_MODEL && data && sz >= sizeof(D3D12_FEATURE_DATA_SHADER_MODEL))
+        askedSm = (uint32_t)((D3D12_FEATURE_DATA_SHADER_MODEL*)data)->HighestShaderModel;
     HRESULT hr = orig(self, f, data, sz);
     std::string extra;
     if (SUCCEEDED(hr) && data){
         if (f == D3D12_FEATURE_SHADER_MODEL && sz >= sizeof(D3D12_FEATURE_DATA_SHADER_MODEL))
-            extra = " SM=" + Hex((uint32_t)((D3D12_FEATURE_DATA_SHADER_MODEL*)data)->HighestShaderModel);
+            extra = " asked=" + Hex(askedSm) + " SM=" +
+                    Hex((uint32_t)((D3D12_FEATURE_DATA_SHADER_MODEL*)data)->HighestShaderModel);
         else if (f == D3D12_FEATURE_FEATURE_LEVELS && sz >= sizeof(D3D12_FEATURE_DATA_FEATURE_LEVELS))
             extra = " maxFL=" + Hex((uint32_t)((D3D12_FEATURE_DATA_FEATURE_LEVELS*)data)->MaxSupportedFeatureLevel);
     }
@@ -5937,6 +6107,76 @@ static LONG WINAPI Bed_DisplayConfigGetDeviceInfo(DISPLAYCONFIG_DEVICE_INFO_HEAD
 static HMONITOR WINAPI Bed_MonitorFromWindow(HWND, DWORD){ return kFakeMonitor; }
 static HMONITOR WINAPI Bed_MonitorFromPoint(POINT, DWORD){ return kFakeMonitor; }
 static HMONITOR WINAPI Bed_MonitorFromRect(LPCRECT, DWORD){ return kFakeMonitor; }
+// ---------------------------------------------------------------------------
+// #150: how many processors does the guest think it has?
+//
+// There was no bed for any of this, so the guest has been reading the app
+// container's raw numbers. A job system that sizes its worker pool from
+// dwNumberOfProcessors -- and most do -- will build whatever pool that implies,
+// and if the container reports very few, a main thread waiting on work can end
+// up waiting on a pool that is too small to produce it.
+//
+// These log the REAL answer once before doing anything else, because the first
+// job is to find out what the guest has been hearing all along. gh_cpus.txt then
+// overrides it, so the hypothesis can be tested from a one-file upload.
+//
+// Affinity is bedded for a different reason: an app container may simply refuse
+// SetThreadAffinityMask, and a pool that treats that failure as fatal parks the
+// worker it just made. Ours logs the attempt and reports success.
+// ---------------------------------------------------------------------------
+static void WINAPI Bed_GetSystemInfo(LPSYSTEM_INFO si)
+{
+    GetSystemInfo(si);
+    if (!si) return;
+    static bool once = false;
+    if (!once){
+        once = true;
+        Diag("BED GetSystemInfo REAL procs=" + std::to_string(si->dwNumberOfProcessors) +
+             " activemask=" + Hex((uint64_t)si->dwActiveProcessorMask) +
+             " pagesize=" + Hex((uint32_t)si->dwPageSize) +
+             " allocgran=" + Hex((uint32_t)si->dwAllocationGranularity));
+    }
+    if (g_cpuCount >= 1 && g_cpuCount <= 64){
+        si->dwNumberOfProcessors = g_cpuCount;
+        si->dwActiveProcessorMask = (g_cpuCount >= 64) ? ~(DWORD_PTR)0
+                                                       : (((DWORD_PTR)1 << g_cpuCount) - 1);
+    }
+}
+static void WINAPI Bed_GetNativeSystemInfo(LPSYSTEM_INFO si){ Bed_GetSystemInfo(si); }
+
+static DWORD WINAPI Bed_GetActiveProcessorCount(WORD group)
+{
+    DWORD real = GetActiveProcessorCount(group);
+    static bool once = false;
+    if (!once){
+        once = true;
+        Diag("BED GetActiveProcessorCount(group=" + std::to_string((int)group) +
+             ") REAL=" + std::to_string(real) +
+             " groups=" + std::to_string((int)GetActiveProcessorGroupCount()));
+    }
+    if (g_cpuCount >= 1 && g_cpuCount <= 64) return g_cpuCount;
+    return real;
+}
+
+static DWORD_PTR WINAPI Bed_SetThreadAffinityMask(HANDLE h, DWORD_PTR mask)
+{
+    DWORD_PTR prev = SetThreadAffinityMask(h, mask);
+    static volatile LONG logged = 0;
+    if (InterlockedIncrement(&logged) <= 12)
+        Diag("BED SetThreadAffinityMask mask=" + Hex((uint64_t)mask) +
+             " -> " + Hex((uint64_t)prev) + (prev ? "" : " FAILED err=" + Hex(GetLastError())));
+    // A refusal must not look like one: report the mask as if it took.
+    return prev ? prev : mask;
+}
+static DWORD WINAPI Bed_SetThreadIdealProcessor(HANDLE h, DWORD n)
+{
+    DWORD prev = SetThreadIdealProcessor(h, n);
+    static volatile LONG logged2 = 0;
+    if (InterlockedIncrement(&logged2) <= 12)
+        Diag("BED SetThreadIdealProcessor n=" + std::to_string(n) + " -> " + std::to_string((int)prev));
+    return prev == (DWORD)-1 ? 0 : prev;
+}
+
 static BOOL WINAPI Bed_GetMonitorInfoW(HMONITOR h, LPMONITORINFO mi){
     static LONG n = 0;
     if (InterlockedIncrement(&n) <= 4)
@@ -6420,6 +6660,9 @@ static void GhInitGuestDisplay()
 
     g_vramCapMb = GhCfgNum(L"gh_vram_mb.txt", "GH_VRAM_MB_FILE", 0);
     if (g_vramCapMb) Diag("DISPLAY vram budget override " + std::to_string(g_vramCapMb) + " MB");
+
+    g_cpuCount = GhCfgNum(L"gh_cpus.txt", "GH_CPUS", 0);
+    if (g_cpuCount) Diag("DISPLAY processor count override " + std::to_string(g_cpuCount));
 }
 
 static void GhProbeAwe()
@@ -7535,6 +7778,11 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"GetMonitorInfoW",      (void*)&Bed_GetMonitorInfoW},
         {"GetMonitorInfoA",      (void*)&Bed_GetMonitorInfoA},
         {"GetSystemMetrics",     (void*)&Bed_GetSystemMetrics},
+        {"GetSystemInfo",        (void*)&Bed_GetSystemInfo},
+        {"GetNativeSystemInfo",  (void*)&Bed_GetNativeSystemInfo},
+        {"GetActiveProcessorCount", (void*)&Bed_GetActiveProcessorCount},
+        {"SetThreadAffinityMask",   (void*)&Bed_SetThreadAffinityMask},
+        {"SetThreadIdealProcessor", (void*)&Bed_SetThreadIdealProcessor},
         {"GetDisplayConfigBufferSizes", (void*)&Bed_GetDisplayConfigBufferSizes},
         {"QueryDisplayConfig",   (void*)&Bed_QueryDisplayConfig},
         {"DisplayConfigGetDeviceInfo", (void*)&Bed_DisplayConfigGetDeviceInfo},
@@ -7799,6 +8047,11 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"GetMonitorInfoW",      (void*)&Bed_GetMonitorInfoW},
         {"GetMonitorInfoA",      (void*)&Bed_GetMonitorInfoA},
         {"GetSystemMetrics",     (void*)&Bed_GetSystemMetrics},
+        {"GetSystemInfo",        (void*)&Bed_GetSystemInfo},
+        {"GetNativeSystemInfo",  (void*)&Bed_GetNativeSystemInfo},
+        {"GetActiveProcessorCount", (void*)&Bed_GetActiveProcessorCount},
+        {"SetThreadAffinityMask",   (void*)&Bed_SetThreadAffinityMask},
+        {"SetThreadIdealProcessor", (void*)&Bed_SetThreadIdealProcessor},
         {"GetDisplayConfigBufferSizes", (void*)&Bed_GetDisplayConfigBufferSizes},
         {"QueryDisplayConfig",   (void*)&Bed_QueryDisplayConfig},
         {"DisplayConfigGetDeviceInfo", (void*)&Bed_DisplayConfigGetDeviceInfo},
@@ -7847,6 +8100,11 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"EnumDisplaySettingsW",     (void*)&Bed_EnumDisplaySettingsW},
         {"EnumDisplaySettingsA",     (void*)&Bed_EnumDisplaySettingsA},
         {"GetSystemMetrics",         (void*)&Bed_GetSystemMetrics},
+        {"GetSystemInfo",            (void*)&Bed_GetSystemInfo},
+        {"GetNativeSystemInfo",      (void*)&Bed_GetNativeSystemInfo},
+        {"GetActiveProcessorCount",  (void*)&Bed_GetActiveProcessorCount},
+        {"SetThreadAffinityMask",    (void*)&Bed_SetThreadAffinityMask},
+        {"SetThreadIdealProcessor",  (void*)&Bed_SetThreadIdealProcessor},
         {"GetDisplayConfigBufferSizes",(void*)&Bed_GetDisplayConfigBufferSizes},
         {"QueryDisplayConfig",       (void*)&Bed_QueryDisplayConfig},
         {"DisplayConfigGetDeviceInfo",(void*)&Bed_DisplayConfigGetDeviceInfo},
@@ -8663,6 +8921,59 @@ static void GhDumpAllThreads(const char* why)
 // One upload of gh_dumpthreads.txt into LocalState == one dump. Consumed on
 // read, exactly like ghpad.txt, so the trigger is a single WDP fsupload and the
 // same file can be uploaded again for a second look.
+// SafeQword's __except is not enough for an address that may not be mapped at
+// all: the access violation is seen first by the demand-commit pager's VEH and
+// the crash observer, and a peek at a guest address before any guest exists
+// took the whole app down. Ask the memory manager instead of faulting.
+static bool GhReadableQword(uintptr_t a, uintptr_t* out)
+{
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery((void*)a, &mbi, sizeof mbi)) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    const DWORD prot = mbi.Protect & 0xFF;
+    if (prot == PAGE_NOACCESS || (mbi.Protect & PAGE_GUARD)) return false;
+    if (!(prot == PAGE_READONLY || prot == PAGE_READWRITE || prot == PAGE_WRITECOPY ||
+          prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE ||
+          prot == PAGE_EXECUTE_WRITECOPY)) return false;
+    if (a + 8 > (uintptr_t)mbi.BaseAddress + mbi.RegionSize) return false;
+    return SafeQword(a, out);
+}
+
+// #152: read named guest addresses live. The tracepoints are one-shot and fire
+// on the first pass through a loop, but what a stall actually needs is the same
+// word sampled repeatedly -- "issued keeps climbing while completed is stuck"
+// and "both frozen" are different bugs and look identical in a single reading.
+// Polls <LocalState>\gh_peek.txt, one "<hex-addr> <label>" per line, and prints
+// four dwords at each beside the MEMORY sampler. The file is NOT consumed, so
+// the series continues for as long as it is there.
+static void GhPollPeekRequest()
+{
+    std::vector<uint8_t> ob;
+    if (!ReadWholeFile(std::wstring(kLocalState) + L"gh_peek.txt", ob, true)) return;
+    std::string text;
+    for (uint8_t c : ob) if (c) text += (char)c;       // UTF-16LE or ASCII alike
+
+    size_t pos = 0;
+    while (pos <= text.size()){
+        size_t eol = text.find('\n', pos);
+        std::string line = text.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+        pos = (eol == std::string::npos) ? text.size() + 1 : eol + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+        size_t sp = line.find_first_of(" \t");
+        uintptr_t a = (uintptr_t)strtoull(line.substr(0, sp).c_str(), nullptr, 16);
+        if (!a) continue;
+        std::string label = (sp == std::string::npos) ? std::string() : line.substr(sp + 1);
+        std::string out = "PEEK " + Hex((uint64_t)a) + (label.empty() ? "" : " " + label) + " dw=";
+        for (int k = 0; k < 4; ++k){
+            uintptr_t q = 0;
+            if (!GhReadableQword(a + (uintptr_t)k * 8, &q)){ out += " ??"; break; }
+            out += " " + Hex((uint32_t)(q & 0xFFFFFFFFu)) + "," + Hex((uint32_t)(q >> 32));
+        }
+        Diag(out);
+    }
+}
+
 static void GhPollThreadDumpRequest()
 {
     std::wstring p = std::wstring(kLocalState) + L"gh_dumpthreads.txt";
@@ -8706,6 +9017,7 @@ static void SnapshotHostThreads()
                 for (unsigned i = 0; i < lim && !g_guestDone; ++i){
                     GhLogMemoryBudget("sample");
                     GhPollThreadDumpRequest();
+                    GhPollPeekRequest();
                     Sleep(3000);
                 }
             }).detach();
