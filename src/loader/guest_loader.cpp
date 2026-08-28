@@ -5171,6 +5171,7 @@ static void GhD12Failed(ID3D12Device* dev, const char* what, HRESULT hr)
 struct GhCLNote {
     ID3D12CommandList* cl;
     volatile LONG draws, idraws, disp, barriers, psosets;
+    volatile LONG work;      // shader-running ops since Reset, 1-based; see GhWorkIndex
     void*   lastPso;
     LONG    type;
 };
@@ -5271,6 +5272,39 @@ static unsigned GhOpMask()
     static const unsigned m = GhCfgNum(L"gh_op_mask.txt", "GH_OP_MASK", 0);
     return m;
 }
+// #158: bisect INSIDE one command list.
+//
+// The op-mask drops whole categories across every list at once, which is far too
+// blunt: the list that hangs the GPU is one render pass of ~32 shader-running ops
+// among hundreds, and dropping "all draws everywhere" changes so much else that
+// the result is unreadable. gh_op_stop.txt=N instead executes only the first N
+// shader-running ops of EVERY list and records the rest without submitting them.
+// Every other list in the frame is shorter than that, so in practice it truncates
+// exactly the one long pass. Binary-search N for the smallest value that still
+// hangs; the CLOP line carrying w=N is then the op that does it.
+static unsigned GhOpStop()
+{
+    static const unsigned n = GhCfgNum(L"gh_op_stop.txt", "GH_OP_STOP", 0);
+    return n;
+}
+// 1-based index of this shader-running op within the current recording. Always
+// counted, even with the knob off, so the CLOP trace and the knob share numbering.
+static LONG GhWorkIndex(ID3D12CommandList* self)
+{
+    GhCLNote* n = GhCLFind(self);
+    return n ? InterlockedIncrement(&n->work) : 0;
+}
+static bool GhWorkOpDropped(ID3D12CommandList* self, LONG idx)
+{
+    const unsigned stop = GhOpStop();
+    if (!stop || idx <= (LONG)stop) return false;
+    static LONG k = 0;
+    LONG j = InterlockedIncrement(&k);
+    if (j <= 4 || (j % 512) == 0)
+        Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " w=" + std::to_string((long)idx) +
+             " DROPPED by gh_op_stop=" + std::to_string(stop) + " n=" + std::to_string((long)j));
+    return true;
+}
 static void GhCLOp(ID3D12CommandList* self, const std::string& what)
 {
     GhCLNote* n = GhCLFind(self);
@@ -5281,7 +5315,7 @@ static HRESULT __stdcall Hook_CLReset(ID3D12GraphicsCommandList* self,
                                       ID3D12CommandAllocator* a, ID3D12PipelineState* pso)
 {
     if (GhCLNote* n = GhCLFind(self)){
-        n->draws = n->idraws = n->disp = n->barriers = n->psosets = 0;
+        n->draws = n->idraws = n->disp = n->barriers = n->psosets = n->work = 0;
         n->lastPso = pso;
     }
     if (GhCLTraceOn())
@@ -5292,25 +5326,31 @@ static HRESULT __stdcall Hook_CLReset(ID3D12GraphicsCommandList* self,
 static void __stdcall Hook_CLDraw(ID3D12GraphicsCommandList* self, UINT a, UINT b, UINT c, UINT d)
 {
     if (GhCLNote* n = GhCLFind(self)) InterlockedIncrement(&n->draws);
-    if (GhCLTraceOn()) GhCLOp(self, "DRAW verts=" + std::to_string((unsigned long)a) +
+    const LONG wi = GhWorkIndex(self);
+    if (GhCLTraceOn()) GhCLOp(self, "w=" + std::to_string((long)wi) +
+                                    " DRAW verts=" + std::to_string((unsigned long)a) +
                                     " inst=" + std::to_string((unsigned long)b));
-    if (GhOpMask() & 1) return;
+    if ((GhOpMask() & 1) || GhWorkOpDropped(self, wi)) return;
     ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT))g_clVtOrig[12])(self, a, b, c, d);
 }
 static void __stdcall Hook_CLDrawIndexed(ID3D12GraphicsCommandList* self, UINT a, UINT b, UINT c, INT d, UINT e)
 {
     if (GhCLNote* n = GhCLFind(self)) InterlockedIncrement(&n->idraws);
-    if (GhCLTraceOn()) GhCLOp(self, "DRAWINDEXED idx=" + std::to_string((unsigned long)a) +
+    const LONG wi = GhWorkIndex(self);
+    if (GhCLTraceOn()) GhCLOp(self, "w=" + std::to_string((long)wi) +
+                                    " DRAWINDEXED idx=" + std::to_string((unsigned long)a) +
                                     " inst=" + std::to_string((unsigned long)b));
-    if (GhOpMask() & 1) return;
+    if ((GhOpMask() & 1) || GhWorkOpDropped(self, wi)) return;
     ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, INT, UINT))g_clVtOrig[13])(self, a, b, c, d, e);
 }
 static void __stdcall Hook_CLDispatch(ID3D12GraphicsCommandList* self, UINT x, UINT y, UINT z)
 {
     if (GhCLNote* n = GhCLFind(self)) InterlockedIncrement(&n->disp);
-    if (GhCLTraceOn()) GhCLOp(self, "DISPATCH " + std::to_string((unsigned long)x) + "," +
+    const LONG wi = GhWorkIndex(self);
+    if (GhCLTraceOn()) GhCLOp(self, "w=" + std::to_string((long)wi) +
+                                    " DISPATCH " + std::to_string((unsigned long)x) + "," +
                                     std::to_string((unsigned long)y) + "," + std::to_string((unsigned long)z));
-    if (GhOpMask() & 2) return;
+    if ((GhOpMask() & 2) || GhWorkOpDropped(self, wi)) return;
     ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT))g_clVtOrig[14])(self, x, y, z);
 }
 static void __stdcall Hook_CLSetPso(ID3D12GraphicsCommandList* self, ID3D12PipelineState* pso)
@@ -5561,6 +5601,7 @@ static void __stdcall Hook_CLExecIndirect(ID3D12GraphicsCommandList* self, void*
                                           ID3D12Resource* cnt, UINT64 cntOff)
 {
     if (GhCLNote* n = GhCLFind(self)) InterlockedIncrement(&n->draws);
+    const LONG wi = GhWorkIndex(self);
     // This is the one op in the hanging frame whose size is not in the command
     // stream: its PSO is a compute pipeline, so the argument buffer holds the
     // thread-group counts, and a garbage count here is a GPU hang by construction.
@@ -5582,14 +5623,15 @@ static void __stdcall Hook_CLExecIndirect(ID3D12GraphicsCommandList* self, void*
                 extra = " args-not-mappable hr=" + Hex((uint32_t)mr);
             }
         }
-        GhCLOp(self, "EXECUTEINDIRECT max=" + std::to_string((unsigned long)maxCount) +
+        GhCLOp(self, "w=" + std::to_string((long)wi) +
+                     " EXECUTEINDIRECT max=" + std::to_string((unsigned long)maxCount) +
                      (cnt ? " counted" : "") + " off=" + Hex((uint64_t)argOff) + extra);
     }
     // gh_skip_indirect.txt=1 drops the call entirely. If the frame then retires
     // and the game runs on, this op is the hang; if the device dies anyway, it
     // is not. Nothing else in the frame can be tested this cheaply.
     static const bool skip = GhCfgNum(L"gh_skip_indirect.txt", "GH_SKIP_INDIRECT", 0) != 0;
-    if (skip || (GhOpMask() & 4)){
+    if (skip || (GhOpMask() & 4) || GhWorkOpDropped(self, wi)){
         static LONG nskip = 0;
         LONG k = InterlockedIncrement(&nskip);
         if (k <= 8) Diag("CLOP EXECUTEINDIRECT SKIPPED by gh_skip_indirect (#" + std::to_string((long)k) + ")");
@@ -5877,6 +5919,63 @@ static void GhHookFence(ID3D12Fence* f)
 
 static void* g_cqVtOrig[20]{};
 static volatile LONG g_cqHooked = 0;
+
+// #158: which submission does the GPU stop INSIDE?
+//
+// The fence trace names the queue that stopped but not the reason: a queue
+// blocked on a GPU wait and a queue grinding on a list that never finishes look
+// identical from outside -- both show as "fences stopped moving", and in the
+// v0.0.206.0 run both queues were reported BLOCKED when in fact only one of
+// them was, the other being stalled behind it. gh_submit_sync.txt=1 makes the
+// CPU wait for each of the GUEST's own submissions to retire before returning
+// from ExecuteCommandLists, so the submission that never completes names itself
+// instead of being inferred from which fence value stopped. It costs all of the
+// pipelining, which is the right trade for a probe and the wrong one to leave on.
+//
+// Our own present queue is deliberately excluded: serialising that would change
+// what reaches the screen rather than what the GPU is asked to do.
+struct GhSubmitSync {
+    ID3D12CommandQueue* q;
+    ID3D12Fence*        f;
+    ID3D12Device*       dev;   // the queue's OWN device, which need not be ours
+    UINT64              v;
+    HANDLE              e;
+};
+static GhSubmitSync g_subSync[8]{};
+static volatile LONG g_subSyncN = 0;
+static SRWLOCK g_subSyncLock = SRWLOCK_INIT;
+
+static GhSubmitSync* GhSubmitSyncFor(ID3D12CommandQueue* q)
+{
+    LONG n = InterlockedCompareExchange(&g_subSyncN, 0, 0);
+    for (LONG i = 0; i < n; ++i) if (g_subSync[i].q == q) return &g_subSync[i];
+    AcquireSRWLockExclusive(&g_subSyncLock);
+    GhSubmitSync* out = nullptr;
+    n = InterlockedCompareExchange(&g_subSyncN, 0, 0);
+    for (LONG i = 0; i < n; ++i) if (g_subSync[i].q == q) out = &g_subSync[i];
+    if (!out && n < (LONG)(sizeof g_subSync / sizeof g_subSync[0])){
+        com_ptr<ID3D12Device> dev;
+        if (SUCCEEDED(q->GetDevice(__uuidof(ID3D12Device), dev.put_void())) && dev){
+            ID3D12Fence* f = nullptr;
+            HRESULT hr = dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), (void**)&f);
+            if (SUCCEEDED(hr) && f){
+                g_subSync[n].q = q;
+                g_subSync[n].f = f;
+                g_subSync[n].dev = dev.detach();   // keep our own reference
+                g_subSync[n].v = 0;
+                g_subSync[n].e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                InterlockedExchange(&g_subSyncN, n + 1);   // publish after it is whole
+                out = &g_subSync[n];
+                Diag("SUBMITSYNC armed q=" + Hex((uint64_t)(uintptr_t)q) +
+                     " fence=" + Hex((uint64_t)(uintptr_t)f));
+            } else {
+                Diag("SUBMITSYNC CreateFence failed hr=" + Hex((uint32_t)hr));
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&g_subSyncLock);
+    return out;
+}
 static void __stdcall Hook_CQExecute(ID3D12CommandQueue* self, UINT n, ID3D12CommandList* const* l)
 {
     LONG seq = InterlockedIncrement(&g_eclCount);
@@ -5902,10 +6001,52 @@ static void __stdcall Hook_CQExecute(ID3D12CommandQueue* self, UINT n, ID3D12Com
                  " q=" + Hex((uint64_t)(uintptr_t)self));
         return;
     }
+    // Drop ONE named submission. The op-mask bisect could only ever drop whole
+    // categories across every list at once, which is why it produced a
+    // contradiction (dropping only barriers hangs, and dropping everything but
+    // barriers also hangs). Once a single submission is known to be the one the
+    // GPU stops inside, this says so out loud: skip exactly that one and see
+    // whether the run continues.
+    static const unsigned skipSeq = GhCfgNum(L"gh_skip_submit.txt", "GH_SKIP_SUBMIT", 0);
+    if (skipSeq && (unsigned)seq == skipSeq && self != g_gfx.queue.get()){
+        Diag("GPUSUBMIT #" + std::to_string((long)seq) + " SKIPPED by gh_skip_submit");
+        return;
+    }
     ((void (__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*))g_cqVtOrig[10])(self, n, l);
     // Drain right after the submission that may have been the last one. The
     // heartbeat is once a second and the device can die between two of its ticks.
     GhDrainInfoQueue();
+
+    static const unsigned subSync = GhCfgNum(L"gh_submit_sync.txt", "GH_SUBMIT_SYNC", 0);
+    if (subSync && self != g_gfx.queue.get()){
+        if (GhSubmitSync* ss = GhSubmitSyncFor(self)){
+            static const unsigned toms = GhCfgNum(L"gh_submit_timeout_ms.txt",
+                                                  "GH_SUBMIT_TIMEOUT_MS", 3000);
+            const UINT64 want = ++ss->v;
+            ((HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64))
+                 g_cqVtOrig[14])(self, ss->f, want);
+            const ULONGLONG t0 = GetTickCount64();
+            if (ss->f->GetCompletedValue() < want && ss->e){
+                ss->f->SetEventOnCompletion(want, ss->e);
+                WaitForSingleObject(ss->e, toms);
+            }
+            const ULONGLONG dt = GetTickCount64() - t0;
+            const bool done = ss->f->GetCompletedValue() >= want;
+            // Only the interesting ones: anything that did not retire, and
+            // anything that took long enough to be on the way to not retiring.
+            if (!done || dt >= 100){
+                std::string m = std::string(done ? "SUBMITSLOW" : "SUBMITSTALL") +
+                                " #" + std::to_string((long)seq) +
+                                " " + std::to_string((unsigned long long)dt) + "ms" +
+                                " q=" + Hex((uint64_t)(uintptr_t)self) +
+                                " lists=" + std::to_string((unsigned)n) +
+                                " removed=" + Hex((uint32_t)(ss->dev ? ss->dev->GetDeviceRemovedReason() : 0));
+                for (UINT i = 0; i < n && i < 8; ++i)
+                    m += "\n    [" + std::to_string(i) + "] " + GhCLSummary(l[i]);
+                Diag(m);
+            }
+        }
+    }
 }
 static HRESULT __stdcall Hook_CQSignal(ID3D12CommandQueue* self, ID3D12Fence* f, UINT64 v)
 {
