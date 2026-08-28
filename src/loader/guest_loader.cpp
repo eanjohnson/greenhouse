@@ -5007,6 +5007,39 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
     }
     return hr;
 }
+// #158: gh_no_uma.txt, read once. Both the capability answer below and the heap
+// calls further down need it -- the lie and the price of the lie are one feature.
+static unsigned GhNoUmaBits()
+{
+    static const unsigned bits = GhCfgNum(L"gh_no_uma.txt", "GH_NO_UMA", 0);
+    return bits;
+}
+
+// The price of the lie. A game told the adapter is discrete asks for CUSTOM heaps
+// in the L1 pool -- dedicated VRAM, which only a discrete adapter has. This console
+// is really UMA, so its driver rejects every L1 request with E_INVALIDARG; D3D12
+// requires L0 for CUSTOM heaps on a UMA adapter. Spider-Man does not check the
+// HRESULT and dereferences the heap it did not get (the null read at GUEST+0x18EB0EE).
+// Translating L1 back to L0 on the way through gives it the heap the adapter would
+// have given it had we never lied -- same memory, same CPU page property, and on a
+// UMA part L0 *is* where dedicated video memory lives. Only active with bit 0 set,
+// so a run with gh_no_uma off is untouched.
+static bool GhFixUmaHeapProps(D3D12_HEAP_PROPERTIES* out,
+                              const D3D12_HEAP_PROPERTIES* in, const char* where)
+{
+    if (!out || !in || !(GhNoUmaBits() & 1)) return false;
+    if (in->Type != D3D12_HEAP_TYPE_CUSTOM) return false;
+    if (in->MemoryPoolPreference != D3D12_MEMORY_POOL_L1) return false;
+    *out = *in;
+    out->MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+    static LONG n = 0;
+    LONG i = InterlockedIncrement(&n);
+    if (i <= 8 || (i % 256) == 0)
+        Diag(std::string("D3D12 ") + where + " pool L1->L0 (UMA lie) cpupage=" +
+             std::to_string((int)in->CPUPageProperty) +
+             " n=" + std::to_string((long)i));
+    return true;
+}
 static HRESULT __stdcall Hook_D12CheckFeature(ID3D12Device* self, D3D12_FEATURE f,
                                               void* data, UINT sz)
 {
@@ -5043,7 +5076,7 @@ static HRESULT __stdcall Hook_D12CheckFeature(ID3D12Device* self, D3D12_FEATURE 
     // A bitmask, not a flag: the two claims are separable and the first run that
     // set both cleared the hang but introduced a null dereference, so which half
     // did which has to be answerable. 1 = not UMA, 2 = no existing heaps.
-    static const unsigned noUmaBits = GhCfgNum(L"gh_no_uma.txt", "GH_NO_UMA", 0);
+    const unsigned noUmaBits = GhNoUmaBits();
     if (noUmaBits && SUCCEEDED(hr) && data){
         if ((noUmaBits & 1) && f == D3D12_FEATURE_ARCHITECTURE && sz >= sizeof(D3D12_FEATURE_DATA_ARCHITECTURE)){
             auto* a = (D3D12_FEATURE_DATA_ARCHITECTURE*)data;
@@ -5195,9 +5228,18 @@ static std::string GhPixName(const void* p, UINT size)
     return best.size() >= 3 ? best : std::string();
 }
 // gh_op_mask.txt bisects the hanging frame by category without touching anything
-// else: bit 0 drops draws, bit 1 drops dispatches, bit 2 drops indirect. The
-// picture is wrong on screen while it is set -- that is the point, it is a probe,
-// not a setting -- and whichever bit makes the device survive names the culprit.
+// else: bit 0 drops draws, bit 1 drops dispatches, bit 2 drops indirect, bit 4
+// drops copies and resolves, bit 5 drops clears and discards. Bit 3 is the blunt
+// one and the one that settles the question the others only narrow: it drops the
+// guest's ExecuteCommandLists outright, so NOTHING the guest recorded ever reaches
+// the GPU while its fences still signal on schedule. If the device still hangs
+// with bit 3 set, no command the guest wrote is responsible and the cause is
+// residency, our own submissions, or the driver. Bit 6 drops resource barriers
+// and bit 7 drops queries and bundles, which between them cover everything left
+// in a list once the work-issuing calls are gone.
+// The picture is wrong on screen while any of this is set -- that is the point, it
+// is a probe, not a setting -- and whichever bit makes the device survive names
+// the culprit.
 static unsigned GhOpMask()
 {
     static const unsigned m = GhCfgNum(L"gh_op_mask.txt", "GH_OP_MASK", 0);
@@ -5252,10 +5294,225 @@ static void __stdcall Hook_CLSetPso(ID3D12GraphicsCommandList* self, ID3D12Pipel
         Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " SETPSO " + Hex((uint64_t)(uintptr_t)pso));
     ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*))g_clVtOrig[25])(self, pso);
 }
+// #158: the barriers that matter are the ones recorded into the submission that
+// never retires, not the first few dozen at load. Keep the most recent ones in a
+// ring and dump it the moment the device is found removed -- that is the only way
+// to read the end of a log that is otherwise thousands of lines of loading.
+static const UINT kBarrKeep = 512;   // filtered-forward buffer; calls carry up to 128
+static const int kBarrRing = 2048;
+static char        g_barrRing[kBarrRing][112];
+static volatile LONG g_barrRingN = 0;
+static void GhBarrNote(const char* s)
+{
+    LONG i = InterlockedIncrement(&g_barrRingN) - 1;
+    char* d = g_barrRing[i % kBarrRing];
+    size_t n = strlen(s); if (n > 110) n = 110;
+    memcpy(d, s, n); d[n] = 0;
+}
+static void GhBarrDump(const char* why)
+{
+    LONG total = InterlockedCompareExchange(&g_barrRingN, 0, 0);
+    LONG start = total > kBarrRing ? total - kBarrRing : 0;
+    Diag(std::string("BARRIERRING ") + why + " total=" + std::to_string((long)total) +
+         " dumping=" + std::to_string((long)(total - start)));
+    std::string chunk;
+    for (LONG i = start; i < total; ++i){
+        chunk += "\n  B[" + std::to_string((long)i) + "] " + g_barrRing[i % kBarrRing];
+        if (chunk.size() > 8000){ Diag(chunk); chunk.clear(); }
+    }
+    if (!chunk.empty()) Diag(chunk);
+}
 static void __stdcall Hook_CLBarrier(ID3D12GraphicsCommandList* self, UINT num,
                                      const D3D12_RESOURCE_BARRIER* b)
 {
     if (GhCLNote* n = GhCLFind(self)) InterlockedAdd(&n->barriers, (LONG)num);
+    // #158: barriers are what hangs this device. With every work-issuing call in
+    // the list already dropped, keeping barriers still hangs it and dropping them
+    // does not -- so the question is now WHICH barrier, and the answer needs the
+    // three sub-kinds separated and the resources named.
+    //
+    //   bit  6 (64)   drop all barriers
+    //   bit  8 (256)  drop TRANSITION barriers
+    //   bit  9 (512)  drop UAV barriers
+    //   bit 10 (1024) drop ALIASING barriers
+    //   bit 11 (2048) drop only barriers naming a resource WE own (guestRT12 or a
+    //                 back buffer) -- the ones where the guest and our 11on12 wrap
+    //                 both believe they control the state.
+    //   bit 12 (4096) drop the barriers recorded during start-up (ecl <= 4) -- the
+    //                 one list that carries 980 COMMON->UNORDERED_ACCESS in a
+    //                 single batch, which is where nearly all of them live
+    //   bit 13 (8192) drop the barriers recorded per frame instead (ecl > 4)
+    // Together those two say whether the poison is the one-off initialisation pass
+    // or the steady-state frame, which the totals alone cannot.
+    const unsigned m = GhOpMask();
+    if (m & 64) return;
+    // No single state class is responsible -- dropping UNORDERED_ACCESS, dropping
+    // RENDER_TARGET and dropping the copy states each leave the hang exactly where
+    // it was. So stop asking which transition and ask what a transition DOES that
+    // the console cannot do here. On this GPU a transition is a cache flush plus,
+    // for render targets and depth, a metadata decompress -- and a decompress is
+    // internal driver shader work, in a container where the driver's own shader
+    // compiler is already known to be broken (SC_DLL/scdxil, #151).
+    //
+    // gh_barrier_mode.txt, which is a candidate fix and not only a probe:
+    //   0  today's behaviour
+    //   1  drop transitions, keep UAV and aliasing barriers
+    //   2  replace the whole call with ONE UAV(nullptr) barrier -- keeps the cache
+    //      flush and the execution ordering the game is asking for, asks for no
+    //      layout change at all
+    //   3  force StateBefore = COMMON on every transition, i.e. do not trust the
+    //      state the game thinks the resource is in
+    static const unsigned barrMode = GhCfgNum(L"gh_barrier_mode.txt", "GH_BARRIER_MODE", 0);
+    if (barrMode && num && b){
+        static LONG shown3 = 0;
+        LONG q = InterlockedIncrement(&shown3);
+        if (q <= 3)
+            Diag("BARRIERMODE " + std::to_string((unsigned)barrMode) + " active, first calls n=" +
+                 std::to_string((unsigned)num));
+        if (barrMode == 2){
+            D3D12_RESOURCE_BARRIER u{};
+            u.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            u.UAV.pResource = nullptr;
+            ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*))g_clVtOrig[26])(self, 1, &u);
+            return;
+        }
+        if ((barrMode == 1 || barrMode == 3) && num <= kBarrKeep){
+            static thread_local D3D12_RESOURCE_BARRIER keep[kBarrKeep];
+            UINT k = 0;
+            for (UINT i = 0; i < num; ++i){
+                if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION){
+                    if (barrMode == 1) continue;
+                    keep[k] = b[i];
+                    keep[k].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                    ++k;
+                    continue;
+                }
+                keep[k++] = b[i];
+            }
+            if (!k) return;
+            ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*))g_clVtOrig[26])(self, k, keep);
+            return;
+        }
+    }
+    // gh_barrier_states.txt is the bisect that needs no rebuild: a D3D12 resource
+    // state bitmask, and any TRANSITION whose before or after state touches it is
+    // dropped. Dropping barriers wholesale lets the game run thousands of frames
+    // instead of forty, so the question left is which state class the driver
+    // cannot service -- 0x8 UNORDERED_ACCESS, 0x4 RENDER_TARGET, 0x30 depth,
+    // 0xC00 copy, 0xac3 generic-read. One run per guess, no build in between.
+    static const unsigned dropStates = GhCfgNum(L"gh_barrier_states.txt", "GH_BARRIER_STATES", 0);
+    if (dropStates){
+        static thread_local D3D12_RESOURCE_BARRIER keep[kBarrKeep];
+        if (num > kBarrKeep){
+            Diag("BARRIERSTATEDROP passthrough: call has " + std::to_string((unsigned)num) +
+                 " barriers, over the " + std::to_string((unsigned)kBarrKeep) + " we can filter");
+        } else {
+        UINT k = 0, dropped = 0;
+        for (UINT i = 0; i < num && b; ++i){
+            if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
+                (((unsigned)b[i].Transition.StateBefore | (unsigned)b[i].Transition.StateAfter) & dropStates)){
+                ++dropped; continue;
+            }
+            keep[k++] = b[i];
+        }
+        if (dropped){
+            static LONG shown2 = 0;
+            LONG q = InterlockedIncrement(&shown2);
+            if (q <= 4 || (q % 512) == 0)
+                Diag("BARRIERSTATEDROP mask=" + Hex(dropStates) + " dropped=" + std::to_string((unsigned)dropped) +
+                     " kept=" + std::to_string((unsigned)k) + " call=" + std::to_string((long)q));
+            if (!k) return;
+            ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*))g_clVtOrig[26])(self, k, keep);
+            return;
+        }
+        }
+    }
+    if (m & (4096 | 8192)){
+        const LONG ecl = InterlockedCompareExchange(&g_eclCount, 0, 0);
+        if ((m & 4096) && ecl <= 4) return;
+        if ((m & 8192) && ecl > 4) return;
+    }
+    // Composition, once, for the first lists: how many of each kind, and whether
+    // any of them name a resource the present path also touches.
+    {
+        static LONG shown = 0;
+        static volatile LONG cTrans = 0, cUav = 0, cAlias = 0, cOurs = 0;
+        bool loud = InterlockedCompareExchange(&shown, 0, 0) < 48;
+        std::string det;
+        for (UINT i = 0; i < num && b; ++i){
+            const bool ours = (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
+                               (b[i].Transition.pResource == (ID3D12Resource*)g_gfx.guestRT12.get() ||
+                                b[i].Transition.pResource == (ID3D12Resource*)g_gfx.backBuffers[0].get() ||
+                                b[i].Transition.pResource == (ID3D12Resource*)g_gfx.backBuffers[1].get()));
+            if (ours) InterlockedIncrement(&cOurs);
+            switch (b[i].Type){
+            case D3D12_RESOURCE_BARRIER_TYPE_TRANSITION:
+                InterlockedIncrement(&cTrans);
+                {
+                    char tmp[112];
+                    _snprintf_s(tmp, sizeof tmp, _TRUNCATE,
+                        "ecl=%ld cl=%p T res=%p sub=%x %x->%x fl=%x%s",
+                        (long)InterlockedCompareExchange(&g_eclCount, 0, 0), (void*)self,
+                        (void*)b[i].Transition.pResource, (unsigned)b[i].Transition.Subresource,
+                        (unsigned)b[i].Transition.StateBefore, (unsigned)b[i].Transition.StateAfter,
+                        (unsigned)b[i].Flags, ours ? " OURS" : "");
+                    GhBarrNote(tmp);
+                }
+                if (loud) det += "\n    T res=" + Hex((uint64_t)(uintptr_t)b[i].Transition.pResource) +
+                                 " sub=" + Hex((uint32_t)b[i].Transition.Subresource) +
+                                 " " + Hex((uint32_t)b[i].Transition.StateBefore) +
+                                 "->" + Hex((uint32_t)b[i].Transition.StateAfter) +
+                                 " flags=" + Hex((uint32_t)b[i].Flags) + (ours ? " OURS" : "");
+                break;
+            case D3D12_RESOURCE_BARRIER_TYPE_UAV:
+                InterlockedIncrement(&cUav);
+                if (loud) det += "\n    U res=" + Hex((uint64_t)(uintptr_t)b[i].UAV.pResource);
+                break;
+            default:
+                InterlockedIncrement(&cAlias);
+                if (loud) det += "\n    A before=" + Hex((uint64_t)(uintptr_t)b[i].Aliasing.pResourceBefore) +
+                                 " after=" + Hex((uint64_t)(uintptr_t)b[i].Aliasing.pResourceAfter);
+                break;
+            }
+        }
+        if (loud && !det.empty()){
+            InterlockedIncrement(&shown);
+            Diag("BARRIER n=" + std::to_string((unsigned)num) +
+                 " cl=" + Hex((uint64_t)(uintptr_t)self) + det);
+        }
+        static LONG64 lastTick = 0;
+        LONG64 now = (LONG64)GetTickCount64();
+        if (now - InterlockedCompareExchange64(&lastTick, 0, 0) > 2000){
+            InterlockedExchange64(&lastTick, now);
+            Diag("BARRIERTOTALS transition=" + std::to_string((long)InterlockedCompareExchange(&cTrans,0,0)) +
+                 " uav=" + std::to_string((long)InterlockedCompareExchange(&cUav,0,0)) +
+                 " aliasing=" + std::to_string((long)InterlockedCompareExchange(&cAlias,0,0)) +
+                 " on-our-resources=" + std::to_string((long)InterlockedCompareExchange(&cOurs,0,0)));
+        }
+    }
+    // Sub-kind filtering needs a private copy: the guest's array is const and may
+    // be a stack temporary it reuses.
+    if ((m & (256 | 512 | 1024 | 2048)) && num <= kBarrKeep){
+        static thread_local D3D12_RESOURCE_BARRIER keep[kBarrKeep];
+        UINT k = 0;
+        for (UINT i = 0; i < num && b; ++i){
+            const bool isT = b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            const bool isU = b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            const bool isA = !isT && !isU;
+            const bool ours = isT &&
+                (b[i].Transition.pResource == (ID3D12Resource*)g_gfx.guestRT12.get() ||
+                 b[i].Transition.pResource == (ID3D12Resource*)g_gfx.backBuffers[0].get() ||
+                 b[i].Transition.pResource == (ID3D12Resource*)g_gfx.backBuffers[1].get());
+            if (isT && (m & 256)) continue;
+            if (isU && (m & 512)) continue;
+            if (isA && (m & 1024)) continue;
+            if (ours && (m & 2048)) continue;
+            keep[k++] = b[i];
+        }
+        if (!k) return;
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*))g_clVtOrig[26])(self, k, keep);
+        return;
+    }
     ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*))g_clVtOrig[26])(self, num, b);
 }
 static void __stdcall Hook_CLBeginEvent(ID3D12GraphicsCommandList* self, UINT meta,
@@ -5315,6 +5572,104 @@ static void __stdcall Hook_CLExecIndirect(ID3D12GraphicsCommandList* self, void*
     ((void (__stdcall*)(ID3D12GraphicsCommandList*, void*, UINT, ID3D12Resource*, UINT64,
                         ID3D12Resource*, UINT64))g_clVtOrig[59])(self, sig, maxCount, args, argOff, cnt, cntOff);
 }
+// Copies and clears: the two categories left in a command list once draws,
+// dispatches and indirect are gone. Signatures are only as precise as they need
+// to be to forward -- these are pass-throughs or drops, nothing reads the args.
+static void __stdcall Hook_CLCopyBufferRegion(ID3D12GraphicsCommandList* self,
+    ID3D12Resource* d, UINT64 dOff, ID3D12Resource* sr, UINT64 sOff, UINT64 n)
+{
+    if (GhOpMask() & 16) return;
+    ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT64,
+                        ID3D12Resource*, UINT64, UINT64))g_clVtOrig[15])(self, d, dOff, sr, sOff, n);
+}
+static void __stdcall Hook_CLCopyTextureRegion(ID3D12GraphicsCommandList* self,
+    const void* d, UINT x, UINT y, UINT z, const void* sr, const void* box)
+{
+    if (GhOpMask() & 16) return;
+    ((void (__stdcall*)(ID3D12GraphicsCommandList*, const void*, UINT, UINT, UINT,
+                        const void*, const void*))g_clVtOrig[16])(self, d, x, y, z, sr, box);
+}
+static void __stdcall Hook_CLCopyResource(ID3D12GraphicsCommandList* self,
+    ID3D12Resource* d, ID3D12Resource* sr)
+{
+    if (GhOpMask() & 16) return;
+    ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*,
+                        ID3D12Resource*))g_clVtOrig[17])(self, d, sr);
+}
+static void __stdcall Hook_CLResolveSubresource(ID3D12GraphicsCommandList* self,
+    ID3D12Resource* d, UINT ds, ID3D12Resource* sr, UINT ss, DXGI_FORMAT f)
+{
+    if (GhOpMask() & 16) return;
+    ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT,
+                        ID3D12Resource*, UINT, DXGI_FORMAT))g_clVtOrig[19])(self, d, ds, sr, ss, f);
+}
+static void __stdcall Hook_CLClearDsv(ID3D12GraphicsCommandList* self,
+    D3D12_CPU_DESCRIPTOR_HANDLE h, D3D12_CLEAR_FLAGS fl, FLOAT depth, UINT8 st,
+    UINT nr, const D3D12_RECT* r)
+{
+    if (GhOpMask() & 32) return;
+    ((void (__stdcall*)(ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE,
+                        D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT,
+                        const D3D12_RECT*))g_clVtOrig[47])(self, h, fl, depth, st, nr, r);
+}
+static void __stdcall Hook_CLClearRtv(ID3D12GraphicsCommandList* self,
+    D3D12_CPU_DESCRIPTOR_HANDLE h, const FLOAT c[4], UINT nr, const D3D12_RECT* r)
+{
+    if (GhOpMask() & 32) return;
+    ((void (__stdcall*)(ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE,
+                        const FLOAT*, UINT, const D3D12_RECT*))g_clVtOrig[48])(self, h, c, nr, r);
+}
+static void __stdcall Hook_CLClearUavUint(ID3D12GraphicsCommandList* self,
+    D3D12_GPU_DESCRIPTOR_HANDLE g, D3D12_CPU_DESCRIPTOR_HANDLE c, ID3D12Resource* res,
+    const UINT v[4], UINT nr, const D3D12_RECT* r)
+{
+    if (GhOpMask() & 32) return;
+    ((void (__stdcall*)(ID3D12GraphicsCommandList*, D3D12_GPU_DESCRIPTOR_HANDLE,
+                        D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*, const UINT*, UINT,
+                        const D3D12_RECT*))g_clVtOrig[49])(self, g, c, res, v, nr, r);
+}
+static void __stdcall Hook_CLClearUavFloat(ID3D12GraphicsCommandList* self,
+    D3D12_GPU_DESCRIPTOR_HANDLE g, D3D12_CPU_DESCRIPTOR_HANDLE c, ID3D12Resource* res,
+    const FLOAT v[4], UINT nr, const D3D12_RECT* r)
+{
+    if (GhOpMask() & 32) return;
+    ((void (__stdcall*)(ID3D12GraphicsCommandList*, D3D12_GPU_DESCRIPTOR_HANDLE,
+                        D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*, const FLOAT*, UINT,
+                        const D3D12_RECT*))g_clVtOrig[50])(self, g, c, res, v, nr, r);
+}
+static void __stdcall Hook_CLExecuteBundle(ID3D12GraphicsCommandList* self,
+                                           ID3D12GraphicsCommandList* b)
+{
+    if (GhOpMask() & 128) return;
+    ((void (__stdcall*)(ID3D12GraphicsCommandList*,
+                        ID3D12GraphicsCommandList*))g_clVtOrig[27])(self, b);
+}
+static void __stdcall Hook_CLBeginQuery(ID3D12GraphicsCommandList* self,
+    ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i)
+{
+    if (GhOpMask() & 128) return;
+    ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12QueryHeap*,
+                        D3D12_QUERY_TYPE, UINT))g_clVtOrig[52])(self, h, t, i);
+}
+static void __stdcall Hook_CLEndQuery(ID3D12GraphicsCommandList* self,
+    ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i)
+{
+    if (GhOpMask() & 128) return;
+    ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12QueryHeap*,
+                        D3D12_QUERY_TYPE, UINT))g_clVtOrig[53])(self, h, t, i);
+}
+// ResolveQueryData is the one op left in the list that WRITES to a buffer the
+// game chose, which makes it the obvious suspect if a bad destination is what the
+// GPU faults on.
+static void __stdcall Hook_CLResolveQuery(ID3D12GraphicsCommandList* self,
+    ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT start, UINT n,
+    ID3D12Resource* dst, UINT64 off)
+{
+    if (GhOpMask() & 128) return;
+    ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12QueryHeap*, D3D12_QUERY_TYPE,
+                        UINT, UINT, ID3D12Resource*,
+                        UINT64))g_clVtOrig[54])(self, h, t, start, n, dst, off);
+}
 static void GhHookCommandList(ID3D12CommandList* cl)
 {
     // As with the queue, one vtable serves every list of this class, so hook it
@@ -5337,6 +5692,18 @@ static void GhHookCommandList(ID3D12CommandList* cl)
     g_clVtOrig[57] = vt[57]; vt[57] = (void*)&Hook_CLBeginEvent;
     g_clVtOrig[58] = vt[58]; vt[58] = (void*)&Hook_CLEndEvent;
     g_clVtOrig[59] = vt[59]; vt[59] = (void*)&Hook_CLExecIndirect;
+    g_clVtOrig[15] = vt[15]; vt[15] = (void*)&Hook_CLCopyBufferRegion;
+    g_clVtOrig[16] = vt[16]; vt[16] = (void*)&Hook_CLCopyTextureRegion;
+    g_clVtOrig[17] = vt[17]; vt[17] = (void*)&Hook_CLCopyResource;
+    g_clVtOrig[19] = vt[19]; vt[19] = (void*)&Hook_CLResolveSubresource;
+    g_clVtOrig[47] = vt[47]; vt[47] = (void*)&Hook_CLClearDsv;
+    g_clVtOrig[48] = vt[48]; vt[48] = (void*)&Hook_CLClearRtv;
+    g_clVtOrig[49] = vt[49]; vt[49] = (void*)&Hook_CLClearUavUint;
+    g_clVtOrig[50] = vt[50]; vt[50] = (void*)&Hook_CLClearUavFloat;
+    g_clVtOrig[27] = vt[27]; vt[27] = (void*)&Hook_CLExecuteBundle;
+    g_clVtOrig[52] = vt[52]; vt[52] = (void*)&Hook_CLBeginQuery;
+    g_clVtOrig[53] = vt[53]; vt[53] = (void*)&Hook_CLEndQuery;
+    g_clVtOrig[54] = vt[54]; vt[54] = (void*)&Hook_CLResolveQuery;
     VirtualProtect(vt, sizeof(void*) * 64, old, &old);
     Diag("D3D12 list vtable hooked (Reset/Draw/Dispatch/SetPSO/Barrier/PIX/ExecuteIndirect)");
 }
@@ -5497,6 +5864,18 @@ static void __stdcall Hook_CQExecute(ID3D12CommandQueue* self, UINT n, ID3D12Com
         for (UINT i = 0; i < n && i < 8; ++i) m += "\n    [" + std::to_string(i) + "] " + GhCLSummary(l[i]);
         Diag(m);
     }
+    // bit 3: swallow the guest's submissions entirely. Ours still go through --
+    // g_gfx.queue is the one the blit and 11on12 use, and dropping that would
+    // change what is on screen rather than what the GPU is asked to do. Fences
+    // are untouched either way, so the guest's CPU side never notices.
+    if ((GhOpMask() & 8) && self != g_gfx.queue.get()){
+        static LONG dropped = 0;
+        LONG k = InterlockedIncrement(&dropped);
+        if (k <= 4 || (k % 256) == 0)
+            Diag("GPUSUBMIT DROPPED by gh_op_mask bit3 n=" + std::to_string((long)k) +
+                 " q=" + Hex((uint64_t)(uintptr_t)self));
+        return;
+    }
     ((void (__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*))g_cqVtOrig[10])(self, n, l);
 }
 static HRESULT __stdcall Hook_CQSignal(ID3D12CommandQueue* self, ID3D12Fence* f, UINT64 v)
@@ -5615,9 +5994,10 @@ static HRESULT __stdcall Hook_D12CreateFence(ID3D12Device* self, UINT64 init,
     return hr;
 }
 
-// The heap/resource calls the fault sits under. Nothing is changed here: these
-// exist so the log says WHICH heap and WHICH placement the driver was servicing
-// when it wrote into memory that was never mapped.
+// The heap/resource calls the fault sits under: the log says WHICH heap and WHICH
+// placement the driver was servicing when it wrote into memory that was never
+// mapped. Both also carry the L1->L0 pool translation that gh_no_uma bit 0 owes
+// the guest -- see GhFixUmaHeapProps.
 static HRESULT __stdcall Hook_D12CreateCommitted(ID3D12Device* self,
     const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC* rd,
     D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID riid, void** pp)
@@ -5625,11 +6005,14 @@ static HRESULT __stdcall Hook_D12CreateCommitted(ID3D12Device* self,
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*,
         D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
         const D3D12_CLEAR_VALUE*, REFIID, void**))g_d12vtOrig[27];
+    D3D12_HEAP_PROPERTIES fixedHp{};
+    if (GhFixUmaHeapProps(&fixedHp, hp, "CreateCommittedResource")) hp = &fixedHp;
     HRESULT hr = orig(self, hp, hf, rd, st, cv, riid, pp);
     static LONG n = 0;
     if (InterlockedIncrement(&n) <= 24 || FAILED(hr))
         Diag("D3D12 CreateCommittedResource heap=" + std::to_string(hp ? (int)hp->Type : -1) +
              " cpupage=" + std::to_string(hp ? (int)hp->CPUPageProperty : -1) +
+             " pool=" + std::to_string(hp ? (int)hp->MemoryPoolPreference : -1) +
              " flags=" + Hex((uint32_t)hf) +
              " dim=" + std::to_string(rd ? (int)rd->Dimension : -1) +
              " w=" + std::to_string(rd ? (unsigned long long)rd->Width : 0ull) +
@@ -5672,6 +6055,13 @@ static HRESULT __stdcall Hook_D12CreateHeap(ID3D12Device* self,
         }
     }
 
+    D3D12_HEAP_DESC fixedHd{};
+    if (hd){
+        D3D12_HEAP_PROPERTIES fp{};
+        if (GhFixUmaHeapProps(&fp, &hd->Properties, "CreateHeap")){
+            fixedHd = *hd; fixedHd.Properties = fp; hd = &fixedHd;
+        }
+    }
     HRESULT hr = orig(self, hd, riid, pp);
     if (SUCCEEDED(hr) && hd){
         InterlockedAdd64(&heapBytes, (LONG64)hd->SizeInBytes);
@@ -5780,6 +6170,7 @@ static void GhCheckDeviceRemoved(const char* where, ID3D12Device* dev)
     if (InterlockedCompareExchange(&g_devRemovedSeen, 1, 0) != 0) return;
     Diag(std::string("DEVICEREMOVED first seen at ") + where +
          " reason=" + Hex((uint32_t)r) + GhGpuProgress());
+    GhBarrDump("at-device-removed");
     com_ptr<ID3D12DeviceRemovedExtendedData> dred;
     if (FAILED(d->QueryInterface(__uuidof(ID3D12DeviceRemovedExtendedData), dred.put_void())) || !dred){
         Diag("DEVICEREMOVED no DRED interface on this device");
