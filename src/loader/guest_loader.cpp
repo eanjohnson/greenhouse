@@ -297,9 +297,11 @@ static int __cdecl Bed_fflush(FILE*){ return 0; }
 // Process exit -- never let the guest tear down the host; flush its CRT then
 // unwind back to us. Covers exit/_exit/_cexit/abort and TerminateProcess.
 static void FinishGuestSession();          // defined with RunGuest, below
+static bool ReadWholeFile(const std::wstring& path, std::vector<uint8_t>& out, bool optional = false);  // defined below; RegHiveLoad needs it
 static void DiagGuestBacktrace(const char* who);   // defined with the module ranges, below
 static std::string NameForCodeAddr(uintptr_t a);
 static bool HandleGuestTracepoint(EXCEPTION_POINTERS* ep);   // defined with them too
+static void GhLogMemoryBudget(const char* where);            // #140 memory sampling
 extern volatile bool g_guestDone;
 
 // A guest's exit() terminates the guest WORKER THREAD rather than longjmp-ing
@@ -1151,6 +1153,25 @@ static void RegPutString(GhRegVal& v, DWORD type, const std::wstring& s){
 static void RegPutDword(GhRegVal& v, DWORD d){ v.type=REG_DWORD; v.data.assign((uint8_t*)&d,(uint8_t*)&d+4); }
 static bool RegIsStr(DWORD t){ return t==REG_SZ||t==REG_EXPAND_SZ||t==REG_MULTI_SZ; }
 
+// A value's NAME is not enough to act on. Spider-Man writes 60-odd graphics
+// settings on its first run and the useful question -- which quality level did
+// it pick for itself? -- is answered only by the data.
+static std::string RegShow(const GhRegVal& v)
+{
+    if (v.type == REG_DWORD && v.data.size() >= 4){
+        DWORD d = 0; memcpy(&d, v.data.data(), 4);
+        return "dword:" + std::to_string(d);
+    }
+    if (RegIsStr(v.type) && v.data.size() >= 2)
+        return "sz:" + RegNarrow(std::wstring((const wchar_t*)v.data.data()));
+    std::string h = "type" + std::to_string(v.type) + ":";
+    for (size_t i = 0; i < v.data.size() && i < 16; ++i){
+        static const char* k = "0123456789abcdef";
+        h += k[v.data[i] >> 4]; h += k[v.data[i] & 15];
+    }
+    return h;
+}
+
 static LSTATUS RegOpenImpl(HKEY root, const std::wstring& sub, PHKEY out){
     std::lock_guard<std::mutex> lk(g_regMutex);
     std::wstring path=RegPathLocked(root,sub);
@@ -1175,7 +1196,7 @@ static LSTATUS RegSetImpl(HKEY hk, const std::wstring& name, DWORD type, const B
     if(ansi && RegIsStr(type)) RegPutString(v,type,RegWiden((const char*)data));
     else if(data && cb) v.data.assign(data,data+cb);
     g_regKeys[it->second].values[RegLower(name)]=v;
-    Diag("REG set " + RegNarrow(it->second) + " : " + RegNarrow(name));
+    Diag("REG set " + RegNarrow(it->second) + " : " + RegNarrow(name) + " = " + RegShow(v));
     return ERROR_SUCCESS;
 }
 static LSTATUS RegQueryImpl(HKEY hk, const std::wstring& name, LPDWORD ptype, LPBYTE data, LPDWORD pcb, bool ansi){
@@ -1216,9 +1237,94 @@ static LSTATUS APIENTRY Bed_RegSetValueExA(HKEY hk, LPCSTR name, DWORD, DWORD ty
 static LSTATUS APIENTRY Bed_RegQueryValueExW(HKEY hk, LPCWSTR name, LPDWORD, LPDWORD ptype, LPBYTE data, LPDWORD pcb){ return RegQueryImpl(hk, name?name:L"", ptype, data, pcb, false); }
 static LSTATUS APIENTRY Bed_RegQueryValueExA(HKEY hk, LPCSTR name, LPDWORD, LPDWORD ptype, LPBYTE data, LPDWORD pcb){ return RegQueryImpl(hk, RegWiden(name), ptype, data, pcb, true); }
 static LSTATUS APIENTRY Bed_RegCloseKey(HKEY hk){ std::lock_guard<std::mutex> lk(g_regMutex); g_regHandles.erase(hk); return ERROR_SUCCESS; }
-static LSTATUS APIENTRY Bed_RegEnumKeyExA(HKEY, DWORD, LPSTR, LPDWORD, LPDWORD, LPSTR, LPDWORD, PFILETIME){ return ERROR_NO_MORE_ITEMS; }
-static LSTATUS APIENTRY Bed_RegEnumValueA(HKEY, DWORD, LPSTR, LPDWORD, LPDWORD, LPDWORD, LPBYTE, LPDWORD){ return ERROR_NO_MORE_ITEMS; }
-static LSTATUS APIENTRY Bed_RegDeleteValueA(HKEY, LPCSTR){ return ERROR_SUCCESS; }
+// Enumeration used to answer NO_MORE_ITEMS unconditionally, which is a safe
+// answer only for a hive that never holds anything worth finding. Now that the
+// hive persists across runs (below), a game reading its settings back by
+// enumerating the key would silently see an empty key and fall back to its
+// defaults -- the exact failure the persistence exists to prevent.
+static LSTATUS RegEnumValueImpl(HKEY hk, DWORD idx, void* name, LPDWORD cchName,
+                                LPDWORD ptype, LPBYTE data, LPDWORD pcb, bool ansi)
+{
+    std::lock_guard<std::mutex> lk(g_regMutex);
+    auto it=g_regHandles.find(hk); if(it==g_regHandles.end()) return ERROR_INVALID_HANDLE;
+    auto ki=g_regKeys.find(it->second); if(ki==g_regKeys.end()) return ERROR_NO_MORE_ITEMS;
+    if(idx >= ki->second.values.size()) return ERROR_NO_MORE_ITEMS;
+    auto vi=ki->second.values.begin(); std::advance(vi,(size_t)idx);
+    const std::wstring& n = vi->first; const GhRegVal& v = vi->second;
+    std::vector<uint8_t> outb;
+    if(RegIsStr(v.type) && ansi){
+        const wchar_t* w=(const wchar_t*)v.data.data();
+        int cn=WideCharToMultiByte(CP_ACP,0,w,-1,nullptr,0,nullptr,nullptr);
+        if(cn>0){ outb.resize(cn); WideCharToMultiByte(CP_ACP,0,w,-1,(char*)outb.data(),cn,nullptr,nullptr); }
+    } else outb=v.data;
+    if(!name || !cchName) return ERROR_INVALID_PARAMETER;
+    if(*cchName <= n.size()) return ERROR_MORE_DATA;
+    if(ansi){ std::string a=RegNarrow(n); memcpy(name,a.c_str(),a.size()+1); }
+    else    { memcpy(name,n.c_str(),(n.size()+1)*sizeof(wchar_t)); }
+    *cchName=(DWORD)n.size();
+    if(ptype)*ptype=v.type;
+    if(data){ if(!pcb) return ERROR_INVALID_PARAMETER;
+              if(*pcb < outb.size()){ *pcb=(DWORD)outb.size(); return ERROR_MORE_DATA; }
+              if(!outb.empty()) memcpy(data,outb.data(),outb.size()); }
+    if(pcb)*pcb=(DWORD)outb.size();
+    return ERROR_SUCCESS;
+}
+// Subkeys are not stored as a tree, only as full paths, so "the children of P"
+// is every path that starts with "P\" and has no further backslash.
+static LSTATUS RegEnumKeyImpl(HKEY hk, DWORD idx, void* name, LPDWORD cchName, bool ansi)
+{
+    std::lock_guard<std::mutex> lk(g_regMutex);
+    auto it=g_regHandles.find(hk); if(it==g_regHandles.end()) return ERROR_INVALID_HANDLE;
+    std::wstring pre = it->second + L"\\";
+    DWORD seen = 0;
+    for (auto& kv : g_regKeys){
+        if (kv.first.size() <= pre.size() || kv.first.compare(0,pre.size(),pre) != 0) continue;
+        std::wstring tail = kv.first.substr(pre.size());
+        if (tail.find(L'\\') != std::wstring::npos) continue;      // grandchild
+        if (seen++ != idx) continue;
+        if(!name || !cchName) return ERROR_INVALID_PARAMETER;
+        if(*cchName <= tail.size()) return ERROR_MORE_DATA;
+        if(ansi){ std::string a=RegNarrow(tail); memcpy(name,a.c_str(),a.size()+1); }
+        else    { memcpy(name,tail.c_str(),(tail.size()+1)*sizeof(wchar_t)); }
+        *cchName=(DWORD)tail.size();
+        return ERROR_SUCCESS;
+    }
+    return ERROR_NO_MORE_ITEMS;
+}
+static LSTATUS APIENTRY Bed_RegEnumKeyExA(HKEY hk, DWORD i, LPSTR n, LPDWORD cn, LPDWORD, LPSTR, LPDWORD, PFILETIME){ return RegEnumKeyImpl(hk,i,n,cn,true); }
+static LSTATUS APIENTRY Bed_RegEnumKeyExW(HKEY hk, DWORD i, LPWSTR n, LPDWORD cn, LPDWORD, LPWSTR, LPDWORD, PFILETIME){ return RegEnumKeyImpl(hk,i,n,cn,false); }
+static LSTATUS APIENTRY Bed_RegEnumValueA(HKEY hk, DWORD i, LPSTR n, LPDWORD cn, LPDWORD r, LPDWORD t, LPBYTE d, LPDWORD cb){ (void)r; return RegEnumValueImpl(hk,i,n,cn,t,d,cb,true); }
+static LSTATUS APIENTRY Bed_RegEnumValueW(HKEY hk, DWORD i, LPWSTR n, LPDWORD cn, LPDWORD r, LPDWORD t, LPBYTE d, LPDWORD cb){ (void)r; return RegEnumValueImpl(hk,i,n,cn,t,d,cb,false); }
+static LSTATUS APIENTRY Bed_RegQueryInfoKeyA(HKEY hk, LPSTR, LPDWORD, LPDWORD, LPDWORD nsub, LPDWORD maxsub, LPDWORD,
+                                             LPDWORD nval, LPDWORD maxval, LPDWORD maxdata, LPDWORD, PFILETIME)
+{
+    std::lock_guard<std::mutex> lk(g_regMutex);
+    auto it=g_regHandles.find(hk); if(it==g_regHandles.end()) return ERROR_INVALID_HANDLE;
+    DWORD nv=0, mv=0, md=0;
+    auto ki=g_regKeys.find(it->second);
+    if(ki!=g_regKeys.end()){
+        nv=(DWORD)ki->second.values.size();
+        for(auto& v : ki->second.values){
+            if(v.first.size() > mv) mv=(DWORD)v.first.size();
+            if(v.second.data.size() > md) md=(DWORD)v.second.data.size();
+        }
+    }
+    std::wstring pre = it->second + L"\\"; DWORD ns=0, ms=0;
+    for(auto& kv : g_regKeys){
+        if(kv.first.size() <= pre.size() || kv.first.compare(0,pre.size(),pre)!=0) continue;
+        std::wstring tail=kv.first.substr(pre.size());
+        if(tail.find(L'\\')!=std::wstring::npos) continue;
+        ++ns; if(tail.size()>ms) ms=(DWORD)tail.size();
+    }
+    if(nsub)*nsub=ns; if(maxsub)*maxsub=ms;
+    if(nval)*nval=nv; if(maxval)*maxval=mv; if(maxdata)*maxdata=md;
+    return ERROR_SUCCESS;
+}
+static LSTATUS APIENTRY Bed_RegDeleteValueA(HKEY hk, LPCSTR name){
+    std::lock_guard<std::mutex> lk(g_regMutex);
+    auto it=g_regHandles.find(hk); if(it==g_regHandles.end()) return ERROR_SUCCESS;
+    auto ki=g_regKeys.find(it->second); if(ki!=g_regKeys.end()) ki->second.values.erase(RegLower(RegWiden(name)));
+    return ERROR_SUCCESS; }
 static LSTATUS APIENTRY Bed_RegDeleteTreeA(HKEY, LPCSTR){ return ERROR_SUCCESS; }
 
 // Pre-seed the Steam cold-client keys. Called once from RunGuest after g_guestDir
@@ -1239,6 +1345,103 @@ static void SeedSteamRegistry(){
     { GhRegVal v; RegPutDword(v,0);                                 ap.values[L"activeuser"]=v; }
     { GhRegVal v; RegPutDword(v,GetCurrentProcessId());            ap.values[L"pid"]=v; }
     Diag("REG seeded Steam cold-client keys (guestdir=" + RegNarrow(gd) + ")");
+}
+
+// ---------------------------------------------------------------------------
+// Persisting the hive (#141).
+//
+// The hive above was per-run, and for a game that keeps its settings in the
+// registry that is a bug the size of a milestone. Spider-Man is one: finding no
+// HKCU\Software\Insomniac Games key, it treats every launch as its first, picks
+// graphics defaults from what the machine looks like, writes sixty-odd values
+// under ...\Graphics, and never reads one of them back. Defaults chosen against
+// a 5 GB app budget and a 4.1 GB advertised video budget are exactly what walks
+// the process into the container's memory ceiling -- and with the hive dropped
+// at exit, no setting could survive to the next launch even if the game's own
+// menu were reachable, which it is not.
+//
+// The file is deliberately plain text, one value per line, because it is also
+// the only handle anyone has on the settings of a game that dies during startup.
+// It is keyed to the guest so one game's hive can never answer another's query.
+// ---------------------------------------------------------------------------
+static std::wstring GhRegHivePath()
+{
+    std::wstring name;
+    std::wstring gd = g_guestDir;
+    while (!gd.empty() && (gd.back()==L'\\' || gd.back()==L'/')) gd.pop_back();
+    size_t slash = gd.find_last_of(L"\\/");
+    std::wstring leaf = (slash == std::wstring::npos) ? gd : gd.substr(slash+1);
+    for (wchar_t c : leaf)
+        if ((c>=L'a'&&c<=L'z')||(c>=L'A'&&c<=L'Z')||(c>=L'0'&&c<=L'9')||c==L'_'||c==L'-') name += c;
+    if (name.empty()) name = L"guest";
+    return std::wstring(kLocalState) + L"ghreg_" + name + L".txt";
+}
+
+static void RegHiveLoad()
+{
+    std::vector<uint8_t> b;
+    if (!ReadWholeFile(GhRegHivePath(), b, true) || b.empty()){
+        Diag("REG hive none (" + RegNarrow(GhRegHivePath()) + ")");
+        return;
+    }
+    std::string text((const char*)b.data(), b.size());
+    size_t pos = 0, n = 0;
+    std::lock_guard<std::mutex> lk(g_regMutex);
+    while (pos < text.size()){
+        size_t nl = text.find('\n', pos);
+        std::string line = text.substr(pos, (nl==std::string::npos ? text.size() : nl) - pos);
+        pos = (nl==std::string::npos) ? text.size() : nl + 1;
+        while (!line.empty() && (line.back()=='\r' || line.back()=='\n')) line.pop_back();
+        if (line.empty() || line[0]=='#') continue;
+        // K|path                       -- a key with no values
+        // V|path|name|type|hexbytes    -- one value
+        std::vector<std::string> f; size_t q = 0;
+        while (true){ size_t bar = line.find('|', q);
+                      f.push_back(line.substr(q, (bar==std::string::npos?line.size():bar)-q));
+                      if (bar==std::string::npos) break; q = bar+1; }
+        auto widen = [](const std::string& a){ return RegLower(std::wstring(a.begin(), a.end())); };
+        if (f.size() >= 2 && f[0]=="K"){ g_regKeys[widen(f[1])]; continue; }
+        if (f.size() >= 5 && f[0]=="V"){
+            GhRegVal v; v.type = (DWORD)strtoul(f[3].c_str(), nullptr, 10);
+            const std::string& h = f[4];
+            for (size_t i = 0; i + 1 < h.size(); i += 2){
+                auto nib=[](char c)->int{ return c>='0'&&c<='9'?c-'0':(c>='a'&&c<='f'?c-'a'+10:(c>='A'&&c<='F'?c-'A'+10:0)); };
+                v.data.push_back((uint8_t)((nib(h[i])<<4)|nib(h[i+1])));
+            }
+            g_regKeys[widen(f[1])].values[widen(f[2])] = v;
+            ++n;
+        }
+    }
+    Diag("REG hive loaded values=" + std::to_string(n) + " keys=" + std::to_string(g_regKeys.size()));
+}
+
+static void RegHiveSave()
+{
+    std::string out =
+        "# Greenhouse virtual registry. Hand-editable: V|<key>|<value>|<type>|<hex little-endian>\n"
+        "# type 4 = REG_DWORD, 1 = REG_SZ (UTF-16 bytes, NUL-terminated).\n";
+    size_t n = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_regMutex);
+        for (auto& kv : g_regKeys){
+            std::string key = RegNarrow(kv.first);
+            if (kv.second.values.empty()){ out += "K|" + key + "\n"; continue; }
+            for (auto& v : kv.second.values){
+                out += "V|" + key + "|" + RegNarrow(v.first) + "|" + std::to_string(v.second.type) + "|";
+                for (uint8_t c : v.second.data){
+                    static const char* k = "0123456789abcdef";
+                    out += k[c>>4]; out += k[c&15];
+                }
+                out += "\n"; ++n;
+            }
+        }
+    }
+    std::wstring path = GhRegHivePath();
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE){ Diag("REG hive save failed err=" + Hex(GetLastError())); return; }
+    DWORD w = 0; WriteFile(h, out.data(), (DWORD)out.size(), &w, nullptr); CloseHandle(h);
+    Diag("REG hive saved values=" + std::to_string(n) + " bytes=" + std::to_string(out.size()));
 }
 // OpenProcessToken is left REAL so the guest gets a genuine, closeable token
 // handle; AdjustTokenPrivileges below simply reports "privilege not held".
@@ -2000,12 +2203,233 @@ static volatile bool g_overlayQuitNow = false;  // set by OverlayTick; Bed_exit 
 static volatile bool g_guestSessionLive = false; // leftover Unity Present must no-op after quit
 #endif
 
+// ------------------------------------------------------------------
+// #139: catching the instruction that corrupts an AdapterProxy vtable pointer.
+//
+// Round one watched root+0x30 with a hardware DATA breakpoint and learned two
+// things. The writes it caught were ordinary destruction (a proxy's dtor
+// re-pointing the vptr, driven by a Release from sl.common.dll -- NVIDIA
+// Streamline, which interposes DXGI), and the object that actually faults is
+// created too late to fit in the four debug registers. But it also confirmed
+// the shape of the damage: root+0x30 loses exactly one, root+0x38 (the
+// refcount) is untouched and still plausible.
+//
+// Disassembling our own binary explains how that can happen. cppwinrt lays an
+// implements<D, I...> out as N producer vtable pointers, then root_implements
+// (its vptr), then the refcount. So for the producer at index k of an
+// N-interface class, the refcount sits at `this + 8*(N-k) + 8` -- a constant
+// baked into that producer's AddRef/Release. AdapterProxy has six interfaces,
+// so its k=1 producer uses `[this+0x30]`, and the linker's identical-code
+// folding gives every (N,k) pair with the same delta ONE shared function. Ours
+// is at .text `lea rdx,[rax-1]; lock cmpxchg QWORD PTR [rcx+0x30],rdx`.
+//
+// Call that with `this` pointing at the ROOT rather than the k=1 producer --
+// eight bytes low -- and it decrements the root_implements vtable pointer
+// instead of the counter. That is exactly the observed damage, and it is the
+// only instruction in the whole image that can produce it.
+//
+// So round two breaks ON that instruction and asks one question: is the value
+// being decremented a small refcount, or a pointer? Every legitimate caller
+// leaves a small integer in rax there. A pointer means we have caught the bad
+// call in the act, with its caller still on the stack -- which is the answer.
+// The AddRef twin is watched the same way, since a stray increment through the
+// same path would be just as wrong.
+//
+// The instruction is found by pattern rather than by a fixed RVA, because every
+// edit to this file moves it. Arming still uses the debug registers, which are
+// per-thread, so each thread arms itself the first time it passes one of our
+// graphics entry points; and SetThreadContext is not dependable on one's own
+// thread, so the registers are written into the CONTEXT the kernel is about to
+// restore -- the same write-back path gh_steam_engine.h uses to DISarm its
+// engine breakpoint.
+// ------------------------------------------------------------------
+static bool SafeQword(uintptr_t a, uintptr_t* out);   // fwd (tracepoint dumps)
+
+#define GH_WATCH_ARM_CODE 0x47485741u          // 'GHWA' -- private and continuable
+static constexpr int kGhWatchMax = 4;          // one per debug register
+static uintptr_t     g_watchAddr[kGhWatchMax] = {0, 0, 0, 0};
+static bool          g_watchWrite[kGhWatchMax] = {false, false, false, false};
+static const char*   g_watchWhat[kGhWatchMax] = {nullptr, nullptr, nullptr, nullptr};
+static volatile LONG g_watchCount = 0;
+static volatile LONG g_watchHits  = 0;
+static volatile LONG g_watchGen   = 0;   // bumped whenever the set changes
+static volatile LONG g_watchTrips = 0;   // every breakpoint trap, bad or not
+static DWORD         g_watchTls   = TLS_OUT_OF_INDEXES;
+
+// Find one byte pattern in our own .text. Returns 0 unless it appears exactly
+// once -- an ambiguous match means the pattern no longer identifies what it was
+// written to identify, and a breakpoint on the wrong instruction is worse than
+// none. Kept free of C++ objects so the __try guarding the walk is legal.
+static const BYTE* GhFindOnceInSelf(const BYTE* pat, size_t n, int* count)
+{
+    *count = 0;
+    const BYTE* found = nullptr;
+    HMODULE self = GetModuleHandleW(nullptr);
+    if (!self) return nullptr;
+    auto* dos = (IMAGE_DOS_HEADER*)self;
+    auto* nt  = (IMAGE_NT_HEADERS*)((BYTE*)self + dos->e_lfanew);
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec){
+        if (memcmp(sec->Name, ".text", 5) != 0) continue;
+        const BYTE* p   = (BYTE*)self + sec->VirtualAddress;
+        SIZE_T      len = sec->Misc.VirtualSize;
+        if (len < n) break;
+        for (SIZE_T o = 0; o + n <= len; ++o){
+            if (p[o] == pat[0] && memcmp(p + o, pat, n) == 0){
+                if (++(*count) == 1) found = p + o;
+            }
+        }
+        break;
+    }
+    return (*count == 1) ? found : nullptr;
+}
+
+// Register one address: `write` selects an eight-byte data-write watchpoint,
+// otherwise an instruction-execution breakpoint. Bumping the generation makes
+// every already-armed thread pick the new set up on its next tick.
+static void GhWatchAdd(const void* addr, bool write, const char* what)
+{
+    if (!addr) return;
+    if (g_watchTls == TLS_OUT_OF_INDEXES) g_watchTls = TlsAlloc();
+    for (int k = 0; k < kGhWatchMax; ++k)
+        if (g_watchAddr[k] == (uintptr_t)addr) return;      // already watched
+    LONG i = InterlockedIncrement(&g_watchCount) - 1;
+    if (i < 0 || i >= kGhWatchMax){ InterlockedDecrement(&g_watchCount); return; }
+    g_watchAddr[i]  = (uintptr_t)addr;
+    g_watchWrite[i] = write;
+    g_watchWhat[i]  = what;
+    InterlockedIncrement(&g_watchGen);
+}
+
+// Overwrite one specific slot, for a watch that follows a moving target.
+static void GhWatchSet(int slot, const void* addr, bool write, const char* what)
+{
+    if (slot < 0 || slot >= kGhWatchMax || !addr) return;
+    if (g_watchTls == TLS_OUT_OF_INDEXES) g_watchTls = TlsAlloc();
+    if (g_watchAddr[slot] == (uintptr_t)addr) return;
+    g_watchAddr[slot]  = (uintptr_t)addr;
+    g_watchWrite[slot] = write;
+    g_watchWhat[slot]  = what;
+    LONG n = InterlockedCompareExchange(&g_watchCount, 0, 0);
+    while (n < slot + 1 && InterlockedCompareExchange(&g_watchCount, slot + 1, n) != n)
+        n = InterlockedCompareExchange(&g_watchCount, 0, 0);
+    InterlockedIncrement(&g_watchGen);
+}
+
+// Locate the two folded refcount instructions, once. `lea rdx,[rax-1]` /
+// `lea rdx,[rax+1]` followed by `lock cmpxchg QWORD PTR [rcx+0x30],rdx`.
+static void GhWatchInstall()
+{
+    static LONG once = 0;
+    if (InterlockedCompareExchange(&once, 1, 0) != 0) return;
+    static const BYTE kDec[] = { 0x48,0x8D,0x50,0xFF, 0xF0,0x48,0x0F,0xB1,0x51,0x30 };
+    static const BYTE kInc[] = { 0x48,0x8D,0x50,0x01, 0xF0,0x48,0x0F,0xB1,0x51,0x30 };
+    int nd = 0, ni = 0;
+    const BYTE* dec = GhFindOnceInSelf(kDec, sizeof(kDec), &nd);
+    const BYTE* inc = GhFindOnceInSelf(kInc, sizeof(kInc), &ni);
+    // Break on the cmpxchg itself (pattern + 4): rcx is still `this` and rax
+    // still holds the value about to be decremented.
+    GhWatchAdd(dec ? dec + 4 : nullptr, false, "Release[this+0x30]");
+    GhWatchAdd(inc ? inc + 4 : nullptr, false, "AddRef[this+0x30]");
+    Diag("WATCH install dec=" + Hex((uint64_t)(uintptr_t)dec) + " (n=" + std::to_string(nd) + ")" +
+         " inc=" + Hex((uint64_t)(uintptr_t)inc) + " (n=" + std::to_string(ni) + ")");
+}
+
+// DR7 for whatever is registered: per slot i, local-enable bit 2i, then the R/W
+// and LEN fields at bit 16+4i -- 00/00 for an execution breakpoint, 01/10 for an
+// eight-byte data write. Eight-byte length needs an eight-byte-aligned address,
+// which every root+0x30 is because the object itself is.
+static DWORD64 GhWatchDr7()
+{
+    DWORD64 dr7 = 0;
+    LONG n = InterlockedCompareExchange(&g_watchCount, 0, 0);
+    if (n > kGhWatchMax) n = kGhWatchMax;
+    for (LONG i = 0; i < n; ++i){
+        if (!g_watchAddr[i]) continue;
+        dr7 |= (DWORD64)1 << (2 * i);
+        if (g_watchWrite[i]){
+            dr7 |= (DWORD64)0x1 << (16 + 4 * i);
+            dr7 |= (DWORD64)0x2 << (18 + 4 * i);
+        }
+    }
+    return dr7;
+}
+
+// Every AdapterProxy ever built, with the vtable pointer its own constructor
+// wrote. Blocks are never recycled (see AdapterProxy::operator new), so this
+// table stays readable for the whole run: an audit at the moment of any fault
+// says which objects were damaged and how many -- and, because the memory cannot
+// have been handed to anything else, damage here IS a write, which is exactly
+// how #139 was separated from a use-after-free.
+static uintptr_t     g_adapterRoot[64] = {0};
+static uintptr_t     g_adapterVptr[64] = {0};
+static volatile LONG g_adapterN        = 0;
+
+static void GhAdapterNote(const void* root)
+{
+    LONG i = InterlockedIncrement(&g_adapterN) - 1;
+    if (i < 0 || i >= 64) return;
+    uintptr_t vp = 0;
+    SafeQword((uintptr_t)root, &vp);
+    g_adapterRoot[i] = (uintptr_t)root;
+    g_adapterVptr[i] = vp;
+}
+
+static void GhAdapterAudit(const char* where)
+{
+    LONG n = InterlockedCompareExchange(&g_adapterN, 0, 0);
+    if (n > 64) n = 64;
+    int bad = 0;
+    for (LONG i = 0; i < n; ++i){
+        if (!g_adapterRoot[i]) continue;
+        uintptr_t vp = 0, rc = 0;
+        SafeQword(g_adapterRoot[i], &vp);
+        SafeQword(g_adapterRoot[i] + 8, &rc);
+        if (vp == g_adapterVptr[i]) continue;
+        if (++bad > 8) continue;
+        Diag(std::string("ADAPTER AUDIT ") + where +
+             " obj=" + Hex((uint64_t)g_adapterRoot[i]) +
+             " vptr=" + Hex((uint64_t)vp) + " was=" + Hex((uint64_t)g_adapterVptr[i]) +
+             " delta=" + std::to_string((long long)((int64_t)vp - (int64_t)g_adapterVptr[i])) +
+             " refcount=" + Hex((uint64_t)rc));
+    }
+    Diag(std::string("ADAPTER AUDIT ") + where + " objects=" + std::to_string((int)n) +
+         " damaged=" + std::to_string(bad));
+}
+
+// Isolated so the __try is legal under /EHsc: no C++ objects live here. If the
+// vectored handler is not installed yet the exception is simply swallowed and
+// this thread stays unarmed -- a missed sample, not a crash.
+static void GhWatchRaiseArm()
+{
+    __try { RaiseException(GH_WATCH_ARM_CODE, 0, 0, nullptr); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { }
+}
+
+// One line at each graphics entry point: arm this thread if it has not been
+// armed yet.
+static void GhWatchTick(const char* where)
+{
+    LONG gen = InterlockedCompareExchange(&g_watchGen, 0, 0);
+    if (gen <= 0) return;
+    if (g_watchTls == TLS_OUT_OF_INDEXES) return;
+    if ((LONG)(intptr_t)TlsGetValue(g_watchTls) == gen) return;
+    TlsSetValue(g_watchTls, (void*)(intptr_t)gen);
+    GhWatchRaiseArm();
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) <= 16)
+        Diag(std::string("WATCH armed tid=") + std::to_string(GetCurrentThreadId()) +
+             " at " + where + " gen=" + std::to_string((int)gen) +
+             " dr7=" + Hex((uint64_t)GhWatchDr7()));
+}
+
 // Present one frame from the guest's point of view: it has rendered into the
 // currently-acquired wrapped back buffer. Release it, flush 11on12's queued work
 // through the D3D12 queue, present, then acquire the next buffer so the guest's
 // next GetBuffer(0) is render-ready.
 static HRESULT GfxPresent(UINT sync)
 {
+    GhWatchTick("GfxPresent");
     if (!g_gfx.ready) return DXGI_ERROR_DEVICE_REMOVED;
 #ifdef GH_LAUNCHER
     if (!g_guestSessionLive) return S_OK;
@@ -2630,15 +3054,118 @@ static HRESULT WrapOutput(IDXGIOutput* raw, IDXGIOutput** out)
     return S_OK;
 }
 
-struct AdapterProxy : winrt::implements<AdapterProxy,
-                                        IDXGIAdapter4, IDXGIAdapter3, IDXGIAdapter2,
-                                        IDXGIAdapter1, IDXGIAdapter, IDXGIObject>
+// AdapterProxy is a plain single-vtable COM object, NOT a cppwinrt
+// winrt::implements. That difference is the whole of #139.
+//
+// cppwinrt lays implements<D, I...> out as one producer per interface, each with
+// its own vtable at its own offset, so QueryInterface hands back a DIFFERENT
+// pointer for IDXGIAdapter than for IDXGIAdapter1. Real DXGI does not work that
+// way and cannot: IDXGIAdapter4 derives from IDXGIAdapter3 derives from ... from
+// IDXGIObject, one single-inheritance chain, so a real adapter is one object
+// with one vtable and every one of those interfaces is the same pointer. Code
+// written against the real headers is entitled to assume that, and Spider-Man
+// does: it was caught calling IDXGIAdapter's Release with the pointer we handed
+// it for IDXGIAdapter1.
+//
+// Against real DXGI that is correct code. Against the producer layout it is
+// memory corruption, because each producer's AddRef/Release has its object's
+// refcount offset baked in as a constant -- one slot apart between adjacent
+// interfaces. Mixing two of them by eight bytes made the decrement land on the
+// root_implements vtable pointer instead of the counter, leaving a vtable
+// pointer exactly one too low. The next virtual call through it read eight bytes
+// straddling two vtable slots and jumped into nothing.
+//
+// So this class is shaped the way the thing it impersonates is shaped: implement
+// the most derived interface, answer every IID in the chain with the same
+// pointer, and keep one refcount. There is then no second producer to mix up.
+//
+// Allocation still comes from a bump arena that never reuses a block. An
+// interposer that outlives its object -- sl.common.dll, NVIDIA Streamline, was
+// observed releasing our adapters -- then lands on a dead object rather than on
+// whatever moved in. A game enumerates adapters a few dozen times and these are
+// a few dozen bytes each, so never freeing them costs a few kilobytes.
+struct AdapterProxy : IDXGIAdapter4
 {
+    static void* operator new(size_t n)
+    {
+        static SRWLOCK  lock  = SRWLOCK_INIT;
+        static BYTE*    arena = nullptr;
+        static size_t   used  = 0;
+        static size_t   cap   = 0;
+        n = (n + 63) & ~(size_t)63;          // keep objects on their own cache lines
+        AcquireSRWLockExclusive(&lock);
+        if (!arena || used + n > cap){
+            cap   = 1u << 20;
+            arena = (BYTE*)VirtualAlloc(nullptr, cap, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            used  = 0;
+            if (!arena){ ReleaseSRWLockExclusive(&lock); return ::operator new(n); }
+        }
+        void* p = arena + used;
+        used += n;
+        ReleaseSRWLockExclusive(&lock);
+        return p;
+    }
+    static void operator delete(void*, size_t) noexcept {}   // deliberately never reused
+    static void operator delete(void*) noexcept {}
+
+    LONG rc = 1;
+
+    HRESULT __stdcall QueryInterface(REFIID riid, void** o) noexcept override
+    {
+        if (!o) return E_POINTER;
+        // Every interface in the chain is this one object, exactly as it is on a
+        // real adapter. The newer ones are answered even when the console's DXGI
+        // is older than they are: the methods behind them degrade to E_NOINTERFACE
+        // individually, which a guest handles, whereas refusing the QI reads as
+        // "this machine has no adapter" and stops it dead.
+        if (riid == __uuidof(IUnknown)       || riid == __uuidof(IDXGIObject)   ||
+            riid == __uuidof(IDXGIAdapter)   || riid == __uuidof(IDXGIAdapter1) ||
+            riid == __uuidof(IDXGIAdapter2)  || riid == __uuidof(IDXGIAdapter3) ||
+            riid == __uuidof(IDXGIAdapter4)){
+            *o = static_cast<IDXGIAdapter4*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *o = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG __stdcall AddRef() noexcept override { return (ULONG)InterlockedIncrement(&rc); }
+    ULONG __stdcall Release() noexcept override
+    {
+        LONG n = InterlockedDecrement(&rc);
+        if (n == 0) delete this;
+        return (ULONG)n;
+    }
+
     com_ptr<IDXGIAdapter>  real;
     com_ptr<IDXGIAdapter1> real1;
     com_ptr<IDXGIAdapter2> real2;
     com_ptr<IDXGIAdapter3> real3;
     com_ptr<IDXGIAdapter4> real4;
+
+    // The console's DXGI reports a 4.1 GB video-memory budget, but this is a UWP
+    // app container: guest image, CPU allocations and driver heaps all come out of
+    // ONE app-memory limit (5 GB here), and about 2.5 GB of it is already spent by
+    // the time the game creates its device. A game that sizes its pools from the
+    // budget therefore walks off the end -- Spider-Man puts up "The game has
+    // crashed due to using more video memory than your system can currently
+    // support" once CreateHeap returns E_OUTOFMEMORY. Advertising a budget that
+    // matches the memory the app can actually get is what a compat layer is for:
+    // the guest then sizes itself to fit. GH_VRAM_MB overrides the number.
+    static UINT64 VramCap()
+    {
+        static UINT64 cap = 0;
+        if (!cap){
+            cap = 2048ull << 20;
+            char buf[32] = {};
+            if (GetEnvironmentVariableA("GH_VRAM_MB", buf, sizeof buf) > 0){
+                unsigned long mb = strtoul(buf, nullptr, 10);
+                if (mb >= 256 && mb <= 16384) cap = (UINT64)mb << 20;
+            }
+            Diag("VRAM cap advertised to the guest = " + Hex(cap));
+        }
+        return cap;
+    }
 
     HRESULT __stdcall SetPrivateData(REFGUID k, UINT s, const void* d) noexcept override
     { return real->SetPrivateData(k, s, d); }
@@ -2668,14 +3195,31 @@ struct AdapterProxy : winrt::implements<AdapterProxy,
         return hr;
     }
     HRESULT __stdcall GetDesc(DXGI_ADAPTER_DESC* d) noexcept override
-    { return real->GetDesc(d); }
+    {
+        HRESULT hr = real->GetDesc(d);
+        if (SUCCEEDED(hr) && d && d->DedicatedVideoMemory > VramCap())
+            d->DedicatedVideoMemory = (SIZE_T)VramCap();
+        return hr;
+    }
     HRESULT __stdcall CheckInterfaceSupport(REFGUID n, LARGE_INTEGER* u) noexcept override
     { return real->CheckInterfaceSupport(n, u); }
 
     HRESULT __stdcall GetDesc1(DXGI_ADAPTER_DESC1* d) noexcept override
-    { return real1 ? real1->GetDesc1(d) : E_NOINTERFACE; }
+    {
+        if (!real1) return E_NOINTERFACE;
+        HRESULT hr = real1->GetDesc1(d);
+        if (SUCCEEDED(hr) && d && d->DedicatedVideoMemory > VramCap())
+            d->DedicatedVideoMemory = (SIZE_T)VramCap();
+        return hr;
+    }
     HRESULT __stdcall GetDesc2(DXGI_ADAPTER_DESC2* d) noexcept override
-    { return real2 ? real2->GetDesc2(d) : E_NOINTERFACE; }
+    {
+        if (!real2) return E_NOINTERFACE;
+        HRESULT hr = real2->GetDesc2(d);
+        if (SUCCEEDED(hr) && d && d->DedicatedVideoMemory > VramCap())
+            d->DedicatedVideoMemory = (SIZE_T)VramCap();
+        return hr;
+    }
 
     HRESULT __stdcall RegisterHardwareContentProtectionTeardownStatusEvent(HANDLE h, DWORD* c) noexcept override
     { return real3 ? real3->RegisterHardwareContentProtectionTeardownStatusEvent(h, c) : E_NOTIMPL; }
@@ -2683,7 +3227,19 @@ struct AdapterProxy : winrt::implements<AdapterProxy,
     { if (real3) real3->UnregisterHardwareContentProtectionTeardownStatus(c); }
     HRESULT __stdcall QueryVideoMemoryInfo(UINT node, DXGI_MEMORY_SEGMENT_GROUP g,
                                            DXGI_QUERY_VIDEO_MEMORY_INFO* i) noexcept override
-    { return real3 ? real3->QueryVideoMemoryInfo(node, g, i) : E_NOTIMPL; }
+    {
+        if (!real3) return E_NOTIMPL;
+        HRESULT hr = real3->QueryVideoMemoryInfo(node, g, i);
+        if (SUCCEEDED(hr) && i && g == DXGI_MEMORY_SEGMENT_GROUP_LOCAL){
+            if (i->Budget > VramCap())                  i->Budget = VramCap();
+            if (i->AvailableForReservation > VramCap()) i->AvailableForReservation = VramCap();
+            static LONG n = 0;
+            if (InterlockedIncrement(&n) <= 4)
+                Diag("AdapterProxy QueryVideoMemoryInfo -> budget=" + Hex((uint64_t)i->Budget) +
+                     " use=" + Hex((uint64_t)i->CurrentUsage));
+        }
+        return hr;
+    }
     HRESULT __stdcall SetVideoMemoryReservation(UINT node, DXGI_MEMORY_SEGMENT_GROUP g, UINT64 v) noexcept override
     { return real3 ? real3->SetVideoMemoryReservation(node, g, v) : E_NOTIMPL; }
     HRESULT __stdcall RegisterVideoMemoryBudgetChangeNotificationEvent(HANDLE h, DWORD* c) noexcept override
@@ -2692,20 +3248,56 @@ struct AdapterProxy : winrt::implements<AdapterProxy,
     { if (real3) real3->UnregisterVideoMemoryBudgetChangeNotification(c); }
 
     HRESULT __stdcall GetDesc3(DXGI_ADAPTER_DESC3* d) noexcept override
-    { return real4 ? real4->GetDesc3(d) : E_NOINTERFACE; }
+    {
+        if (!real4) return E_NOINTERFACE;
+        HRESULT hr = real4->GetDesc3(d);
+        if (SUCCEEDED(hr) && d && d->DedicatedVideoMemory > VramCap())
+            d->DedicatedVideoMemory = (SIZE_T)VramCap();
+        return hr;
+    }
 };
 
+static bool SafeQword(uintptr_t a, uintptr_t* out);   // fwd
+
+// A fresh proxy per enumeration, as before. Caching one proxy per adapter was
+// tried and does not apply here: this console's DXGI hands back a brand-new
+// adapter COM object on every EnumAdapters call, so the canonical IUnknown --
+// the only legitimate identity key -- is different every time and the cache
+// never hits.
 static HRESULT WrapAdapter(IUnknown* raw, REFIID riid, void** out)
 {
     if (!raw || !out) return E_POINTER;
-    auto proxy = winrt::make_self<AdapterProxy>();
+    com_ptr<AdapterProxy> proxy;
+    proxy.attach(new AdapterProxy());          // born with one reference
     raw->QueryInterface(__uuidof(IDXGIAdapter),  proxy->real.put_void());
     raw->QueryInterface(__uuidof(IDXGIAdapter1), proxy->real1.put_void());
     raw->QueryInterface(__uuidof(IDXGIAdapter2), proxy->real2.put_void());
     raw->QueryInterface(__uuidof(IDXGIAdapter3), proxy->real3.put_void());
     raw->QueryInterface(__uuidof(IDXGIAdapter4), proxy->real4.put_void());
     if (!proxy->real) { *out = nullptr; return E_NOINTERFACE; }
-    return proxy->QueryInterface(riid, out);
+    HRESULT qhr = proxy->QueryInterface(riid, out);
+
+    // #139 is fixed by the object's shape, not by this instrumentation, but the
+    // instrumentation is what proved it and it is cheap to keep: the vtable
+    // pointer at offset zero must never change for the life of the object, and
+    // the audit at any fault now says so across every proxy ever built.
+    auto* rootBytes = (BYTE*)proxy.get();
+    GhWatchInstall();
+    static LONG seq = 0;
+    LONG i = InterlockedIncrement(&seq);
+    GhWatchSet(2 + (int)(i & 1), rootBytes, true, "AdapterProxy vtable ptr");
+    GhWatchTick("WrapAdapter");
+
+    GhAdapterNote(rootBytes);
+    if (i <= 16){
+        uintptr_t vp = 0;
+        SafeQword((uintptr_t)rootBytes, &vp);
+        Diag("WrapAdapter obj=" + Hex((uint64_t)(uintptr_t)proxy.get()) +
+             " -> iface=" + Hex((uint64_t)(uintptr_t)*out) +
+             " hr=" + Hex((uint32_t)qhr) + " iid=" + Hex(riid.Data1) +
+             " vptr=" + Hex((uint64_t)vp) + " rc=" + std::to_string((int)proxy->rc));
+    }
+    return qhr;
 }
 
 static HRESULT WrapAdapterTake(HRESULT hr, IUnknown* raw, REFIID riid, void** out)
@@ -2803,6 +3395,7 @@ struct FactoryProxy : winrt::implements<FactoryProxy,
         const DXGI_SWAP_CHAIN_DESC1* d, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs,
         IDXGIOutput*, IDXGISwapChain1** out) noexcept override
     {
+        GhWatchTick("CreateSwapChainForHwnd");
         Diag("FactoryProxy CreateSwapChainForHwnd");
         GfxNoteSwapChainDevice(dev, d);
         if (d)
@@ -3241,7 +3834,7 @@ static HRESULT MakeFactoryProxy(REFIID riid, void** out)
 // hooks tell us whether that was CreateGraphicsPipelineState, a compute PSO, a
 // root signature, or a feature query. Vtable-patched on OUR device object after
 // 11on12 has already been created, so the guest is the only new caller.
-static void* g_d12vtOrig[21];
+static void* g_d12vtOrig[50];
 static LONG  g_d12vtHooked = 0;
 
 static const char* GhFourCC(const void* p, SIZE_T n)
@@ -3265,9 +3858,393 @@ static ID3D12Device* GhCompileOnlyDevice()
     }
     return d.get();
 }
+// SC_DLL.dll -- the UMD's shader compiler -- faults with rip=0, exec 0x0, rax=0,
+// returning into SC_DLL+0x630C. That is `call rax` through a NULL function
+// pointer, i.e. a dispatch table SC_DLL never finished filling in, NOT a
+// compiler choking on shader bytecode: our own four-line passthrough VS/PS,
+// compiled on-device by d3dcompiler_47 and paired with an empty root signature,
+// dies at the same instruction. The likeliest cause is a dependency the app
+// container refuses to hand it -- the same class of gap that made SetupAPI and
+// SHGetKnownFolderPath answer nothing. Dump enough to identify which one.
+// The whole PSO wall, in one sentence: SC_DLL.dll (the UMD shader compiler) does
+// LoadLibraryW(L"scdxil.dll") lazily, and inside our app container that load
+// fails. SC_DLL then calls GetProcAddress(NULL, "SCDxil_IsStageSupportedByNewBE")
+// without checking either result and calls the NULL it gets back -- which is the
+// rip=0 / exec 0x0 fault with SC_DLL+0x630C as the return address that this
+// track has been stuck behind. Nothing to do with shader bytecode: a four-line
+// passthrough VS/PS compiled on-device dies at the identical instruction.
+//
+// SC_DLL loads it by BARE NAME, and an app container's search order does not
+// include the directory SC_DLL itself came from. So resolve that directory
+// ourselves and load scdxil.dll by full path: once the module is in the process,
+// SC_DLL's own bare-name LoadLibraryW finds it already loaded and returns the
+// same handle. This is the same shape as the PRELOADED-singleton short-circuit
+// the steam_api64 beds use.
+// scdxil.dll is present in System32 but its DllMain returns FALSE inside our app
+// container (0x45A ERROR_DLL_INIT_FAILED, no exception -- a clean refusal), and
+// every one of its own imports loads fine, so the refusal is its own decision and
+// not a missing dependency. Rather than reverse-engineer a closed AMD backend's
+// initialisation, answer the question SC_DLL was trying to ask.
+//
+// The call site is:
+//   62f7: lea  rdx,[SCDxil_IsStageSupportedByNewBE]
+//   62fe: mov  rcx,rax          ; the scdxil handle -- NULL here
+//   6301: call [GetProcAddress]
+//   6307: mov  rcx,rbx
+//   630a: call rax              ; rax is NULL on BOTH paths through this code
+// The return value is a bool: "does the NEW (DXIL) back end handle this stage?"
+// Overwriting `call rax` (ff d0) with `xor eax,eax` (31 c0) is the same two bytes
+// and yields false -- so SC_DLL uses the OLD back end, which is exactly the path
+// D3D11 has been compiling through on this console all along.
+static bool GhPatchScDllDxilQuery()
+{
+    static LONG once = 0;
+    static bool done = false;
+    if (InterlockedCompareExchange(&once, 1, 0) != 0) return done;
+
+    HMODULE sc = GetModuleHandleA("SC_DLL.dll");
+    if (!sc){ Diag("SCPATCH SC_DLL not loaded"); return false; }
+    auto* p = (BYTE*)sc + 0x6307;
+
+    // Verify before writing: these RVAs were read off THIS console's driver, and
+    // a different build must be left alone rather than corrupted.
+    static const BYTE kWant[] = { 0x48, 0x8B, 0xCB, 0xFF, 0xD0 };  // mov rcx,rbx ; call rax
+    if (memcmp(p, kWant, sizeof(kWant)) != 0){
+        std::string got;
+        for (size_t i = 0; i < sizeof(kWant); ++i) got += Hex((uint32_t)p[i]) + " ";
+        Diag("SCPATCH signature mismatch at SC_DLL+0x6307, got " + got + "-- not patching");
+        return false;
+    }
+
+    DWORD old = 0;
+    if (!VirtualProtect(p + 3, 2, PAGE_EXECUTE_READWRITE, &old)){
+        Diag("SCPATCH VirtualProtect failed err=" + Hex(GetLastError()));
+        return false;
+    }
+    p[3] = 0x31; p[4] = 0xC0;                     // xor eax,eax
+    VirtualProtect(p + 3, 2, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p + 3, 2);
+    Diag("SCPATCH SC_DLL+0x630A call rax -> xor eax,eax (force old shader back end)");
+    done = true;
+    return done;
+}
+
+// Map a DLL as an image resource -- mapped and RVA-addressable, but with no
+// DllMain and no dependency resolution -- then report whether each of its
+// imports can be loaded on its own.
+static void GhProbeDeps(const wchar_t* path)
+{
+    HMODULE m = LoadLibraryExW(path, nullptr,
+                               LOAD_LIBRARY_AS_IMAGE_RESOURCE | LOAD_LIBRARY_AS_DATAFILE);
+    if (!m){ Diag("SCDXIL dep-probe map failed err=" + Hex(GetLastError())); return; }
+    auto base = (BYTE*)((ULONG_PTR)m & ~(ULONG_PTR)3);   // resource handles tag the low bits
+    auto* dos = (IMAGE_DOS_HEADER*)base;
+    auto* nt  = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    auto& idir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    Diag("SCDXIL dep-probe mapped, imports dir=" + Hex(idir.VirtualAddress));
+    if (idir.VirtualAddress){
+        // Section-mapped as an image, so RVAs address correctly.
+        auto* imp = (IMAGE_IMPORT_DESCRIPTOR*)(base + idir.VirtualAddress);
+        for (; imp->Name; ++imp){
+            const char* dll = (const char*)(base + imp->Name);
+            HMODULE cur = GetModuleHandleA(dll);
+            if (cur){ Diag(std::string("SCDXIL dep ") + dll + " already loaded"); continue; }
+            HMODULE d = LoadLibraryA(dll);
+            Diag(std::string("SCDXIL dep ") + dll +
+                 (d ? " -> ok" : " -> FAIL err=" + Hex(GetLastError())));
+        }
+    }
+    auto& tls = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    Diag("SCDXIL dep-probe tls dir=" + Hex(tls.VirtualAddress) +
+         " subsys=" + std::to_string((int)nt->OptionalHeader.Subsystem) +
+         " dllchar=" + Hex((uint32_t)nt->OptionalHeader.DllCharacteristics));
+    FreeLibrary(m);
+}
+
+static bool GhPreloadScDxil()
+{
+    static LONG once = 0;
+    static bool ok = false;
+    if (InterlockedCompareExchange(&once, 1, 0) != 0) return ok;
+
+    if (GetModuleHandleW(L"scdxil.dll")){ ok = true; Diag("SCDXIL already loaded"); return ok; }
+
+    // Bare name first -- if the container can find it, nothing else is needed.
+    if (HMODULE h = LoadLibraryW(L"scdxil.dll")){
+        ok = true;
+        Diag("SCDXIL loaded by bare name h=" + Hex((uint64_t)(uintptr_t)h));
+        return ok;
+    }
+    DWORD bareErr = GetLastError();
+
+    HMODULE sc = GetModuleHandleA("SC_DLL.dll");
+    if (!sc){ Diag("SCDXIL bare-name err=" + Hex(bareErr) + "; SC_DLL not loaded yet"); return ok; }
+
+    wchar_t path[MAX_PATH] = {};
+    DWORD n = GetModuleFileNameW(sc, path, MAX_PATH);
+    if (!n || n >= MAX_PATH){
+        Diag("SCDXIL GetModuleFileNameW(SC_DLL) failed err=" + Hex(GetLastError()));
+        return ok;
+    }
+    std::wstring dir(path, n);
+    size_t slash = dir.find_last_of(L'\\');
+    if (slash == std::wstring::npos){ Diag("SCDXIL SC_DLL path has no directory"); return ok; }
+    std::wstring full = dir.substr(0, slash + 1) + L"scdxil.dll";
+
+    HMODULE h = LoadLibraryW(full.c_str());
+    DWORD err = h ? 0 : GetLastError();
+    std::string shown;
+    for (wchar_t c : full) shown += (c < 128 ? (char)c : '?');
+    Diag("SCDXIL bare-name err=" + Hex(bareErr) + "; full path " + shown +
+         (h ? " -> loaded h=" + Hex((uint64_t)(uintptr_t)h) : " -> FAILED err=" + Hex(err)));
+    ok = (h != nullptr);
+
+    // ERROR_DLL_INIT_FAILED (0x45A) means the file was found and mapped but an
+    // init step said no -- either scdxil's own DllMain, or a dependency's. Map
+    // it again WITHOUT running any initialisers and walk its imports, checking
+    // each dependency separately, so the log names the one that cannot load
+    // rather than leaving "init failed" as the whole story.
+    if (!h && err == ERROR_DLL_INIT_FAILED) GhProbeDeps(full.c_str());
+    return ok;
+}
+
+// Read a NUL-terminated ASCII string out of a loaded module at a known RVA.
+static void GhDumpString(const char* name, DWORD rva)
+{
+    HMODULE h = GetModuleHandleA(name);
+    if (!h) return;
+    const char* p = (const char*)((BYTE*)h + rva);
+    std::string v;
+    for (int i = 0; i < 128 && p[i]; ++i) v += p[i];
+    Diag(std::string("AUDIT ") + name + " str+" + Hex(rva) + " = \"" + v + "\"");
+}
+// The same, for a UTF-16 name -- whether SC_DLL calls the A or W loader decides
+// which of these two is the real string.
+static void GhDumpStringW(const char* name, DWORD rva)
+{
+    HMODULE h = GetModuleHandleA(name);
+    if (!h) return;
+    const wchar_t* p = (const wchar_t*)((BYTE*)h + rva);
+    std::string v;
+    for (int i = 0; i < 128 && p[i]; ++i) v += (p[i] < 128 ? (char)p[i] : '?');
+    Diag(std::string("AUDIT ") + name + " wstr+" + Hex(rva) + " = \"" + v + "\"");
+}
+// Name the function an import thunk actually points at, so an indirect call
+// site can be read as the API it really is.
+static void GhDumpIatSlot(const char* name, DWORD rva, const char* label)
+{
+    HMODULE h = GetModuleHandleA(name);
+    if (!h) return;
+    void* target = *(void**)((BYTE*)h + rva);
+    Diag(std::string("AUDIT ") + name + " iat+" + Hex(rva) + " (" + label + ") -> " +
+         NameForCodeAddr((uint64_t)(uintptr_t)target));
+}
+static void GhAuditModule(const char* name, DWORD codeRva, DWORD codeLen)
+{
+    HMODULE h = GetModuleHandleA(name);
+    if (!h){ Diag(std::string("AUDIT ") + name + " not loaded"); return; }
+    auto base = (BYTE*)h;
+    auto* dos = (IMAGE_DOS_HEADER*)base;
+    auto* nt  = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    Diag(std::string("AUDIT ") + name + " base=" + Hex((uint64_t)(uintptr_t)base) +
+         " size=" + Hex((uint32_t)nt->OptionalHeader.SizeOfImage));
+
+    // The instruction stream around the faulting call, for offline disassembly:
+    // which global held the NULL is the one thing that names the missing step.
+    if (codeLen){
+        std::string hex;
+        for (DWORD i = 0; i < codeLen; ++i){
+            static const char* k = "0123456789ABCDEF";
+            BYTE b = base[codeRva + i];
+            hex += k[b >> 4]; hex += k[b & 15];
+        }
+        Diag(std::string("AUDIT ") + name + " code+" + Hex((uint32_t)codeRva) + ": " + hex);
+    }
+
+    // Any import thunk left NULL is a dependency the loader could not satisfy.
+    auto& idir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (idir.VirtualAddress){
+        auto* imp = (IMAGE_IMPORT_DESCRIPTOR*)(base + idir.VirtualAddress);
+        for (; imp->Name; ++imp){
+            const char* dll = (const char*)(base + imp->Name);
+            auto* thunk = (IMAGE_THUNK_DATA*)(base + imp->FirstThunk);
+            auto* orig  = imp->OriginalFirstThunk
+                        ? (IMAGE_THUNK_DATA*)(base + imp->OriginalFirstThunk) : thunk;
+            int total = 0, nulls = 0; std::string firstNull;
+            for (; thunk->u1.Function; ++thunk, ++orig){
+                ++total;
+                if (!thunk->u1.Function){ ++nulls; }
+            }
+            Diag(std::string("AUDIT ") + name + " imports " + dll + " n=" + std::to_string(total));
+        }
+    }
+
+    // Delay-loaded dependencies are the ones that can silently stay unresolved:
+    // the module handle slot is still NULL until the first call succeeds.
+    auto& ddir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+    if (ddir.VirtualAddress){
+        auto* dl = (IMAGE_DELAYLOAD_DESCRIPTOR*)(base + ddir.VirtualAddress);
+        for (; dl->DllNameRVA; ++dl){
+            const char* dll = (const char*)(base + dl->DllNameRVA);
+            HMODULE* slot = (HMODULE*)(base + dl->ModuleHandleRVA);
+            HMODULE cur = GetModuleHandleA(dll);
+            Diag(std::string("AUDIT ") + name + " delayload " + dll +
+                 " bound=" + (*slot ? "yes" : "NO") +
+                 " loadable=" + (cur ? "loaded" : (LoadLibraryA(dll) ? "ok" : "FAIL")));
+        }
+    } else {
+        Diag(std::string("AUDIT ") + name + " no delay-import directory");
+    }
+}
+
+// Does this console's D3D12 refuse EVERY graphics PSO, or only Spider-Man's?
+// GREENHOUSE.md 31 concluded the former and short-circuits every PSO to E_FAIL,
+// but our own launcher UI and D2D overlay draw through g_gfx.d11ctx -- the
+// D3D11On12 device sitting on this very g_gfx.d12 -- and those render fine on
+// the TV. 11on12 cannot draw a single triangle without the driver compiling its
+// internal shaders, so the compiler is not globally broken. These two helpers
+// settle it: one builds a known-good PSO of our own, the other lets the guest's
+// real call actually run with the fault caught instead of fatal.
+
+// The raw call, isolated so /EHsc accepts __try (no C++ unwind objects here).
+// A crash inside SC_DLL becomes an HRESULT we can log and keep running past,
+// rather than taking the process down and ending the run.
+typedef HRESULT (__stdcall* GhGpsFn)(ID3D12Device*, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*,
+                                     REFIID, void**);
+static HRESULT GhTryCreateGPS(GhGpsFn fn, ID3D12Device* dev,
+                              const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d,
+                              REFIID riid, void** pp, DWORD* faultCode)
+{
+    HRESULT hr = E_FAIL;
+    *faultCode = 0;
+    __try {
+        hr = fn(dev, d, riid, pp);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *faultCode = GetExceptionCode();
+        hr = E_FAIL;
+    }
+    return hr;
+}
+
+// Compile a trivial VS/PS on-device and build the simplest legal PSO over them.
+// If THIS succeeds, the driver compiles DXBC fine and the fault is something in
+// the guest's desc; if it crashes too, the D3D12 path really is unusable and the
+// track needs a different strategy. d3dcompiler_47.dll was confirmed present in
+// the container by the M0 probe (30), so compiling here rather than embedding a
+// blob also tells us whether that route works at all.
+static void GhProbePSO(ID3D12Device* dev, GhGpsFn orig)
+{
+    static LONG once = 0;
+    if (!dev || !orig || InterlockedCompareExchange(&once, 1, 0) != 0) return;
+
+    if (!GhPreloadScDxil()) GhPatchScDllDxilQuery();
+
+    HMODULE dc = GetModuleHandleA("d3dcompiler_47.dll");
+    if (!dc) dc = LoadLibraryA("d3dcompiler_47.dll");
+    if (!dc){ Diag("PSOPROBE d3dcompiler_47 missing err=" + Hex(GetLastError())); return; }
+    using CompileFn = HRESULT (WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const void*, void*,
+                                        LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+    auto compile = (CompileFn)GetProcAddress(dc, "D3DCompile");
+    if (!compile){ Diag("PSOPROBE no D3DCompile export"); return; }
+
+    static const char kHlsl[] =
+        "struct VOut { float4 p : SV_POSITION; };\n"
+        "VOut vsmain(float4 pos : POSITION) { VOut o; o.p = pos; return o; }\n"
+        "float4 psmain(VOut i) : SV_TARGET { return float4(1,0,1,1); }\n";
+
+    com_ptr<ID3DBlob> vs, ps, err;
+    HRESULT hv = compile(kHlsl, sizeof(kHlsl) - 1, "probe.hlsl", nullptr, nullptr,
+                         "vsmain", "vs_5_0", 0, 0, vs.put(), err.put());
+    err = nullptr;
+    HRESULT hp = compile(kHlsl, sizeof(kHlsl) - 1, "probe.hlsl", nullptr, nullptr,
+                         "psmain", "ps_5_0", 0, 0, ps.put(), err.put());
+    Diag("PSOPROBE compile vs=" + Hex((uint32_t)hv) + " (" +
+         std::to_string(vs ? (unsigned)vs->GetBufferSize() : 0u) + "B) ps=" + Hex((uint32_t)hp) +
+         " (" + std::to_string(ps ? (unsigned)ps->GetBufferSize() : 0u) + "B)");
+    if (!vs || !ps) return;
+
+    // Empty root signature -- the probe binds nothing, so this is the minimum
+    // the runtime will accept and keeps the guest's own descriptor layout out of
+    // the experiment entirely.
+    HMODULE d12 = GetModuleHandleA("d3d12.dll");
+    using SerFn = HRESULT (WINAPI*)(const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION,
+                                    ID3DBlob**, ID3DBlob**);
+    auto ser = d12 ? (SerFn)GetProcAddress(d12, "D3D12SerializeRootSignature") : nullptr;
+    if (!ser){ Diag("PSOPROBE no D3D12SerializeRootSignature"); return; }
+
+    D3D12_ROOT_SIGNATURE_DESC rsd{};
+    rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    com_ptr<ID3DBlob> rsb;
+    err = nullptr;
+    HRESULT hr = ser(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, rsb.put(), err.put());
+    com_ptr<ID3D12RootSignature> rs;
+    if (SUCCEEDED(hr) && rsb)
+        hr = dev->CreateRootSignature(0, rsb->GetBufferPointer(), rsb->GetBufferSize(),
+                                      __uuidof(ID3D12RootSignature), rs.put_void());
+    Diag("PSOPROBE root signature hr=" + Hex((uint32_t)hr));
+    if (!rs) return;
+
+    D3D12_INPUT_ELEMENT_DESC il[1] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
+          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+    };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = rs.get();
+    pd.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+    pd.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+    pd.InputLayout = { il, 1 };
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;   // match the guest's rtv0=28
+    pd.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    pd.SampleDesc.Count = 1;
+    pd.SampleMask = UINT_MAX;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    com_ptr<ID3D12PipelineState> pso;
+    DWORD fault = 0;
+    hr = GhTryCreateGPS(orig, dev, &pd, __uuidof(ID3D12PipelineState), pso.put_void(), &fault);
+    Diag(std::string("PSOPROBE minimal PSO hr=") + Hex((uint32_t)hr) +
+         (fault ? " FAULT=" + Hex((uint32_t)fault) : std::string()) +
+         (pso ? " -> CREATED" : " -> none"));
+    if (fault){
+        // 0x60 bytes ending at the faulting call site: SC_DLL+0x630C is the
+        // RETURN address, so the `call rax` and whatever loaded rax sit just
+        // below it.
+        GhAuditModule("SC_DLL.dll", 0x62AC, 0x60);
+        // Disassembling that window gave the shape of the failure:
+        //   62ed: call 0x133c          ; get a module handle
+        //   62f2: test rax,rax
+        //   62f5: je   0x6307          ; NULL module jumps straight to...
+        //   62f7: lea  rdx,[0x3aceb8]  ; ...the export name
+        //   6301: call [0x3a8130]      ; GetProcAddress, result unchecked
+        //   630a: call rax             ; <-- faults with rax=0
+        // So SC_DLL wants one DLL and one export out of it, and calls the
+        // result without checking either. Name both.
+        GhDumpString("SC_DLL.dll", 0x3ACEB8);
+        GhDumpIatSlot("SC_DLL.dll", 0x3A8130, "resolver");
+        GhDumpIatSlot("SC_DLL.dll", 0x3A8278, "unknown-62dc");
+        GhAuditModule("SC_DLL.dll", 0x133C, 0x80);
+        // 0x133c is a lazy singleton:
+        //   1346: lock cmpxchg [0x5810d8],rcx  ; cached handle, 0 on first call
+        //   1354: lea  rcx,[0x3a8480]          ; the DLL name
+        //   135b: call [0x3a8160]              ; LoadLibrary-of-some-flavour
+        // Name the DLL it wants and confirm the cached handle really is NULL.
+        GhDumpString("SC_DLL.dll", 0x3A8480);
+        GhDumpStringW("SC_DLL.dll", 0x3A8480);
+        GhDumpIatSlot("SC_DLL.dll", 0x3A8160, "loader");
+        GhDumpIatSlot("SC_DLL.dll", 0x3A8150, "onfail");
+        GhDumpIatSlot("SC_DLL.dll", 0x5810D8, "cached-handle");
+    }
+}
+
 static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** pp)
 {
+    GhWatchTick("CreateGraphicsPipelineState");
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*,
                                       REFIID, void**))g_d12vtOrig[10];
     static thread_local int depth = 0;
@@ -3290,6 +4267,21 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
            + " il=" + std::to_string(d->InputLayout.NumElements)
            + " cached=" + std::to_string((unsigned)d->CachedPSO.CachedBlobSizeInBytes)
            + " flags=" + Hex((uint32_t)d->Flags);
+        // The fields the original hook never printed. A NULL pRootSignature is
+        // the classic cause of a NULL-vtable deref inside a UMD, and the game
+        // called CreateRootSignature exactly ONCE for ten-plus PSOs, so whether
+        // each desc actually carries one is the first thing worth knowing.
+        m += std::string(" rootsig=") + (d->pRootSignature ? "yes" : "NULL")
+           + " samplemask=" + Hex((uint32_t)d->SampleMask)
+           + " nodemask=" + Hex((uint32_t)d->NodeMask)
+           + " so=" + std::to_string((unsigned)d->StreamOutput.NumEntries)
+           + " ibcut=" + std::to_string((int)d->IBStripCutValue)
+           + " blend=" + std::to_string((int)d->BlendState.RenderTarget[0].BlendEnable)
+           + "/" + Hex((uint32_t)d->BlendState.RenderTarget[0].RenderTargetWriteMask)
+           + " fill=" + std::to_string((int)d->RasterizerState.FillMode)
+           + " cull=" + std::to_string((int)d->RasterizerState.CullMode)
+           + " depth=" + std::to_string((int)d->DepthStencilState.DepthEnable)
+           + " stencil=" + std::to_string((int)d->DepthStencilState.StencilEnable);
         m += std::string(" VSmag=") + GhFourCC(d->VS.pShaderBytecode, d->VS.BytecodeLength);
         m += std::string(" PSmag=") + GhFourCC(d->PS.pShaderBytecode, d->PS.BytecodeLength);
         if (d->InputLayout.pInputElementDescs){
@@ -3308,14 +4300,40 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     }
     Diag(m);
 
-    // SC_DLL.dll+0x630C crashes with a NULL vtable compiling this DXBC, on BOTH
-    // the 11on12 bridge device and a fresh D3D12CreateDevice (v0.0.118.0). Do
-    // not call the runtime -- it takes the process down. The guest seeing E_FAIL
-    // tells us whether this PSO is optional.
-    (void)orig; (void)self; (void)use; (void)riid; (void)depth;
-    if (pp) *pp = nullptr;
-    Diag("  CreateGraphicsPipelineState skipped (SC_DLL crash); returning E_FAIL");
-    return E_FAIL;
+    // Establish, once, whether this device can build ANY graphics PSO, using
+    // shaders and a root signature of our own. That separates "the console's
+    // compiler is broken" from "something in the guest's desc kills it" -- a
+    // distinction the previous blanket E_FAIL could never draw.
+    ++depth;
+    if (!GhPreloadScDxil()) GhPatchScDllDxilQuery();
+    GhProbePSO(self, orig);
+    --depth;
+
+    // Now let the guest's real call run, with the fault caught rather than
+    // fatal. Once it has faulted once we stop trying: repeating a crash that
+    // costs a structured-exception unwind per PSO buys nothing, and the guest
+    // seeing E_FAIL is the behaviour the previous build already characterised.
+    static LONG faulted = 0;
+    if (InterlockedCompareExchange(&faulted, 0, 0) != 0){
+        if (pp) *pp = nullptr;
+        Diag("  CreateGraphicsPipelineState skipped (already faulted); E_FAIL");
+        return E_FAIL;
+    }
+
+    DWORD fault = 0;
+    ++depth;
+    HRESULT hr = GhTryCreateGPS(orig, self, use, riid, pp, &fault);
+    --depth;
+    if (fault){
+        InterlockedExchange(&faulted, 1);
+        if (pp) *pp = nullptr;
+        Diag("  CreateGraphicsPipelineState FAULTED code=" + Hex((uint32_t)fault) +
+             "; returning E_FAIL");
+        return E_FAIL;
+    }
+    Diag("  CreateGraphicsPipelineState -> hr=" + Hex((uint32_t)hr) +
+         (pp && *pp ? " CREATED" : ""));
+    return hr;
 }
 static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
     const D3D12_COMPUTE_PIPELINE_STATE_DESC* d, REFIID riid, void** pp)
@@ -3368,12 +4386,189 @@ static void __stdcall Hook_D12CreateRTV(ID3D12Device* self, ID3D12Resource* res,
              " fmt=" + (d ? std::to_string((int)d->Format) : "null"));
     orig(self, res, d, dest);
 }
+static void GhLogMemoryBudget(const char* where);   // fwd (defined below)
+
+// Spider-Man does not check its D3D12 return codes: twice now a failed create has
+// surfaced far away as a write through a null pointer. So log EVERY failure from
+// the object-creating device methods -- and, because one lost device makes them
+// all fail at once, ask why the device went away while we are here.
+static void GhD12Failed(ID3D12Device* dev, const char* what, HRESULT hr)
+{
+    std::string ln = std::string("D3D12 FAILED ") + what + " hr=" + Hex((uint32_t)hr);
+    if (dev) ln += " removedreason=" + Hex((uint32_t)dev->GetDeviceRemovedReason());
+    Diag(ln);
+    GhLogMemoryBudget(what);
+}
+static HRESULT __stdcall Hook_D12CreateCQ(ID3D12Device* self, const D3D12_COMMAND_QUEUE_DESC* d,
+                                          REFIID riid, void** pp)
+{
+    auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_COMMAND_QUEUE_DESC*,
+                                      REFIID, void**))g_d12vtOrig[8];
+    HRESULT hr = orig(self, d, riid, pp);
+    if (FAILED(hr)) GhD12Failed(self, "CreateCommandQueue", hr);
+    return hr;
+}
+static HRESULT __stdcall Hook_D12CreateCA(ID3D12Device* self, D3D12_COMMAND_LIST_TYPE t,
+                                          REFIID riid, void** pp)
+{
+    auto orig = (HRESULT (__stdcall*)(ID3D12Device*, D3D12_COMMAND_LIST_TYPE,
+                                      REFIID, void**))g_d12vtOrig[9];
+    HRESULT hr = orig(self, t, riid, pp);
+    if (FAILED(hr)) GhD12Failed(self, "CreateCommandAllocator", hr);
+    return hr;
+}
+static HRESULT __stdcall Hook_D12CreateCL(ID3D12Device* self, UINT node, D3D12_COMMAND_LIST_TYPE t,
+    ID3D12CommandAllocator* alloc, ID3D12PipelineState* init, REFIID riid, void** pp)
+{
+    auto orig = (HRESULT (__stdcall*)(ID3D12Device*, UINT, D3D12_COMMAND_LIST_TYPE,
+        ID3D12CommandAllocator*, ID3D12PipelineState*, REFIID, void**))g_d12vtOrig[12];
+    HRESULT hr = orig(self, node, t, alloc, init, riid, pp);
+    if (FAILED(hr)) GhD12Failed(self, "CreateCommandList", hr);
+    return hr;
+}
+static HRESULT __stdcall Hook_D12CreateDH(ID3D12Device* self, const D3D12_DESCRIPTOR_HEAP_DESC* d,
+                                          REFIID riid, void** pp)
+{
+    auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_DESCRIPTOR_HEAP_DESC*,
+                                      REFIID, void**))g_d12vtOrig[14];
+    HRESULT hr = orig(self, d, riid, pp);
+    if (FAILED(hr)){
+        GhD12Failed(self, "CreateDescriptorHeap", hr);
+        if (d) Diag("  descheap type=" + std::to_string((int)d->Type) +
+                    " n=" + std::to_string((unsigned)d->NumDescriptors) +
+                    " flags=" + Hex((uint32_t)d->Flags));
+    }
+    return hr;
+}
+static HRESULT __stdcall Hook_D12CreateFence(ID3D12Device* self, UINT64 init,
+    D3D12_FENCE_FLAGS f, REFIID riid, void** pp)
+{
+    auto orig = (HRESULT (__stdcall*)(ID3D12Device*, UINT64, D3D12_FENCE_FLAGS,
+                                      REFIID, void**))g_d12vtOrig[36];
+    HRESULT hr = orig(self, init, f, riid, pp);
+    if (FAILED(hr)) GhD12Failed(self, "CreateFence", hr);
+    return hr;
+}
+
+// The heap/resource calls the fault sits under. Nothing is changed here: these
+// exist so the log says WHICH heap and WHICH placement the driver was servicing
+// when it wrote into memory that was never mapped.
+static HRESULT __stdcall Hook_D12CreateCommitted(ID3D12Device* self,
+    const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC* rd,
+    D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID riid, void** pp)
+{
+    auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*,
+        D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
+        const D3D12_CLEAR_VALUE*, REFIID, void**))g_d12vtOrig[27];
+    HRESULT hr = orig(self, hp, hf, rd, st, cv, riid, pp);
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) <= 24 || FAILED(hr))
+        Diag("D3D12 CreateCommittedResource heap=" + std::to_string(hp ? (int)hp->Type : -1) +
+             " cpupage=" + std::to_string(hp ? (int)hp->CPUPageProperty : -1) +
+             " flags=" + Hex((uint32_t)hf) +
+             " dim=" + std::to_string(rd ? (int)rd->Dimension : -1) +
+             " w=" + std::to_string(rd ? (unsigned long long)rd->Width : 0ull) +
+             " h=" + std::to_string(rd ? (unsigned)rd->Height : 0u) +
+             " fmt=" + std::to_string(rd ? (int)rd->Format : -1) +
+             " hr=" + Hex((uint32_t)hr));
+    return hr;
+}
+static HRESULT __stdcall Hook_D12CreateHeap(ID3D12Device* self,
+    const D3D12_HEAP_DESC* hd, REFIID riid, void** pp)
+{
+    auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_HEAP_DESC*,
+                                      REFIID, void**))g_d12vtOrig[28];
+    HRESULT hr = orig(self, hd, riid, pp);
+    Diag("D3D12 CreateHeap size=" + (hd ? Hex((uint64_t)hd->SizeInBytes) : std::string("null")) +
+         " type=" + std::to_string(hd ? (int)hd->Properties.Type : -1) +
+         " cpupage=" + std::to_string(hd ? (int)hd->Properties.CPUPageProperty : -1) +
+         " pool=" + std::to_string(hd ? (int)hd->Properties.MemoryPoolPreference : -1) +
+         " align=" + Hex((uint64_t)(hd ? hd->Alignment : 0)) +
+         " flags=" + Hex((uint32_t)(hd ? hd->Flags : 0)) +
+         " hr=" + Hex((uint32_t)hr) +
+         " heap=" + Hex((uint64_t)(uintptr_t)(pp ? *pp : nullptr)));
+    if (FAILED(hr)){
+        static LONG f = 0;
+        if (InterlockedIncrement(&f) <= 3) GhD12Failed(self, "CreateHeap", hr);
+    }
+    return hr;
+}
+static HRESULT __stdcall Hook_D12CreatePlaced(ID3D12Device* self, ID3D12Heap* heap,
+    UINT64 off, const D3D12_RESOURCE_DESC* rd, D3D12_RESOURCE_STATES st,
+    const D3D12_CLEAR_VALUE* cv, REFIID riid, void** pp)
+{
+    auto orig = (HRESULT (__stdcall*)(ID3D12Device*, ID3D12Heap*, UINT64,
+        const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*,
+        REFIID, void**))g_d12vtOrig[29];
+    static LONG n = 0;
+    LONG i = InterlockedIncrement(&n);
+    bool loud = (i <= 32);
+    if (loud)
+        Diag("D3D12 CreatePlacedResource heap=" + Hex((uint64_t)(uintptr_t)heap) +
+             " off=" + Hex((uint64_t)off) +
+             " dim=" + std::to_string(rd ? (int)rd->Dimension : -1) +
+             " w=" + std::to_string(rd ? (unsigned long long)rd->Width : 0ull) +
+             " h=" + std::to_string(rd ? (unsigned)rd->Height : 0u) +
+             " fmt=" + std::to_string(rd ? (int)rd->Format : -1) +
+             " flags=" + Hex((uint32_t)(rd ? rd->Flags : 0)));
+    HRESULT hr = orig(self, heap, off, rd, st, cv, riid, pp);
+    if (loud || FAILED(hr)) Diag("  CreatePlacedResource -> hr=" + Hex((uint32_t)hr));
+    return hr;
+}
+// ID3D12Device3. If the game is wrapping its OWN memory as a D3D12 heap, that is
+// the whole explanation for a driver writing into a range the app reserved but
+// never committed -- so it is worth knowing whether this is ever called.
+static HRESULT __stdcall Hook_D12OpenHeapAddr(ID3D12Device* self, const void* addr,
+                                              REFIID riid, void** pp)
+{
+    auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const void*, REFIID,
+                                      void**))g_d12vtOrig[48];
+    HRESULT hr = orig(self, addr, riid, pp);
+    Diag("D3D12 OpenExistingHeapFromAddress addr=" + Hex((uint64_t)(uintptr_t)addr) +
+         " hr=" + Hex((uint32_t)hr));
+    return hr;
+}
+
+// #140. CreateHeap starts returning E_OUTOFMEMORY after ~1.1 GB of DEFAULT heaps,
+// so print the two numbers that decide that: the container's own app-memory limit
+// (a UWP app on Xbox gets far less than a title does) and DXGI's video-memory
+// budget for the adapter. The game reads the second and sizes its pools from it.
+static void GhLogMemoryBudget(const char* where)
+{
+    std::string ln = std::string("MEMORY ") + where;
+    __try {
+        ln += " applimit=" + Hex((uint64_t)winrt::Windows::System::MemoryManager::AppMemoryUsageLimit()) +
+              " appused="  + Hex((uint64_t)winrt::Windows::System::MemoryManager::AppMemoryUsage());
+    } __except (EXCEPTION_EXECUTE_HANDLER) { ln += " applimit=?"; }
+    MEMORYSTATUSEX ms{}; ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms))
+        ln += " availphys=" + Hex((uint64_t)ms.ullAvailPhys) +
+              " availpage=" + Hex((uint64_t)ms.ullAvailPageFile);
+    // Ask the real adapter directly rather than through any proxy of ours.
+    com_ptr<IDXGIFactory4> f;
+    if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory4), f.put_void())) && f){
+        com_ptr<IDXGIAdapter1> a;
+        if (SUCCEEDED(f->EnumAdapters1(0, a.put())) && a){
+            com_ptr<IDXGIAdapter3> a3 = a.try_as<IDXGIAdapter3>();
+            DXGI_QUERY_VIDEO_MEMORY_INFO vm{};
+            if (a3 && SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vm)))
+                ln += " vidbudget=" + Hex((uint64_t)vm.Budget) +
+                      " viduse=" + Hex((uint64_t)vm.CurrentUsage) +
+                      " vidres=" + Hex((uint64_t)vm.AvailableForReservation);
+            if (a3 && SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &vm)))
+                ln += " nonlocalbudget=" + Hex((uint64_t)vm.Budget) +
+                      " nonlocaluse=" + Hex((uint64_t)vm.CurrentUsage);
+        }
+    }
+    Diag(ln);
+}
+
 static void GhHookD12Device(ID3D12Device* dev)
 {
     if (!dev || InterlockedCompareExchange(&g_d12vtHooked, 1, 0) != 0) return;
     void** vt = *(void***)dev;
     DWORD old = 0;
-    if (!VirtualProtect(vt, sizeof(void*) * 21, PAGE_READWRITE, &old)){
+    if (!VirtualProtect(vt, sizeof(void*) * 50, PAGE_READWRITE, &old)){
         Diag("D3D12 vtable hook protect failed err=" + Hex(GetLastError()));
         return;
     }
@@ -3382,13 +4577,39 @@ static void GhHookD12Device(ID3D12Device* dev)
     g_d12vtOrig[13] = vt[13]; vt[13] = (void*)&Hook_D12CheckFeature;
     g_d12vtOrig[16] = vt[16]; vt[16] = (void*)&Hook_D12CreateRS;
     g_d12vtOrig[20] = vt[20]; vt[20] = (void*)&Hook_D12CreateRTV;
-    VirtualProtect(vt, sizeof(void*) * 21, old, &old);
-    Diag("D3D12 vtable hooked GPS/CPS/CFS/RS/RTV");
+    g_d12vtOrig[27] = vt[27]; vt[27] = (void*)&Hook_D12CreateCommitted;
+    g_d12vtOrig[28] = vt[28]; vt[28] = (void*)&Hook_D12CreateHeap;
+    g_d12vtOrig[29] = vt[29]; vt[29] = (void*)&Hook_D12CreatePlaced;
+    g_d12vtOrig[48] = vt[48]; vt[48] = (void*)&Hook_D12OpenHeapAddr;
+    g_d12vtOrig[8]  = vt[8];  vt[8]  = (void*)&Hook_D12CreateCQ;
+    g_d12vtOrig[9]  = vt[9];  vt[9]  = (void*)&Hook_D12CreateCA;
+    g_d12vtOrig[12] = vt[12]; vt[12] = (void*)&Hook_D12CreateCL;
+    g_d12vtOrig[14] = vt[14]; vt[14] = (void*)&Hook_D12CreateDH;
+    g_d12vtOrig[36] = vt[36]; vt[36] = (void*)&Hook_D12CreateFence;
+    VirtualProtect(vt, sizeof(void*) * 50, old, &old);
+    Diag("D3D12 vtable hooked GPS/CPS/CFS/RS/RTV/CCR/CH/CPR/OEHFA");
+    GhLogMemoryBudget("device-created");
+    // Only five methods are hooked, so a crash inside any of the others shows up
+    // in a backtrace as a bare D3D12Core.dll+offset with nothing naming the call
+    // the guest made. Printing the slot map once turns that offset back into a
+    // method: the answer is the largest slot address that is <= the return
+    // address in the frame the guest called into.
+    {
+        std::string ln;
+        for (int i = 0; i < 80; ++i){
+            uintptr_t fn = 0;
+            if (!SafeQword((uintptr_t)&vt[i], &fn) || !fn) break;
+            ln += " [" + std::to_string(i) + "]=" + NameForCodeAddr(fn);
+            if ((i % 4) == 3){ Diag("D3D12 vt" + ln); ln.clear(); }
+        }
+        if (!ln.empty()) Diag("D3D12 vt" + ln);
+    }
 }
 
 static HRESULT WINAPI Bed_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL fl,
                                             REFIID riid, void** dev)
 {
+    GhWatchTick("D3D12CreateDevice");
     using Fn = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
     static Fn real = nullptr;
     if (!real){
@@ -4928,6 +6149,732 @@ static bool Bed_crs_start_handler()
     return false;
 }
 
+
+// ---------------------------------------------------------------------------
+// Memory accounting (#141).
+//
+// One app-memory budget covers the guest image, every CPU allocation and every
+// D3D12 heap, and Spider-Man is 2.05 GB into it before its D3D12 device even
+// exists. Nothing in the log says where that went, so these beds sit on the
+// calls a game's own allocator actually makes and name every reservation and
+// commit at or above a threshold, with a running total. Naming the pool beats
+// guessing at it.
+//
+// GlobalMemoryStatusEx and GetPhysicallyInstalledSystemMemory are here for a
+// second reason. A game that sizes its pools from "how much memory does this
+// machine have" sizes them for a machine that is not this one: the console has
+// far more RAM than the 5 GB this app container will ever be allowed to commit,
+// so an honest answer is a misleading one. Clamping DXGI's video budget was
+// honoured and changed nothing (v0.0.141.0), which makes the SYSTEM memory
+// number the next thing worth seeing -- and, via gh_sysmem_mb.txt, changing.
+// ---------------------------------------------------------------------------
+
+// A number from LocalState, with an environment override. Deliberately its own
+// tiny reader rather than ReadCfgW, which is defined much further down the file.
+static unsigned GhCfgNum(const wchar_t* file, const char* envName, unsigned dflt)
+{
+    char buf[32] = {};
+    if (GetEnvironmentVariableA(envName, buf, sizeof buf) > 0){
+        unsigned long v = strtoul(buf, nullptr, 10);
+        if (v) return (unsigned)v;
+    }
+    std::wstring path = std::wstring(kLocalState) + file;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return dflt;
+    char raw[64] = {}; DWORD got = 0;
+    ReadFile(h, raw, sizeof raw - 1, &got, nullptr);
+    CloseHandle(h);
+    // Accept either ASCII or the UTF-16LE our own writers produce.
+    char ascii[64] = {}; size_t n = 0;
+    for (DWORD i = 0; i < got && n < sizeof ascii - 1; ++i)
+        if (raw[i] >= '0' && raw[i] <= '9') ascii[n++] = raw[i];
+    if (!n) return dflt;
+    unsigned long v = strtoul(ascii, nullptr, 10);
+    return v ? (unsigned)v : dflt;
+}
+
+// 0 = report the truth. Otherwise the megabytes to report as installed/total.
+static unsigned GhSysMemMb()
+{
+    static unsigned mb = 0xFFFFFFFF;
+    if (mb == 0xFFFFFFFF){
+        mb = GhCfgNum(L"gh_sysmem_mb.txt", "GH_SYSMEM_MB", 0);
+        Diag("MEMORY sysmem clamp = " + (mb ? std::to_string(mb) + " MB" : std::string("off")));
+    }
+    return mb;
+}
+
+// ---------------------------------------------------------------------------
+// #143: is file-backed memory outside the app's commit budget?
+//
+// Every memory sample from #141 says the same thing: free commit is
+// applimit - appused to three decimal places, at every point in the run, while
+// physical memory barely moves. At the failing 8 MB CreateHeap the app had
+// 3.05 GB of free PHYSICAL pages and 4 MB of free commit. So the ceiling is a
+// COMMIT cap, not a RAM shortage, and a bigger page file cannot lift it -- the
+// page file is what is being counted.
+//
+// What is NOT counted, on desktop Windows, is a view of a real file: the file
+// is its own backing store, so a file-backed section charges no commit at all.
+// The WinRT surface agrees -- AppMemoryReport reports PrivateCommitUsage and
+// TotalCommitUsage, and file-backed pages are in neither. If that holds on
+// Xbox, we can hand the guest file-backed views where it asks for private
+// commit and put its 3.19 GB somewhere the budget does not look.
+//
+// Xbox has historically charged a title for everything it touches, so this is
+// exactly the assumption not to build on. Measure it: map a gigabyte of file,
+// DIRTY every page of it (a clean mapping proves nothing -- those pages would
+// never have been materialised), and watch the budget. Then do the identical
+// gigabyte as private commit as a control, so a flat reading means "not
+// counted" and not "the instrument is broken".
+//
+// Opt-in via <LocalState>\gh_memprobe.txt, because it writes and touches
+// gigabytes and has no business running before an ordinary game launch.
+// ---------------------------------------------------------------------------
+static void GhMemProbeReport(const char* where)
+{
+    std::string ln = std::string("MEMPROBE ") + where;
+    try {
+        namespace WS = winrt::Windows::System;
+        ln += " appused="   + Hex((uint64_t)WS::MemoryManager::AppMemoryUsage());
+        ln += " applimit="  + Hex((uint64_t)WS::MemoryManager::AppMemoryUsageLimit());
+        auto r = WS::MemoryManager::GetAppMemoryReport();
+        ln += " privcommit="  + Hex((uint64_t)r.PrivateCommitUsage());
+        ln += " totalcommit=" + Hex((uint64_t)r.TotalCommitUsage());
+        ln += " commitlimit=" + Hex((uint64_t)r.TotalCommitLimit());
+        auto pr = WS::MemoryManager::GetProcessMemoryReport();
+        ln += " privws="  + Hex((uint64_t)pr.PrivateWorkingSetUsage());
+        ln += " totalws=" + Hex((uint64_t)pr.TotalWorkingSetUsage());
+    } catch (...) { ln += " (winrt threw)"; }
+    MEMORYSTATUSEX ms{}; ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms))
+        ln += " availphys=" + Hex((uint64_t)ms.ullAvailPhys) +
+              " availpage=" + Hex((uint64_t)ms.ullAvailPageFile);
+    Diag(ln);
+}
+
+static void GhProbeFileBackedArena()
+{
+    if (!GhCfgNum(L"gh_memprobe.txt", "GH_MEMPROBE", 0)) return;
+    const uint64_t kArena = 1ull << 30;
+
+    Diag("MEMPROBE ==== file-backed arena probe (#143) ====");
+    GhMemProbeReport("baseline");
+
+    // An arena needs somewhere to live, and the app-data volume turned out to be
+    // a 3 GB partition with 132 MB free -- CreateFileMapping answered
+    // ERROR_DISK_FULL before it answered the question we were asking. So price
+    // every volume the container can reach and put the arena on the roomiest.
+    struct Cand { const wchar_t* path; const char* name; };
+    const Cand cands[] = {
+        { kLocalState,                        "LocalState"      },
+        { L"D:\\DevelopmentFiles\\",          "DevelopmentFiles" },
+        { L"D:\\DevelopmentFiles\\gh_games\\", "gh_games"        },
+    };
+    std::wstring home; uint64_t homeFree = 0;
+    for (const Cand& c : cands){
+        ULARGE_INTEGER availToCaller{}, totalBytes{}, totalFree{};
+        if (GetDiskFreeSpaceExW(c.path, &availToCaller, &totalBytes, &totalFree)){
+            Diag(std::string("MEMPROBE disk ") + c.name +
+                 " availtocaller=" + Hex((uint64_t)availToCaller.QuadPart) +
+                 " total=" + Hex((uint64_t)totalBytes.QuadPart) +
+                 " free="  + Hex((uint64_t)totalFree.QuadPart));
+            if ((uint64_t)availToCaller.QuadPart > homeFree){
+                homeFree = (uint64_t)availToCaller.QuadPart; home = c.path;
+            }
+        } else {
+            Diag(std::string("MEMPROBE disk ") + c.name +
+                 " GetDiskFreeSpaceExW failed err=" + Hex(GetLastError()));
+        }
+    }
+
+    // Free rider: can the cap simply be raised? Two lines, and it would make
+    // everything below unnecessary.
+    try {
+        bool ok = winrt::Windows::System::MemoryManager::TrySetAppMemoryUsageLimit(6ull << 30);
+        Diag(std::string("MEMPROBE TrySetAppMemoryUsageLimit(6GB) -> ") + (ok ? "TRUE" : "false") +
+             " limitnow=" + Hex((uint64_t)winrt::Windows::System::MemoryManager::AppMemoryUsageLimit()));
+    } catch (...) { Diag("MEMPROBE TrySetAppMemoryUsageLimit unavailable"); }
+
+    if (home.empty() || homeFree < (kArena + (256u << 20))){
+        Diag("MEMPROBE no volume with room for a " + Hex(kArena) + " arena (best free=" +
+             Hex(homeFree) + ") -- cannot answer the accounting question here");
+        return;
+    }
+    Diag("MEMPROBE arena home = " + std::string(home.begin(), home.end()) +
+         " free=" + Hex(homeFree));
+    std::wstring path = home + L"gh_arena.bin";
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (f == INVALID_HANDLE_VALUE){
+        Diag("MEMPROBE CreateFileW failed err=" + Hex(GetLastError())); return;
+    }
+    HANDLE m = CreateFileMappingW(f, nullptr, PAGE_READWRITE,
+                                  (DWORD)(kArena >> 32), (DWORD)(kArena & 0xFFFFFFFF), nullptr);
+    if (!m){
+        Diag("MEMPROBE CreateFileMappingW failed err=" + Hex(GetLastError()));
+        CloseHandle(f); return;
+    }
+    GhMemProbeReport("after-CreateFileMapping");
+
+    uint8_t* view = (uint8_t*)MapViewOfFile(m, FILE_MAP_ALL_ACCESS, 0, 0, (SIZE_T)kArena);
+    if (!view){
+        Diag("MEMPROBE MapViewOfFile failed err=" + Hex(GetLastError()));
+        CloseHandle(m); CloseHandle(f); return;
+    }
+    Diag("MEMPROBE view=" + Hex((uint64_t)(uintptr_t)view) + " size=" + Hex(kArena));
+    GhMemProbeReport("after-MapViewOfFile");
+
+    for (uint64_t off = 0; off < kArena; off += 4096) view[off] = (uint8_t)(off >> 12);
+    GhMemProbeReport("after-dirtying-1GB-file-backed");
+
+    // How the guest's own allocator would see such a region. It reads
+    // MEM_MAPPED here where private commit reads MEM_PRIVATE, and Spider-Man
+    // imports VirtualQuery -- so this line is part of the answer too.
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(view, &mbi, sizeof mbi) == sizeof mbi)
+        Diag("MEMPROBE VirtualQuery(view) state=" + Hex((uint32_t)mbi.State) +
+             " prot=" + Hex((uint32_t)mbi.Protect) + " type=" + Hex((uint32_t)mbi.Type) +
+             " regionsize=" + Hex((uint64_t)mbi.RegionSize));
+
+    // The control. Same gigabyte, private commit. If THIS does not move the
+    // numbers, the numbers are not measuring anything.
+    void* priv = VirtualAlloc(nullptr, (SIZE_T)kArena, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (priv){
+        GhMemProbeReport("after-VirtualAlloc-1GB-private");
+        for (uint64_t off = 0; off < kArena; off += 4096) ((uint8_t*)priv)[off] = 1;
+        GhMemProbeReport("after-dirtying-1GB-private");
+        VirtualFree(priv, 0, MEM_RELEASE);
+    } else {
+        Diag("MEMPROBE control VirtualAlloc(1GB) FAILED err=" + Hex(GetLastError()));
+    }
+
+    UnmapViewOfFile(view); CloseHandle(m); CloseHandle(f);
+    GhMemProbeReport("after-unmap-and-release");
+    Diag("MEMPROBE ==== done ====");
+}
+
+static std::mutex                          g_bigAllocMx;
+static std::unordered_map<void*, size_t>   g_bigAlloc;      // >= kBigAlloc only
+static volatile LONG64                     g_guestCommit = 0;
+static volatile LONG                       g_bigLogged   = 0;
+static const SIZE_T                        kBigAlloc     = 32u << 20;
+
+static void NoteBigAlloc(const char* what, void* addr, SIZE_T size, DWORD type,
+                         DWORD prot, uintptr_t caller, bool release)
+{
+    LONG64 tot;
+    if (release) tot = InterlockedExchangeAdd64(&g_guestCommit, -(LONG64)size) - (LONG64)size;
+    else         tot = InterlockedExchangeAdd64(&g_guestCommit,  (LONG64)size) + (LONG64)size;
+    if (InterlockedIncrement(&g_bigLogged) > 400) return;
+    Diag(std::string("MEMBIG ") + what + " addr=" + Hex((uint64_t)(uintptr_t)addr) +
+         " size=" + Hex((uint64_t)size) + " type=" + Hex((uint32_t)type) +
+         " prot=" + Hex((uint32_t)prot) + " guestcommit=" + Hex((uint64_t)(tot < 0 ? 0 : tot)) +
+         " from=" + NameForCodeAddr(caller));
+}
+
+// ---------------------------------------------------------------------------
+// The file-backed guest arena (#144) -- a swap file in user space.
+//
+// #143 measured what the container's 5 GB ceiling is actually made of, and the
+// answer decides the design. It is a COMMIT cap: AppMemoryUsage is exactly
+// AppMemoryReport::TotalCommitUsage and TotalCommitLimit is exactly
+// AppMemoryUsageLimit, and at the CreateHeap that killed Spider-Man there were
+// 3.05 GB of free PHYSICAL pages against 4 MB of free commit. So a bigger page
+// file cannot help -- the page file is the thing being counted -- and
+// TrySetAppMemoryUsageLimit(6GB) answers false.
+//
+// A view of a REAL FILE is different: the file is its own backing store, so it
+// charges no commit. Measured on this console: a 1 GB view with every page
+// dirtied (working set 163 MB -> 1.30 GB) cost 56 MB of budget, where the same
+// gigabyte as private commit cost the full 1 GB the moment it was reserved.
+// About 18x. Spider-Man's 3.19 GB of guest-side commits should cost ~175 MB.
+//
+// So: reserve one big file on the dev volume, map slices of it, and hand those
+// to the guest wherever it asks for a large private reservation. The guest is
+// not told. Three details from the probe that this has to respect:
+//
+//   * The arena cannot live in LocalState -- that volume is 3.0 GB with 126 MB
+//     free and answers ERROR_DISK_FULL. D:\DevelopmentFiles has 12 GB free.
+//   * A view's protection can only ever NARROW, so the section is created
+//     PAGE_EXECUTE_READWRITE and the guest's VirtualProtect works from there.
+//   * VirtualQuery tells the truth, and the truth is wrong for us: arena pages
+//     read Type=MEM_MAPPED where private commit reads MEM_PRIVATE. Spider-Man
+//     imports VirtualQuery. Hence the bed below.
+//
+// Off unless <LocalState>\gh_arena_mb.txt names a size, so a run without it is
+// bit-for-bit the old behaviour and the A/B is honest.
+// ---------------------------------------------------------------------------
+static std::mutex                       g_arenaMx;
+static HANDLE                           g_arenaFile = INVALID_HANDLE_VALUE;
+static HANDLE                           g_arenaMap  = nullptr;   // section 0; also the "is the arena up" flag
+static std::vector<HANDLE>              g_arenaMaps;             // every section over the same file
+static uint64_t                         g_arenaSize = 0;
+static std::map<uint64_t, uint64_t>     g_arenaFree;    // offset -> size, ordered so it can coalesce
+// A slice is one reservation handed to the guest. `chunk` is 0 when it is a
+// single view and the chunk stride when it had to be built out of several --
+// see GhArenaTakeChunked for why that is the common case for anything big.
+struct GhArenaSlice { uint64_t off; uint64_t size; uint64_t chunk; };
+static std::map<void*, GhArenaSlice> g_arenaLive;   // view base -> slice
+static SIZE_T                           g_arenaMin  = 0;
+static volatile LONG                    g_arenaLogs = 0;
+static uint64_t                         g_arenaHanded = 0;
+static bool                             g_arenaExec = false;
+static SIZE_T                           g_arenaChunk = 0;
+static uint64_t                         g_arenaCap   = 0;   // ceiling on bytes mapped at once
+
+static void GhArenaLog(const std::string& msg);   // defined below
+
+// caller holds g_arenaMx
+static bool GhArenaInit()
+{
+    static bool tried = false;
+    if (tried) return g_arenaMap != nullptr;
+    tried = true;
+
+    unsigned mb = GhCfgNum(L"gh_arena_mb.txt", "GH_ARENA_MB", 0);
+    if (!mb){ Diag("ARENA off (no gh_arena_mb.txt)"); return false; }
+    g_arenaMin = (SIZE_T)GhCfgNum(L"gh_arena_min_mb.txt", "GH_ARENA_MIN_MB", 16) << 20;
+    g_arenaChunk = (SIZE_T)GhCfgNum(L"gh_arena_chunk_mb.txt", "GH_ARENA_CHUNK_MB", 256) << 20;
+    // v0.0.151.0 settled the shape of the ceiling: this process may hold 1024 MB
+    // of mapped file view and not a byte more, and it is per-PROCESS -- eight
+    // separate section objects over the same file all failed at the identical
+    // cumulative total, each after mapping exactly 1 GB. So the arena stops
+    // asking at the cap instead of paying for a failed 1 GB map-and-unwind on
+    // every large reservation for the rest of the run.
+    g_arenaCap = (uint64_t)GhCfgNum(L"gh_arena_cap_mb.txt", "GH_ARENA_CAP_MB", 1024) << 20;
+
+    const wchar_t* dir = L"D:\\DevelopmentFiles\\";
+    ULARGE_INTEGER avail{}, tot{}, freeb{};
+    if (!GetDiskFreeSpaceExW(dir, &avail, &tot, &freeb)){
+        Diag("ARENA GetDiskFreeSpaceExW failed err=" + Hex(GetLastError())); return false;
+    }
+    uint64_t want = (uint64_t)mb << 20;
+    // Leave the volume 2 GB of headroom; it also holds the game.
+    uint64_t room = (uint64_t)avail.QuadPart > (2ull << 30) ? (uint64_t)avail.QuadPart - (2ull << 30) : 0;
+    if (want > room) want = room;
+    if (want < (256ull << 20)){
+        Diag("ARENA no room: free=" + Hex((uint64_t)avail.QuadPart) + " usable=" + Hex(room));
+        return false;
+    }
+
+    std::wstring path = std::wstring(dir) + L"gh_guest_arena.bin";
+    // GENERIC_EXECUTE is required by CreateFileMapping for a PAGE_EXECUTE_*
+    // section -- without it the call is ERROR_ACCESS_DENIED, which is exactly
+    // how v0.0.147.0 failed. An app container may still refuse an executable
+    // section outright, so a read/write section is the fallback: the guest's
+    // big heaps are all PAGE_READWRITE anyway (every MEMBIG line says prot=0x4).
+    g_arenaFile = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE, 0,
+                              nullptr, CREATE_ALWAYS, FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (g_arenaFile == INVALID_HANDLE_VALUE){
+        Diag("ARENA CreateFileW(+execute) failed err=" + Hex(GetLastError()) + " -- retrying read/write");
+        g_arenaFile = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                  CREATE_ALWAYS, FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    }
+    if (g_arenaFile == INVALID_HANDLE_VALUE){
+        Diag("ARENA CreateFileW failed err=" + Hex(GetLastError())); return false;
+    }
+    // Executable is opt-in. v0.0.148.0 mapped 341 MB views happily out of a
+    // PAGE_EXECUTE_READWRITE section and could not map 680 MB or more out of the
+    // same one, while #143's PAGE_READWRITE probe mapped a full gigabyte -- so
+    // the section's executability is the first suspect for the view ceiling, and
+    // every guest allocation we want is prot=0x4 anyway.
+    if (GhCfgNum(L"gh_arena_exec.txt", "GH_ARENA_EXEC", 0)){
+        g_arenaMap = CreateFileMappingW(g_arenaFile, nullptr, PAGE_EXECUTE_READWRITE,
+                                        (DWORD)(want >> 32), (DWORD)(want & 0xFFFFFFFF), nullptr);
+        g_arenaExec = g_arenaMap != nullptr;
+    }
+    if (!g_arenaMap){
+        g_arenaMap = CreateFileMappingW(g_arenaFile, nullptr, PAGE_READWRITE,
+                                        (DWORD)(want >> 32), (DWORD)(want & 0xFFFFFFFF), nullptr);
+    }
+    if (!g_arenaMap){
+        Diag("ARENA CreateFileMappingW(" + Hex(want) + ") failed err=" + Hex(GetLastError()));
+        CloseHandle(g_arenaFile); g_arenaFile = INVALID_HANDLE_VALUE; return false;
+    }
+    // v0.0.150.0 measured a hard ceiling on how much file view this process may
+    // hold at once: 1024 MB, after which every MapViewOfFile/MapViewOfFile3 is
+    // ERROR_COMMITMENT_LIMIT no matter how small the view. Whether that pool is
+    // per-section or per-process decides whether the arena can ever be bigger
+    // than a gigabyte, so open several sections over the same file and let
+    // GhArenaTake fall through them. Views of one file stay coherent across
+    // sections, so this costs nothing if the pool turns out to be per-process.
+    g_arenaMaps.push_back(g_arenaMap);
+    unsigned sections = GhCfgNum(L"gh_arena_sections.txt", "GH_ARENA_SECTIONS", 1);
+    for (unsigned i = 1; i < sections; ++i){
+        HANDLE m = CreateFileMappingW(g_arenaFile, nullptr,
+                                      g_arenaExec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE,
+                                      (DWORD)(want >> 32), (DWORD)(want & 0xFFFFFFFF), nullptr);
+        if (!m){ Diag("ARENA section " + std::to_string(i) + " failed err=" + Hex(GetLastError())); break; }
+        g_arenaMaps.push_back(m);
+    }
+    g_arenaSize = want;
+    g_arenaFree[0] = want;
+    Diag("ARENA ready size=" + Hex(want) + " min=" + Hex((uint64_t)g_arenaMin) +
+         " exec=" + std::string(g_arenaExec ? "yes" : "no") +
+         " chunk=" + Hex((uint64_t)g_arenaChunk) + " cap=" + Hex(g_arenaCap) +
+         " sections=" + std::to_string(g_arenaMaps.size()) +
+         " volfree=" + Hex((uint64_t)avail.QuadPart));
+    GhLogMemoryBudget("arena-ready");
+    return true;
+}
+
+// MapViewOfFile refuses a view much over 512 MB in this container with
+// ERROR_COMMITMENT_LIMIT (0x5AF) even though the pages are the file's and the
+// app budget barely moves -- measured on the console: 341 MB maps, 680 MB and
+// up does not. So a big region is assembled out of chunk-sized views placed
+// side by side. VirtualAlloc2's placeholder API is what makes that safe: one
+// reservation covers the whole span, it is split, and each piece is replaced by
+// a view, so the guest gets one contiguous block and no other thread can take
+// an address out from under us in between.
+#ifndef MEM_RESERVE_PLACEHOLDER
+#define MEM_RESERVE_PLACEHOLDER  0x00040000
+#endif
+#ifndef MEM_REPLACE_PLACEHOLDER
+#define MEM_REPLACE_PLACEHOLDER  0x00004000
+#endif
+#ifndef MEM_PRESERVE_PLACEHOLDER
+#define MEM_PRESERVE_PLACEHOLDER 0x00000002
+#endif
+
+typedef struct _GH_ARENA_MEM_EXT_PARAM {
+    struct { ULONG64 Type : 8; ULONG64 Reserved : 56; };
+    union  { ULONG64 ULong64; PVOID Pointer; SIZE_T Size; HANDLE Handle; ULONG ULong; };
+} GH_ARENA_MEM_EXT_PARAM;
+using GhVirtualAlloc2_t  = PVOID (WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG,
+                                           GH_ARENA_MEM_EXT_PARAM*, ULONG);
+using GhMapViewOfFile3_t = PVOID (WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG,
+                                           ULONG, GH_ARENA_MEM_EXT_PARAM*, ULONG);
+
+static GhVirtualAlloc2_t  g_va2 = nullptr;
+static GhMapViewOfFile3_t g_mv3 = nullptr;
+
+static bool GhArenaPlaceholderApi()
+{
+    static bool tried = false;
+    if (!tried){
+        tried = true;
+        HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
+        if (kb){
+            g_va2 = (GhVirtualAlloc2_t) GetProcAddress(kb, "VirtualAlloc2");
+            g_mv3 = (GhMapViewOfFile3_t)GetProcAddress(kb, "MapViewOfFile3");
+        }
+        Diag(std::string("ARENA placeholder api va2=") + (g_va2 ? "yes" : "no") +
+             " mv3=" + (g_mv3 ? "yes" : "no"));
+    }
+    return g_va2 && g_mv3;
+}
+
+// caller holds g_arenaMx. Returns the base of a contiguous run of `need` bytes
+// of the arena starting at `off`, or null.
+static void* GhArenaTakeChunked(HANDLE sect, uint64_t off, uint64_t need, uint64_t chunk, DWORD pageProt)
+{
+    if (!GhArenaPlaceholderApi()) return nullptr;
+    uint8_t* ph = (uint8_t*)g_va2(GetCurrentProcess(), nullptr, (SIZE_T)need,
+                                  MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+    if (!ph){
+        GhArenaLog("placeholder reserve " + Hex(need) + " failed err=" + Hex(GetLastError()));
+        return nullptr;
+    }
+    uint64_t done = 0;
+    while (done < need){
+        uint64_t take = need - done < chunk ? need - done : chunk;
+        uint8_t* at   = ph + done;
+        // Split the head off the remaining placeholder, unless this is the tail.
+        if (done + take < need &&
+            !VirtualFree(at, (SIZE_T)take, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)){
+            GhArenaLog("placeholder split at=" + Hex((uint64_t)(uintptr_t)at) +
+                       " size=" + Hex(take) + " failed err=" + Hex(GetLastError()));
+            break;
+        }
+        if (!g_mv3(sect, GetCurrentProcess(), at, off + done, (SIZE_T)take,
+                   MEM_REPLACE_PLACEHOLDER, pageProt, nullptr, 0)){
+            GhArenaLog("MapViewOfFile3 at=" + Hex((uint64_t)(uintptr_t)at) + " size=" + Hex(take) +
+                       " off=" + Hex(off + done) + " failed err=" + Hex(GetLastError()));
+            break;
+        }
+        done += take;
+    }
+    if (done == need) return ph;
+    // Unwind: the mapped chunks, then whatever placeholder is left.
+    for (uint64_t u = 0; u < done; u += chunk) UnmapViewOfFile(ph + u);
+    if (done < need) VirtualFree(ph + done, 0, MEM_RELEASE);
+    return nullptr;
+}
+
+// caller holds g_arenaMx. wantAddr non-null means the guest demanded a fixed
+// address; if the mapping cannot honour it we return null and the caller falls
+// back to a real VirtualAlloc rather than moving the guest's memory under it.
+static void* GhArenaTake(SIZE_T size, void* wantAddr)
+{
+    const uint64_t kGran = 64u << 10;             // MapViewOfFile offset granularity
+    uint64_t need = ((uint64_t)size + kGran - 1) & ~(kGran - 1);
+    if (g_arenaCap && g_arenaHanded + need > g_arenaCap) return nullptr;
+    for (auto it = g_arenaFree.begin(); it != g_arenaFree.end(); ++it){
+        if (it->second < need) continue;
+        uint64_t off = it->first;
+        DWORD access   = FILE_MAP_ALL_ACCESS | (g_arenaExec ? FILE_MAP_EXECUTE : 0);
+        DWORD pageProt = g_arenaExec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
+        void*    v     = nullptr;
+        uint64_t chunk = 0;
+        for (size_t si = 0; si < g_arenaMaps.size() && !v; ++si){
+            HANDLE sect = g_arenaMaps[si];
+            v = wantAddr
+                ? MapViewOfFileEx(sect, access, (DWORD)(off >> 32),
+                                  (DWORD)(off & 0xFFFFFFFF), (SIZE_T)need, wantAddr)
+                : MapViewOfFile  (sect, access, (DWORD)(off >> 32),
+                                  (DWORD)(off & 0xFFFFFFFF), (SIZE_T)need);
+            if (v){
+                if (si) GhArenaLog("whole view came from section " + std::to_string(si));
+                break;
+            }
+            GhArenaLog("MapViewOfFile" + std::string(wantAddr ? "Ex" : "") + " sect=" + std::to_string(si) +
+                       " need=" + Hex(need) + " off=" + Hex(off) + " failed err=" + Hex(GetLastError()));
+            if (wantAddr) continue;                // a fixed address has no chunked form
+            chunk = (uint64_t)g_arenaChunk;
+            v = GhArenaTakeChunked(sect, off, need, chunk, pageProt);
+            if (v) GhArenaLog("chunked base=" + Hex((uint64_t)(uintptr_t)v) + " need=" + Hex(need) +
+                              " chunk=" + Hex(chunk) + " sect=" + std::to_string(si));
+            else   chunk = 0;
+        }
+        if (!v) return nullptr;
+        if (it->second == need) g_arenaFree.erase(it);
+        else { uint64_t rest = it->second - need; g_arenaFree.erase(it); g_arenaFree[off + need] = rest; }
+        g_arenaLive[v] = { off, need, chunk };
+        g_arenaHanded += need;
+        return v;
+    }
+    return nullptr;
+}
+
+// caller holds g_arenaMx
+static bool GhArenaGive(void* base)
+{
+    auto it = g_arenaLive.find(base);
+    if (it == g_arenaLive.end()) return false;
+    uint64_t off = it->second.off, size = it->second.size, chunk = it->second.chunk;
+    if (chunk){ for (uint64_t u = 0; u < size; u += chunk) UnmapViewOfFile((uint8_t*)base + u); }
+    else       UnmapViewOfFile(base);
+    g_arenaLive.erase(it);
+    g_arenaHanded -= size;
+    // Coalesce with the neighbours so a long session does not shred the file.
+    auto nx = g_arenaFree.lower_bound(off);
+    if (nx != g_arenaFree.end() && nx->first == off + size){ size += nx->second; g_arenaFree.erase(nx); }
+    if (!g_arenaFree.empty()){
+        auto pv = g_arenaFree.lower_bound(off);
+        if (pv != g_arenaFree.begin()){
+            --pv;
+            if (pv->first + pv->second == off){ off = pv->first; size += pv->second; g_arenaFree.erase(pv); }
+        }
+    }
+    g_arenaFree[off] = size;
+    return true;
+}
+
+// caller holds g_arenaMx
+static bool GhArenaFind(const void* p, void** base, SIZE_T* size)
+{
+    for (auto& kv : g_arenaLive){
+        uint8_t* b = (uint8_t*)kv.first;
+        if ((const uint8_t*)p >= b && (const uint8_t*)p < b + kv.second.size){
+            if (base) *base = kv.first;
+            if (size) *size = (SIZE_T)kv.second.size;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void GhArenaLog(const std::string& msg)
+{
+    if (InterlockedIncrement(&g_arenaLogs) <= 300) Diag("ARENA " + msg);
+}
+
+// The guest asked for private commit and must be told it has private commit.
+// MEM_MAPPED is the truth about our arena, not about its allocation, and an
+// allocator that checks Type would reject its own memory.
+static SIZE_T WINAPI Bed_VirtualQuery(LPCVOID addr, PMEMORY_BASIC_INFORMATION mbi, SIZE_T len)
+{
+    SIZE_T r = VirtualQuery(addr, mbi, len);
+    if (r && mbi && len >= sizeof(MEMORY_BASIC_INFORMATION) && mbi->Type == MEM_MAPPED){
+        std::lock_guard<std::mutex> lk(g_arenaMx);
+        void* b = nullptr; SIZE_T sz = 0;
+        if (GhArenaFind(addr, &b, &sz)){
+            mbi->Type             = MEM_PRIVATE;
+            mbi->State            = MEM_COMMIT;
+            mbi->AllocationBase   = b;
+            mbi->AllocationProtect= PAGE_READWRITE;
+        }
+    }
+    return r;
+}
+
+static LPVOID WINAPI Bed_VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_arenaMx);
+        // A commit landing inside a slice we already handed out is already
+        // backed by the file. Say yes and touch nothing -- this is the call the
+        // game makes thousands of times, and answering it from private commit
+        // is exactly what we are avoiding.
+        if (addr && (type & MEM_COMMIT) && !(type & MEM_RESERVE)){
+            void* b = nullptr; SIZE_T sz = 0;
+            if (GhArenaFind(addr, &b, &sz)){
+                if (prot && prot != PAGE_READWRITE){
+                    DWORD old = 0;
+                    if (!VirtualProtect(addr, size, prot, &old))             // can only ever narrow
+                        GhArenaLog("commit-in-slice PROTECT FAILED addr=" + Hex((uint64_t)(uintptr_t)addr) +
+                                   " prot=" + Hex((uint32_t)prot) + " err=" + Hex(GetLastError()));
+                }
+                GhArenaLog("commit-in-slice addr=" + Hex((uint64_t)(uintptr_t)addr) +
+                           " size=" + Hex((uint64_t)size) + " prot=" + Hex((uint32_t)prot));
+                return addr;
+            }
+        }
+        // The 1 MB pre-filter is so an ordinary small reservation never pays the
+        // cost of creating a multi-gigabyte file; g_arenaMin is only known once
+        // GhArenaInit has read the config, so the real threshold is checked after.
+        const DWORD kExecProt = PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if ((type & MEM_RESERVE) && size >= (1u << 20) && GhArenaInit() && size >= g_arenaMin &&
+            (g_arenaExec || !(prot & kExecProt))){
+            if (void* v = GhArenaTake(size, addr)){
+                GhArenaLog("slice addr=" + Hex((uint64_t)(uintptr_t)v) + " size=" + Hex((uint64_t)size) +
+                           " type=" + Hex((uint32_t)type) + " prot=" + Hex((uint32_t)prot) +
+                           " handed=" + Hex(g_arenaHanded) +
+                           " from=" + NameForCodeAddr((uintptr_t)_ReturnAddress()));
+                return v;
+            }
+            uint64_t freeTot = 0, freeMax = 0;
+            for (auto& kv : g_arenaFree){ freeTot += kv.second; if (kv.second > freeMax) freeMax = kv.second; }
+            GhArenaLog("slice DECLINED size=" + Hex((uint64_t)size) +
+                       " handed=" + Hex(g_arenaHanded) + " cap=" + Hex(g_arenaCap) +
+                       " at=" + Hex((uint64_t)(uintptr_t)addr) +
+                       " freetot=" + Hex(freeTot) + " freemax=" + Hex(freeMax) + " -> real reserve");
+        }
+    }
+    LPVOID p = VirtualAlloc(addr, size, type, prot);
+    // Only MEM_COMMIT spends the app budget; a reservation is address space.
+    if (p && size >= kBigAlloc && (type & MEM_COMMIT)){
+        {
+            std::lock_guard<std::mutex> lk(g_bigAllocMx);
+            g_bigAlloc[p] = size;
+        }
+        NoteBigAlloc("VirtualAlloc", p, size, type, prot, (uintptr_t)_ReturnAddress(), false);
+    } else if (!p && size >= kBigAlloc){
+        Diag("MEMBIG VirtualAlloc FAILED size=" + Hex((uint64_t)size) + " type=" + Hex((uint32_t)type) +
+             " err=" + Hex(GetLastError()) + " from=" + NameForCodeAddr((uintptr_t)_ReturnAddress()));
+        GhLogMemoryBudget("valloc-failed");
+    }
+    return p;
+}
+
+static BOOL WINAPI Bed_VirtualFree(LPVOID addr, SIZE_T size, DWORD type)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_arenaMx);
+        if (type & MEM_RELEASE){
+            if (GhArenaGive(addr)){
+                GhArenaLog("release addr=" + Hex((uint64_t)(uintptr_t)addr) +
+                           " handed=" + Hex(g_arenaHanded));
+                return TRUE;
+            }
+        } else if (type & MEM_DECOMMIT){
+            // Nothing to give back: the pages are the file's, not the budget's.
+            void* b = nullptr; SIZE_T sz = 0;
+            if (GhArenaFind(addr, &b, &sz)) return TRUE;
+        }
+    }
+    size_t known = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_bigAllocMx);
+        auto it = g_bigAlloc.find(addr);
+        if (it != g_bigAlloc.end()){ known = it->second; if (type & MEM_RELEASE) g_bigAlloc.erase(it); }
+    }
+    BOOL ok = VirtualFree(addr, size, type);
+    if (ok && known)
+        NoteBigAlloc("VirtualFree", addr, known, type, 0, (uintptr_t)_ReturnAddress(), true);
+    return ok;
+}
+
+static HANDLE WINAPI Bed_HeapCreate(DWORD opts, SIZE_T initial, SIZE_T maxSize)
+{
+    HANDLE h = HeapCreate(opts, initial, maxSize);
+    Diag("MEMBIG HeapCreate opts=" + Hex((uint32_t)opts) + " initial=" + Hex((uint64_t)initial) +
+         " max=" + Hex((uint64_t)maxSize) + " -> " + Hex((uint64_t)(uintptr_t)h) +
+         " from=" + NameForCodeAddr((uintptr_t)_ReturnAddress()));
+    return h;
+}
+
+// The guest's own view of the machine. Report the APP's ceiling, not the box's:
+// AppMemoryUsageLimit is the only number here that is true for this process.
+static void GhFillMemStatus(MEMORYSTATUSEX* ms)
+{
+    unsigned mb = GhSysMemMb();
+    if (!mb) return;
+    ULONGLONG cap = (ULONGLONG)mb << 20;
+    if (ms->ullTotalPhys     > cap) ms->ullTotalPhys     = cap;
+    if (ms->ullAvailPhys     > cap) ms->ullAvailPhys     = cap;
+    if (ms->ullTotalPageFile > cap) ms->ullTotalPageFile = cap;
+    if (ms->ullAvailPageFile > cap) ms->ullAvailPageFile = cap;
+    if (ms->ullTotalVirtual  > cap) ms->ullTotalVirtual  = cap;
+    if (ms->ullAvailVirtual  > cap) ms->ullAvailVirtual  = cap;
+    ms->dwMemoryLoad = (DWORD)(ms->ullTotalPhys ? (100 - (ms->ullAvailPhys * 100 / ms->ullTotalPhys)) : 0);
+}
+
+static volatile LONG g_memStatusLogged = 0;
+
+static BOOL WINAPI Bed_GlobalMemoryStatusEx(LPMEMORYSTATUSEX ms)
+{
+    if (!ms) return FALSE;
+    BOOL ok = GlobalMemoryStatusEx(ms);
+    if (ok){
+        ULONGLONG realPhys = ms->ullTotalPhys, realAvail = ms->ullAvailPhys;
+        GhFillMemStatus(ms);
+        if (InterlockedIncrement(&g_memStatusLogged) <= 8)
+            Diag("BED GlobalMemoryStatusEx totalphys=" + Hex((uint64_t)realPhys) +
+                 " availphys=" + Hex((uint64_t)realAvail) +
+                 " -> reported total=" + Hex((uint64_t)ms->ullTotalPhys) +
+                 " avail=" + Hex((uint64_t)ms->ullAvailPhys) +
+                 " from=" + NameForCodeAddr((uintptr_t)_ReturnAddress()));
+    }
+    return ok;
+}
+
+static void WINAPI Bed_GlobalMemoryStatus(LPMEMORYSTATUS ms)
+{
+    if (!ms) return;
+    MEMORYSTATUSEX ex{}; ex.dwLength = sizeof ex;
+    if (!GlobalMemoryStatusEx(&ex)){ GlobalMemoryStatus(ms); return; }
+    GhFillMemStatus(&ex);
+    // The 32-bit-era struct saturates at 4 GB - 1; that is its documented behaviour.
+    auto sat = [](ULONGLONG v) -> SIZE_T { return (SIZE_T)(v > 0xFFFFFFFFull ? 0xFFFFFFFFull : v); };
+    ms->dwLength        = sizeof(MEMORYSTATUS);
+    ms->dwMemoryLoad    = ex.dwMemoryLoad;
+    ms->dwTotalPhys     = sat(ex.ullTotalPhys);
+    ms->dwAvailPhys     = sat(ex.ullAvailPhys);
+    ms->dwTotalPageFile = sat(ex.ullTotalPageFile);
+    ms->dwAvailPageFile = sat(ex.ullAvailPageFile);
+    ms->dwTotalVirtual  = sat(ex.ullTotalVirtual);
+    ms->dwAvailVirtual  = sat(ex.ullAvailVirtual);
+}
+
+static BOOL WINAPI Bed_GetPhysicallyInstalledSystemMemory(PULONGLONG kb)
+{
+    if (!kb) return FALSE;
+    BOOL ok = GetPhysicallyInstalledSystemMemory(kb);
+    ULONGLONG real = ok ? *kb : 0;
+    unsigned mb = GhSysMemMb();
+    if (!ok){ *kb = (ULONGLONG)(mb ? mb : 8192) * 1024; ok = TRUE; }
+    else if (mb && *kb > (ULONGLONG)mb * 1024) *kb = (ULONGLONG)mb * 1024;
+    if (InterlockedIncrement(&g_memStatusLogged) <= 12)
+        Diag("BED GetPhysicallyInstalledSystemMemory real=" + Hex((uint64_t)real) +
+             "KB -> " + Hex((uint64_t)*kb) + "KB from=" +
+             NameForCodeAddr((uintptr_t)_ReturnAddress()));
+    return ok;
+}
+
 static const std::unordered_map<std::string, void*>& ShimTable()
 {
     static const std::unordered_map<std::string, void*> t = {
@@ -5008,6 +6955,14 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"MessageBoxW",        (void*)&Bed_MessageBoxW},
         {"MessageBoxA",        (void*)&Bed_MessageBoxA},
         {"crs_start_handler",  (void*)&Bed_crs_start_handler},
+        // #141 memory accounting -- see the beds above.
+        {"VirtualAlloc",       (void*)&Bed_VirtualAlloc},
+        {"VirtualFree",        (void*)&Bed_VirtualFree},
+        {"VirtualQuery",       (void*)&Bed_VirtualQuery},
+        {"HeapCreate",         (void*)&Bed_HeapCreate},
+        {"GlobalMemoryStatusEx", (void*)&Bed_GlobalMemoryStatusEx},
+        {"GlobalMemoryStatus",   (void*)&Bed_GlobalMemoryStatus},
+        {"GetPhysicallyInstalledSystemMemory", (void*)&Bed_GetPhysicallyInstalledSystemMemory},
         // Display surrogate. MUST live here, not only in PatchModuleForGuest.
         // The guest exe is mapped by our loader and resolves imports through
         // ShimTable; PatchModuleForGuest only rewrites modules the HOST loaded.
@@ -5119,7 +7074,7 @@ struct LoadedImage { uint8_t* base=nullptr; size_t size=0; uint32_t entryRva=0; 
 // "READFILE fail err=0x2" line -- a file open, an append and a close, forever,
 // for a condition that is the normal case. It buried the guest's own log under
 // thousands of lines of nothing.
-static bool ReadWholeFile(const std::wstring& path, std::vector<uint8_t>& out, bool optional = false)
+static bool ReadWholeFile(const std::wstring& path, std::vector<uint8_t>& out, bool optional)
 {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE){ if (!optional) Diag("READFILE fail err=" + Hex(GetLastError()) ); return false; }
@@ -5176,6 +7131,8 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"RegSetValueExW", (void*)&Bed_RegSetValueExW}, {"RegSetValueExA", (void*)&Bed_RegSetValueExA},
         {"RegCloseKey", (void*)&Bed_RegCloseKey},
         {"RegEnumKeyExA", (void*)&Bed_RegEnumKeyExA}, {"RegEnumValueA", (void*)&Bed_RegEnumValueA},
+        {"RegEnumKeyExW", (void*)&Bed_RegEnumKeyExW}, {"RegEnumValueW", (void*)&Bed_RegEnumValueW},
+        {"RegQueryInfoKeyA", (void*)&Bed_RegQueryInfoKeyA},
         {"RegDeleteValueA", (void*)&Bed_RegDeleteValueA}, {"RegDeleteTreeA", (void*)&Bed_RegDeleteTreeA},
         {"SHGetKnownFolderPath", (void*)&Bed_SHGetKnownFolderPath},      // [DIAG] log persistent-data path build
         {"SHGetFolderPathW", (void*)&Bed_SHGetFolderPathW},              // the CSIDL fallback for the same folders
@@ -5258,6 +7215,14 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"MessageBoxW",        (void*)&Bed_MessageBoxW},
         {"MessageBoxA",        (void*)&Bed_MessageBoxA},
         {"crs_start_handler",  (void*)&Bed_crs_start_handler},
+        // #141 memory accounting -- see the beds above.
+        {"VirtualAlloc",       (void*)&Bed_VirtualAlloc},
+        {"VirtualFree",        (void*)&Bed_VirtualFree},
+        {"VirtualQuery",       (void*)&Bed_VirtualQuery},
+        {"HeapCreate",         (void*)&Bed_HeapCreate},
+        {"GlobalMemoryStatusEx", (void*)&Bed_GlobalMemoryStatusEx},
+        {"GlobalMemoryStatus",   (void*)&Bed_GlobalMemoryStatus},
+        {"GetPhysicallyInstalledSystemMemory", (void*)&Bed_GetPhysicallyInstalledSystemMemory},
         // Display surrogate. These beds already existed, but only in
         // PatchModuleForGuest -- which patches modules the HOST loaded (steamclient,
         // UnityPlayer, guest-owned DLLs). The guest exe is mapped by our own loader
@@ -5606,6 +7571,8 @@ static int PatchModuleImport(HMODULE mod, const char* target, void* repl)
 // diagnostic; it changes no control flow. We log only the first few faults to
 // avoid flooding the diag on a fault storm.
 static volatile long g_vehLogged = 0;
+static volatile LONG g_commitRepairs = 0;   // #140, see the repair below
+static bool SafeQword(uintptr_t a, uintptr_t* out);   // fwd (defined with the tracepoint dumps)
 // Decode the DelayLoadInfo an MSVC delay-load failure carries.
 // VcppException(ERROR_SEVERITY_ERROR, ERROR_MOD_NOT_FOUND) is 0xC06D007E and
 // ...PROC_NOT_FOUND is 0xC06D007F; both put a DelayLoadInfo* in
@@ -5644,9 +7611,110 @@ static void DiagDelayLoadFailure(DWORD code, const void* raw)
     DiagGuestBacktrace("delayload");
 }
 
+// Report one #139 breakpoint hit. Two kinds are armed.
+//
+// The EXECUTION breakpoints sit ON the folded `lock cmpxchg QWORD PTR
+// [rcx+0x30],rdx` that adjusts a cppwinrt refcount for a producer five slots
+// from the end of its object. At that instant rcx is the caller's `this` and rax
+// is the value about to be written back adjusted: a small integer is an ordinary
+// refcount, but a pointer means the caller passed a `this` eight bytes low and
+// is about to walk over a vtable pointer.
+//
+// The WRITE watchpoint sits on a live AdapterProxy's root+0x30 and fires for any
+// store there at all. On a data breakpoint RIP has already moved past the
+// storing instruction, so the site named is the instruction after it -- close
+// enough to identify the writer, and the backtrace names its module.
+static void GhWatchReport(EXCEPTION_POINTERS* ep)
+{
+    InterlockedIncrement(&g_watchTrips);
+    CONTEXT* c = ep->ContextRecord;
+    for (int i = 0; i < kGhWatchMax; ++i){
+        if (!(c->Dr6 & ((DWORD64)1 << i))) continue;
+        const char* what = g_watchWhat[i] ? g_watchWhat[i] : "?";
+        if (!g_watchWrite[i]){
+            // A refcount is a small number; anything larger here is a pointer,
+            // and a pointer here is the bug.
+            if (c->Rax < 0x100000) continue;
+            if (InterlockedIncrement(&g_watchHits) > 6) return;
+            Diag(std::string("WATCH CAUGHT bad ") + what +
+                 " -- the value at [rcx+0x30] is a POINTER, not a refcount");
+            Diag("  this=" + Hex(c->Rcx) + " [this+0x30]=" + Hex(c->Rax) +
+                 " (" + NameForCodeAddr(c->Rax) + ")");
+        } else {
+            if (InterlockedIncrement(&g_watchHits) > 6) return;
+            uintptr_t now = 0;
+            SafeQword(g_watchAddr[i], &now);
+            Diag(std::string("WATCH WRITE to ") + what +
+                 " addr=" + Hex((uint64_t)g_watchAddr[i]) +
+                 " now=" + Hex((uint64_t)now) + " (" + NameForCodeAddr(now) + ")");
+        }
+        Diag("  site=" + NameForCodeAddr(c->Rip) +
+             " tid=" + std::to_string(GetCurrentThreadId()) +
+             " trips=" + std::to_string((int)InterlockedCompareExchange(&g_watchTrips, 0, 0)));
+        uintptr_t ret = 0;
+        if (SafeQword(c->Rsp, &ret)) Diag("  ret=" + NameForCodeAddr(ret));
+        Diag("  rax=" + Hex(c->Rax) + " rbx=" + Hex(c->Rbx) + " rcx=" + Hex(c->Rcx) +
+             " rdx=" + Hex(c->Rdx) + " rsi=" + Hex(c->Rsi) + " rdi=" + Hex(c->Rdi) +
+             " r8=" + Hex(c->R8) + " rbp=" + Hex(c->Rbp) + " rsp=" + Hex(c->Rsp));
+        DiagGuestBacktrace("watch");
+    }
+}
+
+// This handler dereferences pointers it deliberately does not trust; SafeQword
+// guards those reads with __try, but a guarded read that faults still raises a
+// REAL exception, and a vectored handler is called for every exception in the
+// process -- including our own probes. Unguarded, the observer re-enters itself,
+// logs a second "fault" at its own address, burns the log budget, and (in the
+// launcher) reaches the Bed_exit path below and ends the guest session naming
+// OUR probe as the crash instead of the one that actually happened. Re-entry is
+// therefore made invisible: straight back to the __except that was already
+// standing by to handle it.
+static DWORD g_vehTls = TLS_OUT_OF_INDEXES;
+static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep);
+
 static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
 {
+    if (g_vehTls == TLS_OUT_OF_INDEXES) g_vehTls = TlsAlloc();
+    if (g_vehTls == TLS_OUT_OF_INDEXES) return CrashObserverVehInner(ep);
+    if (TlsGetValue(g_vehTls)) return EXCEPTION_CONTINUE_SEARCH;   // our own probe
+    TlsSetValue(g_vehTls, (void*)1);
+    LONG r = CrashObserverVehInner(ep);
+    TlsSetValue(g_vehTls, nullptr);        // Bed_exit below never returns: that
+    return r;                              // thread is leaving anyway.
+}
+
+static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
+{
     DWORD code = ep->ExceptionRecord->ExceptionCode;
+    // #139 watchpoint plumbing. Both arms must run before the "genuine faults
+    // only" filter further down, which would otherwise drop a debug exception on
+    // the floor. Neither changes any control flow the guest can observe.
+    if (code == GH_WATCH_ARM_CODE){
+        // Writing the debug registers into the CONTEXT the kernel is about to
+        // restore is the dependable way to arm the CURRENT thread; CONTEXT_DEBUG_
+        // REGISTERS must be in ContextFlags or the Dr writes are dropped on resume.
+        ep->ContextRecord->ContextFlags |= CONTEXT_DEBUG_REGISTERS;
+        ep->ContextRecord->Dr0 = (DWORD64)g_watchAddr[0];
+        ep->ContextRecord->Dr1 = (DWORD64)g_watchAddr[1];
+        ep->ContextRecord->Dr2 = (DWORD64)g_watchAddr[2];
+        ep->ContextRecord->Dr3 = (DWORD64)g_watchAddr[3];
+        ep->ContextRecord->Dr6 = 0;
+        ep->ContextRecord->Dr7 = GhWatchDr7();
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (code == (DWORD)EXCEPTION_SINGLE_STEP && (ep->ContextRecord->Dr6 & 0xF)){
+        GhWatchReport(ep);
+        ep->ContextRecord->ContextFlags |= CONTEXT_DEBUG_REGISTERS;
+        ep->ContextRecord->Dr6 = 0;
+        // RF suppresses the breakpoint for exactly one instruction. Without it
+        // an EXECUTION breakpoint re-arms before its own instruction retires and
+        // the thread spins on the trap forever.
+        ep->ContextRecord->EFlags |= 0x10000;
+        // Enough evidence beats a flood.
+        if (InterlockedCompareExchange(&g_watchHits, 0, 0) > 6)
+            ep->ContextRecord->Dr7 = 0;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     // Our own tracepoints come through here first. Check them before the fault
     // filter below, which would otherwise drop EXCEPTION_BREAKPOINT on the floor
     // as "a debug exception, not a genuine fault".
@@ -5668,6 +7736,58 @@ static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
         code != EXCEPTION_PRIV_INSTRUCTION && code != EXCEPTION_IN_PAGE_ERROR &&
         code != 0xC0000409 /*STACK_BUFFER_OVERRUN/fastfail*/)
         return EXCEPTION_CONTINUE_SEARCH;
+    // #140. The console's display UMD faults writing a page inside its own heap
+    // that is RESERVED and never COMMITTED -- something failed a commit and the
+    // driver never checked. Commit it here and let the write retry. Either answer
+    // is the answer: if the commit succeeds the run continues and a missing commit
+    // was the whole story; if it fails, GetLastError names why (a UWP memory cap
+    // being the obvious candidate). Deliberately narrow -- private, reserved,
+    // PAGE_READWRITE, a write fault, and a fixed budget -- so it can never turn a
+    // real wild pointer into silently corrupted memory.
+    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2 &&
+        ep->ExceptionRecord->ExceptionInformation[0] == 1){
+        uintptr_t tgt = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery((LPCVOID)tgt, &mbi, sizeof mbi) == sizeof mbi &&
+            mbi.State == MEM_RESERVE && mbi.Type == MEM_PRIVATE &&
+            mbi.AllocationProtect == PAGE_READWRITE){
+            LONG n = InterlockedIncrement(&g_commitRepairs);
+            SIZE_T want = mbi.RegionSize > (16u << 20) ? (SIZE_T)(16u << 20) : mbi.RegionSize;
+            void* got = (n <= 256)
+                      ? VirtualAlloc(mbi.BaseAddress, want, MEM_COMMIT, PAGE_READWRITE)
+                      : nullptr;
+            if (n <= 8 || !got){
+                Diag("COMMIT REPAIR #" + std::to_string((int)n) + " at=" + Hex((uint64_t)tgt) +
+                     " base=" + Hex((uint64_t)(uintptr_t)mbi.BaseAddress) +
+                     " bytes=" + Hex((uint64_t)want) +
+                     (got ? std::string(" ok") : " FAILED err=" + Hex(GetLastError())));
+                MEMORYSTATUSEX ms{}; ms.dwLength = sizeof ms;
+                if (GlobalMemoryStatusEx(&ms))
+                    Diag("  mem load=" + std::to_string((int)ms.dwMemoryLoad) +
+                         "% availphys=" + Hex((uint64_t)ms.ullAvailPhys) +
+                         " totalphys=" + Hex((uint64_t)ms.ullTotalPhys) +
+                         " availvirt=" + Hex((uint64_t)ms.ullAvailVirtual) +
+                         " availpage=" + Hex((uint64_t)ms.ullAvailPageFile));
+            }
+            if (got) return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        // The other shape: the target is not even reserved. Map it and continue,
+        // purely to learn which it is -- a mapping that should exist and does not
+        // (the run carries on) or a wild pointer (it faults again immediately,
+        // somewhere else). Same fixed budget; every one of these is logged.
+        else if (mbi.State == MEM_FREE && tgt >= 0x10000){   // never map the null page
+            LONG n = InterlockedIncrement(&g_commitRepairs);
+            uintptr_t base = tgt & ~(uintptr_t)0xFFFF;      // allocation granularity
+            SIZE_T want = mbi.RegionSize < (SIZE_T)(1u << 20) ? mbi.RegionSize : (SIZE_T)(1u << 20);
+            void* got = (n <= 256) ? VirtualAlloc((LPVOID)base, want,
+                                                  MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+                                   : nullptr;
+            Diag("MAP REPAIR #" + std::to_string((int)n) + " at=" + Hex((uint64_t)tgt) +
+                 " base=" + Hex((uint64_t)base) + " bytes=" + Hex((uint64_t)want) +
+                 (got ? std::string(" ok") : " FAILED err=" + Hex(GetLastError())));
+            if (got) return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
     if (InterlockedIncrement(&g_vehLogged) > 4) return EXCEPTION_CONTINUE_SEARCH;
 
     void* addr = ep->ExceptionRecord->ExceptionAddress;
@@ -5709,6 +7829,27 @@ static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
         line += Hex((uint64_t)p[1]);
     }
     Diag(line);
+    // What IS the address it faulted on? MEM_FREE says the pointer is garbage or
+    // the mapping is already gone; MEM_RESERVE says something reserved the range
+    // and never committed it; MEM_COMMIT with a read-only or NOACCESS protection
+    // says the mapping exists but this access was never granted. One VirtualQuery
+    // separates three very different bugs that all present as the same AV.
+    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2){
+        uintptr_t tgt = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery((LPCVOID)tgt, &mbi, sizeof mbi) == sizeof mbi)
+            Diag("  target=" + Hex((uint64_t)tgt) +
+                 " base=" + Hex((uint64_t)(uintptr_t)mbi.BaseAddress) +
+                 " alloc=" + Hex((uint64_t)(uintptr_t)mbi.AllocationBase) +
+                 " size=" + Hex((uint64_t)mbi.RegionSize) +
+                 " state=" + Hex((uint32_t)mbi.State) +
+                 " prot=" + Hex((uint32_t)mbi.Protect) +
+                 " allocprot=" + Hex((uint32_t)mbi.AllocationProtect) +
+                 " type=" + Hex((uint32_t)mbi.Type));
+        else
+            Diag("  target=" + Hex((uint64_t)tgt) +
+                 " VirtualQuery failed err=" + Hex(GetLastError()));
+    }
     CONTEXT* c = ep->ContextRecord;
     Diag("  rax=" + Hex(c->Rax) + " rbx=" + Hex(c->Rbx) + " rcx=" + Hex(c->Rcx) +
          " rdx=" + Hex(c->Rdx));
@@ -5721,6 +7862,39 @@ static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
     __try { ret = *(uintptr_t*)c->Rsp; }
     __except (EXCEPTION_EXECUTE_HANDLER) { ret = 0; }
     Diag("  ret=" + NameForCodeAddr(ret));
+    // The first four integer-argument registers usually point at something that
+    // names the call: a COM object (whose first qword is its vtable), an IID, or
+    // an out-parameter. Sixteen bytes of each is enough to read an IID straight
+    // out of the log, and an all-zero or wild first qword is what a dead object
+    // looks like. Reads are guarded -- these pointers are exactly the ones we
+    // already know not to trust.
+    {
+        const struct { const char* n; uintptr_t v; } kArgs[] = {
+            {"rcx", c->Rcx}, {"rdx", c->Rdx}, {"r8", c->R8}, {"r9", c->R9},
+        };
+        // The faulting address is already known to be unreadable -- probing it
+        // again only manufactures a second exception.
+        uintptr_t bad = (code == EXCEPTION_ACCESS_VIOLATION &&
+                         ep->ExceptionRecord->NumberParameters >= 2)
+                      ? (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1] : 0;
+        for (auto& a : kArgs){
+            if (a.v < 0x10000) continue;
+            if (bad && (a.v >> 12) == (bad >> 12)){
+                Diag(std::string("  [") + a.n + "] is the faulting address");
+                continue;
+            }
+            uintptr_t lo = 0, hi = 0;
+            if (!SafeQword(a.v, &lo)) { Diag(std::string("  [") + a.n + "] unreadable"); continue; }
+            SafeQword(a.v + 8, &hi);
+            std::string extra;
+            // A vtable pointer lands in a module; an IID does not. Naming it when
+            // it does is what turns this dump into "which proxy object is this".
+            std::string sym = NameForCodeAddr(lo);
+            if (sym.find('+') != std::string::npos) extra = " -> " + sym;
+            Diag(std::string("  [") + a.n + "]=" + Hex((uint64_t)lo) + " " + Hex((uint64_t)hi) + extra);
+        }
+    }
+    GhAdapterAudit("VEH");
     DiagGuestBacktrace("VEH");
 #ifdef GH_LAUNCHER
     // Dedicated slots still let the game's handler run (it may print a Unity
@@ -5779,6 +7953,25 @@ static void SnapshotHostThreads()
     }
     CloseHandle(snap);
     Diag("STAGE=host_thread_snap n=" + std::to_string(g_hostThreadSnap.size()));
+    // #140 is a memory-limit story, and the limit covers the whole container --
+    // guest image, CPU allocations and driver heaps together. Sampling the app's
+    // usage from the moment the guest starts is the only way to see WHERE the
+    // 2.5 GB that is already gone by device-creation time actually goes.
+    {
+        static bool started = false;
+        if (!started){
+            started = true;
+            std::thread([]{
+                for (int i = 0; i < 240 && !g_guestDone; ++i){
+                    GhLogMemoryBudget("sample");
+                    Sleep(3000);
+                }
+            }).detach();
+            // #143. Off its own thread: it writes and dirties gigabytes and must
+            // not stall activation. Opt-in, so an ordinary launch never sees it.
+            std::thread([]{ GhProbeFileBackedArena(); }).detach();
+        }
+    }
 }
 
 static bool IsSnapshottedHostThread(DWORD tid)
@@ -6536,7 +8729,7 @@ static bool MapAndRun32(const std::vector<uint8_t>& file)
 }
 #endif
 
-static bool MapAndRun(const std::vector<uint8_t>& file)
+static bool MapAndRun(std::vector<uint8_t>& file)
 {
 #ifdef GH_LAUNCHER
     if (g_guestImageBase) {
@@ -6592,6 +8785,22 @@ static bool MapAndRun(const std::vector<uint8_t>& file)
     for (int i=0; i<nt->FileHeader.NumberOfSections; ++i){
         if (sec[i].SizeOfRawData)
             std::memcpy(base + sec[i].VirtualAddress, file.data() + sec[i].PointerToRawData, sec[i].SizeOfRawData);
+    }
+
+    // Everything past this point works off the MAPPED image, so the raw file
+    // buffer is dead weight -- and it is not small: Spider-Man's exe is 121 MB,
+    // which the loader was holding for the entire guest session on top of the
+    // 140 MB mapped image. One app-memory budget covers both (#141), so give it
+    // back. The header pointers must move to the copy inside the image first;
+    // nt in particular is read for the entry point, the imports and the reloc
+    // directory long after this line.
+    dos = (IMAGE_DOS_HEADER*)base;
+    nt  = (IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
+    sec = IMAGE_FIRST_SECTION(nt);
+    {
+        const size_t freed = file.size();
+        std::vector<uint8_t>().swap(file);      // clear() alone keeps the capacity
+        Diag("STAGE=guest_file_released bytes=" + Hex((uint64_t)freed));
     }
 
     // Apply base relocations if we didn't land at the preferred base.
@@ -7387,6 +9596,11 @@ static void FinishGuestSession()
     FlushGuestImageOnly();
 #endif
 
+    // Keep whatever the guest wrote to the registry. A crash is exactly when this
+    // matters most: the settings a game chose on the way to dying are the record
+    // of what it thought this machine could do.
+    RegHiveSave();
+
     Diag("EXITCODE=" + std::to_string(g_guestExitCode));
     Diag("CAPTURED_BYTES=" + std::to_string(g_capturedOut.size()));
     static const wchar_t* outPath =
@@ -7900,6 +10114,10 @@ static void RunGuest()
     // (which binds the real export, bypassing our IAT/GPA beds) routes drive-root
     // saves through the VFS. Install now, before any guest DLL (esp. Mono) loads.
     InstallFileHooks();
+    // Restore this guest's own registry first, THEN seed Steam on top: the Steam
+    // cold-client keys are per-run facts (our pid, our install path) and must win
+    // over whatever last run happened to persist.
+    RegHiveLoad();
     // Seed the Steam cold-client registry keys before any guest DLL loads
     // (steamclient64.dll reads HKCU\Software\Valve\Steam\ActiveProcess to init).
     SeedSteamRegistry();
