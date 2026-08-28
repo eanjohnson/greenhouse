@@ -210,6 +210,8 @@ static void InitStdHandles()
     SetStdHandle(STD_INPUT_HANDLE,  g_hIn);
 }
 
+static bool GhLazyMaterialise(const void* addr, SIZE_T size);  // #145 demand-commit; defined with the pager
+
 // Flush a guest's C runtime buffers (shared ucrtbase/msvcrt instances live in
 // our process) before we longjmp out of its exit(), so buffered stdout reaches
 // the sink files.
@@ -246,7 +248,11 @@ static BOOL WINAPI Bed_WriteFile(HANDLE h, LPCVOID buf, DWORD n, LPDWORD wrote, 
         if (wrote) *wrote = n;
         return TRUE;
     }
-    return WriteFile(h, buf, n, wrote, ov);
+    GhLazyMaterialise(buf, n);        // #145: the kernel reads this buffer
+    BOOL ok = WriteFile(h, buf, n, wrote, ov);
+    if (!ok && GetLastError() == ERROR_NOACCESS && GhLazyMaterialise(buf, n))
+        ok = WriteFile(h, buf, n, wrote, ov);
+    return ok;
 }
 static BOOL WINAPI Bed_GetConsoleMode(HANDLE, LPDWORD){ return FALSE; }  // no console
 static BOOL WINAPI Bed_GetConsoleScreenBufferInfo(HANDLE, PCONSOLE_SCREEN_BUFFER_INFO){ return FALSE; }
@@ -302,6 +308,7 @@ static void DiagGuestBacktrace(const char* who);   // defined with the module ra
 static std::string NameForCodeAddr(uintptr_t a);
 static bool HandleGuestTracepoint(EXCEPTION_POINTERS* ep);   // defined with them too
 static void GhLogMemoryBudget(const char* where);            // #140 memory sampling
+static std::string GhLazyStats();                             // #145 demand-commit counters
 extern volatile bool g_guestDone;
 
 // A guest's exit() terminates the guest WORKER THREAD rather than longjmp-ing
@@ -1582,6 +1589,88 @@ static void __cdecl Bed_StartCheckingForUpdates(){}
 static void __cdecl Bed_ForceUpdateNextRestart() {}
 static void* __cdecl Bed_GetClientBootstrapMetrics(){ return nullptr; }
 
+// ---------------------------------------------------------------------------
+// Self-mapped guest DLLs (#146).
+//
+// Some DLLs the OS loader refuses to *initialise* inside the app container:
+// bink2w64.dll answers ERROR_DLL_INIT_FAILED (0x45A) with the file present,
+// every one of its imports binding, and no embedded manifest -- i.e. its
+// DllMain is what fails, not the search. We already own a PE mapper
+// (MapChildImage, built for the CreateProcess surrogate) whose imports bind
+// through our beds, so fall back to it: DllMain then runs against bedded APIs,
+// which both names whichever call the container refuses and, for anything we
+// have a bed for, fixes it.
+//
+// A self-mapped module is not in the OS loader's module list, so the real
+// GetProcAddress cannot see its exports -- we walk the export directory
+// ourselves (Bed_GetProcAddress below), and dedup on it in LoadGuestDll.
+// ---------------------------------------------------------------------------
+struct GhSelfMod { uint8_t* base; std::string name; };
+static std::vector<GhSelfMod> g_selfMods;
+static SRWLOCK                g_selfModLock = SRWLOCK_INIT;
+static HMODULE GhSelfMapDll(const std::wstring& full, const char* dll);   // fwd (needs MapChildImage)
+
+static std::string GhDllBaseName(const char* p)
+{
+    const char* b1 = strrchr(p, '\\'); const char* b2 = strrchr(p, '/');
+    const char* b  = (b1 && b2) ? (b1 > b2 ? b1 : b2) : (b1 ? b1 : b2);
+    std::string n = b ? b + 1 : p;
+    if (n.size() < 4 || _stricmp(n.c_str() + n.size() - 4, ".dll") != 0) n += ".dll";
+    return n;
+}
+static HMODULE GhSelfMapFind(const char* dll)
+{
+    if (!dll || !*dll) return nullptr;
+    std::string want = GhDllBaseName(dll);
+    HMODULE r = nullptr;
+    AcquireSRWLockShared(&g_selfModLock);
+    for (auto& m : g_selfMods) if (0 == _stricmp(m.name.c_str(), want.c_str())){ r = (HMODULE)m.base; break; }
+    ReleaseSRWLockShared(&g_selfModLock);
+    return r;
+}
+static bool GhSelfMapIs(HMODULE h)
+{
+    if (!h) return false;
+    bool r = false;
+    AcquireSRWLockShared(&g_selfModLock);
+    for (auto& m : g_selfMods) if ((HMODULE)m.base == h){ r = true; break; }
+    ReleaseSRWLockShared(&g_selfModLock);
+    return r;
+}
+// Export lookup for a module WE mapped. Handles ordinals and forwarders.
+static FARPROC GhSelfMapExport(HMODULE h, LPCSTR name)
+{
+    if (!GhSelfMapIs(h)) return nullptr;
+    uint8_t* base = (uint8_t*)h;
+    auto* dos = (IMAGE_DOS_HEADER*)base;
+    auto* nt  = (IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
+    auto& d   = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!d.Size) return nullptr;
+    auto* ed  = (IMAGE_EXPORT_DIRECTORY*)(base + d.VirtualAddress);
+    DWORD* fns = (DWORD*)(base + ed->AddressOfFunctions);
+    DWORD  rva = 0;
+    if (!HIWORD(name)){                                        // by ordinal
+        DWORD i = (DWORD)(ULONG_PTR)name - ed->Base;
+        if (i < ed->NumberOfFunctions) rva = fns[i];
+    } else {
+        DWORD* nms = (DWORD*)(base + ed->AddressOfNames);
+        WORD*  ord = (WORD*) (base + ed->AddressOfNameOrdinals);
+        for (DWORD i = 0; i < ed->NumberOfNames; ++i)
+            if (0 == strcmp((const char*)(base + nms[i]), name)){ rva = fns[ord[i]]; break; }
+    }
+    if (!rva) return nullptr;
+    if (rva >= d.VirtualAddress && rva < d.VirtualAddress + d.Size){   // "OTHER.Export"
+        std::string f((const char*)(base + rva));
+        size_t dot = f.find('.');
+        if (dot == std::string::npos) return nullptr;
+        HMODULE fm = LoadGuestDll((f.substr(0, dot) + ".dll").c_str());
+        if (!fm) return nullptr;
+        if (FARPROC fp = GhSelfMapExport(fm, f.c_str() + dot + 1)) return fp;
+        return GetProcAddress(fm, f.c_str() + dot + 1);
+    }
+    return (FARPROC)(base + rva);
+}
+
 static FARPROC WINAPI Bed_GetProcAddress(HMODULE mod, LPCSTR name)
 {
     if (name && HIWORD(name)){                 // by name, not ordinal
@@ -1633,6 +1722,8 @@ static FARPROC WINAPI Bed_GetProcAddress(HMODULE mod, LPCSTR name)
             }
         }
     }
+    // #146: a module we mapped ourselves is invisible to the real loader.
+    if (FARPROC f = GhSelfMapExport(mod, name)) return f;
     return GetProcAddress(mod, name);
 }
 
@@ -4560,6 +4651,7 @@ static void GhLogMemoryBudget(const char* where)
                       " nonlocaluse=" + Hex((uint64_t)vm.CurrentUsage);
         }
     }
+    ln += GhLazyStats();
     Diag(ln);
 }
 
@@ -6691,12 +6783,226 @@ static void GhArenaLog(const std::string& msg)
     if (InterlockedIncrement(&g_arenaLogs) <= 300) Diag("ARENA " + msg);
 }
 
+// ---------------------------------------------------------------------------
+// Demand-commit (#145) -- the other side of the same wall.
+//
+// #143 measured the fact this rests on: VirtualAlloc(1 GB, MEM_COMMIT) charged
+// 1025 MB at the moment of the call, and dirtying every page of it afterwards
+// added 4 KB. The budget is spent when memory is PROMISED, not when it is used,
+// and Spider-Man does not use most of what it is promised -- 3.29 GiB of guest
+// allocations outstanding against an app resident set that grew by ~2.2 GiB,
+// GPU heaps included.
+//
+// So don't commit it. A large MEM_COMMIT into a range the guest already reserved
+// is recorded and answered yes; the range stays reserved. The first touch of any
+// 64 KB granule faults, the VEH commits that granule, and the faulting
+// instruction re-runs. The guest cannot tell: a freshly committed page is zeroed
+// exactly like a real one. Unlike the arena this is ordinary private commit, so
+// there is no 1 GB ceiling on it -- it scales with how much the guest wastes.
+//
+// A per-granule bitmap makes the accounting honest (a second toucher must not
+// count the same granule twice) and is manipulated with lock-free bit-test-and-
+// set, so the fault path holds only the shared lock.
+struct GhLazyRange {
+    uint8_t* base;
+    uint64_t size;
+    DWORD    prot;
+    LONG*    bits;        // one bit per granule, 1 = committed
+};
+static SRWLOCK                  g_lazyLock = SRWLOCK_INIT;
+static std::vector<GhLazyRange> g_lazy;              // sorted by base
+static volatile LONG            g_lazyCount     = 0; // == g_lazy.size(), readable without the lock
+static volatile LONG64          g_lazyPromised  = 0;
+static volatile LONG64          g_lazyCommitted = 0;
+static volatile LONG            g_lazyFaults    = 0;
+static volatile LONG            g_lazyFailed    = 0;
+static volatile LONG            g_lazyNoAccess  = 0; // kernel writes we had to rescue
+static volatile LONG            g_lazyLogs      = 0;
+static bool                     g_lazyOn        = false;
+static uint64_t                 g_lazyGran      = 64u << 10;
+static uint64_t                 g_lazyMin       = 16ull << 20;
+
+static void GhLazyLog(const std::string& m)
+{
+    if (InterlockedIncrement(&g_lazyLogs) <= 200) Diag("LAZY " + m);
+}
+
+static bool GhLazyOn()
+{
+    static bool tried = false;
+    if (!tried){
+        tried    = true;
+        g_lazyOn = GhCfgNum(L"gh_lazy_mb.txt", "GH_LAZY_MB", 0) != 0;
+        if (g_lazyOn){
+            unsigned kb = GhCfgNum(L"gh_lazy_gran_kb.txt", "GH_LAZY_GRAN_KB", 64);
+            if (kb < 4) kb = 4;
+            uint64_t g = 4096;
+            while (g < ((uint64_t)kb << 10)) g <<= 1;      // round up to a power of two
+            g_lazyGran = g;
+            g_lazyMin  = (uint64_t)GhCfgNum(L"gh_lazy_min_mb.txt", "GH_LAZY_MIN_MB", 16) << 20;
+            Diag("LAZY on gran=" + Hex(g_lazyGran) + " min=" + Hex(g_lazyMin));
+        } else {
+            Diag("LAZY off (no gh_lazy_mb.txt)");
+        }
+    }
+    return g_lazyOn;
+}
+
+// Records a range as promised-but-not-committed. Caller must have satisfied
+// itself that the whole span is reserved and uncommitted.
+static bool GhLazyAdd(uint8_t* base, uint64_t size, DWORD prot)
+{
+    uint64_t grans = (size + g_lazyGran - 1) / g_lazyGran;
+    LONG*    bits  = new LONG[(grans + 31) / 32]();
+    bool     added = false;
+    AcquireSRWLockExclusive(&g_lazyLock);
+    // Ranges must not overlap. GhLazyLocate binary-searches for the last range
+    // at or below the address, so an address inside an earlier overlapping range
+    // would simply not be found -- and a fault we fail to answer is a crash.
+    bool clash = false;
+    for (auto& x : g_lazy)
+        if (base < x.base + x.size && x.base < base + size){ clash = true; break; }
+    if (!clash){
+        auto at = std::lower_bound(g_lazy.begin(), g_lazy.end(), base,
+                                   [](const GhLazyRange& x, uint8_t* b){ return x.base < b; });
+        g_lazy.insert(at, GhLazyRange{ base, size, prot ? prot : PAGE_READWRITE, bits });
+        InterlockedExchange(&g_lazyCount, (LONG)g_lazy.size());
+        added = true;
+    }
+    ReleaseSRWLockExclusive(&g_lazyLock);
+    if (!added){ delete[] bits; return false; }
+    InterlockedExchangeAdd64(&g_lazyPromised, (LONG64)size);
+    return true;
+}
+
+// caller holds the lock (either mode). Returns the range containing p, or null.
+static GhLazyRange* GhLazyLocate(const void* p)
+{
+    if (g_lazy.empty()) return nullptr;
+    auto it = std::upper_bound(g_lazy.begin(), g_lazy.end(), (uint8_t*)p,
+                               [](uint8_t* b, const GhLazyRange& x){ return b < x.base; });
+    if (it == g_lazy.begin()) return nullptr;
+    --it;
+    if ((const uint8_t*)p >= it->base && (const uint8_t*)p < it->base + it->size) return &*it;
+    return nullptr;
+}
+
+// The fault path. Must not allocate, must not log, must not recurse.
+static bool GhLazyFault(void* addr)
+{
+    if (InterlockedCompareExchange(&g_lazyCount, 0, 0) == 0) return false;
+    uint8_t* base = nullptr; uint64_t gsize = 0; DWORD prot = 0; LONG bit = 0; LONG* bits = nullptr;
+    AcquireSRWLockShared(&g_lazyLock);
+    if (GhLazyRange* r = GhLazyLocate(addr)){
+        uint64_t off = (uint64_t)((uint8_t*)addr - r->base) & ~(g_lazyGran - 1);
+        base  = r->base + off;
+        gsize = (r->size - off < g_lazyGran) ? (r->size - off) : g_lazyGran;
+        prot  = r->prot;
+        bits  = r->bits;
+        bit   = (LONG)(off / g_lazyGran);
+    }
+    ReleaseSRWLockShared(&g_lazyLock);
+    if (!base) return false;
+    // Claim the granule first. Losing the race is harmless -- committing an
+    // already-committed page succeeds -- it only means we must not count it.
+    bool first = !_interlockedbittestandset(bits, bit);
+    if (!VirtualAlloc(base, (SIZE_T)gsize, MEM_COMMIT, prot)){
+        InterlockedIncrement(&g_lazyFailed);
+        return false;                       // genuinely out of memory: report it honestly
+    }
+    if (first) InterlockedExchangeAdd64(&g_lazyCommitted, (LONG64)gsize);
+    InterlockedIncrement(&g_lazyFaults);
+    return true;
+}
+
+// Commit every granule a range touches, for the callers that cannot take a
+// fault: VirtualProtect (which refuses uncommitted pages) and any API where the
+// KERNEL writes into the buffer, which fails with ERROR_NOACCESS rather than
+// raising something our VEH can catch.
+static bool GhLazyMaterialise(const void* addr, SIZE_T size)
+{
+    if (InterlockedCompareExchange(&g_lazyCount, 0, 0) == 0 || !addr || !size) return false;
+    uint8_t* lo = (uint8_t*)addr;
+    uint8_t* hi = lo + size;
+    bool did = false;
+    AcquireSRWLockShared(&g_lazyLock);
+    for (auto& r : g_lazy){
+        uint8_t* a = r.base > lo ? r.base : lo;
+        uint8_t* b = (r.base + r.size) < hi ? (r.base + r.size) : hi;
+        if (a >= b) continue;
+        uint64_t from = (uint64_t)(a - r.base) & ~(g_lazyGran - 1);
+        uint64_t to   = ((uint64_t)(b - r.base) + g_lazyGran - 1) & ~(g_lazyGran - 1);
+        if (to > r.size) to = r.size;
+        if (!VirtualAlloc(r.base + from, (SIZE_T)(to - from), MEM_COMMIT, r.prot)) continue;
+        for (uint64_t o = from; o < to; o += g_lazyGran)
+            if (!_interlockedbittestandset(r.bits, (LONG)(o / g_lazyGran))){
+                uint64_t g = (r.size - o < g_lazyGran) ? (r.size - o) : g_lazyGran;
+                InterlockedExchangeAdd64(&g_lazyCommitted, (LONG64)g);
+            }
+        did = true;
+    }
+    ReleaseSRWLockShared(&g_lazyLock);
+    return did;
+}
+
+// True if the address is inside a lazy range; fills the recorded protection.
+static bool GhLazyFind(const void* p, DWORD* prot)
+{
+    if (InterlockedCompareExchange(&g_lazyCount, 0, 0) == 0) return false;
+    bool hit = false;
+    AcquireSRWLockShared(&g_lazyLock);
+    if (GhLazyRange* r = GhLazyLocate(p)){ if (prot) *prot = r->prot; hit = true; }
+    ReleaseSRWLockShared(&g_lazyLock);
+    return hit;
+}
+
+// The guest is giving the range back. Forget it; the real VirtualFree that
+// follows releases whatever granules were actually committed.
+static void GhLazyDrop(const void* base, bool release)
+{
+    if (InterlockedCompareExchange(&g_lazyCount, 0, 0) == 0) return;
+    AcquireSRWLockExclusive(&g_lazyLock);
+    for (size_t i = 0; i < g_lazy.size(); ++i){
+        if (g_lazy[i].base != (const uint8_t*)base) continue;
+        if (release){
+            delete[] g_lazy[i].bits;
+            InterlockedExchangeAdd64(&g_lazyPromised, -(LONG64)g_lazy[i].size);
+            g_lazy.erase(g_lazy.begin() + i);
+            InterlockedExchange(&g_lazyCount, (LONG)g_lazy.size());
+        }
+        break;
+    }
+    ReleaseSRWLockExclusive(&g_lazyLock);
+}
+
+static std::string GhLazyStats()
+{
+    if (InterlockedCompareExchange(&g_lazyCount, 0, 0) == 0 && !g_lazyOn) return std::string();
+    LONG64 promised  = InterlockedCompareExchange64(&g_lazyPromised, 0, 0);
+    LONG64 committed = InterlockedCompareExchange64(&g_lazyCommitted, 0, 0);
+    return " lazypromised=" + Hex((uint64_t)promised) +
+           " lazycommitted=" + Hex((uint64_t)committed) +
+           " lazysaved=" + Hex((uint64_t)(promised > committed ? promised - committed : 0)) +
+           " lazyfaults=" + std::to_string((long)InterlockedCompareExchange(&g_lazyFaults, 0, 0)) +
+           " lazyfailed=" + std::to_string((long)InterlockedCompareExchange(&g_lazyFailed, 0, 0)) +
+           " lazynoaccess=" + std::to_string((long)InterlockedCompareExchange(&g_lazyNoAccess, 0, 0));
+}
+
 // The guest asked for private commit and must be told it has private commit.
 // MEM_MAPPED is the truth about our arena, not about its allocation, and an
 // allocator that checks Type would reject its own memory.
 static SIZE_T WINAPI Bed_VirtualQuery(LPCVOID addr, PMEMORY_BASIC_INFORMATION mbi, SIZE_T len)
 {
     SIZE_T r = VirtualQuery(addr, mbi, len);
+    // #145. A demand-commit range really is MEM_RESERVE until something touches
+    // it; the guest was told it owns committed memory and must keep believing it.
+    if (r && mbi && len >= sizeof(MEMORY_BASIC_INFORMATION) && mbi->State == MEM_RESERVE){
+        DWORD prot = 0;
+        if (GhLazyFind(addr, &prot)){
+            mbi->State   = MEM_COMMIT;
+            mbi->Protect = prot;
+        }
+    }
     if (r && mbi && len >= sizeof(MEMORY_BASIC_INFORMATION) && mbi->Type == MEM_MAPPED){
         std::lock_guard<std::mutex> lk(g_arenaMx);
         void* b = nullptr; SIZE_T sz = 0;
@@ -6754,6 +7060,36 @@ static LPVOID WINAPI Bed_VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWOR
                        " freetot=" + Hex(freeTot) + " freemax=" + Hex(freeMax) + " -> real reserve");
         }
     }
+    // #145 demand-commit. Answer a big MEM_COMMIT with a promise instead of
+    // memory. Only when the whole span is one reserved, uncommitted region --
+    // shadowing memory that is already live would be a silent corruption, and
+    // the VirtualQuery costs nothing next to the allocation being skipped.
+    if (addr && (type & MEM_COMMIT) && !(type & MEM_RESERVE) && GhLazyOn() && size >= g_lazyMin){
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(addr, &mbi, sizeof mbi) == sizeof mbi &&
+            mbi.State == MEM_RESERVE &&
+            (uint8_t*)addr + size <= (uint8_t*)mbi.BaseAddress + mbi.RegionSize){
+            if (GhLazyAdd((uint8_t*)addr, (uint64_t)size, prot)){
+            GhLazyLog("promise addr=" + Hex((uint64_t)(uintptr_t)addr) + " size=" + Hex((uint64_t)size) +
+                      " prot=" + Hex((uint32_t)prot) +
+                      " from=" + NameForCodeAddr((uintptr_t)_ReturnAddress()));
+            return addr;
+            }
+        }
+    }
+    // Reserve-and-commit in one call: take the reservation for real, promise the
+    // commit. The guest gets an address it can use either way.
+    if ((type & MEM_COMMIT) && (type & MEM_RESERVE) && GhLazyOn() && size >= g_lazyMin){
+        if (LPVOID q = VirtualAlloc(addr, size, type & ~(DWORD)MEM_COMMIT, PAGE_READWRITE)){
+            if (!GhLazyAdd((uint8_t*)q, (uint64_t)size, prot))
+                return VirtualAlloc(q, size, MEM_COMMIT, prot);   // overlap: do it for real
+            GhLazyLog("promise+reserve addr=" + Hex((uint64_t)(uintptr_t)q) + " size=" + Hex((uint64_t)size) +
+                      " prot=" + Hex((uint32_t)prot) +
+                      " from=" + NameForCodeAddr((uintptr_t)_ReturnAddress()));
+            return q;
+        }
+    }
+
     LPVOID p = VirtualAlloc(addr, size, type, prot);
     // Only MEM_COMMIT spends the app budget; a reservation is address space.
     if (p && size >= kBigAlloc && (type & MEM_COMMIT)){
@@ -6786,6 +7122,9 @@ static BOOL WINAPI Bed_VirtualFree(LPVOID addr, SIZE_T size, DWORD type)
             if (GhArenaFind(addr, &b, &sz)) return TRUE;
         }
     }
+    // #145. Drop the promise before the real free; what was actually committed
+    // is ordinary private commit and VirtualFree handles it normally.
+    if (type & (MEM_RELEASE | MEM_DECOMMIT)) GhLazyDrop(addr, (type & MEM_RELEASE) != 0);
     size_t known = 0;
     {
         std::lock_guard<std::mutex> lk(g_bigAllocMx);
@@ -6795,6 +7134,45 @@ static BOOL WINAPI Bed_VirtualFree(LPVOID addr, SIZE_T size, DWORD type)
     BOOL ok = VirtualFree(addr, size, type);
     if (ok && known)
         NoteBigAlloc("VirtualFree", addr, known, type, 0, (uintptr_t)_ReturnAddress(), true);
+    return ok;
+}
+
+// VirtualProtect refuses a range that is not fully committed, so a demand-commit
+// range has to be materialised before it can be re-protected.
+static BOOL WINAPI Bed_VirtualProtect(LPVOID addr, SIZE_T size, DWORD prot, PDWORD old)
+{
+    GhLazyMaterialise(addr, size);
+    return VirtualProtect(addr, size, prot, old);
+}
+
+// The kernel writing into a page nothing has touched yet does NOT raise anything
+// our VEH can catch -- it fails the call with ERROR_NOACCESS. A streaming engine
+// reading assets straight into its pool is exactly this case. Materialise the
+// buffer up front, and keep a retry as the safety net: if some other API turns
+// out to do the same thing, the log names it instead of corrupting silently.
+static BOOL WINAPI Bed_ReadFile(HANDLE h, LPVOID buf, DWORD n, LPDWORD got, LPOVERLAPPED ov)
+{
+    GhLazyMaterialise(buf, n);
+    BOOL ok = ReadFile(h, buf, n, got, ov);
+    if (!ok && GetLastError() == ERROR_NOACCESS && GhLazyMaterialise(buf, n)){
+        InterlockedIncrement(&g_lazyNoAccess);
+        GhLazyLog("ReadFile ERROR_NOACCESS rescued buf=" + Hex((uint64_t)(uintptr_t)buf) +
+                  " n=" + Hex((uint64_t)n));
+        ok = ReadFile(h, buf, n, got, ov);
+    }
+    return ok;
+}
+
+static BOOL WINAPI Bed_ReadFileEx(HANDLE h, LPVOID buf, DWORD n, LPOVERLAPPED ov,
+                                  LPOVERLAPPED_COMPLETION_ROUTINE cr)
+{
+    GhLazyMaterialise(buf, n);
+    BOOL ok = ReadFileEx(h, buf, n, ov, cr);
+    if (!ok && GetLastError() == ERROR_NOACCESS && GhLazyMaterialise(buf, n)){
+        InterlockedIncrement(&g_lazyNoAccess);
+        GhLazyLog("ReadFileEx ERROR_NOACCESS rescued buf=" + Hex((uint64_t)(uintptr_t)buf));
+        ok = ReadFileEx(h, buf, n, ov, cr);
+    }
     return ok;
 }
 
@@ -6959,6 +7337,9 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"VirtualAlloc",       (void*)&Bed_VirtualAlloc},
         {"VirtualFree",        (void*)&Bed_VirtualFree},
         {"VirtualQuery",       (void*)&Bed_VirtualQuery},
+        {"VirtualProtect",     (void*)&Bed_VirtualProtect},
+        {"ReadFile",           (void*)&Bed_ReadFile},
+        {"ReadFileEx",         (void*)&Bed_ReadFileEx},
         {"HeapCreate",         (void*)&Bed_HeapCreate},
         {"GlobalMemoryStatusEx", (void*)&Bed_GlobalMemoryStatusEx},
         {"GlobalMemoryStatus",   (void*)&Bed_GlobalMemoryStatus},
@@ -7219,6 +7600,9 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"VirtualAlloc",       (void*)&Bed_VirtualAlloc},
         {"VirtualFree",        (void*)&Bed_VirtualFree},
         {"VirtualQuery",       (void*)&Bed_VirtualQuery},
+        {"VirtualProtect",     (void*)&Bed_VirtualProtect},
+        {"ReadFile",           (void*)&Bed_ReadFile},
+        {"ReadFileEx",         (void*)&Bed_ReadFileEx},
         {"HeapCreate",         (void*)&Bed_HeapCreate},
         {"GlobalMemoryStatusEx", (void*)&Bed_GlobalMemoryStatusEx},
         {"GlobalMemoryStatus",   (void*)&Bed_GlobalMemoryStatus},
@@ -7366,10 +7750,88 @@ static bool GuestDllDenied(const char* dll)
     return false;
 }
 
+// Why did LoadLibrary refuse this DLL? Windows only ever says MOD_NOT_FOUND or
+// PROC_NOT_FOUND, never which module or which proc, and inside this container
+// that is the difference between a five-minute fix and a day of guessing.
+//
+// This used to map the file with LOAD_LIBRARY_AS_IMAGE_RESOURCE|AS_DATAFILE and
+// read RVAs straight off it. Combining those two flags gives the RAW file
+// layout, not the section-aligned one, so the import directory RVA landed in the
+// middle of nothing, the very first descriptor read as zero, and the walk exited
+// having printed not one line -- which is exactly what bink2w64.dll produced.
+// Read the bytes and do the RVA arithmetic honestly instead.
+static void ReportWhyDllFailed(const char* dll, const std::wstring& full)
+{
+    std::vector<uint8_t> f;
+    if (!ReadWholeFile(full, f, true) || f.size() < 0x200){
+        Diag(std::string("  WHY ") + dll + ": cannot read the file at all");
+        return;
+    }
+    auto* dos = (IMAGE_DOS_HEADER*)f.data();
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || (size_t)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > f.size()){
+        Diag(std::string("  WHY ") + dll + ": not a PE"); return;
+    }
+    auto* nt = (IMAGE_NT_HEADERS64*)(f.data() + dos->e_lfanew);
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    const WORD nsec = nt->FileHeader.NumberOfSections;
+    auto rva2off = [&](DWORD rva) -> const uint8_t* {
+        for (WORD i = 0; i < nsec; ++i){
+            DWORD va = sec[i].VirtualAddress;
+            DWORD sz = sec[i].Misc.VirtualSize ? sec[i].Misc.VirtualSize : sec[i].SizeOfRawData;
+            if (rva >= va && rva < va + sz){
+                size_t off = (size_t)sec[i].PointerToRawData + (rva - va);
+                return off < f.size() ? f.data() + off : nullptr;
+            }
+        }
+        return nullptr;
+    };
+    auto& idir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    auto* imp = (const IMAGE_IMPORT_DESCRIPTOR*)rva2off(idir.VirtualAddress);
+    if (!imp){ Diag(std::string("  WHY ") + dll + ": no import directory"); return; }
+    int reported = 0;
+    for (; imp->Name && reported < 24; ++imp){
+        auto* nm = (const char*)rva2off(imp->Name);
+        if (!nm) break;
+        HMODULE dep = GetModuleHandleA(nm);
+        bool already = dep != nullptr;
+        if (!dep) dep = LoadLibraryA(nm);
+        if (!dep){
+            Diag(std::string("  DEP ") + nm + " CANNOT LOAD err=" + Hex(GetLastError()));
+            ++reported;
+            continue;
+        }
+        auto* oft = (const IMAGE_THUNK_DATA64*)rva2off(
+            imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk);
+        int miss = 0, total = 0;
+        std::string firstFew;
+        for (; oft && oft->u1.AddressOfData && reported < 24; ++oft){
+            ++total;
+            bool ok;
+            std::string what;
+            if (IMAGE_SNAP_BY_ORDINAL64(oft->u1.Ordinal)){
+                WORD ord = (WORD)(oft->u1.Ordinal & 0xFFFF);
+                ok = GetProcAddress(dep, (LPCSTR)(uintptr_t)ord) != nullptr;
+                what = "#" + std::to_string((unsigned)ord);
+            } else {
+                auto* ibn = (const IMAGE_IMPORT_BY_NAME*)rva2off((DWORD)oft->u1.AddressOfData);
+                if (!ibn) break;
+                ok = GetProcAddress(dep, ibn->Name) != nullptr;
+                what = ibn->Name;
+            }
+            if (!ok){ ++miss; if (miss <= 6){ firstFew += (firstFew.empty() ? "" : " "); firstFew += what; } }
+        }
+        Diag(std::string("  DEP ") + nm + (already ? " (resident)" : " (loaded)") +
+             " imports=" + std::to_string(total) + " missing=" + std::to_string(miss) +
+             (miss ? " -> " + firstFew : std::string()));
+        if (miss) ++reported;
+    }
+}
+
 static HMODULE LoadGuestDll(const char* dll)
 {
     if (GuestDllDenied(dll)){ SetLastError(ERROR_MOD_NOT_FOUND); return nullptr; }
     if (HMODULE m = GetModuleHandleA(dll)) return m;
+    if (HMODULE sm = GhSelfMapFind(dll)) return sm;      // #146: mapped by us, not by the loader
     // SINGLETON FIX (2026-08-03): basename lookup too — a full-path request like
     // "E:\...\Plugins\x86_64\steam_api64.dll" must not bypass the already-loaded
     // module (see Bed_LoadLibraryExW note). Covers the LoadLibraryA/W beds.
@@ -7421,54 +7883,44 @@ static HMODULE LoadGuestDll(const char* dll)
     // LOAD_WITH_ALTERED_SEARCH_PATH so the DLL's OWN dependencies resolve from
     // its own directory (mono's EmbedRuntime\ has MonoPosixHelper.dll etc.).
     HMODULE m = LoadLibraryExW(full.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    DWORD e1 = m ? 0 : GetLastError();
+    // The bare-name fallback below is a LAST resort, and it overwrites the error
+    // from the attempt that actually mattered -- which is how bink2w64.dll spent
+    // two rounds looking like ERROR_MOD_NOT_FOUND when that was just the
+    // fallback failing to find "bink2w64.dll" on the default search path.
+    // Report every attempt separately, and try the search-flag forms a packaged
+    // app is actually supposed to use before giving up.
+    DWORD e2 = 0, e3 = 0, attrs = 0;
+    if (!m){
+        attrs = GetFileAttributesW(full.c_str());
+        m  = LoadLibraryExW(full.c_str(), nullptr,
+                            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        e2 = m ? 0 : GetLastError();
+        if (!m){ m = LoadLibraryW(full.c_str()); e3 = m ? 0 : GetLastError(); }
+        Diag("  GUESTDLL attempts " + std::string(full.begin(), full.end()) +
+             " attrs=" + Hex((uint32_t)attrs) +
+             " altered=" + Hex((uint32_t)e1) + " searchdirs=" + Hex((uint32_t)e2) +
+             " plain=" + Hex((uint32_t)e3) + (m ? " -> RECOVERED" : ""));
+    }
     if (!m && !isAbs) m = LoadLibraryA(dll);   // last resort: normal search by bare name
+    // #146: the loader found the file and bound every import, then the DLL's own
+    // DllMain refused (ERROR_DLL_INIT_FAILED) -- bink2w64.dll does exactly this in
+    // the app container. Map it ourselves so DllMain runs against our beds.
+    if (!m && GetFileAttributesW(full.c_str()) != INVALID_FILE_ATTRIBUTES &&
+        GhCfgNum(L"gh_selfmap.txt", "GH_SELFMAP", 1)){
+        if (HMODULE sm = GhSelfMapDll(full, dll)){
+            Diag(std::string("GUESTDLL self-mapped ") + dll + " -> " + Hex((uintptr_t)sm));
+            RepublishGuestTls(dll);
+            return sm;
+        }
+    }
     Diag(std::string(m ? "GUESTDLL loaded " : "GUESTDLL FAILED ") + dll +
          (m ? "" : " err=" + Hex(GetLastError())));
     // A loaded module may have brought its own TLS directory with it, in which
     // case ntdll just replaced our array. Put our slot back before the guest
     // touches a thread-local again.
     if (m) RepublishGuestTls(dll);
-    if (!m){
-        // Load the DLL as a plain file (no dep resolution) and walk its imports
-        // ourselves to pinpoint the SPECIFIC procedure Windows can't resolve.
-        // Windows just says PROC_NOT_FOUND without telling us which.
-        HMODULE data = LoadLibraryExW(full.c_str(), nullptr,
-            LOAD_LIBRARY_AS_IMAGE_RESOURCE | LOAD_LIBRARY_AS_DATAFILE);
-        Diag(std::string("  file-only load: ") + (data ? "OK" : "FAIL"));
-        if (data){
-            // LOAD_LIBRARY_AS_IMAGE_RESOURCE lays sections out as if loaded (RVAs
-            // work directly); the handle has LSB=2 marker, mask off low bits.
-            auto* base = (uint8_t*)((uintptr_t)data & ~(uintptr_t)3);
-            auto* dos = (IMAGE_DOS_HEADER*)base;
-            auto* nt  = (IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
-            auto& idir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-            auto* imp = (IMAGE_IMPORT_DESCRIPTOR*)(base + idir.VirtualAddress);
-            int missing = 0;
-            for (; imp->Name && missing < 8; ++imp){
-                const char* depDll = (const char*)(base + imp->Name);
-                HMODULE dep = GetModuleHandleA(depDll);
-                if (!dep) dep = LoadLibraryA(depDll);
-                if (!dep){ Diag(std::string("  DEP CANT LOAD ") + depDll); continue; }
-                auto* oft = (IMAGE_THUNK_DATA64*)(base + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
-                for (; oft->u1.AddressOfData && missing < 8; ++oft){
-                    if (IMAGE_SNAP_BY_ORDINAL64(oft->u1.Ordinal)){
-                        WORD ord = (WORD)(oft->u1.Ordinal & 0xFFFF);
-                        if (!GetProcAddress(dep, (LPCSTR)(uintptr_t)ord)){
-                            char b[128]; std::snprintf(b, sizeof(b), "  MISSING %s#%u", depDll, (unsigned)ord);
-                            Diag(b); ++missing;
-                        }
-                    } else {
-                        auto* ibn = (IMAGE_IMPORT_BY_NAME*)(base + oft->u1.AddressOfData);
-                        if (!GetProcAddress(dep, ibn->Name)){
-                            Diag(std::string("  MISSING ") + depDll + "!" + ibn->Name);
-                            ++missing;
-                        }
-                    }
-                }
-            }
-            FreeLibrary(data);
-        }
-    }
+    if (!m) ReportWhyDllFailed(dll, full);
     if (m) PatchModuleForGuest(m, dll);      // it acts for the guest: give it the beds
     return m;
 }
@@ -7674,6 +8126,13 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep);
 
 static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
 {
+    // #145 demand-commit, first and cheapest. It has to run ahead of the
+    // reentrancy guard below, or a first touch taken inside one of our own
+    // probes would be handed to the crash reporter as a genuine fault.
+    if (ep->ExceptionRecord->ExceptionCode == (DWORD)EXCEPTION_ACCESS_VIOLATION &&
+        ep->ExceptionRecord->NumberParameters >= 2 &&
+        GhLazyFault((void*)ep->ExceptionRecord->ExceptionInformation[1]))
+        return EXCEPTION_CONTINUE_EXECUTION;
     if (g_vehTls == TLS_OUT_OF_INDEXES) g_vehTls = TlsAlloc();
     if (g_vehTls == TLS_OUT_OF_INDEXES) return CrashObserverVehInner(ep);
     if (TlsGetValue(g_vehTls)) return EXCEPTION_CONTINUE_SEARCH;   // our own probe
@@ -9061,6 +9520,55 @@ static bool MapChildImage(const std::vector<uint8_t>& file, uint8_t** outBase, v
     *outBase = base;
     *outEntry = base + nt->OptionalHeader.AddressOfEntryPoint;
     return true;
+}
+
+// #146: last-resort loader for a DLL the OS refuses to initialise in the
+// container. Maps it ourselves (imports bound through our beds by
+// MapChildImage) and runs its DllMain under our logging. DllMain returning
+// FALSE is reported honestly and the module dropped, unless gh_selfmap_force
+// says to keep it anyway -- for a codec DLL whose init failure is cosmetic.
+static BOOL GhCallDllMainSeh(void* entry, uint8_t* base, DWORD* outCode)
+{
+    BOOL ok = FALSE;
+    __try { ok = ((BOOL (WINAPI*)(HINSTANCE, DWORD, LPVOID))entry)((HINSTANCE)base, DLL_PROCESS_ATTACH, (LPVOID)1); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *outCode = GetExceptionCode(); ok = FALSE; }
+    return ok;
+}
+static HMODULE GhSelfMapDll(const std::wstring& full, const char* dll)
+{
+    std::string nm = GhDllBaseName(dll);
+    std::vector<uint8_t> bytes;
+    if (!ReadWholeFile(full, bytes) || bytes.size() < 0x200){
+        Diag("SELFMAP " + nm + " read failed");
+        return nullptr;
+    }
+    uint8_t* base = nullptr; void* entry = nullptr;
+    if (!MapChildImage(bytes, &base, &entry)){
+        Diag("SELFMAP " + nm + " map failed");
+        return nullptr;
+    }
+    AcquireSRWLockExclusive(&g_selfModLock);
+    g_selfMods.push_back(GhSelfMod{ base, nm });
+    ReleaseSRWLockExclusive(&g_selfModLock);
+    Diag("SELFMAP " + nm + " mapped base=" + Hex((uintptr_t)base) +
+         " entry=" + Hex((uintptr_t)entry) + " size=" + Hex((uint64_t)bytes.size()));
+
+    auto* dos = (IMAGE_DOS_HEADER*)base;
+    auto* nt  = (IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
+    if (nt->OptionalHeader.AddressOfEntryPoint){
+        DWORD code = 0;
+        BOOL  ok   = GhCallDllMainSeh(entry, base, &code);
+        Diag("SELFMAP " + nm + " DllMain -> " + (ok ? "TRUE" : "FALSE") +
+             (code ? " exception=" + Hex((uint32_t)code) : ""));
+        if (!ok && !GhCfgNum(L"gh_selfmap_force.txt", "GH_SELFMAP_FORCE", 0)){
+            AcquireSRWLockExclusive(&g_selfModLock);
+            g_selfMods.pop_back();
+            ReleaseSRWLockExclusive(&g_selfModLock);
+            SetLastError(ERROR_DLL_INIT_FAILED);
+            return nullptr;
+        }
+    }
+    return (HMODULE)base;
 }
 
 struct ChildRun {
