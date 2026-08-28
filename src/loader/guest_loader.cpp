@@ -7908,6 +7908,19 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"XInputSetState",         (void*)&Bed_XInputSetState},
         {"XInputGetCapabilities",  (void*)&Bed_XInputGetCapabilities},
         {"XInputEnable",           (void*)&Bed_XInputEnable},
+        // #155: the raw-input family has to be reachable from the guest EXE's own
+        // IAT, not just from PatchModuleForGuest (which only patches guest DLLs).
+        // Spider-Man calls RegisterRawInputDevices from the exe, reached the
+        // container's real user32, and got ERROR_CALL_NOT_IMPLEMENTED (0x78) --
+        // its own log says "Failed to register raw input devices". Its input
+        // subsystem then left player 0 pointing at a device slot it never filled,
+        // and the first frame after that dereferenced the NULL (GUEST+0x1CE2D60).
+        // Same beds and the same "no raw-input devices, no data" semantics Unity
+        // guests already see; this only changes WHO can reach them.
+        {"RegisterRawInputDevices", (void*)&Bed_RegisterRawInputDevices},
+        {"GetRawInputDeviceList",   (void*)&Bed_GetRawInputDeviceList},
+        {"GetRawInputData",         (void*)&Bed_GetRawInputData},
+        {"GetRawInputDeviceInfoW",  (void*)&Bed_GetRawInputDeviceInfoW},
 #ifdef GH_LAUNCHER
         {"waveInGetNumDevs",       (void*)&Bed_waveInGetNumDevs},
         {"waveInGetDevCapsA",      (void*)&Bed_waveInGetDevCapsA},
