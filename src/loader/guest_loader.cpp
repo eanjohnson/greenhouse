@@ -144,15 +144,39 @@ static void Diag(const std::string& s)
         capped.store(true, std::memory_order_relaxed);
         // fall through once to write the notice below
     }
+    // SHARING. This opened with FILE_SHARE_READ only, which meant that while one
+    // thread held the log every other thread's CreateFileW failed and its line was
+    // dropped on the floor with no trace. Spider-Man logs from a dozen threads at
+    // once and it cost real evidence: the CreateHeap that killed the device logged
+    // its failure but not the "D3D12 CreateHeap size=..." line that precedes the
+    // call, and a DEVICEREMOVED report lost its first line and kept its last. An
+    // absent line was never proof the event did not happen. FILE_APPEND_DATA
+    // writes are atomic at end-of-file, so several handles are safe; sharing write
+    // (and delete, so clearing the log still works) removes the collision, and the
+    // retry covers anyone outside this process holding it briefly. Drops are now
+    // counted and reported rather than invisible.
     static const std::wstring kPath = std::wstring(kLocalState) + L"loader_diag.txt";
-    HANDLE h = CreateFileW(kPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
-                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    static std::atomic<uint64_t> dropped{0};
+    HANDLE h = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 40; ++attempt){
+        h = CreateFileW(kPath.c_str(), FILE_APPEND_DATA,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) break;
+        Sleep(attempt < 8 ? 0 : 1);
+    }
+    if (h == INVALID_HANDLE_VALUE) dropped.fetch_add(1, std::memory_order_relaxed);
     if (h != INVALID_HANDLE_VALUE)
     {
         std::string line = capped.load(std::memory_order_relaxed)
             ? ("DIAG CAPPED at 64MB -- suppressing further output (guest is likely "
                "in a retry loop; the lines above it repeat)\r\n")
             : (s + "\r\n");
+        // Report accumulated drops on the next line that does get through, so a
+        // gap in the log is visible instead of silent.
+        uint64_t d = dropped.exchange(0, std::memory_order_relaxed);
+        if (d) line = "DIAG DROPPED " + std::to_string(d) +
+                      " line(s) -- log was locked\r\n" + line;
         SetFilePointer(h, 0, nullptr, FILE_END);
         DWORD w = 0; WriteFile(h, line.data(), (DWORD)line.size(), &w, nullptr);
         CloseHandle(h);
@@ -213,6 +237,7 @@ static void InitStdHandles()
 }
 
 static bool GhLazyMaterialise(const void* addr, SIZE_T size);  // #145 demand-commit; defined with the pager
+static bool GhLazyFind(const void* p, DWORD* prot);           // #145; is this address one of ours?
 
 // Flush a guest's C runtime buffers (shared ucrtbase/msvcrt instances live in
 // our process) before we longjmp out of its exit(), so buffered stdout reaches
@@ -310,6 +335,8 @@ static void DiagGuestBacktrace(const char* who);   // defined with the module ra
 static std::string NameForCodeAddr(uintptr_t a);
 static bool HandleGuestTracepoint(EXCEPTION_POINTERS* ep);   // defined with them too
 static void GhLogMemoryBudget(const char* where);            // #140 memory sampling
+static void GhCheckDeviceRemoved(const char* where,
+                                 ID3D12Device* dev = nullptr); // #158 removal + DRED
 static std::string GhLazyStats();                             // #145 demand-commit counters
 extern volatile bool g_guestDone;
 
@@ -2106,6 +2133,25 @@ static void BuildBridgeOnUi()
     com_ptr<IDXGIFactory4> factory;
     HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory4), factory.put_void());
     if (FAILED(hr)) return fail("CreateDXGIFactory4", hr);
+
+    // #158: a PSO came back DEVICE_REMOVED with reason DRIVER_INTERNAL_ERROR, and
+    // the shaders it was carrying were ordinary SM5.0 DXBC that had compiled a
+    // moment earlier -- so the device was probably already dead and that PSO was
+    // the messenger. DRED names the last GPU work before a removal, but only if it
+    // is armed BEFORE the device is created. Entirely optional: the console's
+    // runtime may not offer the interface, and nothing here depends on it.
+    {
+        com_ptr<ID3D12DeviceRemovedExtendedDataSettings> dred;
+        HRESULT dhr = D3D12GetDebugInterface(__uuidof(ID3D12DeviceRemovedExtendedDataSettings),
+                                             dred.put_void());
+        if (SUCCEEDED(dhr) && dred){
+            dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            Diag("DRED armed (auto-breadcrumbs + page faults)");
+        } else {
+            Diag("DRED unavailable hr=" + Hex((uint32_t)dhr));
+        }
+    }
 
     for (UINT i = 0; ; ++i){
         com_ptr<IDXGIAdapter1> a;
@@ -4648,7 +4694,29 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     static thread_local int depth = 0;
     if (depth) return orig(self, d, riid, pp);
 
-    std::string m = "D3D12 CreateGraphicsPipelineState";
+    // #158: the device dies mid shader-compile burst with no GPU breadcrumbs and
+    // no page fault -- the driver failed internally with nothing executing. Two
+    // candidates are left: concurrency (this console's D3D12 is a rarely-walked
+    // path, and PSO creation is supposed to be free-threaded) and exhaustion
+    // inside the driver's compiler. Recording who calls and how many are in
+    // flight separates them without changing behaviour, and the serialize knob
+    // then tests the first directly.
+    struct InFlight {
+        static volatile LONG& cur(){ static volatile LONG v = 0; return v; }
+        static volatile LONG& peak(){ static volatile LONG v = 0; return v; }
+        LONG n;
+        InFlight(){
+            n = InterlockedIncrement(&cur());
+            for (LONG p = peak(); n > p; p = peak())
+                if (InterlockedCompareExchange(&peak(), n, p) == p) break;
+        }
+        ~InFlight(){ InterlockedDecrement(&cur()); }
+    } inflight;
+
+    std::string m = "D3D12 CreateGraphicsPipelineState tid=" +
+                    std::to_string((unsigned long)GetCurrentThreadId()) +
+                    " inflight=" + std::to_string((long)inflight.n) +
+                    " peak=" + std::to_string((long)InFlight::peak());
     D3D12_GRAPHICS_PIPELINE_STATE_DESC local{};
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC* use = d;
     if (d){
@@ -4718,10 +4786,30 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
         return E_FAIL;
     }
 
+    // #158: cause, or messenger? One PSO came back DEVICE_REMOVED carrying
+    // perfectly ordinary SM5.0 DXBC, which is what a PSO looks like when the
+    // device died earlier and every create after it fails. Asking before the
+    // call settles it: a non-S_OK reason here means the device was already gone
+    // and this shader is innocent. One GetDeviceRemovedReason is nothing next to
+    // a PSO compile.
+    HRESULT preRemoved = self->GetDeviceRemovedReason();
+    if (preRemoved != S_OK){
+        Diag("  device ALREADY removed BEFORE this PSO: reason=" + Hex((uint32_t)preRemoved));
+        GhCheckDeviceRemoved("pso-pre", self);
+    }
+
+    // gh_pso_serialize.txt = 1 funnels every PSO compile through one lock. If the
+    // removal is a driver race this makes it go away; if it is exhaustion the
+    // device dies at the same place, only later on the clock.
+    static const bool serialize = GhCfgNum(L"gh_pso_serialize.txt", "GH_PSO_SERIALIZE", 0) != 0;
+    static SRWLOCK   psoLock = SRWLOCK_INIT;
+    if (serialize) AcquireSRWLockExclusive(&psoLock);
+
     DWORD fault = 0;
     ++depth;
     HRESULT hr = GhTryCreateGPS(orig, self, use, riid, pp, &fault);
     --depth;
+    if (serialize) ReleaseSRWLockExclusive(&psoLock);
     if (fault){
         InterlockedExchange(&faulted, 1);
         if (pp) *pp = nullptr;
@@ -4731,6 +4819,12 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     }
     Diag("  CreateGraphicsPipelineState -> hr=" + Hex((uint32_t)hr) +
          (pp && *pp ? " CREATED" : ""));
+    if (FAILED(hr)){
+        HRESULT postRemoved = self->GetDeviceRemovedReason();
+        Diag("  PSO failed: removed before=" + Hex((uint32_t)preRemoved) +
+             " after=" + Hex((uint32_t)postRemoved));
+        if (postRemoved != S_OK) GhCheckDeviceRemoved("pso-post", self);
+    }
     if (FAILED(hr) && d){
         GhDumpFailedShader("vs", d->VS.pShaderBytecode, d->VS.BytecodeLength, self);
         GhDumpFailedShader("ps", d->PS.pShaderBytecode, d->PS.BytecodeLength, self);
@@ -4922,7 +5016,40 @@ static HRESULT __stdcall Hook_D12CreateHeap(ID3D12Device* self,
 {
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_HEAP_DESC*,
                                       REFIID, void**))g_d12vtOrig[28];
+    // #158: a running total, because the interesting question about the heap that
+    // fails is never its own size -- it is how much the guest already holds.
+    static volatile LONG64 heapBytes = 0;
+    static volatile LONG   heapCount = 0;
+
+    // The hang reproduces at the same place every run -- ~2052 heaps, ~1.93 GiB --
+    // and does NOT move when the advertised VRAM budget is halved, so it is a hard
+    // limit somewhere below us, not the game sizing pools to our number. Past it
+    // the driver does not return E_OUTOFMEMORY, it hangs the GPU, and the guest
+    // dies in its own device-lost path. This refuses the heap ourselves just short
+    // of that line. The game already knows how to handle a heap it cannot have
+    // (#140 saw it print its VMEM message and carry on); it has no answer at all
+    // for a hung device. Off unless gh_heap_cap_mb.txt says otherwise, so a run
+    // without it is exactly what it is today.
+    static const unsigned capMb = GhCfgNum(L"gh_heap_cap_mb.txt", "GH_HEAP_CAP_MB", 0);
+    if (capMb && hd){
+        const LONG64 cap = (LONG64)capMb << 20;
+        if (InterlockedCompareExchange64(&heapBytes, 0, 0) + (LONG64)hd->SizeInBytes > cap){
+            static LONG refused = 0;
+            LONG n = InterlockedIncrement(&refused);
+            if (n <= 8 || (n % 64) == 0)
+                Diag("D3D12 CreateHeap REFUSED by gh_heap_cap_mb size=" + Hex((uint64_t)hd->SizeInBytes) +
+                     " heaptotal=" + Hex((uint64_t)InterlockedCompareExchange64(&heapBytes, 0, 0)) +
+                     " cap=" + Hex((uint64_t)cap) + " refusals=" + std::to_string((long)n));
+            if (pp) *pp = nullptr;
+            return E_OUTOFMEMORY;
+        }
+    }
+
     HRESULT hr = orig(self, hd, riid, pp);
+    if (SUCCEEDED(hr) && hd){
+        InterlockedAdd64(&heapBytes, (LONG64)hd->SizeInBytes);
+        InterlockedIncrement(&heapCount);
+    }
     Diag("D3D12 CreateHeap size=" + (hd ? Hex((uint64_t)hd->SizeInBytes) : std::string("null")) +
          " type=" + std::to_string(hd ? (int)hd->Properties.Type : -1) +
          " cpupage=" + std::to_string(hd ? (int)hd->Properties.CPUPageProperty : -1) +
@@ -4930,7 +5057,9 @@ static HRESULT __stdcall Hook_D12CreateHeap(ID3D12Device* self,
          " align=" + Hex((uint64_t)(hd ? hd->Alignment : 0)) +
          " flags=" + Hex((uint32_t)(hd ? hd->Flags : 0)) +
          " hr=" + Hex((uint32_t)hr) +
-         " heap=" + Hex((uint64_t)(uintptr_t)(pp ? *pp : nullptr)));
+         " heap=" + Hex((uint64_t)(uintptr_t)(pp ? *pp : nullptr)) +
+         " nheaps=" + std::to_string((long)InterlockedCompareExchange(&heapCount, 0, 0)) +
+         " heaptotal=" + Hex((uint64_t)InterlockedCompareExchange64(&heapBytes, 0, 0)));
     if (FAILED(hr)){
         static LONG f = 0;
         if (InterlockedIncrement(&f) <= 3) GhD12Failed(self, "CreateHeap", hr);
@@ -4968,8 +5097,38 @@ static HRESULT __stdcall Hook_D12OpenHeapAddr(ID3D12Device* self, const void* ad
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const void*, REFIID,
                                       void**))g_d12vtOrig[48];
     HRESULT hr = orig(self, addr, riid, pp);
-    Diag("D3D12 OpenExistingHeapFromAddress addr=" + Hex((uint64_t)(uintptr_t)addr) +
-         " hr=" + Hex((uint32_t)hr));
+    std::string ln = "D3D12 OpenExistingHeapFromAddress addr=" + Hex((uint64_t)(uintptr_t)addr) +
+                     " hr=" + Hex((uint32_t)hr);
+    // #158: this fails E_INVALIDARG every time, and it is not a side show. The
+    // game's own log says "Is UMA: Yes" then "Using Cpu Buffer Optimize: Yes" --
+    // it wraps its own CPU allocations as GPU heaps, and each refusal leaves it a
+    // buffer it believes the GPU can read. Some time later the GPU stops
+    // responding (0x887A0006 is DEVICE_HUNG, not a compiler error). Two very
+    // different causes have the same symptom, so name which one: memory that is
+    // ineligible because of our own pager or arena (reserve-not-commit, or a
+    // mapped view rather than private bytes), or a runtime that does not support
+    // existing heaps at all. VirtualQuery answers the first; the feature query
+    // below the hook answers the second.
+    if (FAILED(hr)){
+        static LONG n = 0;
+        if (InterlockedIncrement(&n) <= 8){
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(addr, &mbi, sizeof mbi))
+                ln += " | region base=" + Hex((uint64_t)(uintptr_t)mbi.BaseAddress) +
+                      " alloc=" + Hex((uint64_t)(uintptr_t)mbi.AllocationBase) +
+                      " size=" + Hex((uint64_t)mbi.RegionSize) +
+                      " state=" + Hex((uint32_t)mbi.State) +
+                      " prot=" + Hex((uint32_t)mbi.Protect) +
+                      " type=" + Hex((uint32_t)mbi.Type) +
+                      (addr == mbi.AllocationBase ? " AT-ALLOC-BASE" : " NOT-AT-ALLOC-BASE");
+            else
+                ln += " | VirtualQuery failed err=" + Hex(GetLastError());
+            DWORD lazyProt = 0;
+            if (GhLazyFind(addr, &lazyProt))
+                ln += " LAZY(prot=" + Hex((uint32_t)lazyProt) + ")";
+        }
+    }
+    Diag(ln);
     return hr;
 }
 
@@ -4977,8 +5136,58 @@ static HRESULT __stdcall Hook_D12OpenHeapAddr(ID3D12Device* self, const void* ad
 // so print the two numbers that decide that: the container's own app-memory limit
 // (a UWP app on Xbox gets far less than a title does) and DXGI's video-memory
 // budget for the adapter. The game reads the second and sizes its pools from it.
+// #158: the first moment the device is gone is what we actually need. Poll it
+// where we already poll other state, report ONCE, and pull DRED's breadcrumbs if
+// they were armed -- they name the last GPU operations the driver retired, which
+// is the difference between "a shader the compiler hated" and "earlier GPU work
+// faulted and everything after it is collateral".
+static volatile LONG g_devRemovedSeen = 0;
+static void GhCheckDeviceRemoved(const char* where, ID3D12Device* dev)
+{
+    // dev lets a caller ask about the device it actually holds -- the guest's
+    // device is not necessarily the one in g_gfx.
+    ID3D12Device* d = dev ? dev : g_gfx.d12.get();
+    if (!d) return;
+    HRESULT r = d->GetDeviceRemovedReason();
+    if (r == S_OK) return;
+    if (InterlockedCompareExchange(&g_devRemovedSeen, 1, 0) != 0) return;
+    Diag(std::string("DEVICEREMOVED first seen at ") + where +
+         " reason=" + Hex((uint32_t)r));
+    com_ptr<ID3D12DeviceRemovedExtendedData> dred;
+    if (FAILED(d->QueryInterface(__uuidof(ID3D12DeviceRemovedExtendedData), dred.put_void())) || !dred){
+        Diag("DEVICEREMOVED no DRED interface on this device");
+        return;
+    }
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc{};
+    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc))){
+        int nodes = 0;
+        for (const D3D12_AUTO_BREADCRUMB_NODE* n = bc.pHeadAutoBreadcrumbNode;
+             n && nodes < 8; n = n->pNext, ++nodes){
+            UINT done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
+            std::string ln = "DRED node#" + std::to_string(nodes) +
+                             " ops=" + std::to_string(n->BreadcrumbCount) +
+                             " lastdone=" + std::to_string(done);
+            if (n->pCommandListDebugNameA) ln += std::string(" list=") + n->pCommandListDebugNameA;
+            if (n->pCommandQueueDebugNameA) ln += std::string(" queue=") + n->pCommandQueueDebugNameA;
+            Diag(ln);
+            // The op that did not finish is the one at the last-completed index.
+            UINT lo = done > 3 ? done - 3 : 0;
+            UINT hi = done + 3 < n->BreadcrumbCount ? done + 3 : n->BreadcrumbCount;
+            for (UINT k = lo; k < hi; ++k)
+                Diag("  DRED op[" + std::to_string(k) + "]=" +
+                     std::to_string((int)n->pCommandHistory[k]) +
+                     (k == done ? "   <-- last completed" : ""));
+        }
+        if (!nodes) Diag("DRED breadcrumbs empty (not armed, or removal had no GPU work)");
+    } else Diag("DRED GetAutoBreadcrumbsOutput failed");
+    D3D12_DRED_PAGE_FAULT_OUTPUT pf{};
+    if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf)))
+        Diag("DRED pagefault va=" + Hex((uint64_t)pf.PageFaultVA));
+}
+
 static void GhLogMemoryBudget(const char* where)
 {
+    GhCheckDeviceRemoved(where);
     std::string ln = std::string("MEMORY ") + where;
     __try {
         ln += " applimit=" + Hex((uint64_t)winrt::Windows::System::MemoryManager::AppMemoryUsageLimit()) +
@@ -5033,7 +5242,45 @@ static void GhHookD12Device(ID3D12Device* dev)
     g_d12vtOrig[36] = vt[36]; vt[36] = (void*)&Hook_D12CreateFence;
     VirtualProtect(vt, sizeof(void*) * 50, old, &old);
     Diag("D3D12 vtable hooked GPS/CPS/CFS/RS/RTV/CCR/CH/CPR/OEHFA");
+    // #158: does this runtime support existing heaps at all? The guest never asks
+    // -- it infers the path from UMA -- so ask on its behalf, once.
+    {
+        D3D12_FEATURE_DATA_EXISTING_HEAPS eh{};
+        HRESULT ehr = dev->CheckFeatureSupport(D3D12_FEATURE_EXISTING_HEAPS, &eh, sizeof eh);
+        Diag("D3D12 EXISTING_HEAPS supported=" + std::to_string((int)eh.Supported) +
+             " hr=" + Hex((uint32_t)ehr));
+        D3D12_FEATURE_DATA_ARCHITECTURE arch{};
+        HRESULT ahr = dev->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &arch, sizeof arch);
+        Diag("D3D12 ARCHITECTURE uma=" + std::to_string((int)arch.UMA) +
+             " cachecoherent=" + std::to_string((int)arch.CacheCoherentUMA) +
+             " tile=" + std::to_string((int)arch.TileBasedRenderer) +
+             " hr=" + Hex((uint32_t)ahr));
+    }
     GhLogMemoryBudget("device-created");
+
+    // #158: poll for device removal on a 100 ms cadence. The 3-second memory
+    // sampler is far too coarse to say WHERE a removal happened, and asking only
+    // from inside failing hooks can only ever report the calls that come after
+    // it. A tight poll puts the first sighting within a tenth of a second of the
+    // cause, and tells us whether the device died during a burst of guest D3D
+    // calls or while nothing was being asked of it at all. Holds its own
+    // reference so the pointer stays valid; the thread exits after it reports.
+    dev->AddRef();
+    if (HANDLE th = CreateThread(nullptr, 0, [](void* p) -> DWORD {
+            ID3D12Device* d = (ID3D12Device*)p;
+            for (;;){
+                if (d->GetDeviceRemovedReason() != S_OK){
+                    GhCheckDeviceRemoved("watchdog-100ms", d);
+                    break;
+                }
+                if (g_guestDone) break;
+                Sleep(100);
+            }
+            d->Release();
+            return 0;
+        }, dev, 0, nullptr))
+        CloseHandle(th);
+    else dev->Release();
     // Only five methods are hooked, so a crash inside any of the others shows up
     // in a backtrace as a bare D3D12Core.dll+offset with nothing naming the call
     // the guest made. Printing the slot map once turns that offset back into a
