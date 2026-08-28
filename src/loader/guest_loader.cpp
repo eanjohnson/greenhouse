@@ -2714,11 +2714,66 @@ static const HWND kFakeHwnd = (HWND)0x00477A01;
 // and GetContainingOutput needs it.
 static HRESULT GhContainingOutput(IDXGIOutput** out);
 
-struct SwapProxy : winrt::implements<SwapProxy,
-                                     IDXGISwapChain4, IDXGISwapChain3, IDXGISwapChain2,
-                                     IDXGISwapChain1, IDXGISwapChain,
-                                     IDXGIDeviceSubObject, IDXGIObject>
+// #156: single-vtable, for the same reason AdapterProxy is (see the long note
+// above it). As a winrt::implements this class had one producer vtable per
+// interface, each with its own refcount offset baked in, and the RTTI on the
+// crashing object proved it: the vtable dxgi walked was
+// winrt::impl::heap_implements<SwapProxy> at COL offset 24 -- a secondary
+// vtable 24 bytes into the object. Mixing two interface pointers of one
+// swapchain by those 24 bytes put a decrement on a vtable pointer, and the
+// next virtual call through it faulted inside dxgi.dll+0x482D5 right after the
+// first present. Shaped like the thing it impersonates instead: implement the
+// most derived interface, answer every IID in the chain with the same pointer,
+// keep one refcount, and allocate from a never-reused bump arena so an
+// interposer that outlives the object lands on a dead one, not on its successor.
+struct SwapProxy : IDXGISwapChain4
 {
+    static void* operator new(size_t n)
+    {
+        static SRWLOCK  lock  = SRWLOCK_INIT;
+        static BYTE*    arena = nullptr;
+        static size_t   used  = 0;
+        static size_t   cap   = 0;
+        n = (n + 63) & ~(size_t)63;          // keep objects on their own cache lines
+        AcquireSRWLockExclusive(&lock);
+        if (!arena || used + n > cap){
+            cap   = 1u << 20;
+            arena = (BYTE*)VirtualAlloc(nullptr, cap, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            used  = 0;
+            if (!arena){ ReleaseSRWLockExclusive(&lock); return ::operator new(n); }
+        }
+        void* p = arena + used;
+        used += n;
+        ReleaseSRWLockExclusive(&lock);
+        return p;
+    }
+    static void operator delete(void*, size_t) noexcept {}   // deliberately never reused
+    static void operator delete(void*) noexcept {}
+
+    LONG rc = 1;
+
+    HRESULT __stdcall QueryInterface(REFIID riid, void** o) noexcept override
+    {
+        if (!o) return E_POINTER;
+        if (riid == __uuidof(IUnknown)              || riid == __uuidof(IDXGIObject)      ||
+            riid == __uuidof(IDXGIDeviceSubObject)  || riid == __uuidof(IDXGISwapChain)   ||
+            riid == __uuidof(IDXGISwapChain1)       || riid == __uuidof(IDXGISwapChain2)  ||
+            riid == __uuidof(IDXGISwapChain3)       || riid == __uuidof(IDXGISwapChain4)){
+            *o = static_cast<IDXGISwapChain4*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *o = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG __stdcall AddRef() noexcept override { return (ULONG)InterlockedIncrement(&rc); }
+    ULONG __stdcall Release() noexcept override
+    {
+        LONG n = InterlockedDecrement(&rc);
+        if (n == 0) delete this;
+        return (ULONG)n;
+    }
+
     DXGI_SWAP_CHAIN_DESC             desc{};
     DXGI_SWAP_CHAIN_DESC1            desc1{};
     DXGI_SWAP_CHAIN_FULLSCREEN_DESC  fsDesc{};
@@ -3572,10 +3627,10 @@ struct FactoryProxy : winrt::implements<FactoryProxy,
         Diag("FactoryProxy CreateSwapChain (legacy)");
         if (!out) return E_POINTER;
         if (!EnsureBridge()) return E_FAIL;
-        auto proxy = winrt::make_self<SwapProxy>();
+        SwapProxy* proxy = new SwapProxy();
         if (d) proxy->desc = *d;
         proxy->fsDesc.Windowed = d ? d->Windowed : TRUE;
-        *out = proxy.as<IDXGISwapChain>().detach();
+        *out = static_cast<IDXGISwapChain*>(proxy);   // born with the guest's +1 ref
         return S_OK;
     }
     HRESULT __stdcall CreateSoftwareAdapter(HMODULE m, IDXGIAdapter** a) noexcept override
@@ -3618,9 +3673,9 @@ struct FactoryProxy : winrt::implements<FactoryProxy,
                  " flags=" + Hex(d->Flags));
         if (!out) return E_POINTER;
         if (!EnsureBridge()) return E_FAIL;
-        auto proxy = winrt::make_self<SwapProxy>();
-        FillSwapProxyDescs(proxy.get(), d, fs);
-        *out = proxy.as<IDXGISwapChain1>().detach();
+        SwapProxy* proxy = new SwapProxy();
+        FillSwapProxyDescs(proxy, d, fs);
+        *out = static_cast<IDXGISwapChain1*>(proxy);   // born with the guest's +1 ref
         return S_OK;
     }
     HRESULT __stdcall CreateSwapChainForCoreWindow(IUnknown* dev, IUnknown*,
@@ -3630,9 +3685,9 @@ struct FactoryProxy : winrt::implements<FactoryProxy,
         GfxNoteSwapChainDevice(dev, d);
         if (!out) return E_POINTER;
         if (!EnsureBridge()) return E_FAIL;
-        auto proxy = winrt::make_self<SwapProxy>();
-        FillSwapProxyDescs(proxy.get(), d, nullptr);
-        *out = proxy.as<IDXGISwapChain1>().detach();
+        SwapProxy* proxy = new SwapProxy();
+        FillSwapProxyDescs(proxy, d, nullptr);
+        *out = static_cast<IDXGISwapChain1*>(proxy);   // born with the guest's +1 ref
         return S_OK;
     }
     HRESULT __stdcall GetSharedResourceAdapterLuid(HANDLE h, LUID* l) noexcept override
@@ -3653,9 +3708,9 @@ struct FactoryProxy : winrt::implements<FactoryProxy,
         Diag("FactoryProxy CreateSwapChainForComposition");
         if (!out) return E_POINTER;
         if (!EnsureBridge()) return E_FAIL;
-        auto proxy = winrt::make_self<SwapProxy>();
-        FillSwapProxyDescs(proxy.get(), d, nullptr);
-        *out = proxy.as<IDXGISwapChain1>().detach();
+        SwapProxy* proxy = new SwapProxy();
+        FillSwapProxyDescs(proxy, d, nullptr);
+        *out = static_cast<IDXGISwapChain1*>(proxy);   // born with the guest's +1 ref
         return S_OK;
     }
 
@@ -5036,9 +5091,9 @@ static HRESULT WINAPI Bed_D3D11CreateDeviceAndSwapChain(
     if (!EnsureBridge()) return E_FAIL;
     ReturnBridgedDevice(dev, ctx, fl);
     if (swap){
-        auto proxy = winrt::make_self<SwapProxy>();
+        SwapProxy* proxy = new SwapProxy();
         if (scDesc) proxy->desc = *scDesc;
-        *swap = proxy.as<IDXGISwapChain>().detach();   // hand the guest a +1 ref
+        *swap = static_cast<IDXGISwapChain*>(proxy);   // hand the guest a +1 ref
     }
     return S_OK;
 }
