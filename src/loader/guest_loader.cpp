@@ -336,6 +336,7 @@ static std::string NameForCodeAddr(uintptr_t a);
 static bool HandleGuestTracepoint(EXCEPTION_POINTERS* ep);   // defined with them too
 static void GhLogMemoryBudget(const char* where);            // #140 memory sampling
 static std::string GhGpuProgress();                          // #158 submissions + fences
+static void GhDrainInfoQueue();                              // #158 D3D12 validation stream
 static unsigned GhCfgNum(const wchar_t* file, const char* envName, unsigned dflt);  // defined with the config helpers
 static void GhCheckDeviceRemoved(const char* where,
                                  ID3D12Device* dev = nullptr); // #158 removal + DRED
@@ -2166,6 +2167,31 @@ static void BuildBridgeOnUi()
             Diag("DRED armed (auto-breadcrumbs + page faults)");
         } else {
             Diag("DRED unavailable hr=" + Hex((uint32_t)dhr));
+        }
+    }
+
+    // #158: the op-by-op bisect ran out of road -- dropping only barriers hangs,
+    // dropping everything but barriers hangs, dropping everything does not. No
+    // single call is the culprit, so stop guessing and ask the runtime. If the
+    // console has the SDK layers at all, the debug layer names invalid usage
+    // outright; even without them ID3D12InfoQueue can carry driver messages.
+    // gh_d3d12_debug.txt=1, off by default because the layer costs performance
+    // and is not present on every console.
+    if (GhCfgNum(L"gh_d3d12_debug.txt", "GH_D3D12_DEBUG", 0)){
+        com_ptr<ID3D12Debug> dbg;
+        HRESULT dh = D3D12GetDebugInterface(__uuidof(ID3D12Debug), dbg.put_void());
+        if (SUCCEEDED(dh) && dbg){
+            dbg->EnableDebugLayer();
+            Diag("D3D12 debug layer ENABLED");
+            com_ptr<ID3D12Debug1> dbg1;
+            if (SUCCEEDED(dbg->QueryInterface(__uuidof(ID3D12Debug1), dbg1.put_void())) && dbg1){
+                if (GhCfgNum(L"gh_d3d12_debug.txt", "GH_D3D12_DEBUG", 0) >= 2){
+                    dbg1->SetEnableGPUBasedValidation(TRUE);
+                    Diag("D3D12 GPU-based validation ENABLED");
+                }
+            }
+        } else {
+            Diag("D3D12 debug layer UNAVAILABLE hr=" + Hex((uint32_t)dh));
         }
     }
 
@@ -5877,6 +5903,9 @@ static void __stdcall Hook_CQExecute(ID3D12CommandQueue* self, UINT n, ID3D12Com
         return;
     }
     ((void (__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*))g_cqVtOrig[10])(self, n, l);
+    // Drain right after the submission that may have been the last one. The
+    // heartbeat is once a second and the device can die between two of its ticks.
+    GhDrainInfoQueue();
 }
 static HRESULT __stdcall Hook_CQSignal(ID3D12CommandQueue* self, ID3D12Fence* f, UINT64 v)
 {
@@ -6159,6 +6188,59 @@ static HRESULT __stdcall Hook_D12OpenHeapAddr(ID3D12Device* self, const void* ad
 // is the difference between "a shader the compiler hated" and "earlier GPU work
 // faulted and everything after it is collateral".
 static volatile LONG g_devRemovedSeen = 0;
+// Whatever the runtime is willing to tell us. With the debug layer on this is the
+// validation stream; without it, it is still where the driver posts its own
+// messages. Bounded: the queue is drained and cleared each pass, and only the
+// first few hundred lines are printed.
+static void GhDrainInfoQueue()
+{
+    static com_ptr<ID3D12InfoQueue> iq;
+    static bool tried = false;
+    if (!tried){
+        tried = true;
+        if (g_gfx.d12){
+            HRESULT h = g_gfx.d12->QueryInterface(__uuidof(ID3D12InfoQueue), iq.put_void());
+            Diag(std::string("D3D12 InfoQueue ") + (SUCCEEDED(h) && iq ? "available" : "unavailable") +
+                 " hr=" + Hex((uint32_t)h));
+            if (iq){
+                iq->SetMuteDebugOutput(FALSE);
+                // Default storage is 1024 messages and the interesting ones arrive
+                // in a burst right before the device dies -- do not let INFO chatter
+                // evict them.
+                iq->SetMessageCountLimit((UINT64)-1);
+                D3D12_MESSAGE_SEVERITY deny[] = { D3D12_MESSAGE_SEVERITY_INFO,
+                                                  D3D12_MESSAGE_SEVERITY_MESSAGE };
+                D3D12_INFO_QUEUE_FILTER f{};
+                f.DenyList.NumSeverities = 2;
+                f.DenyList.pSeverityList = deny;
+                iq->AddStorageFilterEntries(&f);
+                iq->ClearStoredMessages();
+            }
+        }
+    }
+    if (!iq) return;
+    static LONG printed = 0;
+    UINT64 n = iq->GetNumStoredMessages();
+    for (UINT64 i = 0; i < n; ++i){
+        SIZE_T len = 0;
+        if (FAILED(iq->GetMessage(i, nullptr, &len)) || !len) continue;
+        std::vector<char> buf(len);
+        auto* msg = (D3D12_MESSAGE*)buf.data();
+        if (FAILED(iq->GetMessage(i, msg, &len))) continue;
+        // Warnings are plentiful and mostly the game's own style; errors and
+        // corruption are the reason this is on at all, so budget them apart.
+        static LONG warned = 0;
+        if (msg->Severity >= D3D12_MESSAGE_SEVERITY_WARNING){
+            if (InterlockedIncrement(&warned) > 40) continue;
+        } else if (InterlockedIncrement(&printed) > 400) break;
+        Diag("D3D12MSG sev=" + std::to_string((int)msg->Severity) +
+             " id=" + std::to_string((int)msg->ID) + " " +
+             std::string(msg->pDescription ? msg->pDescription : "", msg->DescriptionByteLength ?
+                         msg->DescriptionByteLength - 1 : 0));
+    }
+    iq->ClearStoredMessages();
+}
+
 static void GhCheckDeviceRemoved(const char* where, ID3D12Device* dev)
 {
     // dev lets a caller ask about the device it actually holds -- the guest's
@@ -6171,6 +6253,7 @@ static void GhCheckDeviceRemoved(const char* where, ID3D12Device* dev)
     Diag(std::string("DEVICEREMOVED first seen at ") + where +
          " reason=" + Hex((uint32_t)r) + GhGpuProgress());
     GhBarrDump("at-device-removed");
+    GhDrainInfoQueue();
     com_ptr<ID3D12DeviceRemovedExtendedData> dred;
     if (FAILED(d->QueryInterface(__uuidof(ID3D12DeviceRemovedExtendedData), dred.put_void())) || !dred){
         Diag("DEVICEREMOVED no DRED interface on this device");
@@ -6308,6 +6391,7 @@ static void GhHookD12Device(ID3D12Device* dev)
                     // Repeat every 5 s even when nothing moved: a silent stretch
                     // has to be readable as a stall, not as a gap in the log.
                     if (key != last || (tick % 50) == 0){ last = key; Diag("GPUHEARTBEAT" + now); }
+                    GhDrainInfoQueue();
                 }
                 Sleep(100);
             }
