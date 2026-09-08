@@ -6694,6 +6694,28 @@ static std::string GhShaderKind(const void* p, SIZE_T n)
                   (unsigned)((ver >> 4) & 0xF), (unsigned)(ver & 0xF));
     return out;
 }
+// #180. Which STAGE is this container? DxilProgramHeader encodes it in the same
+// dword GhShaderKind reads the version from: (Kind << 16) | (major << 4) | minor,
+// and SHEX/SHDR use the identical layout. 5 = compute. The soak needs it because
+// CreateComputePipelineState is the only PSO call that takes one blob and no
+// render state, so only the CS half of the corpus can be driven without a game.
+static int GhDxilStage(const void* p, SIZE_T n)
+{
+    if (!p || n < 36) return -1;
+    auto* b = (const uint8_t*)p;
+    if (std::memcmp(b, "DXBC", 4) != 0) return -1;
+    uint32_t parts = 0; std::memcpy(&parts, b + 28, 4);
+    if (parts > 64) return -1;
+    for (uint32_t i = 0; i < parts && 32 + (size_t)i * 4 + 4 <= n; ++i){
+        uint32_t off = 0; std::memcpy(&off, b + 32 + i * 4, 4);
+        if ((size_t)off + 12 > n) continue;
+        if (std::memcmp(b + off, "DXIL", 4) && std::memcmp(b + off, "SHEX", 4) &&
+            std::memcmp(b + off, "SHDR", 4)) continue;
+        uint32_t tok = 0; std::memcpy(&tok, b + off + 8, 4);
+        return (int)((tok >> 16) & 0xFFFF);
+    }
+    return -1;
+}
 // #169: which OPTIONAL features does this shader actually use? Every DXIL
 // container carries an "SFI0" part holding one uint64 of shader-feature flags
 // (dxc emits it for anything above the baseline), and the two bits that matter
@@ -7175,6 +7197,242 @@ static void GhPsoCacheProbe(ID3D12Device* dev,
 }
 
 
+// ---------------------------------------------------------------------------
+// #180. Is the compile wall a COUNT, and does a fresh device reset it?
+//
+// #179 left the wall in a very specific shape: Tsushima creates 331 pipelines and
+// dies in the 332nd, on a compute shader that -- screened standalone through this
+// same control rig -- returns hr=0x0 and CREATES. The blob is not the problem.
+// What differs between the two is everything the driver's compiler did first, and
+// #179 named the failure precisely: newbe.DLL is LLVM 9 with the AMDGPU back end,
+// and SIFrameLowering walks a MachineInstr whose operand count reads 1.4 billion.
+// That is a dead pointer, i.e. compiler state already torn down or overwritten --
+// a cumulative-state story, not a bytecode story.
+//
+// So drive the driver's compiler directly, with no game and no guest: take the
+// corpus already staged in LocalState as gh_lo_<key>.bin, keep the compute half
+// (CreateComputePipelineState is the only PSO entry point that needs no render
+// state), and compile them back to back on a throwaway device until something
+// gives. Every compile logs its own elapsed time, so the climbing curve the game
+// shows -- 176 ms median early, 2039 ms late -- either reappears here or it does
+// not, and that alone separates "the compiler degrades" from "the game does
+// something else to it".
+//
+//   gh_dxil_soak_reps   loop the list this many times (default 1). The corpus has
+//                       fewer compute blobs than the game's 331 pipelines, so
+//                       reaching that count needs repeats.
+//   gh_dxil_soak_reset  recreate the device (and its root signature) every N
+//                       compiles, 0 = never. The mitigation test: if the state is
+//                       per-device, a reset walks past the count that kills one.
+//   gh_dxil_soak_max    stop after this many compiles, 0 = no limit.
+//
+// Stops at the first device removal and says which compile did it. A run that
+// finishes every compile with drr=0 is just as informative: the count is then not
+// sufficient on its own, and the game contributes something else -- most obviously
+// its 234 GRAPHICS pipelines, which this rig cannot drive.
+static void GhDxilSoak(const D3D12_ROOT_SIGNATURE_DESC& rsd, ID3D12Device* first)
+{
+    const unsigned reps  = GhCfgNum(L"gh_dxil_soak_reps.txt",  "GH_DXIL_SOAK_REPS",  1);
+    const unsigned reset = GhCfgNum(L"gh_dxil_soak_reset.txt", "GH_DXIL_SOAK_RESET", 0);
+    const unsigned maxN  = GhCfgNum(L"gh_dxil_soak_max.txt",   "GH_DXIL_SOAK_MAX",   0);
+    // #180 second cell. The first soak stopped at the first device removal, which
+    // turned out to be an intrinsically bad SHADER (fa29971e, and it kills alone
+    // in a fresh process too) rather than anything to do with depth. Stopping
+    // there means one killer hides every compile behind it. With cont=1 a removal
+    // rearms a fresh device and the walk continues, and any blob that removes the
+    // device or faults is struck off so later passes do not pay for it twice --
+    // which turns one run into a census of every bad blob in the corpus AND lets
+    // the count actually be tested past 181.
+    const unsigned cont  = GhCfgNum(L"gh_dxil_soak_cont.txt",  "GH_DXIL_SOAK_CONT",  0);
+
+    // ...and cont=1 turned out not to be enough, because a removed device poisons
+    // the PROCESS: D3D12CreateDevice itself then returns 0x887A0020, so there is
+    // no rearming after the fact. A killer therefore has to be kept out of the
+    // walk in the first place. gh_dxil_soak_skip.txt is a whitespace-separated
+    // list of key prefixes to leave out -- feed it the census's own "killers:"
+    // and "faulters:" lines and the next run measures everything behind them.
+    // #180 cell E. The game compiles under ~3 GB of its own footprint in a 5 GB
+    // container -- and #178 already had to hand the driver's own arena committed
+    // pages by hand (gh_drv_commit), which is what running out of commit looks
+    // like from the outside. If newbe's LLVM is failing an allocation and not
+    // checking it, the dead MachineInstr has an ordinary cause and the soak
+    // should reproduce it once the process is squeezed the same way. Commit a
+    // balloon first, and touch it so it is real commit and not a reservation.
+    const unsigned balloonMb = GhCfgNum(L"gh_soak_balloon_mb.txt", "GH_SOAK_BALLOON_MB", 0);
+    if (balloonMb){
+        SIZE_T want = (SIZE_T)balloonMb * 1024 * 1024;
+        void* p = VirtualAlloc(nullptr, want, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (p){
+            volatile char* q = (volatile char*)p;
+            for (SIZE_T i = 0; i < want; i += 4096) q[i] = 1;
+            Diag("DXILSOAK balloon " + std::to_string(balloonMb) + " MB committed and touched at " +
+                 Hex((uint64_t)(uintptr_t)p));
+        } else {
+            Diag("DXILSOAK balloon " + std::to_string(balloonMb) + " MB FAILED err=" +
+                 std::to_string((unsigned)GetLastError()));
+        }
+    }
+
+    std::vector<std::string> skipKeys;
+    {
+        std::vector<uint8_t> sk;
+        if (ReadWholeFile(std::wstring(kLocalState) + L"gh_dxil_soak_skip.txt", sk, true) && !sk.empty()){
+            std::string cur;
+            for (uint8_t c : sk){
+                if (c > 0x20) cur.push_back((char)c);
+                else if (!cur.empty()){ skipKeys.push_back(cur); cur.clear(); }
+            }
+            if (!cur.empty()) skipKeys.push_back(cur);
+        }
+    }
+
+    HMODULE d12 = GetModuleHandleA("d3d12.dll");
+    using SerFn = HRESULT (WINAPI*)(const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION,
+                                    ID3DBlob**, ID3DBlob**);
+    auto ser = d12 ? (SerFn)GetProcAddress(d12, "D3D12SerializeRootSignature") : nullptr;
+    if (!ser){ Diag("DXILSOAK no D3D12SerializeRootSignature"); return; }
+
+    // Enumerate the staged corpus. Sorted, so a run is reproducible and two runs
+    // can be diffed compile-for-compile.
+    std::vector<std::wstring> names;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((std::wstring(kLocalState) + L"gh_lo_*.bin").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE){
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+                names.push_back(fd.cFileName);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    std::sort(names.begin(), names.end());
+
+    // Read them once, up front: the soak is measuring the compiler, and file I/O
+    // in the middle of it would land in the same timings.
+    struct GhSoakBlob { std::string key; std::vector<uint8_t> bytes; };
+    std::vector<GhSoakBlob> cs;
+    unsigned skipped = 0, skiplisted = 0;
+    for (const std::wstring& nm : names){
+        std::vector<uint8_t> b;
+        if (!ReadWholeFile(std::wstring(kLocalState) + nm, b, true) || b.size() < 0x24){
+            ++skipped; continue;
+        }
+        if (GhDxilStage(b.data(), b.size()) != 5){ ++skipped; continue; }
+        std::string key = RegNarrow(nm);
+        if (key.size() > 6) key = key.substr(6);                 // strip "gh_lo_"
+        if (key.size() > 4) key = key.substr(0, key.size() - 4); // strip ".bin"
+        bool skip = false;
+        for (const std::string& k : skipKeys)
+            if (!k.empty() && key.compare(0, k.size(), k) == 0){ skip = true; break; }
+        if (skip){ ++skiplisted; continue; }
+        cs.push_back(GhSoakBlob{ key, std::move(b) });
+    }
+    Diag("DXILSOAK staged=" + std::to_string((unsigned)names.size()) +
+         " cs=" + std::to_string((unsigned)cs.size()) +
+         " skipped=" + std::to_string(skipped) +
+         " skiplisted=" + std::to_string(skiplisted) +
+         " reps=" + std::to_string(reps) +
+         " reset=" + std::to_string(reset) +
+         " max=" + std::to_string(maxN));
+    if (cs.empty()) return;
+
+    com_ptr<ID3DBlob> rsb, rserr;
+    HRESULT hr = ser(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, rsb.put(), rserr.put());
+    if (FAILED(hr) || !rsb){ Diag("DXILSOAK serialize hr=" + Hex((uint32_t)hr)); return; }
+
+    ID3D12Device*                dev = first;
+    com_ptr<ID3D12Device>        owned;   // holds the devices the soak makes itself
+    com_ptr<ID3D12RootSignature> rs;
+    unsigned epoch = 0, done = 0, created = 0, failed = 0, removals = 0, faults = 0;
+    std::vector<char> dead(cs.size(), 0);   // blobs struck off after killing/faulting
+    std::string killers, faulters;
+    const ULONGLONG t0 = GetTickCount64();
+
+    auto rearm = [&]() -> bool {
+        rs = nullptr;
+        if (epoch){
+            owned = nullptr;
+            HRESULT dhr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+                                            __uuidof(ID3D12Device), owned.put_void());
+            Diag("DXILSOAK epoch=" + std::to_string(epoch) + " new device hr=" +
+                 Hex((uint32_t)dhr) + (owned ? " ok" : " FAIL"));
+            if (!owned) return false;
+            dev = owned.get();
+        }
+        HRESULT rhr = dev->CreateRootSignature(0, rsb->GetBufferPointer(), rsb->GetBufferSize(),
+                                               __uuidof(ID3D12RootSignature), rs.put_void());
+        if (!rs) Diag("DXILSOAK epoch=" + std::to_string(epoch) +
+                      " root signature hr=" + Hex((uint32_t)rhr));
+        return rs != nullptr;
+    };
+    if (!rearm()) return;
+
+    bool stop = false;
+    for (unsigned rep = 0; rep < reps && !stop; ++rep){
+        for (size_t bi = 0; bi < cs.size(); ++bi){
+            const GhSoakBlob& b = cs[bi];
+            if (dead[bi]) continue;
+            if (maxN && done >= maxN){
+                Diag("DXILSOAK stop: max reached at " + std::to_string(done));
+                stop = true; break;
+            }
+            if (reset && done && (done % reset) == 0){
+                ++epoch;
+                if (!rearm()){ Diag("DXILSOAK stop: rearm failed"); stop = true; break; }
+            }
+
+            D3D12_COMPUTE_PIPELINE_STATE_DESC cd{};
+            cd.pRootSignature = rs.get();
+            cd.CS = { b.bytes.data(), b.bytes.size() };
+
+            const ULONGLONG t1 = GetTickCount64();
+            com_ptr<ID3D12PipelineState> pso;
+            DWORD fault = 0;
+            HRESULT chr = GhTryCreateCPS(dev, &cd, pso.put_void(), &fault);
+            const ULONGLONG ms = GetTickCount64() - t1;
+            const HRESULT drr = dev->GetDeviceRemovedReason();
+            ++done;
+            if (pso) ++created; else ++failed;
+            if (fault){ ++faults; if (cont){ dead[bi] = 1; faulters += b.key.substr(0,8) + " "; } }
+
+            // One line per compile: the curve IS the measurement, so do not
+            // summarise it away. n= is the cumulative count that the game's
+            // 331-then-die has to be compared against.
+            Diag("DXILSOAK n=" + std::to_string(done) +
+                 " rep=" + std::to_string(rep) +
+                 " ep=" + std::to_string(epoch) +
+                 " key=" + b.key.substr(0, 8) +
+                 " sz=" + std::to_string((unsigned)b.bytes.size()) +
+                 " ms=" + std::to_string((unsigned)ms) +
+                 " hr=" + Hex((uint32_t)chr) +
+                 (fault ? " FAULT=" + Hex((uint32_t)fault) : std::string()) +
+                 " drr=" + Hex((uint32_t)drr) +
+                 (pso ? " CREATED" : " none"));
+
+            if (drr != S_OK){
+                ++removals;
+                Diag("DXILSOAK DEVICE REMOVED at n=" + std::to_string(done) +
+                     " key=" + b.key + " drr=" + Hex((uint32_t)drr));
+                if (!cont){ stop = true; break; }
+                // Strike it off and carry on with a fresh device. The removed
+                // device is unusable for every subsequent compile, so this is the
+                // only way past a killer without ending the run.
+                dead[bi] = 1; killers += b.key.substr(0,8) + " ";
+                ++epoch;
+                if (!rearm()){ Diag("DXILSOAK stop: rearm failed after removal"); stop = true; break; }
+            }
+        }
+    }
+    Diag("DXILSOAK done n=" + std::to_string(done) +
+         " created=" + std::to_string(created) +
+         " failed=" + std::to_string(failed) +
+         " removals=" + std::to_string(removals) +
+         " faults=" + std::to_string(faults) +
+         " epochs=" + std::to_string(epoch + 1) +
+         " elapsed_ms=" + std::to_string((unsigned)(GetTickCount64() - t0)));
+    if (!killers.empty())  Diag("DXILSOAK killers: " + killers);
+    if (!faulters.empty()) Diag("DXILSOAK faulters: " + faulters);
+}
+
 static void GhDxilControl()
 {
     static const unsigned mode = GhCfgNum(L"gh_dxil_ctl.txt", "GH_DXIL_CTL", 0);
@@ -7183,12 +7441,15 @@ static void GhDxilControl()
     std::vector<uint8_t> blob;
     if (!ReadWholeFile(std::wstring(kLocalState) + L"gh_dxil_ctl.bin", blob, true) ||
         blob.size() < 0x24){
+        // Mode 6 (#180) reads the staged gh_lo_*.bin corpus instead of one blob,
+        // so a missing control shader is not a reason for it to stop.
         Diag("DXILCTL no gh_dxil_ctl.bin (or too small)");
-        return;
+        if (mode != 6) return;
+        blob.clear();
     }
     uint64_t feat = 0;
-    GhDxilFeat(blob.data(), blob.size(), &feat);
-    Diag("DXILCTL blob=" + std::to_string((unsigned)blob.size()) +
+    if (!blob.empty()) GhDxilFeat(blob.data(), blob.size(), &feat);
+    if (!blob.empty()) Diag("DXILCTL blob=" + std::to_string((unsigned)blob.size()) +
          " magic=" + GhFourCC(blob.data(), blob.size()) +
          " kind=" + GhShaderKind(blob.data(), blob.size()) +
          " feat=" + Hex(feat) + "(" + GhDxilFeatNames(feat) + ")" +
@@ -7202,7 +7463,7 @@ static void GhDxilControl()
     // heaptier=2 (run 70) -- but the bindless lowering stands or falls on the real
     // number, not the one implied by a cap bit, so ask for it. Walk down until one
     // succeeds so a refusal reports the ceiling instead of just failing.
-    if (mode == 3 || mode == 4 || mode == 5){
+    if (mode == 3 || mode == 4 || mode == 5 || mode == 6){
         static const UINT sizes[] = { 1000000, 500000, 100000, 16384, 2048, 256 };
         for (UINT n : sizes){
             D3D12_DESCRIPTOR_HEAP_DESC hd{};
@@ -7311,7 +7572,7 @@ static void GhDxilControl()
     // aliased unbounded ranges is the open question mode 5 exists to answer.
     std::vector<D3D12_DESCRIPTOR_RANGE> resRanges, sampRanges;
     D3D12_ROOT_PARAMETER rp5[2]{};
-    if (mode == 5){
+    if (mode == 5 || mode == 6){
         // Spaces 0-7 for whatever the shader still binds the ordinary way: a
         // lowered shader keeps its CreateHandleFromBinding resources untouched.
         for (UINT sp = 0; sp < 8; ++sp){
@@ -7340,7 +7601,7 @@ static void GhDxilControl()
     D3D12_ROOT_SIGNATURE_DESC rsd{};
     if (mode == 1){ rsd.NumParameters = 1; rsd.pParameters = &rp; }
     else if (mode == 3 || mode == 4){ rsd.NumParameters = 8; rsd.pParameters = blp; }
-    else if (mode == 5){ rsd.NumParameters = 2; rsd.pParameters = rp5; }
+    else if (mode == 5 || mode == 6){ rsd.NumParameters = 2; rsd.pParameters = rp5; }
     rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
     // mode 4 = mode 3 + the two SM 6.6 dynamic-resource flags. An SM 6.6 shader
     // that touches ResourceDescriptorHeap[] REQUIRES them, and without them the
@@ -7353,6 +7614,10 @@ static void GhDxilControl()
                     (D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
                      D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED);
     }
+
+    // #180: mode 6 is the soak -- same root signature, but many compiles instead
+    // of one, and it serializes the desc itself so it can rebuild it per device.
+    if (mode == 6){ GhDxilSoak(rsd, dev); return; }
 
     com_ptr<ID3DBlob> rsb, err;
     HRESULT hr = ser(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, rsb.put(), err.put());
