@@ -7485,6 +7485,17 @@ static void GhSoakAllocHeaps(ID3D12Device* dev)
          "MB lastHr=" + Hex((uint32_t)last));
 }
 
+// #181 cell K. Both instruments release every pipeline the instant they have
+// measured it, so the driver only ever holds ONE. The game holds all 331 it has
+// created when it reaches the 332nd. If what runs out is per-pipeline driver
+// state rather than compile count, that difference is the whole experiment --
+// and it is one vector.
+static std::vector<winrt::com_ptr<ID3D12PipelineState>> g_psoHold;
+static bool GhPsoHoldOn()
+{ static const bool on = GhCfgNum(L"gh_pso_hold.txt", "GH_PSO_HOLD", 0) != 0; return on; }
+static void GhPsoHoldKeep(const winrt::com_ptr<ID3D12PipelineState>& p)
+{ if (p && GhPsoHoldOn()) g_psoHold.push_back(p); }
+
 static void GhDxilSoak(const D3D12_ROOT_SIGNATURE_DESC& rsd, ID3D12Device* first)
 {
     const unsigned reps  = GhCfgNum(L"gh_dxil_soak_reps.txt",  "GH_DXIL_SOAK_REPS",  1);
@@ -7635,6 +7646,7 @@ static void GhDxilSoak(const D3D12_ROOT_SIGNATURE_DESC& rsd, ID3D12Device* first
             const HRESULT drr = dev->GetDeviceRemovedReason();
             ++done;
             if (pso) ++created; else ++failed;
+            GhPsoHoldKeep(pso);
             if (fault){ ++faults; if (cont){ dead[bi] = 1; faulters += b.key.substr(0,8) + " "; } }
 
             // One line per compile: the curve IS the measurement, so do not
@@ -7666,6 +7678,7 @@ static void GhDxilSoak(const D3D12_ROOT_SIGNATURE_DESC& rsd, ID3D12Device* first
         }
     }
     Diag("DXILSOAK done n=" + std::to_string(done) +
+         " held=" + std::to_string((unsigned)g_psoHold.size()) +
          " created=" + std::to_string(created) +
          " failed=" + std::to_string(failed) +
          " removals=" + std::to_string(removals) +
@@ -10344,6 +10357,7 @@ static void GhPsoReplay(ID3D12Device* dev)
             ++n;
             if (pso) ++created; else ++failed;
             if (fault) ++faults;
+            GhPsoHoldKeep(pso);
             Diag("PSOREPLAY n=" + std::to_string(n) + " rep=" + std::to_string(rep) +
                  " idx=" + std::to_string(h.idx) + " " + what +
                  " key=" + std::string(h.key[0][0] ? h.key[0] : "-").substr(0, 8) +
@@ -10362,7 +10376,8 @@ static void GhPsoReplay(ID3D12Device* dev)
             }
         }
     }
-    Diag("PSOREPLAY done n=" + std::to_string(n) + " gfx=" + std::to_string(gfx) +
+    Diag("PSOREPLAY done n=" + std::to_string(n) + " held=" +
+         std::to_string((unsigned)g_psoHold.size()) + " gfx=" + std::to_string(gfx) +
          " cs=" + std::to_string(cs) + " created=" + std::to_string(created) +
          " failed=" + std::to_string(failed) + " faults=" + std::to_string(faults) +
          " missing=" + std::to_string(missing) +
