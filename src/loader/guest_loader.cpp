@@ -21259,6 +21259,99 @@ static bool GhDriverCommitFault(EXCEPTION_POINTERS* ep)
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// #178. The scan in newbe.DLL is BOUNDED. Its bound is garbage.
+// ---------------------------------------------------------------------------
+// Pulling newbe.DLL off the console (LocalState\sys, the #169 Stage 0b copy) and
+// disassembling the function that owns the faulting RIP settles what the console
+// could only hint at. RVA 0x95cf8..0x961e9, and the loop is this:
+//
+//   095e8f  mov  rcx, [rbx+0x20]        ; begin
+//   095e93  mov  edx, [rbx+0x28]        ; count -- a 32-BIT load
+//   095e96  shl  rdx, 5                 ; * sizeof(elem) = 0x20
+//   095e9a  add  rdx, rcx               ; end
+//   095e9d  cmp  rcx, rdx
+//   095ea0  je   0x95eef                ; EMPTY -> skip the whole scan
+//   095ea2  mov  r8d, 0x11000000
+//   095ea8  cmp  byte ptr [rcx], 0      ; <-- every fault we have ever logged
+//   ...     matched entries set edi (4 / 8 / 0xB) from a 12-bit subfield
+//   095ee6  add  rcx, 0x20
+//   095eea  cmp  rcx, rdx
+//   095eed  jne  0x95ea8
+//
+// So it is an ordinary bounded walk of a 32-byte-element array that lives in the
+// caller's argument (rbx = the r8 parameter). It only runs away because `count`
+// at [rbx+0x28] is enormous: the terminal fault of run r178c had walked about
+// 737 MB past the start, which is ~24 million elements. Committing pages under
+// it (gh_drv_commit) does not help and cannot: zero-filled pages satisfy the
+// `cmp byte,0` and the `and/cmp` fails, so every page we hand it buys it one more
+// page of walking. That knob is an instrument, not a repair.
+//
+// The repair the driver itself defines is two lines up: when the array is EMPTY
+// the code jumps to 0x95eef and carries on with whatever `edi` already held. So
+// terminating a runaway scan means sending it exactly there -- not inventing
+// behaviour, but taking the branch the driver takes for "nothing to look at".
+//
+// Keyed on the instruction bytes, never on a hardcoded module offset: the
+// signature at RIP must match, and RIP+0x47 must be the `mov edx,[rbp+0x78]`
+// that begins the exit block. On any other driver build this simply never fires.
+static const unsigned char kGhNewbeScanSig[16] = {
+    0x80,0x39,0x00, 0x75,0x39, 0x8B,0x01, 0x41,0x23,0xC0, 0x41,0x3B,0xC0, 0x75,0x2F, 0x44
+};
+static const unsigned char kGhNewbeScanExit[3] = { 0x8B,0x55,0x78 };
+static const ptrdiff_t     kGhNewbeScanExitOff = 0x47;
+static volatile LONG g_newbeScanHits = 0;
+
+static bool GhNewbeScanFault(EXCEPTION_POINTERS* ep)
+{
+    static const unsigned mode = GhCfgNum(L"gh_newbe_scan.txt", "GH_NEWBE_SCAN", 0);
+    if (!mode) return false;
+    static volatile LONG armed = 0;
+    if (InterlockedExchange(&armed, 1) == 0)
+        Diag("NEWBESCAN armed mode=" + std::to_string(mode) +
+             (mode >= 2 ? " (log + terminate)" : " (log only)"));
+    if (ep->ExceptionRecord->ExceptionCode != (DWORD)EXCEPTION_ACCESS_VIOLATION) return false;
+    if (ep->ExceptionRecord->NumberParameters < 2) return false;
+
+    CONTEXT* cx = ep->ContextRecord;
+    const uintptr_t rip = (uintptr_t)cx->Rip;
+    unsigned char sig[16] = {}, ex[3] = {};
+    if (!GhSafeReadCode((const void*)rip, sig, 16)) return false;
+    if (memcmp(sig, kGhNewbeScanSig, sizeof sig) != 0) return false;
+    if (!GhSafeReadCode((const void*)(rip + kGhNewbeScanExitOff), ex, 3)) return false;
+    if (memcmp(ex, kGhNewbeScanExit, sizeof ex) != 0) return false;
+    // The faulting address must be the [rcx] this instruction reads. Anything
+    // else means we matched bytes that are not this loop.
+    if ((uintptr_t)ep->ExceptionRecord->ExceptionInformation[1] != (uintptr_t)cx->Rcx) return false;
+
+    // The bound, straight from the caller's struct. Read defensively: rbx is
+    // whatever the driver had, and a VEH that faults inside itself takes the
+    // process with it. GhReadableQword checks the mapping before it reads.
+    const uintptr_t rbx = (uintptr_t)cx->Rbx;
+    uintptr_t begin = 0, cntQ = 0; bool gotB = false, gotC = false;
+    gotB = GhReadableQword(rbx + 0x20, &begin);
+    gotC = GhReadableQword(rbx + 0x28, &cntQ);
+    const unsigned long count = gotC ? (unsigned long)(cntQ & 0xFFFFFFFFu) : 0ul;
+    const LONG n = InterlockedIncrement(&g_newbeScanHits);
+    if (n <= 8 || (n % 256) == 0)
+        Diag("NEWBESCAN " + std::to_string((long)n) +
+             " rip=" + Hex((uint64_t)rip) + " rcx=" + Hex((uint64_t)cx->Rcx) +
+             " rbx=" + Hex((uint64_t)rbx) +
+             " begin=" + (gotB ? Hex((uint64_t)begin) : std::string("<unreadable>")) +
+             " count=" + (gotC ? std::to_string((unsigned long long)count) : std::string("?")) +
+             " end=" + ((gotB && gotC) ? Hex((uint64_t)(begin + (uintptr_t)count * 0x20)) : std::string("?")) +
+             " elem=" + ((gotB && (uintptr_t)cx->Rcx >= begin)
+                         ? std::to_string((unsigned long long)(((uintptr_t)cx->Rcx - begin) / 0x20))
+                         : std::string("?")) +
+             " walked=" + ((gotB && (uintptr_t)cx->Rcx >= begin)
+                           ? std::to_string((unsigned long long)(((uintptr_t)cx->Rcx - begin) >> 20)) + "MB"
+                           : std::string("?")));
+    if (mode < 2) return false;          // measure-only cell: let the fault stand
+
+    cx->Rip = (DWORD64)(rip + kGhNewbeScanExitOff);
+    return true;
+}
+
 static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
 {
     // #145 demand-commit, first and cheapest. It has to run ahead of the
@@ -21268,6 +21361,10 @@ static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
         ep->ExceptionRecord->NumberParameters >= 2 &&
         GhLazyFault((void*)ep->ExceptionRecord->ExceptionInformation[1]))
         return EXCEPTION_CONTINUE_EXECUTION;
+    // #178: end a runaway scan in newbe.DLL by taking the driver's own
+    // empty-array exit. Ahead of the page-commit handler below, which would
+    // otherwise hand this very loop another page to walk through.
+    if (GhNewbeScanFault(ep)) return EXCEPTION_CONTINUE_EXECUTION;
     // #177: a one-page commit hole inside the driver's own compiler arena. Also a
     // memory repair rather than a crash, so it belongs up here -- but AFTER the
     // demand-commit pager, which takes over a million faults in a run and must
