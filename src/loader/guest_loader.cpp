@@ -7677,6 +7677,8 @@ static void GhDxilSoak(const D3D12_ROOT_SIGNATURE_DESC& rsd, ID3D12Device* first
 }
 
 static void GhPsoReplay(ID3D12Device* dev);   // #181, defined after the bindless rewrite it reuses
+static volatile LONG g_psoCallSeq = 0;
+static void GhPsoCanaryTick(ID3D12Device* dev);  // #181 cell J, defined beside the replay
 
 static void GhDxilControl()
 {
@@ -9393,6 +9395,7 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
         // keys in the record are corpus keys and the replay reproduces what the
         // game asked for rather than what we made of it.
         GhPsoRecordGfx(d);
+        GhPsoCanaryTick(self);   // #181 cell J
         if (d->CachedPSO.pCachedBlob && d->CachedPSO.CachedBlobSizeInBytes){
             local = *d;
             local.CachedPSO = {};
@@ -9684,6 +9687,7 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
     Diag(m);
 
     GhPsoRecordCs(d);   // #181, before substitution: see GhPsoRecordGfx
+    GhPsoCanaryTick(self);   // #181 cell J
 
     // #173: hand the driver the lowered blob if one is staged, and do it BEFORE
     // the screen below so the screen judges what the driver will actually see --
@@ -10363,6 +10367,122 @@ static void GhPsoReplay(ID3D12Device* dev)
          " failed=" + std::to_string(failed) + " faults=" + std::to_string(faults) +
          " missing=" + std::to_string(missing) +
          " elapsed_ms=" + std::to_string((unsigned long long)(GetTickCount64() - t0)));
+}
+
+// #181 cell J. The replay says the game's whole sequence compiles clean out of
+// the launcher, so whatever kills call #332 belongs to the guest PROCESS, not to
+// the shader and not to the count. This asks the driver the same question over
+// and over from inside the running game: compile ONE fixed record -- by default
+// the very record the game dies in -- every N PSO calls, and log the answer. A
+// canary that creates at at=300 and faults at at=320 names the twenty calls the
+// process goes bad inside, and gh_pso_canary=1 then bisects it exactly. A canary
+// that creates right up to the end says the process is healthy and the fatal
+// call differs from its own replay for some other reason.
+typedef HRESULT (__stdcall* GhCpsFn)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*,
+                                     REFIID, void**);
+
+// The canary must not re-enter our own hook: it calls the original vtable entry,
+// so nothing here records, screens or substitutes.
+static HRESULT GhTryCreateCPSRaw(GhCpsFn fn, ID3D12Device* dev,
+                                 const D3D12_COMPUTE_PIPELINE_STATE_DESC* d,
+                                 void** pp, DWORD* faultCode)
+{
+    HRESULT hr = E_FAIL;
+    *faultCode = 0;
+    __try {
+        hr = fn(dev, d, __uuidof(ID3D12PipelineState), pp);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *faultCode = GetExceptionCode();
+        hr = E_FAIL;
+    }
+    return hr;
+}
+
+static void GhPsoCanaryTick(ID3D12Device* dev)
+{
+    static const unsigned every = GhCfgNum(L"gh_pso_canary.txt", "GH_PSO_CANARY", 0);
+    const unsigned at = (unsigned)InterlockedIncrement(&g_psoCallSeq);
+    if (!every || !dev || (at % every) != 0) return;
+
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
+    static bool dead = false, loaded = false;
+    static std::vector<uint8_t> csBlob;
+    static winrt::com_ptr<ID3D12RootSignature> rs;
+    static uint32_t recIdx = 0;
+    if (dead) return;
+
+    if (!loaded){
+        loaded = true;
+        std::vector<uint8_t> rec;
+        if (!ReadWholeFile(std::wstring(kLocalState) + L"gh_psorec.bin", rec, true) || rec.empty()){
+            Diag("CANARY no gh_psorec.bin staged -- record once with gh_pso_record=1");
+            dead = true; return;
+        }
+        // 0 picks the LAST compute record, which is the call the game dies in.
+        const unsigned want = GhCfgNum(L"gh_pso_canary_idx.txt", "GH_PSO_CANARY_IDX", 0);
+        size_t off = 0, chosen = (size_t)-1;
+        while (off + sizeof(GhPsoRecHdr) <= rec.size()){
+            GhPsoRecHdr t{};
+            std::memcpy(&t, rec.data() + off, sizeof(t));
+            if (t.magic != 0x43455250 || t.size < sizeof(t) || off + t.size > rec.size()) break;
+            if (t.kind == 1 && (!want || t.idx == want)) chosen = off;
+            if (want && t.idx == want) break;
+            off += t.size;
+        }
+        if (chosen == (size_t)-1){
+            Diag("CANARY no compute record idx=" + std::to_string(want) + " in the recording");
+            dead = true; return;
+        }
+        GhPsoRecHdr h{};
+        std::memcpy(&h, rec.data() + chosen, sizeof(h));
+        recIdx = h.idx;
+        const std::vector<uint8_t>* b = GhReplayBlob(h.key[0]);
+        if (!b){ Diag("CANARY no blob for key=" + std::string(h.key[0])); dead = true; return; }
+        csBlob = *b;
+
+        // The guest's own serialized root signature, through the same rewrite its
+        // own CreateRootSignature call went through -- and through the ORIGINAL
+        // vtable entry, so the canary leaves no trace in the recorder.
+        const uint8_t* rsp = rec.data() + chosen + sizeof(h) + (size_t)h.nIL * sizeof(GhPsoRecIL);
+        auto crs = (HRESULT (__stdcall*)(ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**))
+                       g_d12vtOrig[16];
+        std::vector<uint8_t> rw;
+        GhBindlessRoot where{};
+        const bool rewrote = GhRsBindless() && GhAppendBindlessRanges(rsp, h.rsBytes, rw, &where);
+        HRESULT rhr = E_FAIL;
+        if (crs){
+            rhr = crs(dev, 0, rewrote ? rw.data() : rsp,
+                      rewrote ? rw.size() : (SIZE_T)h.rsBytes,
+                      __uuidof(ID3D12RootSignature), rs.put_void());
+            if (FAILED(rhr) && rewrote)
+                rhr = crs(dev, 0, rsp, (SIZE_T)h.rsBytes,
+                          __uuidof(ID3D12RootSignature), rs.put_void());
+        }
+        if (!rs){ Diag("CANARY root signature hr=" + Hex((uint32_t)rhr)); dead = true; return; }
+        Diag("CANARY armed rec=" + std::to_string(recIdx) + " key=" + std::string(h.key[0]) +
+             " cs=" + std::to_string((unsigned)csBlob.size()) + "B rs=" + std::to_string(h.rsBytes) +
+             "B every=" + std::to_string(every));
+    }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cd{};
+    cd.pRootSignature = rs.get();
+    cd.CS = { csBlob.data(), csBlob.size() };
+    winrt::com_ptr<ID3D12PipelineState> pso;
+    DWORD fault = 0;
+    const ULONGLONG t0 = GetTickCount64();
+    auto fn = (GhCpsFn)g_d12vtOrig[11];
+    const HRESULT hr = fn ? GhTryCreateCPSRaw(fn, dev, &cd, pso.put_void(), &fault) : E_FAIL;
+    const unsigned ms = (unsigned)(GetTickCount64() - t0);
+    const HRESULT drr = dev->GetDeviceRemovedReason();
+    Diag("CANARY at=" + std::to_string(at) + " rec=" + std::to_string(recIdx) +
+         " ms=" + std::to_string(ms) + " hr=" + Hex((uint32_t)hr) +
+         (fault ? " FAULT=" + Hex((uint32_t)fault) : "") +
+         " drr=" + Hex((uint32_t)drr) + (pso ? " CREATED" : " none"));
+    if (fault || drr != S_OK){
+        Diag("CANARY the process stopped compiling at at=" + std::to_string(at));
+        dead = true;
+    }
 }
 
 // #158. A descriptor is an opaque handle, so the only thing the bind shadow can say
