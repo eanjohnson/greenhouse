@@ -7410,6 +7410,49 @@ static void GhPsoCacheProbe(ID3D12Device* dev,
 // finishes every compile with drr=0 is just as informative: the count is then not
 // sufficient on its own, and the game contributes something else -- most obviously
 // its 234 GRAPHICS pipelines, which this rig cannot drive.
+// #180 cell E, generalised for #181. An absolute balloon is a poor squeeze: what
+// the game actually presents to the driver's allocator is a REMAINING commit of
+// about 1.2 GB (r178c: availcommit=1193MB), and a fixed 2600 MB balloon lands
+// wherever the rest of the process happens to leave it. gh_soak_balloon_to_mb
+// commits 64 MB at a time until the system reports at most that much commit left,
+// which is the number worth matching; gh_soak_balloon_mb is still the absolute
+// form. Pages are touched, so this is real commit and not a reservation.
+static std::vector<void*> g_soakBalloon;
+static uint64_t GhAvailCommitMb()
+{
+    MEMORYSTATUSEX ms{}; ms.dwLength = sizeof(ms);
+    if (!GlobalMemoryStatusEx(&ms)) return 0;
+    return (uint64_t)(ms.ullAvailPageFile / (1024 * 1024));
+}
+static void GhSoakBalloon(const char* tag)
+{
+    const unsigned absMb = GhCfgNum(L"gh_soak_balloon_mb.txt",    "GH_SOAK_BALLOON_MB",    0);
+    const unsigned toMb  = GhCfgNum(L"gh_soak_balloon_to_mb.txt", "GH_SOAK_BALLOON_TO_MB", 0);
+    if (!absMb && !toMb){
+        Diag(std::string(tag) + " availcommit=" + std::to_string(GhAvailCommitMb()) + "MB (no balloon)");
+        return;
+    }
+    const SIZE_T chunk = 64u * 1024 * 1024;
+    uint64_t got = 0;
+    for (;;){
+        if (absMb && got >= (uint64_t)absMb) break;
+        if (toMb  && GhAvailCommitMb() <= (uint64_t)toMb) break;
+        void* p = VirtualAlloc(nullptr, chunk, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!p){
+            Diag(std::string(tag) + " balloon stopped at " + std::to_string(got) +
+                 "MB err=" + std::to_string((unsigned)GetLastError()));
+            break;
+        }
+        volatile char* q = (volatile char*)p;
+        for (SIZE_T i = 0; i < chunk; i += 4096) q[i] = 1;
+        g_soakBalloon.push_back(p);
+        got += chunk / (1024 * 1024);
+        if (got > 8192) break;                 // never eat the whole container
+    }
+    Diag(std::string(tag) + " balloon " + std::to_string(got) + "MB touched, availcommit=" +
+         std::to_string(GhAvailCommitMb()) + "MB");
+}
+
 // #181 cell H. The one counter that separates every clean soak from every dying
 // game run is `heap`: the game has called CreateHeap 212 times before it reaches
 // the compile that kills it, and the soak calls it zero times. The driver's
@@ -7471,20 +7514,7 @@ static void GhDxilSoak(const D3D12_ROOT_SIGNATURE_DESC& rsd, ID3D12Device* first
     // checking it, the dead MachineInstr has an ordinary cause and the soak
     // should reproduce it once the process is squeezed the same way. Commit a
     // balloon first, and touch it so it is real commit and not a reservation.
-    const unsigned balloonMb = GhCfgNum(L"gh_soak_balloon_mb.txt", "GH_SOAK_BALLOON_MB", 0);
-    if (balloonMb){
-        SIZE_T want = (SIZE_T)balloonMb * 1024 * 1024;
-        void* p = VirtualAlloc(nullptr, want, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (p){
-            volatile char* q = (volatile char*)p;
-            for (SIZE_T i = 0; i < want; i += 4096) q[i] = 1;
-            Diag("DXILSOAK balloon " + std::to_string(balloonMb) + " MB committed and touched at " +
-                 Hex((uint64_t)(uintptr_t)p));
-        } else {
-            Diag("DXILSOAK balloon " + std::to_string(balloonMb) + " MB FAILED err=" +
-                 std::to_string((unsigned)GetLastError()));
-        }
-    }
+    GhSoakBalloon("DXILSOAK");
 
     std::vector<std::string> skipKeys;
     {
@@ -10194,6 +10224,7 @@ static void GhPsoReplay(ID3D12Device* dev)
     }
     const unsigned maxN = GhCfgNum(L"gh_dxil_soak_max.txt", "GH_DXIL_SOAK_MAX", 0);
     const unsigned reps = GhCfgNum(L"gh_dxil_soak_reps.txt", "GH_DXIL_SOAK_REPS", 1);
+    GhSoakBalloon("PSOREPLAY");
     GhSoakAllocHeaps(dev);
 
     // Root signatures, rebuilt once per distinct serialized blob and through the
