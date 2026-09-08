@@ -6878,6 +6878,19 @@ static const std::vector<uint8_t>* GhLoweredBlob(const void* code, SIZE_T n)
     return it->second.empty() ? nullptr : &it->second;
 }
 
+// gh_pso_serialize funnels PSO creation through ONE lock. It used to be a static
+// inside the graphics hook, which serialized graphics against graphics and left
+// compute running free alongside -- and the driver's compiler is one shared
+// thing, so that could never test what the knob claims to test. #177's fault
+// lands on a third thread while the main and D3D threads are both already inside
+// SC_DLL, so the lock has to cover every path into it.
+static SRWLOCK g_psoLock = SRWLOCK_INIT;
+static bool GhPsoSerialize()
+{
+    static const bool on = GhCfgNum(L"gh_pso_serialize.txt", "GH_PSO_SERIALIZE", 0) != 0;
+    return on;
+}
+
 // Swap a bytecode slot in place if a lowered blob is staged for it. Returns true
 // if anything changed, so the caller only copies the PSO desc when it must.
 static bool GhSubstShader(D3D12_SHADER_BYTECODE* bc)
@@ -6982,6 +6995,185 @@ static HRESULT GhTryCreateCPS(ID3D12Device* dev,
 }
 
 #include "gh_dxil_spaces.h"   // generated: toolchain/dxil/emit_spaces.py
+
+// ---------------------------------------------------------------------------
+// #177. Does this driver hand back a compiled PSO, and will it take one back?
+//
+// #176 left Tsushima creating every pipeline it asks for and spending 323 s of a
+// 420 s window inside SC_DLL to do it -- 241 compiles at 1.34 s each and rising,
+// against a default.pso that lists 16,192 pipelines. Every desc the game hands
+// us arrives cached=0, and Hook_D12CreateGPS deliberately STRIPS the game's own
+// CachedPSO because that blob came off a PC driver. Nothing has ever asked this
+// driver for its OWN compiled output.
+//
+// If D3D12_SHADER_CACHE_SUPPORT_SINGLE_PSO is set and GetCachedBlob returns
+// something the driver will accept back, then a disk-backed cache keyed by our
+// substitution digest turns a five-minute compile stall into a one-time cost.
+// If it is not set, that whole plan is dead and the answer is one CheckFeature
+// call rather than a day of plumbing -- which is why this probe exists and runs
+// BEFORE any of that is written.
+//
+// Launcher-only, on the throwaway device, with no guest in the process. The one
+// shader it compiles is the control blob that has already been created once on
+// the line above, so nothing new reaches the back end.
+static void GhPsoCacheProbe(ID3D12Device* dev,
+                            const D3D12_COMPUTE_PIPELINE_STATE_DESC& cd,
+                            ID3D12PipelineState* pso)
+{
+    static const unsigned on = GhCfgNum(L"gh_pso_cache.txt", "GH_PSO_CACHE", 0);
+    if (!on || !dev) return;
+
+    // 0. Checkpoint the device before anything, then again after a pause. Run 2
+    //    of this probe found the device already removed (drr=0x887A0020) by the
+    //    time GetCachedBlob was called, with only CheckFeatureSupport in between
+    //    -- and CheckFeatureSupport had returned S_OK. Two candidates: the query
+    //    kills it, or the control shader's compile poisons the device and the
+    //    removal simply lands a moment after the create returned. Timestamped
+    //    reads either side of a deliberate wait separate those.
+    Diag("PSOCACHE drr@entry=" + Hex((uint32_t)dev->GetDeviceRemovedReason()));
+    Sleep(250);
+    Diag("PSOCACHE drr@+250ms=" + Hex((uint32_t)dev->GetDeviceRemovedReason()));
+
+    // 1. What the driver says it supports. SINGLE_PSO is the bit the plan needs;
+    //    LIBRARY would let us keep one blob for the whole set instead of a file
+    //    per pipeline; AUTOMATIC_DISK_CACHE would mean the runtime already does
+    //    this for us and the whole task is a knob somewhere else.
+    D3D12_FEATURE_DATA_SHADER_CACHE sc{};
+    HRESULT fhr = dev->CheckFeatureSupport(D3D12_FEATURE_SHADER_CACHE, &sc, sizeof(sc));
+    const HRESULT drrAfterFeat = dev->GetDeviceRemovedReason();
+    std::string names;
+    const struct { unsigned bit; const char* nm; } kFlags[] = {
+        { D3D12_SHADER_CACHE_SUPPORT_SINGLE_PSO,             "SINGLE_PSO" },
+        { D3D12_SHADER_CACHE_SUPPORT_LIBRARY,                "LIBRARY" },
+        { D3D12_SHADER_CACHE_SUPPORT_AUTOMATIC_INPROC_CACHE, "INPROC" },
+        { D3D12_SHADER_CACHE_SUPPORT_AUTOMATIC_DISK_CACHE,   "DISK" },
+        { D3D12_SHADER_CACHE_SUPPORT_DRIVER_MANAGED_CACHE,   "DRIVER_MANAGED" },
+        { D3D12_SHADER_CACHE_SUPPORT_SHADER_CONTROL_CLEAR,   "CONTROL_CLEAR" },
+        { D3D12_SHADER_CACHE_SUPPORT_SHADER_SESSION_DELETE,  "SESSION_DELETE" },
+    };
+    for (auto& f : kFlags)
+        if ((unsigned)sc.SupportFlags & f.bit){ if (!names.empty()) names += "|"; names += f.nm; }
+    Diag("PSOCACHE feature hr=" + Hex((uint32_t)fhr) +
+         " flags=" + Hex((uint32_t)sc.SupportFlags) +
+         "(" + (names.empty() ? "none" : names) + ")" +
+         " drrAfter=" + Hex((uint32_t)drrAfterFeat));
+
+    // The bulk mechanism used to be probed here, second. It is now LAST and
+    // behind gh_pso_cache>=2, because it is device-fatal: measured on this
+    // console, an empty CreatePipelineLibrary prints "D3D12: Removing Device"
+    // and returns DEVICE_REMOVED, and every call after it -- GetCachedBlob
+    // included -- then returns 0x887A0005 for a reason that has nothing to do
+    // with the question being asked. The first version of this probe ran it
+    // second and concluded from the wreckage that the driver returns nothing to
+    // cache, which was a statement about the corpse, not the patient.
+
+    if (!pso){ Diag("PSOCACHE no control PSO to ask -- stopping here"); return; }
+
+    LARGE_INTEGER freq{}; QueryPerformanceFrequency(&freq);
+    auto ms = [&](LARGE_INTEGER a, LARGE_INTEGER b){
+        return freq.QuadPart ? (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)freq.QuadPart : 0.0;
+    };
+
+    // 3. Ask for the driver's compiled output.
+    com_ptr<ID3DBlob> cb;
+    const HRESULT drrPreBlob = dev->GetDeviceRemovedReason();
+    HRESULT ghr = pso->GetCachedBlob(cb.put());
+    if (drrPreBlob != S_OK)
+        Diag("PSOCACHE device was ALREADY removed before GetCachedBlob (drr=" +
+             Hex((uint32_t)drrPreBlob) + ") -- the result below is about the device, not the blob");
+    Diag("PSOCACHE GetCachedBlob hr=" + Hex((uint32_t)ghr) +
+         " bytes=" + std::to_string(cb ? (unsigned long long)cb->GetBufferSize() : 0ull));
+    if (FAILED(ghr) || !cb || !cb->GetBufferSize()){
+        Diag("PSOCACHE no blob back from a LIVE device (drr=" +
+             Hex((uint32_t)dev->GetDeviceRemovedReason()) +
+             ") -- per-PSO persistence is not available here");
+        return;
+    }
+    // Keep it: the size and the header say whether a per-pipeline file is
+    // affordable against 16,192 pipelines, and that is a host-side question.
+    {
+        HANDLE h = CreateFileW((std::wstring(kLocalState) + L"gh_pso_cache_probe.bin").c_str(),
+                               GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE){
+            DWORD wrote = 0;
+            WriteFile(h, cb->GetBufferPointer(), (DWORD)cb->GetBufferSize(), &wrote, nullptr);
+            CloseHandle(h);
+            Diag("PSOCACHE wrote gh_pso_cache_probe.bin " + std::to_string((unsigned long)wrote) + " bytes");
+        }
+    }
+
+    // 4. The measurement that matters: a second COLD compile of the same shader
+    //    against a warm compile from the blob. One cold create is the baseline
+    //    because the driver may already keep an in-process cache -- if it does,
+    //    the cold number comes back near zero and says so rather than flattering
+    //    the cached one.
+    DWORD fault = 0;
+    LARGE_INTEGER t0{}, t1{}, t2{}, t3{};
+    com_ptr<ID3D12PipelineState> cold, warm;
+    QueryPerformanceCounter(&t0);
+    HRESULT chr = GhTryCreateCPS(dev, &cd, cold.put_void(), &fault);
+    QueryPerformanceCounter(&t1);
+    Diag("PSOCACHE cold recreate hr=" + Hex((uint32_t)chr) +
+         (fault ? " FAULT=" + Hex((uint32_t)fault) : std::string()) +
+         " ms=" + std::to_string(ms(t0, t1)));
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC wd = cd;
+    wd.CachedPSO.pCachedBlob           = cb->GetBufferPointer();
+    wd.CachedPSO.CachedBlobSizeInBytes = cb->GetBufferSize();
+    fault = 0;
+    QueryPerformanceCounter(&t2);
+    HRESULT whr = GhTryCreateCPS(dev, &wd, warm.put_void(), &fault);
+    QueryPerformanceCounter(&t3);
+    Diag("PSOCACHE warm from blob hr=" + Hex((uint32_t)whr) +
+         (fault ? " FAULT=" + Hex((uint32_t)fault) : std::string()) +
+         " ms=" + std::to_string(ms(t2, t3)) +
+         (warm ? " -> CREATED" : " -> none"));
+
+    // 5. Does it VALIDATE, or does it trust us? A cached blob handed to the
+    //    wrong desc is the failure mode a disk cache lives or dies on: if the
+    //    driver checks, a key collision costs a recompile, and if it does not,
+    //    a key collision is a corrupt pipeline and the cache must carry its own
+    //    identity. D3D12_ERROR_DRIVER_VERSION_MISMATCH (0x887E0002) or
+    //    ADAPTER_NOT_FOUND (0x887E0001) is the documented answer.
+    {
+        std::vector<uint8_t> bad((const uint8_t*)cb->GetBufferPointer(),
+                                 (const uint8_t*)cb->GetBufferPointer() + cb->GetBufferSize());
+        bad[bad.size() / 2] ^= 0xFF;
+        D3D12_COMPUTE_PIPELINE_STATE_DESC bd = cd;
+        bd.CachedPSO.pCachedBlob           = bad.data();
+        bd.CachedPSO.CachedBlobSizeInBytes = bad.size();
+        com_ptr<ID3D12PipelineState> junk;
+        fault = 0;
+        HRESULT bhr = GhTryCreateCPS(dev, &bd, junk.put_void(), &fault);
+        Diag("PSOCACHE corrupted blob hr=" + Hex((uint32_t)bhr) +
+             (fault ? " FAULT=" + Hex((uint32_t)fault) : std::string()) +
+             (junk ? " -> CREATED (the driver does NOT validate -- a key collision"
+                     " would build the wrong pipeline)"
+                   : " -> rejected (validated; a key collision only costs a recompile)"));
+    }
+    Diag("PSOCACHE drr=" + Hex((uint32_t)dev->GetDeviceRemovedReason()));
+
+    // LAST, and opt-in, because it kills the device: gh_pso_cache=2. A library
+    // would be one blob for the whole set instead of a file per pipeline, so it
+    // is worth knowing whether the refusal is the empty-library case or the
+    // mechanism -- but nothing may run after it on this device.
+    if (on >= 2){
+        com_ptr<ID3D12Device1> dev1;
+        HRESULT qhr = dev->QueryInterface(__uuidof(ID3D12Device1), dev1.put_void());
+        std::string lm = "PSOCACHE ID3D12Device1 hr=" + Hex((uint32_t)qhr);
+        if (SUCCEEDED(qhr) && dev1){
+            com_ptr<ID3D12PipelineLibrary> lib;
+            HRESULT lhr = dev1->CreatePipelineLibrary(nullptr, 0,
+                              __uuidof(ID3D12PipelineLibrary), lib.put_void());
+            lm += " CreatePipelineLibrary(empty) hr=" + Hex((uint32_t)lhr) +
+                  (lib ? " -> CREATED" : " -> none") +
+                  " drrAfter=" + Hex((uint32_t)dev->GetDeviceRemovedReason());
+        }
+        Diag(lm);
+    }
+}
+
 
 static void GhDxilControl()
 {
@@ -7192,6 +7384,10 @@ static void GhDxilControl()
          " drrBefore=" + Hex((uint32_t)drrBefore) +
          " drrAfter=" + Hex((uint32_t)drrAfter) +
          (pso ? " -> CREATED" : " -> none"));
+
+    // #177 rides on the control rig: it needs one real PSO on a live device with
+    // no guest in the process, and that is exactly what the line above just made.
+    GhPsoCacheProbe(dev, cd, pso.get());
 }
 // SC_DLL.dll -- the UMD's shader compiler -- faults with rip=0, exec 0x0, rax=0,
 // returning into SC_DLL+0x630C. That is `call rax` through a NULL function
@@ -8753,15 +8949,14 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     // gh_pso_serialize.txt = 1 funnels every PSO compile through one lock. If the
     // removal is a driver race this makes it go away; if it is exhaustion the
     // device dies at the same place, only later on the clock.
-    static const bool serialize = GhCfgNum(L"gh_pso_serialize.txt", "GH_PSO_SERIALIZE", 0) != 0;
-    static SRWLOCK   psoLock = SRWLOCK_INIT;
-    if (serialize) AcquireSRWLockExclusive(&psoLock);
+    const bool serialize = GhPsoSerialize();
+    if (serialize) AcquireSRWLockExclusive(&g_psoLock);
 
     DWORD fault = 0;
     ++depth;
     HRESULT hr = GhTryCreateGPS(orig, self, use, riid, pp, &fault);
     --depth;
-    if (serialize) ReleaseSRWLockExclusive(&psoLock);
+    if (serialize) ReleaseSRWLockExclusive(&g_psoLock);
     if (fault){
         const LONG nf = InterlockedIncrement(&faulted);
         if (pp) *pp = nullptr;
@@ -8943,7 +9138,10 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
         }
     }
 
+    const bool serialize = GhPsoSerialize();
+    if (serialize) AcquireSRWLockExclusive(&g_psoLock);
     HRESULT hr = orig(self, d, riid, pp);
+    if (serialize) ReleaseSRWLockExclusive(&g_psoLock);
     {
         static volatile LONG cpsIdx = 0;
         std::string res = "  CreateComputePipelineState -> hr=" + Hex((uint32_t)hr);
@@ -20984,8 +21182,73 @@ static bool GhFpTrapHandle(EXCEPTION_POINTERS* ep)
     return true;
 }
 
+// #177. Every full-corpus run dies the same way: a byte scan inside newbe.DLL
+// (the driver's DXIL back end) reads a page that is inside its OWN private
+// reservation but is not committed. Under gh_pso_serialize the hole is exactly
+// ONE page wide -- `size=0x1000 state=MEM_RESERVE` with committed arena either
+// side -- which is not a bump allocator walking off its end. It is a commit that
+// failed and was never checked, in a process sitting at ~4.0 GB of a 5 GB
+// container. gh_drv_commit is a page budget (0 = off): commit the page, let the
+// scan continue, and see whether the compiler finishes. If VirtualAlloc itself
+// fails, that failure is the answer and it is the container ceiling again.
+static const char* const kGhDrvCommitMods[] = {
+    "newbe.DLL", "SC_DLL.dll", "scdxil.dll", "umd12ddi.dll"
+};
+static volatile LONG g_drvCommitted = 0;
+
+static bool GhDriverCommitFault(EXCEPTION_POINTERS* ep)
+{
+    static const long budget = (long)GhCfgNum(L"gh_drv_commit.txt", "GH_DRV_COMMIT", 0);
+    if (budget <= 0) return false;
+    if (ep->ExceptionRecord->ExceptionCode != (DWORD)EXCEPTION_ACCESS_VIOLATION) return false;
+    if (ep->ExceptionRecord->NumberParameters < 2) return false;
+    if (InterlockedCompareExchange(&g_drvCommitted, 0, 0) >= budget) return false;
+
+    // Only for the driver's own compiler modules. A hole anywhere else is
+    // somebody's real bug and papering over it would hide it.
+    HMODULE mod = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR)ep->ExceptionRecord->ExceptionAddress, &mod) || !mod)
+        return false;
+    wchar_t mp[MAX_PATH]; DWORD n = GetModuleFileNameW(mod, mp, MAX_PATH);
+    std::wstring mw(mp, n); size_t sl = mw.find_last_of(L"\\/");
+    std::string base(mw.begin() + (sl == std::wstring::npos ? 0 : sl + 1), mw.end());
+    bool known = false;
+    for (const char* m : kGhDrvCommitMods) if (_stricmp(base.c_str(), m) == 0) { known = true; break; }
+    if (!known) return false;
+
+    const uintptr_t tgt = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery((LPCVOID)tgt, &mbi, sizeof mbi) != sizeof mbi) return false;
+    if (mbi.State != MEM_RESERVE || mbi.Type != MEM_PRIVATE) return false;   // not our case
+
+    const SIZE_T hole = mbi.RegionSize;
+    void* got = VirtualAlloc(mbi.BaseAddress, hole, MEM_COMMIT, PAGE_READWRITE);
+    const DWORD err = got ? 0 : GetLastError();
+    const LONG k = InterlockedIncrement(&g_drvCommitted);
+    // Plain Win32 only in here: this runs on an arbitrary driver thread inside a
+    // VEH, so no WinRT and nothing that can take a loader lock.
+    MEMORYSTATUSEX ms{}; ms.dwLength = sizeof ms;
+    GlobalMemoryStatusEx(&ms);
+    Diag("DRVCOMMIT " + std::to_string((long)k) + "/" + std::to_string(budget) +
+         " " + base + "+" + Hex((uint64_t)((uintptr_t)ep->ExceptionRecord->ExceptionAddress - (uintptr_t)mod)) +
+         " target=" + Hex((uint64_t)tgt) +
+         " hole=" + Hex((uint64_t)hole) +
+         " alloc=" + Hex((uint64_t)(uintptr_t)mbi.AllocationBase) +
+         (got ? " COMMITTED" : " VirtualAlloc FAILED err=" + std::to_string((unsigned long)err)) +
+         " availcommit=" + std::to_string((unsigned long long)(ms.ullAvailPageFile >> 20)) + "MB" +
+         " availphys=" + std::to_string((unsigned long long)(ms.ullAvailPhys >> 20)) + "MB");
+    if (!got) return false;      // let the crash reporter have it; the failure IS the finding
+    return true;
+}
+
 static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
 {
+    // #177: a one-page commit hole inside the driver's own compiler arena. Ahead
+    // of everything else for the same reason GhLazyFault is: it is a memory
+    // repair, not a crash.
+    if (GhDriverCommitFault(ep)) return EXCEPTION_CONTINUE_EXECUTION;
     // #145 demand-commit, first and cheapest. It has to run ahead of the
     // reentrancy guard below, or a first touch taken inside one of our own
     // probes would be handed to the crash reporter as a genuine fault.
