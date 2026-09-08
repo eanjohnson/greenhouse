@@ -7410,6 +7410,38 @@ static void GhPsoCacheProbe(ID3D12Device* dev,
 // finishes every compile with drr=0 is just as informative: the count is then not
 // sufficient on its own, and the game contributes something else -- most obviously
 // its 234 GRAPHICS pipelines, which this rig cannot drive.
+// #181 cell H. The one counter that separates every clean soak from every dying
+// game run is `heap`: the game has called CreateHeap 212 times before it reaches
+// the compile that kills it, and the soak calls it zero times. The driver's
+// compiler and its resource allocator live in the same user-mode driver and the
+// same arena, so "what has been allocated" is a plausible thing for a compile to
+// depend on. This puts the game's GPU allocation state in front of the replay
+// without the game: N heaps of M MB each, kept alive for the whole walk.
+static std::vector<winrt::com_ptr<ID3D12Heap>> g_soakHeaps;
+static void GhSoakAllocHeaps(ID3D12Device* dev)
+{
+    const unsigned n  = GhCfgNum(L"gh_soak_heaps_n.txt", "GH_SOAK_HEAPS_N", 0);
+    const unsigned mb = GhCfgNum(L"gh_soak_heap_mb.txt", "GH_SOAK_HEAP_MB", 16);
+    if (!dev || !n) return;
+    unsigned ok = 0;
+    HRESULT last = S_OK;
+    for (unsigned i = 0; i < n; ++i){
+        D3D12_HEAP_DESC hd{};
+        hd.SizeInBytes = (UINT64)mb * 1024 * 1024;
+        hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+        winrt::com_ptr<ID3D12Heap> h;
+        last = dev->CreateHeap(&hd, __uuidof(ID3D12Heap), h.put_void());
+        if (!h) break;
+        g_soakHeaps.push_back(h);
+        ++ok;
+    }
+    Diag("SOAKHEAPS asked=" + std::to_string(n) + " each=" + std::to_string(mb) +
+         "MB got=" + std::to_string(ok) + " total=" + std::to_string((unsigned)((uint64_t)ok * mb)) +
+         "MB lastHr=" + Hex((uint32_t)last));
+}
+
 static void GhDxilSoak(const D3D12_ROOT_SIGNATURE_DESC& rsd, ID3D12Device* first)
 {
     const unsigned reps  = GhCfgNum(L"gh_dxil_soak_reps.txt",  "GH_DXIL_SOAK_REPS",  1);
@@ -7424,6 +7456,7 @@ static void GhDxilSoak(const D3D12_ROOT_SIGNATURE_DESC& rsd, ID3D12Device* first
     // which turns one run into a census of every bad blob in the corpus AND lets
     // the count actually be tested past 181.
     const unsigned cont  = GhCfgNum(L"gh_dxil_soak_cont.txt",  "GH_DXIL_SOAK_CONT",  0);
+    GhSoakAllocHeaps(first);
 
     // ...and cont=1 turned out not to be enough, because a removed device poisons
     // the PROCESS: D3D12CreateDevice itself then returns 0x887A0020, so there is
@@ -8845,6 +8878,81 @@ static bool GhSkipPsShaderSizes(SIZE_T vs, SIZE_T ps)
     return vs == (SIZE_T)wantVs && ps == (SIZE_T)wantPs;
 }
 
+// #181 cell I. Every PSO the game submits replays clean out of the launcher, on
+// the launcher's own thread. The game's calls arrive instead on ITS threads --
+// job-system threads whose TLS, stack and creation path are all ours -- and that
+// is now one of the few differences left between a compile that works and the
+// same compile, on the same device, in the same order, that does not.
+//
+// gh_pso_marshal=1 moves every CreateGraphics/ComputePipelineState onto one
+// dedicated loader-owned thread, created by the ordinary CRT path with a large
+// stack, and blocks the caller until it returns. If the game then gets past the
+// compile that kills it, the environment the driver's compiler runs in is the
+// cause -- and this is the fix, not just the instrument. Note this is NOT #177's
+// gh_pso_serialize: that one kept every call on its own thread and only added a
+// lock, and it changed nothing.
+static bool GhPsoMarshal()
+{
+    static const bool on = GhCfgNum(L"gh_pso_marshal.txt", "GH_PSO_MARSHAL", 0) != 0;
+    return on;
+}
+
+struct GhPsoJob {
+    void (*fn)(void*);
+    void* arg;
+    HANDLE done;
+};
+static std::mutex g_pmMu;
+static std::deque<GhPsoJob*> g_pmQ;
+static HANDLE g_pmSem = nullptr;
+static HANDLE g_pmThread = nullptr;
+
+static DWORD WINAPI GhPsoMarshalThread(LPVOID)
+{
+    for (;;){
+        WaitForSingleObject(g_pmSem, INFINITE);
+        GhPsoJob* j = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_pmMu);
+            if (!g_pmQ.empty()){ j = g_pmQ.front(); g_pmQ.pop_front(); }
+        }
+        if (!j) continue;
+        j->fn(j->arg);
+        SetEvent(j->done);
+    }
+}
+
+// Run one call on the marshal thread and wait. Returns false if the thread could
+// not be brought up, so the caller falls back to calling inline.
+static bool GhPsoMarshalRun(void (*fn)(void*), void* arg)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_pmMu);
+        if (!g_pmThread){
+            g_pmSem = CreateSemaphoreW(nullptr, 0, 0x7FFFFFFF, nullptr);
+            if (g_pmSem){
+                // 8 MB: LLVM's instruction selection recurses, and a guest job
+                // thread's stack is not something we want it inheriting.
+                g_pmThread = CreateThread(nullptr, 8u * 1024 * 1024, GhPsoMarshalThread,
+                                          nullptr, 0, nullptr);
+            }
+            Diag(std::string("PSOMARSHAL worker ") + (g_pmThread ? "up" : "FAILED err=") +
+                 (g_pmThread ? "" : std::to_string((unsigned)GetLastError())));
+        }
+        if (!g_pmThread) return false;
+    }
+    GhPsoJob j{ fn, arg, CreateEventW(nullptr, TRUE, FALSE, nullptr) };
+    if (!j.done) return false;
+    {
+        std::lock_guard<std::mutex> lk(g_pmMu);
+        g_pmQ.push_back(&j);
+    }
+    ReleaseSemaphore(g_pmSem, 1, nullptr);
+    WaitForSingleObject(j.done, INFINITE);
+    CloseHandle(j.done);
+    return true;
+}
+
 static HRESULT GhTryCreateGPS(GhGpsFn fn, ID3D12Device* dev,
                               const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d,
                               REFIID riid, void** pp, DWORD* faultCode)
@@ -9409,7 +9517,19 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
 
     DWORD fault = 0;
     ++depth;
-    HRESULT hr = GhTryCreateGPS(orig, self, use, riid, pp, &fault);
+    HRESULT hr = E_FAIL;
+    {
+        // #181 cell I: same call, one dedicated loader thread.
+        struct Ctx { GhGpsFn fn; ID3D12Device* dev;
+                     const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d;
+                     const IID* riid; void** pp; DWORD* fault; HRESULT hr; }
+            ctx{ orig, self, use, &riid, pp, &fault, E_FAIL };
+        auto run = [](void* v){ Ctx* c = (Ctx*)v;
+            c->hr = GhTryCreateGPS(c->fn, c->dev, c->d, *c->riid, c->pp, c->fault); };
+        if (!GhPsoMarshal() || !GhPsoMarshalRun(run, &ctx))
+            ctx.hr = GhTryCreateGPS(orig, self, use, riid, pp, &fault);
+        hr = ctx.hr;
+    }
     --depth;
     if (serialize) ReleaseSRWLockExclusive(&g_psoLock);
     if (fault){
@@ -9597,7 +9717,20 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
 
     const bool serialize = GhPsoSerialize();
     if (serialize) AcquireSRWLockExclusive(&g_psoLock);
-    HRESULT hr = orig(self, d, riid, pp);
+    HRESULT hr = E_FAIL;
+    {
+        // #181 cell I: same call, one dedicated loader thread.
+        typedef HRESULT (__stdcall* CpsFn)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*,
+                                           REFIID, void**);
+        struct Ctx { CpsFn fn; ID3D12Device* dev;
+                     const D3D12_COMPUTE_PIPELINE_STATE_DESC* d;
+                     const IID* riid; void** pp; HRESULT hr; }
+            ctx{ (CpsFn)orig, self, d, &riid, pp, E_FAIL };
+        auto run = [](void* v){ Ctx* c = (Ctx*)v; c->hr = c->fn(c->dev, c->d, *c->riid, c->pp); };
+        if (!GhPsoMarshal() || !GhPsoMarshalRun(run, &ctx))
+            ctx.hr = orig(self, d, riid, pp);
+        hr = ctx.hr;
+    }
     if (serialize) ReleaseSRWLockExclusive(&g_psoLock);
     {
         static volatile LONG cpsIdx = 0;
@@ -10061,6 +10194,7 @@ static void GhPsoReplay(ID3D12Device* dev)
     }
     const unsigned maxN = GhCfgNum(L"gh_dxil_soak_max.txt", "GH_DXIL_SOAK_MAX", 0);
     const unsigned reps = GhCfgNum(L"gh_dxil_soak_reps.txt", "GH_DXIL_SOAK_REPS", 1);
+    GhSoakAllocHeaps(dev);
 
     // Root signatures, rebuilt once per distinct serialized blob and through the
     // same rewrite the guest's own call went through.
