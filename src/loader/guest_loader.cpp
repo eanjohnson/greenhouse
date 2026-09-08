@@ -21200,6 +21200,12 @@ static bool GhDriverCommitFault(EXCEPTION_POINTERS* ep)
 {
     static const long budget = (long)GhCfgNum(L"gh_drv_commit.txt", "GH_DRV_COMMIT", 0);
     if (budget <= 0) return false;
+    // Proof of life. Without it a run with zero DRVCOMMIT lines is ambiguous
+    // between "no reserve fault happened" and "the knob never loaded", and a
+    // cell whose knob left no trace is void rather than negative.
+    static volatile LONG armed = 0;
+    if (InterlockedExchange(&armed, 1) == 0)
+        Diag("DRVCOMMIT armed budget=" + std::to_string(budget) + " pages");
     if (ep->ExceptionRecord->ExceptionCode != (DWORD)EXCEPTION_ACCESS_VIOLATION) return false;
     if (ep->ExceptionRecord->NumberParameters < 2) return false;
     if (InterlockedCompareExchange(&g_drvCommitted, 0, 0) >= budget) return false;
@@ -21223,8 +21229,17 @@ static bool GhDriverCommitFault(EXCEPTION_POINTERS* ep)
     if (VirtualQuery((LPCVOID)tgt, &mbi, sizeof mbi) != sizeof mbi) return false;
     if (mbi.State != MEM_RESERVE || mbi.Type != MEM_PRIVATE) return false;   // not our case
 
+    // Commit ONE PAGE, not the whole uncommitted run. The first cut committed
+    // mbi.RegionSize and worked 75 times -- every hole was a page or two -- and
+    // then met a 4 GB reservation whose first page had been read: asking for
+    // 0x100000000 got ERROR_COMMITMENT_LIMIT (1455) with 1.2 GB of commit left,
+    // and the handler's own policy, not the driver, is what could not be
+    // satisfied. The driver wants the page it touched.
+    SYSTEM_INFO si{}; GetSystemInfo(&si);
+    const SIZE_T pg = si.dwPageSize ? si.dwPageSize : 4096;
     const SIZE_T hole = mbi.RegionSize;
-    void* got = VirtualAlloc(mbi.BaseAddress, hole, MEM_COMMIT, PAGE_READWRITE);
+    void* page = (void*)(tgt & ~(uintptr_t)(pg - 1));
+    void* got = VirtualAlloc(page, pg, MEM_COMMIT, PAGE_READWRITE);
     const DWORD err = got ? 0 : GetLastError();
     const LONG k = InterlockedIncrement(&g_drvCommitted);
     // Plain Win32 only in here: this runs on an arbitrary driver thread inside a
@@ -21234,6 +21249,7 @@ static bool GhDriverCommitFault(EXCEPTION_POINTERS* ep)
     Diag("DRVCOMMIT " + std::to_string((long)k) + "/" + std::to_string(budget) +
          " " + base + "+" + Hex((uint64_t)((uintptr_t)ep->ExceptionRecord->ExceptionAddress - (uintptr_t)mod)) +
          " target=" + Hex((uint64_t)tgt) +
+         " page=" + Hex((uint64_t)(uintptr_t)page) +
          " hole=" + Hex((uint64_t)hole) +
          " alloc=" + Hex((uint64_t)(uintptr_t)mbi.AllocationBase) +
          (got ? " COMMITTED" : " VirtualAlloc FAILED err=" + std::to_string((unsigned long)err)) +
@@ -21245,10 +21261,6 @@ static bool GhDriverCommitFault(EXCEPTION_POINTERS* ep)
 
 static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
 {
-    // #177: a one-page commit hole inside the driver's own compiler arena. Ahead
-    // of everything else for the same reason GhLazyFault is: it is a memory
-    // repair, not a crash.
-    if (GhDriverCommitFault(ep)) return EXCEPTION_CONTINUE_EXECUTION;
     // #145 demand-commit, first and cheapest. It has to run ahead of the
     // reentrancy guard below, or a first touch taken inside one of our own
     // probes would be handed to the crash reporter as a genuine fault.
@@ -21256,6 +21268,11 @@ static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
         ep->ExceptionRecord->NumberParameters >= 2 &&
         GhLazyFault((void*)ep->ExceptionRecord->ExceptionInformation[1]))
         return EXCEPTION_CONTINUE_EXECUTION;
+    // #177: a one-page commit hole inside the driver's own compiler arena. Also a
+    // memory repair rather than a crash, so it belongs up here -- but AFTER the
+    // demand-commit pager, which takes over a million faults in a run and must
+    // not pay for a module lookup on every one of them.
+    if (GhDriverCommitFault(ep)) return EXCEPTION_CONTINUE_EXECUTION;
     // #154, also ahead of the reentrancy guard: an invalid-op trap is not a
     // crash, and it returns the thread straight back to the faulting instruction.
     if (GhFpTrapHandle(ep)) return EXCEPTION_CONTINUE_EXECUTION;
@@ -22261,6 +22278,12 @@ static void GhPollPokeRequest()
 // Returns the stack as one line rather than logging it, so the caller can
 // suppress repeats -- the useful signal is the LAST distinct stack before the
 // app disappears, and an unfiltered per-tick log buries it.
+// #178. The guest worker's stack extent, published by the worker itself the
+// moment it starts (GetCurrentThreadStackLimits reports the whole RESERVATION,
+// not the currently-committed part, which is what we need to measure headroom
+// against). Read by the liveness sampler below.
+static uintptr_t g_guestStackLow = 0, g_guestStackHigh = 0;
+
 static std::string GhLiveStack(DWORD tid)
 {
     HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
@@ -22274,6 +22297,15 @@ static std::string GhLiveStack(DWORD tid)
     CloseHandle(h);
     if (!ok) return "";
     std::string line;
+    // #178. Stack headroom, for the guest worker only. A run that ends with the
+    // whole app gone and NOT ONE exception logged is what a stack overflow looks
+    // like from in here: our VEH allocates a std::string and takes a lock, so on
+    // the guard page it faults again and the process is torn down before a line
+    // can be written. If that is what SC_DLL is doing to us, this number walks
+    // down to zero across the samples; if it is flat, the theory is dead.
+    if (tid == g_guestWorkerTid && g_guestStackLow && rsp > g_guestStackLow)
+        line += " free=" + std::to_string((unsigned long long)(((uintptr_t)rsp - g_guestStackLow) >> 10)) +
+                "K/" + std::to_string((unsigned long long)((g_guestStackHigh - g_guestStackLow) >> 20)) + "M";
     for (int i = 0; i < nf && i < 20; ++i) line += " | " + NameForCodeAddr(frames[i]);
     return line;
 }
@@ -25192,6 +25224,53 @@ static void ResetGuestForRelaunch()
 #include "launcher_ui.h"
 
 // ---------------------------------------------------------------------------
+// #178. The guest worker thread, and how big its stack is.
+// ---------------------------------------------------------------------------
+// This was `std::thread`, which takes the stack size out of OUR exe header --
+// 1 MB. Every full-corpus Tsushima run ends the same way: all 234 graphics and
+// all 97 compute pipelines are CREATED, the game keeps warming its 16,192-entry
+// default.pso, and then at around 240 driver compiles the ENTIRE app vanishes
+// with no exception logged at all. Exactly one AV is ever recorded in a run
+// (umd12ddi+0x3732D, r14=0) and the driver's own handler swallows it -- PSOs are
+// still created afterwards -- so that one is a marker, not the killer.
+//
+// A guard-page hit on this thread would look precisely like this from in here,
+// because our own VEH cannot survive it: it allocates and locks before it writes.
+// gh_guest_stack_mb reserves a bigger stack so the theory can be tested; 0 keeps
+// std::thread's default, so the knob is a probe and not a silent change.
+static DWORD WINAPI GhGuestWorkerProc(LPVOID)
+{
+    g_guestWorkerTid = GetCurrentThreadId();
+    ULONG_PTR lo = 0, hi = 0;
+    GetCurrentThreadStackLimits(&lo, &hi);
+    g_guestStackLow = (uintptr_t)lo; g_guestStackHigh = (uintptr_t)hi;
+    Diag("GUESTSTACK tid=" + std::to_string((unsigned long)g_guestWorkerTid) +
+         " low=" + Hex((uint64_t)lo) + " high=" + Hex((uint64_t)hi) +
+         " reserve=" + std::to_string((unsigned long long)((hi - lo) >> 20)) + "MB");
+    GhProbePsPcDeps();          // #165, knob-gated
+    RunGuest();
+    g_guestDone = true;
+    return 0;
+}
+
+static void GhStartGuestWorker()
+{
+    const unsigned mb = GhCfgNum(L"gh_guest_stack_mb.txt", "GH_GUEST_STACK_MB", 0);
+    if (mb){
+        // STACK_SIZE_PARAM_IS_A_RESERVATION: reserve the address space, commit on
+        // demand. A 64 MB reservation costs nothing until the compiler goes deep.
+        HANDLE h = CreateThread(nullptr, (SIZE_T)mb << 20, &GhGuestWorkerProc, nullptr,
+                                STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+        if (h){ CloseHandle(h); return; }
+        Diag("GUESTSTACK CreateThread(" + std::to_string(mb) +
+             "MB) failed err=" + std::to_string((unsigned long)GetLastError()) +
+             " -- falling back to the default stack");
+    }
+    std::thread([]{ GhGuestWorkerProc(nullptr); }).detach();
+}
+
+
+// ---------------------------------------------------------------------------
 // #165. Keep the swapchain alive while the guest has not presented yet.
 // ---------------------------------------------------------------------------
 // Ghost of Tsushima spends tens of seconds loading before its first Present,
@@ -25429,12 +25508,7 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
                      " SSE invalid-operation faults, then re-mask and run on");
             g_guestSessionLive = true;
             g_guestRunning = true;
-            std::thread([]{
-                g_guestWorkerTid = GetCurrentThreadId();
-                GhProbePsPcDeps();          // #165, knob-gated
-                RunGuest();
-                g_guestDone = true;
-            }).detach();
+            GhStartGuestWorker();
             // #165. Time every step of the pump. A step that never blocks never
             // prints, so this is silent on a healthy run and names the culprit on
             // the run where the UI thread goes dark for eleven seconds and the
