@@ -2,9 +2,10 @@
  "note": "Backported DXIL for Ghost of Tsushima (app 2215430). Keys are the ORIGINAL SM 6.6 container digest (bytes [4:20]); the loader looks up gh_lo_<key>.bin by that key, so filenames must not be renamed.",
  "lowered": {
   "count": 380,
-  "what": "the complete corpus: stage this for maximum coverage",
+  "what": "the complete corpus: stage this for maximum coverage. Only ops 111 waveGetLaneIndex and 113 waveAnyTrue remain, both measured CREATED by #175.",
   "all_pass_dxv": true,
   "wave_ops_remaining": [
+   "111",
    "113"
   ]
  },
@@ -341,7 +342,7 @@
  },
  "approximate": {
   "count": 55,
-  "what": "lowered/ holds a WIDTH-1 rewrite of these; exact/ holds the un-approximated original, which is correct but contains wave ops the console has not been measured on (or has been measured to die on). Swap one back in per #175 sweep cell that passes.",
+  "what": "lowered/ holds a LANE-SOLO rewrite of these; exact/ holds the un-approximated original, which is correct but contains wave ops the console has not been measured on (or has been measured to die on). Swap one back in per #175 sweep cell that passes.",
   "names": [
    "gh_lo_027d28e809755df0c3830e61c6357b14.bin",
    "gh_lo_0ab0e824482a2c67aafa73ecc61596fd.bin",
@@ -398,6 +399,7 @@
    "gh_lo_f771c4a531b03baa2a877db1d5c51af1.bin",
    "gh_lo_fa29971ed902b2fad02cec2d64a0052a.bin",
    "gh_lo_fd7eab875210f0ac53e217a0e59b928b.bin"
-  ]
+  ],
+  "model": "lane-solo: each lane behaves as if it were alone in the wave, but the machine keeps its real width (64). WaveGetLaneCount folds to 64, WaveIsFirstLane becomes WaveGetLaneIndex()==0, and every cross-lane read or reduction yields the lane's own value. Exact for the wave-aggregated atomic; wrong where a reduction is used for its value. Superseded the earlier width-1 model, which folded the width to 1 as well and made 15 of these blobs index LDS out of bounds (#176)."
  }
 }

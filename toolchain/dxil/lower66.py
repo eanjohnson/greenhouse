@@ -203,8 +203,13 @@ def lower_cs_implicit_lod(text, report=None):
 
 
 _W1_COPY  = {117, 118, 119, 120, 122, 123}   # cross-lane read/reduce -> own value
-_W1_CONST = {110: 'true', 111: '0', 112: '1', 115: 'true', 136: '0'}
-_W1_PASS  = {113, 114}                       # any/all over one lane -> the condition
+_W1_CONST = {115: 'true', 136: '0'}
+_W1_PASS  = {114}                            # all-true over one lane -> the condition
+_W1_KEEP  = {111, 113}
+# Left alone on purpose. 111 waveGetLaneIndex and 113 waveAnyTrue are both
+# measured CREATED (#175), and both keep their real meaning under this model:
+# the lane still has an index and a wave still has other lanes. 112 is folded to
+# the machine's real width by fold_lane_count, which must run first.
 _WAVE_CALL = re.compile(
     r'^(\s*)(%[\w.]+) = call ([%\w.]+) @dx\.op\.(\w+)(?:\.[\w.]+)?\('
     r'i32 (\d+)(.*?)\)\s*(;.*)?$')
@@ -253,6 +258,7 @@ def lower_wave1(text, report=None):
     """
     rep = report if report is not None else []
     alias, lines, structs, counts = {}, [], {}, {}
+    need111 = set()
 
     for line in text.split('\n'):
         m = _WAVE_CALL.match(line)
@@ -260,8 +266,24 @@ def lower_wave1(text, report=None):
             ind, dst, ret, name, op, rest, _c = m.groups()
             op = int(op)
             a = _args(rest)
+            if op in _W1_KEEP:
+                lines.append(line)          # measured CREATED; means what it says
+                continue
             counts[op] = counts.get(op, 0) + 1
-            if op in _W1_CONST:
+            if op == 110:
+                # WaveIsFirstLane -> WaveGetLaneIndex() == 0, NOT the constant
+                # `true`. Constant-folding it makes every lane take the
+                # first-lane branch, and that branch is usually the one that
+                # writes the wave's result to LDS at index tid/waveWidth -- so
+                # with the width folded to its real value the index is right and
+                # exactly one thread stores, while `true` had all of them store
+                # OUT OF BOUNDS (measured: `[8 x i32]` indexed 0..63). Op 111 is
+                # measured CREATED, so this costs nothing.
+                lines.append('%s%s_li = call i32 @dx.op.waveGetLaneIndex(i32 111)'
+                             % (ind, dst))
+                lines.append('%s%s = icmp eq i32 %s_li, 0' % (ind, dst, dst))
+                need111.add(True)
+            elif op in _W1_CONST:
                 alias[dst] = _W1_CONST[op]
             elif op in _W1_PASS or op in _W1_COPY:
                 alias[dst] = a[0][1]
@@ -313,8 +335,18 @@ def lower_wave1(text, report=None):
             raise SystemExit('wave1: %s (ballot/match) is used other than by '
                              'extractvalue' % d)
 
-    text = re.sub(r'^declare [^\n]*@dx\.op\.(?:wave|quad)\w*(?:\.[\w.]+)?\([^\n]*\n',
-                  '', text, flags=re.M)
+    # Strip only the declares nothing calls any more. Blanket-stripping every
+    # wave declare was safe while the pass removed every wave call; now 111 and
+    # 113 survive, and one of them may have just been introduced.
+    def _drop(m):
+        name = m.group(1)
+        return '' if not re.search(r'call [^\n]*@dx\.op\.%s\b' % re.escape(name),
+                                   text) else m.group(0)
+    text = re.sub(r'^declare [^\n]*@dx\.op\.((?:wave|quad)\w*)(?:\.[\w.]+)?\([^\n]*\n',
+                  _drop, text, flags=re.M)
+    if need111 and not re.search(r'^declare i32 @dx\.op\.waveGetLaneIndex\(', text, re.M):
+        text = re.sub(r'^(declare )', r'declare i32 @dx.op.waveGetLaneIndex(i32) #0\n\n\1',
+                      text, count=1, flags=re.M)
     rep.append('  wave1 %s' % ', '.join(
         ('%d extractvalue' % n) if op == -1 else ('op %d x%d' % (op, n))
         for op, n in sorted(counts.items())))

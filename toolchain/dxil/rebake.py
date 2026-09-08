@@ -13,6 +13,11 @@ import lower, lower66, dxilhash
 
 DXC = os.environ['GH_DXC']
 SRC, DST = sys.argv[1], sys.argv[2]
+# The lane-solo rewrite keeps the machine's real wave width -- folding op 112 to
+# a literal is part of the same lowering, not an alternative to it (#176).
+WAVE = int(os.environ.get('GH_WAVE_SIZE') or 0)
+if not WAVE:
+    raise SystemExit('rebake needs GH_WAVE_SIZE (64 for this console)')
 env = dict(os.environ, LD_LIBRARY_PATH=os.path.join(DXC, 'lib'))
 run = lambda a: subprocess.run(a, capture_output=True, text=True, env=env)
 os.makedirs(DST, exist_ok=True)
@@ -25,7 +30,8 @@ for name in sorted(os.listdir(SRC)):
         print('%-24s DISASM FAILED' % name[6:22]); bad += 1; continue
     rep = []
     try:
-        text = lower66.lower_wave1(d.stdout, rep)
+        text = lower66.fold_lane_count(d.stdout, WAVE, rep)
+        text = lower66.lower_wave1(text, rep)
         text = lower66.lower_cs_implicit_lod(text, rep)
     except SystemExit as e:
         print('%-24s %s' % (name[6:22], e)); bad += 1; continue
@@ -39,10 +45,14 @@ for name in sorted(os.listdir(SRC)):
         print('%-24s %s' % (name[6:22], e)); bad += 1; continue
     v = run([os.path.join(DXC, 'bin', 'dxv'), dstp])
     left = run([os.path.join(DXC, 'bin', 'dxc'), '-dumpbin', dstp]).stdout
-    rem = sorted(set(re.findall(r'@dx\.op\.(?:wave|quad)\w*(?:\.[\w.]+)?\(i32 (\d+)', left)))
-    feat = 'WaveOps' in left
-    if v.returncode or rem or feat:
-        print('%-24s dxv=%d remaining=%s waveflag=%s' % (name[6:22], v.returncode, rem, feat))
+    # 111 waveGetLaneIndex and 113 waveAnyTrue are measured CREATED and are what
+    # the rewrite deliberately leaves (and, for 111, introduces). Anything else
+    # surviving is a pass that did not fire. The WaveOps shader flag stays set
+    # and is not a failure: #175's per-op table has CREATED shaders carrying it.
+    rem = sorted(set(re.findall(r'@dx\.op\.(?:wave|quad)\w*(?:\.[\w.]+)?\(i32 (\d+)', left))
+                 - {'111', '113'})
+    if v.returncode or rem:
+        print('%-24s dxv=%d remaining=%s' % (name[6:22], v.returncode, rem))
         bad += 1; continue
     ok += 1
     print('%-24s OK  %s' % (name[6:22], rep[0].strip()))

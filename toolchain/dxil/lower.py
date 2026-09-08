@@ -39,13 +39,17 @@ def lower_text(text, templates, report=None):
     # in place, where the back end will take the device down (#175).
     wave = int(os.environ.get('GH_WAVE_SIZE') or 0)
     text = lower66.fold_lane_count(text, wave, report) if wave else text
-    # GH_WAVE1=1 re-expresses the whole wave family as a one-lane wave, which is
-    # the only way past waveActiveOp/wavePrefixOp (#175) but is only faithful for
-    # the wave-aggregated-atomic idiom. Off by default, and never both: folding
-    # lane count to 64 and then pretending the wave is one lane contradict.
+    # GH_WAVE1=1 re-expresses the cross-lane family as if each lane were alone,
+    # which is the only way past waveActiveOp/wavePrefixOp (#175) but is only
+    # faithful for the wave-aggregated-atomic idiom. Off by default.
+    # GH_WAVE1 now REQUIRES the real width rather than contradicting it. The
+    # model is "each lane behaves as if it were alone", not "the wave is one lane
+    # wide": the machine's width still decides how a shader indexes LDS, and
+    # pretending it is 1 made 15 blobs write out of bounds (#176).
     if os.environ.get('GH_WAVE1') == '1':
-        if wave and wave != 1:
-            raise SystemExit('GH_WAVE1=1 contradicts GH_WAVE_SIZE=%d' % wave)
+        if not wave:
+            raise SystemExit('GH_WAVE1=1 needs GH_WAVE_SIZE (64 for this console): '
+                             'the lane-solo rewrite keeps the real wave width')
         text = lower66.lower_wave1(text, report)
     # The other 6.6-only thing a compute shader can do with a quad. Separate
     # knob: it costs mip selection in the shaders it touches.

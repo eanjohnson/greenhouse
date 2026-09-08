@@ -51,12 +51,15 @@ handle's type, and `lower66` is what collapses them.
 | knob | pass | what it costs |
 |---|---|---|
 | `GH_WAVE_SIZE=64` | `fold_lane_count` | nothing — the wave width is a constant on a fixed target |
-| `GH_WAVE1=1` | `lower_wave1` | exact for wave-aggregated atomics, **wrong** for reductions used as values |
+| `GH_WAVE1=1` | `lower_wave1` | exact for wave-aggregated atomics, **wrong** for reductions used as values. Requires `GH_WAVE_SIZE` |
 | `GH_CS_LOD0=1` | `lower_cs_implicit_lod` | mip selection in the compute shaders it touches |
 
-`GH_WAVE1=1` refuses to run with `GH_WAVE_SIZE=64`: a lane count of 64 inside a
-shader where everything else behaves as one lane is a contradiction, and it is
-exactly the corpus that chaining the two passes in the obvious order builds.
+`GH_WAVE1=1` **requires** `GH_WAVE_SIZE`. The model is "each lane behaves as if
+it were alone", not "the wave is one lane wide" -- the machine's real width still
+decides how a shader indexes LDS, so `WaveIsFirstLane()` lowers to
+`WaveGetLaneIndex() == 0` (op 111, measured CREATED) rather than to `true`.
+Folding the width to 1 as well made 15 blobs index an `[8 x i32]` LDS array with
+`tid` instead of `tid / 64` (#176).
 
 The reason any of this is needed is #175: the console's back end does not merely
 refuse some wave intrinsics, it **takes the device down at compile time** on
