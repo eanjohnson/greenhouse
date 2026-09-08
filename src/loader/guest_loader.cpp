@@ -21,6 +21,7 @@
 #include <ws2tcpip.h>
 #include <unknwn.h>          // must precede C++/WinRT to use classic COM interfaces (D3D/DXGI)
 #include <winrt/windows.applicationmodel.core.h>
+#include <winrt/windows.applicationmodel.h>   // #165: SuspendingEventArgs / Entered-LeavingBackgroundEventArgs
 #include <winrt/windows.foundation.h>
 #include <winrt/windows.foundation.collections.h>
 #include <winrt/windows.storage.h>
@@ -54,6 +55,7 @@
 #include <setjmp.h>
 #include <thread>
 #include <mutex>
+#include <map>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -121,6 +123,10 @@ static uint32_t     g_launcherSelectedApp = 0;   // Steam appid of the picked ro
 // the result of *its* call. CPython hit exactly this: a missing pyvenv.cfg came
 // back as EEXIST instead of ENOENT, so its `except FileNotFoundError` missed and
 // interpreter startup died. Save and restore around everything we do here.
+// #165. One process-wide clock so every timestamped diagnostic (PLM events, the
+// keep-alive presenter) is on the same axis as the run harness's poll table.
+static const ULONGLONG g_procT0 = GetTickCount64();
+static unsigned long long GhUpMs(){ return (unsigned long long)(GetTickCount64() - g_procT0); }
 static std::mutex g_diagRingMu;
 static std::deque<std::string> g_diagRing;   // last N Diag lines for the launcher crash screen
 static void Diag(const std::string& s)
@@ -131,6 +137,14 @@ static void Diag(const std::string& s)
         g_diagRing.push_back(s);
         while (g_diagRing.size() > 80) g_diagRing.pop_front();
     }
+#ifdef GH_RELEASE
+    // RELEASE BUILD. The in-memory ring above is kept -- the launcher's crash
+    // screen renders it -- but nothing is written to disk. The #158 diagnostic
+    // knobs all default to off and read their values through GhCfgNum, so with
+    // no log sink a release package produces no diagnostic output at all.
+    SetLastError(savedErr);
+    return;
+#else
     // HARD CAP. A guest stuck in a retry loop logs one line per attempt: a
     // steamclient CreateDirectory retry produced 944MB in about a minute and made
     // the log unreadable over WDP (a whole-file GET simply hangs). The cap keeps
@@ -182,6 +196,7 @@ static void Diag(const std::string& s)
         CloseHandle(h);
     }
     SetLastError(savedErr);
+#endif  // GH_RELEASE
 }
 static std::vector<std::string> DiagRingCopy()
 {
@@ -199,6 +214,14 @@ static bool      g_guestExited   = false;
 static volatile bool g_guestCrashed = false;
 static std::string   g_guestFailWhy;              // human reason for the launcher crash screen
 static DWORD         g_guestWorkerTid = 0;
+// #165. The shell kills the app ~30 s in, and the keep-alive presenter stops at
+// frame #4 (t~16.6 s) in EVERY run -- so it is the UI thread that goes quiet,
+// not the guest, and the live sampler has never once looked at it.
+static DWORD         g_uiTid = 0;
+// #163. Last thread to call into our D3D12 hooks. A liveness trace that can only
+// name the guest's main thread is nearly useless for a renderer: the thread that
+// matters is whichever one last touched the device.
+static volatile LONG g_lastD3DTid = 0;
 static std::string g_capturedOut;                 // guest stdout/stderr text
 
 // A child spawned via the in-process CreateProcess surrogate runs on its own
@@ -333,14 +356,57 @@ static void FinishGuestSession();          // defined with RunGuest, below
 static bool ReadWholeFile(const std::wstring& path, std::vector<uint8_t>& out, bool optional = false);  // defined below; RegHiveLoad needs it
 static void DiagGuestBacktrace(const char* who);   // defined with the module ranges, below
 static std::string NameForCodeAddr(uintptr_t a);
+static void GhDumpModules(const char* why);
+static std::string GhNearestExport(uintptr_t a);
 static bool HandleGuestTracepoint(EXCEPTION_POINTERS* ep);   // defined with them too
 static void GhLogMemoryBudget(const char* where);            // #140 memory sampling
 static std::string GhGpuProgress();                          // #158 submissions + fences
 static void GhDrainInfoQueue();                              // #158 D3D12 validation stream
 static unsigned GhCfgNum(const wchar_t* file, const char* envName, unsigned dflt);  // defined with the config helpers
+static void GhDdiInstall();   // #169 Stage 0: instrument the DDI caps path before any device exists
+static void GhDdiPatchShaderModelCap();   // #169 Stage 1: must run before the FIRST D3D12 device
+static unsigned GhDsNoGpu();              // #169: keep DirectStorage's DXIL out of the driver
+// #165. GhCfgNum CANNOT EXPRESS ZERO: it ends `return v ? v : dflt`, so a knob
+// file containing "0" is indistinguishable from a knob file that is absent.
+// Every knob whose default is 0 is unaffected -- which is most of them, which
+// is why this went unnoticed for the whole project. But ~25 knobs have a
+// NONZERO default (gh_selfmap, gh_present_sync, gh_sc_flip, gh_desc_win,
+// gh_copy_as_direct, the arena/lazy sizes, the whole gh_rttest_* family), and
+// NOT ONE OF THEM HAS EVER BEEN TURNABLE OFF from the harness. That is the
+// project's own documented bug class again -- a setting that cannot produce
+// its own line in the log has never been tested -- in its sharpest form yet:
+// the knob is uploaded, the harness prints it, the loader reads it, and the
+// value is then thrown away.
+//
+// GhCfgNumZ is the honest reader: dflt is used only when the value is ABSENT
+// (no env var, no file, no digits), never when it is present and zero.
+//
+// Deliberately NOT retrofitted onto the other callers. run27x.py uploads "0"
+// for every knob it is not explicitly told about, so switching them all at
+// once would silently zero gh_selfmap, gh_sc_buffers, gh_present_sync and the
+// rest in every run ever launched by the harness. Convert one knob at a time,
+// each with its own control cell.
+static unsigned GhCfgNumZ(const wchar_t* file, const char* envName, unsigned dflt);
 static void GhCheckDeviceRemoved(const char* where,
                                  ID3D12Device* dev = nullptr); // #158 removal + DRED
 static std::string GhLazyStats();                             // #145 demand-commit counters
+static void GhIssuedPairsDump(const char* when);              // #158 executed-barrier tally
+static void GhBarrFlushPending(ID3D12GraphicsCommandList* self); // #158 coalescing
+// #158 one entry of the game's captured frame program; replayed by GhRtTest.
+struct GhProgEnt { void* res; UINT sub; unsigned before, after; };
+static const GhProgEnt* GhProgCap(LONG* n);
+static void GhRtTest(ID3D12Device* dev0 = nullptr,
+                     ID3D12CommandQueue* q0 = nullptr);        // #158 standalone barrier repro
+static void* GhCqOrig(int slot);   // #158 original (unhooked) ID3D12CommandQueue vtable entry
+static ID3D12Resource* GhBarrCensusRes(unsigned i, unsigned* n, bool pairOnly); // #158 the game's own surfaces
+static void GhLogMemoryBudget(const char* where);             // #158 memory vs. barrier count
+static void GhRtAuditRtv(void* res);                          // #158 RT audit
+static void GhCommitRtStats(const char* when);                // #158 aliasing placements
+static void GhCommitRtAllStats(const char* when);             // #158 transitioning RTs -> committed
+static void GhCoreHeapStats(const char* when);                 // #158 D3D12Core private-heap growth
+static void GhCoreHeapBigDump(const char* when);               // #158 large-request ring
+static void GhSecStats(const char* when);                      // #158 section/mapping traffic (mode 4)
+static void GhSecBigDump(const char* when);                    // #158 section ring (mode 4)
 extern volatile bool g_guestDone;
 
 // A guest's exit() terminates the guest WORKER THREAD rather than longjmp-ing
@@ -614,8 +680,31 @@ static void EnsureParentOf(const std::wstring& realFile){
 }
 
 static bool g_vfsTrace = true;
+// #165. The file-redirection trace is 82% of the whole diag -- 1542 lines and
+// 364 KB in a 20-second Tsushima startup -- and every line is its own
+// CreateFile/Write/Close on the console's storage, on whichever guest thread
+// happened to touch a file. That is real time taken out of a startup the shell
+// kills at ~30 s. It has been hard-wired on since it was written, so its cost
+// has never once been measured. Default stays 1 so nothing about an existing
+// run changes; gh_vfs_trace=0 buys the guest the time back.
+//
+// GhCfgNumZ, not GhCfgNum: with a default of 1 this knob is exactly the case
+// GhCfgNum cannot express, and run 53 proved it -- the harness uploaded 0, the
+// harness printed `gh_vfs_trace.txt = 0`, and the diag still came back with
+// 1176 VFS lines. Note the consequence: run27x.py writes "0" for every knob it
+// is not told about, so from this build on the trace is OFF in harness runs
+// unless a cell asks for it, and ON for a hand launch with no file staged.
+static bool GhVfsTraceOn(){
+    static const bool on = GhCfgNumZ(L"gh_vfs_trace.txt", "GH_VFS_TRACE", 1) != 0;
+    static const bool said = [](){
+        Diag(std::string("VFSTRACE ") + (on ? "on" : "off"));
+        return true;
+    }();
+    (void)said;
+    return on;
+}
 static void VfsTrace(const char* api, const wchar_t* g, const std::wstring& r){
-    if(!g_vfsTrace) return;
+    if(!g_vfsTrace || !GhVfsTraceOn()) return;
     std::wstring gw(g ? g : L"");
     std::string gg(gw.begin(), gw.end());
     std::string rr(r.begin(), r.end());
@@ -931,6 +1020,81 @@ static BOOL WINAPI Hook_DeleteFileW(LPCWSTR a)
     return g_realDeleteFileW(pa);
 }
 
+// #163. A UWP app container runs with STRICT HANDLE CHECKS on, and that turns a
+// harmless third-party bug into a fatal one: where a desktop process gets FALSE
+// and ERROR_INVALID_HANDLE back from a call on a stale handle, the kernel here
+// RAISES STATUS_INVALID_HANDLE through KiRaiseUserExceptionDispatcher. Ghost of
+// Tsushima never got past it -- dstorage.dll calls GetFileType on a bad handle
+// inside its own DllMain, the raise found no handler anywhere on the stack, and
+// the app parked forever in the unhandled-exception path until the OS killed it:
+//
+//   LoadLibraryExW -> LdrLoadDll -> DllMain(dstorage.dll)
+//     dstorage+0x166AF .. +0xD73D -> KERNELBASE!GetFileType+0x79
+//       KiRaiseUserExceptionDispatcher -> RtlRaiseException 0xC0000008
+//
+// Catching the raise and returning what desktop Windows returns is the whole fix.
+// Do NOT try to pre-validate the handle instead: every user-mode way to ask "is
+// this handle live?" goes through the same kernel check and would raise as well.
+// This is a class, not a single call -- any handle-taking Win32 function a
+// third-party DLL pokes with a stale handle behaves this way in the container --
+// so if another one turns up, guard it here the same way.
+typedef DWORD (WINAPI* GetFileType_t)(HANDLE);
+static GetFileType_t g_realGetFileType = nullptr;
+// No C++ objects in a function with __except.
+static DWORD GhGetFileTypeGuarded(HANDLE h, int* raised)
+{
+    __try { *raised = 0; return g_realGetFileType(h); }
+    __except (GetExceptionCode() == (DWORD)0xC0000008 /*STATUS_INVALID_HANDLE*/
+              ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        *raised = 1; return FILE_TYPE_UNKNOWN;
+    }
+}
+static DWORD WINAPI Hook_GetFileType(HANDLE h)
+{
+    int raised = 0;
+    const DWORD t = g_realGetFileType ? GhGetFileTypeGuarded(h, &raised) : FILE_TYPE_UNKNOWN;
+    if (raised){
+        static LONG n = 0;
+        if (InterlockedIncrement(&n) <= 8)
+            Diag("HOOK GetFileType: container raised STATUS_INVALID_HANDLE for h=" +
+                 Hex((uintptr_t)h) + " -- returning FILE_TYPE_UNKNOWN as desktop would");
+        SetLastError(ERROR_INVALID_HANDLE);
+    }
+    return t;
+}
+
+// #163. Where does a bad handle come from in the first place? Almost always the
+// CRT: __acrt_initialize_stdio asks GetStdHandle for the three standard handles
+// and calls GetFileType on each to decide if it is a console. A UWP container has
+// no standard handles, but GetStdHandle here does not answer NULL -- it answers a
+// stale value that looks plausible, and the CRT dutifully probes it. The CRT
+// already skips NULL and INVALID_HANDLE_VALUE, so answering NULL is both the
+// truth and the thing that stops every future DllMain walking into the same trap.
+// Run this BEFORE any guest DLL is loaded.
+static void GhFixStdHandles()
+{
+    if (!g_realGetFileType) return;
+    static const struct { DWORD id; const char* name; } kStd[] = {
+        { (DWORD)STD_INPUT_HANDLE,  "stdin"  },
+        { (DWORD)STD_OUTPUT_HANDLE, "stdout" },
+        { (DWORD)STD_ERROR_HANDLE,  "stderr" },
+    };
+    for (const auto& e : kStd){
+        HANDLE h = GetStdHandle(e.id);
+        if (!h || h == INVALID_HANDLE_VALUE) continue;
+        int raised = 0;
+        const DWORD t = GhGetFileTypeGuarded(h, &raised);
+        if (raised){
+            SetStdHandle(e.id, nullptr);
+            Diag(std::string("STDHANDLE ") + e.name + " = " + Hex((uintptr_t)h) +
+                 " RAISES STATUS_INVALID_HANDLE -- set to NULL");
+        } else {
+            Diag(std::string("STDHANDLE ") + e.name + " = " + Hex((uintptr_t)h) +
+                 " type=" + Hex((uint32_t)t) + " ok");
+        }
+    }
+}
+
 static void InstallFileHooks(){
     if (g_realCreateFileW) return;   // already planted; a second install would hook the hook
     InstallOneHook("CreateFileW", (void*)&Hook_CreateFileW, (void**)&g_realCreateFileW);
@@ -949,6 +1113,18 @@ static void InstallFileHooks(){
             Diag("HOOK NtOpenFile installed @ " + Hex((uint64_t)po));
         else
             Diag("HOOK NtOpenFile: install FAILED");
+    }
+    InstallOneHook("GetFileType", (void*)&Hook_GetFileType, (void**)&g_realGetFileType);
+    if (!g_realGetFileType){
+        // The prologue decoder cannot always steal 14 bytes. That only costs us
+        // the process-wide interception; the bed table below still routes every
+        // guest-owned module's GetFileType through Hook_GetFileType, and that
+        // needs a real function to forward to.
+        HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
+        if (!kb) kb = GetModuleHandleW(L"kernel32.dll");
+        g_realGetFileType = kb ? (GetFileType_t)GetProcAddress(kb, "GetFileType") : nullptr;
+        Diag(std::string("HOOK GetFileType: no inline hook; bed fallback ") +
+             (g_realGetFileType ? "armed" : "UNAVAILABLE"));
     }
     InstallOneHook("MoveFileExW", (void*)&Hook_MoveFileExW, (void**)&g_realMoveFileExW);
     InstallOneHook("DeleteFileW", (void*)&Hook_DeleteFileW, (void**)&g_realDeleteFileW);
@@ -989,22 +1165,71 @@ static BOOL WINAPI Bed_ReplaceFileW(LPCWSTR replaced, LPCWSTR replacement, LPCWS
     return r; }
 static DWORD WINAPI Bed_GetFileAttributesW(LPCWSTR path){
     std::wstring real = MapToReal(path); DWORD a = GetFileAttributesW(real.c_str());
-    if (path){ std::wstring g(path); Diag("GetFileAttributesW " + std::string(g.begin(),g.end()) + (a==INVALID_FILE_ATTRIBUTES?" MISSING":" ok")); }
+    if (path && GhVfsTraceOn()){ std::wstring g(path); Diag("GetFileAttributesW " + std::string(g.begin(),g.end()) + (a==INVALID_FILE_ATTRIBUTES?" MISSING":" ok")); }
     return a; }
 static BOOL WINAPI Bed_SetFileAttributesW(LPCWSTR path, DWORD a){ return SetFileAttributesW(MapToReal(path).c_str(), a); }
 static BOOL WINAPI Bed_CreateHardLinkW(LPCWSTR link, LPCWSTR target, LPSECURITY_ATTRIBUTES sa){
     std::wstring rl=MapToReal(link); EnsureParentOf(rl); return CreateHardLinkW(rl.c_str(), MapToReal(target).c_str(), sa); }
-static HANDLE WINAPI Bed_FindFirstFileW(LPCWSTR pattern, LPWIN32_FIND_DATAW fd){
-    // Split trailing wildcard component; map the directory, keep the pattern.
-    std::wstring p(pattern); for(auto&c:p) if(c==L'/')c=L'\\';
+// Split the trailing wildcard component off a search pattern, map the directory
+// through the VFS and put the pattern back. Shared by every Find bed so the A,
+// W and Ex forms cannot disagree about where a directory lives.
+static std::wstring MapFindPattern(LPCWSTR pattern){
+    std::wstring p(pattern ? pattern : L""); for(auto&c:p) if(c==L'/')c=L'\\';
     size_t s = p.find_last_of(L'\\');
     std::wstring dir = (s==std::wstring::npos)? g_vCwd : p.substr(0,s);
     std::wstring pat = (s==std::wstring::npos)? p : p.substr(s+1);
-    std::wstring realDir = MapToReal(dir.c_str());
-    std::wstring realPat = realDir + L"\\" + pat;
+    return MapToReal(dir.c_str()) + L"\\" + pat;
+}
+static HANDLE WINAPI Bed_FindFirstFileW(LPCWSTR pattern, LPWIN32_FIND_DATAW fd){
+    std::wstring realPat = MapFindPattern(pattern);
     HANDLE h = FindFirstFileW(realPat.c_str(), fd);           // returns filenames only; no translation needed
     VfsTrace("FindFirstFileW", pattern, realPat);
     return h;                                                 // FindNextFileW/FindClose pass through to real
+}
+static HANDLE WINAPI Bed_FindFirstFileExW(LPCWSTR pattern, FINDEX_INFO_LEVELS level, LPVOID fd,
+                                          FINDEX_SEARCH_OPS op, LPVOID filter, DWORD flags){
+    std::wstring realPat = MapFindPattern(pattern);
+    HANDLE h = FindFirstFileExW(realPat.c_str(), level, fd, op, filter, flags);
+    VfsTrace("FindFirstFileExW", pattern, realPat);
+    return h;
+}
+// The ANSI Find family was a VFS hole. FindFirstFileA / FindFirstFileExA went
+// straight to the real kernel32, so a guest enumerating a virtual directory saw
+// the host filesystem and nothing of ours -- and no line in the log named the
+// call, which is the worse half: the search simply found nothing, silently.
+//
+// #164 is that shape. Ghost of Tsushima's PlayStation PC SDK runtime loader
+// enumerates <ProgramData>\Sony Interactive Entertainment Inc\PSPC_SDK\S22\*
+// with FindFirstFileExA to pick a version directory. The W half of the same
+// search (libScePad's) was bedded and worked; this one was not.
+//
+// WIN32_FIND_DATAA and ...W are identical up to cFileName, so the fixed part
+// copies straight across and only the two name fields need narrowing. The
+// HANDLE is an ordinary find handle either way, so the guest's own
+// FindNextFileA/FindClose keep working on it unchanged.
+static void FindDataWtoA(const WIN32_FIND_DATAW& w, LPWIN32_FIND_DATAA a){
+    if (!a) return;
+    std::memcpy(a, &w, offsetof(WIN32_FIND_DATAW, cFileName));
+    a->cFileName[0] = 0; a->cAlternateFileName[0] = 0;
+    WideCharToMultiByte(CP_ACP, 0, w.cFileName, -1, a->cFileName, MAX_PATH, nullptr, nullptr);
+    WideCharToMultiByte(CP_ACP, 0, w.cAlternateFileName, -1, a->cAlternateFileName, 14, nullptr, nullptr);
+}
+static HANDLE WINAPI Bed_FindFirstFileA(LPCSTR pattern, LPWIN32_FIND_DATAA fd){
+    wchar_t w[1024];
+    if (!pattern || !MultiByteToWideChar(CP_ACP,0,pattern,-1,w,1024)) return INVALID_HANDLE_VALUE;
+    WIN32_FIND_DATAW wd{};
+    HANDLE h = Bed_FindFirstFileW(w, &wd);
+    if (h != INVALID_HANDLE_VALUE) FindDataWtoA(wd, fd);
+    return h;
+}
+static HANDLE WINAPI Bed_FindFirstFileExA(LPCSTR pattern, FINDEX_INFO_LEVELS level, LPVOID fd,
+                                          FINDEX_SEARCH_OPS op, LPVOID filter, DWORD flags){
+    wchar_t w[1024];
+    if (!pattern || !MultiByteToWideChar(CP_ACP,0,pattern,-1,w,1024)) return INVALID_HANDLE_VALUE;
+    WIN32_FIND_DATAW wd{};
+    HANDLE h = Bed_FindFirstFileExW(w, level, &wd, op, filter, flags);
+    if (h != INVALID_HANDLE_VALUE) FindDataWtoA(wd, (LPWIN32_FIND_DATAA)fd);
+    return h;
 }
 static DWORD WINAPI Bed_GetCurrentDirectoryW(DWORD len, LPWSTR buf){
     DWORD need = (DWORD)g_vCwd.size();
@@ -1507,6 +1732,8 @@ static BOOL WINAPI Bed_SetFileSecurityW(LPCWSTR, SECURITY_INFORMATION, PSECURITY
 static const std::unordered_map<std::string, void*>& ShimTable();   // fwd
 static HMODULE LoadGuestDll(const char* dll);                       // fwd
 static void    RepublishGuestTls(const char* why);                  // fwd (see TLS section)
+static void    RunGuestTlsCallbacksForThread();                     // fwd (see TLS section)
+static std::wstring FindGuestSupportDll(const wchar_t* name);       // fwd (see support DLLs)
 
 // Runtime library loads get the same guest-directory fallback as the IAT ones.
 // DIAG (2026-08-03): trace steam* loads — hunting who resolves "steam_api64" for Mono.
@@ -1783,11 +2010,19 @@ static const DWORD  kGuestTlsIndex = 128;    // beyond any real loader assignmen
 static const size_t kTlsSlots      = 256;    // entries in the array we publish
 
 static bool     g_tlsActive    = false;
+// #126: which index the guest's _tls_index actually holds, and who owns the
+// array behind it. With a real index (a ghtlsN.dll donor, below) ntdll owns
+// TEB+0x58 and maintains our slot on every thread forever; every fake-array
+// path in this section -- install, republish, restore, and the VEH repair --
+// then stands down, because competing with ntdll is exactly what broke.
+static DWORD    g_tlsIndex    = kGuestTlsIndex;
+static bool     g_tlsReal     = false;
 static uint8_t* g_tlsTemplate  = nullptr;    // guest's TLS init image (in-image)
 static size_t   g_tlsRawSize   = 0;          // bytes to copy from the template
 static size_t   g_tlsTotalSize = 0;          // raw + SizeOfZeroFill
 static uint64_t g_tlsCallbacks = 0;          // VA of the callback array (or 0)
 static void**   g_tlsMainThreadSaved = nullptr;   // guest worker's original array
+static uint8_t* g_tlsImageBase = nullptr;        // set once the image can take callbacks
 
 // The guest TLS block published for the CALLING thread. Kept per-thread so the
 // array can be re-published without reallocating the block -- the guest has
@@ -1840,7 +2075,7 @@ static size_t ReadableEntries(void* p, size_t want)
 // exactly what killed curl's resolver threads and swallowed the guest's exit.)
 static bool InstallGuestTlsForThread(void*** savedOld = nullptr)
 {
-    if (!g_tlsActive) return true;
+    if (!g_tlsActive || g_tlsReal) return true;   // #126: ntdll is doing this for us
     HANDLE heap = GetProcessHeap();
 
     uint8_t* blk = (uint8_t*)HeapAlloc(heap, HEAP_ZERO_MEMORY, g_tlsTotalSize ? g_tlsTotalSize : 1);
@@ -1875,7 +2110,7 @@ static bool InstallGuestTlsForThread(void*** savedOld = nullptr)
 // far better trade than a teardown crash.
 static void RestoreThreadTls(void** old)
 {
-    if (!g_tlsActive || !old) return;
+    if (!g_tlsActive || g_tlsReal || !old) return;
     ((void**)NtCurrentTeb())[0x58 / sizeof(void*)] = old;
 }
 
@@ -1900,7 +2135,7 @@ static void RestoreThreadTls(void** old)
 // version, deliberately.
 static void RepublishGuestTls(const char* why)
 {
-    if (!g_tlsActive || !t_guestTlsBlock) return;
+    if (!g_tlsActive || g_tlsReal || !t_guestTlsBlock) return;
     void** teb = (void**)NtCurrentTeb();
     void** cur = (void**)teb[0x58 / sizeof(void*)];
 
@@ -1962,6 +2197,16 @@ static DWORD WINAPI GuestThreadStub(LPVOID p)
     delete (GuestThreadStart*)p;
     void** old = nullptr;
     InstallGuestTlsForThread(&old);
+    // The OS calls every TLS callback with DLL_THREAD_ATTACH on each new thread;
+    // we only ever ran them with DLL_PROCESS_ATTACH. Ghost of Tsushima's single
+    // callback tests `reason == DLL_THREAD_ATTACH` and returns immediately for
+    // anything else, so our process-attach pass did literally nothing. Run the
+    // real one here, where the context is a fresh thread and guest code is safe
+    // to enter -- deliberately NOT from InstallGuestTlsForThread, which the VEH
+    // repair below also calls and where running guest code would be reckless.
+    // (No DLL_THREAD_DETACH: a lazily repaired foreign thread could never get a
+    // matching one, and a leak is a better asymmetry than a half-kept contract.)
+    RunGuestTlsCallbacksForThread();
     GhFpTrapArmThisThread();
     DWORD rc = s.fn(s.arg);
     RestoreThreadTls(old);
@@ -1995,6 +2240,121 @@ static HANDLE WINAPI Bed_CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stack,
     return h;
 }
 
+// ---------------------------------------------------------------------------
+// #126: borrow a REAL TLS index instead of inventing one.
+//
+// ghtlsN.dll (corpus/shims/ghtls.cpp) is a DLL whose entire purpose is to own a
+// 16 KB __declspec(thread) reserve. LoadLibrary it and the OS assigns it a
+// genuine index, allocates a block at that index for every thread -- the ones
+// that already exist and every one created afterwards -- and, crucially, carries
+// the slot forward through every reallocation of ThreadLocalStoragePointer.
+// Point the guest's `_tls_index` at that index and the guest's TLS is simply
+// correct, maintained by the same code that maintains it for every other module
+// in the process. No republishing, no per-thread install, no VEH repair, no race
+// with ntdll -- because there is nothing left to race with.
+//
+// The block is bigger than the guest's template, so the guest's own offsets sit
+// inside it and the tail is spare. The donor's TLS callback seeds each new
+// thread from the guest template on DLL_THREAD_ATTACH; threads that predate the
+// load get no callback, so we walk the thread list once and seed them by TEB.
+//
+// The first 16 bytes of the block are the donor's own CRT TLS (_tls_start and
+// _Init_thread_epoch) and the seed overwrites them. That is deliberate and safe:
+// the guest counts offsets from the block base, and ghtls.cpp has no magic
+// statics, so nothing in the donor ever reads those bytes. GhTlsReserveOffset()
+// reports the number so a future toolchain change shows up in the log instead of
+// as a mystery.
+//
+// Returns false -- donor missing, too small, wrong exports -- and the legacy
+// fake-array path runs exactly as before. gh_no_real_tls=1 forces that path for
+// an A/B.
+static HMODULE                                       g_tlsDonor = nullptr;
+static BOOL (*g_tlsSeedBlock)(void*)                = nullptr;
+static LONG (*g_tlsSeedCount)(void)                 = nullptr;
+
+static bool TryRealGuestTls(unsigned slot)
+{
+    if (GhCfgNum(L"gh_no_real_tls.txt", "GH_NO_REAL_TLS", 0)) {
+        Diag("TLS: real-index donor disabled (gh_no_real_tls) -- using fake index "
+             + std::to_string(kGuestTlsIndex));
+        return false;
+    }
+    const std::wstring name = L"ghtls" + std::to_wstring(slot) + L".dll";
+    std::wstring path = FindGuestSupportDll(name.c_str());
+    if (path.empty()) { Diag("TLS: donor ghtls" + std::to_string(slot) + ".dll not staged"); return false; }
+
+    HMODULE h = LoadLibraryW(path.c_str());
+    if (!h) { Diag("TLS: donor LoadLibrary failed err=" + Hex(GetLastError())); return false; }
+
+    auto idxFn   = (ULONG (*)(void))   GetProcAddress(h, "GhTlsIndex");
+    auto capFn   = (unsigned (*)(void))GetProcAddress(h, "GhTlsCapacity");
+    auto offFn   = (unsigned (*)(void))GetProcAddress(h, "GhTlsReserveOffset");
+    auto setFn   = (BOOL (*)(const void*, unsigned, unsigned))GetProcAddress(h, "GhTlsSetTemplate");
+    auto seedFn  = (BOOL (*)(void*))   GetProcAddress(h, "GhTlsSeedBlock");
+    auto countFn = (LONG (*)(void))    GetProcAddress(h, "GhTlsSeedCount");
+    if (!idxFn || !capFn || !offFn || !setFn || !seedFn || !countFn) {
+        Diag("TLS: donor is missing exports -- falling back"); return false;
+    }
+
+    const unsigned cap = capFn();
+    if (g_tlsTotalSize > cap) {
+        Diag("TLS: donor reserve " + Hex((uint32_t)cap) + " < guest template " +
+             Hex((uint32_t)g_tlsTotalSize) + " -- falling back");
+        return false;
+    }
+    if (!setFn(g_tlsTemplate, (unsigned)g_tlsRawSize, (unsigned)g_tlsTotalSize)) {
+        Diag("TLS: donor refused the template -- falling back"); return false;
+    }
+
+    g_tlsDonor     = h;
+    g_tlsSeedBlock = seedFn;
+    g_tlsSeedCount = countFn;
+    g_tlsIndex     = idxFn();
+    g_tlsReal      = true;
+
+    Diag("STAGE=tls_real_index slot=" + std::to_string(slot) +
+         " index=" + std::to_string(g_tlsIndex) +
+         " reserve=" + Hex((uint32_t)cap) +
+         " reserve_off=" + Hex((uint32_t)offFn()) +
+         " total=" + Hex((uint32_t)g_tlsTotalSize));
+
+    // Threads that already exist never get a DLL_THREAD_ATTACH for a DLL loaded
+    // after them, but ntdll HAS given them a block -- that is what a real index
+    // buys. Seed them by hand, once.
+    typedef LONG (WINAPI *NtQIT)(HANDLE, int, void*, ULONG, ULONG*);
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    auto ntqit = ntdll ? (NtQIT)GetProcAddress(ntdll, "NtQueryInformationThread") : nullptr;
+    int seeded = 0, missed = 0;
+    if (ntqit) {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            THREADENTRY32 te{}; te.dwSize = sizeof(te);
+            const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+            if (Thread32First(snap, &te)) do {
+                if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+                HANDLE t = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+                if (!t) { ++missed; continue; }
+                struct { LONG ExitStatus; void* Teb; } tbi{};
+                void* blk = nullptr;
+                if (ntqit(t, 0 /*ThreadBasicInformation*/, &tbi, sizeof(tbi), nullptr) == 0 && tbi.Teb) {
+                    // Bounds-check before indexing: a thread whose array is
+                    // shorter than our index would otherwise hand back adjacent
+                    // heap, and we would memcpy the guest template onto it.
+                    void** arr = *(void***)((char*)tbi.Teb + 0x58);
+                    if (ReadableEntries(arr, g_tlsIndex + 1) > g_tlsIndex) blk = arr[g_tlsIndex];
+                }
+                if (blk && g_tlsSeedBlock(blk)) ++seeded; else ++missed;
+                CloseHandle(t);
+            } while (Thread32Next(snap, &te));
+            CloseHandle(snap);
+        }
+    }
+    Diag("STAGE=tls_real_seed existing_seeded=" + std::to_string(seeded) +
+         " no_block=" + std::to_string(missed) +
+         " total_seeds=" + std::to_string((long)g_tlsSeedCount()));
+    return true;
+}
+
 // Parse the guest's TLS directory, hand it an index, and set up this thread.
 // Must run after relocations (AddressOfIndex/AddressOfCallBacks are VAs).
 static void SetupGuestTls(uint8_t* base, IMAGE_NT_HEADERS64* nt)
@@ -2010,15 +2370,21 @@ static void SetupGuestTls(uint8_t* base, IMAGE_NT_HEADERS64* nt)
     g_tlsTotalSize = g_tlsRawSize + tls->SizeOfZeroFill;
     g_tlsCallbacks = tls->AddressOfCallBacks;
 
-    // Tell the guest which slot to look in. This is the variable its code loads
-    // as `_tls_index`; everything else follows from it.
-    if (tls->AddressOfIndex) *(DWORD*)tls->AddressOfIndex = kGuestTlsIndex;
-
     g_tlsActive = true;
     g_tlsMainThreadSaved = nullptr;
+
+    // #126: prefer a real OS index (slot 0 is the main image). Only if that is
+    // unavailable do we fall back to the fake array at kGuestTlsIndex.
+    if (!TryRealGuestTls(0)) g_tlsIndex = kGuestTlsIndex;
+
+    // Tell the guest which slot to look in. This is the variable its code loads
+    // as `_tls_index`; everything else follows from it.
+    if (tls->AddressOfIndex) *(DWORD*)tls->AddressOfIndex = g_tlsIndex;
+
     Diag("STAGE=tls_directory raw=" + Hex((uint32_t)g_tlsRawSize) +
          " zerofill=" + Hex((uint32_t)tls->SizeOfZeroFill) +
          " index_at=" + Hex((uint64_t)tls->AddressOfIndex) +
+         " index=" + std::to_string(g_tlsIndex) + (g_tlsReal ? " (real)" : " (fake)") +
          " callbacks=" + Hex(g_tlsCallbacks));
 
     if (!InstallGuestTlsForThread(&g_tlsMainThreadSaved)) g_tlsActive = false;
@@ -2032,7 +2398,18 @@ static void RunGuestTlsCallbacks(uint8_t* base)
     auto** cb = (PIMAGE_TLS_CALLBACK*)g_tlsCallbacks;
     int n = 0;
     for (; *cb; ++cb, ++n) (*cb)((PVOID)base, DLL_PROCESS_ATTACH, nullptr);
+    g_tlsImageBase = base;
     if (n) Diag("STAGE=tls_callbacks ran=" + std::to_string(n));
+}
+
+// The per-thread half of the same contract. Only legal once the image is fully
+// formed, which is what g_tlsImageBase records -- it is set by the process-attach
+// pass above, so a thread that starts before then simply skips its callbacks.
+static void RunGuestTlsCallbacksForThread()
+{
+    if (!g_tlsActive || !g_tlsCallbacks || !g_tlsImageBase) return;
+    auto** cb = (PIMAGE_TLS_CALLBACK*)g_tlsCallbacks;
+    for (; *cb; ++cb) (*cb)((PVOID)g_tlsImageBase, DLL_THREAD_ATTACH, nullptr);
 }
 
 // ===========================================================================
@@ -2056,7 +2433,14 @@ static void RunGuestTlsCallbacks(uint8_t* base)
 // ---------------------------------------------------------------------------
 using namespace winrt::Windows::UI::Core;
 
-static const UINT kGfxFrames = 2;
+// #158: this is now the ARRAY BOUND / maximum. The LIVE back-buffer count is
+// g_gfx.nFrames (gh_sc_buffers.txt, default 2) -- the swapchain shape is one of
+// the few things in the display path we configure, and it had never been varied.
+// #158: raised 4 -> 8 to let the back-buffer ladder be walked past 4. The count is
+// clamped to this, so before the raise gh_sc_buffers=5 silently ran as 4 -- a knob
+// that reads a value it cannot deliver, which is the bug class this project keeps
+// paying for. Eight is inside DXGI's flip-model limit of 16 and costs ~8 MB a buffer.
+static const UINT kGfxFrames = 8;
 struct Gfx
 {
     com_ptr<ID3D12Device>           d12;
@@ -2116,6 +2500,42 @@ struct Gfx
     bool                            blitReady = false;
     bool                            blitStandingReleased = false;
     D3D_FEATURE_LEVEL               d12Level = (D3D_FEATURE_LEVEL)0;
+    UINT                            nFrames = 2;   // live back-buffer count
+    // #158, gh_sc_guestq: true once the swapchain has been rebound to the guest's
+    // own queue, which also moves the blit onto that queue so ONE queue owns the
+    // whole display path.
+    bool                            scOnGuestQ = false;
+    // gh_sc_dedicated=1: give the swapchain a queue of its OWN, so that "owns the
+    // swapchain" and "submits the blit" stop being the same object. If the ~405
+    // budget follows one of them the role decomposes; if both are fatal, or neither,
+    // that is equally informative. scFence orders the blit (on queue) before the
+    // Present (on scQueue).
+    com_ptr<ID3D12CommandQueue>     scQueue;
+    com_ptr<ID3D12Fence>            scFence;
+    uint64_t                        scFenceV = 0;
+    // The BACK edge. scFence orders blit-before-Present; without the mirror of it
+    // the NEXT frame's blit on g_gfx.queue starts overwriting the back buffer that
+    // scQueue is still presenting. That race is what made the first split build
+    // render exactly one frame and then lose the device with reason 0x887A002B.
+    com_ptr<ID3D12Fence>            scPresFence;
+    uint64_t                        scPresV = 0;
+    // #158, the AGE cell. The full 2x2 showed that neither presenting nor the guest
+    // cross-fence makes g_gfx.queue fatal to dose -- with both off it still dies at
+    // 480 while a queue created moments earlier survives 8000. The two things left
+    // that separate them are (a) it was created at loader init, before the guest,
+    // and (b) it is the swapchain's owning queue even when Present is never called.
+    // spareQueue is created in the same breath as g_gfx.queue and then NEVER USED
+    // for anything: same age, no swapchain, no work. gh_rttest_useq=5 doses it.
+    // Dies -> age is the agent and the display path is out. Survives -> owning the
+    // swapchain is the agent, with presenting on it shown not to matter.
+    com_ptr<ID3D12CommandQueue>     spareQueue;
+    // #158, the reset test (gh_pool_reset). Rebuilding the swapchain mid-run needs
+    // the two things BuildBridgeOnUi held only as locals -- the factory it came
+    // from and the CoreWindow it is attached to -- plus the exact description, so
+    // the replacement is the same shape and the cell varies one thing only.
+    com_ptr<IDXGIFactory4>          factory;
+    com_ptr<IUnknown>               coreWindow;
+    DXGI_SWAP_CHAIN_DESC1           scDesc{};
     bool                            guest12 = false;
     // Software mouse-cursor overlay: two tiny solid bars forming a "+", copied into
     // the live back buffer each Present at g_kmCurX/Y. There is no hardware cursor
@@ -2136,6 +2556,11 @@ static CoreDispatcher g_dispatcher{ nullptr };   // set on the UI thread in App:
 // reference.
 static void BuildBridgeOnUi()
 {
+    // #169: the LAST point before the process's first D3D12 device exists. The
+    // guest never creates its own -- Bed_D3D12CreateDevice hands back this one --
+    // so the shader-model cap has to be raised here or not at all.
+    GhDdiPatchShaderModelCap();
+
     auto fail = [](const char* where, HRESULT hr){
         g_gfx.failed = true;
         Diag(std::string("GFX FAIL ") + where + " hr=" + Hex((uint32_t)hr));
@@ -2177,6 +2602,37 @@ static void BuildBridgeOnUi()
     // outright; even without them ID3D12InfoQueue can carry driver messages.
     // gh_d3d12_debug.txt=1, off by default because the layer costs performance
     // and is not present on every console.
+    // #168. The thing that refuses an SM 6.6 shader is not (only) the driver:
+    // D3D12Core validates a DXIL container against the shader model the DEVICE
+    // reports, and this one reports 5.1 (`FAKED real=0x51` -- our fake is applied
+    // to the guest's queries, never to the runtime's own view). That check runs
+    // before the UMD is ever asked, which is why loading scdxil.dll and
+    // redirecting SC_DLL's imports changed nothing: SC_DLL never got called.
+    //
+    // D3D12ExperimentalShaderModels is the documented way to turn that validation
+    // off. It needs Developer Mode -- which this console is in -- and it must be
+    // called before ANY device exists in the process, so it goes here, ahead of
+    // the bridge's own D3D12CreateDevice. If the runtime or the driver refuses,
+    // the honest outcomes are an hr on this line or a device creation that now
+    // fails; both are readable, and gh_exp_sm=0 puts everything back.
+    {
+        static const GUID kExpShaderModels =
+            { 0x76f5573e, 0xf13a, 0x40f5, { 0xb2, 0x97, 0x81, 0xce, 0x9e, 0x18, 0x93, 0x3f } };
+        if (GhCfgNum(L"gh_exp_sm.txt", "GH_EXP_SM", 0)){
+            using ExpFn = HRESULT (WINAPI*)(UINT, const IID*, void*, UINT*);
+            HMODULE hd12 = GetModuleHandleA("d3d12.dll");
+            if (!hd12) hd12 = LoadLibraryA("d3d12.dll");
+            auto ef = hd12 ? (ExpFn)GetProcAddress(hd12, "D3D12EnableExperimentalFeatures") : nullptr;
+            if (!ef){
+                Diag("EXPSM D3D12EnableExperimentalFeatures not exported err=" + Hex(GetLastError()));
+            } else {
+                HRESULT eh = ef(1, &kExpShaderModels, nullptr, nullptr);
+                Diag("EXPSM D3D12ExperimentalShaderModels -> hr=" + Hex((uint32_t)eh) +
+                     (SUCCEEDED(eh) ? " ENABLED" : " refused"));
+            }
+        }
+    }
+
     if (GhCfgNum(L"gh_d3d12_debug.txt", "GH_D3D12_DEBUG", 0)){
         com_ptr<ID3D12Debug> dbg;
         HRESULT dh = D3D12GetDebugInterface(__uuidof(ID3D12Debug), dbg.put_void());
@@ -2185,6 +2641,11 @@ static void BuildBridgeOnUi()
             Diag("D3D12 debug layer ENABLED");
             com_ptr<ID3D12Debug1> dbg1;
             if (SUCCEEDED(dbg->QueryInterface(__uuidof(ID3D12Debug1), dbg1.put_void())) && dbg1){
+                // #158, TESTED AND DEAD: the call succeeds and prints ENABLED, but
+                // D3D12CreateDevice then fails E_FAIL on EVERY adapter, so the loader
+                // gets no device at all and the guest never launches (heap=0 sub=0).
+                // Verified 3/3 graphics inits in one run against a DBG=0 control on the
+                // same build. Do not spend another run on it; see GREENHOUSE.md.
                 if (GhCfgNum(L"gh_d3d12_debug.txt", "GH_D3D12_DEBUG", 0) >= 2){
                     dbg1->SetEnableGPUBasedValidation(TRUE);
                     Diag("D3D12 GPU-based validation ENABLED");
@@ -2228,6 +2689,12 @@ static void BuildBridgeOnUi()
     D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     hr = g_gfx.d12->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), g_gfx.queue.put_void());
     if (FAILED(hr)) return fail("CreateCommandQueue", hr);
+    // The age control (gh_rttest_useq=5). Same descriptor, same moment, same device
+    // -- and then left completely idle for the life of the process.
+    if (SUCCEEDED(g_gfx.d12->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue),
+                                                g_gfx.spareQueue.put_void())))
+        Diag("GFX spare (age-control) queue " + Hex((uint64_t)(uintptr_t)g_gfx.spareQueue.get()) +
+             " created beside " + Hex((uint64_t)(uintptr_t)g_gfx.queue.get()) + ", never used");
 
     DXGI_SWAP_CHAIN_DESC1 sd{};
     // RGBA (not BGRA): Unity's D3D11 backend requests an R8G8B8A8_UNORM back buffer
@@ -2235,19 +2702,78 @@ static void BuildBridgeOnUi()
     // creation fail (E_INVALIDARG) so it rendered nothing into the buffer we present.
     sd.Width = w; sd.Height = h; sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.SampleDesc.Count = 1; sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.BufferCount = kGfxFrames; sd.Scaling = DXGI_SCALING_STRETCH;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL; sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    unsigned nbuf = GhCfgNum(L"gh_sc_buffers.txt", "GH_SC_BUFFERS", 2);
+    if (nbuf < 2) nbuf = 2;
+    if (nbuf > kGfxFrames) nbuf = kGfxFrames;
+    g_gfx.nFrames = nbuf;
+    sd.BufferCount = g_gfx.nFrames; sd.Scaling = DXGI_SCALING_STRETCH;
+    // gh_sc_flip: 1 (default) = FLIP_SEQUENTIAL, 2 = FLIP_DISCARD. GhCfgNum cannot
+    // carry a zero, so the values start at 1.
+    const unsigned flipSel = GhCfgNum(L"gh_sc_flip.txt", "GH_SC_FLIP", 1);
+    sd.SwapEffect = (flipSel == 2) ? DXGI_SWAP_EFFECT_FLIP_DISCARD
+                                   : DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    // gh_sc_dedicated=1: the swapchain gets its own queue; the blit stays on g_gfx.queue.
+    const unsigned scDed = GhCfgNum(L"gh_sc_dedicated.txt", "GH_SC_DEDICATED", 0);
+    ID3D12CommandQueue* scq = g_gfx.queue.get();
+    if (scDed){
+        hr = g_gfx.d12->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), g_gfx.scQueue.put_void());
+        if (FAILED(hr)) return fail("CreateCommandQueue(swapchain)", hr);
+        hr = g_gfx.d12->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), g_gfx.scFence.put_void());
+        if (FAILED(hr)) return fail("CreateFence(swapchain)", hr);
+        hr = g_gfx.d12->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), g_gfx.scPresFence.put_void());
+        if (FAILED(hr)) return fail("CreateFence(swapchain-present)", hr);
+        scq = g_gfx.scQueue.get();
+    }
+    Diag("GFX swapchain buffers=" + std::to_string(g_gfx.nFrames) +
+         " effect=" + std::string(flipSel == 2 ? "FLIP_DISCARD" : "FLIP_SEQUENTIAL") +
+         " queue=" + Hex((uint64_t)(uintptr_t)scq) +
+         (scDed ? " DEDICATED (blit stays on " + Hex((uint64_t)(uintptr_t)g_gfx.queue.get()) + ")"
+                : " (shared with the blit)"));
+    // #158 gh_sc_guestq=2: defer the chain instead of creating it here. EnsureBridge
+    // has nine callers and the bridge is normally built at D3D12CreateDevice, long
+    // before the guest's queue exists, so "born on the guest's queue" is reachable
+    // only by waiting. Mode 1 rebinds an existing chain; mode 2 never builds one to
+    // rebind, which is the cleaner test -- no teardown, no re-wrap, no released
+    // buffers -- and the fallback if mode 1's recreate turns out to be as silent as
+    // the mid-run recreate in the reset test.
+    const unsigned scGuestQ = GhCfgNum(L"gh_sc_guestq.txt", "GH_SC_GUESTQ", 0);
+    const bool deferSwap = (scGuestQ >= 2);
     com_ptr<IDXGISwapChain1> sc1;
-    hr = factory->CreateSwapChainForCoreWindow(g_gfx.queue.get(), winrt::get_unknown(window),
-                                               &sd, nullptr, sc1.put());
-    if (FAILED(hr)) return fail("CreateSwapChainForCoreWindow", hr);
-    g_gfx.swap = sc1.as<IDXGISwapChain3>();
+    if (deferSwap){
+        Diag("SCGQ mode=2 DEFERRING swapchain creation to the first present");
+    } else {
+        hr = factory->CreateSwapChainForCoreWindow(scq, winrt::get_unknown(window),
+                                                   &sd, nullptr, sc1.put());
+        if (FAILED(hr)) return fail("CreateSwapChainForCoreWindow", hr);
+        g_gfx.swap = sc1.as<IDXGISwapChain3>();
+    }
+    // #158: kept for gh_pool_reset mode 2 and gh_sc_guestq, both of which build
+    // this same chain later.
+    g_gfx.factory    = factory;
+    g_gfx.coreWindow.copy_from(winrt::get_unknown(window));
+    g_gfx.scDesc     = sd;
 
     const D3D_FEATURE_LEVEL levels[] = {
         D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0,
         D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
     };
-    IUnknown* queues[] = { g_gfx.queue.get() };
+    // #158: 11on12 must know about the swapchain's queue as well as the blit queue.
+    // With gh_sc_dedicated=1 and only g_gfx.queue declared here, CreateWrappedResource
+    // over the back buffers wraps buffers owned by a queue 11on12 has never seen, and
+    // the device is REMOVED (0x887A0005, reason 0x887A002B) before the guest gets as far
+    // as its first CreateCommandQueue. Declare both; queues[0] stays the blit queue, so
+    // ordinary D3D11 work (overlay, cursor) is unaffected when dedicated is off.
+    // #158, second attempt. Declaring BOTH queues here fails outright on this console:
+    // D3D11On12CreateDevice returns 0x80070057 (E_INVALIDARG) for a two-queue array, so
+    // 11on12 must be given exactly one. Give it the SWAPCHAIN's queue, so the back
+    // buffers it wraps are owned by the queue it knows about (declaring g_gfx.queue while
+    // the swapchain lived on scQueue REMOVED the device at init, 0x887A0005 reason
+    // 0x887A002B). With gh_sc_dedicated=1 this puts 11on12 and Present on scQueue and
+    // leaves the pure-D3D12 blit (gh_d12_blit=1) on g_gfx.queue -- which is the actual
+    // split being tested: one queue submits the render-target writes, another owns the
+    // swapchain and presents. With dedicated off, scq IS g_gfx.queue and nothing changes.
+    IUnknown* queues[] = { scq };
     hr = D3D11On12CreateDevice(g_gfx.d12.get(), D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                                levels, ARRAYSIZE(levels), queues, ARRAYSIZE(queues), 0,
                                g_gfx.d11.put(), g_gfx.d11ctx.put(), &g_gfx.level);
@@ -2255,7 +2781,7 @@ static void BuildBridgeOnUi()
     g_gfx.on12 = g_gfx.d11.as<ID3D11On12Device>();
     if (!g_gfx.on12) return fail("no_ID3D11On12Device", E_NOINTERFACE);
 
-    for (UINT i = 0; i < kGfxFrames; ++i){
+    for (UINT i = 0; !deferSwap && i < g_gfx.nFrames; ++i){
         hr = g_gfx.swap->GetBuffer(i, __uuidof(ID3D12Resource), g_gfx.backBuffers[i].put_void());
         if (FAILED(hr)) return fail("GetBuffer", hr);
         D3D11_RESOURCE_FLAGS rf{}; rf.BindFlags = D3D11_BIND_RENDER_TARGET;
@@ -2301,14 +2827,1191 @@ static void BuildBridgeOnUi()
 
     // Acquire the first back buffer so the copy-on-present path always has an
     // acquired physical buffer to blit into. Present() rotates from here.
-    g_gfx.cur = g_gfx.swap->GetCurrentBackBufferIndex();
-    ID3D11Resource* first[] = { g_gfx.wrapped[g_gfx.cur].get() };
-    g_gfx.on12->AcquireWrappedResources(first, 1);
+    if (!deferSwap){
+        g_gfx.cur = g_gfx.swap->GetCurrentBackBufferIndex();
+        ID3D11Resource* first[] = { g_gfx.wrapped[g_gfx.cur].get() };
+        g_gfx.on12->AcquireWrappedResources(first, 1);
+    }
 
     g_gfx.ready = true;
+    // #158 standalone barrier repro, no guest involved -- but ONLY when no in-situ
+    // trigger is armed. gh_rttest_at asks for the probe at submission N; running it
+    // here as well is a second, uncontrolled probe, and on 0.0.335.0 it is worse than
+    // a confound: it faults MFPlat during guest start-up. AB34_a and AB34_r200, six
+    // launches between them, died at 0xC0000005 in MFPlat.DLL+0x2C586 before a single
+    // GPUSUBMIT, at RT=2000 and RT=200 alike, while CTL335_a on this same build and
+    // the same base knobs was healthy (9 frames, fatal #44, WORK=2034). The cost of
+    // the probe is not the variable; running it here at all is. It executes at GFX
+    // ready, right after AcquireWrappedResources, on g_gfx.d12 -- the presentation
+    // device Media Foundation goes on to query.
+    if (!GhCfgNum(L"gh_rttest_census.txt", "GH_RTTEST_CENSUS", 0) &&
+        !GhCfgNum(L"gh_rttest_at.txt",     "GH_RTTEST_AT",     0)){
+        GhRtTest(nullptr);
+    } else if (GhCfgNum(L"gh_rttest.txt", "GH_RTTEST", 0)){
+        // #158. The standalone run was also, silently, a WARM-UP. It is what first
+        // pulled d3dcompiler_47.dll into the process, and every later
+        // GetModuleHandleA("d3dcompiler_47.dll") then answered with that module.
+        // Spider-Man ships its OWN D3DCompiler_47.dll and loads it during start-up, so
+        // an in-situ probe that compiles for the first time at submission #34 gets the
+        // GAME'S copy -- which rejects ps_5_1 outright ("error X3506: unrecognized
+        // compiler target 'ps_5_1'"), builds no PSO, and then reports SURVIVED with
+        // 0 draws and SELFSRV consumed=0. That is exactly the VOID the gh_rttest_selfsrv
+        // comment below warns about: a probe whose transitions have no consumer measured
+        // nothing. AB36_a died that way. Pin the compiler HERE, before the guest's copy
+        // exists, so the in-situ probe compiles against the same module the standalone
+        // one always did.
+        HMODULE dc = LoadLibraryA("d3dcompiler_47.dll");
+        Diag("RTTEST pinned d3dcompiler_47.dll mod=" +
+             std::to_string((unsigned long long)(uintptr_t)dc));
+    }
     Diag(std::string("GFX ready level=") +
          (g_gfx.level >= D3D_FEATURE_LEVEL_11_1 ? "11_1" :
           g_gfx.level >= D3D_FEATURE_LEVEL_11_0 ? "11_0" : "10_x"));
+}
+
+
+// #158. Everything about the hang is now known except what the driver DOES per
+// RENDER_TARGET<->GENERIC_READ transition, and no process-visible counter moves with
+// it: handles, paged and non-paged pool are all flat across 575 of them, and video
+// memory grows 16 MB over a whole run. So stop watching the game and reproduce the
+// operation on its own -- our device, our resource, nothing else in the command list
+// but the two barriers. If this dies at the same count the game does, the repro is
+// four hundred milliseconds long instead of seven minutes, and every axis (format,
+// flags, placed vs committed, subresource, destination state, how many surfaces are
+// in flight) becomes one cheap run instead of a game boot.
+//
+//   gh_rttest        iterations, 0 = off
+//   gh_rttest_w/_h   surface size (default 1920x1080)
+//   gh_rttest_fmt    DXGI format (default 28 = R8G8B8A8_UNORM)
+//   gh_rttest_flags  D3D12_RESOURCE_FLAGS + 1 (default RENDER_TARGET|UNORDERED_ACCESS)
+//   gh_rttest_after  destination state + 1 (default 0xAC3 GENERIC_READ)
+//   gh_rttest_mode   0 committed, 1 placed in its own heap
+//   gh_rttest_res    how many distinct surfaces to cycle through (default 1)
+static void GhRtTest(ID3D12Device* dev0, ID3D12CommandQueue* q0)
+{
+    const unsigned iters = GhCfgNum(L"gh_rttest.txt", "GH_RTTEST", 0);
+    ID3D12Device* dev = dev0 ? dev0 : g_gfx.d12.get();
+    if (!iters || !dev) return;
+    const unsigned w    = GhCfgNum(L"gh_rttest_w.txt", "GH_RTTEST_W", 1920);
+    const unsigned h    = GhCfgNum(L"gh_rttest_h.txt", "GH_RTTEST_H", 1080);
+    const unsigned fmt  = GhCfgNum(L"gh_rttest_fmt.txt", "GH_RTTEST_FMT", 28);
+    const unsigned fl   = GhCfgNum(L"gh_rttest_flags.txt", "GH_RTTEST_FLAGS", 0);
+    const unsigned aft  = GhCfgNum(L"gh_rttest_after.txt", "GH_RTTEST_AFTER", 0);
+    const unsigned mode = GhCfgNum(L"gh_rttest_mode.txt", "GH_RTTEST_MODE", 0);
+    unsigned nres = GhCfgNum(L"gh_rttest_res.txt", "GH_RTTEST_RES", 1);
+    if (nres < 1) nres = 1;
+    if (nres > 32) nres = 32;
+    const D3D12_RESOURCE_FLAGS rflags = fl ? (D3D12_RESOURCE_FLAGS)(fl - 1u)
+        : (D3D12_RESOURCE_FLAGS)(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    const D3D12_RESOURCE_STATES after = aft ? (D3D12_RESOURCE_STATES)(aft - 1u)
+                                            : D3D12_RESOURCE_STATE_GENERIC_READ;
+
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1;
+    // The game's bloom pyramid is ONE mipped RT|UAV resource whose barriers name a
+    // single subresource, and the split-barrier probe showed the smallest mip (15x9)
+    // is enough to kill it. A one-mip texture transitioned as ALL_SUBRESOURCES is not
+    // the same operation.
+    // #158. gh_rttest_pyr = P: build the FATAL SHAPE instead of P identical surfaces.
+    // Everything about how Greenhouse allocates these surfaces has now been eliminated
+    // -- placed or committed, our pager or the driver's, compressed or not, with or
+    // without re-initialisation -- so the remaining object is the console's own driver
+    // on this one transition. That is a bad thing to interrogate through a 20-minute
+    // differential against a 9-frame wall, so reproduce the shape with no game in the
+    // process: P differently-sized render targets, a halving pyramid 960/480/240/...
+    // like the game's, ALL PLACED AT OFFSET 0 OF ONE SHARED HEAP, cycled through the
+    // existing RT <-> read toggle. That is the defining feature the probe has never
+    // had; gh_rttest_mode=1 gives each surface a heap of its own, which is the one
+    // arrangement the game never uses.
+    const unsigned pyr = GhCfgNum(L"gh_rttest_pyr.txt", "GH_RTTEST_PYR", 0);
+    const unsigned mips = GhCfgNum(L"gh_rttest_mips.txt", "GH_RTTEST_MIPS", 1);
+    rd.MipLevels = (UINT16)(mips ? mips : 1);
+    rd.Format = (DXGI_FORMAT)fmt; rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN; rd.Flags = rflags;
+
+    com_ptr<ID3D12Resource> res[32];
+    com_ptr<ID3D12Heap>     heaps[32];
+    D3D12_RESOURCE_DESC     cdesc[32]{};   // each surface's REAL descriptor
+    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    // gh_rttest_census=1: do not build surfaces of our own -- transition the GAME'S,
+    // the exact nineteen the barrier census recorded. Three thousand of these
+    // transitions on resources WE created are harmless on this same device, so if the
+    // game's own surfaces die under the identical loop the difference is the resource,
+    // not the operation. Needs the census running (gh_barr_res_mod=1 turns it on).
+    const unsigned useCensus = GhCfgNum(L"gh_rttest_census.txt", "GH_RTTEST_CENSUS", 0);
+    if (useCensus){
+        const bool pairOnly = (useCensus >= 2);
+        unsigned have = 0;
+        GhBarrCensusRes(0, &have, pairOnly);
+        if (!have){ Diag("RTTEST census empty -- nothing recorded yet"); return; }
+        if (nres > have) nres = have;
+        for (unsigned i = 0; i < nres; ++i){
+            unsigned dummy = 0;
+            ID3D12Resource* r = GhBarrCensusRes(i, &dummy, pairOnly);
+            if (!r){ Diag("RTTEST census slot " + std::to_string(i) + " empty"); return; }
+            res[i].copy_from(r);
+            cdesc[i] = r->GetDesc();
+        }
+        Diag("RTTEST using " + std::to_string(nres) + " of the game's own " +
+             std::to_string(have) + (pairOnly ? " PAIR-CARRYING" : "") + " censused surfaces");
+    }
+    // gh_rttest_grt=1: target guestRT12 -- the loader's own guest render target, and the
+    // ONE object both fatal queues touch that a fresh probe queue never does (the guest's
+    // queue writes it, the presentation queue reads it and blits it to the back buffer).
+    // Every census set is drawn from the GAME's barriers, so this surface has never been
+    // in one, and "the resource is not the agent" was never tested against it. Run this on
+    // a FRESH queue (useq=0): if it dies, the discriminator is this shared resource; if it
+    // survives, the resource axis stays flat and what matters is the queue's ROLE rather
+    // than anything it handles. Format and mip count already match the probe's defaults
+    // (R8G8B8A8_UNORM, 1 mip), so no descriptor juggling is needed.
+    const unsigned useGrt = GhCfgNum(L"gh_rttest_grt.txt", "GH_RTTEST_GRT", 0);
+    if (useGrt && !useCensus){
+        if (!g_gfx.guestRT12){
+            Diag("RTTEST grt=1 REQUESTED BUT guestRT12 IS NULL -- run is VOID");
+            return;
+        }
+        nres = 1;
+        res[0].copy_from(g_gfx.guestRT12.get());
+        cdesc[0] = res[0]->GetDesc();
+        Diag("RTTEST using guestRT12 " + Hex((uint64_t)(uintptr_t)g_gfx.guestRT12.get()) +
+             " as the sole surface (the shared guest render target)");
+    } else if (useGrt){
+        Diag("RTTEST grt=1 IGNORED -- census mode owns the surfaces; run is VOID");
+        return;
+    }
+    for (unsigned i = 0; !useCensus && !useGrt && i < nres; ++i){
+        HRESULT hr;
+        if (pyr){
+            // Level i of the pyramid, wrapping every `pyr` surfaces so nres can be
+            // larger than the pyramid is deep -- the game keeps 12-14 placements per
+            // heap offset across only 7 distinct sizes.
+            const unsigned lvl = i % pyr;
+            D3D12_RESOURCE_DESC rdi = rd;
+            rdi.Width  = (w >> lvl) ? (w >> lvl) : 1;
+            rdi.Height = (h >> lvl) ? (h >> lvl) : 1;
+            rdi.MipLevels = 1;
+            if (i == 0){
+                // One heap, sized to the WIDEST surface, exactly as the game's is.
+                const D3D12_RESOURCE_ALLOCATION_INFO ai0 = dev->GetResourceAllocationInfo(0, 1, &rdi);
+                D3D12_HEAP_DESC hd{};
+                hd.SizeInBytes = ai0.SizeInBytes;
+                hd.Properties  = hp;
+                hd.Alignment   = ai0.Alignment;
+                hd.Flags       = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+                hr = dev->CreateHeap(&hd, __uuidof(ID3D12Heap), heaps[0].put_void());
+                if (FAILED(hr)){
+                    Diag("RTTEST pyr heap failed hr=" + Hex((uint32_t)hr));
+                    return;
+                }
+                Diag("RTTEST pyr heap=" + Hex((uint64_t)(uintptr_t)heaps[0].get()) +
+                     " bytes=" + std::to_string((unsigned long long)ai0.SizeInBytes) +
+                     " levels=" + std::to_string((unsigned long)pyr) +
+                     " surfaces=" + std::to_string((unsigned long)nres));
+            }
+            // EVERY surface at offset 0 of that one heap: the aliasing the game does
+            // and never declares.
+            hr = dev->CreatePlacedResource(heaps[0].get(), 0, &rdi,
+                                           D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                           __uuidof(ID3D12Resource), res[i].put_void());
+            cdesc[i] = rdi;
+            if (i < 8 || FAILED(hr))
+                Diag("RTTEST pyr #" + std::to_string(i) +
+                     " " + std::to_string((unsigned long long)rdi.Width) + "x" +
+                     std::to_string((unsigned long)rdi.Height) +
+                     " res=" + Hex((uint64_t)(uintptr_t)res[i].get()) +
+                     " hr=" + Hex((uint32_t)hr));
+        } else if (mode & 1){ // bit 0 = placed resource; bit 1 (below) = real draw work
+            const D3D12_RESOURCE_ALLOCATION_INFO ai = dev->GetResourceAllocationInfo(0, 1, &rd);
+            D3D12_HEAP_DESC hd{};
+            hd.SizeInBytes = ai.SizeInBytes;
+            hd.Properties = hp;
+            hd.Alignment = ai.Alignment;
+            hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+            hr = dev->CreateHeap(&hd, __uuidof(ID3D12Heap), heaps[i].put_void());
+            if (SUCCEEDED(hr))
+                hr = dev->CreatePlacedResource(heaps[i].get(), 0, &rd,
+                                               D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                               __uuidof(ID3D12Resource), res[i].put_void());
+        } else {
+            hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                              D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                              __uuidof(ID3D12Resource), res[i].put_void());
+        }
+        if (FAILED(hr) || !res[i]){
+            Diag("RTTEST create failed i=" + std::to_string(i) + " hr=" + Hex((uint32_t)hr));
+            return;
+        }
+    }
+
+    // RETRACTED (loader 0.0.293.0, #158): there is no "~2053 driver ceiling".
+    // Asking for 4096 heaps here yields 1152 (3889 pre-guest) and fails with
+    // E_OUTOFMEMORY only because appused has reached applimit -- the CONTAINER
+    // COMMIT cap, not a driver limit. The game's ~2054 heaps sit nowhere near any
+    // ceiling, and padding 512 extra heaps (all succeed, nheaps 2572) leaves the
+    // ~405-operation budget untouched at gops=402. Heap headroom is NOT the agent;
+    // this knob is kept only as a memory-pressure control.
+    const unsigned padN  = GhCfgNum(L"gh_rttest_pad_heaps.txt", "GH_RTTEST_PAD_HEAPS", 0);
+    const unsigned padMb = GhCfgNum(L"gh_rttest_pad_mb.txt", "GH_RTTEST_PAD_MB", 1);
+    std::vector<com_ptr<ID3D12Heap>> pad;
+    if (padN){
+        D3D12_HEAP_DESC hd{};
+        hd.SizeInBytes = (UINT64)padMb * 1024ull * 1024ull;
+        hd.Properties = hp;
+        hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+        unsigned made = 0; HRESULT lasthr = S_OK;
+        pad.reserve(padN);
+        for (unsigned i = 0; i < padN; ++i){
+            com_ptr<ID3D12Heap> hh;
+            lasthr = dev->CreateHeap(&hd, __uuidof(ID3D12Heap), hh.put_void());
+            if (FAILED(lasthr)) break;
+            pad.push_back(hh); ++made;
+        }
+        Diag("RTTEST pad heaps=" + std::to_string(made) + "/" + std::to_string(padN) +
+             " of " + std::to_string(padMb) + "MB lasthr=" + Hex((uint32_t)lasthr));
+        GhLogMemoryBudget("rttest-padded");
+    }
+
+    com_ptr<ID3D12CommandQueue>     q;
+    com_ptr<ID3D12CommandAllocator> alloc;
+    com_ptr<ID3D12GraphicsCommandList> cl;
+    com_ptr<ID3D12Fence>            fence;
+    D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    // gh_rttest_useq=1: submit on the GAME'S queue rather than one of ours. A thousand
+    // of these transitions on the game's own surfaces, on our queue, are harmless while
+    // the game dies after ~250 of its own -- so the next thing to split is the
+    // submission context: our queue and lists, or the game's.
+    HRESULT hr = S_OK;
+    const unsigned useQ = GhCfgNum(L"gh_rttest_useq.txt", "GH_RTTEST_USEQ", 0);
+    // gh_rttest_useq=2: the INTERLEAVE probe (#158). The same work, on a queue of our
+    // OWN, but fenced strictly INTO the game's timeline: before each batch the game's
+    // queue signals and our queue waits on that value, after it our queue signals and
+    // the game's queue waits on ours. Same operations, same serialized hardware order,
+    // different queue OBJECT. useq=1 (game's queue) dies at ~150-240 ops; useq=0 (our
+    // queue, free-running) is free. This splits those two: if interleaving dies the
+    // budget follows the timeline, if it survives it follows the game's own queue.
+    const bool interleave = (useQ == 2) && q0 != nullptr;
+    // gh_rttest_useq=3: submit on the LOADER'S PRESENTATION queue (g_gfx.queue) -- the
+    // queue the real swapchain was created with, which does the blit and calls Present
+    // every frame. It survives every run today, but it has never carried more than the
+    // one blit per frame (~26 ops over a whole run) against a ~405-op budget, so "a
+    // queue that presents does not die" is an UNDOSED observation, not an answer. This
+    // doses it to the wall. Dies  => the budget belongs to whatever queue drives the
+    // display, and the guest's queue is a victim of the per-frame psync pair. Survives
+    // => presentation is fully exonerated and the discriminator is specifically the
+    // queue the GUEST ITSELF submits on. Same device by construction:
+    // GfxNoteSwapChainDevice refuses a guest queue whose device is not g_gfx.d12.
+    ID3D12CommandQueue* pq = g_gfx.queue.get();
+    if (useQ == 1 && q0){ q.copy_from(q0); Diag("RTTEST submitting on the game's own queue " +
+                                           Hex((uint64_t)(uintptr_t)q0)); }
+    else if (useQ == 3 && pq){ q.copy_from(pq);
+        Diag("RTTEST submitting on the loader's PRESENTATION queue " +
+             Hex((uint64_t)(uintptr_t)pq) + " (blit queue)"); }
+    // useq=4: the DEDICATED swapchain queue (gh_sc_dedicated=1), which owns the
+    // swapchain but submits no blit. Splits "owns the swapchain" from "submits the
+    // present blit" -- useq=3 doses the latter, this doses the former.
+    else if (useQ == 5 && g_gfx.spareQueue){ q.copy_from(g_gfx.spareQueue.get());
+        Diag("RTTEST submitting on the SPARE age-control queue " +
+             Hex((uint64_t)(uintptr_t)g_gfx.spareQueue.get()) +
+             " (loader-init age, no swapchain, no work)"); }
+    else if (useQ == 4 && g_gfx.scQueue){ q.copy_from(g_gfx.scQueue.get());
+        Diag("RTTEST submitting on the DEDICATED swapchain queue " +
+             Hex((uint64_t)(uintptr_t)g_gfx.scQueue.get())); }
+    else {
+        // A probe that silently degrades into its own control is this project's most
+        // repeated failure. Say so rather than measuring useq=0 and calling it useq=3.
+        if (useQ == 3) Diag("RTTEST useq=3 REQUESTED BUT g_gfx.queue IS NULL -- run is VOID");
+        if (useQ == 4) Diag("RTTEST useq=4 REQUESTED BUT g_gfx.scQueue IS NULL (gh_sc_dedicated off?) -- run is VOID");
+        if (useQ == 5) Diag("RTTEST useq=5 REQUESTED BUT g_gfx.spareQueue IS NULL -- run is VOID");
+        hr = dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), q.put_void());
+    }
+    if (interleave) Diag("RTTEST INTERLEAVE: our queue fenced into the game's timeline, game q=" +
+                         Hex((uint64_t)(uintptr_t)q0));
+    // gh_rttest_inflight=N: the last asymmetry between this probe and the game.
+    // Ours submitted one list at a time and drained the GPU between each; the
+    // game's ~41-barrier lists arrive pipelined, several outstanding at once. With
+    // a pool of N allocators and lists we only wait when a SLOT is reused, so up to
+    // N of our lists are in flight together, exactly as the game's are.
+    unsigned nfly = GhCfgNum(L"gh_rttest_inflight.txt", "GH_RTTEST_INFLIGHT", 1);
+    if (nfly < 1) nfly = 1;
+    if (nfly > 16) nfly = 16;
+    com_ptr<ID3D12CommandAllocator> allocs[16];
+    com_ptr<ID3D12GraphicsCommandList> cls[16];
+    UINT64 slotFv[16]{};
+    for (unsigned i = 0; i < nfly && SUCCEEDED(hr); ++i){
+        hr = dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                         __uuidof(ID3D12CommandAllocator), allocs[i].put_void());
+        if (SUCCEEDED(hr)) hr = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                       allocs[i].get(), nullptr,
+                                                       __uuidof(ID3D12GraphicsCommandList), cls[i].put_void());
+    }
+    if (SUCCEEDED(hr)){ alloc.copy_from(allocs[0].get()); cl.copy_from(cls[0].get()); }
+    if (SUCCEEDED(hr)) hr = dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), fence.put_void());
+    // Two more fences for the interleave: ilGame is signalled by the game's queue and
+    // waited on by ours, ilOurs the other way round. Both start at 0 and only ever
+    // advance, so a missed signal deadlocks rather than silently degrading to useq=0.
+    com_ptr<ID3D12Fence> ilGame, ilOurs;
+    UINT64 ilGv = 0, ilOv = 0;
+    if (SUCCEEDED(hr) && interleave){
+        hr = dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), ilGame.put_void());
+        if (SUCCEEDED(hr)) hr = dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), ilOurs.put_void());
+    }
+    if (FAILED(hr)){ Diag("RTTEST setup failed hr=" + Hex((uint32_t)hr)); return; }
+    // gh_rttest_rawsub=1: bypass our own queue hooks for every submit/signal/wait this
+    // probe issues, so useq=1 stops re-entering Hook_CQExecute on the queue it is inside.
+    const unsigned rawSub = GhCfgNum(L"gh_rttest_rawsub.txt", "GH_RTTEST_RAWSUB", 0);
+    const bool rawOk = rawSub && GhCqOrig(10) && GhCqOrig(14) && GhCqOrig(15);
+    if (rawSub) Diag(std::string("RTTEST RAWSUB ") + (rawOk ? "ON -- submitting through the original vtable"
+                                                            : "REQUESTED BUT UNAVAILABLE -- run is VOID"));
+    auto ExecOn = [&](ID3D12CommandQueue* qq, UINT n, ID3D12CommandList* const* ls){
+        if (rawOk) ((void (__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*))GhCqOrig(10))(qq, n, ls);
+        else qq->ExecuteCommandLists(n, ls);
+    };
+    auto SignalOn = [&](ID3D12CommandQueue* qq, ID3D12Fence* f, UINT64 v){
+        if (rawOk) ((HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64))GhCqOrig(14))(qq, f, v);
+        else qq->Signal(f, v);
+    };
+    auto WaitOn = [&](ID3D12CommandQueue* qq, ID3D12Fence* f, UINT64 v){
+        if (rawOk) ((HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64))GhCqOrig(15))(qq, f, v);
+        else qq->Wait(f, v);
+    };
+    // A surface that has never been written to may have no compression metadata to
+    // resolve, so the driver can fast-path the decompress and the probe would test
+    // nothing. Clears are also the OTHER sufficient cause of this hang (gh_op_mask=80
+    // kills it with no draws at all), and a clear is exactly what writes the metadata
+    // that the next RENDER_TARGET->read transition has to resolve. So offer the pair.
+    const unsigned doClear = GhCfgNum(L"gh_rttest_clear.txt", "GH_RTTEST_CLEAR", 0);
+    // gh_rttest_bind=1: also BIND the surface as a render target around the pair.
+    // Our barriers on the game's own surfaces, on the game's own queue, are harmless;
+    // what our lists still never do is bind an RTV, which every one of the game's
+    // lists does even under gh_op_mask=55.
+    const unsigned doBind = GhCfgNum(L"gh_rttest_bind.txt", "GH_RTTEST_BIND", 0);
+    if (!useCensus && !pyr) for (unsigned i = 0; i < nres; ++i) cdesc[i] = rd;
+    // #158. THE MISSING CONSUMER. The loop below puts a surface into GENERIC_READ
+    // with b[0] and takes it straight back out with b[1], and NOTHING between the two
+    // ever reads it. A transition into a read state exists to make a compressed
+    // surface readable; if no one reads it, the driver is entitled to skip the
+    // resolve altogether -- in which case every "SURVIVED all 2000 transitions" this
+    // probe has ever reported measured nothing, which is exactly this project's most
+    // repeated failure. gh_rttest_selfsrv=1 samples the surface while it is in the
+    // read state, from a shader, into a scratch target, so the decompress has an
+    // actual consumer and cannot be elided.
+    const unsigned selfSrv = GhCfgNum(L"gh_rttest_selfsrv.txt", "GH_RTTEST_SELFSRV", 0);
+    // #158. MULTI-THREADED RECORDING -- the last named difference between this probe
+    // and the game. The game records these transitions from many threads onto many
+    // lists at once; the probe has always recorded from one. gh_rttest_perlist gave it
+    // the game's BATCHING but never its CONCURRENCY.
+    //
+    // The hazard this has to avoid is inventing a failure of its own: two lists
+    // transitioning the SAME resource concurrently is undefined by the API, and a hang
+    // caused by that would be our bug, not the game's. So the surfaces are PARTITIONED
+    // -- thread t owns the contiguous block [t*nres/T, (t+1)*nres/T) and no other
+    // thread touches those resources. Every thread still writes into the same aliased
+    // heap bytes, because that is exactly what the game does and it is the interesting
+    // part; what is excluded is only the API-illegal case. Each thread gets its own
+    // allocator, list, fence and scratch target, so nothing is shared but the queue,
+    // and ExecuteCommandLists is documented thread-safe.
+    unsigned nThreads = GhCfgNum(L"gh_rttest_threads.txt", "GH_RTTEST_THREADS", 0);
+    if (nThreads < 1) nThreads = 1;
+    if (nThreads > 8) nThreads = 8;
+    unsigned maxMip = 1;
+    for (unsigned i = 0; i < nres; ++i)
+        if (cdesc[i].MipLevels > maxMip) maxMip = cdesc[i].MipLevels;
+    com_ptr<ID3D12DescriptorHeap> rtvHeap;
+    UINT rtvStep = 0;
+    com_ptr<ID3D12Resource> scratchRt[8];       // #158 selfsrv: where the sample lands, one per thread
+    if (doClear || doBind || selfSrv){
+        D3D12_DESCRIPTOR_HEAP_DESC dhd{};
+        dhd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        dhd.NumDescriptors = nres * maxMip + 8;   // + one scratch RTV per thread
+        HRESULT dh = dev->CreateDescriptorHeap(&dhd, __uuidof(ID3D12DescriptorHeap), rtvHeap.put_void());
+        if (FAILED(dh)){ Diag("RTTEST rtv heap failed hr=" + Hex((uint32_t)dh)); return; }
+        rtvStep = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        D3D12_CPU_DESCRIPTOR_HANDLE base = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        unsigned skipped = 0;
+        for (unsigned i = 0; i < nres; ++i)
+            for (unsigned m = 0; m < maxMip; ++m){
+                D3D12_CPU_DESCRIPTOR_HANDLE hcpu = base;
+                hcpu.ptr += (SIZE_T)(i * maxMip + m) * rtvStep;
+                if (m >= cdesc[i].MipLevels ||
+                    !(cdesc[i].Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
+                    cdesc[i].Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D){ ++skipped; continue; }
+                D3D12_RENDER_TARGET_VIEW_DESC vd{};
+                vd.Format = cdesc[i].Format;
+                vd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+                vd.Texture2D.MipSlice = m;
+                dev->CreateRenderTargetView(res[i].get(), &vd, hcpu);
+            }
+        if (skipped) Diag("RTTEST rtv skipped " + std::to_string(skipped) +
+                          " of " + std::to_string(nres * maxMip) + " slots");
+        // The scratch target the sampled result is written into. Committed and outside
+        // the shared heap, so it can never alias what is being sampled.
+        if (selfSrv){
+            D3D12_HEAP_PROPERTIES shp{}; shp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC sd{};
+            sd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            sd.Width = w; sd.Height = h; sd.DepthOrArraySize = 1; sd.MipLevels = 1;
+            sd.Format = (DXGI_FORMAT)fmt; sd.SampleDesc.Count = 1;
+            sd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            for (unsigned t = 0; t < nThreads; ++t){
+                HRESULT hs = dev->CreateCommittedResource(&shp, D3D12_HEAP_FLAG_NONE, &sd,
+                                 D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                 __uuidof(ID3D12Resource), scratchRt[t].put_void());
+                if (FAILED(hs) || !scratchRt[t]){
+                    Diag("RTTEST selfsrv scratch RT failed t=" + std::to_string(t) +
+                         " hr=" + Hex((uint32_t)hs) + " -- run is VOID");
+                    return;
+                }
+                D3D12_CPU_DESCRIPTOR_HANDLE hsc = base;
+                hsc.ptr += (SIZE_T)(nres * maxMip + t) * rtvStep;
+                dev->CreateRenderTargetView(scratchRt[t].get(), nullptr, hsc);
+            }
+            Diag("RTTEST selfsrv scratch=" + Hex((uint64_t)(uintptr_t)scratchRt[0].get()) +
+                 " " + std::to_string((unsigned long)w) + "x" + std::to_string((unsigned long)h) +
+                 " copies=" + std::to_string((unsigned long)nThreads));
+        }
+    }
+
+    // ---- #158: real draw work (gh_rttest_mode bit 1) --------------------------
+    // Every previous run of this probe issued barriers and transitions ONLY -- no
+    // root signature, no PSO, no vertex data, no rasterisation. GREENHOUSE.md:9900
+    // later showed that regime does not predict this hang (barriers alone in a
+    // loader list survive 541,225 while the real frame dies in five executions), so
+    // "the standalone repro does not reproduce" was only ever measured in the one
+    // regime known not to reproduce it. This gives it work to contain.
+    //
+    // Shaders are compiled in-container: GhNoopComputeShader proves d3dcompiler_47
+    // is present and D3DCompile works, so no embedded blob is needed. SM 5.1, never
+    // SM 6 -- this console has no DXIL (#151). Positions come from SV_VertexID, so
+    // there is no vertex buffer, no view and no GPU address to get wrong.
+    const bool doDraw = (mode & 2) != 0;
+    // Bit 2 = REAL BINDINGS. The floor above draws through an empty root signature:
+    // no descriptor heap, no table, no root descriptor, nothing the driver has to
+    // resolve per draw. The game's fatal submission carries uniqTbl=73 handles into
+    // a 1,000,000-descriptor shader-visible heap, uniqVA=24 root addresses and
+    // uniqHeap=2 bound heaps. Bit 3 = 18 distinct PSOs, matching uniqPSO=18.
+    const bool doRich = (mode & 4) != 0;
+    const bool doMPso = (mode & 8) != 0;
+    const unsigned nDesc = GhCfgNum(L"gh_rttest_ndesc.txt", "GH_RTTEST_NDESC", 1000000);
+    unsigned nPso = GhCfgNum(L"gh_rttest_npso.txt", "GH_RTTEST_NPSO", 18);
+    if (nPso < 1) nPso = 1;
+    if (nPso > 64) nPso = 64;
+    // #158. DESCRIPTOR VOLUME. The heap size already matches the census (1,000,000
+    // descriptors), but the probe only ever uses the first eight slots, adjacent, while
+    // the game's fatal submission carries uniqTbl=73 DISTINCT table handles spread
+    // across that heap. Volume and spread are separate things from heap size, and only
+    // the first has ever been reproduced here. gh_rttest_ntbl=N builds N table starts
+    // spaced evenly across the heap, each holding a real SRV; slot t views surface
+    // t % nres, so the iteration can always pick a handle whose texture is the one it
+    // is about to sample and the selfsrv consumer stays intact.
+    const unsigned nTbl = GhCfgNum(L"gh_rttest_ntbl.txt", "GH_RTTEST_NTBL", 0);
+    std::vector<UINT> tblSlot;
+    com_ptr<ID3D12DescriptorHeap> smpHeap;   // the census reports uniqHeap=2 bound
+    const unsigned nSrv = 8, nCb = 24;
+    com_ptr<ID3D12RootSignature>  rootSig;
+    com_ptr<ID3D12PipelineState>  pso;
+    com_ptr<ID3D12PipelineState>  psoN[64];
+    com_ptr<ID3D12DescriptorHeap> svHeap;
+    com_ptr<ID3D12Resource>       srvTex[8], upBuf, rbBuf;
+    D3D12_GPU_VIRTUAL_ADDRESS     cbVa = 0, rawVa = 0;
+    UINT svStep = 0;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT rbFp{};
+    unsigned drawsIssued = 0;
+    unsigned selfSampled = 0;      // #158 selfsrv: draws that CONSUMED a decompress
+    bool rbAsked = false, rbDone = false;
+    if (doDraw){
+        HMODULE dc = GetModuleHandleA("d3dcompiler_47.dll");
+        if (!dc) dc = LoadLibraryA("d3dcompiler_47.dll");
+        using CompileFn = HRESULT (WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const void*, void*,
+                                            LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+        auto compile = dc ? (CompileFn)GetProcAddress(dc, "D3DCompile") : nullptr;
+        HMODULE d12 = GetModuleHandleA("d3d12.dll");
+        using SerFn = HRESULT (WINAPI*)(const D3D12_ROOT_SIGNATURE_DESC*,
+                                        D3D_ROOT_SIGNATURE_VERSION, ID3DBlob**, ID3DBlob**);
+        auto ser = d12 ? (SerFn)GetProcAddress(d12, "D3D12SerializeRootSignature") : nullptr;
+        if (!compile || !ser){
+            Diag("RTDRAW no compiler/serializer compile=" + std::to_string((bool)compile) +
+                 " ser=" + std::to_string((bool)ser));
+        } else {
+            // The standard full-screen triangle: covers the whole target from three
+            // vertices with no input assembler state at all.
+            static const char kVs[] =
+                "float4 vsmain(uint id : SV_VertexID) : SV_Position {\n"
+                "  float2 uv = float2((id << 1) & 2, id & 2);\n"
+                "  return float4(uv * float2(2,-2) + float2(-1,1), 0, 1);\n"
+                "}\n";
+            static const char kPsPlain[] =
+                "float4 psmain() : SV_Target { return float4(1,0,0,1); }\n";
+            // Every binding is genuinely consumed: the texture is sampled, the raw
+            // buffer is loaded and the constant buffer supplies the output. The
+            // multiply by k cannot be folded away because u is a runtime load, so
+            // the sample survives optimisation -- yet k is always 0 (the CPU writes
+            // zero there), which keeps the readback deterministic no matter what
+            // uninitialised contents the texture holds.
+            static const char kPsRich[] =
+                "Texture2D tex : register(t0);\n"
+                "ByteAddressBuffer rb : register(t1);\n"
+                "SamplerState smp : register(s0);\n"
+                "cbuffer CB : register(b0) { float4 tint; };\n"
+                "float4 psmain(float4 pos : SV_Position) : SV_Target {\n"
+                "  float4 c = tex.SampleLevel(smp, pos.xy * 0.0005, 0);\n"
+                "  uint u = rb.Load(0);\n"
+                "  float k = (u != 0) ? 1.0 : 0.0;\n"
+                "  return tint + c * k;\n"
+                "}\n";
+            const char* psSrc  = doRich ? kPsRich : kPsPlain;
+            const size_t psLen = (doRich ? sizeof(kPsRich) : sizeof(kPsPlain)) - 1;
+            com_ptr<ID3DBlob> vsb, psb, rsb, err;
+            HRESULT hv = compile(kVs, sizeof(kVs) - 1, "ghrt_vs.hlsl", nullptr, nullptr,
+                                 "vsmain", "vs_5_1", 0, 0, vsb.put(), err.put());
+            err = nullptr;
+            HRESULT hpx = compile(psSrc, psLen, "ghrt_ps.hlsl", nullptr, nullptr,
+                                  "psmain", "ps_5_1", 0, 0, psb.put(), err.put());
+            if (FAILED(hpx) && err)
+                Diag(std::string("RTDRAW ps errors: ") +
+                     std::string((const char*)err->GetBufferPointer(),
+                                 (size_t)err->GetBufferSize()).substr(0, 400));
+            Diag("RTDRAW compile vs=" + Hex((uint32_t)hv) +
+                 " bytes=" + std::to_string(vsb ? (unsigned)vsb->GetBufferSize() : 0u) +
+                 " ps=" + Hex((uint32_t)hpx) +
+                 " bytes=" + std::to_string(psb ? (unsigned)psb->GetBufferSize() : 0u) +
+                 " rich=" + std::to_string((int)doRich));
+
+            D3D12_DESCRIPTOR_RANGE rng{};
+            rng.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            rng.NumDescriptors = 1;
+            rng.BaseShaderRegister = 0;
+            rng.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+            D3D12_ROOT_PARAMETER rp[3]{};
+            rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rp[0].DescriptorTable.NumDescriptorRanges = 1;
+            rp[0].DescriptorTable.pDescriptorRanges = &rng;
+            rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+            rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            rp[1].Descriptor.ShaderRegister = 0;
+            rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+            rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            rp[2].Descriptor.ShaderRegister = 1;
+            rp[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+            D3D12_STATIC_SAMPLER_DESC ss{};
+            ss.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+            ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            ss.MaxLOD = D3D12_FLOAT32_MAX;
+            ss.ShaderRegister = 0;
+            ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+            D3D12_ROOT_SIGNATURE_DESC rsd{};
+            if (doRich){
+                rsd.NumParameters = 3; rsd.pParameters = rp;
+                rsd.NumStaticSamplers = 1; rsd.pStaticSamplers = &ss;
+            }
+            rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+            com_ptr<ID3DBlob> rerr;
+            HRESULT hs = ser(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, rsb.put(), rerr.put());
+            if (SUCCEEDED(hs) && rsb)
+                hs = dev->CreateRootSignature(0, rsb->GetBufferPointer(), rsb->GetBufferSize(),
+                                              __uuidof(ID3D12RootSignature), rootSig.put_void());
+            HRESULT hp2 = E_FAIL;
+            if (SUCCEEDED(hs) && rootSig && vsb && psb){
+                D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+                pd.pRootSignature = rootSig.get();
+                pd.VS = { vsb->GetBufferPointer(), vsb->GetBufferSize() };
+                pd.PS = { psb->GetBufferPointer(), psb->GetBufferSize() };
+                pd.SampleMask = UINT_MAX;
+                pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+                pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+                pd.RasterizerState.DepthClipEnable = TRUE;
+                for (unsigned k = 0; k < 8; ++k)
+                    pd.BlendState.RenderTarget[k].RenderTargetWriteMask =
+                        D3D12_COLOR_WRITE_ENABLE_ALL;
+                pd.DepthStencilState.DepthEnable   = FALSE;
+                pd.DepthStencilState.StencilEnable = FALSE;
+                pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+                pd.NumRenderTargets = 1;
+                pd.RTVFormats[0] = (DXGI_FORMAT)fmt;
+                pd.SampleDesc.Count = 1;
+                hp2 = dev->CreateGraphicsPipelineState(&pd, __uuidof(ID3D12PipelineState),
+                                                       pso.put_void());
+                if (doMPso && SUCCEEDED(hp2)){
+                    unsigned made = 0;
+                    for (unsigned k = 0; k < nPso; ++k)
+                        if (SUCCEEDED(dev->CreateGraphicsPipelineState(
+                                &pd, __uuidof(ID3D12PipelineState), psoN[k].put_void())))
+                            ++made;
+                    Diag("RTDRAW psoN=" + std::to_string(made) + "/" + std::to_string(nPso));
+                }
+            }
+            Diag("RTDRAW rootsig=" + Hex((uint32_t)hs) + " psohr=" + Hex((uint32_t)hp2));
+
+            if (doRich && pso){
+                // Exactly the shape the census reports: a 1,000,000-descriptor
+                // shader-visible heap of which only the first handful are ever used.
+                D3D12_DESCRIPTOR_HEAP_DESC svd{};
+                svd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+                svd.NumDescriptors = nDesc;
+                svd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+                HRESULT hh = dev->CreateDescriptorHeap(&svd, __uuidof(ID3D12DescriptorHeap),
+                                                       svHeap.put_void());
+                svStep = dev->GetDescriptorHandleIncrementSize(
+                             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                unsigned madeT = 0;
+                if (SUCCEEDED(hh) && svHeap){
+                    D3D12_CPU_DESCRIPTOR_HANDLE sb = svHeap->GetCPUDescriptorHandleForHeapStart();
+                    D3D12_HEAP_PROPERTIES dhp{}; dhp.Type = D3D12_HEAP_TYPE_DEFAULT;
+                    D3D12_RESOURCE_DESC td{};
+                    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                    td.Width = 64; td.Height = 64; td.DepthOrArraySize = 1; td.MipLevels = 1;
+                    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
+                    for (unsigned k = 0; k < nSrv; ++k){
+                        if (FAILED(dev->CreateCommittedResource(
+                                &dhp, D3D12_HEAP_FLAG_NONE, &td,
+                                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                                __uuidof(ID3D12Resource), srvTex[k].put_void()))) continue;
+                        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+                        sv.Format = td.Format;
+                        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                        sv.Texture2D.MipLevels = 1;
+                        D3D12_CPU_DESCRIPTOR_HANDLE hc = sb;
+                        hc.ptr += (SIZE_T)k * svStep;
+                        dev->CreateShaderResourceView(srvTex[k].get(), &sv, hc);
+                        ++madeT;
+                    }
+                    // #158 selfsrv: one SRV per PYRAMID surface, parked past the dummy
+                    // slots. Sampling THESE is what gives the decompress a consumer.
+                    if (selfSrv)
+                        for (unsigned k = 0; k < nres; ++k){
+                            if (!res[k]) continue;
+                            D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+                            sv.Format = cdesc[k].Format;
+                            sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                            sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                            sv.Texture2D.MipLevels = cdesc[k].MipLevels ? cdesc[k].MipLevels : 1;
+                            D3D12_CPU_DESCRIPTOR_HANDLE hc = sb;
+                            hc.ptr += (SIZE_T)(nSrv + k) * svStep;
+                            dev->CreateShaderResourceView(res[k].get(), &sv, hc);
+                        }
+                    // #158 ntbl: N table starts spread across the whole heap.
+                    if (nTbl > 1 && nres){
+                        const unsigned base   = nSrv + nres;
+                        const unsigned room   = (nDesc > base + 1) ? (nDesc - base - 1) : 0;
+                        const unsigned spread = room / nTbl ? room / nTbl : 1;
+                        tblSlot.reserve(nTbl);
+                        for (unsigned t = 0; t < nTbl; ++t){
+                            const unsigned slot = base + t * spread;
+                            if (slot >= nDesc) break;
+                            ID3D12Resource* src = (selfSrv && res[t % nres])
+                                                ? res[t % nres].get()
+                                                : srvTex[t % nSrv].get();
+                            if (!src) continue;
+                            const D3D12_RESOURCE_DESC srcd = src->GetDesc();
+                            D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+                            sv.Format = srcd.Format;
+                            sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                            sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                            sv.Texture2D.MipLevels = srcd.MipLevels ? srcd.MipLevels : 1;
+                            D3D12_CPU_DESCRIPTOR_HANDLE hc = sb;
+                            hc.ptr += (SIZE_T)slot * svStep;
+                            dev->CreateShaderResourceView(src, &sv, hc);
+                            tblSlot.push_back(slot);
+                        }
+                        // uniqHeap=2: the game always has a second heap bound.
+                        D3D12_DESCRIPTOR_HEAP_DESC smd{};
+                        smd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+                        smd.NumDescriptors = 16;
+                        smd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+                        dev->CreateDescriptorHeap(&smd, __uuidof(ID3D12DescriptorHeap),
+                                                  smpHeap.put_void());
+                        Diag("RTTEST ntbl tables=" + std::to_string((unsigned long)tblSlot.size()) +
+                             "/" + std::to_string((unsigned long)nTbl) +
+                             " spread=" + std::to_string((unsigned long)spread) +
+                             " lastslot=" + std::to_string((unsigned long)(tblSlot.empty() ? 0u : tblSlot.back())) +
+                             " ndesc=" + std::to_string((unsigned long)nDesc) +
+                             " sampler=" + std::to_string((bool)smpHeap));
+                    }
+                }
+                // One upload buffer serving both root descriptors: 24 constant-buffer
+                // slots at 256-byte stride, and a raw buffer of zeros at 32 KB.
+                D3D12_HEAP_PROPERTIES uhp{}; uhp.Type = D3D12_HEAP_TYPE_UPLOAD;
+                D3D12_RESOURCE_DESC ub{};
+                ub.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                ub.Width = 65536; ub.Height = 1; ub.DepthOrArraySize = 1; ub.MipLevels = 1;
+                ub.Format = DXGI_FORMAT_UNKNOWN; ub.SampleDesc.Count = 1;
+                ub.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                HRESULT hu = dev->CreateCommittedResource(&uhp, D3D12_HEAP_FLAG_NONE, &ub,
+                                 D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                 __uuidof(ID3D12Resource), upBuf.put_void());
+                if (SUCCEEDED(hu) && upBuf){
+                    void* pm = nullptr; D3D12_RANGE nr{0,0};
+                    if (SUCCEEDED(upBuf->Map(0, &nr, &pm)) && pm){
+                        memset(pm, 0, 65536);
+                        for (unsigned k = 0; k < nCb; ++k){
+                            float* f = (float*)((char*)pm + (size_t)k * 256);
+                            f[0] = 1.0f; f[1] = 0.0f; f[2] = 0.0f; f[3] = 1.0f;
+                        }
+                        upBuf->Unmap(0, nullptr);
+                    }
+                    cbVa  = upBuf->GetGPUVirtualAddress();
+                    rawVa = cbVa + 32768;
+                }
+                Diag("RTDRAW rich heap=" + Hex((uint32_t)hh) +
+                     " ndesc=" + std::to_string(nDesc) +
+                     " step=" + std::to_string(svStep) +
+                     " srv=" + std::to_string(madeT) + "/" + std::to_string(nSrv) +
+                     " upload=" + Hex((uint32_t)hu) +
+                     " cbVa=" + Hex((uint64_t)cbVa));
+                if (!svHeap || !upBuf)
+                    Diag("RTDRAW RICH SETUP INCOMPLETE -- run is VOID, not negative");
+            }
+
+            // POSITIVE CONTROL. A "survives" result is worthless unless the draws
+            // provably reached the GPU -- that is exactly how this probe produced a
+            // confident null before. One pixel is copied back after the first batch
+            // and checked against what the pixel shader writes.
+            if (pso){
+                D3D12_RESOURCE_DESC r1 = rd;
+                r1.Width = 1; r1.Height = 1; r1.MipLevels = 1;
+                r1.Flags = D3D12_RESOURCE_FLAG_NONE;
+                UINT64 rbBytes = 0;
+                dev->GetCopyableFootprints(&r1, 0, 1, 0, &rbFp, nullptr, nullptr, &rbBytes);
+                D3D12_HEAP_PROPERTIES rbHp{}; rbHp.Type = D3D12_HEAP_TYPE_READBACK;
+                D3D12_RESOURCE_DESC rbd{};
+                rbd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                rbd.Width = rbBytes ? rbBytes : 256; rbd.Height = 1;
+                rbd.DepthOrArraySize = 1; rbd.MipLevels = 1;
+                rbd.Format = DXGI_FORMAT_UNKNOWN; rbd.SampleDesc.Count = 1;
+                rbd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                HRESULT hrb = dev->CreateCommittedResource(&rbHp, D3D12_HEAP_FLAG_NONE, &rbd,
+                                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                  __uuidof(ID3D12Resource), rbBuf.put_void());
+                Diag("RTDRAW readback buf hr=" + Hex((uint32_t)hrb) +
+                     " bytes=" + std::to_string((unsigned long long)rbBytes));
+            }
+        }
+        if (!pso) Diag("RTDRAW NO PSO -- draw mode is VOID, not negative");
+    }
+
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    cl->Close();
+
+    // #158: the probe survived 2000 transitions where the game dies after ~290, and
+    // the last untested difference is the RECORDING CONTEXT. We recorded ONE pair
+    // per command list and reset the allocator every iteration; the game packs many
+    // barriers into one list and rotates a small pool of allocators. So make the
+    // probe do the same thing:
+    //   gh_rttest_perlist=N   record N pairs into one list before Close/Execute
+    //   gh_rttest_noreset=1   never reset the allocator, so its memory accumulates
+    //                         exactly the way a long-lived guest allocator's does
+    // If a batch of ~150 pairs (300 transitions) in ONE list dies where 1000 lists
+    // of one pair did not, the budget is per command list, not per operation.
+    unsigned perList = GhCfgNum(L"gh_rttest_perlist.txt", "GH_RTTEST_PERLIST", 1);
+    if (!perList) perList = 1;
+    const unsigned noReset = GhCfgNum(L"gh_rttest_noreset.txt", "GH_RTTEST_NORESET", 0);
+    // gh_rttest_replay=1: ignore our own synthetic pair and replay the frame program
+    // gh_barr_prog_cap froze. Needs that capture to have happened first, so it only
+    // does anything from the in-situ call site.
+    const unsigned replay = GhCfgNum(L"gh_rttest_replay.txt", "GH_RTTEST_REPLAY", 0);
+
+    Diag("RTTEST start dev=" + Hex((uint64_t)(uintptr_t)dev) +
+         " iters=" + std::to_string(iters) +
+         " " + std::to_string(w) + "x" + std::to_string(h) +
+         " fmt=" + std::to_string(fmt) +
+         " flags=" + Hex((uint32_t)rflags) +
+         " after=" + Hex((uint32_t)after) +
+         " mode=" + std::to_string(mode) +
+         " draw=" + std::to_string((int)doDraw) +
+         " rich=" + std::to_string((int)doRich) +
+         " mpso=" + std::to_string((int)doMPso) +
+         " pso=" + std::to_string((bool)pso) +
+         " res=" + std::to_string(nres) +
+         " mips=" + std::to_string(mips) +
+         " clear=" + std::to_string(doClear) +
+         " bind=" + std::to_string(doBind) +
+         " maxmip=" + std::to_string(maxMip) +
+         " perlist=" + std::to_string(perList) +
+         " noreset=" + std::to_string(noReset) +
+         " inflight=" + std::to_string(nfly) +
+        " replay=" + std::to_string(replay));
+
+    // ---- #158 gh_rttest_threads: the LAST named difference between this probe and the
+    // game is that the game records these barriers from SEVERAL threads at once; the
+    // probe has only ever recorded from one. Threads 1..N-1 each own a DISJOINT block
+    // of surfaces (thread 0 keeps block 0, which is exactly what the single-threaded
+    // probe always did, so every result already in the record keeps its meaning). No
+    // two lists ever transition the same resource concurrently -- that is undefined by
+    // the API and would be OUR bug, not the game's. Every block still writes into the
+    // SAME aliased heap bytes, which is the part that matters.
+    volatile LONG wIters = 0, wDied = 0, wStarted = 0;
+    HRESULT wRr = S_OK;
+    struct GhRtWorkers {
+        std::vector<std::thread> th;
+        volatile LONG stop = 0;
+        void join_all(){
+            InterlockedExchange(&stop, 1);
+            for (auto& t : th) if (t.joinable()) t.join();
+            th.clear();
+        }
+        ~GhRtWorkers(){ join_all(); }   // covers every early return out of the loop
+    } workers;
+    const unsigned wBlk = nres / nThreads;
+    if (nThreads > 1 && wBlk){
+        for (unsigned t = 1; t < nThreads; ++t){
+            const unsigned lo = t * wBlk, hi = lo + wBlk;
+            workers.th.emplace_back([&, t, lo, hi](){
+                com_ptr<ID3D12CommandAllocator>   wa;
+                com_ptr<ID3D12GraphicsCommandList> wl;
+                com_ptr<ID3D12Fence>              wf;
+                if (FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                       IID_PPV_ARGS(wa.put())))) return;
+                if (FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                  wa.get(), nullptr, IID_PPV_ARGS(wl.put())))) return;
+                wl->Close();
+                if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(wf.put())))) return;
+                HANDLE wev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                UINT64 wv = 0;
+                InterlockedIncrement(&wStarted);
+                for (unsigned k = 0; !workers.stop && k < iters; ++k){
+                    const unsigned s = lo + (k % (hi - lo));
+                    ID3D12Resource* wr = res[s].get();
+                    if (!wr) break;
+                    wa->Reset();
+                    wl->Reset(wa.get(), nullptr);
+                    D3D12_RESOURCE_BARRIER wb[2]{};
+                    wb[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    wb[0].Transition.pResource   = wr;
+                    wb[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                    wb[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    wb[0].Transition.StateAfter  = after;
+                    wb[1] = wb[0];
+                    wb[1].Transition.StateBefore = after;
+                    wb[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    if (doClear && rtvHeap){
+                        D3D12_CPU_DESCRIPTOR_HANDLE hc = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+                        hc.ptr += (SIZE_T)(s * maxMip) * rtvStep;
+                        const float col[4] = { 0.1f, 0.2f, 0.3f, 1.0f };
+                        wl->ClearRenderTargetView(hc, col, 0, nullptr);
+                    }
+                    wl->ResourceBarrier(1, &wb[0]);
+                    // Same consumer as thread 0: the decompress this barrier asks for
+                    // must have a real reader or the driver may elide it.
+                    if (selfSrv && pso && rootSig && svHeap && rtvHeap && scratchRt[t]){
+                        D3D12_CPU_DESCRIPTOR_HANDLE hsc = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+                        hsc.ptr += (SIZE_T)(nres * maxMip + t) * rtvStep;
+                        wl->OMSetRenderTargets(1, &hsc, FALSE, nullptr);
+                        D3D12_VIEWPORT wvp{ 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
+                        D3D12_RECT wsc{ 0, 0, (LONG)w, (LONG)h };
+                        wl->RSSetViewports(1, &wvp);
+                        wl->RSSetScissorRects(1, &wsc);
+                        ID3D12DescriptorHeap* whp[] = { svHeap.get(), smpHeap.get() };
+                        wl->SetDescriptorHeaps(smpHeap ? 2 : 1, whp);
+                        wl->SetGraphicsRootSignature(rootSig.get());
+                        D3D12_GPU_DESCRIPTOR_HANDLE wg = svHeap->GetGPUDescriptorHandleForHeapStart();
+                        UINT wslot = nSrv + s;
+                        if (!tblSlot.empty()){
+                            const unsigned per = (unsigned)tblSlot.size() / nres;
+                            const unsigned tt = per ? s + nres * ((k / nres) % per)
+                                                    : (k % (unsigned)tblSlot.size());
+                            if (tt < tblSlot.size()) wslot = tblSlot[tt];
+                        }
+                        wg.ptr += (UINT64)wslot * svStep;
+                        wl->SetGraphicsRootDescriptorTable(0, wg);
+                        if (upBuf){
+                            wl->SetGraphicsRootConstantBufferView(1, cbVa + (UINT64)(k % nCb) * 256);
+                            wl->SetGraphicsRootShaderResourceView(2, rawVa);
+                        }
+                        wl->SetPipelineState(pso.get());
+                        wl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                        wl->DrawInstanced(3, 1, 0, 0);
+                        wl->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+                    }
+                    wl->ResourceBarrier(1, &wb[1]);
+                    wl->Close();
+                    ID3D12CommandList* wls[] = { wl.get() };
+                    ExecOn(q.get(), 1, wls);
+                    SignalOn(q.get(), wf.get(), ++wv);
+                    if (wf->GetCompletedValue() < wv && wev){
+                        wf->SetEventOnCompletion(wv, wev);
+                        WaitForSingleObject(wev, 3000);
+                    }
+                    InterlockedIncrement(&wIters);
+                    const HRESULT wrr = dev->GetDeviceRemovedReason();
+                    if (wrr != S_OK){ wRr = wrr; InterlockedIncrement(&wDied); break; }
+                }
+                if (wev) CloseHandle(wev);
+            });
+        }
+    }
+
+    const ULONGLONG t0 = GetTickCount64();
+    UINT64 fv = 0;
+    unsigned i = 0;
+    bool open = false;
+    unsigned slot = 0, batch = 0;
+    for (; i < iters; ++i){
+        if (!open){
+            slot = batch % nfly;
+            // Only wait when this slot comes round again -- that is what leaves the
+            // other N-1 lists outstanding on the GPU.
+            if (slotFv[slot] && fence->GetCompletedValue() < slotFv[slot] && ev){
+                fence->SetEventOnCompletion(slotFv[slot], ev);
+                WaitForSingleObject(ev, 3000);
+            }
+            alloc = allocs[slot];
+            cl = cls[slot];
+            if (!noReset) alloc->Reset();
+            cl->Reset(alloc.get(), nullptr);
+            open = true;
+        }
+        // #158 threads: thread 0's block. With nThreads==1 this is exactly i % nres,
+        // so every single-threaded result in the record keeps its meaning.
+        const unsigned myLo = 0;
+        const unsigned myHi = nres / nThreads ? nres / nThreads : 1;
+        const unsigned si   = myLo + (i % (myHi - myLo));
+        ID3D12Resource* r = res[si].get();
+        D3D12_RESOURCE_BARRIER b[2]{};
+        if (replay){
+            // Walk the captured program in order and emit each transition exactly as
+            // the game recorded it. No return barrier: the program is its own return,
+            // which is why looping it stays self-consistent from the second pass on.
+            LONG pn = 0; const GhProgEnt* pc = GhProgCap(&pn);
+            if (pn > 0){
+                const GhProgEnt& e = pc[i % (unsigned)pn];
+                b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b[0].Transition.pResource   = (ID3D12Resource*)e.res;
+                b[0].Transition.Subresource = e.sub;
+                b[0].Transition.StateBefore = (D3D12_RESOURCE_STATES)e.before;
+                b[0].Transition.StateAfter  = (D3D12_RESOURCE_STATES)e.after;
+                cl->ResourceBarrier(1, &b[0]);
+                if (((i + 1) % perList) != 0 && (i + 1) < iters) continue;
+                open = false;
+                cl->Close();
+                ID3D12CommandList* rl[] = { cl.get() };
+                ExecOn(q.get(), 1, rl);
+                SignalOn(q.get(), fence.get(), ++fv);
+                slotFv[slot] = fv; ++batch;
+                if (nfly == 1 && fence->GetCompletedValue() < fv && ev){
+                    fence->SetEventOnCompletion(fv, ev);
+                    WaitForSingleObject(ev, 3000);
+                }
+                const HRESULT rr2 = dev->GetDeviceRemovedReason();
+                if (rr2 != S_OK){
+                    Diag("RTTEST REPLAY DIED at iteration " + std::to_string(i + 1) +
+                         " pass " + std::to_string((i + 1) / (unsigned)pn) +
+                         " removed=" + Hex((uint32_t)rr2) +
+                         " t=" + std::to_string((unsigned long long)(GetTickCount64() - t0)) + "ms");
+                    GhLogMemoryBudget("rttest-replay-died");
+                    if (ev) CloseHandle(ev);
+                    return;
+                }
+                if (((i + 1) % 5000) == 0)
+                    Diag("RTTEST replay ok " + std::to_string(i + 1) + "/" + std::to_string(iters) +
+                         " pass " + std::to_string((i + 1) / (unsigned)pn) +
+                         " t=" + std::to_string((unsigned long long)(GetTickCount64() - t0)) + "ms");
+                continue;
+            }
+        }
+        b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[0].Transition.pResource = r;
+        const unsigned nmip = cdesc[si].MipLevels ? cdesc[si].MipLevels : 1;
+        const unsigned sub = (nmip > 1) ? (i % nmip) : D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b[0].Transition.Subresource = sub;
+        b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        b[0].Transition.StateAfter  = after;
+        b[1] = b[0];
+        b[1].Transition.StateBefore = after;
+        b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        if (doClear){
+            D3D12_CPU_DESCRIPTOR_HANDLE hcpu = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+            hcpu.ptr += (SIZE_T)((si) * maxMip + (nmip > 1 ? (i % nmip) : 0)) * rtvStep;
+            const float col[4] = { 0.1f, 0.2f, 0.3f, 1.0f };
+            cl->ClearRenderTargetView(hcpu, col, 0, nullptr);
+        }
+        cl->ResourceBarrier(1, &b[0]);
+        // #158 selfsrv. The surface is in the read state HERE and nowhere else in the
+        // loop. Sample it from a shader into the scratch target, so the decompress
+        // b[0] just asked for has an actual consumer and cannot be optimised away.
+        if (selfSrv && pso && rootSig && svHeap && rtvHeap && scratchRt[0]){
+            D3D12_CPU_DESCRIPTOR_HANDLE hsc = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+            hsc.ptr += (SIZE_T)(nres * maxMip) * rtvStep;
+            cl->OMSetRenderTargets(1, &hsc, FALSE, nullptr);
+            D3D12_VIEWPORT svp{ 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
+            D3D12_RECT ssc{ 0, 0, (LONG)w, (LONG)h };
+            cl->RSSetViewports(1, &svp);
+            cl->RSSetScissorRects(1, &ssc);
+            ID3D12DescriptorHeap* shp2[] = { svHeap.get(), smpHeap.get() };
+            cl->SetDescriptorHeaps(smpHeap ? 2 : 1, shp2);
+            cl->SetGraphicsRootSignature(rootSig.get());
+            D3D12_GPU_DESCRIPTOR_HANDLE g = svHeap->GetGPUDescriptorHandleForHeapStart();
+            // THIS surface's own SRV. With gh_rttest_ntbl the handle comes from one of
+            // the spread table starts instead -- slot t views surface t % nres, and t is
+            // chosen so t % nres == si, so the consumer still samples the surface
+            // the transition just decompressed.
+            UINT tslot = nSrv + (si);
+            if (!tblSlot.empty()){
+                const unsigned per = (unsigned)tblSlot.size() / nres;
+                const unsigned t = per ? (si) + nres * ((i / nres) % per)
+                                       : (i % (unsigned)tblSlot.size());
+                if (t < tblSlot.size()) tslot = tblSlot[t];
+            }
+            g.ptr += (UINT64)tslot * svStep;
+            cl->SetGraphicsRootDescriptorTable(0, g);
+            if (upBuf){
+                cl->SetGraphicsRootConstantBufferView(1, cbVa + (UINT64)(i % nCb) * 256);
+                cl->SetGraphicsRootShaderResourceView(2, rawVa);
+            }
+            cl->SetPipelineState(pso.get());
+            cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            cl->DrawInstanced(3, 1, 0, 0);
+            ++selfSampled;
+            cl->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+        }
+        if (doBind && rtvHeap){
+            D3D12_CPU_DESCRIPTOR_HANDLE hb = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+            hb.ptr += (SIZE_T)((si) * maxMip + (nmip > 1 ? (i % nmip) : 0)) * rtvStep;
+            cl->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+            cl->ResourceBarrier(1, &b[1]);
+            cl->OMSetRenderTargets(1, &hb, FALSE, nullptr);
+        } else {
+            cl->ResourceBarrier(1, &b[1]);
+        }
+        // ---- #158: real draw work, mode bit 1. The resource is back in
+        // RENDER_TARGET here (b[1] just restored it), so it can be bound and drawn to.
+        if (doDraw && pso && rootSig && rtvHeap){
+            D3D12_CPU_DESCRIPTOR_HANDLE hd = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+            hd.ptr += (SIZE_T)((si) * maxMip + (nmip > 1 ? (i % nmip) : 0)) * rtvStep;
+            cl->OMSetRenderTargets(1, &hd, FALSE, nullptr);
+            D3D12_VIEWPORT vp{ 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
+            D3D12_RECT scr{ 0, 0, (LONG)w, (LONG)h };
+            cl->RSSetViewports(1, &vp);
+            cl->RSSetScissorRects(1, &scr);
+            if (doRich && svHeap){
+                ID3D12DescriptorHeap* hs[] = { svHeap.get() };
+                cl->SetDescriptorHeaps(1, hs);
+            }
+            cl->SetGraphicsRootSignature(rootSig.get());
+            if (doRich && svHeap && upBuf){
+                D3D12_GPU_DESCRIPTOR_HANDLE g = svHeap->GetGPUDescriptorHandleForHeapStart();
+                g.ptr += (UINT64)(i % nSrv) * svStep;
+                cl->SetGraphicsRootDescriptorTable(0, g);
+                cl->SetGraphicsRootConstantBufferView(1, cbVa + (UINT64)(i % nCb) * 256);
+                cl->SetGraphicsRootShaderResourceView(2, rawVa);
+            }
+            cl->SetPipelineState((doMPso && psoN[i % nPso]) ? psoN[i % nPso].get()
+                                                            : pso.get());
+            cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            cl->DrawInstanced(3, 1, 0, 0);
+            ++drawsIssued;
+            // POSITIVE CONTROL. Copy one pixel back on the first draw only. Without
+            // this a "survived" reading cannot be distinguished from a run whose
+            // draws never reached the GPU -- which is exactly how this probe produced
+            // a confident null for four rounds.
+            if (!rbAsked && rbBuf && nmip == 1){
+                rbAsked = true;
+                D3D12_RESOURCE_BARRIER cb{};
+                cb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                cb.Transition.pResource = r;
+                cb.Transition.Subresource = 0;
+                cb.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                cb.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                cl->ResourceBarrier(1, &cb);
+                D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+                src.pResource = r;
+                src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                src.SubresourceIndex = 0;
+                dst.pResource = rbBuf.get();
+                dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                dst.PlacedFootprint = rbFp;
+                D3D12_BOX box{}; box.left = 0; box.top = 0; box.front = 0;
+                box.right = 1; box.bottom = 1; box.back = 1;
+                cl->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+                std::swap(cb.Transition.StateBefore, cb.Transition.StateAfter);
+                cl->ResourceBarrier(1, &cb);
+            }
+        }
+        // Not a batch boundary yet -- keep recording into the same list.
+        if (((i + 1) % perList) != 0 && (i + 1) < iters) continue;
+        open = false;
+        cl->Close();
+        ID3D12CommandList* lists[] = { cl.get() };
+        // Order this batch strictly between two points on the GAME's queue.
+        if (interleave){
+            SignalOn(q0, ilGame.get(), ++ilGv);
+            WaitOn(q.get(), ilGame.get(), ilGv);
+        }
+        ExecOn(q.get(), 1, lists);
+        if (interleave){
+            SignalOn(q.get(), ilOurs.get(), ++ilOv);
+            WaitOn(q0, ilOurs.get(), ilOv);
+        }
+        SignalOn(q.get(), fence.get(), ++fv);
+        slotFv[slot] = fv;
+        ++batch;
+        // With a pool we deliberately do NOT drain here; the wait happens when the
+        // slot is reused, so up to nfly submissions are outstanding at once.
+        if (nfly == 1 && fence->GetCompletedValue() < fv && ev){
+            fence->SetEventOnCompletion(fv, ev);
+            WaitForSingleObject(ev, 3000);
+        }
+        if (rbAsked && !rbDone && rbBuf && nfly == 1 &&
+            fence->GetCompletedValue() >= fv){
+            rbDone = true;
+            void* pm = nullptr; D3D12_RANGE rr0{ 0, 4 };
+            HRESULT hm = rbBuf->Map(0, &rr0, &pm);
+            UINT32 px = 0;
+            if (SUCCEEDED(hm) && pm){ memcpy(&px, pm, 4); D3D12_RANGE nw{0,0}; rbBuf->Unmap(0, &nw); }
+            // The PS writes float4(1,0,0,1); in R8G8B8A8_UNORM that is FF 00 00 FF,
+            // which reads back as 0xFF0000FF little-endian. Any other format changes
+            // the expected value but not the point: a nonzero, non-clear pixel means
+            // the rasteriser ran.
+            Diag(std::string("RTDRAW readback=") + Hex((uint32_t)px) +
+                 " expected=0xFF0000FF maphr=" + Hex((uint32_t)hm) +
+                 " draws=" + std::to_string(drawsIssued) +
+                 (px == 0xFF0000FFu ? "  PIXELS WRITTEN"
+                                    : "  NO PIXELS -- run is VOID, not negative"));
+        }
+        const HRESULT rr = dev->GetDeviceRemovedReason();
+        const bool late = (nfly == 1) && fence->GetCompletedValue() < fv;
+        if (rr != S_OK || late){
+            Diag("RTTEST DIED at iteration " + std::to_string(i + 1) +
+                 " batch=" + std::to_string(batch) +
+                 " draws=" + std::to_string(drawsIssued) +
+                 " removed=" + Hex((uint32_t)rr) +
+                 (late ? " (fence never retired)" : "") +
+                 " t=" + std::to_string((unsigned long long)(GetTickCount64() - t0)) + "ms");
+            GhLogMemoryBudget("rttest-died");
+            if (ev) CloseHandle(ev);
+            return;
+        }
+        if (((i + 1) % 100) == 0)
+            Diag("RTTEST ok " + std::to_string(i + 1) + "/" + std::to_string(iters) +
+                 " batches=" + std::to_string(batch) +
+                 " draws=" + std::to_string(drawsIssued) +
+                 " t=" + std::to_string((unsigned long long)(GetTickCount64() - t0)) + "ms");
+    }
+    workers.join_all();
+    if (nThreads > 1)
+        Diag("RTTEST THREADS threads=" + std::to_string(nThreads) +
+             " started=" + std::to_string((long)wStarted) +
+             " block=" + std::to_string(wBlk) +
+             " worker_iters=" + std::to_string((long)wIters) +
+             " worker_died=" + std::to_string((long)wDied) +
+             " removed=" + Hex((uint32_t)wRr) +
+             (wStarted + 1 < (LONG)nThreads ? "  -- WORKERS FAILED TO START, run is VOID" : ""));
+    if (interleave) Diag("RTTEST INTERLEAVE completed " + std::to_string(ilGv) +
+                         " cross-queue fence pairs");
+    if (selfSrv)
+        Diag("RTTEST SELFSRV consumed=" + std::to_string(selfSampled) +
+             " of " + std::to_string(iters) + " transitions"
+             " -- a zero here means the probe still measured NOTHING");
+    Diag("RTTEST SURVIVED all " + std::to_string(iters) + " transitions, " +
+         std::to_string(batch) + " submissions, " + std::to_string(drawsIssued) +
+         " draws in " +
+         std::to_string((unsigned long long)(GetTickCount64() - t0)) + "ms");
+    if (doDraw && !rbDone)
+        Diag("RTDRAW NO READBACK CONFIRMED -- this run is VOID, not negative");
+    GhLogMemoryBudget("rttest-survived");
+    if (ev) CloseHandle(ev);
 }
 
 // Called from the guest WORKER thread. Marshals the build to the UI thread once.
@@ -2321,6 +4024,10 @@ static bool EnsureBridge()
     attempted = true;
 
     if (!g_dispatcher){ Diag("GFX FAIL no_dispatcher"); g_gfx.failed = true; return false; }
+
+    // #169: the bridge builds the FIRST D3D12 device in the process, so this is
+    // the only window in which the caps negotiation has not happened yet.
+    GhDdiInstall();
 
     HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_dispatcher.RunAsync(CoreDispatcherPriority::Normal, [done]{
@@ -2655,9 +4362,459 @@ static void GhWatchTick(const char* where)
 // currently-acquired wrapped back buffer. Release it, flush 11on12's queued work
 // through the D3D12 queue, present, then acquire the next buffer so the guest's
 // next GetBuffer(0) is render-ready.
+// #158. Every run presents exactly once and then never asks for a second frame,
+// while the render thread keeps queuing lists until the TDR fires. So the question
+// is not what the GPU choked on -- it is what the thread that presented is doing
+// instead of presenting again. Record it so the stall dump can name it.
+// #158: per-vtable-slot API profiler.
+//
+// Frame 26 is reached with the guest's command lists emptied AND with our whole
+// present path short-circuited, so the trigger is neither the guest's recorded
+// content nor our blit. What is left is the calls the guest makes on the DEVICE
+// and the QUEUE -- and the log only shows the handful of those we happen to hook
+// and Diag. This profiles ALL of them, hooked or not, logged or not.
+//
+// Every slot gets a 24-byte thunk that bumps a counter and tail-jumps to whatever
+// the slot held before (our own hook, or the driver's). The thunk touches only
+// rax, which in the Win64 ABI is caller-saved and never carries an argument --
+// not even the hidden return pointer of a large struct return, which is rcx --
+// so one thunk shape is correct for every signature without knowing any of them.
+// That is the whole point: an API we never guessed at can still name itself.
+static const int GH_PROF_MAX = 64;
+struct GhProfTable {
+    const char* name = "";
+    int slots = 0;
+    volatile LONG64 counts[GH_PROF_MAX]{};
+    LONG64 prev[GH_PROF_MAX]{};
+};
+static GhProfTable g_profDev, g_profQ, g_profCL;
+static unsigned GhApiProfOn()
+{ static const unsigned v = GhCfgNum(L"gh_api_prof.txt", "GH_API_PROF", 0); return v; }
+
+static bool GhProfHookVtbl(void* obj, int slots, GhProfTable* t, const char* name)
+{
+    if (!obj || slots <= 0 || slots > GH_PROF_MAX) return false;
+    void** vt = *(void***)obj;
+    if (!vt) return false;
+    BYTE* page = (BYTE*)VirtualAlloc(nullptr, (SIZE_T)slots * 32,
+                                     MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!page) return false;
+    DWORD old = 0;
+    if (!VirtualProtect(vt, sizeof(void*) * slots, PAGE_READWRITE, &old)){
+        VirtualFree(page, 0, MEM_RELEASE);
+        return false;
+    }
+    for (int i = 0; i < slots; ++i){
+        BYTE* p = page + (size_t)i * 32;
+        void* prev = vt[i];
+        p[0] = 0x48; p[1] = 0xB8;                       // mov rax, imm64
+        *(void**)(p + 2) = (void*)&t->counts[i];        //   &counts[i]
+        p[10] = 0xF0; p[11] = 0x48; p[12] = 0xFF; p[13] = 0x00;  // lock inc qword [rax]
+        p[14] = 0x48; p[15] = 0xB8;                     // mov rax, imm64
+        *(void**)(p + 16) = prev;                       //   original slot
+        p[24] = 0xFF; p[25] = 0xE0;                     // jmp rax
+        vt[i] = p;
+    }
+    VirtualProtect(vt, sizeof(void*) * slots, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), page, (SIZE_T)slots * 32);
+    t->name = name; t->slots = slots;
+    Diag(std::string("APIPROF hooked ") + name + " slots=" + std::to_string(slots) +
+         " vt=" + Hex((uint64_t)(uintptr_t)vt));
+    return true;
+}
+
+// Deltas since the previous dump, so a per-frame call prints that frame's profile
+// and the frame-25 line can be diffed straight against the frame-26 line.
+static unsigned GhClCensus();   // #158, defined with the relocation knobs below
+static void GhProfDump(const char* why)
+{
+    if (!GhApiProfOn() && !GhClCensus()) return;
+    GhProfTable* tabs[3] = { &g_profDev, &g_profQ, &g_profCL };
+    for (GhProfTable* t : tabs){
+        if (!t->slots) continue;
+        std::string s = std::string("APIPROF ") + why + " " + t->name;
+        bool any = false;
+        for (int i = 0; i < t->slots; ++i){
+            const LONG64 c = InterlockedCompareExchange64(&t->counts[i], 0, 0);
+            const LONG64 d = c - t->prev[i];
+            t->prev[i] = c;
+            if (d){ s += " " + std::to_string(i) + "=" + std::to_string((long long)d); any = true; }
+        }
+        if (any) Diag(s);
+    }
+}
+
+static volatile LONG64 g_heapBytes = 0;   // #158, shared with Hook_D12CreateHeap
+static volatile LONG   g_heapCount = 0;
+static LONG GhEclNow();                   // #158, defined with g_eclCount below
+static volatile LONG g_presentTid = 0;
+static volatile LONG g_presentN   = 0;
+static volatile LONG64 g_presentTick = 0;
+// ---------------------------------------------------------------------------
+// #158, THE RESET TEST (gh_pool_reset).
+//
+// The budget is MONOTONIC: inflight=1 says every probe submission was fully
+// retired and still spent the pool permanently. ~2,048 lifetime render-target
+// metadata operations cannot be a driver design limit -- a retail title clears
+// render targets thousands of times a second -- so something on OUR display path
+// consumes an entry per operation and never gives it back. That is a recycle
+// failure, and this knob asks the only question that names the owner: rebuild an
+// object on the display path mid-run, and see whether the headroom comes back.
+//
+//   gh_pool_reset      = N   reset after every Nth present   (0 = OFF, default)
+//   gh_pool_reset_mode = 1   ResizeBuffers -- same swapchain object, same queue,
+//                            freshly allocated back buffers
+//                      = 2   a whole new swapchain on the same queue and the same
+//                            11on12 device -- the strictly stronger version
+//                      = 3   THE NO-OP CONTROL, and the one to run first. Every
+//                            step of the dance -- drain, release the wrapped
+//                            resources and the back buffers, re-GetBuffer, re-wrap,
+//                            re-acquire -- with the reset call itself left out. It
+//                            is the discriminator the first round needed and did
+//                            not have: mode 1 removed the device (0x887A0005) one
+//                            frame after a ResizeBuffers that returned S_OK, and
+//                            nothing in that run says whether the fault is in the
+//                            reset or in OUR teardown around it. Mode 3 dies ->
+//                            the teardown; mode 3 survives -> ResizeBuffers.
+//   gh_pool_reset_max  = M   stop after M resets (0 = unlimited)
+//
+// There is deliberately no "new queue" mode. The queue is already the best-ruled-
+// out object on the path: R_sub and R_rot4 (substitute and rotated guest queues)
+// never raised the ceiling, a FRESH queue that never presents has its own pool
+// (55,972 ops, zero displacement), and Z3_ctl's second PRESENTING queue SHRANK
+// the ceiling threefold. Presenting is the thing that shares the pool, not queue
+// identity -- so a third mode would spend the riskiest teardown in the loader on
+// the outcome the corpus already predicts.
+//
+// Reading it: more than 9 frames, or more than the eleven-rung ladder, means the
+// rebuilt object was holding the un-recycled entries. Unchanged at mode 2 means
+// the pool is per-DEVICE and the answer is upstream, in how we present at all.
+// Either way it is decisive -- and it is a DIAGNOSTIC, not a fix: 2,080 budget
+// over ~373 work ops per frame is 5.5 frames, so "rebuild the swapchain every
+// five frames" does not describe a playable game. It names the owning object.
+// Presents still to be reported after a reset. Mode 1's device removal showed up
+// one frame LATER with an hr nobody was printing, so the frames either side of a
+// reset are the ones that need a line.
+static volatile LONG g_prPost = 0;
+
+static bool GhPoolResetNow(unsigned mode, bool useD12Blit, unsigned long long presentN)
+{
+    if (!g_gfx.swap || !g_gfx.d12) return false;
+    const ULONGLONG t0 = GetTickCount64();
+    Diag("POOLRESET begin n=" + std::to_string(presentN) + " mode=" + std::to_string(mode) +
+         " cur=" + std::to_string((unsigned)g_gfx.cur) +
+         " swap=" + Hex((uint64_t)(uintptr_t)g_gfx.swap.get()));
+
+    // The removal probe. Mode 1 lost the device with 0x887A0005 a frame after a
+    // ResizeBuffers that returned S_OK, so the useful question is not "did the call
+    // succeed" but "which step was the device still alive after". Sample it at every
+    // seam; the first non-zero reading names the step.
+    auto drr = [](const char* where){
+        HRESULT r = g_gfx.d12 ? g_gfx.d12->GetDeviceRemovedReason() : E_FAIL;
+        Diag(std::string("POOLRESET drr@") + where + "=" + Hex((uint32_t)r));
+        return r;
+    };
+    // A full GPU idle on both of OUR queues. Called twice: once to retire work that
+    // still references a back buffer, and again after the references are dropped --
+    // D3D11 destruction is DEFERRED, so a wrapped resource is only really gone once
+    // the context has been flushed AND the frame carrying it has retired.
+    auto idle = [](const char* where){
+        com_ptr<ID3D12Fence> f;
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (ev && g_gfx.d12 && SUCCEEDED(g_gfx.d12->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                                   __uuidof(ID3D12Fence), f.put_void()))){
+            uint64_t v = 0;
+            // Only OUR queues ever touch a back buffer -- the guest renders into
+            // guestRT12 -- so the guest queue is left alone and its fence protocol
+            // is not disturbed.
+            ID3D12CommandQueue* qs[] = { g_gfx.queue.get(), g_gfx.scQueue.get() };
+            for (ID3D12CommandQueue* q : qs){
+                if (!q) continue;
+                if (FAILED(q->Signal(f.get(), ++v))) break;
+                if (f->GetCompletedValue() < v){
+                    f->SetEventOnCompletion(v, ev);
+                    if (WaitForSingleObject(ev, 2000) != WAIT_OBJECT_0)
+                        Diag(std::string("POOLRESET drain TIMEOUT at ") + where +
+                             " on queue " + Hex((uint64_t)(uintptr_t)q));
+                }
+            }
+        }
+        if (ev) CloseHandle(ev);
+    };
+
+    // 1. Drain. DXGI answers DXGI_ERROR_INVALID_CALL while a single reference to a
+    //    back buffer is outstanding, and the GPU holds one for as long as the last
+    //    blit or Present is in flight.
+    drr("entry");
+    idle("pre-release");
+
+    // 2. Give every back-buffer reference back. NOTE the one window this is safe in:
+    //    the sole caller runs AFTER Present and BEFORE the next frame's acquire, so
+    //    no back buffer is currently acquired by 11on12 in EITHER path (the d12-blit
+    //    path released its standing acquire once and for all; the 11on12 path
+    //    released wrapped[cur] a few lines above the Present). Releasing here as
+    //    well would be a double release. Move the call and this stops being true.
+    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+    for (UINT i = 0; i < kGfxFrames; ++i) g_gfx.wrapped[i] = nullptr;
+    // ClearState drops any view D3D11 still has bound to a back buffer -- the
+    // overlay and the cursor both re-establish their state on every use, so
+    // nothing depends on it surviving. Flush, idle, flush: the release has to have
+    // travelled all the way through the deferred-destruction path before the
+    // D3D12 resources underneath it go.
+    if (g_gfx.d11ctx){ g_gfx.d11ctx->ClearState(); g_gfx.d11ctx->Flush(); }
+    idle("post-release");
+    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+    for (UINT i = 0; i < kGfxFrames; ++i) g_gfx.backBuffers[i] = nullptr;
+    drr("released");
+
+    // 3. Rebuild.
+    HRESULT hr = S_OK;
+    if (mode == 3){
+        // The no-op control: the reset call, and only the reset call, is missing.
+        // Tested BEFORE the mode>=2 branch -- ordering it after made `mode >= 2`
+        // swallow mode 3, so the first attempt at this control silently ran a full
+        // swapchain recreate instead (PR3_b, which is therefore a mode-2 cell).
+        Diag("POOLRESET mode=3 NO-OP (teardown/rebuild only, no reset call)");
+    } else if (mode >= 2){
+        if (!g_gfx.factory || !g_gfx.coreWindow){
+            Diag("POOLRESET mode=2 UNAVAILABLE: no stashed factory/CoreWindow");
+        } else {
+            ID3D12CommandQueue* scq = g_gfx.scQueue ? g_gfx.scQueue.get() : g_gfx.queue.get();
+            // The old chain has to go first: a CoreWindow carries one swapchain, so
+            // creating the replacement while the incumbent is alive fails outright.
+            // If the create then fails there is nothing to fall back to -- which is
+            // why mode 2 is not the default and mode 1 is the cell to run first.
+            g_gfx.swap = nullptr;
+            com_ptr<IDXGISwapChain1> sc1;
+            hr = g_gfx.factory->CreateSwapChainForCoreWindow(scq, g_gfx.coreWindow.get(),
+                                                             &g_gfx.scDesc, nullptr, sc1.put());
+            Diag("POOLRESET mode=2 CreateSwapChainForCoreWindow hr=" + Hex((uint32_t)hr));
+            if (SUCCEEDED(hr)) g_gfx.swap = sc1.as<IDXGISwapChain3>();
+        }
+    } else {
+        // Width/height 0 and format UNKNOWN mean "keep what you had" -- the shape is
+        // held fixed so the cell varies the allocation and nothing else.
+        hr = g_gfx.swap->ResizeBuffers(g_gfx.nFrames, 0, 0, DXGI_FORMAT_UNKNOWN,
+                                       g_gfx.scDesc.Flags);
+        Diag("POOLRESET mode=1 ResizeBuffers hr=" + Hex((uint32_t)hr));
+    }
+    drr("post-reset");
+
+    if (!g_gfx.swap){
+        Diag("POOLRESET FAILED: no swapchain, the display path is gone");
+        return false;
+    }
+
+    // 4. Re-acquire and re-wrap, exactly as BuildBridgeOnUi does. On a failed
+    //    ResizeBuffers the old buffers are still there and GetBuffer still serves
+    //    them, so this path also restores a cell that could not reset -- the log
+    //    line above is what tells the two apart.
+    for (UINT i = 0; i < g_gfx.nFrames; ++i){
+        HRESULT gb = g_gfx.swap->GetBuffer(i, __uuidof(ID3D12Resource),
+                                           g_gfx.backBuffers[i].put_void());
+        if (FAILED(gb)){ Diag("POOLRESET GetBuffer " + std::to_string(i) +
+                              " hr=" + Hex((uint32_t)gb)); return false; }
+        D3D11_RESOURCE_FLAGS rf{}; rf.BindFlags = D3D11_BIND_RENDER_TARGET;
+        HRESULT wr = g_gfx.on12->CreateWrappedResource(g_gfx.backBuffers[i].get(), &rf,
+                         D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PRESENT,
+                         __uuidof(ID3D11Resource), g_gfx.wrapped[i].put_void());
+        if (FAILED(wr)){ Diag("POOLRESET CreateWrappedResource " + std::to_string(i) +
+                              " hr=" + Hex((uint32_t)wr)); return false; }
+    }
+
+    // 5. Put the frame bookkeeping back where a fresh chain expects it: nothing of
+    //    ours is in flight against any index any more, and the standing acquire has
+    //    to be re-established on whichever buffer the new chain starts on.
+    for (UINT i = 0; i < kGfxFrames; ++i) g_gfx.blitFrameV[i] = 0;
+    g_gfx.cur = g_gfx.swap->GetCurrentBackBufferIndex();
+    g_gfx.blitStandingReleased = false;
+    if (useD12Blit){
+        ID3D11Resource* standing[] = { g_gfx.wrapped[g_gfx.cur].get() };
+        g_gfx.on12->ReleaseWrappedResources(standing, 1);
+        g_gfx.d11ctx->Flush();
+        g_gfx.blitStandingReleased = true;
+    } else {
+        ID3D11Resource* next[] = { g_gfx.wrapped[g_gfx.cur].get() };
+        g_gfx.on12->AcquireWrappedResources(next, 1);
+    }
+
+    drr("rewrapped");
+    InterlockedExchange(&g_prPost, 4);
+    Diag("POOLRESET done n=" + std::to_string(presentN) + " mode=" + std::to_string(mode) +
+         " hr=" + Hex((uint32_t)hr) + " cur=" + std::to_string((unsigned)g_gfx.cur) +
+         " swap=" + Hex((uint64_t)(uintptr_t)g_gfx.swap.get()) +
+         " ms=" + std::to_string((unsigned long long)(GetTickCount64() - t0)));
+    return SUCCEEDED(hr);
+}
+
+// #158, the queue-ownership test (gh_sc_guestq / SCGQ).
+//
+// The pool is MONOTONIC: submissions that fully retired (inflight=1) still cost
+// it, so the useful question is not what spends entries but why ours are never
+// RETURNED. A retail title plainly recycles them, or every game on this console
+// would die after nine frames.
+//
+// The one structural oddity left in our design is that the guest renders on ITS
+// queue while we present on OURS. If the driver recycles a queue's render-target
+// metadata at present time, the guest's entries can never come back, because the
+// guest's queue never presents. That fits everything measured: a fresh queue that
+// never presents has its own pool and never exhausts it, while every presenting
+// queue shares one.
+//
+// This rebinds the swapchain to the guest's queue at the moment that queue first
+// becomes known -- inside CreateSwapChainForHwnd, before a single frame has been
+// presented. That is NOT the mid-run recreate the reset test proved fatal: there,
+// a second chain was made for a window that already had a presenting one.
+//
+// The blit moves with it (see GfxPresent), so the whole display path ends up on
+// one queue. That requires the pure-D3D12 blit: the 11on12 device was handed its
+// queue at creation and cannot be moved without rebuilding it.
+static bool GhSwapToGuestQueue()
+{
+    if (!g_gfx.d12 || !g_gfx.guestQueue || !g_gfx.factory || !g_gfx.coreWindow || !g_gfx.swap){
+        Diag("SCGQ prerequisites missing -- staying on our queue");
+        return false;
+    }
+    const uint64_t t0 = GetTickCount64();
+    auto drr = [&](const char* where){
+        Diag(std::string("SCGQ drr@") + where + "=" +
+             Hex((uint32_t)g_gfx.d12->GetDeviceRemovedReason()));
+    };
+    drr("entry");
+
+    // Drain our queue before dropping anything it still references.
+    {
+        com_ptr<ID3D12Fence> f;
+        if (SUCCEEDED(g_gfx.d12->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                             __uuidof(ID3D12Fence), f.put_void()))){
+            HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (ev){
+                if (SUCCEEDED(g_gfx.queue->Signal(f.get(), 1)) && f->GetCompletedValue() < 1){
+                    f->SetEventOnCompletion(1, ev);
+                    WaitForSingleObject(ev, 2000);
+                }
+                CloseHandle(ev);
+            }
+        }
+    }
+
+    // BuildBridgeOnUi leaves one back buffer acquired by 11on12. Hand it back
+    // before the wrappers go, or D3D11 and D3D12 both believe they own its state.
+    if (g_gfx.on12 && g_gfx.wrapped[g_gfx.cur]){
+        ID3D11Resource* standing[] = { g_gfx.wrapped[g_gfx.cur].get() };
+        g_gfx.on12->ReleaseWrappedResources(standing, 1);
+    }
+    if (g_gfx.d11ctx){ g_gfx.d11ctx->Flush(); g_gfx.d11ctx->ClearState(); g_gfx.d11ctx->Flush(); }
+    for (UINT i = 0; i < kGfxFrames; ++i) g_gfx.wrapped[i]     = nullptr;
+    for (UINT i = 0; i < kGfxFrames; ++i) g_gfx.backBuffers[i] = nullptr;
+    g_gfx.swap = nullptr;
+    drr("released");
+
+    com_ptr<IDXGISwapChain1> sc1;
+    HRESULT hr = g_gfx.factory->CreateSwapChainForCoreWindow(
+        g_gfx.guestQueue.get(), g_gfx.coreWindow.get(), &g_gfx.scDesc, nullptr, sc1.put());
+    Diag("SCGQ CreateSwapChainForCoreWindow(guestQueue=" +
+         Hex((uint64_t)(uintptr_t)g_gfx.guestQueue.get()) + ") hr=" + Hex((uint32_t)hr));
+    if (FAILED(hr)){
+        Diag("SCGQ FAILED -- the bridge has no swapchain now, this cell is VOID");
+        return false;
+    }
+    g_gfx.swap = sc1.as<IDXGISwapChain3>();
+    drr("recreated");
+
+    for (UINT i = 0; i < g_gfx.nFrames; ++i){
+        HRESULT gb = g_gfx.swap->GetBuffer(i, __uuidof(ID3D12Resource),
+                                           g_gfx.backBuffers[i].put_void());
+        if (FAILED(gb)){ Diag("SCGQ GetBuffer " + std::to_string(i) +
+                              " hr=" + Hex((uint32_t)gb)); return false; }
+        D3D11_RESOURCE_FLAGS rf{}; rf.BindFlags = D3D11_BIND_RENDER_TARGET;
+        HRESULT wr = g_gfx.on12->CreateWrappedResource(g_gfx.backBuffers[i].get(), &rf,
+                         D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PRESENT,
+                         __uuidof(ID3D11Resource), g_gfx.wrapped[i].put_void());
+        if (FAILED(wr)){ Diag("SCGQ CreateWrappedResource " + std::to_string(i) +
+                              " hr=" + Hex((uint32_t)wr)); return false; }
+    }
+
+    // Nothing of ours is in flight against any index on the new chain, and the
+    // standing acquire has to be re-established on whichever buffer it starts on.
+    // The d12-blit path releases it again on its first pass (blitStandingReleased),
+    // so leave that flag false and let GfxPresent do it -- one owner for that
+    // invariant, not two.
+    for (UINT i = 0; i < kGfxFrames; ++i) g_gfx.blitFrameV[i] = 0;
+    g_gfx.cur = g_gfx.swap->GetCurrentBackBufferIndex();
+    g_gfx.blitStandingReleased = false;
+    {
+        ID3D11Resource* next[] = { g_gfx.wrapped[g_gfx.cur].get() };
+        g_gfx.on12->AcquireWrappedResources(next, 1);
+    }
+
+    g_gfx.scOnGuestQ = true;
+    drr("rewrapped");
+    Diag("SCGQ done: swapchain now presents on the GUEST queue, swap=" +
+         Hex((uint64_t)(uintptr_t)g_gfx.swap.get()) +
+         " cur=" + std::to_string((unsigned)g_gfx.cur) +
+         " ms=" + std::to_string((unsigned long long)(GetTickCount64() - t0)));
+    return true;
+}
+
+// #158 gh_sc_guestq=2, the other half of the deferral: build the chain here, on
+// the first present, when the guest's queue is finally known. Nothing is torn
+// down because nothing was ever built -- the difference from mode 1, and the
+// reason this is the cleaner vehicle for the same question.
+static bool GhCreateDeferredSwap()
+{
+    if (!g_gfx.d12 || !g_gfx.factory || !g_gfx.coreWindow || !g_gfx.on12){
+        Diag("SCGQ deferred create: prerequisites missing -- VOID");
+        return false;
+    }
+    ID3D12CommandQueue* const q = g_gfx.guestQueue ? g_gfx.guestQueue.get() : g_gfx.queue.get();
+    const bool onGuest = (g_gfx.guestQueue != nullptr);
+    if (!onGuest)
+        Diag("SCGQ deferred create: guest queue STILL unknown at first present -- "
+             "falling back to ours, which measures nothing. Score this cell VOID.");
+
+    com_ptr<IDXGISwapChain1> sc1;
+    HRESULT hr = g_gfx.factory->CreateSwapChainForCoreWindow(
+        q, g_gfx.coreWindow.get(), &g_gfx.scDesc, nullptr, sc1.put());
+    Diag("SCGQ deferred CreateSwapChainForCoreWindow(q=" +
+         Hex((uint64_t)(uintptr_t)q) + (onGuest ? " GUEST" : " OURS") +
+         ") hr=" + Hex((uint32_t)hr));
+    if (FAILED(hr)) return false;
+    g_gfx.swap = sc1.as<IDXGISwapChain3>();
+
+    for (UINT i = 0; i < g_gfx.nFrames; ++i){
+        HRESULT gb = g_gfx.swap->GetBuffer(i, __uuidof(ID3D12Resource),
+                                           g_gfx.backBuffers[i].put_void());
+        if (FAILED(gb)){ Diag("SCGQ deferred GetBuffer " + std::to_string(i) +
+                              " hr=" + Hex((uint32_t)gb)); return false; }
+        D3D11_RESOURCE_FLAGS rf{}; rf.BindFlags = D3D11_BIND_RENDER_TARGET;
+        HRESULT wr = g_gfx.on12->CreateWrappedResource(g_gfx.backBuffers[i].get(), &rf,
+                         D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PRESENT,
+                         __uuidof(ID3D11Resource), g_gfx.wrapped[i].put_void());
+        if (FAILED(wr)){ Diag("SCGQ deferred CreateWrappedResource " + std::to_string(i) +
+                              " hr=" + Hex((uint32_t)wr)); return false; }
+    }
+
+    g_gfx.cur = g_gfx.swap->GetCurrentBackBufferIndex();
+    g_gfx.blitStandingReleased = false;
+    {
+        ID3D11Resource* first[] = { g_gfx.wrapped[g_gfx.cur].get() };
+        g_gfx.on12->AcquireWrappedResources(first, 1);
+    }
+    g_gfx.scOnGuestQ = onGuest;
+    Diag("SCGQ deferred done: swap=" + Hex((uint64_t)(uintptr_t)g_gfx.swap.get()) +
+         " cur=" + std::to_string((unsigned)g_gfx.cur) +
+         " onGuestQueue=" + std::to_string((int)onGuest) +
+         " drr=" + Hex((uint32_t)g_gfx.d12->GetDeviceRemovedReason()));
+    return true;
+}
+
 static HRESULT GfxPresent(UINT sync)
 {
     GhWatchTick("GfxPresent");
+    InterlockedExchange(&g_presentTid, (LONG)GetCurrentThreadId());
+    InterlockedIncrement(&g_presentN);
+    InterlockedExchange64(&g_presentTick, (LONG64)GetTickCount64());
     if (!g_gfx.ready) return DXGI_ERROR_DEVICE_REMOVED;
 #ifdef GH_LAUNCHER
     if (!g_guestSessionLive) return S_OK;
@@ -2708,6 +4865,24 @@ static HRESULT GfxPresent(UINT sync)
         return S_OK;
     }
 
+    // #158 gh_sc_guestq=2: the chain was deferred so it could be created on the
+    // guest's own queue. This is the first moment that queue is known.
+    if (!g_gfx.swap){
+        std::lock_guard<std::mutex> lk(g_d11Mutex);
+        if (!g_gfx.swap){
+            static const unsigned scgq = GhCfgNum(L"gh_sc_guestq.txt", "GH_SC_GUESTQ", 0);
+            if (scgq < 2){
+                static bool said = false;
+                if (!said){ said = true; Diag("GfxPresent: no swapchain and no deferral asked for"); }
+                return E_FAIL;
+            }
+            if (!GhCreateDeferredSwap()){
+                Diag("SCGQ deferred create FAILED -- score this cell VOID, not negative");
+                return E_FAIL;
+            }
+        }
+    }
+
     // #158: pure D3D12 blit -- no 11on12 wrap, no acquire/release, no D3D11
     // flush. The overlay and the software cursor are drawn with D3D11 and are
     // skipped while this path is selected; that is a deliberate limitation of the
@@ -2720,7 +4895,7 @@ static HRESULT GfxPresent(UINT sync)
         std::lock_guard<std::mutex> lk(g_d11Mutex);
         if (!g_gfx.blitReady){
             bool ok = true;
-            for (UINT i = 0; i < kGfxFrames && ok; ++i)
+            for (UINT i = 0; i < g_gfx.nFrames && ok; ++i)
                 ok = SUCCEEDED(g_gfx.d12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
                         __uuidof(ID3D12CommandAllocator), g_gfx.blitAlloc[i].put_void()));
             if (ok) ok = SUCCEEDED(g_gfx.d12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -2770,8 +4945,24 @@ static HRESULT GfxPresent(UINT sync)
             g_gfx.blitList->ResourceBarrier(2, b);
             g_gfx.blitList->Close();
             ID3D12CommandList* lists[] = { g_gfx.blitList.get() };
-            g_gfx.queue->ExecuteCommandLists(1, lists);
-            g_gfx.queue->Signal(g_gfx.blitFence.get(), ++g_gfx.blitFenceV);
+            // blitFrameV above waits only for OUR previous blit into this index; with a
+            // dedicated swapchain queue the Present of that buffer runs on scQueue and
+            // is not covered by it. Wait for the last Present before touching any back
+            // buffer -- conservative (it serialises blit and present), but this path is
+            // a diagnostic, and the alternative is a scan-out race.
+            // #158 gh_sc_guestq: when the swapchain has been rebound to the guest
+            // queue the blit has to ride along, or the queue that presents is still
+            // not the queue that produced the image. Submitting here puts the whole
+            // display path -- the game's own work, our blit, and the Present -- on
+            // one queue, which is the only configuration that lets a per-queue
+            // recycle at present time return OUR entries too.
+            ID3D12CommandQueue* const presentQ =
+                (g_gfx.scOnGuestQ && g_gfx.guestQueue) ? g_gfx.guestQueue.get()
+                                                       : g_gfx.queue.get();
+            if (g_gfx.scQueue && g_gfx.scPresFence && g_gfx.scPresV)
+                presentQ->Wait(g_gfx.scPresFence.get(), g_gfx.scPresV);
+            presentQ->ExecuteCommandLists(1, lists);
+            presentQ->Signal(g_gfx.blitFence.get(), ++g_gfx.blitFenceV);
             g_gfx.blitFrameV[i] = g_gfx.blitFenceV;
         }
     } else {
@@ -2815,7 +5006,20 @@ static HRESULT GfxPresent(UINT sync)
     }
 #endif
 
+    // With a dedicated swapchain queue the blit runs on g_gfx.queue and the Present
+    // is inserted on scQueue, so the two must be ordered explicitly.
+    if (g_gfx.scQueue && g_gfx.scFence){
+        g_gfx.queue->Signal(g_gfx.scFence.get(), ++g_gfx.scFenceV);
+        g_gfx.scQueue->Wait(g_gfx.scFence.get(), g_gfx.scFenceV);
+    }
     hr = g_gfx.swap->Present(sync, 0);
+    if (InterlockedCompareExchange(&g_prPost, 0, 0) > 0){
+        InterlockedDecrement(&g_prPost);
+        Diag("POOLRESET post present hr=" + Hex((uint32_t)hr) +
+             " drr=" + Hex((uint32_t)g_gfx.d12->GetDeviceRemovedReason()));
+    }
+    if (g_gfx.scQueue && g_gfx.scPresFence)
+        g_gfx.scQueue->Signal(g_gfx.scPresFence.get(), ++g_gfx.scPresV);
 
     // The mirror of the wait above: the guest must not start drawing the next
     // frame into guestRT12 until our queue has finished reading it.
@@ -2852,14 +5056,64 @@ static HRESULT GfxPresent(UINT sync)
     if (s_present_n == 0 || (s_present_n % 300) == 0)
         Diag("GfxPresent n=" + std::to_string(s_present_n) + " hr=" + Hex(hr));
 #endif
+    // #158. 26 presents is the only deterministic number in this task, so every
+    // frame gets a line: what changed between frame 25 and frame 26 is the whole
+    // question, and 26 lines cost nothing.
+    {
+        static LONG s_lastEcl = 0, s_lastHeaps = 0;
+        static ULONGLONG s_lastMs = 0;
+        const LONG e = GhEclNow(), h = InterlockedCompareExchange(&g_heapCount, 0, 0);
+        const ULONGLONG now = GetTickCount64();
+        // #158. The conversion stats were only ever dumped from the stall path, so a
+        // run that SURVIVES printed nothing and could not be told from one where the
+        // knob never fired. Dump them on a slow cadence instead.
+        if ((s_present_n % 60) == 0) GhCommitRtAllStats("frame");
+        GhCoreHeapStats("frame");   // #158: the growth curve, one line per present
+        GhSecStats("frame");        // #158: section traffic, one line per present
+        Diag("FRAME n=" + std::to_string((unsigned long long)s_present_n) +
+             " ecl=" + std::to_string((long)e) + " decl=" + std::to_string((long)(e - s_lastEcl)) +
+             " heaps=" + std::to_string((long)h) + " dheaps=" + std::to_string((long)(h - s_lastHeaps)) +
+             " heapMB=" + std::to_string((long long)(InterlockedCompareExchange64(&g_heapBytes, 0, 0) >> 20)) +
+             " dt=" + std::to_string((unsigned long long)(s_lastMs ? now - s_lastMs : 0)) + "ms" +
+             // #158. The cross-queue waits are the only part of the per-frame path
+             // not cleared, and they cannot be cleared by removal -- every psync
+             // variant dies before the first frame. So watch them instead: for each
+             // fence, the value we have SIGNALLED against the value the GPU has
+             // COMPLETED. A side whose completed value stops advancing at frame 26
+             // while its signalled value keeps climbing is the side that is stuck.
+             " gf=" + std::to_string((unsigned long long)g_gfx.guestFenceV) + "/" +
+                 std::to_string((unsigned long long)(g_gfx.guestFence ? g_gfx.guestFence->GetCompletedValue() : 0)) +
+             " cf=" + std::to_string((unsigned long long)g_gfx.copyFenceV) + "/" +
+                 std::to_string((unsigned long long)(g_gfx.copyFence ? g_gfx.copyFence->GetCompletedValue() : 0)) +
+             " bf=" + std::to_string((unsigned long long)g_gfx.blitFenceV) + "/" +
+                 std::to_string((unsigned long long)(g_gfx.blitFence ? g_gfx.blitFence->GetCompletedValue() : 0)));
+        s_lastEcl = e; s_lastHeaps = h; s_lastMs = now;
+        GhProfDump("frame");   // #158: the frame-25 vs frame-26 diff
+    }
     ++s_present_n;
 
     {
         std::lock_guard<std::mutex> lk(g_d11Mutex);
-        g_gfx.cur = g_gfx.swap->GetCurrentBackBufferIndex();
-        if (!useD12Blit){
-            ID3D11Resource* next[] = { g_gfx.wrapped[g_gfx.cur].get() };
-            g_gfx.on12->AcquireWrappedResources(next, 1);
+        // #158, the reset test. Fires HERE and nowhere else: this is the only point
+        // in the frame where no back buffer is acquired by 11on12 and nothing of
+        // ours is queued against one. GhPoolResetNow re-establishes cur and the
+        // acquire itself, so the ordinary path below is its else-branch.
+        static unsigned s_resets = 0;
+        // Resolved once: GhCfgNum opens a file on every call, and this is per-frame.
+        static const unsigned prPeriod = GhCfgNum(L"gh_pool_reset.txt",      "GH_POOL_RESET",      0);
+        static const unsigned prMode   = GhCfgNum(L"gh_pool_reset_mode.txt", "GH_POOL_RESET_MODE", 1);
+        static const unsigned prMax    = GhCfgNum(L"gh_pool_reset_max.txt",  "GH_POOL_RESET_MAX",  0);
+        const bool doReset = prPeriod && (s_present_n % prPeriod) == 0 &&
+                             (!prMax || s_resets < prMax);
+        if (doReset){
+            ++s_resets;
+            GhPoolResetNow(prMode, useD12Blit, (unsigned long long)s_present_n);
+        } else {
+            g_gfx.cur = g_gfx.swap->GetCurrentBackBufferIndex();
+            if (!useD12Blit){
+                ID3D11Resource* next[] = { g_gfx.wrapped[g_gfx.cur].get() };
+                g_gfx.on12->AcquireWrappedResources(next, 1);
+            }
         }
     }
     return hr;
@@ -2893,6 +5147,32 @@ static const HWND kFakeHwnd = (HWND)0x00477A01;
 // and GetContainingOutput needs it.
 static HRESULT GhContainingOutput(IDXGIOutput** out);
 
+// One never-reused bump arena behind every single-vtable DXGI proxy in this file
+// (Swap, Adapter, Factory, Output). Never reusing a block is the point: an
+// interposer that outlives its object -- sl.common.dll, NVIDIA Streamline, was
+// observed releasing our adapters -- then lands on a dead object rather than on
+// whatever moved in. A guest makes a few dozen of these at a few dozen bytes
+// each, so never freeing costs a few kilobytes.
+static void* GhProxyArenaAlloc(size_t n)
+{
+    static SRWLOCK  lock  = SRWLOCK_INIT;
+    static BYTE*    arena = nullptr;
+    static size_t   used  = 0;
+    static size_t   cap   = 0;
+    n = (n + 63) & ~(size_t)63;              // keep objects on their own cache lines
+    AcquireSRWLockExclusive(&lock);
+    if (!arena || used + n > cap){
+        cap   = 1u << 20;
+        arena = (BYTE*)VirtualAlloc(nullptr, cap, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        used  = 0;
+        if (!arena){ ReleaseSRWLockExclusive(&lock); return ::operator new(n); }
+    }
+    void* p = arena + used;
+    used += n;
+    ReleaseSRWLockExclusive(&lock);
+    return p;
+}
+
 // #156: single-vtable, for the same reason AdapterProxy is (see the long note
 // above it). As a winrt::implements this class had one producer vtable per
 // interface, each with its own refcount offset baked in, and the RTTI on the
@@ -2907,25 +5187,7 @@ static HRESULT GhContainingOutput(IDXGIOutput** out);
 // interposer that outlives the object lands on a dead one, not on its successor.
 struct SwapProxy : IDXGISwapChain4
 {
-    static void* operator new(size_t n)
-    {
-        static SRWLOCK  lock  = SRWLOCK_INIT;
-        static BYTE*    arena = nullptr;
-        static size_t   used  = 0;
-        static size_t   cap   = 0;
-        n = (n + 63) & ~(size_t)63;          // keep objects on their own cache lines
-        AcquireSRWLockExclusive(&lock);
-        if (!arena || used + n > cap){
-            cap   = 1u << 20;
-            arena = (BYTE*)VirtualAlloc(nullptr, cap, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            used  = 0;
-            if (!arena){ ReleaseSRWLockExclusive(&lock); return ::operator new(n); }
-        }
-        void* p = arena + used;
-        used += n;
-        ReleaseSRWLockExclusive(&lock);
-        return p;
-    }
+    static void* operator new(size_t n){ return GhProxyArenaAlloc(n); }
     static void operator delete(void*, size_t) noexcept {}   // deliberately never reused
     static void operator delete(void*) noexcept {}
 
@@ -3155,6 +5417,20 @@ static void GfxNoteSwapChainDevice(IUnknown* dev, const DXGI_SWAP_CHAIN_DESC1* d
              " copyFence=" + Hex((uint64_t)(uintptr_t)g_gfx.copyFence.get()));
         if (EnsureGuestRT12(w, h)) g_gfx.guest12 = true;
         else Diag("  SC D3D12 guest RT unavailable -- GetBuffer will still fail");
+
+        // #158 gh_sc_guestq: this is the only moment the rebind can happen -- the
+        // guest's queue has just become known, and nothing has been presented yet.
+        if (GhCfgNum(L"gh_sc_guestq.txt", "GH_SC_GUESTQ", 0) != 0){
+            // Without the pure-D3D12 blit the copy still runs on the 11on12 device's
+            // own queue, so the queue that presents is still not the queue that drew
+            // the image and the test is only half done. Say so rather than let the
+            // cell be scored as a negative.
+            if (GhCfgNum(L"gh_d12_blit.txt", "GH_D12_BLIT", 0) == 0)
+                Diag("SCGQ WARNING: gh_d12_blit is off, so the blit stays on the 11on12 "
+                     "queue -- this cell does NOT put the whole display path on one queue");
+            if (!GhSwapToGuestQueue())
+                Diag("SCGQ did not take effect -- score this cell VOID, not negative");
+        }
         return;
     }
 
@@ -3239,11 +5515,45 @@ static void GhSanitizeOutputDesc(DXGI_OUTPUT_DESC* d)
     }
 }
 
-struct OutputProxy : winrt::implements<OutputProxy,
-                                       IDXGIOutput6, IDXGIOutput5, IDXGIOutput4,
-                                       IDXGIOutput3, IDXGIOutput2, IDXGIOutput1,
-                                       IDXGIOutput, IDXGIObject>
+// Single-vtable, for the same reason AdapterProxy and SwapProxy are -- see the
+// long note above AdapterProxy. IDXGIOutput6 derives from 5 from 4 ... from
+// IDXGIObject in one single-inheritance chain, so a real output is ONE object
+// with ONE vtable and every interface in that chain is the same pointer. As a
+// winrt::implements this class had one producer vtable per interface, each with
+// its own refcount offset baked in, and a guest holding two of them by their
+// real-header types would corrupt memory the moment it mixed them. That is #139
+// and #156; this is the same class of bug caught before it fired.
+struct OutputProxy : IDXGIOutput6
 {
+    static void* operator new(size_t n){ return GhProxyArenaAlloc(n); }
+    static void operator delete(void*, size_t) noexcept {}   // deliberately never reused
+    static void operator delete(void*) noexcept {}
+
+    LONG rc = 1;
+
+    HRESULT __stdcall QueryInterface(REFIID riid, void** o) noexcept override
+    {
+        if (!o) return E_POINTER;
+        if (riid == __uuidof(IUnknown)      || riid == __uuidof(IDXGIObject)  ||
+            riid == __uuidof(IDXGIOutput)   || riid == __uuidof(IDXGIOutput1) ||
+            riid == __uuidof(IDXGIOutput2)  || riid == __uuidof(IDXGIOutput3) ||
+            riid == __uuidof(IDXGIOutput4)  || riid == __uuidof(IDXGIOutput5) ||
+            riid == __uuidof(IDXGIOutput6)){
+            *o = static_cast<IDXGIOutput6*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *o = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG __stdcall AddRef() noexcept override { return (ULONG)InterlockedIncrement(&rc); }
+    ULONG __stdcall Release() noexcept override
+    {
+        LONG n = InterlockedDecrement(&rc);
+        if (n == 0) delete this;
+        return (ULONG)n;
+    }
+
     com_ptr<IDXGIOutput>  real;
     com_ptr<IDXGIOutput1> real1;
     com_ptr<IDXGIOutput2> real2;
@@ -3441,7 +5751,7 @@ struct OutputProxy : winrt::implements<OutputProxy,
 static HRESULT WrapOutput(IDXGIOutput* raw, IDXGIOutput** out)
 {
     if (!raw || !out) return E_POINTER;
-    auto proxy = winrt::make_self<OutputProxy>();
+    OutputProxy* proxy = new OutputProxy();   // rc = 1, handed to the caller below
     proxy->real.copy_from(raw);
     raw->QueryInterface(__uuidof(IDXGIOutput1), proxy->real1.put_void());
     raw->QueryInterface(__uuidof(IDXGIOutput2), proxy->real2.put_void());
@@ -3449,7 +5759,10 @@ static HRESULT WrapOutput(IDXGIOutput* raw, IDXGIOutput** out)
     raw->QueryInterface(__uuidof(IDXGIOutput4), proxy->real4.put_void());
     raw->QueryInterface(__uuidof(IDXGIOutput5), proxy->real5.put_void());
     raw->QueryInterface(__uuidof(IDXGIOutput6), proxy->real6.put_void());
-    *out = proxy.as<IDXGIOutput>().detach();
+    // One object, one vtable: the IDXGIOutput the guest gets is the same pointer
+    // every other interface in the chain answers with. The rc=1 from new is the
+    // reference being handed out; there is nothing to detach.
+    *out = static_cast<IDXGIOutput*>(proxy);
     return S_OK;
 }
 
@@ -3527,25 +5840,7 @@ static HRESULT GhContainingOutput(IDXGIOutput** out)
 // a few dozen bytes each, so never freeing them costs a few kilobytes.
 struct AdapterProxy : IDXGIAdapter4
 {
-    static void* operator new(size_t n)
-    {
-        static SRWLOCK  lock  = SRWLOCK_INIT;
-        static BYTE*    arena = nullptr;
-        static size_t   used  = 0;
-        static size_t   cap   = 0;
-        n = (n + 63) & ~(size_t)63;          // keep objects on their own cache lines
-        AcquireSRWLockExclusive(&lock);
-        if (!arena || used + n > cap){
-            cap   = 1u << 20;
-            arena = (BYTE*)VirtualAlloc(nullptr, cap, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            used  = 0;
-            if (!arena){ ReleaseSRWLockExclusive(&lock); return ::operator new(n); }
-        }
-        void* p = arena + used;
-        used += n;
-        ReleaseSRWLockExclusive(&lock);
-        return p;
-    }
+    static void* operator new(size_t n){ return GhProxyArenaAlloc(n); }
     static void operator delete(void*, size_t) noexcept {}   // deliberately never reused
     static void operator delete(void*) noexcept {}
 
@@ -3793,11 +6088,49 @@ static HRESULT WrapAdapterTake(HRESULT hr, IUnknown* raw, REFIID riid, void** ou
 // wraps, (b) create its swapchain against its fake HWND -- intercepted and routed
 // to a CoreWindow-backed SwapProxy.
 // ------------------------------------------------------------------
-struct FactoryProxy : winrt::implements<FactoryProxy,
-                                        IDXGIFactory7, IDXGIFactory6, IDXGIFactory5,
-                                        IDXGIFactory4, IDXGIFactory3,
-                                        IDXGIFactory2, IDXGIFactory1, IDXGIFactory, IDXGIObject>
+// Single-vtable, for the same reason AdapterProxy and SwapProxy are -- see the
+// long note above AdapterProxy. This one is the likeliest of the four to be mixed:
+// a modern D3D12 title holds the plain IDXGIFactory it was handed and then QIs
+// IDXGIFactory4 for EnumAdapterByLuid, IDXGIFactory5 for CheckFeatureSupport and
+// IDXGIFactory6 for EnumAdapterByGpuPreference during startup, so it ends up with
+// several interface pointers to this object at once. Against real DXGI those are
+// all the same pointer; against the old winrt::implements producer layout they
+// were not, and each producer's Release had its own refcount offset baked in.
+struct FactoryProxy : IDXGIFactory7
 {
+    static void* operator new(size_t n){ return GhProxyArenaAlloc(n); }
+    static void operator delete(void*, size_t) noexcept {}   // deliberately never reused
+    static void operator delete(void*) noexcept {}
+
+    LONG rc = 1;
+
+    HRESULT __stdcall QueryInterface(REFIID riid, void** o) noexcept override
+    {
+        if (!o) return E_POINTER;
+        // Answered even when the console's own dxgi is older than the interface:
+        // the methods behind it degrade individually, which a guest handles,
+        // whereas refusing the QI reads as "this machine has no DXGI" and stops
+        // it dead. That is why every real* below is optional.
+        if (riid == __uuidof(IUnknown)        || riid == __uuidof(IDXGIObject)    ||
+            riid == __uuidof(IDXGIFactory)    || riid == __uuidof(IDXGIFactory1)  ||
+            riid == __uuidof(IDXGIFactory2)   || riid == __uuidof(IDXGIFactory3)  ||
+            riid == __uuidof(IDXGIFactory4)   || riid == __uuidof(IDXGIFactory5)  ||
+            riid == __uuidof(IDXGIFactory6)   || riid == __uuidof(IDXGIFactory7)){
+            *o = static_cast<IDXGIFactory7*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *o = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG __stdcall AddRef() noexcept override { return (ULONG)InterlockedIncrement(&rc); }
+    ULONG __stdcall Release() noexcept override
+    {
+        LONG n = InterlockedDecrement(&rc);
+        if (n == 0) delete this;
+        return (ULONG)n;
+    }
+
     com_ptr<IDXGIFactory2> real;   // real underlying factory for pass-throughs
     // The console's own dxgi may be older than the interface a game asks for, so
     // each of these is optional and every method that needs one has a fallback.
@@ -4231,7 +6564,7 @@ static HRESULT MakeFactoryProxy(REFIID riid, void** out)
     com_ptr<IDXGIFactory2> real;
     HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory2), real.put_void());
     if (FAILED(hr)) return hr;
-    auto proxy = winrt::make_self<FactoryProxy>();
+    FactoryProxy* proxy = new FactoryProxy();   // rc = 1, released after the QI below
     proxy->real = real;
     // Best-effort: whichever of these the console's dxgi actually has, the proxy
     // delegates to; the rest it answers itself. QI failures here are expected and
@@ -4283,6 +6616,10 @@ static HRESULT MakeFactoryProxy(REFIID riid, void** out)
          (proxy->real5 ? " f5" : "") + (proxy->real6 ? " f6" : "") +
          (proxy->real7 ? " f7" : ""));
     HRESULT qi = proxy->QueryInterface(riid, out);
+    // A successful QI AddRef'd; drop the construction reference either way so the
+    // caller's is the only one. (The bump arena never reuses the block, so even a
+    // drop to zero leaves the memory safely dead rather than recycled.)
+    proxy->Release();
     // FactoryProxy implements IDXGIFactory7 and below. Anything still refused here
     // is an interface we have never seen asked for -- log the IID, because the guest
     // reads a refusal as "this machine has no DXGI" and the failure then surfaces
@@ -4323,21 +6660,254 @@ static const char* GhFourCC(const void* p, SIZE_T n)
     buf[4] = 0;
     return buf;
 }
+// A DXIL (SM6) container and a DXBC (SM5) container BOTH start with the ASCII
+// magic "DXBC", so GhFourCC above says "DXBC" for either -- which is exactly why
+// #151 recorded "SM6 containers still say DXBC". The distinguishing evidence is
+// one level in: an SM6 container carries a "DXIL" part, an SM5 one carries
+// "SHEX" (or the older "SHDR"). Walk the part table and say which, plus the
+// shader model the part header declares. This is the single measurement that
+// answers whether a title's PREBUILT shaders can run on an SM 5.1 runtime at
+// all -- for a game that ships no shader compiler there is no second chance.
+static std::string GhShaderKind(const void* p, SIZE_T n)
+{
+    if (!p || n < 36) return "?";
+    auto* b = (const uint8_t*)p;
+    if (std::memcmp(b, "DXBC", 4) != 0) return "notdxbc";
+    uint32_t parts = 0; std::memcpy(&parts, b + 28, 4);
+    if (parts > 64) return "badparts";
+    std::string kind; uint32_t ver = 0;
+    for (uint32_t i = 0; i < parts && 32 + (size_t)i * 4 + 4 <= n; ++i){
+        uint32_t off = 0; std::memcpy(&off, b + 32 + i * 4, 4);
+        if ((size_t)off + 12 > n) continue;
+        const bool dxil = !std::memcmp(b + off, "DXIL", 4);
+        const bool sm5  = !std::memcmp(b + off, "SHEX", 4) || !std::memcmp(b + off, "SHDR", 4);
+        if (!dxil && !sm5) continue;
+        if (kind.empty()) kind = dxil ? "DXIL" : "DXBC5";
+        // Both part bodies open with a version dword whose LOW BYTE is
+        // (major << 4) | minor -- DxilProgramHeader::ProgramVersion for DXIL,
+        // the SHEX version token for SM5.
+        if (!ver){ uint32_t tok = 0; std::memcpy(&tok, b + off + 8, 4); ver = tok & 0xFF; }
+    }
+    if (kind.empty()) return "noshaderpart";
+    char out[32];
+    std::snprintf(out, sizeof(out), "%s/%u.%u", kind.c_str(),
+                  (unsigned)((ver >> 4) & 0xF), (unsigned)(ver & 0xF));
+    return out;
+}
+// #169: which OPTIONAL features does this shader actually use? Every DXIL
+// container carries an "SFI0" part holding one uint64 of shader-feature flags
+// (dxc emits it for anything above the baseline), and the two bits that matter
+// here are ResourceDescriptorHeapIndexing (0x2000000) and
+// SamplerDescriptorHeapIndexing (0x4000000) -- the SM 6.6 dynamic-resource ops.
+// Reading them costs a walk of the part table and answers, without ever calling
+// the driver, whether a pipeline needs anything the back end has not got.
+static bool GhDxilFeat(const void* p, SIZE_T n, uint64_t* out)
+{
+    if (out) *out = 0;
+    if (!p || n < 36) return false;
+    auto* b = (const uint8_t*)p;
+    if (std::memcmp(b, "DXBC", 4) != 0) return false;
+    uint32_t parts = 0; std::memcpy(&parts, b + 28, 4);
+    if (parts > 64) return false;
+    for (uint32_t i = 0; i < parts && 32 + (size_t)i * 4 + 4 <= n; ++i){
+        uint32_t off = 0; std::memcpy(&off, b + 32 + i * 4, 4);
+        if ((size_t)off + 8 > n) continue;
+        if (std::memcmp(b + off, "SFI0", 4) != 0) continue;
+        uint32_t sz = 0; std::memcpy(&sz, b + off + 4, 4);
+        if (sz < 8 || (size_t)off + 8 + 8 > n) return false;
+        uint64_t f = 0; std::memcpy(&f, b + off + 8, 8);
+        if (out) *out = f;
+        return true;
+    }
+    return false;   // no SFI0 part: the shader uses nothing optional
+}
+
+// Only the flags worth naming in a log line. Anything else shows as its hex.
+static std::string GhDxilFeatNames(uint64_t f)
+{
+    static const struct { uint64_t bit; const char* n; } kF[] = {
+        { 0x0000001ull, "Doubles" },          { 0x0004000ull, "WaveOps" },
+        { 0x0008000ull, "Int64" },            { 0x0010000ull, "ViewID" },
+        { 0x0020000ull, "Barycentrics" },     { 0x0040000ull, "NativeLowPrec" },
+        { 0x0080000ull, "ShadingRate" },      { 0x0100000ull, "RT1_1" },
+        { 0x0200000ull, "SamplerFeedback" },  { 0x0800000ull, "AtomicI64GS" },
+        { 0x2000000ull, "ResDescHeap" },      { 0x4000000ull, "SmpDescHeap" },
+        { 0x10000000ull, "AtomicI64Heap" },   { 0x20000000ull, "AdvTexOps" },
+        { 0x40000000ull, "WriteableMSAA" },   { 0x80000000ull, "SampleCmpGradBias" },
+    };
+    std::string o;
+    for (auto& e : kF) if (f & e.bit){ if (!o.empty()) o += "|"; o += e.n; }
+    return o.empty() ? std::string("-") : o;
+}
+
+// gh_dxil_screen: 0 off, 1 census only, 2 also refuse a pipeline whose shaders
+// ask for anything in gh_dxil_mask -- WITHOUT calling the driver. Refusing in
+// front of the compiler matters for more than tidiness: catching the compiler's
+// access violation with SEH unwinds out of newbe.DLL while it holds its own
+// locks, and every later compile then waits on them forever. A clean E_FAIL
+// leaves the back end usable for the shaders it CAN build.
+static unsigned GhDxilScreen()
+{ static const unsigned v = GhCfgNum(L"gh_dxil_screen.txt", "GH_DXIL_SCREEN", 0); return v; }
+// The DXIL part's declared shader model, as 0xMm (0x66 for 6.6), or 0 if this
+// is not a DXIL container. Screening on THIS rather than on features is the
+// honest test against a back end whose opcode table stops at DXIL 1.5: SM 6.6
+// lowers every resource handle through AnnotateHandle (opcode 216), so the
+// model number, not the feature flags, is what decides whether the back end can
+// read the module at all.
+static unsigned GhDxilSm(const void* p, SIZE_T n)
+{
+    const std::string k = GhShaderKind(p, n);
+    if (k.rfind("DXIL/", 0) != 0) return 0;
+    unsigned maj = 0, mnr = 0;
+    if (std::sscanf(k.c_str() + 5, "%u.%u", &maj, &mnr) != 2) return 0;
+    return (maj << 4) | (mnr & 0xF);
+}
+// gh_dxil_maxsm: refuse (screen >= 2) any pipeline carrying a DXIL shader above
+// this model, expressed the way gh_ddi_sm is -- 65 means 6.5. 0 = no SM screen.
+static unsigned GhDxilMaxSm()
+{
+    static const unsigned v = GhCfgNum(L"gh_dxil_maxsm.txt", "GH_DXIL_MAXSM", 0);
+    if (!v) return 0;
+    return ((v / 10) << 4) | (v % 10);
+}
+static uint64_t GhDxilMask()
+{
+    // Default: the two SM 6.6 dynamic-resource bits, which are what indexes the
+    // back end's opcode table off its end (DXIL 1.5 stops at opcode 215).
+    // GhCfgNumZ, not GhCfgNum: 0 is a value this knob must be able to express --
+    // it is how you ask for the shader-model screen with no feature screen.
+    static const unsigned v = GhCfgNumZ(L"gh_dxil_mask.txt", "GH_DXIL_MASK", 0x6000000);
+    return (uint64_t)v;
+}
+
 // #151: a PSO that the runtime refuses tells us nothing by itself. Write the
 // rejected bytecode out to LocalState so it can be pulled off the console and
 // disassembled, and record what the device thinks happened.
+// The key a dumped shader is filed under is the container's OWN digest -- bytes
+// [4:20] of a DXBC/DXIL container, which both DXC and the DXBC assembler already
+// fill in. Nothing has to be computed, the two sides cannot disagree, and it is
+// the same key the lowered-blob cache is looked up by.
+//
+// This replaces a per-run sequence counter that was shared across tags and reset
+// every launch, so runs silently overwrote each other's dumps: the cs corpus had
+// 205 files with a highest index of 1114 and 909 gaps. Naming by content makes
+// the dump directory self-deduplicating and its coverage converge across runs.
+static bool GhShaderKey(const void* code, SIZE_T n, char out[33])
+{
+    if (!code || n < 20) return false;
+    const unsigned char* p = (const unsigned char*)code + 4;
+    unsigned zero = 0;
+    for (int i = 0; i < 16; ++i) zero |= p[i];
+    if (!zero) return false;                 // unsigned container -- no key to use
+    static const char* hex = "0123456789abcdef";
+    for (int i = 0; i < 16; ++i){ out[i*2] = hex[p[i] >> 4]; out[i*2+1] = hex[p[i] & 15]; }
+    out[32] = 0;
+    return true;
+}
+
+// #173, the substitution half of the backporter. A shader the console refuses is
+// looked up by its container digest in LocalState\gh_lo_<key>.bin and, if a lowered
+// SM 6.5 blob is staged there, that blob is handed to the driver instead.
+//
+// The key is the container's own digest, so the baker (toolchain/dxil/lower.py,
+// offline today) and the loader cannot disagree about what a shader is called, and
+// an on-device translator can later fill the same directory behind the same key
+// without any of this changing.
+static bool GhShaderSubOn()
+{
+    static const bool on = GhCfgNum(L"gh_shader_sub.txt", "GH_SHADER_SUB", 0) != 0;
+    return on;
+}
+
+static const std::vector<uint8_t>* GhLoweredBlob(const void* code, SIZE_T n)
+{
+    if (!GhShaderSubOn() || !code || n < 20) return nullptr;
+    char key[33];
+    if (!GhShaderKey(code, n, key)) return nullptr;
+
+    // Misses are cached too: this runs inside PSO creation, and a game that
+    // compiles two thousand pipelines must not pay a file open per pipeline.
+    static std::mutex mu;
+    static std::map<std::string, std::vector<uint8_t>> cache;
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = cache.find(key);
+    if (it == cache.end()){
+        std::vector<uint8_t> blob;
+        std::wstring wkey;
+        for (const char* c = key; *c; ++c) wkey.push_back((wchar_t)*c);
+        // Flat naming first. WDP's file API will not create a subdirectory under
+        // LocalState (every fsupload into ghlo\ returns 500), so the staged cache
+        // lives in the root as gh_lo_<key>.bin. The subdirectory is still read as a
+        // fallback, for an on-device translator that writes its own tree.
+        ReadWholeFile(std::wstring(kLocalState) + L"gh_lo_" + wkey + L".bin", blob, true);
+        if (blob.empty())
+            ReadWholeFile(std::wstring(kLocalState) + L"ghlo\\" + wkey + L".bin", blob, true);
+        static volatile LONG hits = 0, misses = 0;
+        const LONG k = blob.empty() ? InterlockedIncrement(&misses)
+                                    : InterlockedIncrement(&hits);
+        // Every HIT prints: the run's score IS the hit count, and the old
+        // "first 8 then every 200th" throttle capped the log at 8 and made the
+        // total unreadable. Misses stay throttled -- there are ~160 of them.
+        if (!blob.empty() || k <= 8 || (k % 50) == 0)
+            Diag(std::string("SHADERSUB ") + (blob.empty() ? "miss" : "HIT ") +
+                 " key=" + key + " bytes=" + std::to_string((unsigned)blob.size()) +
+                 " hits=" + std::to_string((long)InterlockedCompareExchange(&hits, 0, 0)) +
+                 " misses=" + std::to_string((long)InterlockedCompareExchange(&misses, 0, 0)));
+        // A miss is the only thing that still reaches the back end unlowered, and
+        // an unlowered SM 6.6 shader is exactly what makes newbe.DLL read past the
+        // end of its 214-entry opcode table (the +0x22E082 fault, rbx=0xDA=218).
+        // Dumping on the miss -- not only on a failure, as GhDumpFailedShader does
+        // -- is what makes the corpus close itself: whatever the game asked for and
+        // we had not baked comes back off the console named by the same digest the
+        // baker uses, so the next bake covers it. One write per distinct key, and
+        // only for a container we would have had to lower anyway.
+        if (blob.empty() && GhDxilSm(code, n) > 0x65){
+            std::wstring path = std::wstring(kLocalState) + L"gh_sh_miss_" + wkey + L".bin";
+            HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h != INVALID_HANDLE_VALUE){
+                DWORD wrote = 0;
+                WriteFile(h, code, (DWORD)n, &wrote, nullptr);
+                CloseHandle(h);
+                Diag("SHADERSUB dumped miss key=" + std::string(key) +
+                     " bytes=" + std::to_string((unsigned long)wrote));
+            }
+        }
+        it = cache.emplace(key, std::move(blob)).first;
+    }
+    return it->second.empty() ? nullptr : &it->second;
+}
+
+// Swap a bytecode slot in place if a lowered blob is staged for it. Returns true
+// if anything changed, so the caller only copies the PSO desc when it must.
+static bool GhSubstShader(D3D12_SHADER_BYTECODE* bc)
+{
+    if (!bc || !bc->pShaderBytecode) return false;
+    const std::vector<uint8_t>* lo = GhLoweredBlob(bc->pShaderBytecode, bc->BytecodeLength);
+    if (!lo) return false;
+    bc->pShaderBytecode = lo->data();
+    bc->BytecodeLength  = lo->size();
+    return true;
+}
+
 static void GhDumpFailedShader(const char* tag, const void* code, SIZE_T n,
                                ID3D12Device* dev)
 {
     static volatile LONG seq = 0;
     LONG i = InterlockedIncrement(&seq);
+    char key[33];
+    const bool haveKey = GhShaderKey(code, n, key);
     std::string ln = std::string("SHADERFAIL ") + tag + " #" + std::to_string(i) +
                      " bytes=" + std::to_string((unsigned)n) +
-                     " magic=" + GhFourCC(code, n);
+                     " magic=" + GhFourCC(code, n) +
+                     " key=" + (haveKey ? key : "none");
     if (dev) ln += " removedreason=" + Hex((uint32_t)dev->GetDeviceRemovedReason());
     if (code && n){
-        wchar_t name[64];
-        std::swprintf(name, 64, L"gh_failed_%hs%ld.bin", tag, (long)i);
+        wchar_t name[80];
+        if (haveKey)
+            std::swprintf(name, 80, L"gh_sh_%hs_%hs.bin", tag, key);
+        else
+            std::swprintf(name, 80, L"gh_failed_%hs%ld.bin", tag, (long)i);
         std::wstring path = std::wstring(kLocalState) + name;
         HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -4364,6 +6934,264 @@ static ID3D12Device* GhCompileOnlyDevice()
              (d ? " ok" : " FAIL"));
     }
     return d.get();
+}
+
+// ---------------------------------------------------------------------------
+// #170. The measurement #169 never made: does this console's DXIL back end
+// compile ANY DXIL, or does it merely fail differently per shader model?
+//
+// Everything #169 concluded is an inference from a fault INDEX -- newbe.DLL
+// reads entry rbx=216 of an array of 48-byte records, and 216 is both
+// NumOpCodes_Dxil_1_5 and AnnotateHandle, the first SM 6.6 opcode. An inference
+// is not a demonstration. The only DXIL <= 6.5 blob we had ever put in front of
+// the driver, DirectStorage's GDeflate compute shader, took the device down with
+// DRIVER_INTERNAL_ERROR while declaring WaveOps|Int64 -- so it cannot separate
+// "6.5 is fine, 6.6 is not" from "no DXIL compiles here at all".
+//
+// The control must be a REAL, SIGNED container: the runtime validates the
+// container hash, so a hand-built or byte-edited blob is refused for a reason
+// that has nothing to do with the back end. We cannot sign one (dxil.dll is
+// Windows-only, and the VM that has it is offline), so take one the console
+// already trusts: amd_fidelityfx_dx12.dll, in the game's own directory, carries
+// 176 plain DXIL <= 6.5 containers whose SFI0 feature word is zero.
+//
+// The blob is deliberately NOT embedded. The harness uploads it, so the control
+// shader -- its model, its feature bits, its bindings -- can be changed without
+// a rebuild, and no third-party bytes enter this source tree.
+//
+//   gh_dxil_ctl = 1  root signature = one table { SRV t0, UAV u0 }, which is the
+//                    PSV0 binding list of the shader this was written against
+//                 2  empty root signature, for a shader that binds nothing
+//
+// Runs on the loader thread with no guest and its own throwaway device, so if
+// the control kills the device it kills one nothing else is using.
+// ---------------------------------------------------------------------------
+static HRESULT GhTryCreateCPS(ID3D12Device* dev,
+                              const D3D12_COMPUTE_PIPELINE_STATE_DESC* d,
+                              void** pp, DWORD* faultCode)
+{
+    HRESULT hr = E_FAIL;
+    *faultCode = 0;
+    __try {
+        hr = dev->CreateComputePipelineState(d, __uuidof(ID3D12PipelineState), pp);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *faultCode = GetExceptionCode();
+        hr = E_FAIL;
+    }
+    return hr;
+}
+
+#include "gh_dxil_spaces.h"   // generated: toolchain/dxil/emit_spaces.py
+
+static void GhDxilControl()
+{
+    static const unsigned mode = GhCfgNum(L"gh_dxil_ctl.txt", "GH_DXIL_CTL", 0);
+    if (!mode) return;
+
+    std::vector<uint8_t> blob;
+    if (!ReadWholeFile(std::wstring(kLocalState) + L"gh_dxil_ctl.bin", blob, true) ||
+        blob.size() < 0x24){
+        Diag("DXILCTL no gh_dxil_ctl.bin (or too small)");
+        return;
+    }
+    uint64_t feat = 0;
+    GhDxilFeat(blob.data(), blob.size(), &feat);
+    Diag("DXILCTL blob=" + std::to_string((unsigned)blob.size()) +
+         " magic=" + GhFourCC(blob.data(), blob.size()) +
+         " kind=" + GhShaderKind(blob.data(), blob.size()) +
+         " feat=" + Hex(feat) + "(" + GhDxilFeatNames(feat) + ")" +
+         " mode=" + std::to_string(mode));
+
+    ID3D12Device* dev = GhCompileOnlyDevice();
+    if (!dev){ Diag("DXILCTL no device"); return; }
+
+    // E2's other half: how big a SHADER-VISIBLE CBV_SRV_UAV heap will this console
+    // actually create? The spec says tier 2 allows 1,000,000 and we measured
+    // heaptier=2 (run 70) -- but the bindless lowering stands or falls on the real
+    // number, not the one implied by a cap bit, so ask for it. Walk down until one
+    // succeeds so a refusal reports the ceiling instead of just failing.
+    if (mode == 3 || mode == 4 || mode == 5){
+        static const UINT sizes[] = { 1000000, 500000, 100000, 16384, 2048, 256 };
+        for (UINT n : sizes){
+            D3D12_DESCRIPTOR_HEAP_DESC hd{};
+            hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            hd.NumDescriptors = n;
+            hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            com_ptr<ID3D12DescriptorHeap> h;
+            HRESULT hhr = dev->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap),
+                                                    h.put_void());
+            Diag("DXILCTL heap CBV_SRV_UAV shader-visible n=" + std::to_string(n) +
+                 " hr=" + Hex((uint32_t)hhr) + (h ? " OK" : " refused"));
+            if (h) break;
+        }
+        D3D12_DESCRIPTOR_HEAP_DESC sd{};
+        sd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+        sd.NumDescriptors = 2048;
+        sd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        com_ptr<ID3D12DescriptorHeap> sh;
+        HRESULT shr = dev->CreateDescriptorHeap(&sd, __uuidof(ID3D12DescriptorHeap),
+                                                sh.put_void());
+        Diag("DXILCTL heap SAMPLER shader-visible n=2048 hr=" + Hex((uint32_t)shr) +
+             (sh ? " OK" : " refused"));
+    }
+
+    HMODULE d12 = GetModuleHandleA("d3d12.dll");
+    using SerFn = HRESULT (WINAPI*)(const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION,
+                                    ID3DBlob**, ID3DBlob**);
+    auto ser = d12 ? (SerFn)GetProcAddress(d12, "D3D12SerializeRootSignature") : nullptr;
+    if (!ser){ Diag("DXILCTL no D3D12SerializeRootSignature"); return; }
+
+    D3D12_DESCRIPTOR_RANGE ranges[2]{};
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[0].NumDescriptors = 1;
+    ranges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ranges[1].NumDescriptors = 1;
+    ranges[1].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_PARAMETER rp{};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp.DescriptorTable.NumDescriptorRanges = 2;
+    rp.DescriptorTable.pDescriptorRanges = ranges;
+    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    // mode 3 -- the PERMISSIVE BINDLESS root signature, and the rig E2/E3 need.
+    //
+    // Mode 1's single table (one SRV + one UAV, space0) is only a superset of a
+    // shader that binds almost nothing. Push a REAL shader through it and D3D12
+    // rejects the PSO with E_INVALIDARG for a root-signature mismatch -- which is
+    // indistinguishable, from the log, from the back end refusing the bytecode.
+    // That confound would have made the WaveOps control unreadable.
+    //
+    // So build a root signature that is a superset of essentially any binding a
+    // compute shader can declare: one UNBOUNDED range per descriptor type in
+    // space0, plus one unbounded array per (class, type) in spaces 100-103, which
+    // is exactly the SM 6.5 target form the 6.6->6.5 lowering emits. Unbounded
+    // ranges need RESOURCE_BINDING_TIER_3 -- this console reports tier 3 (run 70,
+    // `bindingtier=3 heaptier=2`), so serializing this at all is itself a live
+    // test of that claim, and a failure HERE is a different and useful answer.
+    //
+    // Budget: 64 DWORDs. A descriptor table costs 1 DWORD each, so 8 tables is 8.
+    D3D12_DESCRIPTOR_RANGE bl[8]{};
+    D3D12_ROOT_PARAMETER   blp[8]{};
+    auto mkrange = [](D3D12_DESCRIPTOR_RANGE_TYPE t, UINT space){
+        D3D12_DESCRIPTOR_RANGE r{};
+        r.RangeType = t;
+        r.NumDescriptors = UINT_MAX;   // unbounded -- requires binding tier 3
+        r.BaseShaderRegister = 0;
+        r.RegisterSpace = space;
+        r.OffsetInDescriptorsFromTableStart = 0;
+        return r;
+    };
+    if (mode == 3 || mode == 4){
+        bl[0] = mkrange(D3D12_DESCRIPTOR_RANGE_TYPE_SRV,     0);
+        bl[1] = mkrange(D3D12_DESCRIPTOR_RANGE_TYPE_UAV,     0);
+        bl[2] = mkrange(D3D12_DESCRIPTOR_RANGE_TYPE_CBV,     0);
+        bl[3] = mkrange(D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 0);
+        bl[4] = mkrange(D3D12_DESCRIPTOR_RANGE_TYPE_SRV,     100);
+        bl[5] = mkrange(D3D12_DESCRIPTOR_RANGE_TYPE_SRV,     101);
+        bl[6] = mkrange(D3D12_DESCRIPTOR_RANGE_TYPE_UAV,     102);
+        bl[7] = mkrange(D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 103);
+        for (int i = 0; i < 8; ++i){
+            blp[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            blp[i].DescriptorTable.NumDescriptorRanges = 1;
+            blp[i].DescriptorTable.pDescriptorRanges = &bl[i];
+            blp[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        }
+    }
+
+    // mode 5 -- the HEAP-TIER root signature (#172), and the first one that has to
+    // match a real lowered shader rather than merely be permissive.
+    //
+    // SM 6.6's ResourceDescriptorHeap[] carries no type, so the 6.6->6.5 lowering
+    // has to invent a typed declaration for every distinct type the game reaches
+    // through the heap -- one unbounded array per type, each in its own register
+    // space, all bound at the heap base so the 6.6 heap index stays the index.
+    // toolchain/dxil/templates.json is where those spaces are frozen and
+    // gh_dxil_spaces.h is its generated image, so this table cannot drift from
+    // the blobs the baker produces.
+    //
+    // All the CBV_SRV_UAV ranges alias each other at offset 0, and so do the
+    // sampler ranges. That is deliberate and is the whole point: they are
+    // different typed views of the SAME descriptors. Two tables, not one per
+    // range -- a table costs 1 DWORD of the 64-DWORD budget whatever it holds,
+    // and ~90 tables would not fit. Whether this console's runtime accepts
+    // aliased unbounded ranges is the open question mode 5 exists to answer.
+    std::vector<D3D12_DESCRIPTOR_RANGE> resRanges, sampRanges;
+    D3D12_ROOT_PARAMETER rp5[2]{};
+    if (mode == 5){
+        // Spaces 0-7 for whatever the shader still binds the ordinary way: a
+        // lowered shader keeps its CreateHandleFromBinding resources untouched.
+        for (UINT sp = 0; sp < 8; ++sp){
+            resRanges.push_back(mkrange(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, sp));
+            resRanges.push_back(mkrange(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, sp));
+            resRanges.push_back(mkrange(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, sp));
+            sampRanges.push_back(mkrange(D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, sp));
+        }
+        for (const GhBindlessSpace& b : kGhBindlessSpaces)
+            (b.type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER ? sampRanges : resRanges)
+                .push_back(mkrange(b.type, b.space));
+        rp5[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp5[0].DescriptorTable.NumDescriptorRanges = (UINT)resRanges.size();
+        rp5[0].DescriptorTable.pDescriptorRanges = resRanges.data();
+        rp5[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        rp5[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp5[1].DescriptorTable.NumDescriptorRanges = (UINT)sampRanges.size();
+        rp5[1].DescriptorTable.pDescriptorRanges = sampRanges.data();
+        rp5[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        Diag("DXILCTL mode5 bindless spaces=" + std::to_string(kGhBindlessSpaceCount) +
+             " base=" + std::to_string(kGhBindlessSpaceBase) +
+             " resRanges=" + std::to_string((unsigned)resRanges.size()) +
+             " sampRanges=" + std::to_string((unsigned)sampRanges.size()));
+    }
+
+    D3D12_ROOT_SIGNATURE_DESC rsd{};
+    if (mode == 1){ rsd.NumParameters = 1; rsd.pParameters = &rp; }
+    else if (mode == 3 || mode == 4){ rsd.NumParameters = 8; rsd.pParameters = blp; }
+    else if (mode == 5){ rsd.NumParameters = 2; rsd.pParameters = rp5; }
+    rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    // mode 4 = mode 3 + the two SM 6.6 dynamic-resource flags. An SM 6.6 shader
+    // that touches ResourceDescriptorHeap[] REQUIRES them, and without them the
+    // RUNTIME refuses the PSO ("Root Signature doesn't match Compute Shader",
+    // hr=0x80070057) before the driver is ever asked -- run 92 was void for
+    // exactly that reason, and only the driver's own DBGSTR channel said so.
+    // Kept separate from mode 3 so runs 88-91 stay comparable.
+    if (mode == 4){
+        rsd.Flags = (D3D12_ROOT_SIGNATURE_FLAGS)
+                    (D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
+                     D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED);
+    }
+
+    com_ptr<ID3DBlob> rsb, err;
+    HRESULT hr = ser(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, rsb.put(), err.put());
+    com_ptr<ID3D12RootSignature> rs;
+    if (SUCCEEDED(hr) && rsb)
+        hr = dev->CreateRootSignature(0, rsb->GetBufferPointer(), rsb->GetBufferSize(),
+                                      __uuidof(ID3D12RootSignature), rs.put_void());
+    Diag("DXILCTL root signature hr=" + Hex((uint32_t)hr) +
+         (err && err->GetBufferPointer()
+              ? " err=" + std::string((const char*)err->GetBufferPointer(),
+                                      (size_t)err->GetBufferSize())
+              : std::string()));
+    if (!rs) return;
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cd{};
+    cd.pRootSignature = rs.get();
+    cd.CS = { blob.data(), blob.size() };
+
+    // drr on both sides: a compile that removes the device reports its real cause
+    // only through GetDeviceRemovedReason, and reading it BEFORE proves the device
+    // was healthy going in.
+    const HRESULT drrBefore = dev->GetDeviceRemovedReason();
+    com_ptr<ID3D12PipelineState> pso;
+    DWORD fault = 0;
+    hr = GhTryCreateCPS(dev, &cd, pso.put_void(), &fault);
+    const HRESULT drrAfter = dev->GetDeviceRemovedReason();
+    Diag("DXILCTL CreateComputePipelineState hr=" + Hex((uint32_t)hr) +
+         (fault ? " FAULT=" + Hex((uint32_t)fault) : std::string()) +
+         " drrBefore=" + Hex((uint32_t)drrBefore) +
+         " drrAfter=" + Hex((uint32_t)drrAfter) +
+         (pso ? " -> CREATED" : " -> none"));
 }
 // SC_DLL.dll -- the UMD's shader compiler -- faults with rip=0, exec 0x0, rax=0,
 // returning into SC_DLL+0x630C. That is `call rax` through a NULL function
@@ -4403,6 +7231,198 @@ static ID3D12Device* GhCompileOnlyDevice()
 // Overwriting `call rax` (ff d0) with `xor eax,eax` (31 c0) is the same two bytes
 // and yields false -- so SC_DLL uses the OLD back end, which is exactly the path
 // D3D11 has been compiling through on this console all along.
+// ---------------------------------------------------------------------------
+// #164/#165. Ghost of Tsushima's PlayStation PC SDK signature check.
+// ---------------------------------------------------------------------------
+// GhostOfTsushima.exe verifies PsPcSdk.dll before it will load it, and ONE
+// heavily obfuscated function decides -- 0xD30034..0xD30351 in the shipped exe.
+// Its scattered basic blocks run BOTH checks the game knows how to make:
+//   ImageEnumerateCertificates / ImageGetCertificateHeader / ImageGetCertificateData
+//   CryptVerifyMessageSignature / CertGetNameStringA / CertGetEnhancedKeyUsage
+//   WinVerifyTrust / WTHelperProvDataFromStateData
+//     / WTHelperGetProvSignerFromChain / WTHelperGetProvCertFromChain
+// and it returns a single bool -- `movzbl %bl,%eax` at +0xD30192, immediately
+// before the stack-cookie check and the function's one epilogue.
+//
+// Neither check can pass inside this app container, and Bed_WinVerifyTrust is
+// not enough on its own. Forcing WinVerifyTrust to ERROR_SUCCESS still leaves
+// hWVTStateData null -- there is no trust provider registered to allocate it,
+// both naming keys being absent -- so the caller's WTHelperProvDataFromStateData
+// walk fails one call later. Run 43 shows exactly that: our forced success, and
+// then "The program can't start becuase PlayStation(R) PC SDK Runtime is
+// missing" anyway.
+//
+// ImageGetCertificateData is also where the process spends SEVENTEEN SECONDS.
+// The main thread sits in imagehlp -> KERNELBASE -> ntdll (the return address
+// GUEST+0xD300E8 is the instruction after that call), the loader's own log
+// writes queue up behind it, the app presents nothing for the whole window, and
+// the shell kills it. So there are two useful patch points and the knob picks:
+//
+//   gh_pspc_trust = 1  the VERDICT (+0xD30192). Every side effect of the
+//                      function still happens, including the 17 s read; only the
+//                      answer changes. Conservative: safe even if the function
+//                      fills an out-parameter its caller reads.
+//   gh_pspc_trust = 2  the ENTRY (+0xD30034). Return TRUE immediately and skip
+//                      the certificate work altogether -- which is also the only
+//                      version that removes the stall.
+//
+// Both sites are checked byte-for-byte before anything is written. A different
+// build of the game must be left alone, not corrupted. This is not stepping
+// around a decision anyone made about this file: PsPcSdk.dll is Sony's own
+// signed DLL, staged by us, and the container has no trust provider to ask.
+static void GhPatchPsPcTrustCheck(uint8_t* base, DWORD imageSize)
+{
+    const unsigned mode = GhCfgNum(L"gh_pspc_trust.txt", "GH_PSPC_TRUST", 0);
+    if (!mode) return;
+
+    // RVA, expected bytes, replacement. The verdict is `movzbl %bl,%eax` ->
+    // `push $1 ; pop %rax`, which is the same three bytes and leaves RSP exactly
+    // as it found it (the next instruction reads through RBP, and the epilogue's
+    // cookie check has not run yet). The entry is `mov %rbx,0x20(%rsp) ; push
+    // %rbp` -> `mov $1,%eax ; ret`, taken before the frame is set up.
+    static const BYTE kVerdictWant[] = { 0x0F, 0xB6, 0xC3 };
+    static const BYTE kVerdictNew [] = { 0x6A, 0x01, 0x58 };
+    static const BYTE kEntryWant  [] = { 0x48, 0x89, 0x5C, 0x24, 0x20, 0x55 };
+    static const BYTE kEntryNew   [] = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 };
+
+    const DWORD  rva  = (mode == 2) ? 0xD30034u : 0xD30192u;
+    const BYTE*  want = (mode == 2) ? kEntryWant : kVerdictWant;
+    const BYTE*  neu  = (mode == 2) ? kEntryNew  : kVerdictNew;
+    const size_t n    = (mode == 2) ? sizeof(kEntryWant) : sizeof(kVerdictWant);
+    const char*  what = (mode == 2) ? "entry" : "verdict";
+
+    if (rva + n > imageSize){
+        Diag("PSPCPATCH rva " + Hex((uint32_t)rva) + " outside the image -- not patching");
+        return;
+    }
+    BYTE* p = base + rva;
+    if (std::memcmp(p, want, n) != 0){
+        std::string got;
+        for (size_t i = 0; i < n; ++i) got += Hex((uint32_t)p[i]) + " ";
+        Diag("PSPCPATCH signature mismatch at GUEST+" + Hex((uint32_t)rva) +
+             " (" + what + "), got " + got + "-- not patching");
+        return;
+    }
+    DWORD old = 0;
+    if (!VirtualProtect(p, n, PAGE_EXECUTE_READWRITE, &old)){
+        Diag("PSPCPATCH VirtualProtect failed err=" + Hex(GetLastError()));
+        return;
+    }
+    std::memcpy(p, neu, n);
+    VirtualProtect(p, n, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, n);
+    Diag("PSPCPATCH mode=" + std::to_string(mode) + " " + what + " at GUEST+" +
+         Hex((uint32_t)rva) + " patched -- PsPcSdk.dll reports as trusted");
+}
+
+// #164. The SDK now LOADS -- and its init still fails.
+//
+// Staging MSVCP140/VCRUNTIME140/VCRUNTIME140_1 next to PsPcSdk.dll and standing
+// in a real tbs.dll took the load from "16562 ms then 0x7E" to "16 ms, loaded".
+// Run 55 then got the whole renderer up -- swapchain, DirectStorage, 16192
+// cached pipelines -- and stopped on the game's own line:
+//
+//     [SCE] scePsPcInitialize failed: 8a800106
+//
+// followed by EXITCODE=1. So this was never the freeze #165 was named for: the
+// game exits deliberately, and what looked like a hang was our teardown waiting
+// for the shell to kill the app.
+//
+// The call site is plain, unobfuscated code (the SDK wrappers around it are not
+// -- 0x140d27c70 disassembles to garbage on disk, like the trust check):
+//
+//     140544542  call 0x140d27c70            ; scePsPcInitialize wrapper
+//     140544547  mov  %eax,%edi
+//     140544549  test %eax,%eax
+//     14054454b  je   0x14054456f            ; <- success path
+//     14054454d  ...  lea r8,"scePsPcInitialize failed: %x" ; log and give up
+//
+// One byte: `74` (je) -> `EB` (jmp). The displacement, the length and every
+// register are untouched, so nothing downstream shifts.
+//
+// This does NOT make the SDK work. It cannot: the PS PC SDK wants a Windows
+// service, PSN and a TPM, none of which exist in an app container. It asserts
+// that the game can carry on without it, which is a claim to be TESTED, not
+// assumed -- and the success path is the right place to test it, because it
+// already tolerates its own next call failing (0x140544579 -> jne 0x1405445af,
+// straight to "mark initialised"). If the game instead needs real SDK state,
+// the next failure will say so, and it will say so somewhere new.
+static void GhPatchPsPcInit(uint8_t* base, DWORD imageSize)
+{
+    if (!GhCfgNum(L"gh_pspc_init.txt", "GH_PSPC_INIT", 0)) return;
+
+    const DWORD rva = 0x54454Bu;
+    static const BYTE kWant[] = { 0x74, 0x22 };   // je  +0x22
+    static const BYTE kNew [] = { 0xEB, 0x22 };   // jmp +0x22
+    const size_t n = sizeof kWant;
+
+    if (rva + n > imageSize){
+        Diag("PSPCINIT rva " + Hex((uint32_t)rva) + " outside the image -- not patching");
+        return;
+    }
+    BYTE* p = base + rva;
+    if (std::memcmp(p, kWant, n) != 0){
+        std::string got;
+        for (size_t i = 0; i < n; ++i) got += Hex((uint32_t)p[i]) + " ";
+        Diag("PSPCINIT signature mismatch at GUEST+" + Hex((uint32_t)rva) +
+             ", got " + got + "-- not patching");
+        return;
+    }
+    DWORD old = 0;
+    if (!VirtualProtect(p, n, PAGE_EXECUTE_READWRITE, &old)){
+        Diag("PSPCINIT VirtualProtect failed err=" + Hex(GetLastError()));
+        return;
+    }
+    std::memcpy(p, kNew, n);
+    VirtualProtect(p, n, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, n);
+    Diag("PSPCINIT patched GUEST+" + Hex((uint32_t)rva) +
+         " je -> jmp -- scePsPcInitialize's return code is now ignored");
+}
+
+// #165. WHICH load costs seventeen seconds.
+// With the trust check patched out (gh_pspc_trust=2) the stall did not go away,
+// it MOVED: the last live sample of the main thread is inside our own
+// LoadGuestDll, one frame above KERNELBASE, immediately after
+// "GUESTDLL attempts ...\PSPC_SDK\S22\2.50.00.10\PsPcSdk.dll". So the cost is
+// loading the SDK itself -- and the DLL is only 3.2 MB, so it is not the read.
+// Its import list names three things that have no business succeeding quickly
+// inside an app container: SETUPAPI (device enumeration, which #container-gaps
+// records as answering nothing here), NTDSAPI (directory services) and tbs.dll
+// (TPM Base Services). Any of their DllMains could sit on a timeout.
+//
+// Load each import first, on its own, timed, and then the SDK. Whichever line
+// carries the seventeen seconds is the answer. Knob-gated because pre-loading
+// these changes what the guest finds already resident.
+static void GhProbePsPcDeps()
+{
+    if (!GhCfgNum(L"gh_pspc_probe.txt", "GH_PSPC_PROBE", 0)) return;
+    static const wchar_t* const kDeps[] = {
+        L"VERSION.dll", L"SHLWAPI.dll", L"SHELL32.dll", L"ole32.dll",
+        L"RPCRT4.dll", L"ADVAPI32.dll", L"CRYPT32.dll", L"bcrypt.dll",
+        L"ncrypt.dll", L"WS2_32.dll", L"WINHTTP.dll", L"dxgi.dll",
+        L"SETUPAPI.dll", L"NTDSAPI.dll", L"tbs.dll",
+        L"MSVCP140.dll", L"VCRUNTIME140.dll", L"VCRUNTIME140_1.dll",
+    };
+    Diag("PSPCPROBE loading PsPcSdk.dll's imports one at a time, timed");
+    for (const wchar_t* n : kDeps){
+        const ULONGLONG t0 = GetTickCount64();
+        HMODULE m = LoadLibraryW(n);
+        const ULONGLONG dt = GetTickCount64() - t0;
+        Diag("PSPCPROBE " + RegNarrow(n) + " -> " + Hex((uint64_t)(uintptr_t)m) +
+             (m ? std::string() : " err=" + Hex(GetLastError())) +
+             " " + std::to_string((unsigned long long)dt) + "ms");
+    }
+    const std::wstring sdk = std::wstring(kLocalState) +
+        L"ghprogramdata\\Sony Interactive Entertainment Inc\\PSPC_SDK\\S22\\2.50.00.10\\PsPcSdk.dll";
+    const ULONGLONG t0 = GetTickCount64();
+    HMODULE m = LoadLibraryW(sdk.c_str());
+    const ULONGLONG dt = GetTickCount64() - t0;
+    Diag("PSPCPROBE PsPcSdk.dll -> " + Hex((uint64_t)(uintptr_t)m) +
+         (m ? std::string() : " err=" + Hex(GetLastError())) +
+         " " + std::to_string((unsigned long long)dt) + "ms");
+}
+
 static bool GhPatchScDllDxilQuery()
 {
     static LONG once = 0;
@@ -4468,6 +7488,551 @@ static void GhProbeDeps(const wchar_t* path)
     FreeLibrary(m);
 }
 
+// #163. Both of the helpers below call LoadLibrary from whichever guest thread
+// makes the FIRST CreateGraphicsPipelineState call, and on Ghost of Tsushima that
+// deadlocks outright -- see the gate in Hook_D12CreateGPS. Opt-in, off by default.
+static bool GhScdxilPreload()
+{ static const bool on = GhCfgNum(L"gh_scdxil_preload.txt", "GH_SCDXIL_PRELOAD", 0) != 0; return on; }
+static bool GhPsoProbeOn()
+{ static const bool on = GhCfgNum(L"gh_pso_probe.txt", "GH_PSO_PROBE", 0) != 0; return on; }
+
+// ---------------------------------------------------------------------------
+// #168 route (a): bring the DXIL back end up inside the container.
+//
+// The console's D3D12 is not simply "SM 5.1 hardware". SC_DLL (the UMD shader
+// compiler) carries a SECOND back end for DXIL and asks scdxil.dll whether it
+// handles a given stage. Inside our app container that DLL's DllMain refuses --
+// 0x45A ERROR_DLL_INIT_FAILED, no exception, every one of its own imports
+// binding (GhProbeDeps proved that) -- so SC_DLL GetProcAddress's a NULL handle,
+// gets NULL, and calls it. Our answer so far is GhPatchScDllDxilQuery: overwrite
+// `call rax` with `xor eax,eax` so SC_DLL uses the OLD back end. That is what
+// makes ANY PSO work on this console -- and it is also, for a title that ships
+// nothing but SM 6.6 (Ghost of Tsushima: 465 graphics + 184 compute PSOs, 0
+// created), the wall itself.
+//
+// #146 solved this exact failure class for bink2w64.dll: ERROR_DLL_INIT_FAILED
+// with every import binding means the DLL's own DllMain is refusing, and mapping
+// it OURSELVES (MapChildImage, imports bound through our beds) both names the
+// call the container denies and, where we have a bed, answers it.
+//
+// Two things are needed past the map. SC_DLL is a DRIVER module, not the guest,
+// so nothing of ours is in its imports: it has to be made to find our copy. We
+// patch its LoadLibraryW and GetProcAddress import slots -- pure pointer writes,
+// no loader lock, safe on the PSO thread -- so its own bare-name lookup returns
+// the self-mapped base and its export lookups walk the image we mapped.
+//
+// And the timing. The old gh_scdxil_preload called LoadLibrary from inside the
+// guest's first CreateGraphicsPipelineState and never returned (#163), so the
+// bring-up here happens BEFORE the guest starts, on the loader's own thread with
+// nothing else running; only the pointer writes happen at PSO time.
+//
+//   gh_scdxil = 1  bring scdxil up and REPORT, but still apply SCPATCH. The run
+//                  is otherwise identical to a control -- a clean instrument.
+//   gh_scdxil = 2  bring it up, patch SC_DLL, and DO NOT apply SCPATCH: the DXIL
+//                  back end is live and SM6 shaders are actually offered to it.
+// ---------------------------------------------------------------------------
+static int PatchModuleImport(HMODULE mod, const char* target, void* repl);   // fwd
+static unsigned GhScdxilMode()
+{ static const unsigned m = GhCfgNum(L"gh_scdxil.txt", "GH_SCDXIL", 0); return m; }
+
+static HMODULE g_scdxil     = nullptr;   // real OR self-mapped handle
+static bool    g_scdxilSelf = false;     // true if it is one of ours
+
+// Where the file is. System32 first (the comment block above records it there),
+// then next to SC_DLL itself -- an app container's search order does not include
+// the directory a driver module came from, which is why SC_DLL's own bare-name
+// load fails in the first place.
+static std::wstring GhScdxilFindPath()
+{
+    std::vector<std::wstring> cands;
+    wchar_t sys[MAX_PATH] = {};
+    UINT n = GetSystemDirectoryW(sys, MAX_PATH);
+    if (n && n < MAX_PATH) cands.push_back(std::wstring(sys) + L"\\scdxil.dll");
+    if (HMODULE sc = GetModuleHandleA("SC_DLL.dll")){
+        wchar_t mp[MAX_PATH] = {};
+        DWORD m = GetModuleFileNameW(sc, mp, MAX_PATH);
+        if (m && m < MAX_PATH){
+            std::wstring d(mp, m);
+            size_t slash = d.find_last_of(L'\\');
+            if (slash != std::wstring::npos) cands.push_back(d.substr(0, slash + 1) + L"scdxil.dll");
+        }
+    }
+    for (auto& c : cands){
+        DWORD a = GetFileAttributesW(c.c_str());
+        std::string shown; for (wchar_t ch : c) shown += (ch < 128 ? (char)ch : '?');
+        Diag("SCDXIL cand " + shown + (a != INVALID_FILE_ATTRIBUTES
+                 ? " EXISTS" : " missing err=" + Hex(GetLastError())));
+        if (a != INVALID_FILE_ATTRIBUTES) return c;
+    }
+    return std::wstring();
+}
+
+static void GhScdxilBringUp()
+{
+    static LONG once = 0;
+    if (InterlockedCompareExchange(&once, 1, 0) != 0) return;
+    if (!GhScdxilMode()) return;
+
+    if (HMODULE h = GetModuleHandleW(L"scdxil.dll")){
+        g_scdxil = h;
+        Diag("SCDXIL already loaded h=" + Hex((uintptr_t)h));
+    } else {
+        std::wstring full = GhScdxilFindPath();
+        if (full.empty()){ Diag("SCDXIL file not found -- nothing to bring up"); return; }
+        // Try the OS loader first: if the container ever lets it initialise, the
+        // real module is better than ours in every way.
+        if (HMODULE h = LoadLibraryW(full.c_str())){
+            g_scdxil = h;
+            Diag("SCDXIL real load OK h=" + Hex((uintptr_t)h));
+        } else {
+            DWORD err = GetLastError();
+            Diag("SCDXIL real load FAILED err=" + Hex(err) +
+                 (err == ERROR_DLL_INIT_FAILED ? " (DllMain refused -- self-mapping)" : ""));
+            if (HMODULE sm = GhSelfMapDll(full, "scdxil.dll")){
+                g_scdxil = sm; g_scdxilSelf = true;
+                Diag("SCDXIL SELF-MAPPED h=" + Hex((uintptr_t)sm));
+            } else {
+                Diag("SCDXIL self-map FAILED err=" + Hex(GetLastError()));
+            }
+        }
+    }
+    if (!g_scdxil) return;
+    // The one export the whole wall turns on. If this is NULL the bring-up is
+    // useless even though the module is mapped, and the log should say so before
+    // anybody reads a PSO result.
+    FARPROC q = g_scdxilSelf ? GhSelfMapExport(g_scdxil, "SCDxil_IsStageSupportedByNewBE")
+                             : GetProcAddress(g_scdxil, "SCDxil_IsStageSupportedByNewBE");
+    Diag("SCDXIL SCDxil_IsStageSupportedByNewBE -> " + Hex((uintptr_t)q) +
+         (q ? "" : " (NOT RESOLVED)"));
+}
+
+// SC_DLL's own view of the world, redirected at its two import slots.
+static HMODULE WINAPI Bed_SC_LoadLibraryW(LPCWSTR n)
+{
+    if (n && g_scdxil){
+        const wchar_t* b1 = wcsrchr(n, L'\\');
+        const wchar_t* b  = b1 ? b1 + 1 : n;
+        if (_wcsicmp(b, L"scdxil.dll") == 0){
+            Diag("SCDXIL SC_DLL LoadLibraryW(scdxil.dll) -> ours " + Hex((uintptr_t)g_scdxil));
+            return g_scdxil;
+        }
+    }
+    return LoadLibraryW(n);
+}
+static FARPROC WINAPI Bed_SC_GetProcAddress(HMODULE h, LPCSTR name)
+{
+    if (h && h == g_scdxil && g_scdxilSelf){
+        FARPROC r = GhSelfMapExport(h, name);
+        Diag(std::string("SCDXIL SC_DLL GPA ") + ((name && HIWORD(name)) ? name : "#ordinal") +
+             " -> " + Hex((uintptr_t)r));
+        return r;
+    }
+    return GetProcAddress(h, name);
+}
+// Pointer writes only -- no loader lock, so this is safe on the PSO thread that
+// the old LoadLibrary-based preload deadlocked.
+static bool GhScdxilPatchScDll()
+{
+    static LONG done = 0;
+    if (InterlockedCompareExchange(&done, 0, 0) != 0) return true;
+    if (!g_scdxil) return false;
+    HMODULE sc = GetModuleHandleA("SC_DLL.dll");
+    if (!sc){ Diag("SCDXIL SC_DLL not loaded yet -- cannot patch its imports"); return false; }
+    int n = PatchModuleImport(sc, "LoadLibraryW",   (void*)&Bed_SC_LoadLibraryW);
+    n    += PatchModuleImport(sc, "GetProcAddress", (void*)&Bed_SC_GetProcAddress);
+    Diag("SCDXIL SC_DLL imports patched x" + std::to_string(n));
+    if (n) InterlockedExchange(&done, 1);
+    return n != 0;
+}
+
+// ---------------------------------------------------------------------------
+// #169 Stage 0. Where does 0x51 actually come from?
+//
+// #168 closed on "the console's D3D12 has no DXIL path" -- which is exactly what
+// the runtime says. But the runtime is repeating a number it was TOLD. Max
+// shader model is not read off the silicon: the user-mode driver reports it
+// through D3D12DDIARG_GETCAPS with D3D12DDICAPS_TYPE_0011_SHADER_MODELS, and on
+// this console that driver is umd12ddi.dll -- loaded in OUR process, all over
+// our own stack traces (D3D12Core.dll+0x7FB7 -> umd12ddi.dll+0x53902). Nobody
+// has ever looked at that query.
+//
+// Four measurements say the cap may be a conservative report rather than a fact:
+//   * we already report bindingtier=3, which is HALF of what the 157 id=622
+//     "resource descriptor heap indexing" rejections ask for. The other half is
+//     the shader model, and nothing else;
+//   * scdxil.dll -- the driver's own DXIL back end -- is installed and loads
+//     cleanly in this container (measured, #168);
+//   * SC_DLL is BUILT to consume DXIL and gate it per stage, which is the whole
+//     reason SCDxil_IsStageSupportedByNewBE exists for us to patch out;
+//   * the device reports feature level 12_0, for which Microsoft's own table
+//     lists Shader Model 6.0. Ours says 5.1.
+//
+// Stage 0 patches NOTHING and answers three questions:
+//   0a does the driver's DXIL back end claim this hardware, per stage?
+//   0b what are these binaries, exactly (get them out for host RE)?
+//   0c which call produces 0x51?
+//
+//   gh_ddi_probe = 1  0a reads + 0b copies   (no calls, no hooks)
+//                  2  + 0c, wrap the UMD's adapter open and log the negotiation
+//                  3  + actually CALL the stage query. DELIBERATELY SEPARATE:
+//                     its prototype is not public, and a wrong ABI guess faults
+//                     into our own VEH, which has killed the app before
+//                     ([[guest-live-peek]]). Decode the bytes mode 1 prints
+//                     FIRST, then come back and set 3.
+// ---------------------------------------------------------------------------
+static bool GhSafeReadCode(const void* p, unsigned char* out, int n);   // fwd
+static bool GhReadableQword(uintptr_t a, uintptr_t* out);               // fwd
+
+static unsigned GhDdiProbe()
+{ static const unsigned m = GhCfgNum(L"gh_ddi_probe.txt", "GH_DDI_PROBE", 0); return m; }
+
+static std::string GhDdiHexBytes(const void* p, int n)
+{
+    std::vector<unsigned char> b((size_t)n);
+    if (!GhSafeReadCode(p, b.data(), n)) return std::string("<unreadable>");
+    static const char* hx = "0123456789ABCDEF";
+    std::string s;
+    for (int i = 0; i < n; ++i){ s += hx[b[i] >> 4]; s += hx[b[i] & 15]; s += ' '; }
+    return s;
+}
+
+// --- 0a --------------------------------------------------------------------
+// Two independent reads, so the host can decode the real signature instead of
+// us guessing it. The call site is ground truth for how the DRIVER invokes it:
+// SC_DLL+0x630A is the `call rax` we have been overwriting since the PSO wall,
+// so the argument setup is immediately above it. The prologue says whether the
+// callee treats rcx as a value or a pointer.
+static int GhDdiTryCallStage(void* fn, unsigned stage, int* out)
+{
+    using StageFn = int (WINAPI*)(unsigned);
+    __try { *out = ((StageFn)fn)(stage); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+static void GhDdiProbeDxilStages()
+{
+    if (!g_scdxil){ Diag("DDIPROBE 0a: scdxil not brought up -- needs gh_scdxil>=1"); return; }
+    FARPROC q = g_scdxilSelf ? GhSelfMapExport(g_scdxil, "SCDxil_IsStageSupportedByNewBE")
+                             : GetProcAddress(g_scdxil, "SCDxil_IsStageSupportedByNewBE");
+    if (!q){ Diag("DDIPROBE 0a: export not resolved"); return; }
+    Diag("DDIPROBE 0a export " + Hex((uintptr_t)q) + " prologue: " + GhDdiHexBytes((void*)q, 48));
+
+    if (HMODULE sc = GetModuleHandleA("SC_DLL.dll")){
+        const uint8_t* site = (const uint8_t*)sc + 0x630A;
+        Diag("DDIPROBE 0a SC_DLL+0x62CA..0x631A: " + GhDdiHexBytes(site - 0x40, 0x50));
+    } else {
+        Diag("DDIPROBE 0a: SC_DLL not loaded -- no call site to read");
+    }
+
+    if (GhDdiProbe() < 3){
+        Diag("DDIPROBE 0a: not calling it (gh_ddi_probe<3). Decode the bytes above first.");
+        return;
+    }
+    std::string r = "DDIPROBE 0a SCDxil_IsStageSupportedByNewBE:";
+    for (unsigned s = 0; s < 8; ++s){
+        int v = -1;
+        if (!GhDdiTryCallStage((void*)q, s, &v)){
+            Diag(r + " stage " + std::to_string(s) +
+                 " FAULTED -- the ABI guess is wrong, NOT a refusal");
+            return;
+        }
+        r += " [" + std::to_string(s) + "]=" + std::to_string(v);
+    }
+    Diag(r);
+}
+
+// --- 0b --------------------------------------------------------------------
+// An app container can READ System32 -- LoadLibraryW from there already works --
+// so the whole graphics stack can be copied out and pulled with the file API.
+// Take each module's REAL path from the loaded module wherever there is one: the
+// UMD need not live in System32, and guessing is how you RE the wrong binary.
+static void GhDdiCopyStackForRE()
+{
+    static const wchar_t* kMods[] = {
+        L"umd12ddi.dll", L"SC_DLL.dll", L"scdxil.dll",
+        L"D3D12Core.dll", L"D3D12SDKLayers.dll", L"d3d12.dll",
+        // #169 Stage 2: the DXIL back end itself is where the compile faults, so
+        // it is the one module we actually need to disassemble, plus the DXBC->DXIL
+        // converter it sits behind.
+        L"newbe.DLL", L"dxbc2dxil.dll",
+    };
+    std::wstring dir = std::wstring(kLocalState) + L"sys";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    wchar_t sys[MAX_PATH] = {};
+    GetSystemDirectoryW(sys, MAX_PATH);
+    for (const wchar_t* m : kMods){
+        std::wstring src;
+        wchar_t mp[MAX_PATH] = {};
+        if (HMODULE h = GetModuleHandleW(m)){
+            DWORD n = GetModuleFileNameW(h, mp, MAX_PATH);
+            if (n && n < MAX_PATH) src.assign(mp, n);
+        }
+        if (src.empty()) src = std::wstring(sys) + L"\\" + m;
+        std::string shown; for (wchar_t c : src) shown += (c < 128 ? (char)c : '?');
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        std::string tail;
+        if (!GetFileAttributesExW(src.c_str(), GetFileExInfoStandard, &fa)){
+            tail = " MISSING err=" + Hex(GetLastError());
+        } else {
+            tail = " size=" + std::to_string(((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow);
+            tail += CopyFileW(src.c_str(), (dir + L"\\" + m).c_str(), FALSE)
+                        ? std::string(" -> LocalState\\sys OK")
+                        : std::string(" copy FAILED err=") + Hex(GetLastError());
+        }
+        Diag("DDIPROBE 0b " + shown + tail);
+    }
+}
+
+// --- 0c --------------------------------------------------------------------
+// D3D12Core loads the UMD by name and resolves its OpenAdapter entry point, so
+// the two import slots that expose the whole negotiation are D3D12Core's own
+// LoadLibraryW and GetProcAddress -- the same pair, one module over, that #168
+// used on SC_DLL.
+//
+// D3D12DDIARG_OPENADAPTER's layout is DDI-version dependent, so nothing here
+// hardcodes an offset. The wrapper dumps the argument block as attributed
+// qwords before and after the call: the driver's adapter-funcs table is the
+// entry that goes from NULL to a pointer into umd12ddi, and its slots are the
+// function pointers we want. Decode that offline against the binary 0b pulled,
+// then Stage 1 wraps pfnGetCaps for real. Reads go through GhReadableQword, not
+// SEH -- an access violation in this process reaches the pager's VEH first.
+static HMODULE g_d12Umd = nullptr;
+static void*   g_umdOpenAdapter = nullptr;
+
+static void GhDdiLogArgs(const char* when, void* pArgs)
+{
+    if (!pArgs) return;
+    std::string s = std::string("DDIPROBE 0c args ") + when + " " + Hex((uintptr_t)pArgs);
+    for (int i = 0; i < 20; ++i){
+        uintptr_t v = 0;
+        if (!GhReadableQword((uintptr_t)pArgs + (uintptr_t)i * 8, &v)){
+            s += "\n    [" + std::to_string(i) + "] <unreadable>";
+            break;
+        }
+        s += "\n    [" + std::to_string(i) + "] " + Hex((uint64_t)v);
+        if (v > 0x10000) s += "  " + NameForCodeAddr(v);
+    }
+    Diag(s);
+}
+
+static HRESULT WINAPI Bed_UmdOpenAdapter(void* pArgs)
+{
+    GhDdiLogArgs("pre ", pArgs);
+    using Fn = HRESULT (WINAPI*)(void*);
+    HRESULT hr = ((Fn)g_umdOpenAdapter)(pArgs);
+    Diag("DDIPROBE 0c OpenAdapter -> hr=" + Hex((uint32_t)hr));
+    GhDdiLogArgs("post", pArgs);
+    return hr;
+}
+
+static HMODULE WINAPI Bed_Core_LoadLibraryW(LPCWSTR n)
+{
+    HMODULE h = LoadLibraryW(n);
+    if (n){
+        std::string shown; for (const wchar_t* p = n; *p; ++p) shown += (*p < 128 ? (char)*p : '?');
+        Diag("DDIPROBE 0c D3D12Core LoadLibraryW(" + shown + ") -> " + Hex((uintptr_t)h));
+        const wchar_t* b1 = wcsrchr(n, L'\\');
+        const wchar_t* b  = b1 ? b1 + 1 : n;
+        if (h && _wcsicmp(b, L"umd12ddi.dll") == 0) g_d12Umd = h;
+    }
+    return h;
+}
+
+static FARPROC WINAPI Bed_Core_GetProcAddress(HMODULE h, LPCSTR name)
+{
+    FARPROC r = GetProcAddress(h, name);
+    const char* nm = (name && HIWORD(name)) ? name : "#ordinal";
+    Diag(std::string("DDIPROBE 0c D3D12Core GPA ") + nm + " from " + Hex((uintptr_t)h) +
+         " -> " + Hex((uintptr_t)r));
+    // Every DDI generation spells this differently (OpenAdapter10, OpenAdapter10_2,
+    // OpenAdapter12...), so match the prefix rather than a version we guessed.
+    if (r && name && HIWORD(name) && _strnicmp(name, "OpenAdapter", 11) == 0){
+        g_umdOpenAdapter = (void*)r;
+        Diag(std::string("DDIPROBE 0c wrapping ") + nm);
+        return (FARPROC)&Bed_UmdOpenAdapter;
+    }
+    return r;
+}
+
+// D3D12Core is loaded lazily by d3d12.dll at its first entry point, so force it
+// in ourselves first: the window we need is after the module exists and before
+// it has opened the adapter. Called from EnsureBridge ahead of the bridge's own
+// D3D12CreateDevice, which is the first device in the process.
+
+// ---------------------------------------------------------------------------
+// #169 Stage 1. The 0x51 is a DEFAULT in D3D12Core, not a fact about the GPU.
+//
+// Stage 0 pulled the console's graphics stack out of System32 and the RE is
+// unambiguous. D3D12Core carries these four diagnostics verbatim:
+//
+//   "Driver did not respond to D3D12DDICAPS_TYPE_0011_SHADER_MODELS caps query
+//    with a list of supported shader models."
+//   "Driver cannot have gaps in reported support for release shader models ..."
+//   "Driver did not report any supported shader models ..."
+//   "For now, driver must include shader model 5.1 support in the list of shader
+//    models returned via D3D12DDICAPS_TYPE_0011_SHADER_MODELS caps query."
+//
+// All four sit in ONE function (D3D12Core+0x1F4560 in the console's build), and
+// that function reads, in order:
+//
+//   +0x1F4584  mov  dword [rcx+0x104], 0x51      <-- P1: the DEFAULT is 5.1
+//   +0x1F4591  cmp  dword [rcx+0x10], 0x100      \  two early exits that keep
+//   +0x1F45A6  cmp  byte  [rcx+8], 3 ; jb exit   /  the default un-queried
+//              ... query the driver twice (count, then list) ...
+//              ... fold the list down to the highest model in r14d ...
+//   +0x1F4868  mov  eax, 0x60085                 <-- the RUNTIME's own maximum
+//   +0x1F486D  cmp  r14d, eax ; cmovl eax, r14d  <-- P2: min(driver, runtime)
+//   +0x1F4880  mov  [r13+0x104], eax             <-- the number CheckFeature-
+//                                                    Support(f=7) hands back
+//
+// So the cap the whole DXIL wall rests on is min(what the driver listed, what
+// this runtime knows), with 5.1 as the fallback when the driver is not even
+// asked. Two patches make the runtime report a model of our choosing:
+//
+//   P1  the 0x51 immediate -> the D3D_SHADER_MODEL byte we want. Covers the
+//       early-exit paths, and the identical initializer at +0xA42F2.
+//   P2  NOP the `cmovl`, and set the 0x60085 immediate to our DDI value, so the
+//       min() collapses to a constant on the path that does query.
+//
+// Encoding, read off the runtime's own translator at D3D12Core+0x94A18 and its
+// model table: DDI = major<<16 | minor<<4 | 5, and D3D_SHADER_MODEL = the
+// familiar 0xMm byte. 5.1 = 0x50015/0x51, 6.6 = 0x60065/0x66, 6.8 = 0x60085/0x68.
+//
+// Patterns, not RVAs: a console update moves every address but not these
+// instruction encodings, and a hard-coded offset that lands in the wrong
+// function is a byte patch that corrupts silently.
+//
+// This asks the driver to accept shaders it never advertised, so it is off by
+// default and the whole point of the run is to find out what it does. Reporting
+// a capability the hardware cannot back is exactly the kind of thing that hangs
+// a GPU -- gh_ddi_sm is the switch, 0 leaves the runtime alone.
+//
+//   gh_ddi_sm = 0   report whatever the driver/runtime negotiated (default)
+//               51  pin to 5.1 -- the control: same patch machinery, same value
+//               60..68  report SM 6.0 .. 6.8
+// ---------------------------------------------------------------------------
+static unsigned GhDdiSm()
+{ static const unsigned v = GhCfgNum(L"gh_ddi_sm.txt", "GH_DDI_SM", 0); return v; }
+
+// Search a module's executable sections for an exact byte string. Walks the
+// section table from the loaded image rather than assuming one .text.
+static int GhDdiScanAndPatch(HMODULE mod, const char* what,
+                             const unsigned char* pat, int patLen,
+                             const unsigned char* rep, int repLen, int repAt)
+{
+    auto* dos = (IMAGE_DOS_HEADER*)mod;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    auto* nt = (IMAGE_NT_HEADERS64*)((uint8_t*)mod + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    int hits = 0;
+    for (unsigned s = 0; s < nt->FileHeader.NumberOfSections; ++s, ++sec){
+        if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        uint8_t* p   = (uint8_t*)mod + sec->VirtualAddress;
+        size_t   len = sec->Misc.VirtualSize;
+        if (len < (size_t)patLen) continue;
+        for (size_t i = 0; i + (size_t)patLen <= len; ++i){
+            if (p[i] != pat[0] || memcmp(p + i, pat, (size_t)patLen) != 0) continue;
+            uint8_t* site = p + i + repAt;
+            DWORD old = 0;
+            if (!VirtualProtect(site, (SIZE_T)repLen, PAGE_EXECUTE_READWRITE, &old)){
+                Diag(std::string("DDISM ") + what + " rva=" +
+                     Hex((uint64_t)(p + i - (uint8_t*)mod)) +
+                     " VirtualProtect FAILED err=" + Hex(GetLastError()));
+                continue;
+            }
+            std::string before; static const char* hx = "0123456789ABCDEF";
+            for (int k = 0; k < repLen; ++k){ before += hx[site[k]>>4]; before += hx[site[k]&15]; before += ' '; }
+            memcpy(site, rep, (size_t)repLen);
+            DWORD tmp = 0; VirtualProtect(site, (SIZE_T)repLen, old, &tmp);
+            FlushInstructionCache(GetCurrentProcess(), site, (SIZE_T)repLen);
+            std::string after;
+            for (int k = 0; k < repLen; ++k){ after += hx[rep[k]>>4]; after += hx[rep[k]&15]; after += ' '; }
+            Diag(std::string("DDISM ") + what + " PATCHED rva=" +
+                 Hex((uint64_t)(p + i - (uint8_t*)mod)) + " [" + before + "] -> [" + after + "]");
+            ++hits;
+        }
+    }
+    if (!hits) Diag(std::string("DDISM ") + what + " pattern NOT FOUND -- "
+                    "this D3D12Core is not the build #169 was read from");
+    return hits;
+}
+
+static void GhDdiPatchShaderModelCap()
+{
+    static LONG once = 0;
+    if (InterlockedCompareExchange(&once, 1, 0) != 0) return;
+    const unsigned v = GhDdiSm();
+    if (!v) return;
+    const unsigned maj = v / 10, mnr = v % 10;
+    if (maj < 5 || maj > 6 || mnr > 8 || (maj == 5 && mnr != 1)){
+        Diag("DDISM gh_ddi_sm=" + std::to_string(v) +
+             " is not a shader model (want 51, or 60..68) -- ignored");
+        return;
+    }
+    const uint8_t  smByte = (uint8_t)((maj << 4) | mnr);        // D3D_SHADER_MODEL
+    const uint32_t ddi    = (maj << 16) | (mnr << 4) | 5u;      // D3D12DDI_SHADER_MODEL
+
+    HMODULE core = GetModuleHandleW(L"D3D12Core.dll");
+    if (!core){
+        core = LoadLibraryW(L"D3D12Core.dll");
+        Diag("DDISM forced D3D12Core load -> " + Hex((uintptr_t)core));
+    }
+    if (!core){ Diag("DDISM no D3D12Core -- nothing patched"); return; }
+    Diag("DDISM target SM=" + Hex(smByte) + " ddi=" + Hex(ddi) +
+         " D3D12Core=" + Hex((uintptr_t)core));
+
+    // P1: mov dword ptr [rcx+0x104], 0x51   -- the default, in two places
+    const unsigned char p1[10] = { 0xC7,0x81,0x04,0x01,0x00,0x00, 0x51,0x00,0x00,0x00 };
+    const unsigned char r1[4]  = { smByte, 0x00, 0x00, 0x00 };
+    int n1 = GhDdiScanAndPatch(core, "P1default", p1, 10, r1, 4, 6);
+
+    // P2: mov eax, 0x60085 ; cmp r14d, eax ; cmovl eax, r14d
+    //     -> mov eax, <ddi> ; cmp r14d, eax ; nop dword ptr [rax]
+    // The cmp stays: it only sets flags nothing downstream reads, and leaving it
+    // keeps the patch to the four bytes that actually decide the value.
+    const unsigned char p2[12] = { 0xB8,0x85,0x00,0x06,0x00, 0x44,0x3B,0xF0, 0x41,0x0F,0x4C,0xC6 };
+    const unsigned char r2[11] = { (unsigned char)( ddi        & 0xFF),
+                                   (unsigned char)((ddi >>  8) & 0xFF),
+                                   (unsigned char)((ddi >> 16) & 0xFF),
+                                   (unsigned char)((ddi >> 24) & 0xFF),
+                                   0x44,0x3B,0xF0,
+                                   0x0F,0x1F,0x40,0x00 };
+    int n2 = GhDdiScanAndPatch(core, "P2clamp", p2, 12, r2, 11, 1);
+
+    Diag("DDISM sites patched P1=" + std::to_string(n1) + " P2=" + std::to_string(n2) +
+         (n1 && n2 ? std::string()
+                   : std::string("  -- INCOMPLETE, do not score this run as a negative")));
+}
+
+static void GhDdiInstall()
+{
+    static LONG once = 0;
+    if (InterlockedCompareExchange(&once, 1, 0) != 0) return;
+
+    // Stage 1 first: it must land before ANY D3D12 device negotiates caps, and
+    // it is independent of the read-only Stage 0 probes.
+    GhDdiPatchShaderModelCap();
+
+    if (!GhDdiProbe()) return;
+
+    GhDdiProbeDxilStages();
+    GhDdiCopyStackForRE();
+    if (GhDdiProbe() < 2) return;
+
+    HMODULE core = GetModuleHandleW(L"D3D12Core.dll");
+    if (!core){
+        core = LoadLibraryW(L"D3D12Core.dll");
+        Diag("DDIPROBE 0c forced D3D12Core load -> " + Hex((uintptr_t)core) +
+             (core ? std::string() : " err=" + Hex(GetLastError())));
+    }
+    if (!core){ Diag("DDIPROBE 0c: no D3D12Core -- cannot instrument the DDI"); return; }
+    int n = PatchModuleImport(core, "LoadLibraryW",   (void*)&Bed_Core_LoadLibraryW);
+    n    += PatchModuleImport(core, "GetProcAddress", (void*)&Bed_Core_GetProcAddress);
+    Diag("DDIPROBE 0c D3D12Core imports patched x" + std::to_string(n) +
+         (n ? std::string() : std::string(" -- it resolves the UMD some other way; RE the 0b copy")));
+}
+
 static bool GhPreloadScDxil()
 {
     static LONG once = 0;
@@ -4475,6 +8040,11 @@ static bool GhPreloadScDxil()
     if (InterlockedCompareExchange(&once, 1, 0) != 0) return ok;
 
     if (GetModuleHandleW(L"scdxil.dll")){ ok = true; Diag("SCDXIL already loaded"); return ok; }
+
+    // Say so BEFORE the call, not after: the first version of this only logged
+    // its result, so when the LoadLibrary itself never returned the diag showed
+    // nothing at all and the hang looked like it was somewhere else entirely.
+    Diag("SCDXIL preload: LoadLibraryW(scdxil.dll) ...");
 
     // Bare name first -- if the container can find it, nothing else is needed.
     if (HMODULE h = LoadLibraryW(L"scdxil.dll")){
@@ -4833,6 +8403,86 @@ static void GhProbePSO(ID3D12Device* dev, GhGpsFn orig)
     }
 }
 
+// ---------------------------------------------------------------- #158 PSO bytecode keep
+static unsigned GhDumpPsoAt()
+{ static const unsigned n = GhCfgNum(L"gh_dump_pso_at.txt", "GH_DUMP_PSO_AT", 0); return n; }
+static bool GhPsoKeepOn(){ return GhDumpPsoAt() != 0; }
+
+struct GhPsoBytes {
+    void*          pso;
+    unsigned char* vs; SIZE_T vsn;
+    unsigned char* ps; SIZE_T psn;
+};
+static GhPsoBytes g_psoBytes[8192]{};
+static volatile LONG g_psoBytesN = 0;
+static SRWLOCK g_psoBytesLk = SRWLOCK_INIT;
+
+static void GhPsoKeep(void* pso, const void* vs, SIZE_T vsn, const void* ps, SIZE_T psn)
+{
+    if (!pso) return;
+    auto dup = [](const void* p, SIZE_T n) -> unsigned char* {
+        if (!p || !n) return nullptr;
+        unsigned char* q = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, n);
+        if (q) memcpy(q, p, n);
+        return q;
+    };
+    unsigned char* v = dup(vs, vsn);
+    unsigned char* q = dup(ps, psn);
+    AcquireSRWLockExclusive(&g_psoBytesLk);
+    LONG n = g_psoBytesN;
+    if (n < (LONG)(sizeof g_psoBytes / sizeof g_psoBytes[0])){
+        g_psoBytes[n].pso = pso;
+        g_psoBytes[n].vs = v; g_psoBytes[n].vsn = vsn;
+        g_psoBytes[n].ps = q; g_psoBytes[n].psn = psn;
+        g_psoBytesN = n + 1; n = -1;
+    }
+    ReleaseSRWLockExclusive(&g_psoBytesLk);
+    if (n >= 0){ if (v) HeapFree(GetProcessHeap(), 0, v); if (q) HeapFree(GetProcessHeap(), 0, q); }
+}
+
+// Dump the shaders of the pipeline bound at global op g. Called from the breadcrumb,
+// which owns that numbering.
+static void GhPsoDumpAt(void* pso, LONG g)
+{
+    static volatile LONG done = 0;
+    if (InterlockedCompareExchange(&done, 1, 0) != 0) return;
+    const GhPsoBytes* hit = nullptr;
+    AcquireSRWLockShared(&g_psoBytesLk);
+    for (LONG i = 0, n = g_psoBytesN; i < n; ++i)
+        if (g_psoBytes[i].pso == pso){ hit = &g_psoBytes[i]; break; }
+    ReleaseSRWLockShared(&g_psoBytesLk);
+    if (!hit){
+        Diag("PSOAT g=" + std::to_string((long)g) + " pso=" + Hex((uint64_t)(uintptr_t)pso) +
+             " NOT in the keep table (compute pipeline, or created before the knob was read)");
+        return;
+    }
+    auto put = [&](const wchar_t* name, const void* p2, SIZE_T n2, const char* tag){
+        if (!p2 || !n2){ Diag(std::string("PSOAT ") + tag + " empty"); return; }
+        std::wstring path = std::wstring(kLocalState) + name;
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE){
+            Diag(std::string("PSOAT ") + tag + " open failed err=" + Hex(GetLastError()));
+            return;
+        }
+        DWORD wrote = 0;
+        WriteFile(h, p2, (DWORD)n2, &wrote, nullptr);
+        CloseHandle(h);
+        Diag(std::string("PSOAT ") + tag + " wrote " + std::to_string((unsigned long)wrote) + " bytes");
+    };
+    Diag("PSOAT g=" + std::to_string((long)g) + " pso=" + Hex((uint64_t)(uintptr_t)pso) +
+         " VS=" + std::to_string((unsigned long long)hit->vsn) +
+         " PS=" + std::to_string((unsigned long long)hit->psn));
+    put(L"gh_ps_at.bin", hit->ps, hit->psn, "ps");
+    put(L"gh_vs_at.bin", hit->vs, hit->vsn, "vs");
+}
+
+// #158 gh_null_ps = 1: strip the pixel shader out of every graphics PSO. See the call
+// site below for why a null PS rather than a substituted one.
+static unsigned GhNullPs()
+{ static const unsigned v = (unsigned)GhCfgNum(L"gh_null_ps.txt", "GH_NULL_PS", 0); return v; }
+static volatile LONG g_nullPsN = 0;   // PSOs actually stripped; the knob's proof of life
+
 static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** pp)
 {
@@ -4868,6 +8518,11 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     // loop and which constant drives it. gh_dump_ps_size.txt = the PS bytecode
     // length to match (2648 for the hanging one); the blobs land in LocalState
     // next to the diag, and RDEF names the resources and constants.
+    // #158. gh_dump_ps_size keys on a bytecode LENGTH, which means knowing in
+    // advance which shader you want. The breadcrumb names an op, not a length, so
+    // keep every pipeline's VS/PS by pointer (~10 MB for this game's 1895 PSOs) and
+    // let gh_dump_pso_at name a global op number instead -- the same number that
+    // appears as `BCOP g=` and as `started=` when the GPU dies.
     if (d){
         static const unsigned wantPs = GhCfgNum(L"gh_dump_ps_size.txt", "GH_DUMP_PS_SIZE", 0);
         static volatile LONG dumped = 0;
@@ -4892,6 +8547,7 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
         }
     }
 
+    InterlockedExchange(&g_lastD3DTid, (LONG)GetCurrentThreadId());
     std::string m = "D3D12 CreateGraphicsPipelineState tid=" +
                     std::to_string((unsigned long)GetCurrentThreadId()) +
                     " inflight=" + std::to_string((long)inflight.n) +
@@ -4929,6 +8585,18 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
            + " stencil=" + std::to_string((int)d->DepthStencilState.StencilEnable);
         m += std::string(" VSmag=") + GhFourCC(d->VS.pShaderBytecode, d->VS.BytecodeLength);
         m += std::string(" PSmag=") + GhFourCC(d->PS.pShaderBytecode, d->PS.BytecodeLength);
+        m += " VSkind=" + GhShaderKind(d->VS.pShaderBytecode, d->VS.BytecodeLength);
+        m += " PSkind=" + GhShaderKind(d->PS.pShaderBytecode, d->PS.BytecodeLength);
+        if (GhDxilScreen()){
+            uint64_t fv = 0, fp = 0, fg = 0, fh = 0, fd = 0;
+            GhDxilFeat(d->VS.pShaderBytecode, d->VS.BytecodeLength, &fv);
+            GhDxilFeat(d->PS.pShaderBytecode, d->PS.BytecodeLength, &fp);
+            GhDxilFeat(d->GS.pShaderBytecode, d->GS.BytecodeLength, &fg);
+            GhDxilFeat(d->HS.pShaderBytecode, d->HS.BytecodeLength, &fh);
+            GhDxilFeat(d->DS.pShaderBytecode, d->DS.BytecodeLength, &fd);
+            const uint64_t all = fv | fp | fg | fh | fd;
+            m += " feat=" + Hex((uint64_t)all) + "(" + GhDxilFeatNames(all) + ")";
+        }
         if (d->InputLayout.pInputElementDescs){
             for (UINT i = 0; i < d->InputLayout.NumElements && i < 6; ++i){
                 auto& e = d->InputLayout.pInputElementDescs[i];
@@ -4942,6 +8610,29 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
             use = &local;
             m += " (stripped PC PSO cache)";
         }
+        // #158 gh_null_ps: build every graphics pipeline with NO pixel shader.
+        //
+        // gh_skip_vs/gh_skip_ps only ever skipped ONE named pair (2140/2648), and doing
+        // so moved the death from submission 38 to 50 -- the hang stepped to the next op,
+        // which settles that no single shader owns it but says nothing about shader
+        // execution as a class. This removes the class: a null PS is legal D3D12 (it is
+        // how depth-only passes are built), needs no bytecode of our own, and eliminates
+        // every pixel-shader invocation and every texture fetch behind one in a single
+        // move. NumRenderTargets and the RTV formats are left alone deliberately -- the
+        // targets stay bound and simply go unwritten, so the binding topology the driver
+        // sees is unchanged and this is not a repeat of the OMSetRenderTargets probe.
+        //
+        // Survives -> the budget is spent inside shader execution, and the search moves
+        // into bytecode. Dies identically -> the entire pixel path is excluded wholesale,
+        // an elimination nothing on the record has been able to make.
+        if (GhNullPs() && d->PS.BytecodeLength && d->PS.pShaderBytecode){
+            if (use != &local) local = *d;
+            local.PS.pShaderBytecode = nullptr;
+            local.PS.BytecodeLength  = 0;
+            use = &local;
+            InterlockedIncrement(&g_nullPsN);
+            m += " (NULLPS)";
+        }
     }
     Diag(m);
 
@@ -4950,16 +8641,98 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     // compiler is broken" from "something in the guest's desc kills it" -- a
     // distinction the previous blanket E_FAIL could never draw.
     ++depth;
-    if (!GhPreloadScDxil()) GhPatchScDllDxilQuery();
-    GhProbePSO(self, orig);
+    // #163. These two were #158 diagnostics that ran unconditionally inside the
+    // guest's first CreateGraphicsPipelineState, and both call LoadLibrary from
+    // that thread. On Ghost of Tsushima the scdxil preload never returns: the
+    // guest's PSO call never returns either, its main thread sits in
+    // WaitForSingleObject(INFINITE) waiting for that worker, and the OS kills an
+    // app in which nothing is running. GhPatchScDllDxilQuery is NOT a probe --
+    // it is the two-byte fix that makes any PSO work at all -- so it stays on
+    // the unconditional path.
+    if (GhScdxilMode()){
+        // #168 route (a). The module itself came up before the guest started;
+        // all that is left here is redirecting SC_DLL's two import slots.
+        const bool ready = GhScdxilPatchScDll();
+        // Mode 2 hands SC_DLL a real answer, so the two-byte "always say no"
+        // patch must NOT be applied -- it would force the old back end anyway.
+        // If the bring-up failed, fall back to the patch rather than leaving the
+        // guest to call a NULL: a wall is better than a crash.
+        if (!(GhScdxilMode() >= 2 && ready)) GhPatchScDllDxilQuery();
+    } else if (!GhScdxilPreload() || !GhPreloadScDxil()) GhPatchScDllDxilQuery();
+    if (GhPsoProbeOn()) GhProbePSO(self, orig);
     --depth;
 
     // Now let the guest's real call run, with the fault caught rather than
     // fatal. Once it has faulted once we stop trying: repeating a crash that
     // costs a structured-exception unwind per PSO buys nothing, and the guest
     // seeing E_FAIL is the behaviour the previous build already characterised.
+    // #169. Refuse in FRONT of the compiler rather than catching its fault:
+    // an SEH unwind out of newbe.DLL leaves the back end's own locks held and
+    // every later compile blocks on them for the rest of the run.
+    // #173: substitute lowered blobs before the screen, for the same reason as the
+    // compute path -- the screen must judge what the driver will actually see.
+    // `local` may already be in use by an earlier rewrite, so copy only once.
+    if (use && GhShaderSubOn()){
+        if (use != &local){ local = *use; }
+        bool any = false;
+        any |= GhSubstShader(&local.VS);
+        any |= GhSubstShader(&local.PS);
+        any |= GhSubstShader(&local.GS);
+        any |= GhSubstShader(&local.HS);
+        any |= GhSubstShader(&local.DS);
+        if (any){
+            static volatile LONG nsub = 0;
+            const LONG k = InterlockedIncrement(&nsub);
+            if (k <= 8 || (k % 100) == 0)
+                Diag("  GFX SUBSTITUTED n=" + std::to_string((long)k) +
+                     " VS=" + std::to_string((unsigned)local.VS.BytecodeLength) +
+                     " PS=" + std::to_string((unsigned)local.PS.BytecodeLength));
+            use = &local;
+        } else if (use != &local){
+            // nothing swapped -- leave `use` pointing at the guest's own desc
+        }
+    }
+
+    if (GhDxilScreen() >= 2 && use){
+        uint64_t all = 0, f = 0;
+        GhDxilFeat(use->VS.pShaderBytecode, use->VS.BytecodeLength, &f); all |= f;
+        GhDxilFeat(use->PS.pShaderBytecode, use->PS.BytecodeLength, &f); all |= f;
+        GhDxilFeat(use->GS.pShaderBytecode, use->GS.BytecodeLength, &f); all |= f;
+        GhDxilFeat(use->HS.pShaderBytecode, use->HS.BytecodeLength, &f); all |= f;
+        GhDxilFeat(use->DS.pShaderBytecode, use->DS.BytecodeLength, &f); all |= f;
+        unsigned sm = 0;
+        if (const unsigned cap = GhDxilMaxSm()){
+            const unsigned smv[5] = {
+                GhDxilSm(use->VS.pShaderBytecode, use->VS.BytecodeLength),
+                GhDxilSm(use->PS.pShaderBytecode, use->PS.BytecodeLength),
+                GhDxilSm(use->GS.pShaderBytecode, use->GS.BytecodeLength),
+                GhDxilSm(use->HS.pShaderBytecode, use->HS.BytecodeLength),
+                GhDxilSm(use->DS.pShaderBytecode, use->DS.BytecodeLength) };
+            for (unsigned v : smv) if (v > sm) sm = v;
+            if (sm <= cap) sm = 0;      // within the back end's reach
+        }
+        if ((all & GhDxilMask()) || sm){
+            static volatile LONG screened = 0;
+            const LONG k = InterlockedIncrement(&screened);
+            if (pp) *pp = nullptr;
+            Diag("  CreateGraphicsPipelineState SCREENED n=" + std::to_string((long)k) +
+                 " feat=" + Hex((uint64_t)all) + "(" + GhDxilFeatNames(all) + ")" +
+                 " hit=" + Hex((uint64_t)(all & GhDxilMask())) +
+                 " sm=" + Hex((uint32_t)sm) +
+                 " VS=" + std::to_string((unsigned long long)use->VS.BytecodeLength) +
+                 " PS=" + std::to_string((unsigned long long)use->PS.BytecodeLength) +
+                 "; E_FAIL without calling the driver");
+            return E_FAIL;
+        }
+    }
+
     static LONG faulted = 0;
-    if (InterlockedCompareExchange(&faulted, 0, 0) != 0){
+    // gh_pso_faults = how many faulting pipelines to absorb before giving up on
+    // the rest. 1 is the old behaviour. Raising it answers the question the old
+    // latch hid: does the back end choke on EVERY SM 6.6 shader, or on a few?
+    static const long faultBudget =
+        (long)GhCfgNum(L"gh_pso_faults.txt", "GH_PSO_FAULTS", 1);
+    if (InterlockedCompareExchange(&faulted, 0, 0) >= faultBudget){
         if (pp) *pp = nullptr;
         Diag("  CreateGraphicsPipelineState skipped (already faulted); E_FAIL");
         return E_FAIL;
@@ -4990,9 +8763,18 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     --depth;
     if (serialize) ReleaseSRWLockExclusive(&psoLock);
     if (fault){
-        InterlockedExchange(&faulted, 1);
+        const LONG nf = InterlockedIncrement(&faulted);
         if (pp) *pp = nullptr;
+        // Name the pipeline. Shader byte lengths are this game's stable identity
+        // for a PSO (the creation index moves between runs -- they come off a job
+        // pool), so this is what makes a faulting shader findable again.
         Diag("  CreateGraphicsPipelineState FAULTED code=" + Hex((uint32_t)fault) +
+             " n=" + std::to_string((long)nf) + "/" + std::to_string(faultBudget) +
+             " VS=" + std::to_string(use ? (unsigned long long)use->VS.BytecodeLength : 0ull) +
+             " PS=" + std::to_string(use ? (unsigned long long)use->PS.BytecodeLength : 0ull) +
+             " GS=" + std::to_string(use ? (unsigned long long)use->GS.BytecodeLength : 0ull) +
+             " HS=" + std::to_string(use ? (unsigned long long)use->HS.BytecodeLength : 0ull) +
+             " DS=" + std::to_string(use ? (unsigned long long)use->DS.BytecodeLength : 0ull) +
              "; returning E_FAIL");
         return E_FAIL;
     }
@@ -5011,6 +8793,9 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     if (pp && *pp){
         res += " CREATED pso=" + Hex((uint64_t)(uintptr_t)*pp) +
                " idx=" + std::to_string((long)InterlockedIncrement(&psoIdx));
+        // Keep the bytecode by PSO pointer so gh_dump_pso_at can name an op, not a length.
+        if (d && GhPsoKeepOn()) GhPsoKeep(*pp, d->VS.pShaderBytecode, d->VS.BytecodeLength,
+                                               d->PS.pShaderBytecode, d->PS.BytecodeLength);
         if (d) res += " vs=" + std::to_string((unsigned long long)d->VS.BytecodeLength) +
                       " ps=" + std::to_string((unsigned long long)d->PS.BytecodeLength);
         if (d && GhSkipPsShaderSizes(d->VS.BytecodeLength, d->PS.BytecodeLength)){
@@ -5020,6 +8805,49 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
         }
     }
     Diag(res);
+
+    // #158: gh_pso_clone.txt = K creates K extra copies of this pipeline and
+    // never releases them.
+    //
+    // The reason: across ten runs whose configurations differ wildly -- 720p,
+    // empty command lists, every barrier dropped, 600 preloaded heaps, a 100 ms
+    // submit delay, the entire present path short-circuited -- the device dies
+    // after 1886 to 1925 graphics pipelines, a 2% spread, while ecl spans 90 to
+    // 125 and the frame count is only incidentally 26. The PSO count is the
+    // invariant; "frame 26" was a proxy for reaching it.
+    //
+    // If that is a fixed budget inside the driver, then manufacturing pipelines
+    // faster must reach it sooner: with K=1 the guest should get only about half
+    // as far before the same total is hit. If instead the guest still reaches
+    // ~1900 of its OWN pipelines with the clones costing nothing, the budget is
+    // not what is being exhausted and this whole line is wrong. Either answer is
+    // worth one run. The clones are deliberately leaked -- releasing them would
+    // hand the budget back and measure nothing.
+    static const unsigned clone = GhCfgNum(L"gh_pso_clone.txt", "GH_PSO_CLONE", 0);
+    if (clone && SUCCEEDED(hr) && pp && *pp && use){
+        static volatile LONG cloned = 0, cloneFail = 0;
+        for (unsigned i = 0; i < clone; ++i){
+            void* extra = nullptr;
+            ++depth;
+            HRESULT chr = orig(self, use, riid, &extra);
+            --depth;
+            if (SUCCEEDED(chr) && extra){
+                InterlockedIncrement(&cloned);          // leaked on purpose
+            } else {
+                const LONG nf = InterlockedIncrement(&cloneFail);
+                if (nf <= 4)
+                    Diag("  PSOCLONE failed hr=" + Hex((uint32_t)chr) +
+                         " afterCloned=" + std::to_string((long)cloned) +
+                         " removed=" + Hex((uint32_t)self->GetDeviceRemovedReason()));
+                break;
+            }
+        }
+        const LONG nc = InterlockedCompareExchange(&cloned, 0, 0);
+        if ((nc % 200) == 0)
+            Diag("  PSOCLONE cloned=" + std::to_string((long)nc) +
+                 " failed=" + std::to_string((long)InterlockedCompareExchange(&cloneFail, 0, 0)));
+    }
+
     if (FAILED(hr)){
         HRESULT postRemoved = self->GetDeviceRemovedReason();
         Diag("  PSO failed: removed before=" + Hex((uint32_t)preRemoved) +
@@ -5027,6 +8855,7 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
         if (postRemoved != S_OK) GhCheckDeviceRemoved("pso-post", self);
     }
     if (FAILED(hr) && d){
+        GhDrainInfoQueue();                                    // #168, see the CS path
         GhDumpFailedShader("vs", d->VS.pShaderBytecode, d->VS.BytecodeLength, self);
         GhDumpFailedShader("ps", d->PS.pShaderBytecode, d->PS.BytecodeLength, self);
     }
@@ -5041,12 +8870,79 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
                     (d ? std::to_string((unsigned)d->CS.BytecodeLength) : "?");
     if (d){
         m += std::string(" CSmag=") + GhFourCC(d->CS.pShaderBytecode, d->CS.BytecodeLength);
+        m += " CSkind=" + GhShaderKind(d->CS.pShaderBytecode, d->CS.BytecodeLength);
+        if (GhDxilScreen()){
+            uint64_t fc = 0;
+            GhDxilFeat(d->CS.pShaderBytecode, d->CS.BytecodeLength, &fc);
+            m += " feat=" + Hex((uint64_t)fc) + "(" + GhDxilFeatNames(fc) + ")";
+        }
         m += std::string(" rootsig=") + (d->pRootSignature ? "yes" : "no");
         m += " nodemask=" + Hex((uint32_t)d->NodeMask);
         m += " flags=" + Hex((uint32_t)d->Flags);
         m += " cached=" + std::to_string((unsigned)d->CachedPSO.CachedBlobSizeInBytes);
     }
     Diag(m);
+
+    // #173: hand the driver the lowered blob if one is staged, and do it BEFORE
+    // the screen below so the screen judges what the driver will actually see --
+    // a lowered shader is SM 6.5 with the descriptor-heap feature bits gone, and
+    // screening it on the 6.6 blob's features would refuse the very thing the
+    // substitution exists to let through.
+    D3D12_COMPUTE_PIPELINE_STATE_DESC subd;
+    if (d && GhShaderSubOn()){
+        subd = *d;
+        if (GhSubstShader(&subd.CS)){
+            static volatile LONG nsub = 0;
+            const LONG k = InterlockedIncrement(&nsub);
+            if (k <= 8 || (k % 100) == 0)
+                Diag("  CS SUBSTITUTED n=" + std::to_string((long)k) +
+                     " " + std::to_string((unsigned)d->CS.BytecodeLength) + " -> " +
+                     std::to_string((unsigned)subd.CS.BytecodeLength) + " bytes, kind=" +
+                     GhShaderKind(subd.CS.pShaderBytecode, subd.CS.BytecodeLength));
+            d = &subd;
+        }
+    }
+
+    // #169: DirectStorage's GDeflate decompression shader is the first DXIL the
+    // driver ever sees, and it kills the device (DRIVER_INTERNAL_ERROR) before
+    // Tsushima compiles one shader of its own -- so it hides the only question
+    // worth asking, which is whether the GAME's DXIL compiles. Refusing it here
+    // is the clean version of what DStorageSetConfiguration was supposed to do:
+    // DirectStorage treats a failed decompression PSO as "no GPU path" and falls
+    // back to the CPU, and every other caller is untouched.
+    if (GhDsNoGpu() >= 3 && d &&
+        GhShaderKind(d->CS.pShaderBytecode, d->CS.BytecodeLength).rfind("DXIL", 0) == 0){
+        const std::string who = NameForCodeAddr((uintptr_t)_ReturnAddress());
+        if (who.find("dstorage") != std::string::npos){
+            Diag("  CreateComputePipelineState REFUSED for " + who +
+                 " (gh_ds_nogpu>=3) -- keeping DirectStorage's DXIL out of the driver");
+            return E_INVALIDARG;
+        }
+    }
+
+    // #169: the same screen the graphics path uses -- refuse in front of the
+    // compiler rather than let it fault and take its own locks down with it.
+    if (GhDxilScreen() >= 2 && d){
+        uint64_t f = 0;
+        GhDxilFeat(d->CS.pShaderBytecode, d->CS.BytecodeLength, &f);
+        unsigned sm = 0;
+        if (const unsigned cap = GhDxilMaxSm()){
+            sm = GhDxilSm(d->CS.pShaderBytecode, d->CS.BytecodeLength);
+            if (sm <= cap) sm = 0;
+        }
+        if ((f & GhDxilMask()) || sm){
+            static volatile LONG screenedC = 0;
+            const LONG k = InterlockedIncrement(&screenedC);
+            if (pp) *pp = nullptr;
+            Diag("  CreateComputePipelineState SCREENED n=" + std::to_string((long)k) +
+                 " feat=" + Hex((uint64_t)f) + "(" + GhDxilFeatNames(f) + ")" +
+                 " sm=" + Hex((uint32_t)sm) +
+                 " CS=" + std::to_string((unsigned long long)d->CS.BytecodeLength) +
+                 "; E_FAIL without calling the driver");
+            return E_FAIL;
+        }
+    }
+
     HRESULT hr = orig(self, d, riid, pp);
     {
         static volatile LONG cpsIdx = 0;
@@ -5059,6 +8955,12 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
         Diag(res);
     }
     if (FAILED(hr) && d){
+        // #168: the runtime's own words for WHY. The info queue carries driver and
+        // runtime validation messages even with the debug layer off, and a PSO
+        // refusal is exactly the kind it explains ("shader model ... not
+        // supported" vs a compiler error) -- the difference between a wall we can
+        // move and one we cannot.
+        GhDrainInfoQueue();
         GhDumpFailedShader("cs", d->CS.pShaderBytecode, d->CS.BytecodeLength, self);
         if (GhIsDxil(d->CS.pShaderBytecode, d->CS.BytecodeLength)){
             // Shader Model 6. This console's D3D12 tops out below that, so the
@@ -5093,6 +8995,35 @@ static unsigned GhNoUmaBits()
 {
     static const unsigned bits = GhCfgNum(L"gh_no_uma.txt", "GH_NO_UMA", 0);
     return bits;
+}
+// ---------------------------------------------------------------- #158 gh_fmt_probe
+// The depth-downsample chain the GPU dies inside writes R11G11B10_FLOAT (fmt 26) targets
+// created ALLOW_RENDER_TARGET|ALLOW_UNORDERED_ACCESS -- flags=0x5 on every level, in every
+// BIND line. Typed UAV load and store are REQUIRED in D3D12 only for R32_FLOAT, R32_UINT
+// and R32_SINT; for everything else, R11G11B10_FLOAT included, they are optional and
+// reported per format. So a resource can carry the UAV flag on a format whose typed UAV
+// path this console does not actually have, and nothing on the CPU side would ever say so.
+// That is the same shape as the two console landmines already found: SC_DLL calling a NULL
+// export, and CUSTOM heaps asking for an L1 pool a UMA adapter has not got.
+//
+// A bitmask, because the claim and the flag are separable:
+//   1 = drop ALLOW_UNORDERED_ACCESS from non-buffer resources whose format is 26
+//   2 = report TypedUAVLoadAdditionalFormats = FALSE, so the guest takes its fallback
+//   4 = drop ALLOW_UNORDERED_ACCESS from EVERY non-buffer render target, whatever the
+//       format -- the control that separates "this format" from "the UAV flag at all"
+static unsigned GhFmtProbe()
+{
+    static const unsigned bits = GhCfgNum(L"gh_fmt_probe.txt", "GH_FMT_PROBE", 0);
+    return bits;
+}
+static volatile LONG g_fmtProbeN = 0, g_fmtProbeLie = 0;
+static void GhFmtProbeStats(const char* where)
+{
+    if (!GhFmtProbe()) return;
+    Diag(std::string("FMTPROBE at ") + where +
+         " bits=" + std::to_string((unsigned long)GhFmtProbe()) +
+         " stripped=" + std::to_string((long)InterlockedCompareExchange(&g_fmtProbeN, 0, 0)) +
+         " lied=" + std::to_string((long)InterlockedCompareExchange(&g_fmtProbeLie, 0, 0)));
 }
 
 // The price of the lie. A game told the adapter is discrete asks for CUSTOM heaps
@@ -5131,13 +9062,54 @@ static HRESULT __stdcall Hook_D12CheckFeature(ID3D12Device* self, D3D12_FEATURE 
     if (f == D3D12_FEATURE_SHADER_MODEL && data && sz >= sizeof(D3D12_FEATURE_DATA_SHADER_MODEL))
         askedSm = (uint32_t)((D3D12_FEATURE_DATA_SHADER_MODEL*)data)->HighestShaderModel;
     HRESULT hr = orig(self, f, data, sz);
+    // #160. Ghost of Tsushima asks for SM 6.6, gets 5.1 -- this console's ceiling
+    // (#151) -- puts up "Launcher_SM66NotSupported_Message" and exits(1) before it
+    // creates a single pipeline state. That refusal is a VERSION GATE, and a gate
+    // is not the same thing as a capability: raising the reported model says which
+    // of the two is actually in the way. If the game then dies creating its first
+    // PSO, the wall is real DXIL support and no amount of reporting moves it; if it
+    // runs, the gate was the whole story. gh_fake_sm.txt = the model to claim, e.g.
+    // 0x66. Off by default, and diagnostic only -- it makes the device lie, which
+    // is exactly the sort of answer that has to be labelled in the log.
+    uint32_t realSm = 0, fakedSm = 0;
+    if (f == D3D12_FEATURE_SHADER_MODEL && SUCCEEDED(hr) && data &&
+        sz >= sizeof(D3D12_FEATURE_DATA_SHADER_MODEL)){
+        static const unsigned fakeSm = GhCfgNum(L"gh_fake_sm.txt", "GH_FAKE_SM", 0);
+        auto* smd = (D3D12_FEATURE_DATA_SHADER_MODEL*)data;
+        realSm = (uint32_t)smd->HighestShaderModel;
+        // The API contract is min(asked, supported), so never claim more than the
+        // caller asked for -- a caller probing 5.1 must still be told 5.1.
+        const uint32_t want = (askedSm < fakeSm) ? askedSm : fakeSm;
+        if (fakeSm && realSm < want){ smd->HighestShaderModel = (D3D_SHADER_MODEL)want; fakedSm = want; }
+    }
     std::string extra;
     if (SUCCEEDED(hr) && data){
         if (f == D3D12_FEATURE_SHADER_MODEL && sz >= sizeof(D3D12_FEATURE_DATA_SHADER_MODEL))
             extra = " asked=" + Hex(askedSm) + " SM=" +
-                    Hex((uint32_t)((D3D12_FEATURE_DATA_SHADER_MODEL*)data)->HighestShaderModel);
+                    Hex((uint32_t)((D3D12_FEATURE_DATA_SHADER_MODEL*)data)->HighestShaderModel) +
+                    (fakedSm ? " FAKED real=" + Hex(realSm) : std::string());
         else if (f == D3D12_FEATURE_FEATURE_LEVELS && sz >= sizeof(D3D12_FEATURE_DATA_FEATURE_LEVELS))
             extra = " maxFL=" + Hex((uint32_t)((D3D12_FEATURE_DATA_FEATURE_LEVELS*)data)->MaxSupportedFeatureLevel);
+        // #158 format landmine. The guest asks FORMAT_SUPPORT exactly twice in a whole
+        // run and neither the format nor the answer has ever been in a log. The
+        // depth-downsample chain that hangs writes R11G11B10_FLOAT (fmt 26) targets
+        // created ALLOW_RENDER_TARGET|ALLOW_UNORDERED_ACCESS, and typed UAV load/store
+        // on that format is OPTIONAL in D3D12 -- only R32_FLOAT/UINT/SINT are required.
+        // So what this console claims for 26 is exactly the question.
+        else if (f == D3D12_FEATURE_FORMAT_SUPPORT && sz >= sizeof(D3D12_FEATURE_DATA_FORMAT_SUPPORT)){
+            auto* fs = (D3D12_FEATURE_DATA_FORMAT_SUPPORT*)data;
+            extra = " fmt=" + std::to_string((unsigned)fs->Format) +
+                    " sup1=" + Hex((uint32_t)fs->Support1) +
+                    " sup2=" + Hex((uint32_t)fs->Support2);
+        }
+        else if (f == D3D12_FEATURE_D3D12_OPTIONS && sz >= sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS)){
+            auto* o = (D3D12_FEATURE_DATA_D3D12_OPTIONS*)data;
+            extra = " typeduavload=" + std::to_string((int)o->TypedUAVLoadAdditionalFormats) +
+                    " rovs=" + std::to_string((int)o->ROVsSupported) +
+                    " minprec=" + Hex((uint32_t)o->MinPrecisionSupport) +
+                    " bindingtier=" + std::to_string((int)o->ResourceBindingTier) +
+                    " heaptier=" + std::to_string((int)o->ResourceHeapTier);
+        }
     }
     // #158: the console really is UMA, and telling the guest so makes it take a
     // path this environment cannot serve. Spider-Man logs "Is UMA: Yes" ->
@@ -5171,21 +9143,229 @@ static HRESULT __stdcall Hook_D12CheckFeature(ID3D12Device* self, D3D12_FEATURE 
             extra += " [forced EXISTING_HEAPS=0]";
         }
     }
+    if ((GhFmtProbe() & 2) && SUCCEEDED(hr) && data &&
+        f == D3D12_FEATURE_D3D12_OPTIONS && sz >= sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS)){
+        ((D3D12_FEATURE_DATA_D3D12_OPTIONS*)data)->TypedUAVLoadAdditionalFormats = FALSE;
+        InterlockedIncrement(&g_fmtProbeLie);
+        extra += " [forced typeduavload=0]";
+    }
     static LONG n = 0;
     if (InterlockedIncrement(&n) <= 16 || f == D3D12_FEATURE_SHADER_MODEL ||
         f == D3D12_FEATURE_ARCHITECTURE || f == D3D12_FEATURE_ARCHITECTURE1 ||
-        f == D3D12_FEATURE_EXISTING_HEAPS)
+        f == D3D12_FEATURE_EXISTING_HEAPS || f == D3D12_FEATURE_FORMAT_SUPPORT ||
+        f == D3D12_FEATURE_D3D12_OPTIONS)
         Diag("D3D12 CheckFeatureSupport f=" + std::to_string((int)f) +
              " hr=" + Hex((uint32_t)hr) + extra);
     return hr;
 }
+// #158. A serialized root signature carries, per descriptor range, the promises the
+// application makes to the driver about descriptor and data staticness. Under version
+// 1.1 static descriptors are the DEFAULT, and an out-of-bounds access to a BUFFER view
+// through a static descriptor is undefined -- possible device reset -- because the
+// driver may promote it to a root descriptor, which does no bounds checking. Nothing we
+// own can observe that promise being broken: it is not an API call, and the debug layer
+// only validates it under GPU-Based Validation, which this console refuses outright.
+// So dump the blobs and read the flags off the RTS0 chunk on the host instead.
+// Off by default; a run without gh_rs_dump is bit-for-bit what it was.
+static bool GhRsDumpOn()
+{
+    static const bool on = GhCfgNum(L"gh_rs_dump.txt", "GH_RS_DUMP", 0) != 0;
+    return on;
+}
+// #173. The game's own root signature says nothing about the register spaces the
+// 6.6 -> 6.5 lowering invents, so a substituted shader would be refused for a root
+// signature mismatch before the driver ever compiled it. Append the frozen bindless
+// ranges to whatever the guest asked for.
+//
+// APPEND, never insert: the guest's existing root parameter indices are baked into
+// its own SetGraphicsRootDescriptorTable calls, so the two new tables have to land
+// past the end. Two tables cost 2 of the 64 root DWORDs whatever they hold -- run 95
+// proved this console serializes ~109 aliased unbounded ranges in one of them.
+//
+// Only the frozen 5000+ spaces are added. Blanketing spaces 0-7 the way the mode-5
+// test rig does would collide with the guest's own declarations in those spaces.
+static unsigned GhRsBindless()
+{
+    static const unsigned m = GhCfgNum(L"gh_rs_bindless.txt", "GH_RS_BINDLESS", 0);
+    return m;
+}
+
+// Root DWORD cost, so a refusal reports a budget rather than a bare E_INVALIDARG.
+static UINT GhRootCost(const D3D12_ROOT_PARAMETER1* p, UINT n)
+{
+    UINT dw = 0;
+    for (UINT i = 0; i < n; ++i){
+        switch (p[i].ParameterType){
+        case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE: dw += 1; break;
+        case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:  dw += p[i].Constants.Num32BitValues; break;
+        default:                                         dw += 2; break;   // root descriptor
+        }
+    }
+    return dw;
+}
+
+// Which two root parameter indices carry the bindless tables, per root signature.
+// The command lists need this to bind the descriptor heap base to them.
+struct GhBindlessRoot { UINT res, samp; };
+static std::mutex g_ghRsMu;
+static std::map<void*, GhBindlessRoot> g_ghRsBindless;
+
+static bool GhAppendBindlessRanges(const void* blob, SIZE_T len,
+                                   std::vector<uint8_t>& out, GhBindlessRoot* where)
+{
+    HMODULE d12 = GetModuleHandleA("d3d12.dll");
+    if (!d12) return false;
+    using DeserFn = HRESULT (WINAPI*)(LPCVOID, SIZE_T, REFIID, void**);
+    using SerFn   = HRESULT (WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*,
+                                      ID3DBlob**, ID3DBlob**);
+    auto deser = (DeserFn)GetProcAddress(d12, "D3D12CreateVersionedRootSignatureDeserializer");
+    auto ser   = (SerFn)  GetProcAddress(d12, "D3D12SerializeVersionedRootSignature");
+    if (!deser || !ser){
+        Diag("  RSBINDLESS no versioned root signature API");
+        return false;
+    }
+    com_ptr<ID3D12VersionedRootSignatureDeserializer> vd;
+    HRESULT hr = deser(blob, len, __uuidof(ID3D12VersionedRootSignatureDeserializer),
+                       vd.put_void());
+    if (FAILED(hr) || !vd){
+        Diag("  RSBINDLESS deserialize hr=" + Hex((uint32_t)hr));
+        return false;
+    }
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* got = nullptr;
+    hr = vd->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &got);
+    if (FAILED(hr) || !got){
+        Diag("  RSBINDLESS GetRootSignatureDescAtVersion hr=" + Hex((uint32_t)hr));
+        return false;
+    }
+    const D3D12_ROOT_SIGNATURE_DESC1& src = got->Desc_1_1;
+
+    // Ranges are 1.1 here. VOLATILE on both descriptors and data is the 1.0
+    // behaviour, and it is the only honest answer for a heap the guest rewrites
+    // whenever it likes -- promising STATIC would licence caching we cannot back.
+    std::vector<D3D12_DESCRIPTOR_RANGE1> resR, sampR;
+    for (const GhBindlessSpace& b : kGhBindlessSpaces){
+        D3D12_DESCRIPTOR_RANGE1 r{};
+        r.RangeType = b.type;
+        r.NumDescriptors = UINT_MAX;
+        r.BaseShaderRegister = 0;
+        r.RegisterSpace = b.space;
+        // DATA_* describes the data a descriptor points at, and a sampler points
+        // at none: the serializer rejects the whole signature with E_INVALIDARG
+        // ("Sampler descriptor ranges can't specify DATA_* flags") if it is set,
+        // which is what made every rewrite in run 96 fall back.
+        r.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
+        if (b.type != D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER)
+            r.Flags |= D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+        r.OffsetInDescriptorsFromTableStart = 0;
+        (b.type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER ? sampR : resR).push_back(r);
+    }
+
+    std::vector<D3D12_ROOT_PARAMETER1> params(src.pParameters,
+                                              src.pParameters + src.NumParameters);
+    const UINT before = GhRootCost(params.data(), (UINT)params.size());
+    D3D12_ROOT_PARAMETER1 t{};
+    t.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    t.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    where->res = (UINT)params.size();
+    t.DescriptorTable.NumDescriptorRanges = (UINT)resR.size();
+    t.DescriptorTable.pDescriptorRanges = resR.data();
+    params.push_back(t);
+    where->samp = (UINT)params.size();
+    t.DescriptorTable.NumDescriptorRanges = (UINT)sampR.size();
+    t.DescriptorTable.pDescriptorRanges = sampR.data();
+    params.push_back(t);
+
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC vr{};
+    vr.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    vr.Desc_1_1 = src;
+    vr.Desc_1_1.NumParameters = (UINT)params.size();
+    vr.Desc_1_1.pParameters = params.data();
+    // The lowered shaders index ordinary unbounded arrays, not the 6.6 heap, so
+    // the two *_HEAP_DIRECTLY_INDEXED flags are deliberately NOT set here.
+
+    com_ptr<ID3DBlob> nb, err;
+    hr = ser(&vr, nb.put(), err.put());
+    if (FAILED(hr) || !nb){
+        Diag("  RSBINDLESS serialize hr=" + Hex((uint32_t)hr) +
+             " rootDwordsBefore=" + std::to_string((unsigned)before) + "/64" +
+             (err && err->GetBufferPointer()
+                  ? " err=" + std::string((const char*)err->GetBufferPointer(),
+                                          (size_t)err->GetBufferSize())
+                  : std::string()));
+        return false;
+    }
+    out.assign((const uint8_t*)nb->GetBufferPointer(),
+               (const uint8_t*)nb->GetBufferPointer() + nb->GetBufferSize());
+    Diag("  RSBINDLESS params " + std::to_string((unsigned)src.NumParameters) + " -> " +
+         std::to_string((unsigned)params.size()) +
+         " resRanges=" + std::to_string((unsigned)resR.size()) +
+         " sampRanges=" + std::to_string((unsigned)sampR.size()) +
+         " rootDwords " + std::to_string((unsigned)before) + " -> " +
+         std::to_string((unsigned)(before + 2)) + "/64" +
+         " bytes " + std::to_string((unsigned)len) + " -> " +
+         std::to_string((unsigned)out.size()) +
+         " resParam=" + std::to_string((unsigned)where->res) +
+         " sampParam=" + std::to_string((unsigned)where->samp));
+    return true;
+}
+
 static HRESULT __stdcall Hook_D12CreateRS(ID3D12Device* self, UINT node,
     const void* blob, SIZE_T len, REFIID riid, void** pp)
 {
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**))g_d12vtOrig[16];
     Diag("D3D12 CreateRootSignature bytes=" + std::to_string((unsigned)len));
-    HRESULT hr = orig(self, node, blob, len, riid, pp);
-    Diag("  CreateRootSignature -> hr=" + Hex((uint32_t)hr));
+    if (GhRsDumpOn() && blob && len){
+        static volatile LONG rsSeq = 0;
+        const LONG i = InterlockedIncrement(&rsSeq);
+        std::string ln = "RSDUMP #" + std::to_string(i) +
+                         " bytes=" + std::to_string((unsigned)len) +
+                         " magic=" + GhFourCC(blob, len);
+        wchar_t name[64];
+        std::swprintf(name, 64, L"gh_rs_%ld.bin", (long)i);
+        std::wstring path = std::wstring(kLocalState) + name;
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE){
+            DWORD wrote = 0;
+            BOOL ok = WriteFile(h, blob, (DWORD)len, &wrote, nullptr);
+            CloseHandle(h);
+            ln += ok ? " dumped=" + std::to_string((unsigned)wrote)
+                     : " dumpfailed=" + Hex(GetLastError());
+        } else {
+            ln += " dumpopenfailed=" + Hex(GetLastError());
+        }
+        Diag(ln);
+    }
+    // #173: rewrite before the driver sees it, and fall back to the guest's own
+    // signature if anything about the rewrite fails -- a game that runs with 6.6
+    // shaders screened out is strictly better than one that cannot create a root
+    // signature at all.
+    std::vector<uint8_t> rw;
+    GhBindlessRoot where{};
+    bool rewrote = false;
+    if (GhRsBindless() && blob && len){
+        static volatile LONG nrs = 0, nfail = 0;
+        rewrote = GhAppendBindlessRanges(blob, len, rw, &where);
+        const LONG k = rewrote ? InterlockedIncrement(&nrs) : InterlockedIncrement(&nfail);
+        if (!rewrote && k <= 4)
+            Diag("  RSBINDLESS fell back to the guest's own signature");
+    }
+    HRESULT hr = orig(self, node, rewrote ? rw.data() : blob,
+                      rewrote ? rw.size() : len, riid, pp);
+    if (rewrote && FAILED(hr)){
+        // The rewrite is the only new thing here, so an outright refusal means it
+        // is wrong. Retry unmodified rather than fail the guest's call.
+        Diag("  RSBINDLESS rewritten signature REFUSED hr=" + Hex((uint32_t)hr) +
+             " -- retrying with the guest's own");
+        hr = orig(self, node, blob, len, riid, pp);
+        rewrote = false;
+    }
+    if (rewrote && SUCCEEDED(hr) && pp && *pp){
+        std::lock_guard<std::mutex> lk(g_ghRsMu);
+        g_ghRsBindless[*pp] = where;
+    }
+    Diag("  CreateRootSignature -> hr=" + Hex((uint32_t)hr) +
+         (rewrote ? " (bindless ranges appended)" : ""));
     return hr;
 }
 
@@ -5201,13 +9381,26 @@ static bool GhDescTrackOn()
     static const bool on = GhCfgNum(L"gh_bind_dump.txt", "GH_BIND_DUMP", 0) != 0;
     return on;
 }
-struct GhDescNote { volatile LONG64 cpu; ID3D12Resource* res; UINT32 kind; UINT32 fmt; };
+// `va` is only ever set for CBVs, which name a raw GPU address instead of a
+// resource: without it a constant buffer view built on a stale address is the one
+// binding in the run that leaves no trace at all.
+// #158 gh_desc_seq: `seq` is the global order in which this slot was last written.
+// The BIND dump reads descriptors at RECORD time and the GPU reads them at EXECUTE
+// time; if the game rewrites a slot in between, nothing else in the loader would see
+// it. A monotonic write number on the slot plus a ring of the recent writes turns
+// that into a diff anyone can do from the log.
+struct GhDescNote { volatile LONG64 cpu; ID3D12Resource* res; UINT32 kind; UINT32 fmt; UINT64 va; UINT32 seq; };
 static GhDescNote g_desc[16384]{};
+struct GhDescWrite { UINT32 seq; UINT32 kind; UINT64 cpu; void* res; };
+static GhDescWrite g_dwr[1024]{};
+static volatile LONG g_descSeq = 0;
+static volatile LONG g_descDrop = 0;   // notes lost to a full 32-probe run
 static inline size_t GhDescSlot(UINT64 h)
 {
     return (size_t)(((h >> 5) * 0x9E3779B97F4A7C15ull) >> 50) & 16383;
 }
-static void GhDescPut(UINT64 cpu, ID3D12Resource* res, unsigned kind, unsigned fmt)
+static void GhDescPut(UINT64 cpu, ID3D12Resource* res, unsigned kind, unsigned fmt,
+                      UINT64 va = 0)
 {
     if (!cpu) return;
     size_t i = GhDescSlot(cpu);
@@ -5216,9 +9409,16 @@ static void GhDescPut(UINT64 cpu, ID3D12Resource* res, unsigned kind, unsigned f
         if ((UINT64)cur == cpu || (cur == 0 &&
              InterlockedCompareExchange64(&g_desc[i].cpu, (LONG64)cpu, 0) == 0)){
             g_desc[i].res = res; g_desc[i].kind = kind; g_desc[i].fmt = fmt;
+            g_desc[i].va = va;
+            const LONG sq = InterlockedIncrement(&g_descSeq);
+            g_desc[i].seq = (UINT32)sq;
+            GhDescWrite* w = &g_dwr[(size_t)(sq - 1) & 1023];
+            w->seq = (UINT32)sq; w->kind = (UINT32)kind;
+            w->cpu = cpu; w->res = res;
             return;
         }
     }
+    InterlockedIncrement(&g_descDrop);
 }
 static const GhDescNote* GhDescGet(UINT64 cpu)
 {
@@ -5231,7 +9431,42 @@ static const GhDescNote* GhDescGet(UINT64 cpu)
     }
     return nullptr;
 }
-struct GhDHNote { UINT64 cpu0, gpu0; UINT32 inc, num, type; };
+// #158 gh_desc_seq. Dumped from GhBreadcrumbDump, i.e. after the GPU has stopped.
+// Every BIND line carries `dseq=` (the write counter as that op was recorded) and each
+// described table entry carries `@<cpu handle>#<seq>`. So any DESCW below whose seq is
+// greater than the fatal op's dseq, and whose cpu falls on one of that op's handles,
+// is the game rewriting a descriptor the GPU had not read yet. Identity closes the
+// last "the bindings were valid" loophole from the execute side.
+// #158 Step 3. The window was hardcoded to the last 64 writes against a 1024-entry
+// ring, and that is exactly why the first record-vs-execute diff came back
+// inconclusive rather than clean: in VA_b the fatal op was recorded at dseq=11927 and
+// the run ended at 12089, so 162 writes landed after it, of which only the last 64
+// (12026..12089) were printed. The 98 writes in 11928..12025 -- the window a rewrite
+// would actually sit in -- were never in the log at all. A negative drawn from a
+// window that does not cover the question is not a negative.
+// The ring already holds 1024, so the whole post-record window fits; only the print
+// limit was in the way. ringcap= and dropped= go in the line so partial coverage is
+// visible from the log instead of having to be reconstructed.
+static unsigned GhDescWin()
+{ static const unsigned n = GhCfgNum(L"gh_desc_win.txt", "GH_DESC_WIN", 64); return n; }
+static void GhDescSeqStats(const char* where)
+{
+    if (!GhDescTrackOn()) return;
+    const LONG tot = InterlockedCompareExchange(&g_descSeq, 0, 0);
+    unsigned win = GhDescWin(); if (win > 1024) win = 1024;
+    Diag(std::string("DESCSEQ at ") + where + " total=" + std::to_string((long)tot) +
+         " window=" + std::to_string((unsigned long)win) + " ringcap=1024 dropped=" +
+         std::to_string((long)InterlockedCompareExchange(&g_descDrop, 0, 0)));
+    LONG lo = tot - (LONG)win; if (lo < 0) lo = 0;
+    for (LONG q = lo; q < tot; ++q){
+        const GhDescWrite* w = &g_dwr[(size_t)q & 1023];
+        if (w->seq != (UINT32)(q + 1)) continue;   // overwritten by a later wrap
+        Diag("DESCW seq=" + std::to_string((unsigned long)w->seq) +
+             " kind=" + std::to_string((unsigned long)w->kind) +
+             " cpu=" + Hex(w->cpu) + " res=" + Hex((uint64_t)(uintptr_t)w->res));
+    }
+}
+struct GhDHNote { UINT64 cpu0, gpu0; UINT32 inc, num, type; void* obj; };
 static GhDHNote g_dh[128]{};
 static volatile LONG g_dhN = 0;
 static void GhDHAdd(ID3D12Device* dev, ID3D12DescriptorHeap* h,
@@ -5246,6 +9481,24 @@ static void GhDHAdd(ID3D12Device* dev, ID3D12DescriptorHeap* h,
     g_dh[i].inc  = dev->GetDescriptorHandleIncrementSize(d->Type);
     g_dh[i].num  = d->NumDescriptors;
     g_dh[i].type = (UINT32)d->Type;
+    g_dh[i].obj  = (void*)h;
+}
+// D3D12 requires that a table handle live in a heap that is currently BOUND on
+// the list. A handle inside some other, unbound heap is undefined behaviour and
+// on this console the GPU dereferences it anyway.
+static bool GhHandleInBoundHeap(void* const heaps[2], UINT64 gpu)
+{
+    if (!heaps[0] && !heaps[1]) return true;      // nothing bound yet; not our call
+    LONG n = g_dhN; if (n > 128) n = 128;
+    for (int k = 0; k < 2; ++k){
+        if (!heaps[k]) continue;
+        for (LONG i = 0; i < n; ++i){
+            const GhDHNote& d = g_dh[i];
+            if (d.obj != heaps[k] || !d.gpu0 || !d.inc) continue;
+            if (gpu >= d.gpu0 && gpu < d.gpu0 + (UINT64)d.inc * d.num) return true;
+        }
+    }
+    return false;
 }
 // A shader-visible table handle is a GPU address; walk the registered heaps for the
 // one whose GPU range contains it and convert to the matching CPU handle.
@@ -5263,10 +9516,121 @@ static UINT64 GhGpuHandleToCpu(UINT64 gpu, UINT* incOut = nullptr)
     }
     return 0;
 }
+// ---- #158: GPU address validation -------------------------------------------
+// The hang is owned by no single op, pipeline, list or submission, it needs real
+// GPU work, and it stops the GPU dead with no slow-down first (there is exactly
+// one SUBMITSLOW line in any hanging run, and it is printed after the device is
+// already gone). That shape is a GPU page fault, and it is the one thing none of
+// our bookkeeping could see: until now the loader logged no GPU virtual address
+// anywhere. Register what the GPU is allowed to dereference, then check every
+// address the guest hands it at the moment it hands it over, while the caller is
+// still on the stack.
+static bool GhVaCheckOn()
+{
+    static const bool on = GhCfgNum(L"gh_va_check.txt", "GH_VA_CHECK", 0) != 0;
+    return on;
+}
+struct GhBufVa { UINT64 lo, hi; ID3D12Resource* res; };
+static GhBufVa g_bufVa[16384]{};
+static volatile LONG g_bufVaN = 0;
+static SRWLOCK g_bufVaLk = SRWLOCK_INIT;
+
+// Only buffers have a GPU virtual address; textures return 0 and are reached
+// through descriptors instead, which is what the g_dh/g_desc tables already cover.
+static void GhVaRegister(ID3D12Resource* r, const D3D12_RESOURCE_DESC* rd)
+{
+    if (!GhVaCheckOn() || !r || !rd) return;
+    if (rd->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return;
+    UINT64 va = (UINT64)r->GetGPUVirtualAddress();
+    if (!va) return;
+    AcquireSRWLockExclusive(&g_bufVaLk);
+    LONG i = g_bufVaN;
+    if (i >= 0 && i < 16384){
+        g_bufVa[i].lo = va; g_bufVa[i].hi = va + (UINT64)rd->Width; g_bufVa[i].res = r;
+        g_bufVaN = i + 1;
+    }
+    ReleaseSRWLockExclusive(&g_bufVaLk);
+}
+// A zero VABAD count only means something if the checks actually ran; these are
+// the positive control that says how many addresses were tested against how many
+// registered buffers.
+static volatile LONG g_vaChkRoot = 0, g_vaChkTbl = 0, g_vaChkCbv = 0;
+// #158. The validator covered the GRAPHICS setters only. Counted separately so a
+// clean run says which pipeline was actually exercised rather than implying both.
+static volatile LONG g_vaChkCmpTbl = 0, g_vaChkCmpRoot = 0;
+static void GhVaStats(const char* when)
+{
+    AcquireSRWLockShared(&g_bufVaLk);
+    LONG nb = g_bufVaN;
+    ReleaseSRWLockShared(&g_bufVaLk);
+    Diag(std::string("VASTATS ") + when +
+         " buffers=" + std::to_string((long)nb) +
+         " descheaps=" + std::to_string((long)g_dhN) +
+         " checked_root=" + std::to_string((long)g_vaChkRoot) +
+         " checked_table=" + std::to_string((long)g_vaChkTbl) +
+         " checked_cbv=" + std::to_string((long)g_vaChkCbv) +
+         " checked_cmptbl=" + std::to_string((long)g_vaChkCmpTbl) +
+         " checked_cmproot=" + std::to_string((long)g_vaChkCmpRoot));
+}
+// #158. Three VACHK cells in a row died before the stall dump ran, so VASTATS -- the
+// only proof the checks executed -- never printed, and three clean VABAD-free runs had
+// to be thrown away as void. The counts have to reach the log while the guest is still
+// rendering. This prints the same line inline, on the first check and every 4096th.
+static void GhVaTick()
+{
+    static volatile LONG t = 0;
+    const LONG k = InterlockedIncrement(&t);
+    if (k == 1 || (k % 4096) == 0) GhVaStats("inline");
+}
+// The scan is per root descriptor per draw over every buffer ever created, and that
+// cost is why the VACHK runs reach the wall late enough to be killed before they can
+// dump. Root descriptors repeat across draws almost perfectly, so remembering the last
+// range that answered turns the common case into two compares.
+static volatile LONG g_bufVaHint = 0;
+static bool GhVaInBuffer(UINT64 va)
+{
+    bool hit = false;
+    AcquireSRWLockShared(&g_bufVaLk);
+    LONG n = g_bufVaN; if (n > 16384) n = 16384;
+    const LONG h = g_bufVaHint;
+    if (h >= 0 && h < n && va >= g_bufVa[h].lo && va < g_bufVa[h].hi){
+        hit = true;
+    } else {
+        for (LONG i = 0; i < n; ++i)
+            if (va >= g_bufVa[i].lo && va < g_bufVa[i].hi){ hit = true; g_bufVaHint = i; break; }
+    }
+    ReleaseSRWLockShared(&g_bufVaLk);
+    return hit;
+}
+// The nearest registered range is what turns "this address is wrong" into "this
+// address is 0x40 past the end of the buffer the previous draw used".
+static void GhVaBad(const char* site, UINT64 v, UINT idx, const void* cl, UINT64 extra)
+{
+    static LONG n = 0;
+    LONG k = InterlockedIncrement(&n);
+    if (k > 64) return;                     // the first one is the answer
+    UINT64 bestLo = 0, bestHi = 0, bestD = ~0ull;
+    AcquireSRWLockShared(&g_bufVaLk);
+    LONG m = g_bufVaN; if (m > 16384) m = 16384;
+    for (LONG i = 0; i < m; ++i){
+        UINT64 d = (v < g_bufVa[i].lo) ? (g_bufVa[i].lo - v)
+                 : (v >= g_bufVa[i].hi)  ? (v - g_bufVa[i].hi + 1) : 0;
+        if (d < bestD){ bestD = d; bestLo = g_bufVa[i].lo; bestHi = g_bufVa[i].hi; }
+    }
+    ReleaseSRWLockShared(&g_bufVaLk);
+    Diag(std::string("VABAD ") + site + " va=" + Hex(v) +
+         " root=" + std::to_string((unsigned)idx) +
+         " cl=" + Hex((uint64_t)(uintptr_t)cl) +
+         " size=" + Hex(extra) +
+         " nearest=[" + Hex(bestLo) + "," + Hex(bestHi) + ")" +
+         " delta=" + Hex(bestD) +
+         " nbuf=" + std::to_string((long)m) + " n=" + std::to_string((long)k));
+}
 static const char* GhDescKindName(unsigned k)
 {
     switch (k){ case 1: return "CBV"; case 2: return "SRV"; case 3: return "UAV";
-                case 4: return "RTV"; case 5: return "DSV"; default: return "?"; }
+                case 4: return "RTV"; case 5: return "DSV"; case 6: return "SMP";
+                default: return "?"; }
 }
 // Describe whatever a descriptor handle names. Diagnostic-only, called from the
 // bind dump; GetDesc on a resource the guest has already released would be a read
@@ -5286,13 +9650,33 @@ static std::string GhDescribeHandle(UINT64 cpu)
                " fmt=" + std::to_string((int)rd.Format) +
                " flags=" + Hex((uint32_t)rd.Flags);
     }
+    // #158: a SMP note has no resource and no address -- `fmt` is the D3D12_FILTER and
+    // `va` is the packed address/comparison/anisotropy state.  Running it through the
+    // buffer check would stamp "NOT IN ANY BUFFER" on every sampler in the log.
+    if (n->kind == 6){
+        out += " filter=" + std::to_string((unsigned)n->fmt) +
+               " addr=" + std::to_string((unsigned)(n->va & 0xF)) + "," +
+                          std::to_string((unsigned)((n->va >> 4) & 0xF)) + "," +
+                          std::to_string((unsigned)((n->va >> 8) & 0xF)) +
+               " cmp=" + std::to_string((unsigned)((n->va >> 12) & 0xF)) +
+               " aniso=" + std::to_string((unsigned)((n->va >> 16) & 0xFF));
+        return out;
+    }
     if (n->fmt) out += " viewfmt=" + std::to_string((int)n->fmt);
+    if (n->va) out += " va=" + Hex(n->va) + (GhVaInBuffer(n->va) ? "" : " <<< NOT IN ANY BUFFER");
     return out;
 }
 static void __stdcall Hook_D12CreateCBV(ID3D12Device* self,
     const D3D12_CONSTANT_BUFFER_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE dest)
 {
-    if (GhDescTrackOn()) GhDescPut((UINT64)dest.ptr, nullptr, 1, 0);
+    // A CBV carries a raw address, not a resource. Recording nullptr here is what
+    // made every constant buffer in the run invisible; keep the address.
+    const UINT64 va = d ? (UINT64)d->BufferLocation : 0;
+    if (GhDescTrackOn() || GhVaCheckOn()) GhDescPut((UINT64)dest.ptr, nullptr, 1, 0, va);
+    if (GhVaCheckOn() && va){
+        InterlockedIncrement(&g_vaChkCbv); GhVaTick();
+        if (!GhVaInBuffer(va)) GhVaBad("CBV", va, 0, self, d ? (UINT64)d->SizeInBytes : 0);
+    }
     ((void (__stdcall*)(ID3D12Device*, const D3D12_CONSTANT_BUFFER_VIEW_DESC*,
         D3D12_CPU_DESCRIPTOR_HANDLE))g_d12vtOrig[17])(self, d, dest);
 }
@@ -5321,6 +9705,36 @@ static void __stdcall Hook_D12CreateDSV(ID3D12Device* self, ID3D12Resource* res,
         const D3D12_DEPTH_STENCIL_VIEW_DESC*,
         D3D12_CPU_DESCRIPTOR_HANDLE))g_d12vtOrig[21])(self, res, d, dest);
 }
+// #158.  CreateSampler (device vtable slot 22) was the ONE descriptor-write entry point
+// never hooked -- 17/18/19/20/21/23/24 all are -- and the cost of that gap is visible on
+// every draw of every run that ever dumped bindings: root table 3 reads
+//
+//     t3=0x19960010 map3(0R/0n/128.)=................................................
+//
+// 128 slots, not one of them with a write record, in a heap that IS bound (they print as
+// '.' and not 'X').  That has exactly two readings and they are very far apart: either the
+// game wrote those samplers through the one path we could not see, or it binds a
+// 128-descriptor sampler table whose descriptors were never initialised -- which on this
+// driver the GPU dereferences anyway, and which would be charged per draw, be independent
+// of resolution, and be inherited by the injected degenerate draw exactly as the dose curve
+// requires.  Closing the gap decides between them, and costs one build.
+static volatile LONG64 g_smpN = 0;
+static void __stdcall Hook_D12CreateSampler(ID3D12Device* self,
+    const D3D12_SAMPLER_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE dest)
+{
+    if (GhDescTrackOn() || GhVaCheckOn()){
+        UINT64 packed = 0;
+        if (d) packed = (UINT64)(unsigned)d->AddressU
+                      | ((UINT64)(unsigned)d->AddressV << 4)
+                      | ((UINT64)(unsigned)d->AddressW << 8)
+                      | ((UINT64)(unsigned)d->ComparisonFunc << 12)
+                      | ((UINT64)(unsigned)(d->MaxAnisotropy & 0xFF) << 16);
+        GhDescPut((UINT64)dest.ptr, nullptr, 6, d ? (unsigned)d->Filter : 0u, packed);
+        InterlockedIncrement64(&g_smpN);
+    }
+    ((void (__stdcall*)(ID3D12Device*, const D3D12_SAMPLER_DESC*,
+        D3D12_CPU_DESCRIPTOR_HANDLE))g_d12vtOrig[22])(self, d, dest);
+}
 // The engine stages descriptors in a non-shader-visible heap and copies them into
 // the per-frame table, so without these two the shadow would only ever see the
 // staging slots and every table would resolve to nothing.
@@ -5332,7 +9746,7 @@ static void __stdcall Hook_D12CopyDescSimple(ID3D12Device* self, UINT num,
         UINT inc = self->GetDescriptorHandleIncrementSize(type);
         for (UINT k = 0; k < num && k < 4096; ++k){
             const GhDescNote* n = GhDescGet((UINT64)src.ptr + (UINT64)k * inc);
-            if (n) GhDescPut((UINT64)dst.ptr + (UINT64)k * inc, n->res, n->kind, n->fmt);
+            if (n) GhDescPut((UINT64)dst.ptr + (UINT64)k * inc, n->res, n->kind, n->fmt, n->va);
         }
     }
     ((void (__stdcall*)(ID3D12Device*, UINT, D3D12_CPU_DESCRIPTOR_HANDLE,
@@ -5353,7 +9767,7 @@ static void __stdcall Hook_D12CopyDesc(ID3D12Device* self,
             if (dk >= dn){ ++di; dk = 0; continue; }
             if (sk >= sn){ ++si; sk = 0; continue; }
             const GhDescNote* n = GhDescGet((UINT64)src[si].ptr + (UINT64)sk * inc);
-            if (n) GhDescPut((UINT64)dst[di].ptr + (UINT64)dk * inc, n->res, n->kind, n->fmt);
+            if (n) GhDescPut((UINT64)dst[di].ptr + (UINT64)dk * inc, n->res, n->kind, n->fmt, n->va);
             ++dk; ++sk;
         }
     }
@@ -5374,6 +9788,7 @@ static void __stdcall Hook_D12CreateRTV(ID3D12Device* self, ID3D12Resource* res,
              (res == g_gfx.guestRT12.get() ? "guestRT12" : "other") +
              " fmt=" + (d ? std::to_string((int)d->Format) : "null"));
     if (GhDescTrackOn()) GhDescPut((UINT64)dest.ptr, res, 4, d ? (unsigned)d->Format : 0u);
+    GhRtAuditRtv(res);
     orig(self, res, d, dest);
 }
 static void GhLogMemoryBudget(const char* where);   // fwd (defined below)
@@ -5400,6 +9815,42 @@ static void GhD12Failed(ID3D12Device* dev, const char* what, HRESULT hr)
 struct GhCLNote {
     ID3D12CommandList* cl;
     volatile LONG draws, idraws, disp, barriers, psosets;
+    // #158. Every counter above is bumped by the hook BEFORE the op-mask /
+    // gh_op_stop / gh_skip_pso drop check, so it counts calls the guest made, not
+    // work that reached the driver. That is fine for census work and actively
+    // misleading for elimination: "empty lists still hang" rests entirely on the
+    // mask doing what it says, and nothing in the log has ever confirmed it.
+    // These are bumped AFTER the forwarding call instead, so GhCLSummary can
+    // print recorded/issued and the difference is visible.
+    volatile LONG iDraws, iIdraws, iDisp, iBarr, iPsosets;
+    // #158. The frame's barrier program is the same 74 transitions in the same
+    // order every frame, so the only dimension left to bisect is a transition's
+    // position WITHIN that program. Every other knob filters on the global
+    // sequence number, which averages this away. 0-based, reset with the list.
+    volatile LONG progIdx;
+    // #158 gh_barr_coalesce: barriers only have to have completed before the next
+    // command that touches the resources, so consecutive ResourceBarrier calls can
+    // be held and issued as ONE call at the next work-issuing op or at Close. That
+    // is semantically equivalent -- barriers inside a single call are unordered
+    // with respect to each other, which is exactly what a run of back-to-back
+    // calls already is -- and it collapses ~41 calls per frame into a handful.
+    D3D12_RESOURCE_BARRIER pend[32];
+    volatile LONG npend;
+    // #158 gh_barr_reloc. The one axis never tested: the game's barriers hang on the
+    // game's command lists, while 10,000 of ours on loader-owned lists cost nothing.
+    // Everything else -- content, resources, subresource counts, state pairs, queue --
+    // has been matched. So capture this list's barriers here instead of forwarding
+    // them, and re-record them into a loader-owned list at submission time. pend[32]
+    // is far too small to reuse: the start-up batch alone carries 980. Batch
+    // boundaries are kept separately because the breadcrumb counts BATCHES, and one
+    // call of seven is not the same command stream as seven calls of one.
+    D3D12_RESOURCE_BARRIER* relBuf;   LONG relCap, relN;
+    UINT32*                 relBatch; LONG relBatchCap, relBatchN;
+    // #158 gh_cl_rec. The full recorded command stream of this list, in call order,
+    // plus the arena its array arguments were deep-copied into. See gh_clrec.h.
+    struct GhRecOp*         rops;     LONG ropCap, ropN;
+    BYTE*                   rar;      LONG rarCap, rarN;
+    LONG                    recIsOurs;   // 1 = a loader replay list, never record it
     volatile LONG work;      // shader-running ops since Reset, 1-based; see GhWorkIndex
     void*   lastPso;
     LONG    type;
@@ -5426,19 +9877,48 @@ struct GhCLNote {
     float   vp[4][6];        // x, y, w, h, zn, zf
     LONG    sc[4][4];        // l, t, r, b
     UINT32  nvp, nsc;
+    // #173. The last root signature bound for each pipeline type, so the two
+    // appended bindless tables can be pointed at the descriptor heap base every
+    // time either the signature or the heaps change.
+    void*   rsGfx;
+    void*   rsComp;
 };
 static GhCLNote g_clNotes[512]{};
 static SRWLOCK  g_clLock = SRWLOCK_INIT;
+// #158 audit. Every op count in the corpus is only as complete as this table.
+// GhCLAdd gives up silently after 16 probes, and GhCLFind gives up silently after
+// 16 too: an untracked list records no ops and no draws, so a coverage gap would
+// bias the very budget the whole law is fitted to, with nothing in the log to say
+// so. These three counters are that missing line. clfull/clprobe MUST read 0.
+static volatile LONG g_clAdded = 0;   // lists successfully tracked
+static volatile LONG g_clFull  = 0;   // GhCLAdd gave up: 16 probes, no free slot
+static volatile LONG g_clProbe = 0;   // GhCLFind gave up: 16 non-empty, no match
 static inline size_t GhCLSlot(const void* p){ return ((uintptr_t)p >> 5) & 511; }
 static GhCLNote* GhCLFind(ID3D12CommandList* cl)
 {
     size_t i = GhCLSlot(cl);
     for (int probe = 0; probe < 16; ++probe, i = (i + 1) & 511){
-        ID3D12CommandList* c = g_clNotes[i].cl;
+        // Paired with the InterlockedExchangePointer publish in GhCLAdd: .cl is
+        // written last and atomically, so a reader either sees the slot empty or a
+        // fully-initialised note. Every other shared table in this file locks both
+        // sides; this one is read on nearly every hooked D3D12 method from ~53 guest
+        // threads, which is why it does not -- and why the read is a volatile load
+        // rather than an Interlocked one. On x86-64 a plain load is already acquire;
+        // volatile only stops the compiler hoisting or caching it across the loop.
+        ID3D12CommandList* c = (ID3D12CommandList*)*(void* volatile*)&g_clNotes[i].cl;
         if (c == cl) return &g_clNotes[i];
         if (!c) return nullptr;
     }
+    InterlockedIncrement(&g_clProbe);
     return nullptr;
+}
+static void GhCLTableStats(const char* where)
+{
+    Diag(std::string("CLTABLE at ") + where +
+         " tracked=" + std::to_string((long)InterlockedCompareExchange(&g_clAdded, 0, 0)) +
+         " clfull="  + std::to_string((long)InterlockedCompareExchange(&g_clFull,  0, 0)) +
+         " clprobe=" + std::to_string((long)InterlockedCompareExchange(&g_clProbe, 0, 0)) +
+         " cap=512 probes=16");
 }
 static void GhCLAdd(ID3D12CommandList* cl, D3D12_COMMAND_LIST_TYPE t)
 {
@@ -5446,7 +9926,32 @@ static void GhCLAdd(ID3D12CommandList* cl, D3D12_COMMAND_LIST_TYPE t)
     size_t i = GhCLSlot(cl);
     for (int probe = 0; probe < 16; ++probe, i = (i + 1) & 511){
         if (g_clNotes[i].cl == cl) break;
-        if (!g_clNotes[i].cl){ g_clNotes[i] = GhCLNote{}; g_clNotes[i].type = (LONG)t; g_clNotes[i].cl = cl; break; }
+        if (!g_clNotes[i].cl){
+            g_clNotes[i] = GhCLNote{}; g_clNotes[i].type = (LONG)t;
+            // .cl publishes the note. Written last, and atomically, so the unlocked
+            // reader above cannot see a half-built slot.
+            InterlockedExchangePointer((void* volatile*)&g_clNotes[i].cl, cl);
+            InterlockedIncrement(&g_clAdded);
+            // #158. Only the first DIRECT list's vtable is ever hooked, so every
+            // op-mask result is only true for lists that share it. Print each list's
+            // vtable once per (type, vtable) pair: if compute and copy lists carry a
+            // DIFFERENT vtable, they have been running unfiltered this whole time.
+            {
+                void* vt = *(void**)cl;
+                static void* seen[16]{}; static LONG seenT[16]{}; static LONG nseen = 0;
+                bool have = false;
+                for (LONG q = 0; q < nseen; ++q)
+                    if (seen[q] == vt && seenT[q] == (LONG)t){ have = true; break; }
+                if (!have && nseen < 16){
+                    seen[nseen] = vt; seenT[nseen] = (LONG)t; ++nseen;
+                    Diag("CLVTABLE type=" + std::to_string((long)t) +
+                         " vt=" + Hex((uint64_t)(uintptr_t)vt) +
+                         " distinct=" + std::to_string((long)nseen));
+                }
+            }
+            break;
+        }
+        if (probe == 15) InterlockedIncrement(&g_clFull);   // never placed: untracked list
     }
     ReleaseSRWLockExclusive(&g_clLock);
 }
@@ -5455,17 +9960,42 @@ static std::string GhCLSummary(ID3D12CommandList* cl)
     GhCLNote* n = GhCLFind(cl);
     std::string s = Hex((uint64_t)(uintptr_t)cl);
     if (!n) return s + "(unknown)";
+    // draws=REC/IREC issued=DRAW+IDRAW -- recorded on the left, what actually
+    // reached the driver on the right. See the iDraws comment on GhCLNote.
     s += " type=" + std::to_string((long)n->type) +
          " draws=" + std::to_string((long)n->draws) +
          "/" + std::to_string((long)n->idraws) +
          " disp=" + std::to_string((long)n->disp) +
          " barriers=" + std::to_string((long)n->barriers) +
-         " psosets=" + std::to_string((long)n->psosets);
+         " psosets=" + std::to_string((long)n->psosets) +
+         " issued=" + std::to_string((long)n->iDraws) +
+         "/" + std::to_string((long)n->iIdraws) +
+         "/" + std::to_string((long)n->iDisp) +
+         "/" + std::to_string((long)n->iBarr) +
+         "/" + std::to_string((long)n->iPsosets);
     if (n->lastPso) s += " lastpso=" + Hex((uint64_t)(uintptr_t)n->lastPso);
     return s;
 }
 
-static void* g_clVtOrig[64]{};
+// #158. A command list's vtable is per TYPE, not per device: DIRECT lists carry
+// one and COPY lists another. Hooking only the first one seen left every copy
+// list uninstrumented -- no op mask, no barrier filter, no census -- so "the
+// guest's lists contain nothing but barriers" was only ever true of the DIRECT
+// ones. Keep one originals table per vtable class and dispatch on the list's own.
+struct GhClVtSet { void** vt; void* orig[64]; };
+static GhClVtSet g_clVts[4]{};
+static LONG g_clVtsN = 0;
+static void* GhClOrig(void* self, int slot)
+{
+    void** vt = *(void***)self;
+    for (LONG i = 0; i < g_clVtsN; ++i)
+        if (g_clVts[i].vt == vt) return g_clVts[i].orig[slot];
+    return g_clVts[0].orig[slot];
+}
+
+// #158. The command-list recorder needs GhCLNote, GhCLFind and GhClOrig, and every
+// capture site below needs the recorder -- so it lands exactly here.
+#include "gh_clrec.h"
 static volatile LONG g_clHooked = 0;
 
 // Submission #35 is the first frame with real work in it and the one the GPU
@@ -5475,7 +10005,20 @@ static volatile LONG g_clHooked = 0;
 // PIX markers are traced too: the game labels its own passes, and a label is a
 // far better name for the hang than a pipeline pointer.
 static volatile LONG g_eclCount = 0;   // ExecuteCommandLists calls, and the trace budget
-static bool GhCLTraceOn(){ return InterlockedCompareExchange(&g_eclCount, 0, 0) <= 64; }
+// #158. This was hardcoded to "the first 64 submissions", which is exactly the
+// wrong window: the submission that fails to retire is #89-#113 in every run, so
+// the one instrument that records every single op has never once covered the
+// failure. gh_cl_trace_lo/_hi move the window; with both unset the old behaviour
+// is kept byte-for-byte so an untouched run stays comparable.
+static bool GhCLTraceOn()
+{
+    static const unsigned lo = GhCfgNum(L"gh_cl_trace_lo.txt", "GH_CL_TRACE_LO", 0);
+    static const unsigned hi = GhCfgNum(L"gh_cl_trace_hi.txt", "GH_CL_TRACE_HI", 0);
+    const LONG e = InterlockedCompareExchange(&g_eclCount, 0, 0);
+    if (!lo && !hi) return e <= 64;
+    return e >= (LONG)lo && (!hi || e <= (LONG)hi);
+}
+static LONG GhEclNow(){ return InterlockedCompareExchange(&g_eclCount, 0, 0); }
 static std::string GhPixName(const void* p, UINT size)
 {
     // PIX packs its header bit-wise and the layout has changed between versions,
@@ -5516,6 +10059,13 @@ static std::string GhPixName(const void* p, UINT size)
 // residency, our own submissions, or the driver. Bit 6 drops resource barriers
 // and bit 7 drops queries and bundles, which between them cover everything left
 // in a list once the work-issuing calls are gone.
+// #158 adds the state-setting calls, which no bit covered before and which are
+// all that is left in the guest's lists once gh_op_mask=55 has taken the work
+// away: bit 14 drops OMSetRenderTargets, bit 15 SetDescriptorHeaps, bit 16
+// SetPipelineState, bit 17 the root signature and every root binding, bit 18
+// viewports and scissors. With 55|507904 set, a guest command list carries
+// nothing but barriers -- so if the device still dies at its usual submission,
+// the barriers really are alone in doing it.
 // The picture is wrong on screen while any of this is set -- that is the point, it
 // is a probe, not a setting -- and whichever bit makes the device survive names
 // the culprit.
@@ -5579,6 +10129,7 @@ static void GhBreadcrumbInit(ID3D12Device* dev)
     }
     g_bcCpu = (volatile UINT32*)p;
     g_bcCpu[0] = 0; g_bcCpu[1] = 0;
+    g_bcCpu[2] = 0; g_bcCpu[3] = 0;   // #158 barrier-batch breadcrumb
     g_bcVa = g_bcRes->GetGPUVirtualAddress();
     Diag("BREADCRUMB armed va=" + Hex((uint64_t)g_bcVa) +
          " cpu=" + Hex((uint64_t)(uintptr_t)p));
@@ -5588,6 +10139,12 @@ static void GhBreadcrumbInit(ID3D12Device* dev)
 static LONG GhBreadcrumbBefore(ID3D12GraphicsCommandList* cl)
 {
     if (!InterlockedCompareExchange(&g_bcOn, 0, 0) || !g_bcVa || !cl) return 0;
+    // #158 gh_cl_rec: this command is about to be captured and replayed elsewhere, so
+    // stamping it here would put the marker in a list the command never reaches.
+    // GhRecReplay re-issues the stamp against the loader-owned list instead.
+    // gh_cl_dup is the opposite case: the command is captured AND still executed from
+    // this list, so the stamp belongs here and the duplicate carries none.
+    if (GhClRec() && GhRecOn(cl)) return 0;
     LONG g = InterlockedIncrement(&g_bcSeq);
     com_ptr<ID3D12GraphicsCommandList2> cl2;
     if (FAILED(cl->QueryInterface(__uuidof(ID3D12GraphicsCommandList2), cl2.put_void())) || !cl2){
@@ -5608,6 +10165,10 @@ static LONG GhBreadcrumbBefore(ID3D12GraphicsCommandList* cl)
     if (g <= 8192) Diag("BCOP g=" + std::to_string((long)g) +
                         " cl=" + Hex((uint64_t)(uintptr_t)cl));
     GhBindDump(cl, g);
+    if (GhDumpPsoAt() && g == (LONG)GhDumpPsoAt()){
+        const GhCLNote* n = GhCLFind(cl);
+        GhPsoDumpAt(n ? n->lastPso : nullptr, g);
+    }
     return g;
 }
 static void GhBreadcrumbAfter(ID3D12GraphicsCommandList* cl, LONG g)
@@ -5621,19 +10182,119 @@ static void GhBreadcrumbAfter(ID3D12GraphicsCommandList* cl, LONG g)
     D3D12_WRITEBUFFERIMMEDIATE_MODE md = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
     cl2->WriteBufferImmediate(1, &pr, &md);
 }
+// #158. The draw breadcrumb is stamped at exactly four sites -- draws, dispatch
+// and indirect. Barriers were never stamped, so in the ONE configuration that
+// isolates them (gh_op_mask=508087, barriers-only lists) the device dies and
+// `started=/finished=` is not printed at all: nothing marked the command stream.
+// That is the whole reason "which barrier does the GPU stop on" has never been
+// answerable. Stamp the barrier BATCH -- once per ResourceBarrier call, not once
+// per barrier -- into slots 2/3 of the same readback buffer, and emit a matching
+// `BC k=` line into the barrier ring so the number resolves to a resource, a
+// subresource and a state pair.
+// gh_bc_barriers.txt=1. Off by default: it adds a WriteBufferImmediate pair per
+// batch, which perturbs the command stream like every other instrument here.
+static unsigned GhBcBarriers()
+{ static const unsigned v = (unsigned)GhCfgNum(L"gh_bc_barriers.txt", "GH_BC_BARRIERS", 0); return v; }
+static volatile LONG g_barrBcSeq = 0;
+
+// Returns the batch number stamped, or 0 when the knob is off.
+static LONG GhBcBarrierBefore(ID3D12GraphicsCommandList* cl, LONG knownType = -1)
+{
+    if (!GhBcBarriers() || !InterlockedCompareExchange(&g_bcOn, 0, 0) || !g_bcVa || !cl) return 0;
+    if (GhClRec() && GhRecOn(cl)) return 0; // #158 gh_cl_rec, see GhBreadcrumbBefore
+    // WriteBufferImmediate's MARKER_IN/MARKER_OUT modes are only guaranteed on
+    // queues that report support for them, and COPY is the one that usually does
+    // not. The fatal lists are all type=0, and copy lists carry no barriers in any
+    // run measured, so restrict the stamp to DIRECT rather than risk inventing a
+    // second failure mode inside the instrument.
+    // The relocated list is loader-owned and therefore not in the CL registry, so it
+    // passes its type in directly rather than being silently skipped.
+    if (knownType < 0){
+        if (GhCLNote* nt = GhCLFind(cl)) knownType = nt->type;
+        else return 0;
+    }
+    if (knownType != D3D12_COMMAND_LIST_TYPE_DIRECT) return 0;
+    com_ptr<ID3D12GraphicsCommandList2> cl2;
+    if (FAILED(cl->QueryInterface(__uuidof(ID3D12GraphicsCommandList2), cl2.put_void())) || !cl2) return 0;
+    LONG k = InterlockedIncrement(&g_barrBcSeq);
+    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER pr{};
+    pr.Dest  = g_bcVa + 8;                  // slot 2 = barrier batch started
+    pr.Value = (UINT32)k;
+    D3D12_WRITEBUFFERIMMEDIATE_MODE md = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN;
+    cl2->WriteBufferImmediate(1, &pr, &md);
+    return k;
+}
+static void GhBcBarrierAfter(ID3D12GraphicsCommandList* cl, LONG k)
+{
+    if (!k || !g_bcVa || !cl) return;
+    com_ptr<ID3D12GraphicsCommandList2> cl2;
+    if (FAILED(cl->QueryInterface(__uuidof(ID3D12GraphicsCommandList2), cl2.put_void())) || !cl2) return;
+    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER pr{};
+    pr.Dest  = g_bcVa + 12;                 // slot 3 = barrier batch finished
+    pr.Value = (UINT32)k;
+    D3D12_WRITEBUFFERIMMEDIATE_MODE md = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+    cl2->WriteBufferImmediate(1, &pr, &md);
+}
+
+static void GhDumpAllThreads(const char* why);   // #158, defined far below
+// #158 gh_cl_reloc. How much of the guest's command stream actually ended up in our
+// memory. A substitution that quietly stopped taking makes a relocated run into a second
+// control that still prints its knob -- which is exactly what the first build did.
+static void GhClRelocStats(const char* where);
+static void GhClRecStats(const char* where);
+static void GhObjLifeStats(const char* where);   // #158 gh_obj_life
+static void GhPsoRebindStats(const char* where);  // #158 gh_pso_rebind
+static void GhTblRebindStats(const char* where);  // #158 gh_tbl_rebind
+static void GhDegenDrawStats(const char* where);   // #158 gh_degen_draw
+static void GhCLTableStats(const char* where);     // #158 audit: CL-note coverage
+static void GhClearCensus(const char* where);       // #158: depth vs colour clears
 static void GhBreadcrumbDump(const char* where)
 {
+    // Ahead of the g_bcCpu gate on purpose: table coverage is a property of the
+    // instrument, not of the breadcrumb probe, and must print in every run.
+    GhCLTableStats(where);
+    GhClearCensus(where);
     if (!g_bcCpu) return;
     Diag(std::string("BREADCRUMB at ") + where +
          " started=" + std::to_string((unsigned long)g_bcCpu[0]) +
          " finished=" + std::to_string((unsigned long)g_bcCpu[1]) +
          " issued=" + std::to_string((long)InterlockedCompareExchange(&g_bcSeq, 0, 0)));
+    // #158: kept on its own line so a run with both draws and barriers stamped is
+    // still readable, and so the two numbering schemes are never confused.
+    if (GhBcBarriers())
+        Diag(std::string("BARRBREADCRUMB at ") + where +
+             " started=" + std::to_string((unsigned long)g_bcCpu[2]) +
+             " finished=" + std::to_string((unsigned long)g_bcCpu[3]) +
+             " issued=" + std::to_string((long)InterlockedCompareExchange(&g_barrBcSeq, 0, 0)));
+    GhClRelocStats(where);
+    GhClRecStats(where);
+    GhObjLifeStats(where);
+    GhPsoRebindStats(where);
+    GhTblRebindStats(where);
+    GhDegenDrawStats(where);
+    GhCoreHeapStats(where);  // #158 gh_va_trace>=3, D3D12Core private-heap growth
+    GhCoreHeapBigDump(where);
+    GhSecStats(where);       // #158 gh_va_trace>=4, section/mapping growth
+    Diag(std::string("SAMPLER ") + where + " created=" +
+         std::to_string((long long)InterlockedCompareExchange64(&g_smpN, 0, 0)) +
+         " descdrop=" + std::to_string((long)InterlockedCompareExchange(&g_descDrop, 0, 0)));
+    GhSecBigDump(where);
+    if (GhVaCheckOn()) GhVaStats(where);   // #158: the only positive control gh_va_check has
+    GhDescSeqStats(where);   // #158 gh_desc_seq, rides on gh_bind_dump
+    GhFmtProbeStats(where);  // #158 gh_fmt_probe
+    // #158. Proof of life for the knobs whose failure mode is doing nothing quietly.
+    // Eight knobs on this record were hardcoded past and produced normal-looking runs
+    // with the probe never firing; "I tried X" is worthless without a count.
+    if (GhNullPs())
+        Diag(std::string("NULLPS at ") + where +
+             " stripped=" + std::to_string((long)InterlockedCompareExchange(&g_nullPsN, 0, 0)));
 }
 
 // #158. Shadow the graphics root bindings and render targets so the draw the
 // breadcrumb names can be described completely: which descriptor heaps were
 // bound, which table handle each root parameter pointed at, which raw GPU
 // addresses the root CBV/SRV/UAVs carried, and what was bound as a render target.
+static void GhBindBindlessTables(ID3D12GraphicsCommandList* self, GhCLNote* nt);
 static void __stdcall Hook_CLSetHeaps(ID3D12GraphicsCommandList* self, UINT n,
                                       ID3D12DescriptorHeap* const* h)
 {
@@ -5641,8 +10302,62 @@ static void __stdcall Hook_CLSetHeaps(ID3D12GraphicsCommandList* self, UINT n,
         nt->heaps[0] = (n > 0 && h) ? (void*)h[0] : nullptr;
         nt->heaps[1] = (n > 1 && h) ? (void*)h[1] : nullptr;
     }
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
-        ID3D12DescriptorHeap* const*))g_clVtOrig[28])(self, n, h);
+    if (GhOpMask() & 32768) return;
+    if (!GhRecCap28(self, n, h))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
+        ID3D12DescriptorHeap* const*))GhClOrig(self, 28))(self, n, h);
+    if (GhRsBindless()){ if (GhCLNote* nt = GhCLFind(self)) GhBindBindlessTables(self, nt); }
+}
+// #173. A lowered shader reads its resources as ResourceDescriptorHeap[i] lowered
+// to unbounded arrays in the frozen 5000+ spaces, all based at the heap start. So
+// the two root parameters GhAppendBindlessRanges added have to be pointed at the
+// heap base -- once per (root signature, heap set) pair, on every list. Without
+// this the arrays are unbound and a substituted shader reads garbage.
+//
+// Bind from both the SetRootSignature and the SetDescriptorHeaps hooks, because
+// the guest may issue them in either order and D3D12 clears the root bindings on
+// a root signature change. Original vtable slots, never our own hooks: routing a
+// loader-issued bind back through Hook_CLSetGfxTable would poison the #158 bind
+// shadow and the op census with calls the guest never made.
+static void GhBindBindlessTables(ID3D12GraphicsCommandList* self, GhCLNote* nt)
+{
+    if (!GhRsBindless() || !self || !nt) return;
+    ID3D12DescriptorHeap* res = nullptr;
+    ID3D12DescriptorHeap* smp = nullptr;
+    for (int i = 0; i < 2; ++i){
+        auto* h = (ID3D12DescriptorHeap*)nt->heaps[i];
+        if (!h) continue;
+        D3D12_DESCRIPTOR_HEAP_DESC d = h->GetDesc();
+        if (d.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) res = h;
+        else if (d.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) smp = h;
+    }
+    if (!res && !smp) return;
+
+    static volatile LONG nb = 0;
+    for (int comp = 0; comp < 2; ++comp){
+        void* rs = comp ? nt->rsComp : nt->rsGfx;
+        if (!rs) continue;
+        GhBindlessRoot w{};
+        {
+            std::lock_guard<std::mutex> lk(g_ghRsMu);
+            auto it = g_ghRsBindless.find(rs);
+            if (it == g_ghRsBindless.end()) continue;
+            w = it->second;
+        }
+        const int slot = comp ? 31 : 32;
+        auto set = (void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
+                                      D3D12_GPU_DESCRIPTOR_HANDLE))GhClOrig(self, slot);
+        if (!set) continue;
+        if (res) set(self, w.res,  res->GetGPUDescriptorHandleForHeapStart());
+        if (smp) set(self, w.samp, smp->GetGPUDescriptorHandleForHeapStart());
+        const LONG k = InterlockedIncrement(&nb);
+        if (k <= 4 || (k % 2000) == 0)
+            Diag("RSBINDLESS bound " + std::string(comp ? "compute" : "graphics") +
+                 " res=" + std::to_string((unsigned)w.res) +
+                 " samp=" + std::to_string((unsigned)w.samp) +
+                 " heaps=" + std::string(res ? "R" : "-") + (smp ? "S" : "-") +
+                 " n=" + std::to_string((long)k));
+    }
 }
 static void __stdcall Hook_CLSetGfxTable(ID3D12GraphicsCommandList* self, UINT idx,
                                          D3D12_GPU_DESCRIPTOR_HANDLE hnd)
@@ -5650,35 +10365,79 @@ static void __stdcall Hook_CLSetGfxTable(ID3D12GraphicsCommandList* self, UINT i
     if (GhCLNote* nt = GhCLFind(self)){
         if (idx < 16){ nt->tbl[idx] = (UINT64)hnd.ptr; nt->tblSet |= (1u << idx); }
     }
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
-        D3D12_GPU_DESCRIPTOR_HANDLE))g_clVtOrig[32])(self, idx, hnd);
+    // GhGpuHandleToCpu already answers "is this handle inside a registered heap";
+    // it returned 0 silently before, which is exactly the failure we are hunting.
+    if (GhVaCheckOn() && hnd.ptr){
+        InterlockedIncrement(&g_vaChkTbl); GhVaTick();
+        if (!GhGpuHandleToCpu((UINT64)hnd.ptr))
+            GhVaBad("TABLE", (UINT64)hnd.ptr, idx, self, 0);
+        else if (GhCLNote* nb = GhCLFind(self)){
+            if (!GhHandleInBoundHeap(nb->heaps, (UINT64)hnd.ptr))
+                GhVaBad("TABLE-UNBOUND", (UINT64)hnd.ptr, idx, self,
+                        (UINT64)(uintptr_t)nb->heaps[0]);
+        }
+    }
+    if (GhOpMask() & 131072) return;
+    if (!GhRecCap32(self, idx, hnd))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
+        D3D12_GPU_DESCRIPTOR_HANDLE))GhClOrig(self, 32))(self, idx, hnd);
 }
 static void GhNoteRootVa(ID3D12GraphicsCommandList* self, UINT idx, UINT64 va)
 {
     if (GhCLNote* nt = GhCLFind(self)){
         if (idx < 16){ nt->rootva[idx] = va; nt->vaSet |= (1u << idx); }
     }
+    if (GhVaCheckOn() && va){
+        InterlockedIncrement(&g_vaChkRoot); GhVaTick();
+        if (!GhVaInBuffer(va)) GhVaBad("ROOTVA", va, idx, self, 0);
+    }
 }
 static void __stdcall Hook_CLSetGfxCbv(ID3D12GraphicsCommandList* self, UINT idx,
                                        D3D12_GPU_VIRTUAL_ADDRESS va)
 {
     GhNoteRootVa(self, idx, (UINT64)va);
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
-        D3D12_GPU_VIRTUAL_ADDRESS))g_clVtOrig[38])(self, idx, va);
+    if (GhOpMask() & 131072) return;
+    if (!GhRecCap38(self, idx, va))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
+        D3D12_GPU_VIRTUAL_ADDRESS))GhClOrig(self, 38))(self, idx, va);
 }
 static void __stdcall Hook_CLSetGfxSrv(ID3D12GraphicsCommandList* self, UINT idx,
                                        D3D12_GPU_VIRTUAL_ADDRESS va)
 {
     GhNoteRootVa(self, idx, (UINT64)va);
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
-        D3D12_GPU_VIRTUAL_ADDRESS))g_clVtOrig[40])(self, idx, va);
+    if (GhOpMask() & 131072) return;
+    if (!GhRecCapVA(self, 40, idx, va))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
+        D3D12_GPU_VIRTUAL_ADDRESS))GhClOrig(self, 40))(self, idx, va);
 }
 static void __stdcall Hook_CLSetGfxUav(ID3D12GraphicsCommandList* self, UINT idx,
                                        D3D12_GPU_VIRTUAL_ADDRESS va)
 {
     GhNoteRootVa(self, idx, (UINT64)va);
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
-        D3D12_GPU_VIRTUAL_ADDRESS))g_clVtOrig[42])(self, idx, va);
+    if (GhOpMask() & 131072) return;
+    if (!GhRecCapVA(self, 42, idx, va))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
+        D3D12_GPU_VIRTUAL_ADDRESS))GhClOrig(self, 42))(self, idx, va);
+}
+static void __stdcall Hook_CLSetCompRootSig(ID3D12GraphicsCommandList* self,
+                                           ID3D12RootSignature* rs)
+{
+    if (GhOpMask() & 131072) return;
+    if (!GhRecCap29(self, rs))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12RootSignature*))GhClOrig(self, 29))(self, rs);
+    if (GhRsBindless()){
+        if (GhCLNote* nt = GhCLFind(self)){ nt->rsComp = rs; GhBindBindlessTables(self, nt); }
+    }
+}
+static void __stdcall Hook_CLSetGfxRootSig(ID3D12GraphicsCommandList* self,
+                                           ID3D12RootSignature* rs)
+{
+    if (GhOpMask() & 131072) return;
+    if (!GhRecCap30(self, rs))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12RootSignature*))GhClOrig(self, 30))(self, rs);
+    if (GhRsBindless()){
+        if (GhCLNote* nt = GhCLFind(self)){ nt->rsGfx = rs; GhBindBindlessTables(self, nt); }
+    }
 }
 static void __stdcall Hook_CLSetViewports(ID3D12GraphicsCommandList* self, UINT n,
                                           const D3D12_VIEWPORT* v)
@@ -5691,8 +10450,10 @@ static void __stdcall Hook_CLSetViewports(ID3D12GraphicsCommandList* self, UINT 
             nt->vp[i][4] = v[i].MinDepth; nt->vp[i][5] = v[i].MaxDepth;
         }
     }
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
-        const D3D12_VIEWPORT*))g_clVtOrig[21])(self, n, v);
+    if (GhOpMask() & 262144) return;
+    if (!GhRecCap21(self, n, v))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
+        const D3D12_VIEWPORT*))GhClOrig(self, 21))(self, n, v);
 }
 static void __stdcall Hook_CLSetScissors(ID3D12GraphicsCommandList* self, UINT n,
                                          const D3D12_RECT* r)
@@ -5704,8 +10465,10 @@ static void __stdcall Hook_CLSetScissors(ID3D12GraphicsCommandList* self, UINT n
             nt->sc[i][2] = r[i].right; nt->sc[i][3] = r[i].bottom;
         }
     }
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
-        const D3D12_RECT*))g_clVtOrig[22])(self, n, r);
+    if (GhOpMask() & 262144) return;
+    if (!GhRecCap22(self, n, r))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
+        const D3D12_RECT*))GhClOrig(self, 22))(self, n, r);
 }
 static void __stdcall Hook_CLOMSetRT(ID3D12GraphicsCommandList* self, UINT n,
     const D3D12_CPU_DESCRIPTOR_HANDLE* rtv, BOOL single,
@@ -5718,10 +10481,26 @@ static void __stdcall Hook_CLOMSetRT(ID3D12GraphicsCommandList* self, UINT n,
         nt->hasDsv = dsv ? 1u : 0u;
         nt->dsv = dsv ? (UINT64)dsv->ptr : 0;
     }
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
+    if (GhOpMask() & 16384) return;
+    if (!GhRecCap46(self, n, rtv, single, dsv))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
         const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL,
-        const D3D12_CPU_DESCRIPTOR_HANDLE*))g_clVtOrig[46])(self, n, rtv, single, dsv);
+        const D3D12_CPU_DESCRIPTOR_HANDLE*))GhClOrig(self, 46))(self, n, rtv, single, dsv);
 }
+// #158. The game's root signatures declare SRV ranges of 128 descriptors (all eleven are
+// version 1.0, so every descriptor is volatile and must simply be valid when read). This
+// dump has only ever read the FIRST FOUR slots of a table, and worse, it stopped at the
+// first slot with no record -- so an unpopulated slot in the middle of a range was
+// indistinguishable from the end of the table. Both of those hid exactly the thing DRED
+// names as its third page-fault cause: a shader referencing an uninitialized or stale
+// descriptor. gh_bind_deep scans further and prints one character per slot:
+//     'R' a descriptor that names a resource
+//     'n' a descriptor written with a null resource
+//     '.' no record that the slot was ever written
+// It never breaks early, so a hole reads as a hole. Default 0 keeps the old output
+// byte-for-byte.
+static unsigned GhBindDeep()
+{ static const unsigned n = GhCfgNum(L"gh_bind_deep.txt", "GH_BIND_DEEP", 0); return n; }
 static void GhBindDump(ID3D12GraphicsCommandList* self, LONG g)
 {
     static const unsigned on = GhCfgNum(L"gh_bind_dump.txt", "GH_BIND_DUMP", 0);
@@ -5729,6 +10508,7 @@ static void GhBindDump(ID3D12GraphicsCommandList* self, LONG g)
     GhCLNote* n = GhCLFind(self);
     if (!n) return;
     std::string m = "BIND g=" + std::to_string((long)g) +
+                    " dseq=" + std::to_string((long)InterlockedCompareExchange(&g_descSeq, 0, 0)) +
                     " heaps=" + Hex((uint64_t)(uintptr_t)n->heaps[0]) +
                     "," + Hex((uint64_t)(uintptr_t)n->heaps[1]) +
                     " nrt=" + std::to_string((unsigned long)n->nrt);
@@ -5761,7 +10541,31 @@ static void GhBindDump(ID3D12GraphicsCommandList* self, LONG g)
             for (int k = 0; cpu && k < 4; ++k){
                 const GhDescNote* dn = GhDescGet(cpu + (UINT64)k * inc);
                 if (!dn) break;
-                m += " [" + std::to_string(k) + "]" + GhDescribeHandle(cpu + (UINT64)k * inc);
+                m += " [" + std::to_string(k) + "]" + GhDescribeHandle(cpu + (UINT64)k * inc) +
+                     " @" + Hex(cpu + (UINT64)k * inc) + "#" + std::to_string((unsigned long)dn->seq);
+            }
+            const unsigned deep = GhBindDeep();
+            if (deep && cpu){
+                unsigned nres = 0, nnull = 0, nrec = 0;
+                std::string map;
+                const unsigned lim = deep > 1024 ? 1024u : deep;
+                map.reserve(lim);
+                unsigned noob = 0;
+                for (unsigned k = 0; k < lim; ++k){
+                    const GhDescNote* dn = GhDescGet(cpu + (UINT64)k * inc);
+                    if (dn && dn->res)  { map += 'R'; ++nres;  }
+                    else if (dn)        { map += 'n'; ++nnull; }
+                    // No write record. Two very different things: a slot inside the
+                    // heap that was simply never written ('.'), and a slot the range
+                    // reaches PAST the end of the heap ('X'), which is a descriptor
+                    // read with no backing memory at all.
+                    else if (!GhHandleInBoundHeap(n->heaps, n->tbl[i] + (UINT64)k * inc))
+                                        { map += 'X'; ++noob;  }
+                    else                { map += '.'; ++nrec;  }
+                }
+                m += " map" + std::to_string(i) + "(" + std::to_string(nres) + "R/" +
+                     std::to_string(nnull) + "n/" + std::to_string(nrec) + "./" +
+                     std::to_string(noob) + "X)=" + map;
             }
         }
     for (UINT i = 0; i < 16; ++i)
@@ -5774,6 +10578,185 @@ static unsigned GhOpStop()
     static const unsigned n = GhCfgNum(L"gh_op_stop.txt", "GH_OP_STOP", 0);
     return n;
 }
+// ---------------------------------------------------------------- #158 gh_pso_rebind
+// The GPU stops entering the 240x135 level of a depth-downsample chain whose earlier
+// levels it has just cleared off the same source with the same shader. The one thing
+// that level has and the four that worked do not: it is the FIRST draw in the chain to
+// reuse the previous draw's PSO with no intervening SetPipelineState, while its render
+// target, viewport, scissor and descriptor table all change underneath it.
+//
+// Take that property away from every draw and see whether the wall moves. This binds
+// the SAME pipeline state the guest already bound -- it changes no pipeline, only how
+// often the driver is told about it -- so a run that still dies at nine frames closes
+// the lead, and one that does not says the driver is failing to carry some piece of
+// state across a bare draw.
+static unsigned GhPsoRebind()
+{ static const unsigned n = GhCfgNum(L"gh_pso_rebind.txt", "GH_PSO_REBIND", 0); return n; }
+static volatile LONG g_psoRebindN = 0;
+
+// Call the ORIGINAL slot 25, never Hook_CLSetPso: routing through the hook would inflate
+// n->psosets and put a SETPSO line in the CLOP trace for a call the guest never made,
+// and the trace is what every other reading in #158 is scored against.
+static void GhPsoRebindBefore(ID3D12GraphicsCommandList* self)
+{
+    if (!GhPsoRebind() || !self) return;
+    const GhCLNote* n = GhCLFind(self);
+    if (!n || !n->lastPso) return;
+    ID3D12PipelineState* pso = (ID3D12PipelineState*)n->lastPso;
+    ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*))
+        GhClOrig(self, 25))(self, pso);
+    const LONG k = InterlockedIncrement(&g_psoRebindN);
+    if (k == 1 || (k % 4096) == 0)
+        Diag("PSOREBIND n=" + std::to_string((long)k) +
+             " pso=" + Hex((uint64_t)(uintptr_t)pso));
+}
+
+// The positive control. Eight knobs on this record were hardcoded past and produced
+// normal-looking runs with the probe never firing; a zero here means the run measured
+// nothing, which is not the same finding as "rebinding the PSO changed nothing".
+static void GhPsoRebindStats(const char* where)
+{
+    if (!GhPsoRebind()) return;
+    Diag(std::string("PSOREBIND total=") +
+         std::to_string((long)InterlockedCompareExchange(&g_psoRebindN, 0, 0)) +
+         " at " + where);
+}
+
+// #158 gh_tbl_rebind. The budget tracks the raw count of ops in drawing submissions
+// (CV 3.46%) and beats every richer candidate, but two injection experiments say the
+// count is NOT over commands reaching the driver: 390 breadcrumbs and 156 redundant
+// SetPipelineState calls both cost nothing. Both of those are state/immediate commands
+// that reference no resource and touch no descriptor, so strictly they exonerate two
+// command KINDS, not all of them.
+//
+// This injects the guest's most common op instead -- a redundant
+// SetGraphicsRootDescriptorTable, ~3 per draw in the real lists -- reusing the handles
+// the guest itself last bound, so the binding is a no-op semantically and adds a real
+// descriptor-table reference to whatever the driver keeps per command.
+//
+//   budget unchanged  -> driver commands are free whatever their kind; the consumable
+//                        is in our own per-op path, not the driver's.
+//   budget falls by ~ the injected count -> it is REFERENCES reaching the driver, and
+//                        "ops" was a proxy for a count nobody had measured.
+//
+// gh_tbl_rebind = N rebinds at most N of the currently-set tables per draw, so the dose
+// is controllable: 1 matches the PSO probe's dose exactly, 16 rebinds everything.
+static unsigned GhTblRebind()
+{ static const unsigned n = GhCfgNum(L"gh_tbl_rebind.txt", "GH_TBL_REBIND", 0); return n; }
+static volatile LONG g_tblRebindN = 0;
+static volatile LONG g_tblRebindSkip = 0;   // swap mode: draws with only one table bound
+
+static void GhTblRebindBefore(ID3D12GraphicsCommandList* self)
+{
+    const unsigned lim = GhTblRebind();
+    if (!lim || !self) return;
+    const GhCLNote* n = GhCLFind(self);
+    if (!n || !n->tblSet) return;
+    auto orig = (void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
+                                   D3D12_GPU_DESCRIPTOR_HANDLE))GhClOrig(self, 32);
+    // Dose convention: 1..16 = REDUNDANT rebind (set the slot to what it already holds);
+    // 101..116 = SWAP mode, dose = lim-100.  Every injection in the redundant mode is a
+    // no-op state change a driver is free to filter out, which would make it cost nothing
+    // for a reason that says nothing about the budget.  Swap mode binds the slot to ANOTHER
+    // slot's valid handle and then binds the correct one back: net state identical, guest
+    // correctness preserved, and NEITHER command is dedupable.
+    const bool swap = (lim > 100);
+    const unsigned dose = swap ? (lim - 100) : lim;
+    unsigned done = 0;
+    for (UINT i = 0; i < 16 && done < dose; ++i){
+        if (!(n->tblSet & (1u << i)) || !n->tbl[i]) continue;
+        D3D12_GPU_DESCRIPTOR_HANDLE h; h.ptr = n->tbl[i];
+        if (swap){
+            UINT j = 16;
+            for (UINT t = 0; t < 16; ++t)
+                if (t != i && (n->tblSet & (1u << t)) && n->tbl[t]) { j = t; break; }
+            if (j == 16){ InterlockedIncrement(&g_tblRebindSkip); continue; }  // only one table bound
+            D3D12_GPU_DESCRIPTOR_HANDLE o; o.ptr = n->tbl[j];
+            orig(self, i, o);                // real state change ...
+            orig(self, i, h);                // ... and back; two non-redundant commands
+        } else {                             // (g_tblRebindN counts SITES; swap emits 2/site)
+            orig(self, i, h);                // ORIGINAL slot, never Hook_CLSetGfxTable:
+        }                                    // the hook would inflate uniqTbl and the trace
+        ++done;
+        const LONG k = InterlockedIncrement(&g_tblRebindN);
+        if (k == 1 || (k % 4096) == 0)
+            Diag("TBLREBIND n=" + std::to_string((long)k) +
+                 " swap=" + std::to_string((int)swap) +
+                 " idx=" + std::to_string((unsigned long)i) +
+                 " h=" + Hex((uint64_t)n->tbl[i]));
+    }
+}
+
+static void GhTblRebindStats(const char* where)
+{
+    if (!GhTblRebind()) return;
+    Diag(std::string("TBLREBIND total=") +
+         std::to_string((long)InterlockedCompareExchange(&g_tblRebindN, 0, 0)) +
+         " skipped=" +
+         std::to_string((long)InterlockedCompareExchange(&g_tblRebindSkip, 0, 0)) +
+         " at " + where);
+}
+
+// ---------------------------------------------------------------- #158 gh_degen_draw
+// Family (B): is the meter something the driver allocates per command that causes GPU WORK?
+// Every injection so far (breadcrumbs, PSO rebind, table rebind redundant AND swapped) was a
+// state set or an immediate write -- none of it made the GPU draw.  Worse, root-parameter and
+// PSO binding are commonly DEFERRED to draw time by D3D12 drivers, so those three probes may
+// have collapsed to nothing before reaching the command buffer at all.
+//
+// This injects a real draw: DrawInstanced(1,1,0,0) through the ORIGINAL slot 12 before every
+// guest draw.  A single vertex cannot complete a triangle, so under the game's TRIANGLELIST
+// passes it rasterises nothing -- but it is a genuine draw packet the driver must emit full
+// state for, and nothing can defer or dedupe it.  (Chosen over the empty-scissor variant I
+// first sketched because that needs the guest's scissor saved and restored, and GhCLNote does
+// not record scissor rects -- this needs no state change at all.  Under a POINTLIST or
+// TRIANGLESTRIP topology it may emit one stray point; acceptable for a diagnostic.)
+//
+//   budget roughly halves -> the meter counts work-causing commands, and WORK is mechanism.
+//   budget unchanged      -> (B) dies; the meter is not driver-side and the search moves
+//                            into our own per-guest-op hook path.
+static unsigned GhDegenDraw()
+{ static const unsigned n = GhCfgNum(L"gh_degen_draw.txt", "GH_DEGEN_DRAW", 0); return n; }
+static volatile LONG g_degenDrawN = 0;
+
+static void GhDegenDrawBefore(ID3D12GraphicsCommandList* self)
+{
+    const unsigned lim = GhDegenDraw();
+    if (!lim || !self) return;
+    const GhCLNote* n = GhCLFind(self);
+    if (!n || !n->lastPso) return;           // no PSO bound yet: a draw here is not legal
+    auto orig = (void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT))
+                GhClOrig(self, 12);
+    for (unsigned k = 0; k < lim; ++k){
+        orig(self, 1, 1, 0, 0);              // 1 vertex, 1 instance: real packet, no coverage
+        const LONG c = InterlockedIncrement(&g_degenDrawN);
+        if (c == 1 || (c % 4096) == 0)
+            Diag("DEGENDRAW n=" + std::to_string((long)c));
+    }
+}
+
+static void GhDegenDrawStats(const char* where)
+{
+    if (!GhDegenDraw()) return;
+    Diag(std::string("DEGENDRAW total=") +
+         std::to_string((long)InterlockedCompareExchange(&g_degenDrawN, 0, 0)) +
+         " at " + where);
+}
+// #158: bisect ACROSS the whole burst, not inside one list.
+//
+// gh_op_stop is per-list, so it reshapes every list in the frame at once and cannot
+// separate "the GPU dies after N ops of work" from "the GPU dies on one particular
+// op" -- every elimination so far is consistent with either. These two count the
+// same ops the breadcrumb counts, in the same order, so N here and `issued=N` there
+// are the same number:
+//   gh_op_gstop = N  -> execute only global ops 1..N, drop the rest.
+//   gh_op_gdrop = K  -> execute everything EXCEPT global op K.
+// gstop bounds where the fault lives; gdrop then asks whether one op owns it.
+static unsigned GhOpGStop()
+{ static const unsigned n = GhCfgNum(L"gh_op_gstop.txt", "GH_OP_GSTOP", 0); return n; }
+static unsigned GhOpGDrop()
+{ static const unsigned n = GhCfgNum(L"gh_op_gdrop.txt", "GH_OP_GDROP", 0); return n; }
+static volatile LONG g_gopSeq = 0;
 // 1-based index of this shader-running op within the current recording. Always
 // counted, even with the knob off, so the CLOP trace and the knob share numbering.
 static LONG GhWorkIndex(ID3D12CommandList* self)
@@ -5796,13 +10779,35 @@ static bool GhWorkOpDropped(ID3D12CommandList* self, LONG idx)
         }
     }
     const unsigned stop = GhOpStop();
-    if (!stop || idx <= (LONG)stop) return false;
-    static LONG k = 0;
-    LONG j = InterlockedIncrement(&k);
-    if (j <= 4 || (j % 512) == 0)
-        Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " w=" + std::to_string((long)idx) +
-             " DROPPED by gh_op_stop=" + std::to_string(stop) + " n=" + std::to_string((long)j));
-    return true;
+    if (stop && idx > (LONG)stop){
+        static LONG k = 0;
+        LONG j = InterlockedIncrement(&k);
+        if (j <= 4 || (j % 512) == 0)
+            Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " w=" + std::to_string((long)idx) +
+                 " DROPPED by gh_op_stop=" + std::to_string(stop) + " n=" + std::to_string((long)j));
+        return true;
+    }
+    // Global numbering. Counted only for ops that survived every gate above, so it
+    // stays in lockstep with the breadcrumb's g.
+    const unsigned gstop = GhOpGStop(), gdrop = GhOpGDrop();
+    if (gstop || gdrop){
+        const LONG g = InterlockedIncrement(&g_gopSeq);
+        if (gdrop && g == (LONG)gdrop){
+            Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " w=" + std::to_string((long)idx) +
+                 " DROPPED by gh_op_gdrop g=" + std::to_string((long)g));
+            return true;
+        }
+        if (gstop && g > (LONG)gstop){
+            static LONG k2 = 0;
+            LONG j2 = InterlockedIncrement(&k2);
+            if (j2 <= 4 || (j2 % 512) == 0)
+                Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " w=" + std::to_string((long)idx) +
+                     " DROPPED by gh_op_gstop=" + std::to_string(gstop) +
+                     " g=" + std::to_string((long)g) + " n=" + std::to_string((long)j2));
+            return true;
+        }
+    }
+    return false;
 }
 static void GhCLOp(ID3D12CommandList* self, const std::string& what)
 {
@@ -5810,20 +10815,245 @@ static void GhCLOp(ID3D12CommandList* self, const std::string& what)
     Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " " + what +
          (n && n->lastPso ? " pso=" + Hex((uint64_t)(uintptr_t)n->lastPso) : ""));
 }
+// #158 gh_cl_reloc. Barrier relocation proved the agent is the command list the commands
+// are recorded into, not the commands themselves. This relocates the WHOLE guest command
+// stream -- and it does so without recording or replaying a single call. The guest keeps
+// its own list object and records into it exactly as before; what changes is that the
+// list is Reset against a LOADER-OWNED command allocator, so every command the guest
+// writes lands in memory we own.
+//
+// That is strictly better than a record/replay recorder here: a recorder would have to
+// intercept every one of the forty-odd methods a real game calls, and one missed method
+// silently produces a broken list -- indistinguishable from the theory being wrong.
+// Substituting the allocator cannot miss a method and cannot reorder anything.
+//
+// The allocator is SHADOWED ONE-FOR-ONE, not pooled. A pool needs to know when an
+// allocator's contents are dead, and the first build guessed "when the GPU passed its
+// last submission" -- which is wrong, because a closed command list may legally be
+// submitted again. That guess is what produced `Reset failed` in mode 1 and, once every
+// bad slot leaked, `CreateCommandAllocator failed` in mode 2: both builds disabled
+// themselves within 45 calls and silently ran as second controls.
+//
+// The guest already answers the question exactly, every frame: the moment its own
+// allocator is Reset is the moment its contents are dead. So mirror it. Each guest
+// allocator gets one shadow for life, and the shadow is Reset when, and only when, the
+// guest resets the original. Identical topology, identical cadence, bounded memory --
+// the only thing that differs is whose memory the commands are in, which is the variable
+// under test.
+//
+//   1 = shadow, Reset in lockstep with the guest's allocator.
+//   2 = shadow, but a FRESH allocator each time the guest resets, up to a cap. Removes
+//       reuse entirely, so if 2 survives and 1 does not, the fault is reuse of allocator
+//       memory rather than whose memory it is.
+static unsigned GhClReloc()
+{ static const unsigned v = GhCfgNum(L"gh_cl_reloc.txt", "GH_CL_RELOC", 0); return v; }
+
+// #158. Count every ID3D12GraphicsCommandList method the guest calls, so a draw
+// relocation can be built against the state the game actually sets rather than the
+// state I guessed it sets.
+static unsigned GhClCensus()
+{ static const unsigned v = GhCfgNum(L"gh_cl_census.txt", "GH_CL_CENSUS", 0); return v; }
+static volatile LONG g_clCensusDone = 0;
+
+struct GhCAShadow {
+    ID3D12CommandAllocator*         guest;   // key only; never dereferenced for lifetime
+    com_ptr<ID3D12CommandAllocator> ours;
+    LONG                            type;
+    LONG                            gen;     // mode 2: how many times it has been replaced
+};
+static const int kCAShadowMax = 512;
+static GhCAShadow g_caShadow[kCAShadowMax];
+static LONG       g_caShadowN = 0;
+static SRWLOCK    g_caLk = SRWLOCK_INIT;
+static volatile LONG g_clSubN = 0, g_clSubMiss = 0, g_clResetN = 0, g_clFresh = 0;
+static volatile LONG g_clCreateFail = 0, g_clResetFail = 0, g_clCap = 0;
+
+// The shadow for one guest allocator, created on first sight. Returns nullptr to leave
+// the guest's own allocator in place, which is always the safe answer.
+static ID3D12CommandAllocator* GhCAShadowFor(ID3D12CommandAllocator* g, ID3D12Device* dev,
+                                             LONG type)
+{
+    if (!g || !dev || type < 0 || type > 3) return nullptr;
+    AcquireSRWLockExclusive(&g_caLk);
+    for (LONG i = 0; i < g_caShadowN; ++i)
+        if (g_caShadow[i].guest == g){
+            ID3D12CommandAllocator* a = g_caShadow[i].ours.get();
+            ReleaseSRWLockExclusive(&g_caLk);
+            return a;
+        }
+    if (g_caShadowN >= kCAShadowMax){
+        if (InterlockedIncrement(&g_clCap) == 1)
+            Diag("CLRELOC shadow table full -- further allocators stay the guest's");
+        ReleaseSRWLockExclusive(&g_caLk);
+        return nullptr;
+    }
+    GhCAShadow& sh = g_caShadow[g_caShadowN];
+    const HRESULT hr = dev->CreateCommandAllocator((D3D12_COMMAND_LIST_TYPE)type,
+                            __uuidof(ID3D12CommandAllocator), sh.ours.put_void());
+    if (FAILED(hr) || !sh.ours){
+        const LONG f = InterlockedIncrement(&g_clCreateFail);
+        if (f <= 8)
+            Diag("CLRELOC CreateCommandAllocator failed hr=" + Hex((uint32_t)hr) +
+                 " type=" + std::to_string((long)type) +
+                 " shadows=" + std::to_string((long)g_caShadowN) +
+                 " -- this allocator stays the guest's");
+        sh.ours = nullptr;
+        ReleaseSRWLockExclusive(&g_caLk);
+        return nullptr;
+    }
+    sh.guest = g; sh.type = type; sh.gen = 0;
+    ++g_caShadowN;
+    ID3D12CommandAllocator* a = sh.ours.get();
+    const LONG k = InterlockedIncrement(&g_clFresh);
+    if (k <= 8 || (k % 64) == 0)
+        Diag("CLRELOC shadow #" + std::to_string((long)k) +
+             " guest=" + Hex((uint64_t)(uintptr_t)g) +
+             " ours=" + Hex((uint64_t)(uintptr_t)a) +
+             " type=" + std::to_string((long)type));
+    ReleaseSRWLockExclusive(&g_caLk);
+    return a;
+}
+
+// The guest just declared its allocator's contents dead. Do the same to the shadow --
+// this is the whole reason the substitution is safe, so it must never be skipped.
+static void GhCAShadowReset(ID3D12CommandAllocator* g)
+{
+    if (!g) return;
+    com_ptr<ID3D12CommandAllocator> ours;
+    LONG type = -1, idx = -1;
+    AcquireSRWLockExclusive(&g_caLk);
+    for (LONG i = 0; i < g_caShadowN; ++i)
+        if (g_caShadow[i].guest == g){ ours = g_caShadow[i].ours; type = g_caShadow[i].type; idx = i; break; }
+    ReleaseSRWLockExclusive(&g_caLk);
+    if (!ours) return;
+    InterlockedIncrement(&g_clResetN);
+
+    if (GhClReloc() >= 2 && type >= 0){
+        // Mode 2: retire this shadow and hand out a virgin one, so no allocator memory is
+        // ever recorded into twice. Falls back to resetting in place once the device
+        // stops handing them out, which keeps the run alive instead of voiding it.
+        com_ptr<ID3D12Device> dev;
+        com_ptr<ID3D12CommandAllocator> fresh;
+        if (SUCCEEDED(ours->GetDevice(__uuidof(ID3D12Device), dev.put_void())) && dev &&
+            SUCCEEDED(dev->CreateCommandAllocator((D3D12_COMMAND_LIST_TYPE)type,
+                          __uuidof(ID3D12CommandAllocator), fresh.put_void())) && fresh){
+            AcquireSRWLockExclusive(&g_caLk);
+            if (idx >= 0 && idx < g_caShadowN && g_caShadow[idx].guest == g){
+                g_caShadow[idx].ours = fresh;
+                ++g_caShadow[idx].gen;
+            }
+            ReleaseSRWLockExclusive(&g_caLk);
+            InterlockedIncrement(&g_clFresh);
+            return;
+        }
+        if (InterlockedIncrement(&g_clCap) == 1)
+            Diag("CLRELOC mode 2 ran out of allocators -- resetting shadows in place");
+    }
+
+    const HRESULT hr = ours->Reset();
+    if (FAILED(hr)){
+        const LONG f = InterlockedIncrement(&g_clResetFail);
+        if (f <= 8 || (f % 256) == 0)
+            Diag("CLRELOC shadow Reset failed hr=" + Hex((uint32_t)hr) +
+                 " guest=" + Hex((uint64_t)(uintptr_t)g) +
+                 " fails=" + std::to_string((long)f));
+    }
+}
+
+// How much of the guest's command stream actually ended up in our memory. A substitution
+// that quietly stopped taking makes a relocated run into a second control that still
+// prints its knob -- which is exactly what the first two builds did.
+static void GhClRelocStats(const char* where)
+{
+    if (!GhClReloc()) return;
+    Diag(std::string("CLRELOCSTATS at ") + where +
+         " subbed=" + std::to_string((long)InterlockedCompareExchange(&g_clSubN, 0, 0)) +
+         " missed=" + std::to_string((long)InterlockedCompareExchange(&g_clSubMiss, 0, 0)) +
+         " shadows=" + std::to_string((long)g_caShadowN) +
+         " made=" + std::to_string((long)InterlockedCompareExchange(&g_clFresh, 0, 0)) +
+         " caresets=" + std::to_string((long)InterlockedCompareExchange(&g_clResetN, 0, 0)) +
+         " createfail=" + std::to_string((long)InterlockedCompareExchange(&g_clCreateFail, 0, 0)) +
+         " resetfail=" + std::to_string((long)InterlockedCompareExchange(&g_clResetFail, 0, 0)) +
+         " capped=" + std::to_string((long)InterlockedCompareExchange(&g_clCap, 0, 0)));
+}
+
+// Substitute for a list Reset / list creation. `type` comes from the list, not the
+// allocator, because that is what CreateCommandList validates against.
+static ID3D12CommandAllocator* GhClSubstitute(ID3D12CommandAllocator* g, ID3D12Device* dev,
+                                              LONG type)
+{
+    if (!GhClReloc()) return nullptr;
+    ID3D12CommandAllocator* a = GhCAShadowFor(g, dev, type);
+    if (a) InterlockedIncrement(&g_clSubN);
+    else   InterlockedIncrement(&g_clSubMiss);
+    return a;
+}
+
+// ID3D12CommandAllocator::Reset is vtable slot 8 (IUnknown 0-2, ID3D12Object 3-6,
+// ID3D12DeviceChild 7). Only the first allocator's vtable is patched: they share one
+// class, the same assumption GhHookCommandQueue already makes and which every
+// substituted allocator in the log confirms.
+static void* g_caVtOrig8 = nullptr;
+static volatile LONG g_caHooked = 0;
+static HRESULT __stdcall Hook_CAReset(ID3D12CommandAllocator* self)
+{
+    GhCAShadowReset(self);
+    return ((HRESULT (__stdcall*)(ID3D12CommandAllocator*))g_caVtOrig8)(self);
+}
+static void GhHookCommandAllocator(ID3D12CommandAllocator* a)
+{
+    if (!a || InterlockedCompareExchange(&g_caHooked, 1, 0) != 0) return;
+    void** vt = *(void***)a;
+    DWORD old = 0;
+    if (!VirtualProtect(vt, sizeof(void*) * 9, PAGE_READWRITE, &old)){
+        Diag("D3D12 allocator vtable protect failed err=" + Hex(GetLastError()));
+        InterlockedExchange(&g_caHooked, 0);
+        return;
+    }
+    g_caVtOrig8 = vt[8]; vt[8] = (void*)&Hook_CAReset;
+    VirtualProtect(vt, sizeof(void*) * 9, old, &old);
+    Diag("D3D12 allocator vtable hooked (Reset)");
+}
+
 static HRESULT __stdcall Hook_CLReset(ID3D12GraphicsCommandList* self,
                                       ID3D12CommandAllocator* a, ID3D12PipelineState* pso)
 {
     if (GhCLNote* n = GhCLFind(self)){
         n->draws = n->idraws = n->disp = n->barriers = n->psosets = n->work = 0;
+        n->iDraws = n->iIdraws = n->iDisp = n->iBarr = n->iPsosets = 0;
+        n->progIdx = 0;
+        n->npend = 0;
+        n->relN = 0; n->relBatchN = 0;   // #158 keep the allocations, drop the contents
+        n->ropN = 0; n->rarN = 0;        // #158 gh_cl_rec, same rule
         n->lastPso = pso;
+        // Reset discards every binding on the real list, so a shadow that keeps
+        // them describes the PREVIOUS recording. That made BIND lines pair this
+        // frame's table handles with last frame's heaps, which reads exactly like
+        // a table pointing into an unbound heap and is not one.
+        n->tblSet = n->vaSet = 0;
+        n->heaps[0] = n->heaps[1] = nullptr;
+        n->rsGfx = n->rsComp = nullptr;   // #173, same rule: Reset clears the root signature
+        n->nrt = n->hasDsv = n->nvp = n->nsc = 0;
+        n->dsv = 0;
+        for (int i = 0; i < 16; ++i){ n->tbl[i] = 0; n->rootva[i] = 0; }
+        for (int i = 0; i < 8; ++i) n->rtv[i] = 0;
     }
     if (GhCLTraceOn())
         Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " RESET pso=" + Hex((uint64_t)(uintptr_t)pso));
+    ID3D12CommandAllocator* useA = a;
+    if (GhClReloc() && a){
+        GhCLNote* nt = GhCLFind(self);
+        com_ptr<ID3D12Device> dev;
+        if (nt && SUCCEEDED(self->GetDevice(__uuidof(ID3D12Device), dev.put_void())) && dev)
+            if (ID3D12CommandAllocator* sa = GhClSubstitute(a, dev.get(), nt->type))
+                useA = sa;
+    }
     return ((HRESULT (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*,
-                                  ID3D12PipelineState*))g_clVtOrig[10])(self, a, pso);
+                                  ID3D12PipelineState*))GhClOrig(self, 10))(self, useA, pso);
 }
 static void __stdcall Hook_CLDraw(ID3D12GraphicsCommandList* self, UINT a, UINT b, UINT c, UINT d)
 {
+    GhBarrFlushPending(self);
     if (GhCLNote* n = GhCLFind(self)) InterlockedIncrement(&n->draws);
     const LONG wi = GhWorkIndex(self);
     if (GhCLTraceOn()) GhCLOp(self, "w=" + std::to_string((long)wi) +
@@ -5831,11 +11061,18 @@ static void __stdcall Hook_CLDraw(ID3D12GraphicsCommandList* self, UINT a, UINT 
                                     " inst=" + std::to_string((unsigned long)b));
     if ((GhOpMask() & 1) || GhWorkOpDropped(self, wi)) return;
     const LONG bcg = GhBreadcrumbBefore(self);
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT))g_clVtOrig[12])(self, a, b, c, d);
+    if (!GhRecCap12(self, a, b, c, d)){
+        GhPsoRebindBefore(self);
+        GhTblRebindBefore(self);
+        GhDegenDrawBefore(self);
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT))GhClOrig(self, 12))(self, a, b, c, d);
+    }
+    if (GhCLNote* nn = GhCLFind(self)) InterlockedIncrement(&nn->iDraws);  // #158 issued-side
     GhBreadcrumbAfter(self, bcg);
 }
 static void __stdcall Hook_CLDrawIndexed(ID3D12GraphicsCommandList* self, UINT a, UINT b, UINT c, INT d, UINT e)
 {
+    GhBarrFlushPending(self);
     if (GhCLNote* n = GhCLFind(self)) InterlockedIncrement(&n->idraws);
     const LONG wi = GhWorkIndex(self);
     if (GhCLTraceOn()) GhCLOp(self, "w=" + std::to_string((long)wi) +
@@ -5843,11 +11080,18 @@ static void __stdcall Hook_CLDrawIndexed(ID3D12GraphicsCommandList* self, UINT a
                                     " inst=" + std::to_string((unsigned long)b));
     if ((GhOpMask() & 1) || GhWorkOpDropped(self, wi)) return;
     const LONG bcg = GhBreadcrumbBefore(self);
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, INT, UINT))g_clVtOrig[13])(self, a, b, c, d, e);
+    if (!GhRecCap13(self, a, b, c, d, e)){
+        GhPsoRebindBefore(self);
+        GhTblRebindBefore(self);
+        GhDegenDrawBefore(self);
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, INT, UINT))GhClOrig(self, 13))(self, a, b, c, d, e);
+    }
+    if (GhCLNote* nn = GhCLFind(self)) InterlockedIncrement(&nn->iIdraws);  // #158 issued-side
     GhBreadcrumbAfter(self, bcg);
 }
 static void __stdcall Hook_CLDispatch(ID3D12GraphicsCommandList* self, UINT x, UINT y, UINT z)
 {
+    GhBarrFlushPending(self);
     if (GhCLNote* n = GhCLFind(self)) InterlockedIncrement(&n->disp);
     const LONG wi = GhWorkIndex(self);
     if (GhCLTraceOn()) GhCLOp(self, "w=" + std::to_string((long)wi) +
@@ -5855,7 +11099,9 @@ static void __stdcall Hook_CLDispatch(ID3D12GraphicsCommandList* self, UINT x, U
                                     std::to_string((unsigned long)y) + "," + std::to_string((unsigned long)z));
     if ((GhOpMask() & 2) || GhWorkOpDropped(self, wi)) return;
     const LONG bcg = GhBreadcrumbBefore(self);
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT))g_clVtOrig[14])(self, x, y, z);
+    if (!GhRecCap14(self, x, y, z))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT))GhClOrig(self, 14))(self, x, y, z);
+    if (GhCLNote* nn = GhCLFind(self)) InterlockedIncrement(&nn->iDisp);  // #158 issued-side
     GhBreadcrumbAfter(self, bcg);
 }
 static void __stdcall Hook_CLSetPso(ID3D12GraphicsCommandList* self, ID3D12PipelineState* pso)
@@ -5863,7 +11109,10 @@ static void __stdcall Hook_CLSetPso(ID3D12GraphicsCommandList* self, ID3D12Pipel
     if (GhCLNote* n = GhCLFind(self)){ InterlockedIncrement(&n->psosets); n->lastPso = pso; }
     if (GhCLTraceOn())
         Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " SETPSO " + Hex((uint64_t)(uintptr_t)pso));
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*))g_clVtOrig[25])(self, pso);
+    if (GhOpMask() & 65536) return;
+    if (!GhRecCap25(self, pso))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*))GhClOrig(self, 25))(self, pso);
+    if (GhCLNote* nn = GhCLFind(self)) InterlockedExchangeAdd(&nn->iPsosets, 1);  // #158 issued-side
 }
 // #158: the barriers that matter are the ones recorded into the submission that
 // never retires, not the first few dozen at load. Keep the most recent ones in a
@@ -5893,9 +11142,762 @@ static void GhBarrDump(const char* why)
     }
     if (!chunk.empty()) Diag(chunk);
 }
+// ---------------------------------------------------------------- #158 barrier bisect
+// The op cutoff gates draws; this gates the barriers themselves, one at a time.
+// The isolated bisects put the fault in PER-FRAME transitions touching
+// RENDER_TARGET, so the numbering is over a SELECTED subset -- everything not
+// selected passes through untouched and is never counted, which keeps the index
+// stable while the selection narrows.
+//   gh_barr_sel   = S  only transitions whose before|after touches S participate
+//                      (0 = every transition; 4 = RENDER_TARGET, the culprit class)
+//   gh_barr_gstop = N  issue only the first N selected transitions
+//   gh_barr_gdrop = K  drop exactly the Kth selected transition
+// Bisect gstop for the smallest N that still hangs; BARRSEL g=N then names the
+// resource, its subresource and the exact state pair.
+static unsigned GhBarrSel()
+{ static const unsigned n = GhCfgNum(L"gh_barr_sel.txt", "GH_BARR_SEL", 0); return n; }
+static unsigned GhBarrGStop()
+{ static const unsigned n = GhCfgNum(L"gh_barr_gstop.txt", "GH_BARR_GSTOP", 0); return n; }
+static unsigned GhBarrGDrop()
+{ static const unsigned n = GhCfgNum(L"gh_barr_gdrop.txt", "GH_BARR_GDROP", 0); return n; }
+//   gh_barr_pair_before / gh_barr_pair_after  = X   participate only if the
+//                      transition's StateBefore / StateAfter is exactly X.
+//                      0xFFFFFFFF (the default) is a wildcard.
+//   gh_barr_ecl_lo / gh_barr_ecl_hi = L,H  participate only while the submission
+//                      counter is in [L,H].  hi=0 disables the window.
+//   gh_barr_dropall = 1  drop every participating transition (no index involved).
+// The pair and ecl keys are reproducible across runs; the g index is NOT, because
+// barriers are recorded on several threads at once.  Bisect with those.
+// Encoded as state+1, because GhCfgNum cannot carry a zero: it treats 0 as
+// "absent" and hands back the default.  0 here means wildcard, 1 means the
+// COMMON state (0), 5 means RENDER_TARGET (4), and so on.
+static unsigned GhBarrPairB()
+{ static const unsigned n = GhCfgNum(L"gh_barr_pair_before.txt", "GH_BARR_PAIR_BEFORE", 0); return n; }
+static unsigned GhBarrPairA()
+{ static const unsigned n = GhCfgNum(L"gh_barr_pair_after.txt", "GH_BARR_PAIR_AFTER", 0); return n; }
+static unsigned GhBarrEclLo()
+{ static const unsigned n = GhCfgNum(L"gh_barr_ecl_lo.txt", "GH_BARR_ECL_LO", 0); return n; }
+static unsigned GhBarrEclHi()
+{ static const unsigned n = GhCfgNum(L"gh_barr_ecl_hi.txt", "GH_BARR_ECL_HI", 0); return n; }
+// Reproducible resource keys: the surface's width and DXGI format. Unlike a
+// pointer or a global index, both are the same on every run, so a bisect over
+// them converges.
+static unsigned GhBarrResW()
+{ static const unsigned n = GhCfgNum(L"gh_barr_res_w.txt", "GH_BARR_RES_W", 0); return n; }
+
+// #158: the barrier breadcrumb named the fatal transition twice in a row as a
+// small placed texture (w=30 in the barriers-only rung, w=120 in the baseline),
+// each the widest tenant at offset 0 of a 12-13 way DRS alias chain. gh_barr_res_w
+// only matches ONE exact width, which is why every earlier single-surface probe
+// came back "no surface owns it" -- the fatal surface MOVES along the chain between
+// runs. These two select a width RANGE instead, so the whole pyramid can be taken
+// or spared as a unit. Both are plain widths in pixels; 0 = disabled.
+static unsigned GhBarrResWMin()
+{ static const unsigned n = GhCfgNum(L"gh_barr_res_wmin.txt", "GH_BARR_RES_WMIN", 0); return n; }
+static unsigned GhBarrResWMax()
+{ static const unsigned n = GhCfgNum(L"gh_barr_res_wmax.txt", "GH_BARR_RES_WMAX", 0); return n; }
+// #158. 1 = do not issue the guest's barriers on the guest's own command list at all.
+// Capture them per list and re-record them into a loader-owned list, submitted on the
+// guest's own queue inside the guest's own ExecuteCommandLists call. Under
+// gh_op_mask=508087 the guest's lists contain nothing but barriers, so this is a pure
+// object swap: same barriers, same values, same order, same queue, same submission
+// boundaries -- only the recording object changes.
+static unsigned GhBarrReloc()
+{ static const unsigned v = GhCfgNum(L"gh_barr_reloc.txt", "GH_BARR_RELOC", 0); return v; }
+static unsigned GhBarrResFmt()
+{ static const unsigned n = GhCfgNum(L"gh_barr_res_fmt.txt", "GH_BARR_RES_FMT", 0); return n; }
+// State REWRITE, as opposed to dropping. Spider-Man moves its render targets to
+// D3D12_RESOURCE_STATE_GENERIC_READ (0xAC3) -- a state that also promises INDEX_BUFFER,
+// INDIRECT_ARGUMENT and COPY_SOURCE. A driver has to make the surface readable by every
+// one of those units, which on this hardware means a full decompress. Rewriting the pair
+// to the states the game actually uses (0xC0, the two shader-resource bits) keeps the
+// barrier and its count identical and only narrows what the driver must do.
+// Both knobs are encoded as state+1; 0 = disabled.
+static unsigned GhBarrRwFrom()
+{ static const unsigned n = GhCfgNum(L"gh_barr_rw_from.txt", "GH_BARR_RW_FROM", 0); return n; }
+static unsigned GhBarrRwTo()
+{ static const unsigned n = GhCfgNum(L"gh_barr_rw_to.txt", "GH_BARR_RW_TO", 0); return n; }
+static volatile LONG g_barrRw = 0;
+// SPLIT barriers. A transition can be issued as a BEGIN_ONLY/END_ONLY pair, which on
+// most drivers is a different code path from the immediate one: the decompress the
+// transition forces is started at the BEGIN and only has to have landed by the END.
+//   1 = each selected transition becomes BEGIN,END adjacent, in place
+//   2 = every selected BEGIN is issued first, then every END, so the batch's
+//       decompresses can overlap instead of running one at a time
+static unsigned GhBarrSplit()
+{ static const unsigned n = GhCfgNum(L"gh_barr_split.txt", "GH_BARR_SPLIT", 0); return n; }
+static volatile LONG g_barrSplit = 0;
+// Density vs. count. Every experiment so far cut the total number of RENDER_TARGET
+// transitions and their per-submission density together, so the dose curve cannot say
+// which one the GPU is actually reacting to. These two hold one constant and vary the
+// other.
+//   gh_barr_keep_every = K  keep one in every K participating transitions, drop the rest
+//                           (spreads a reduced total evenly across every submission)
+//   gh_barr_invert = 1      negate participation after all the filters, so an ecl window
+//                           means "drop everything OUTSIDE it" -- the same reduced total
+//                           at full density, confined to part of the run
+// gh_barr_res_mod = M / gh_barr_res_rem = R+1: keep only the transitions of the
+// resources whose census slot satisfies idx % M == R, and drop every transition of
+// the others. Halving by resource is state-consistent -- a resource either gets its
+// whole barrier sequence or none of it -- where keeping one barrier in two is not:
+// that leaves every second StateBefore lying, and the runtime rejects the list at
+// Close (0x80070057) long before the GPU ever sees it.
+// gh_barr_mem_every = N: every N executed RENDER_TARGET transitions, sample memory
+// (app commit, system available physical, and the REAL adapter's video-memory usage)
+// and dump the per-pair tally at the same instant. On a UMA console the driver's own
+// allocations come out of system RAM, so a per-transition leak shows up here even
+// when it is made kernel-side and never passes through any call we hook.
+static unsigned GhBarrMemEvery()
+{ static const unsigned n = GhCfgNum(L"gh_barr_mem_every.txt", "GH_BARR_MEM_EVERY", 0); return n; }
+static volatile LONG g_barrMemBusy = 0;
+static unsigned GhBarrResMod()
+{ static const unsigned n = GhCfgNum(L"gh_barr_res_mod.txt", "GH_BARR_RES_MOD", 0); return n; }
+static unsigned GhBarrResRem()
+{ static const unsigned n = GhCfgNum(L"gh_barr_res_rem.txt", "GH_BARR_RES_REM", 0); return n; }
+static unsigned GhBarrKeepEvery()
+{ static const unsigned n = GhCfgNum(L"gh_barr_keep_every.txt", "GH_BARR_KEEP_EVERY", 0); return n; }
+static unsigned GhBarrInvert()
+{ static const unsigned n = GhCfgNum(L"gh_barr_invert.txt", "GH_BARR_INVERT", 0); return n; }
+static unsigned GhBarrDropAll()
+{ static const unsigned n = GhCfgNum(L"gh_barr_dropall.txt", "GH_BARR_DROPALL", 0); return n; }
+// #158: the frame's barrier program is byte-identical every frame -- the same 74
+// transitions in the same order -- and it runs clean a dozen times before the
+// thirteenth execution hangs the GPU. Content cannot be the differentiator, so
+// what changes must be the RESOURCES the barriers name. We never AddRef anything
+// the guest hands us; if the game retires a render target and the driver recycles
+// its address, the next frame's identical barrier decompresses metadata that no
+// longer belongs to it. gh_barr_retain=1 takes a reference on every resource that
+// reaches a transition, so nothing the game barriers can ever be freed. It leaks
+// by design -- one reference per barrier, a few hundred all told -- and it is a
+// probe, not a fix. If the hang goes away, the cause is a use-after-free of a
+// render target, and the fix is a real per-resource retention table.
+static unsigned GhBarrRetain()
+{ static const unsigned v = GhCfgNum(L"gh_barr_retain.txt", "GH_BARR_RETAIN", 0); return v; }
+// #158. Volume of barrier work is what the device cannot take: dropping it
+// survives, substituting a UAV barrier for it does not. gh_barr_coalesce=1 keeps
+// every barrier the guest asked for but issues runs of them as a single call.
+static unsigned GhBarrCoalesce()
+{ static const unsigned v = GhCfgNum(L"gh_barr_coalesce.txt", "GH_BARR_COALESCE", 0); return v; }
+static LONG g_barrCoalIn = 0, g_barrCoalOut = 0;
+// #158: describe the batch the breadcrumb is about to stamp, so `started=K`
+// resolves to a resource, a subresource and a state pair. Goes into the same ring
+// as the per-barrier T lines, so ordering between them is preserved in the dump.
+static void GhBarrBcNote(LONG k, ID3D12GraphicsCommandList* self, UINT n,
+                         const D3D12_RESOURCE_BARRIER* arr)
+{
+    if (!k) return;
+    char tmp[112];
+    if (n && arr && arr[0].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
+        _snprintf_s(tmp, sizeof tmp, _TRUNCATE,
+            "BC k=%ld cl=%p n=%u res=%p sub=%x %x->%x", (long)k, (void*)self, (unsigned)n,
+            (void*)arr[0].Transition.pResource, (unsigned)arr[0].Transition.Subresource,
+            (unsigned)arr[0].Transition.StateBefore, (unsigned)arr[0].Transition.StateAfter);
+    else
+        _snprintf_s(tmp, sizeof tmp, _TRUNCATE, "BC k=%ld cl=%p n=%u type=%u",
+            (long)k, (void*)self, (unsigned)n, (unsigned)(n && arr ? arr[0].Type : 0));
+    GhBarrNote(tmp);
+}
+static volatile LONG g_relBarr = 0, g_relBatch = 0, g_relStarve = 0, g_relOver = 0;
+// #158. The single point where a guest barrier either reaches the guest's own list or
+// is taken for relocation. Both issue paths call it, so the control run (reloc off) is
+// byte-for-byte the code path every earlier run measured.
+static void GhBarrForward(ID3D12GraphicsCommandList* self, UINT n,
+                          const D3D12_RESOURCE_BARRIER* arr)
+{
+    if (GhBarrReloc() && n && arr){
+        GhCLNote* nt = GhCLFind(self);
+        // A list we do not track cannot be replayed in the right order at submission
+        // time, so it keeps its barriers rather than losing them silently.
+        if (nt){
+            const LONG kMaxRel = 65536;
+            bool ok = true;
+            if (nt->relN + (LONG)n > nt->relCap){
+                LONG want = nt->relCap ? nt->relCap * 2 : 1024;
+                while (want < nt->relN + (LONG)n) want *= 2;
+                if (want > kMaxRel) ok = false;
+                else if (void* q = realloc(nt->relBuf, (size_t)want * sizeof(D3D12_RESOURCE_BARRIER))){
+                    nt->relBuf = (D3D12_RESOURCE_BARRIER*)q; nt->relCap = want;
+                } else ok = false;
+            }
+            if (ok && nt->relBatchN + 1 > nt->relBatchCap){
+                LONG want = nt->relBatchCap ? nt->relBatchCap * 2 : 256;
+                if (void* q = realloc(nt->relBatch, (size_t)want * sizeof(UINT32))){
+                    nt->relBatch = (UINT32*)q; nt->relBatchCap = want;
+                } else ok = false;
+            }
+            if (ok){
+                memcpy(nt->relBuf + nt->relN, arr, (size_t)n * sizeof(D3D12_RESOURCE_BARRIER));
+                nt->relN += (LONG)n;
+                nt->relBatch[nt->relBatchN++] = (UINT32)n;
+                InterlockedExchangeAdd(&g_relBarr, (LONG)n);
+                InterlockedIncrement(&g_relBatch);
+                return;                       // NOT forwarded: that is the experiment
+            }
+            if (InterlockedIncrement(&g_relOver) == 1)
+                Diag("BARRRELOC capture overflow -- this list keeps its own barriers");
+        }
+    }
+    const LONG bck = GhBcBarrierBefore(self);            // #158 barrier-batch breadcrumb
+    GhBarrBcNote(bck, self, n, arr);
+    if (!GhRecCap26(self, n, arr))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
+                        const D3D12_RESOURCE_BARRIER*))GhClOrig(self, 26))(self, n, arr);
+    GhBcBarrierAfter(self, bck);
+    if (GhCLNote* nn = GhCLFind(self)) InterlockedExchangeAdd(&nn->iBarr, (LONG)n);  // #158 issued-side
+}
+static void GhBarrFlushPending(ID3D12GraphicsCommandList* self)
+{
+    if (!GhBarrCoalesce()) return;
+    GhCLNote* n = GhCLFind(self);
+    if (!n || n->npend <= 0) return;
+    const LONG k = n->npend;
+    n->npend = 0;
+    InterlockedAdd(&g_barrCoalOut, 1);
+    GhBarrForward(self, (UINT)k, n->pend);
+}
+// #158. Every probe so far repeated ONE state pair. The game's frame program is a
+// mixed sequence of eleven distinct pairs across nineteen resources, in a fixed
+// order, and it is a closed loop -- it leaves every resource in the state its own
+// first barrier expects. So capture it verbatim and replay it. That is the closest
+// thing to being the game short of being the game, and unlike the game it can be
+// run a hundred times over the fatal dose.
+// gh_barr_prog_cap=N freezes the first list that records N selected transitions.
+static GhProgEnt g_progCap[128]{}, g_progTmp[128]{};
+static LONG g_progCapN = 0, g_progTmpN = 0;
+static ID3D12GraphicsCommandList* g_progList = nullptr;
+static SRWLOCK g_progLk = SRWLOCK_INIT;
+static unsigned GhBarrProgCapN()
+{ static const unsigned v = GhCfgNum(L"gh_barr_prog_cap.txt", "GH_BARR_PROG_CAP", 0); return v; }
+static const GhProgEnt* GhProgCap(LONG* n){ if (n) *n = g_progCapN; return g_progCap; }
+// #158: drop the transitions whose index within their own command list falls in
+// [lo, hi]. Both are stored as index+1 because GhCfgNum cannot carry a zero, so
+// gh_barr_prog_lo=1 is index 0. Leaving hi at 0 means "to the end of the list".
+// The index is counted BEFORE the drop decision, so it does not shift as the
+// bisect narrows -- index 37 names the same barrier in every run.
+static unsigned GhBarrProgLo()
+{ static const unsigned v = GhCfgNum(L"gh_barr_prog_lo.txt", "GH_BARR_PROG_LO", 0); return v; }
+static unsigned GhBarrProgHi()
+{ static const unsigned v = GhCfgNum(L"gh_barr_prog_hi.txt", "GH_BARR_PROG_HI", 0); return v; }
+static bool GhBarrProgOn(){ return GhBarrProgLo() || GhBarrProgHi(); }
+// #158. Until loader 0.0.261.0 only the DIRECT list vtable was hooked, so every
+// barrier filter -- gh_barr_dropall included -- silently spared COPY lists. The
+// one configuration that has ever survived was measured under that gap, and it
+// now hangs. gh_barr_type restricts the whole filter to ONE list type so that
+// exact pre-fix behaviour can be reproduced on the current build: value+1, so
+// 1=DIRECT, 2=BUNDLE, 3=COMPUTE, 4=COPY. Lists of any other type pass untouched.
+static unsigned GhBarrType()
+{ static const unsigned v = GhCfgNum(L"gh_barr_type.txt", "GH_BARR_TYPE", 0); return v; }
+static bool GhBarrBisectOn()
+{ return GhBarrGStop() || GhBarrGDrop() || GhBarrDropAll() ||
+         GhBarrPairB() || GhBarrPairA() || GhBarrEclHi() ||
+         GhBarrResW() || GhBarrResWMin() || GhBarrResWMax() ||
+         GhBarrResFmt() || GhBarrSplit() ||
+         GhBarrKeepEvery() || GhBarrInvert() || GhBarrResMod() ||
+         GhBarrProgOn() ||
+         (GhBarrRwFrom() && GhBarrRwTo()); }
+
+// A full census of the SELECTED transitions, so the answer no longer depends on
+// which rate-limited BARRSEL lines the log sampler happened to keep.
+struct GhBarrPairNote { unsigned before, after; LONG n; };
+static GhBarrPairNote g_barrPair[24]{};
+static volatile LONG g_barrPairN = 0;
+struct GhBarrResNote { void* res; LONG n; D3D12_RESOURCE_DESC d; LONG nPair; };
+static GhBarrResNote g_barrRes[96]{};
+static volatile LONG g_barrResN = 0;
+static SRWLOCK g_barrCensusLk = SRWLOCK_INIT;
+static LONG GhBarrCensus(const D3D12_RESOURCE_BARRIER& x)
+{
+    AcquireSRWLockExclusive(&g_barrCensusLk);
+    LONG np = g_barrPairN, i = 0;
+    for (; i < np; ++i)
+        if (g_barrPair[i].before == (unsigned)x.Transition.StateBefore &&
+            g_barrPair[i].after  == (unsigned)x.Transition.StateAfter) break;
+    if (i < np) ++g_barrPair[i].n;
+    else if (np < (LONG)(sizeof(g_barrPair)/sizeof(g_barrPair[0]))){
+        g_barrPair[np] = { (unsigned)x.Transition.StateBefore,
+                           (unsigned)x.Transition.StateAfter, 1 };
+        g_barrPairN = np + 1;
+    }
+    LONG nr = g_barrResN, j = 0;
+    for (; j < nr; ++j) if (g_barrRes[j].res == (void*)x.Transition.pResource) break;
+    // Which resources actually carry the fatal pair? The first nineteen the census
+    // sees are start-up 0x0->0x4 surfaces, not these; picking by index would probe
+    // the wrong ones.
+    const unsigned sb = (unsigned)x.Transition.StateBefore, sa = (unsigned)x.Transition.StateAfter;
+    const bool isPair = (sb == 0x4u && sa == 0xAC3u) || (sb == 0xAC3u && sa == 0x4u);
+    if (j < nr){ ++g_barrRes[j].n; if (isPair) ++g_barrRes[j].nPair; }
+    else if (nr < (LONG)(sizeof(g_barrRes)/sizeof(g_barrRes[0]))){
+        // Take the descriptor HERE, while the guest is recording a barrier on the
+        // resource and it is certainly still alive. Reading it at stall time would
+        // be a dereference of a pointer the game may already have released.
+        D3D12_RESOURCE_DESC d{};
+        if (x.Transition.pResource) d = x.Transition.pResource->GetDesc();
+        g_barrRes[nr] = { (void*)x.Transition.pResource, 1, d, isPair ? 1 : 0 };
+        g_barrResN = nr + 1;
+    }
+    ReleaseSRWLockExclusive(&g_barrCensusLk);
+    return j;   // the resource's stable slot for this run
+}
+static ID3D12Resource* GhBarrCensusRes(unsigned i, unsigned* n, bool pairOnly)
+{
+    AcquireSRWLockExclusive(&g_barrCensusLk);
+    const LONG have = g_barrResN;
+    ID3D12Resource* r = nullptr;
+    LONG seen = 0;
+    for (LONG j = 0; j < have; ++j){
+        if (pairOnly && g_barrRes[j].nPair <= 0) continue;
+        if ((LONG)i == seen) r = (ID3D12Resource*)g_barrRes[j].res;
+        ++seen;
+    }
+    ReleaseSRWLockExclusive(&g_barrCensusLk);
+    if (n) *n = (unsigned)seen;
+    return r;
+}
+static const UINT kBarrBisect = 1024;   // the start-up batch alone carries 980
+static const UINT kBarrOut = 2 * kBarrBisect;   // splitting doubles a batch
+// One selected barrier goes out as itself, as an adjacent BEGIN/END pair, or as a
+// BEGIN now with its END deferred to the end of the batch.
+static void GhBarrEmit(D3D12_RESOURCE_BARRIER* out, UINT& k,
+                       D3D12_RESOURCE_BARRIER* ends, UINT& ke,
+                       const D3D12_RESOURCE_BARRIER& x, unsigned split)
+{
+    if (!split || x.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION){
+        if (k < kBarrOut) out[k++] = x;
+        return;
+    }
+    D3D12_RESOURCE_BARRIER a = x, z = x;
+    a.Flags = D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY;
+    z.Flags = D3D12_RESOURCE_BARRIER_FLAG_END_ONLY;
+    InterlockedIncrement(&g_barrSplit);
+    if (k < kBarrOut) out[k++] = a;
+    if (split == 1){ if (k < kBarrOut) out[k++] = z; }
+    else if (ke < kBarrBisect) ends[ke++] = z;
+}
+static void GhBarrCensusDump(const char* when)
+{
+    AcquireSRWLockExclusive(&g_barrCensusLk);
+    std::string pl;
+    for (LONG i = 0; i < g_barrPairN; ++i)
+        pl += " " + Hex((uint32_t)g_barrPair[i].before) + "->" +
+              Hex((uint32_t)g_barrPair[i].after) + "=" +
+              std::to_string((long)g_barrPair[i].n);
+    std::string rl;
+    for (LONG i = 0; i < g_barrResN && i < 32; ++i)
+        rl += " " + Hex((uint64_t)(uintptr_t)g_barrRes[i].res) + "=" +
+              std::to_string((long)g_barrRes[i].n);
+    std::string dl;
+    for (LONG i = 0; i < g_barrResN && i < 32; ++i){
+        const D3D12_RESOURCE_DESC& d = g_barrRes[i].d;
+        dl += "\n    " + Hex((uint64_t)(uintptr_t)g_barrRes[i].res) +
+              " fmt=" + std::to_string((unsigned long)d.Format) +
+              " " + std::to_string((unsigned long long)d.Width) + "x" +
+              std::to_string((unsigned long)d.Height) +
+              " dim=" + std::to_string((unsigned long)d.Dimension) +
+              " mips=" + std::to_string((unsigned long)d.MipLevels) +
+              " arr=" + std::to_string((unsigned long)d.DepthOrArraySize) +
+              " samp=" + std::to_string((unsigned long)d.SampleDesc.Count) +
+              " layout=" + std::to_string((unsigned long)d.Layout) +
+              " flags=" + Hex((uint32_t)d.Flags) +
+              " n=" + std::to_string((long)g_barrRes[i].n);
+    }
+    const LONG nr = g_barrResN;
+    ReleaseSRWLockExclusive(&g_barrCensusLk);
+    Diag(std::string("BARRPAIRS ") + when + " pairs=" + std::to_string((long)g_barrPairN) + pl);
+    Diag(std::string("BARRRES ") + when + " distinct=" + std::to_string((long)nr) + rl);
+    Diag(std::string("BARRRESDESC ") + when + dl);
+}
+static volatile LONG g_barrSeq = 0, g_barrDropped = 0;
+// Every RENDER_TARGET transition that survives ALL filtering and reaches the driver.
+// `selected`/`dropped` only count barriers that passed the participation filters, so
+// until now no log line said how many actually executed -- which is the whole
+// measurement for the density experiment.
+static volatile LONG g_barrIssued = 0;
+static void GhBarrSelStats(const char* when)
+{
+    GhIssuedPairsDump(when);
+    if (GhBarrBisectOn()) GhBarrCensusDump(when);
+    Diag(std::string("BARRSELSTATS ") + when +
+         " sel=" + Hex((uint32_t)GhBarrSel()) +
+         " before=" + (GhBarrPairB() ? Hex((uint32_t)(GhBarrPairB() - 1u)) : std::string("*")) +
+         " after=" + (GhBarrPairA() ? Hex((uint32_t)(GhBarrPairA() - 1u)) : std::string("*")) +
+         " ecl=[" + std::to_string((unsigned long)GhBarrEclLo()) + "," +
+                    std::to_string((unsigned long)GhBarrEclHi()) + "]" +
+         " w=" + std::to_string((unsigned long)GhBarrResW()) +
+         " wmin=" + std::to_string((unsigned long)GhBarrResWMin()) +
+         " wmax=" + std::to_string((unsigned long)GhBarrResWMax()) +
+         " fmt=" + std::to_string((unsigned long)GhBarrResFmt()) +
+         " split=" + std::to_string((unsigned long)GhBarrSplit()) +
+         " splitted=" + std::to_string((long)InterlockedCompareExchange(&g_barrSplit, 0, 0)) +
+         " rw=" + std::to_string((unsigned long)GhBarrRwFrom()) + "/" +
+                    std::to_string((unsigned long)GhBarrRwTo()) +
+         " rewritten=" + std::to_string((long)InterlockedCompareExchange(&g_barrRw, 0, 0)) +
+         " dropall=" + std::to_string((unsigned long)GhBarrDropAll()) +
+         " gstop=" + std::to_string((unsigned long)GhBarrGStop()) +
+         " gdrop=" + std::to_string((unsigned long)GhBarrGDrop()) +
+         " issued=" + std::to_string((long)InterlockedCompareExchange(&g_barrIssued, 0, 0)) +
+         " coal=" + std::to_string((long)g_barrCoalIn) + "/" + std::to_string((long)g_barrCoalOut) +
+         " keep_every=" + std::to_string((unsigned long)GhBarrKeepEvery()) +
+         " res_mod=" + std::to_string((unsigned long)GhBarrResMod()) +
+         "/" + std::to_string((unsigned long)(GhBarrResRem() ? GhBarrResRem() - 1u : 0u)) +
+         " invert=" + std::to_string((unsigned long)GhBarrInvert()) +
+         " selected=" + std::to_string((long)InterlockedCompareExchange(&g_barrSeq, 0, 0)) +
+         " dropped=" + std::to_string((long)InterlockedCompareExchange(&g_barrDropped, 0, 0)));
+}
+
+
+// The zero-cost form of the same idea. Rather than giving an aliased render target
+// its own memory, tell the driver its memory has a new tenant: an ALIASING barrier
+// with pResourceBefore = NULL is exactly the "discard whatever metadata the previous
+// occupant left" signal, and the game issues none all run. Emitted once per resource,
+// as its own ResourceBarrier call immediately before the batch that first transitions
+// it, which is where D3D12 wants it.
+//   gh_alias_fix = 1   only for placements we detected landing on used memory
+//   gh_alias_fix = 2   for every resource that carries a transition, aliased or not
+//   gh_alias_fix = 3   both sides of every heap-range collision -- the later
+//                      placements AND the earlier occupant they landed on. Mode 1
+//                      emitted zero barriers on a 9-frame run (863 resources
+//                      flagged, none of them ever transitioned) because the
+//                      surface the game renders to is always the FIRST placement
+//                      in its range; mode 3 is that run made meaningful.
+static unsigned GhAliasFix()
+{ static const unsigned n = GhCfgNum(L"gh_alias_fix.txt", "GH_ALIAS_FIX", 0); return n; }
+#define GH_ALIASRES_MAX 4096
+static void* g_aliasRes[GH_ALIASRES_MAX]{};
+static volatile LONG g_aliasResN = 0;
+static void* g_aliasDone[GH_ALIASRES_MAX]{};
+static volatile LONG g_aliasDoneN = 0;
+static volatile LONG g_aliasEmit = 0;
+static SRWLOCK g_aliasLk = SRWLOCK_INIT;
+// #158. Deduplicated. Mode 3 notes the prior occupant once per collision, and a
+// range holds twelve to fourteen tenants, so without this the 4096-entry table
+// saturates on duplicates of the first few surfaces and silently drops every
+// distinct resource discovered afterwards -- which is what
+// "aliased_resources=4096 barriers_emitted=23" was reporting.
+static volatile LONG g_aliasNoteDrop = 0;
+static void GhAliasNote(void* res)
+{
+    if (!res) return;
+    AcquireSRWLockExclusive(&g_aliasLk);
+    bool have = false;
+    for (LONG i = 0; i < g_aliasResN; ++i) if (g_aliasRes[i] == res){ have = true; break; }
+    if (!have){
+        if (g_aliasResN < GH_ALIASRES_MAX) g_aliasRes[g_aliasResN++] = res;
+        else InterlockedIncrement(&g_aliasNoteDrop);
+    }
+    ReleaseSRWLockExclusive(&g_aliasLk);
+}
+// True once per resource: the first time it needs its aliasing barrier.
+static bool GhAliasNeeds(void* res)
+{
+    const unsigned mode = GhAliasFix();
+    if (!mode || !res) return false;
+    bool need = false;
+    AcquireSRWLockExclusive(&g_aliasLk);
+    if (mode == 1 || mode == 3){
+        need = false;
+        for (LONG i = 0; i < g_aliasResN; ++i) if (g_aliasRes[i] == res){ need = true; break; }
+    } else need = true;
+    if (need){
+        for (LONG i = 0; i < g_aliasDoneN; ++i) if (g_aliasDone[i] == res){ need = false; break; }
+        if (need && g_aliasDoneN < GH_ALIASRES_MAX) g_aliasDone[g_aliasDoneN++] = res;
+        else if (need) need = false;                 // table full: stop, do not repeat
+    }
+    ReleaseSRWLockExclusive(&g_aliasLk);
+    return need;
+}
+static void GhAliasEmit(ID3D12GraphicsCommandList* self, UINT num,
+                        const D3D12_RESOURCE_BARRIER* b)
+{
+    if (!GhAliasFix() || !b) return;
+    static thread_local D3D12_RESOURCE_BARRIER ab[64];
+    UINT k = 0;
+    for (UINT i = 0; i < num && k < 64; ++i){
+        if (b[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) continue;
+        if (!GhAliasNeeds(b[i].Transition.pResource)) continue;
+        ab[k] = {};
+        ab[k].Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+        ab[k].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+        ab[k].Aliasing.pResourceBefore = nullptr;
+        ab[k].Aliasing.pResourceAfter = b[i].Transition.pResource;
+        const LONG n = InterlockedIncrement(&g_aliasEmit);
+        if (n <= 96 || (n % 256) == 0)
+            Diag("ALIASFIX n=" + std::to_string((long)n) +
+                 " res=" + Hex((uint64_t)(uintptr_t)b[i].Transition.pResource) +
+                 " before its " + Hex((uint32_t)b[i].Transition.StateBefore) + "->" +
+                 Hex((uint32_t)b[i].Transition.StateAfter));
+        ++k;
+    }
+    if (k) GhBarrForward(self, k, ab);
+}
+static void GhAliasStats(const char* when)
+{
+    if (!GhAliasFix()) return;
+    Diag(std::string("ALIASFIXSTATS ") + when +
+         " mode=" + std::to_string((unsigned long)GhAliasFix()) +
+         " aliased_resources=" + std::to_string((long)InterlockedCompareExchange(&g_aliasResN,0,0)) +
+         " dropped_full=" + std::to_string((long)InterlockedCompareExchange(&g_aliasNoteDrop,0,0)) +
+         " barriers_emitted=" + std::to_string((long)InterlockedCompareExchange(&g_aliasEmit,0,0)));
+}
+// Every barrier this hook hands to the driver goes through here, so the count is of
+// what actually executed rather than of what the game asked for.
+// Broken down by state pair, because the total is NOT what is conserved: dropping
+// RENDER_TARGET -> GENERIC_READ lets 5495 other RT transitions execute without dying,
+// where an untouched run dies after ~600. Only a per-pair tally of what actually
+// EXECUTED can say which pair carries the budget.
+struct GhIssuedPair { unsigned before, after; volatile LONG n; };
+static GhIssuedPair g_issuedPair[24];
+static LONG g_issuedPairN = 0;
+static SRWLOCK g_issuedPairLk = SRWLOCK_INIT;
+static void GhIssuedTally(const D3D12_RESOURCE_BARRIER& x)
+{
+    AcquireSRWLockExclusive(&g_issuedPairLk);
+    LONG n = g_issuedPairN, i = 0;
+    for (; i < n; ++i)
+        if (g_issuedPair[i].before == (unsigned)x.Transition.StateBefore &&
+            g_issuedPair[i].after  == (unsigned)x.Transition.StateAfter) break;
+    if (i < n) ++g_issuedPair[i].n;
+    else if (n < (LONG)(sizeof(g_issuedPair)/sizeof(g_issuedPair[0]))){
+        g_issuedPair[n] = { (unsigned)x.Transition.StateBefore,
+                            (unsigned)x.Transition.StateAfter, 1 };
+        g_issuedPairN = n + 1;
+    }
+    ReleaseSRWLockExclusive(&g_issuedPairLk);
+}
+static void GhIssuedPairsDump(const char* when)
+{
+    std::string s = "ISSUEDPAIRS "; s += when;
+    AcquireSRWLockExclusive(&g_issuedPairLk);
+    const LONG n = g_issuedPairN;
+    s += " pairs=" + std::to_string((long)n);
+    for (LONG i = 0; i < n; ++i)
+        s += " " + Hex((uint32_t)g_issuedPair[i].before) + "->" +
+             Hex((uint32_t)g_issuedPair[i].after) + "=" +
+             std::to_string((long)g_issuedPair[i].n);
+    ReleaseSRWLockExclusive(&g_issuedPairLk);
+    Diag(s);
+}
+static void GhBarrIssue(ID3D12GraphicsCommandList* self, UINT n,
+                        const D3D12_RESOURCE_BARRIER* arr)
+{
+    for (UINT i = 0; i < n && arr; ++i)
+        if (arr[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
+            (((unsigned)arr[i].Transition.StateBefore |
+              (unsigned)arr[i].Transition.StateAfter) &
+             (unsigned)D3D12_RESOURCE_STATE_RENDER_TARGET)){
+            const LONG now = InterlockedIncrement(&g_barrIssued);
+            GhIssuedTally(arr[i]);
+            const unsigned every = GhBarrMemEvery();
+            // One sampler at a time: this runs on whichever guest thread is recording.
+            if (every && ((unsigned)now % every) == 0 &&
+                InterlockedCompareExchange(&g_barrMemBusy, 1, 0) == 0){
+                const std::string w = "barr" + std::to_string((long)now);
+                GhLogMemoryBudget(w.c_str());
+                GhIssuedPairsDump(w.c_str());
+                InterlockedExchange(&g_barrMemBusy, 0);
+            }
+        }
+    if (GhBarrCoalesce()){
+        if (GhCLNote* nt = GhCLFind(self)){
+            InterlockedAdd(&g_barrCoalIn, 1);
+            for (UINT i = 0; i < n; ++i){
+                if (nt->npend >= (LONG)(sizeof(nt->pend)/sizeof(nt->pend[0])))
+                    GhBarrFlushPending(self);
+                nt->pend[nt->npend++] = arr[i];
+            }
+            return;
+        }
+    }
+    GhBarrForward(self, n, arr);
+}
+// #158. The NARROWED-STATE probe, and it is a candidate fix rather than only a
+// probe. The GPU dies inside ONE transition; contents, ordinal, wall-clock and
+// aliasing have each been eliminated, so the transition itself is what is left.
+// RENDER_TARGET -> GENERIC_READ (0xac3) tells the driver to undo the render
+// target's compression for EVERY kind of read at once -- shader sampling, copy
+// source, indirect arguments, vertex and index fetch. The surfaces that hang are
+// a blur pyramid the game only ever samples. Narrowing the destination changes
+// how much metadata the driver must resolve and changes not one pixel.
+//
+//   gh_barr_narrow = 1   -> 0xc0   PIXEL | NON_PIXEL_SHADER_RESOURCE
+//   gh_barr_narrow = 2   -> 0x80   PIXEL_SHADER_RESOURCE alone
+//   gh_barr_narrow = 3   -> 0x8c0  the above plus COPY_SOURCE
+//
+// ONLY transitions whose other side is RENDER_TARGET are rewritten, so a surface
+// enters the narrowed state solely through 4->narrow and leaves solely through
+// narrow->4: self-consistent by construction, with no need to touch creation
+// states. The corpus has exactly one resource that mixes 4<->ac3 with 8->ac3,
+// and it reaches 8->ac3 first, so the poison list catches it before anything of
+// its has been rewritten. NARROWSTATS reports `LATE_MISMATCH`, which is the only
+// way that ordering can fail -- a run with a nonzero one is VOID, not a result.
+static unsigned GhBarrNarrow()
+{ static const unsigned n = GhCfgNum(L"gh_barr_narrow.txt", "GH_BARR_NARROW", 0); return n; }
+static unsigned GhBarrNarrowState()
+{
+    switch (GhBarrNarrow()){
+    case 2:  return (unsigned)D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    case 3:  return (unsigned)(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    default: return (unsigned)(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+}
+#define GH_NARROW_MAX 1024
+static void* g_nrPoison[GH_NARROW_MAX]{}; static volatile LONG g_nrPoisonN = 0;
+static void* g_nrDone  [GH_NARROW_MAX]{}; static volatile LONG g_nrDoneN   = 0;
+static volatile LONG g_nrRewrote = 0, g_nrLate = 0, g_nrSkipped = 0, g_nrOver = 0;
+static SRWLOCK g_nrLk = SRWLOCK_INIT;
+static bool GhNarrowPoisoned(void* r)
+{
+    bool poisoned = false;
+    AcquireSRWLockShared(&g_nrLk);
+    for (LONG i = 0; i < g_nrPoisonN; ++i) if (g_nrPoison[i] == r){ poisoned = true; break; }
+    ReleaseSRWLockShared(&g_nrLk);
+    return poisoned;
+}
+static void GhNarrowPoison(void* r)
+{
+    if (!r) return;
+    AcquireSRWLockExclusive(&g_nrLk);
+    bool have = false;
+    for (LONG i = 0; i < g_nrPoisonN; ++i) if (g_nrPoison[i] == r){ have = true; break; }
+    if (!have){
+        if (g_nrPoisonN < GH_NARROW_MAX) g_nrPoison[g_nrPoisonN++] = r;
+        else InterlockedIncrement(&g_nrOver);
+        // Poisoned AFTER we already narrowed it: the guest now believes a state we
+        // have rewritten out from under it. Says so loudly rather than scoring.
+        for (LONG i = 0; i < g_nrDoneN; ++i) if (g_nrDone[i] == r){ InterlockedIncrement(&g_nrLate); break; }
+    }
+    ReleaseSRWLockExclusive(&g_nrLk);
+}
+static void GhNarrowNoteDone(void* r)
+{
+    AcquireSRWLockExclusive(&g_nrLk);
+    bool have = false;
+    for (LONG i = 0; i < g_nrDoneN; ++i) if (g_nrDone[i] == r){ have = true; break; }
+    if (!have){
+        if (g_nrDoneN < GH_NARROW_MAX) g_nrDone[g_nrDoneN++] = r;
+        else InterlockedIncrement(&g_nrOver);
+    }
+    ReleaseSRWLockExclusive(&g_nrLk);
+}
+static void GhNarrowStats(const char* when)
+{
+    if (!GhBarrNarrow()) return;
+    Diag(std::string("NARROWSTATS ") + when +
+         " mode=" + std::to_string((unsigned long)GhBarrNarrow()) +
+         " state=" + Hex((uint32_t)GhBarrNarrowState()) +
+         " rewritten=" + std::to_string((long)InterlockedCompareExchange(&g_nrRewrote,0,0)) +
+         " surfaces=" + std::to_string((long)InterlockedCompareExchange(&g_nrDoneN,0,0)) +
+         " poisoned=" + std::to_string((long)InterlockedCompareExchange(&g_nrPoisonN,0,0)) +
+         " skipped_poisoned=" + std::to_string((long)InterlockedCompareExchange(&g_nrSkipped,0,0)) +
+         " LATE_MISMATCH=" + std::to_string((long)InterlockedCompareExchange(&g_nrLate,0,0)) +
+         " table_over=" + std::to_string((long)InterlockedCompareExchange(&g_nrOver,0,0)));
+}
+// #158. ACTIVATION-TIME RE-INITIALISATION. Two halves of the D3D12-mandated
+// sequence for re-using an aliased placed render target have each been tested
+// alone, one-shot, and each came back negative:
+//
+//   gh_rtds_init  initialises 2077 surfaces -- ONCE, at a pre-submit flush.
+//   gh_alias_fix  emits the aliasing barrier -- ONCE per resource, ever
+//                 (GhAliasNeeds keeps a g_aliasDone guard).
+//
+// Neither can hold. The fatal surfaces are 12-14 placements aliased at one heap
+// offset and cycled continuously, and the spec is explicit that after an aliasing
+// barrier activates a placed resource its contents AND its compression metadata
+// are undefined until the resource is Cleared, Discarded, or fully overwritten.
+// So one initialisation at start-up is void the first time the offset is re-used,
+// and an aliasing barrier on its own never makes metadata valid. The combination,
+// every cycle, has never run -- which is what this knob does.
+//
+//   gh_alias_reinit = 1   aliasing barrier + DiscardResource, every activation
+//   gh_alias_reinit = 2   DiscardResource only      (is the discard the half that matters?)
+//   gh_alias_reinit = 3   aliasing barrier only, every time, no once-guard
+//                         (is the g_aliasDone guard what made gh_alias_fix a false negative?)
+//
+// "Activation" is any transition into RENDER_TARGET of a resource the placement
+// registry knows to share heap bytes with another. The aliasing barrier goes in
+// BEFORE the game's own batch; the discard goes AFTER it, when the surface is
+// actually in RENDER_TARGET state and Discard is legal on it.
+static unsigned GhAliasReinit()
+{ static const unsigned n = GhCfgNum(L"gh_alias_reinit.txt", "GH_ALIAS_REINIT", 0); return n; }
+static bool GhAliasIsKnown(void* res)
+{
+    if (!res) return false;
+    bool have = false;
+    AcquireSRWLockShared(&g_aliasLk);
+    for (LONG i = 0; i < g_aliasResN; ++i) if (g_aliasRes[i] == res){ have = true; break; }
+    ReleaseSRWLockShared(&g_aliasLk);
+    return have;
+}
+static volatile LONG g_riAlias = 0, g_riDiscard = 0, g_riSeen = 0, g_riOver = 0;
+// Collects on construction, discards on destruction, so every one of
+// Hook_CLBarrier's return paths is covered rather than only the last one.
+struct GhReinitScope {
+    ID3D12GraphicsCommandList* cl;
+    void* res[32];
+    UINT  n;
+    GhReinitScope(ID3D12GraphicsCommandList* self, UINT num,
+                  const D3D12_RESOURCE_BARRIER* b) : cl(self), n(0)
+    {
+        const unsigned mode = GhAliasReinit();
+        if (!mode || !b || !num) return;
+        for (UINT i = 0; i < num; ++i){
+            if (b[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) continue;
+            if (b[i].Transition.StateAfter != D3D12_RESOURCE_STATE_RENDER_TARGET) continue;
+            void* r = (void*)b[i].Transition.pResource;
+            if (!GhAliasIsKnown(r)) continue;
+            if (n >= 32){ InterlockedIncrement(&g_riOver); break; }
+            res[n++] = r;
+        }
+        if (!n) return;
+        InterlockedExchangeAdd(&g_riSeen, (LONG)n);
+        if (mode == 1 || mode == 3){
+            D3D12_RESOURCE_BARRIER ab[32]{};
+            for (UINT i = 0; i < n; ++i){
+                ab[i].Type  = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+                ab[i].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+                ab[i].Aliasing.pResourceBefore = nullptr;
+                ab[i].Aliasing.pResourceAfter  = (ID3D12Resource*)res[i];
+            }
+            const LONG k = InterlockedExchangeAdd(&g_riAlias, (LONG)n) + (LONG)n;
+            if (k <= 8 || (k % 1024) == 0)
+                Diag("REINIT alias n=" + std::to_string((long)k) +
+                     " res=" + Hex((uint64_t)(uintptr_t)res[0]));
+            GhBarrForward(cl, n, ab);
+        }
+    }
+    ~GhReinitScope()
+    {
+        const unsigned mode = GhAliasReinit();
+        if (!n || !(mode == 1 || mode == 2)) return;
+        for (UINT i = 0; i < n; ++i){
+            ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*,
+                const D3D12_DISCARD_REGION*))GhClOrig(cl, 51))(
+                    cl, (ID3D12Resource*)res[i], nullptr);
+            const LONG k = InterlockedIncrement(&g_riDiscard);
+            if (k <= 8 || (k % 1024) == 0)
+                Diag("REINIT discard n=" + std::to_string((long)k) +
+                     " res=" + Hex((uint64_t)(uintptr_t)res[i]));
+        }
+    }
+};
+static void GhReinitStats(const char* when)
+{
+    if (!GhAliasReinit()) return;
+    Diag(std::string("REINITSTATS ") + when +
+         " mode=" + std::to_string((unsigned long)GhAliasReinit()) +
+         " activations=" + std::to_string((long)InterlockedCompareExchange(&g_riSeen,0,0)) +
+         " aliasing_barriers=" + std::to_string((long)InterlockedCompareExchange(&g_riAlias,0,0)) +
+         " discards=" + std::to_string((long)InterlockedCompareExchange(&g_riDiscard,0,0)) +
+         " registry=" + std::to_string((long)InterlockedCompareExchange(&g_aliasResN,0,0)) +
+         " batch_over=" + std::to_string((long)InterlockedCompareExchange(&g_riOver,0,0)));
+}
 static void __stdcall Hook_CLBarrier(ID3D12GraphicsCommandList* self, UINT num,
                                      const D3D12_RESOURCE_BARRIER* b)
 {
+    GhAliasEmit(self, num, b);
+    GhReinitScope reinit(self, num, b);          // #158: discards fire on every exit path
     if (GhCLNote* n = GhCLFind(self)) InterlockedAdd(&n->barriers, (LONG)num);
     // #158: barriers are what hangs this device. With every work-issuing call in
     // the list already dropped, keeping barriers still hangs it and dropping them
@@ -5944,7 +11946,7 @@ static void __stdcall Hook_CLBarrier(ID3D12GraphicsCommandList* self, UINT num,
             D3D12_RESOURCE_BARRIER u{};
             u.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
             u.UAV.pResource = nullptr;
-            ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*))g_clVtOrig[26])(self, 1, &u);
+            GhBarrIssue(self, 1, &u);
             return;
         }
         if ((barrMode == 1 || barrMode == 3) && num <= kBarrKeep){
@@ -5961,7 +11963,7 @@ static void __stdcall Hook_CLBarrier(ID3D12GraphicsCommandList* self, UINT num,
                 keep[k++] = b[i];
             }
             if (!k) return;
-            ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*))g_clVtOrig[26])(self, k, keep);
+            GhBarrIssue(self, k, keep);
             return;
         }
     }
@@ -5993,10 +11995,42 @@ static void __stdcall Hook_CLBarrier(ID3D12GraphicsCommandList* self, UINT num,
                 Diag("BARRIERSTATEDROP mask=" + Hex(dropStates) + " dropped=" + std::to_string((unsigned)dropped) +
                      " kept=" + std::to_string((unsigned)k) + " call=" + std::to_string((long)q));
             if (!k) return;
-            ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*))g_clVtOrig[26])(self, k, keep);
+            GhBarrIssue(self, k, keep);
             return;
         }
         }
+    }
+    // #158 narrowed-state probe. Runs last, so everything downstream -- the
+    // census, the barrier ring, the breadcrumb markers -- records the states we
+    // actually issue rather than the ones the game asked for.
+    if (GhBarrNarrow() && num && b && num <= kBarrKeep){
+        static thread_local D3D12_RESOURCE_BARRIER nb[kBarrKeep];
+        const unsigned GR = 0xac3u;
+        const unsigned RT = (unsigned)D3D12_RESOURCE_STATE_RENDER_TARGET;
+        const unsigned NS = GhBarrNarrowState();
+        bool any = false;
+        for (UINT i = 0; i < num; ++i){
+            nb[i] = b[i];
+            if (b[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) continue;
+            const unsigned s0 = (unsigned)b[i].Transition.StateBefore;
+            const unsigned s1 = (unsigned)b[i].Transition.StateAfter;
+            if (s0 != GR && s1 != GR) continue;
+            void* r = (void*)b[i].Transition.pResource;
+            if (!((s0 == RT && s1 == GR) || (s0 == GR && s1 == RT))){ GhNarrowPoison(r); continue; }
+            if (GhNarrowPoisoned(r)){ InterlockedIncrement(&g_nrSkipped); continue; }
+            if (s1 == GR) nb[i].Transition.StateAfter  = (D3D12_RESOURCE_STATES)NS;
+            else          nb[i].Transition.StateBefore = (D3D12_RESOURCE_STATES)NS;
+            GhNarrowNoteDone(r);
+            const LONG nn = InterlockedIncrement(&g_nrRewrote);
+            if (nn <= 8 || (nn % 512) == 0)
+                Diag("NARROW n=" + std::to_string((long)nn) +
+                     " res=" + Hex((uint64_t)(uintptr_t)r) + " " +
+                     Hex((uint32_t)s0) + "->" + Hex((uint32_t)s1) + " becomes " +
+                     Hex((uint32_t)nb[i].Transition.StateBefore) + "->" +
+                     Hex((uint32_t)nb[i].Transition.StateAfter));
+            any = true;
+        }
+        if (any) b = nb;
     }
     if (m & (4096 | 8192)){
         const LONG ecl = InterlockedCompareExchange(&g_eclCount, 0, 0);
@@ -6011,10 +12045,16 @@ static void __stdcall Hook_CLBarrier(ID3D12GraphicsCommandList* self, UINT num,
         bool loud = InterlockedCompareExchange(&shown, 0, 0) < 48;
         std::string det;
         for (UINT i = 0; i < num && b; ++i){
-            const bool ours = (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
-                               (b[i].Transition.pResource == (ID3D12Resource*)g_gfx.guestRT12.get() ||
-                                b[i].Transition.pResource == (ID3D12Resource*)g_gfx.backBuffers[0].get() ||
-                                b[i].Transition.pResource == (ID3D12Resource*)g_gfx.backBuffers[1].get()));
+            // #158: this used to name backBuffers[0] and [1] only, so every cell with
+            // gh_sc_buffers > 2 under-reported "ours" for the buffers past the second.
+            // Walk the live count instead.
+            bool ours = false;
+            if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION){
+                ID3D12Resource* const r = (ID3D12Resource*)b[i].Transition.pResource;
+                ours = (r == (ID3D12Resource*)g_gfx.guestRT12.get());
+                for (UINT bb = 0; !ours && bb < g_gfx.nFrames && bb < kGfxFrames; ++bb)
+                    ours = (r == (ID3D12Resource*)g_gfx.backBuffers[bb].get());
+            }
             if (ours) InterlockedIncrement(&cOurs);
             switch (b[i].Type){
             case D3D12_RESOURCE_BARRIER_TYPE_TRANSITION:
@@ -6061,6 +12101,132 @@ static void __stdcall Hook_CLBarrier(ID3D12GraphicsCommandList* self, UINT num,
                  " on-our-resources=" + std::to_string((long)InterlockedCompareExchange(&cOurs,0,0)));
         }
     }
+    // Per-barrier bisect. Runs after the category/phase filters so the numbering is
+    // over exactly the barriers the current configuration would have issued.
+    if (GhBarrBisectOn()){
+        static thread_local D3D12_RESOURCE_BARRIER bsel[kBarrOut];
+        static thread_local D3D12_RESOURCE_BARRIER bend[kBarrBisect];
+        if (num > kBarrBisect){
+            static LONG warned = 0;
+            if (InterlockedIncrement(&warned) == 1)
+                Diag("BARRSEL passthrough: call carries " + std::to_string((unsigned)num) +
+                     " barriers, over the " + std::to_string((unsigned)kBarrBisect) + " we can filter");
+        } else {
+            const unsigned sel = GhBarrSel();
+            const unsigned pairB = GhBarrPairB(), pairA = GhBarrPairA();
+            const unsigned eclLo = GhBarrEclLo(), eclHi = GhBarrEclHi();
+            const bool dropAll = GhBarrDropAll() != 0;
+            const unsigned resW = GhBarrResW(), resFmt = GhBarrResFmt();
+            const unsigned resWMin = GhBarrResWMin(), resWMax = GhBarrResWMax();
+            const unsigned rwFrom = GhBarrRwFrom(), rwTo = GhBarrRwTo();
+            const unsigned split = GhBarrSplit();
+            const unsigned keepEvery = GhBarrKeepEvery();
+            const unsigned resMod = GhBarrResMod();
+            const unsigned resRem = GhBarrResRem() ? GhBarrResRem() - 1u : 0u;
+            const bool invert = GhBarrInvert() != 0;
+            UINT ke = 0;   // deferred END_ONLY barriers, for split mode 2
+            const LONG stopN = (LONG)GhBarrGStop(), dropK = (LONG)GhBarrGDrop();
+            const unsigned ecl = (unsigned)InterlockedCompareExchange(&g_eclCount, 0, 0);
+            UINT k = 0;
+            for (UINT i = 0; i < num && b; ++i){
+                bool part = (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION);
+                if (part && sel)
+                    part = ((((unsigned)b[i].Transition.StateBefore |
+                              (unsigned)b[i].Transition.StateAfter) & sel) != 0);
+                if (part && pairB)
+                    part = ((unsigned)b[i].Transition.StateBefore == pairB - 1u);
+                if (part && pairA)
+                    part = ((unsigned)b[i].Transition.StateAfter == pairA - 1u);
+                if (part){
+                    bool inWin = !eclHi || (ecl >= eclLo && ecl <= eclHi);
+                    if (invert) inWin = !inWin;
+                    part = inWin;
+                }
+                if (part && (resW || resWMin || resWMax || resFmt) && b[i].Transition.pResource){
+                    const D3D12_RESOURCE_DESC rd = b[i].Transition.pResource->GetDesc();
+                    if (resW && rd.Width != (UINT64)resW) part = false;
+                    if (part && resWMin && rd.Width < (UINT64)resWMin) part = false;
+                    if (part && resWMax && rd.Width > (UINT64)resWMax) part = false;
+                    if (part && resFmt && (unsigned)rd.Format != resFmt) part = false;
+                }
+                if (!part){ bsel[k++] = b[i]; continue; }
+                if (rwFrom && rwTo){
+                    D3D12_RESOURCE_BARRIER r = b[i];
+                    bool hit = false;
+                    if ((unsigned)r.Transition.StateBefore == rwFrom - 1u){
+                        r.Transition.StateBefore = (D3D12_RESOURCE_STATES)(rwTo - 1u); hit = true; }
+                    if ((unsigned)r.Transition.StateAfter == rwFrom - 1u){
+                        r.Transition.StateAfter = (D3D12_RESOURCE_STATES)(rwTo - 1u); hit = true; }
+                    if (hit){
+                        const LONG rn = InterlockedIncrement(&g_barrRw);
+                        if (rn <= 4 || (rn % 256) == 0)
+                            Diag("BARRRW n=" + std::to_string((long)rn) +
+                                 " res=" + Hex((uint64_t)(uintptr_t)r.Transition.pResource) +
+                                 " " + Hex((uint32_t)b[i].Transition.StateBefore) + "->" +
+                                 Hex((uint32_t)b[i].Transition.StateAfter) + " becomes " +
+                                 Hex((uint32_t)r.Transition.StateBefore) + "->" +
+                                 Hex((uint32_t)r.Transition.StateAfter));
+                        GhBarrCensus(b[i]);
+                        GhBarrEmit(bsel, k, bend, ke, r, split);
+                        continue;
+                    }
+                }
+                if (GhBarrRetain() && b[i].Transition.pResource)
+                    b[i].Transition.pResource->AddRef();
+                const LONG ri = GhBarrCensus(b[i]);
+                const LONG g = InterlockedIncrement(&g_barrSeq);
+                LONG pidx = -1;
+                LONG ltype = -1;
+                if (GhCLNote* pn = GhCLFind(self)){
+                    pidx = InterlockedIncrement(&pn->progIdx) - 1;
+                    ltype = pn->type;
+                }
+                if (GhBarrProgCapN() && pidx >= 0 && !g_progCapN){
+                    AcquireSRWLockExclusive(&g_progLk);
+                    if (pidx == 0){ g_progList = self; g_progTmpN = 0; }
+                    if (self == g_progList && g_progTmpN < 128 && !g_progCapN){
+                        g_progTmp[g_progTmpN].res    = (void*)b[i].Transition.pResource;
+                        g_progTmp[g_progTmpN].sub    = b[i].Transition.Subresource;
+                        g_progTmp[g_progTmpN].before = (unsigned)b[i].Transition.StateBefore;
+                        g_progTmp[g_progTmpN].after  = (unsigned)b[i].Transition.StateAfter;
+                        ++g_progTmpN;
+                        if (g_progTmpN >= (LONG)GhBarrProgCapN()){
+                            for (LONG c = 0; c < g_progTmpN; ++c) g_progCap[c] = g_progTmp[c];
+                            g_progCapN = g_progTmpN;
+                            Diag("BARRPROGCAP froze " + std::to_string((long)g_progCapN) +
+                                 " transitions from cl=" + Hex((uint64_t)(uintptr_t)self));
+                        }
+                    }
+                    ReleaseSRWLockExclusive(&g_progLk);
+                }
+                bool progDrop = false;
+                if (GhBarrProgOn() && pidx >= 0){
+                    const unsigned lo = GhBarrProgLo() ? GhBarrProgLo() - 1u : 0u;
+                    const unsigned hi = GhBarrProgHi() ? GhBarrProgHi() - 1u : 0xFFFFFFFFu;
+                    progDrop = ((unsigned)pidx >= lo && (unsigned)pidx <= hi);
+                }
+                const bool typeSkip = GhBarrType() && ltype != (LONG)(GhBarrType() - 1u);
+                const bool drop = !typeSkip && (progDrop || dropAll || (dropK && g == dropK) || (stopN && g > stopN) ||
+                                  (keepEvery && ((unsigned)g % keepEvery) != 0) ||
+                                  (resMod && ri >= 0 && ((unsigned)ri % resMod) != resRem));
+                if (g <= 64 || (g % 64) == 0 || g == dropK || g == stopN || g == stopN + 1)
+                    Diag("BARRSEL g=" + std::to_string((long)g) +
+                         (drop ? " DROP" : " keep") +
+                         " res=" + Hex((uint64_t)(uintptr_t)b[i].Transition.pResource) +
+                         " sub=" + Hex((uint32_t)b[i].Transition.Subresource) +
+                         " " + Hex((uint32_t)b[i].Transition.StateBefore) +
+                         "->" + Hex((uint32_t)b[i].Transition.StateAfter) +
+                         " ecl=" + std::to_string((long)InterlockedCompareExchange(&g_eclCount, 0, 0)) +
+                         " p=" + std::to_string((long)pidx) +
+                         " cl=" + Hex((uint64_t)(uintptr_t)self));
+                if (drop){ InterlockedIncrement(&g_barrDropped); continue; }
+                GhBarrEmit(bsel, k, bend, ke, b[i], split);
+            }
+            for (UINT e = 0; e < ke && k < kBarrOut; ++e) bsel[k++] = bend[e];
+            if (!k) return;
+            num = k; b = bsel;
+        }
+    }
     // Sub-kind filtering needs a private copy: the guest's array is const and may
     // be a stack temporary it reuses.
     if ((m & (256 | 512 | 1024 | 2048)) && num <= kBarrKeep){
@@ -6081,10 +12247,17 @@ static void __stdcall Hook_CLBarrier(ID3D12GraphicsCommandList* self, UINT num,
             keep[k++] = b[i];
         }
         if (!k) return;
-        ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*))g_clVtOrig[26])(self, k, keep);
+        GhBarrIssue(self, k, keep);
         return;
     }
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*))g_clVtOrig[26])(self, num, b);
+    GhBarrIssue(self, num, b);
+}
+// #158: the last flush point. Anything still pending when the guest closes the
+// list must go in before it, or the barriers simply never happen.
+static HRESULT __stdcall Hook_CLClose(ID3D12GraphicsCommandList* self)
+{
+    GhBarrFlushPending(self);
+    return ((HRESULT (__stdcall*)(ID3D12GraphicsCommandList*))GhClOrig(self, 9))(self);
 }
 static void __stdcall Hook_CLBeginEvent(ID3D12GraphicsCommandList* self, UINT meta,
                                         const void* data, UINT size)
@@ -6094,17 +12267,117 @@ static void __stdcall Hook_CLBeginEvent(ID3D12GraphicsCommandList* self, UINT me
         Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " BEGINEVENT " +
              (nm.empty() ? ("meta=" + Hex((uint32_t)meta) + " size=" + std::to_string((unsigned long)size)) : nm));
     }
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, const void*, UINT))g_clVtOrig[57])(self, meta, data, size);
+    if (!GhRecCap57(self, meta, data, size))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, const void*, UINT))GhClOrig(self, 57))(self, meta, data, size);
 }
 static void __stdcall Hook_CLEndEvent(ID3D12GraphicsCommandList* self)
 {
     if (GhCLTraceOn()) Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " ENDEVENT");
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*))g_clVtOrig[58])(self);
+    if (!GhRecCap58(self))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*))GhClOrig(self, 58))(self);
 }
+// ---------------------------------------------------------------- #158 indirect args
+// The ExecuteIndirect argument buffer is the one op in the hanging frame whose GPU
+// work size is not in the command stream: the PSO is compute, so the buffer holds
+// D3D12_DISPATCH_ARGUMENTS and a garbage thread-group count is a GPU hang by
+// construction. It lives on a DEFAULT heap, so the CPU cannot Map it -- copy it on
+// the GPU into a READBACK buffer instead and read that once the fence retires.
+static unsigned GhIndArgsMode()
+{ static const unsigned m = (unsigned)GhCfgNum(L"gh_indirect_args.txt", "GH_INDIRECT_ARGS", 0); return m; }
+
+#define GH_IND_SLOTS 64
+#define GH_IND_STRIDE 32
+struct GhIndNote { LONG op; UINT maxCount; UINT64 off; void* cl; void* args; UINT64 bytes; };
+static GhIndNote g_indNote[GH_IND_SLOTS]{};
+static volatile LONG g_indN = 0;
+static com_ptr<ID3D12Resource> g_indRb;
+static bool g_indRbTried = false;
+static SRWLOCK g_indLk = SRWLOCK_INIT;
+
+static bool GhIndEnsureRb(ID3D12GraphicsCommandList* self)
+{
+    if (g_indRb) return true;
+    if (g_indRbTried) return false;
+    g_indRbTried = true;
+    com_ptr<ID3D12Device> dev;
+    if (FAILED(self->GetDevice(__uuidof(ID3D12Device), dev.put_void()))) return false;
+    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = GH_IND_SLOTS * GH_IND_STRIDE;
+    rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                     __uuidof(ID3D12Resource), g_indRb.put_void());
+    if (FAILED(hr)){ Diag("INDARGS readback create failed hr=" + Hex((uint32_t)hr)); return false; }
+    Diag("INDARGS readback ready res=" + Hex((uint64_t)(uintptr_t)g_indRb.get()) +
+         " slots=" + std::to_string((long)GH_IND_SLOTS));
+    return true;
+}
+
+// Copy the arguments on the GPU, through the ORIGINAL vtable slot so our own copy is
+// never counted as a guest op -- the breadcrumb indices must not shift.
+static void GhIndCapture(ID3D12GraphicsCommandList* self, ID3D12Resource* args, UINT64 argOff,
+                         UINT maxCount, LONG op)
+{
+    if (!GhIndArgsMode() || !args) return;
+    // Never read past the end of the argument buffer: the first version asked for 32
+    // bytes from a 12-byte buffer, the runtime errored the command list, the guest's
+    // Close() returned E_INVALIDARG and the game tore the device down at submission 8.
+    const D3D12_RESOURCE_DESC ad = args->GetDesc();
+    if (ad.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || ad.Width <= argOff) return;
+    UINT64 nb = ad.Width - argOff;
+    if (nb > GH_IND_STRIDE) nb = GH_IND_STRIDE;
+    nb &= ~(UINT64)3;                       // whole dwords only
+    if (!nb) return;
+    AcquireSRWLockExclusive(&g_indLk);
+    const bool ok = GhIndEnsureRb(self);
+    LONG s = g_indN;
+    if (ok && s < GH_IND_SLOTS){
+        g_indNote[s].op = op; g_indNote[s].maxCount = maxCount; g_indNote[s].off = argOff;
+        g_indNote[s].cl = self; g_indNote[s].args = args; g_indNote[s].bytes = nb;
+        g_indN = s + 1;
+    } else s = -1;
+    ReleaseSRWLockExclusive(&g_indLk);
+    if (s < 0) return;
+    ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT64,
+                        ID3D12Resource*, UINT64, UINT64))GhClOrig(self, 15))(
+        self, g_indRb.get(), (UINT64)s * GH_IND_STRIDE, args, argOff, nb);
+}
+
+static void GhIndDump(const char* when)
+{
+    if (!GhIndArgsMode() || !g_indRb) return;
+    LONG n = g_indN;
+    if (n <= 0) return;
+    void* p = nullptr;
+    D3D12_RANGE rr{ 0, (SIZE_T)(n * GH_IND_STRIDE) };
+    HRESULT hr = g_indRb->Map(0, &rr, &p);
+    if (FAILED(hr) || !p){ Diag(std::string("INDARGS ") + when + " map hr=" + Hex((uint32_t)hr)); return; }
+    for (LONG i = 0; i < n; ++i){
+        const UINT* a = (const UINT*)((const unsigned char*)p + (size_t)i * GH_IND_STRIDE);
+        std::string s = std::string("INDARGS ") + when + " #" + std::to_string((long)i) +
+                        " op=" + std::to_string((long)g_indNote[i].op) +
+                        " cl=" + Hex((uint64_t)(uintptr_t)g_indNote[i].cl) +
+                        " args=" + Hex((uint64_t)(uintptr_t)g_indNote[i].args) +
+                        " off=" + Hex((uint64_t)g_indNote[i].off) +
+                        " max=" + std::to_string((unsigned long)g_indNote[i].maxCount) +
+                        " bytes=" + std::to_string((unsigned long)g_indNote[i].bytes) + " u32=";
+        const int nd = (int)(g_indNote[i].bytes / 4);
+        for (int k = 0; k < nd; ++k) s += Hex((uint32_t)a[k]) + (k < nd - 1 ? "," : "");
+        Diag(s);
+    }
+    D3D12_RANGE none{0, 0};
+    g_indRb->Unmap(0, &none);
+}
+
 static void __stdcall Hook_CLExecIndirect(ID3D12GraphicsCommandList* self, void* sig, UINT maxCount,
                                           ID3D12Resource* args, UINT64 argOff,
                                           ID3D12Resource* cnt, UINT64 cntOff)
 {
+    GhBarrFlushPending(self);
     if (GhCLNote* n = GhCLFind(self)) InterlockedIncrement(&n->draws);
     const LONG wi = GhWorkIndex(self);
     // This is the one op in the hanging frame whose size is not in the command
@@ -6112,20 +12385,33 @@ static void __stdcall Hook_CLExecIndirect(ID3D12GraphicsCommandList* self, void*
     // thread-group counts, and a garbage count here is a GPU hang by construction.
     // Read them when the buffer is CPU-visible -- on a DEFAULT heap Map simply
     // refuses and says so, which is itself worth knowing.
+    GhIndCapture(self, args, argOff, maxCount, wi);
     if (GhCLTraceOn()){
         std::string extra;
         if (args){
-            void* mp = nullptr;
-            D3D12_RANGE rr{ (SIZE_T)argOff, (SIZE_T)(argOff + 32) };
-            HRESULT mr = args->Map(0, &rr, &mp);
-            if (SUCCEEDED(mr) && mp){
-                const UINT* a = (const UINT*)((const unsigned char*)mp + argOff);
-                extra = " args=";
-                for (int i = 0; i < 6; ++i) extra += Hex((uint32_t)a[i]) + (i < 5 ? "," : "");
-                D3D12_RANGE none{0, 0};
-                args->Unmap(0, &none);
+            // Ask the heap first. Calling Map on a DEFAULT heap is invalid D3D12 usage
+            // -- it is what the debug layer's six id=822 errors were, and they were
+            // ours, not the guest's. The values come back through GhIndCapture instead.
+            D3D12_HEAP_PROPERTIES hp{};
+            D3D12_HEAP_FLAGS hf = D3D12_HEAP_FLAG_NONE;
+            const bool haveHp = SUCCEEDED(args->GetHeapProperties(&hp, &hf));
+            const bool mappable = haveHp && hp.Type != D3D12_HEAP_TYPE_DEFAULT &&
+                                  hp.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
+            if (!mappable){
+                extra = " args-on-gpu-heap type=" + std::to_string((unsigned long)hp.Type);
             } else {
-                extra = " args-not-mappable hr=" + Hex((uint32_t)mr);
+                void* mp = nullptr;
+                D3D12_RANGE rr{ (SIZE_T)argOff, (SIZE_T)(argOff + 32) };
+                HRESULT mr = args->Map(0, &rr, &mp);
+                if (SUCCEEDED(mr) && mp){
+                    const UINT* a = (const UINT*)((const unsigned char*)mp + argOff);
+                    extra = " args=";
+                    for (int i = 0; i < 6; ++i) extra += Hex((uint32_t)a[i]) + (i < 5 ? "," : "");
+                    D3D12_RANGE none{0, 0};
+                    args->Unmap(0, &none);
+                } else {
+                    extra = " args-map-failed hr=" + Hex((uint32_t)mr);
+                }
             }
         }
         GhCLOp(self, "w=" + std::to_string((long)wi) +
@@ -6143,8 +12429,9 @@ static void __stdcall Hook_CLExecIndirect(ID3D12GraphicsCommandList* self, void*
         return;
     }
     const LONG bcg = GhBreadcrumbBefore(self);
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, void*, UINT, ID3D12Resource*, UINT64,
-                        ID3D12Resource*, UINT64))g_clVtOrig[59])(self, sig, maxCount, args, argOff, cnt, cntOff);
+    if (!GhRecCap59(self, sig, maxCount, args, argOff, cnt, cntOff))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, void*, UINT, ID3D12Resource*, UINT64,
+                        ID3D12Resource*, UINT64))GhClOrig(self, 59))(self, sig, maxCount, args, argOff, cnt, cntOff);
     GhBreadcrumbAfter(self, bcg);
 }
 // Copies and clears: the two categories left in a command list once draws,
@@ -6153,85 +12440,142 @@ static void __stdcall Hook_CLExecIndirect(ID3D12GraphicsCommandList* self, void*
 static void __stdcall Hook_CLCopyBufferRegion(ID3D12GraphicsCommandList* self,
     ID3D12Resource* d, UINT64 dOff, ID3D12Resource* sr, UINT64 sOff, UINT64 n)
 {
+    GhBarrFlushPending(self);
     if (GhOpMask() & 16) return;
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT64,
-                        ID3D12Resource*, UINT64, UINT64))g_clVtOrig[15])(self, d, dOff, sr, sOff, n);
+    if (!GhRecCap15(self, d, dOff, sr, sOff, n))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT64,
+                        ID3D12Resource*, UINT64, UINT64))GhClOrig(self, 15))(self, d, dOff, sr, sOff, n);
 }
 static void __stdcall Hook_CLCopyTextureRegion(ID3D12GraphicsCommandList* self,
     const void* d, UINT x, UINT y, UINT z, const void* sr, const void* box)
 {
+    GhBarrFlushPending(self);
     if (GhOpMask() & 16) return;
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, const void*, UINT, UINT, UINT,
-                        const void*, const void*))g_clVtOrig[16])(self, d, x, y, z, sr, box);
+    if (!GhRecCap16(self, d, x, y, z, sr, box))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, const void*, UINT, UINT, UINT,
+                        const void*, const void*))GhClOrig(self, 16))(self, d, x, y, z, sr, box);
 }
 static void __stdcall Hook_CLCopyResource(ID3D12GraphicsCommandList* self,
     ID3D12Resource* d, ID3D12Resource* sr)
 {
+    GhBarrFlushPending(self);
     if (GhOpMask() & 16) return;
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*,
-                        ID3D12Resource*))g_clVtOrig[17])(self, d, sr);
+    if (!GhRecCap17(self, d, sr))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*,
+                        ID3D12Resource*))GhClOrig(self, 17))(self, d, sr);
 }
 static void __stdcall Hook_CLResolveSubresource(ID3D12GraphicsCommandList* self,
     ID3D12Resource* d, UINT ds, ID3D12Resource* sr, UINT ss, DXGI_FORMAT f)
 {
+    GhBarrFlushPending(self);
     if (GhOpMask() & 16) return;
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT,
-                        ID3D12Resource*, UINT, DXGI_FORMAT))g_clVtOrig[19])(self, d, ds, sr, ss, f);
+    if (!GhRecCap19(self, d, ds, sr, ss, f))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT,
+                        ID3D12Resource*, UINT, DXGI_FORMAT))GhClOrig(self, 19))(self, d, ds, sr, ss, f);
 }
+// #158. NC=1 buys exactly one frame by making colour render targets uncompressed,
+// which is the first affirmative evidence that the consumable is RT-compression
+// metadata. The obvious reason the relief stops at one frame is that D3D12 has no
+// way to ask for an UNCOMPRESSED DEPTH buffer -- GhFixRtDesc is legally barred from
+// ALLOW_DEPTH_STENCIL -- so depth metadata is entirely uncovered. Nothing in the log
+// has ever separated a depth clear from a colour one: all four clears share op-mask
+// bit 32 and none is counted. These counters are that missing split, and they cost
+// one interlocked increment on a path that runs a few hundred times a run.
+static volatile LONG g_clrDsv = 0, g_clrRtv = 0, g_clrUavU = 0, g_clrUavF = 0;
+// Creation-side census, counted for every run regardless of the knob so a control
+// and an NC cell are directly comparable.
+static volatile LONG g_resRt = 0, g_resDs = 0, g_resRtMsaa = 0;
+// #158: textures that are UAVs and never render targets. NC=1 cannot see these
+// (GhFixRtDesc gates on ALLOW_RENDER_TARGET), and ClearUnorderedAccessViewUint is
+// 1103 of the 1198 clears this game issues -- so this is the denominator for the
+// one class of clear traffic #158 has never examined.
+static volatile LONG g_resUavOnly = 0, g_noUavN = 0;
+// #158: only 18 textures are UAV-and-never-render-target, yet the game issues
+// 1103 UAV clears. So most of that traffic must land on RT|UAV textures -- which
+// NC=1 ALREADY makes uncompressed. If that is so, the resources behind 92% of the
+// clear traffic are already treated and the wall still stands, which would say the
+// consumable is not the compression state of the cleared resource. Ask the clear
+// itself rather than inferring it: read the target's desc at clear time.
+static volatile LONG g_uavClrRt = 0, g_uavClrPlain = 0, g_uavClrUnknown = 0;
 static void __stdcall Hook_CLClearDsv(ID3D12GraphicsCommandList* self,
     D3D12_CPU_DESCRIPTOR_HANDLE h, D3D12_CLEAR_FLAGS fl, FLOAT depth, UINT8 st,
     UINT nr, const D3D12_RECT* r)
 {
+    InterlockedIncrement(&g_clrDsv);
+    GhBarrFlushPending(self);
     if (GhOpMask() & 32) return;
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE,
+    if (!GhRecCap47(self, h, fl, depth, st, nr, r))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE,
                         D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT,
-                        const D3D12_RECT*))g_clVtOrig[47])(self, h, fl, depth, st, nr, r);
+                        const D3D12_RECT*))GhClOrig(self, 47))(self, h, fl, depth, st, nr, r);
 }
 static void __stdcall Hook_CLClearRtv(ID3D12GraphicsCommandList* self,
     D3D12_CPU_DESCRIPTOR_HANDLE h, const FLOAT c[4], UINT nr, const D3D12_RECT* r)
 {
+    InterlockedIncrement(&g_clrRtv);
+    GhBarrFlushPending(self);
     if (GhOpMask() & 32) return;
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE,
-                        const FLOAT*, UINT, const D3D12_RECT*))g_clVtOrig[48])(self, h, c, nr, r);
+    if (!GhRecCap48(self, h, c, nr, r))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE,
+                        const FLOAT*, UINT, const D3D12_RECT*))GhClOrig(self, 48))(self, h, c, nr, r);
 }
 static void __stdcall Hook_CLClearUavUint(ID3D12GraphicsCommandList* self,
     D3D12_GPU_DESCRIPTOR_HANDLE g, D3D12_CPU_DESCRIPTOR_HANDLE c, ID3D12Resource* res,
     const UINT v[4], UINT nr, const D3D12_RECT* r)
 {
+    InterlockedIncrement(&g_clrUavU);
+    // Attribute the clear to a resource class. GetDesc returns by value and touches
+    // no driver state, so this is safe on the recording thread.
+    if (res){
+        const D3D12_RESOURCE_DESC rdc = res->GetDesc();
+        if (rdc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+            InterlockedIncrement(&g_uavClrRt);
+        else
+            InterlockedIncrement(&g_uavClrPlain);
+    } else InterlockedIncrement(&g_uavClrUnknown);
+    GhBarrFlushPending(self);
     if (GhOpMask() & 32) return;
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, D3D12_GPU_DESCRIPTOR_HANDLE,
+    if (!GhRecCap49(self, g, c, res, v, nr, r))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, D3D12_GPU_DESCRIPTOR_HANDLE,
                         D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*, const UINT*, UINT,
-                        const D3D12_RECT*))g_clVtOrig[49])(self, g, c, res, v, nr, r);
+                        const D3D12_RECT*))GhClOrig(self, 49))(self, g, c, res, v, nr, r);
 }
 static void __stdcall Hook_CLClearUavFloat(ID3D12GraphicsCommandList* self,
     D3D12_GPU_DESCRIPTOR_HANDLE g, D3D12_CPU_DESCRIPTOR_HANDLE c, ID3D12Resource* res,
     const FLOAT v[4], UINT nr, const D3D12_RECT* r)
 {
+    InterlockedIncrement(&g_clrUavF);
+    GhBarrFlushPending(self);
     if (GhOpMask() & 32) return;
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, D3D12_GPU_DESCRIPTOR_HANDLE,
+    if (!GhRecCap50(self, g, c, res, v, nr, r))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, D3D12_GPU_DESCRIPTOR_HANDLE,
                         D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*, const FLOAT*, UINT,
-                        const D3D12_RECT*))g_clVtOrig[50])(self, g, c, res, v, nr, r);
+                        const D3D12_RECT*))GhClOrig(self, 50))(self, g, c, res, v, nr, r);
 }
 static void __stdcall Hook_CLExecuteBundle(ID3D12GraphicsCommandList* self,
                                            ID3D12GraphicsCommandList* b)
 {
+    GhBarrFlushPending(self);
     if (GhOpMask() & 128) return;
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*,
-                        ID3D12GraphicsCommandList*))g_clVtOrig[27])(self, b);
+    if (!GhRecCap27(self, b))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*,
+                        ID3D12GraphicsCommandList*))GhClOrig(self, 27))(self, b);
 }
 static void __stdcall Hook_CLBeginQuery(ID3D12GraphicsCommandList* self,
     ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i)
 {
     if (GhOpMask() & 128) return;
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12QueryHeap*,
-                        D3D12_QUERY_TYPE, UINT))g_clVtOrig[52])(self, h, t, i);
+    if (!GhRecCap52(self, h, t, i))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12QueryHeap*,
+                        D3D12_QUERY_TYPE, UINT))GhClOrig(self, 52))(self, h, t, i);
 }
 static void __stdcall Hook_CLEndQuery(ID3D12GraphicsCommandList* self,
     ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i)
 {
     if (GhOpMask() & 128) return;
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12QueryHeap*,
-                        D3D12_QUERY_TYPE, UINT))g_clVtOrig[53])(self, h, t, i);
+    if (!GhRecCap53(self, h, t, i))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12QueryHeap*,
+                        D3D12_QUERY_TYPE, UINT))GhClOrig(self, 53))(self, h, t, i);
 }
 // ResolveQueryData is the one op left in the list that WRITES to a buffer the
 // game chose, which makes it the obvious suspect if a bad destination is what the
@@ -6241,54 +12585,181 @@ static void __stdcall Hook_CLResolveQuery(ID3D12GraphicsCommandList* self,
     ID3D12Resource* dst, UINT64 off)
 {
     if (GhOpMask() & 128) return;
-    ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12QueryHeap*, D3D12_QUERY_TYPE,
+    if (!GhRecCap54(self, h, t, start, n, dst, off))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12QueryHeap*, D3D12_QUERY_TYPE,
                         UINT, UINT, ID3D12Resource*,
-                        UINT64))g_clVtOrig[54])(self, h, t, start, n, dst, off);
+                        UINT64))GhClOrig(self, 54))(self, h, t, start, n, dst, off);
 }
+
+// #158 gh_cl_rec. Eight stream methods the census caught the game using that had no
+// hook at all -- topology, vertex/index buffers, blend factor, stencil ref, the compute
+// descriptor table, DiscardResource and SetPredication. Without these the relocated
+// stream would replay draws with the wrong pipeline state, which looks exactly like the
+// theory being wrong. They capture and forward; they change nothing when recording is
+// off.
+static void __stdcall Hook_CLIASetTopology(ID3D12GraphicsCommandList* self,
+                                           D3D12_PRIMITIVE_TOPOLOGY t)
+{
+    if (!GhRecCap20(self, t))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*,
+            D3D12_PRIMITIVE_TOPOLOGY))GhClOrig(self, 20))(self, t);
+}
+static void __stdcall Hook_CLOMSetBlendFactor(ID3D12GraphicsCommandList* self, const FLOAT* bf)
+{
+    if (!GhRecCap23(self, bf))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*,
+            const FLOAT*))GhClOrig(self, 23))(self, bf);
+}
+static void __stdcall Hook_CLOMSetStencilRef(ID3D12GraphicsCommandList* self, UINT r)
+{
+    if (!GhRecCap24(self, r))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT))GhClOrig(self, 24))(self, r);
+}
+// #158. Slot 31 forwarded with no VA check at all, and the compute root CBV/SRV/UAV
+// setters (37/39/41) were not hooked, so every binding a DISPATCH uses went
+// unvalidated while the graphics equivalents (32/38/40/42) were fully covered. Heavy
+// submissions carry disp>=6, so this was real unexamined traffic, and a "no bad
+// address" result that silently excluded compute would have been over-read.
+// These validate and forward. They deliberately do NOT capture into the recorder:
+// slots 37/39/41 were never captured before, and adding them now would change what
+// gh_cl_rec replays, which is a different experiment.
+static void __stdcall Hook_CLSetCompTable(ID3D12GraphicsCommandList* self, UINT i,
+                                          D3D12_GPU_DESCRIPTOR_HANDLE h)
+{
+    if (GhVaCheckOn() && h.ptr){
+        InterlockedIncrement(&g_vaChkCmpTbl); GhVaTick();
+        if (!GhGpuHandleToCpu((UINT64)h.ptr))
+            GhVaBad("CMPTABLE", (UINT64)h.ptr, i, self, 0);
+        else if (GhCLNote* nb = GhCLFind(self)){
+            if (!GhHandleInBoundHeap(nb->heaps, (UINT64)h.ptr))
+                GhVaBad("CMPTABLE-UNBOUND", (UINT64)h.ptr, i, self,
+                        (UINT64)(uintptr_t)nb->heaps[0]);
+        }
+    }
+    if (!GhRecCap31(self, i, h))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
+            D3D12_GPU_DESCRIPTOR_HANDLE))GhClOrig(self, 31))(self, i, h);
+}
+static void GhNoteCmpRootVa(ID3D12GraphicsCommandList* self, UINT idx, UINT64 va)
+{
+    if (GhVaCheckOn() && va){
+        InterlockedIncrement(&g_vaChkCmpRoot); GhVaTick();
+        if (!GhVaInBuffer(va)) GhVaBad("CMPROOTVA", va, idx, self, 0);
+    }
+}
+static void __stdcall Hook_CLSetCmpCbv(ID3D12GraphicsCommandList* self, UINT idx,
+                                       D3D12_GPU_VIRTUAL_ADDRESS va)
+{
+    GhNoteCmpRootVa(self, idx, (UINT64)va);
+    ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
+        D3D12_GPU_VIRTUAL_ADDRESS))GhClOrig(self, 37))(self, idx, va);
+}
+static void __stdcall Hook_CLSetCmpSrv(ID3D12GraphicsCommandList* self, UINT idx,
+                                       D3D12_GPU_VIRTUAL_ADDRESS va)
+{
+    GhNoteCmpRootVa(self, idx, (UINT64)va);
+    ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
+        D3D12_GPU_VIRTUAL_ADDRESS))GhClOrig(self, 39))(self, idx, va);
+}
+static void __stdcall Hook_CLSetCmpUav(ID3D12GraphicsCommandList* self, UINT idx,
+                                       D3D12_GPU_VIRTUAL_ADDRESS va)
+{
+    GhNoteCmpRootVa(self, idx, (UINT64)va);
+    ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
+        D3D12_GPU_VIRTUAL_ADDRESS))GhClOrig(self, 41))(self, idx, va);
+}
+static void __stdcall Hook_CLIASetIB(ID3D12GraphicsCommandList* self,
+                                     const D3D12_INDEX_BUFFER_VIEW* v)
+{
+    if (!GhRecCap43(self, v))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*,
+            const D3D12_INDEX_BUFFER_VIEW*))GhClOrig(self, 43))(self, v);
+}
+static void __stdcall Hook_CLIASetVB(ID3D12GraphicsCommandList* self, UINT start, UINT n,
+                                     const D3D12_VERTEX_BUFFER_VIEW* v)
+{
+    if (!GhRecCap44(self, start, n, v))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, UINT,
+            const D3D12_VERTEX_BUFFER_VIEW*))GhClOrig(self, 44))(self, start, n, v);
+}
+static void __stdcall Hook_CLDiscard(ID3D12GraphicsCommandList* self, ID3D12Resource* res,
+                                     const D3D12_DISCARD_REGION* reg)
+{
+    if (!GhRecCap51(self, res, reg))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*,
+            const D3D12_DISCARD_REGION*))GhClOrig(self, 51))(self, res, reg);
+}
+static void __stdcall Hook_CLSetPredication(ID3D12GraphicsCommandList* self,
+                                            ID3D12Resource* buf, UINT64 off,
+                                            D3D12_PREDICATION_OP op)
+{
+    if (!GhRecCap55(self, buf, off, op))
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT64,
+            D3D12_PREDICATION_OP))GhClOrig(self, 55))(self, buf, off, op);
+}
+
 static void GhHookCommandList(ID3D12CommandList* cl)
 {
-    // As with the queue, one vtable serves every list of this class, so hook it
-    // once. A bundle or a copy list may use a different one; those simply stay
-    // uninstrumented and report as "unknown" rather than crashing.
-    if (!cl || InterlockedCompareExchange(&g_clHooked, 1, 0) != 0) return;
+    // One vtable per list TYPE. Hook each class we have not seen before, so copy
+    // lists are filtered exactly like direct ones.
+    if (!cl) return;
     void** vt = *(void***)cl;
+    for (LONG i = 0; i < g_clVtsN; ++i) if (g_clVts[i].vt == vt) return;
+    if (g_clVtsN >= (LONG)(sizeof(g_clVts)/sizeof(g_clVts[0]))) return;
+    GhClVtSet& set = g_clVts[g_clVtsN];
     DWORD old = 0;
     if (!VirtualProtect(vt, sizeof(void*) * 64, PAGE_READWRITE, &old)){
         Diag("D3D12 list vtable protect failed err=" + Hex(GetLastError()));
-        InterlockedExchange(&g_clHooked, 0);
         return;
     }
-    g_clVtOrig[10] = vt[10]; vt[10] = (void*)&Hook_CLReset;
-    g_clVtOrig[12] = vt[12]; vt[12] = (void*)&Hook_CLDraw;
-    g_clVtOrig[13] = vt[13]; vt[13] = (void*)&Hook_CLDrawIndexed;
-    g_clVtOrig[14] = vt[14]; vt[14] = (void*)&Hook_CLDispatch;
-    g_clVtOrig[25] = vt[25]; vt[25] = (void*)&Hook_CLSetPso;
-    g_clVtOrig[26] = vt[26]; vt[26] = (void*)&Hook_CLBarrier;
-    g_clVtOrig[57] = vt[57]; vt[57] = (void*)&Hook_CLBeginEvent;
-    g_clVtOrig[58] = vt[58]; vt[58] = (void*)&Hook_CLEndEvent;
-    g_clVtOrig[59] = vt[59]; vt[59] = (void*)&Hook_CLExecIndirect;
-    g_clVtOrig[15] = vt[15]; vt[15] = (void*)&Hook_CLCopyBufferRegion;
-    g_clVtOrig[16] = vt[16]; vt[16] = (void*)&Hook_CLCopyTextureRegion;
-    g_clVtOrig[17] = vt[17]; vt[17] = (void*)&Hook_CLCopyResource;
-    g_clVtOrig[19] = vt[19]; vt[19] = (void*)&Hook_CLResolveSubresource;
-    g_clVtOrig[47] = vt[47]; vt[47] = (void*)&Hook_CLClearDsv;
-    g_clVtOrig[48] = vt[48]; vt[48] = (void*)&Hook_CLClearRtv;
-    g_clVtOrig[49] = vt[49]; vt[49] = (void*)&Hook_CLClearUavUint;
-    g_clVtOrig[50] = vt[50]; vt[50] = (void*)&Hook_CLClearUavFloat;
-    g_clVtOrig[27] = vt[27]; vt[27] = (void*)&Hook_CLExecuteBundle;
-    g_clVtOrig[28] = vt[28]; vt[28] = (void*)&Hook_CLSetHeaps;
-    g_clVtOrig[32] = vt[32]; vt[32] = (void*)&Hook_CLSetGfxTable;
-    g_clVtOrig[38] = vt[38]; vt[38] = (void*)&Hook_CLSetGfxCbv;
-    g_clVtOrig[40] = vt[40]; vt[40] = (void*)&Hook_CLSetGfxSrv;
-    g_clVtOrig[42] = vt[42]; vt[42] = (void*)&Hook_CLSetGfxUav;
-    g_clVtOrig[21] = vt[21]; vt[21] = (void*)&Hook_CLSetViewports;
-    g_clVtOrig[22] = vt[22]; vt[22] = (void*)&Hook_CLSetScissors;
-    g_clVtOrig[46] = vt[46]; vt[46] = (void*)&Hook_CLOMSetRT;
-    g_clVtOrig[52] = vt[52]; vt[52] = (void*)&Hook_CLBeginQuery;
-    g_clVtOrig[53] = vt[53]; vt[53] = (void*)&Hook_CLEndQuery;
-    g_clVtOrig[54] = vt[54]; vt[54] = (void*)&Hook_CLResolveQuery;
+    set.vt = vt;
+    set.orig[9]  = vt[9];  vt[9]  = (void*)&Hook_CLClose;
+    set.orig[10] = vt[10]; vt[10] = (void*)&Hook_CLReset;
+    set.orig[12] = vt[12]; vt[12] = (void*)&Hook_CLDraw;
+    set.orig[13] = vt[13]; vt[13] = (void*)&Hook_CLDrawIndexed;
+    set.orig[14] = vt[14]; vt[14] = (void*)&Hook_CLDispatch;
+    set.orig[25] = vt[25]; vt[25] = (void*)&Hook_CLSetPso;
+    set.orig[26] = vt[26]; vt[26] = (void*)&Hook_CLBarrier;
+    set.orig[57] = vt[57]; vt[57] = (void*)&Hook_CLBeginEvent;
+    set.orig[58] = vt[58]; vt[58] = (void*)&Hook_CLEndEvent;
+    set.orig[59] = vt[59]; vt[59] = (void*)&Hook_CLExecIndirect;
+    set.orig[15] = vt[15]; vt[15] = (void*)&Hook_CLCopyBufferRegion;
+    set.orig[16] = vt[16]; vt[16] = (void*)&Hook_CLCopyTextureRegion;
+    set.orig[17] = vt[17]; vt[17] = (void*)&Hook_CLCopyResource;
+    set.orig[19] = vt[19]; vt[19] = (void*)&Hook_CLResolveSubresource;
+    set.orig[47] = vt[47]; vt[47] = (void*)&Hook_CLClearDsv;
+    set.orig[48] = vt[48]; vt[48] = (void*)&Hook_CLClearRtv;
+    set.orig[49] = vt[49]; vt[49] = (void*)&Hook_CLClearUavUint;
+    set.orig[50] = vt[50]; vt[50] = (void*)&Hook_CLClearUavFloat;
+    set.orig[27] = vt[27]; vt[27] = (void*)&Hook_CLExecuteBundle;
+    set.orig[28] = vt[28]; vt[28] = (void*)&Hook_CLSetHeaps;
+    set.orig[32] = vt[32]; vt[32] = (void*)&Hook_CLSetGfxTable;
+    set.orig[38] = vt[38]; vt[38] = (void*)&Hook_CLSetGfxCbv;
+    set.orig[40] = vt[40]; vt[40] = (void*)&Hook_CLSetGfxSrv;
+    set.orig[42] = vt[42]; vt[42] = (void*)&Hook_CLSetGfxUav;
+    set.orig[29] = vt[29]; vt[29] = (void*)&Hook_CLSetCompRootSig;
+    set.orig[30] = vt[30]; vt[30] = (void*)&Hook_CLSetGfxRootSig;
+    set.orig[21] = vt[21]; vt[21] = (void*)&Hook_CLSetViewports;
+    set.orig[22] = vt[22]; vt[22] = (void*)&Hook_CLSetScissors;
+    set.orig[46] = vt[46]; vt[46] = (void*)&Hook_CLOMSetRT;
+    set.orig[52] = vt[52]; vt[52] = (void*)&Hook_CLBeginQuery;
+    set.orig[53] = vt[53]; vt[53] = (void*)&Hook_CLEndQuery;
+    set.orig[54] = vt[54]; vt[54] = (void*)&Hook_CLResolveQuery;
+    set.orig[20] = vt[20]; vt[20] = (void*)&Hook_CLIASetTopology;
+    set.orig[23] = vt[23]; vt[23] = (void*)&Hook_CLOMSetBlendFactor;
+    set.orig[24] = vt[24]; vt[24] = (void*)&Hook_CLOMSetStencilRef;
+    set.orig[31] = vt[31]; vt[31] = (void*)&Hook_CLSetCompTable;
+    set.orig[37] = vt[37]; vt[37] = (void*)&Hook_CLSetCmpCbv;
+    set.orig[39] = vt[39]; vt[39] = (void*)&Hook_CLSetCmpSrv;
+    set.orig[41] = vt[41]; vt[41] = (void*)&Hook_CLSetCmpUav;
+    set.orig[43] = vt[43]; vt[43] = (void*)&Hook_CLIASetIB;
+    set.orig[44] = vt[44]; vt[44] = (void*)&Hook_CLIASetVB;
+    set.orig[51] = vt[51]; vt[51] = (void*)&Hook_CLDiscard;
+    set.orig[55] = vt[55]; vt[55] = (void*)&Hook_CLSetPredication;
     VirtualProtect(vt, sizeof(void*) * 64, old, &old);
-    Diag("D3D12 list vtable hooked (Reset/Draw/Dispatch/SetPSO/Barrier/PIX/ExecuteIndirect)");
+    ++g_clVtsN;
+    Diag("D3D12 hooked command-list vtable class " + std::to_string((long)g_clVtsN) +
+         " at " + Hex((uint64_t)(uintptr_t)vt));
 }
 
 // #158: the hang is not on any creation path -- it follows the first present by
@@ -6434,6 +12905,12 @@ static void GhHookFence(ID3D12Fence* f)
 
 static void* g_cqVtOrig[20]{};
 static volatile LONG g_cqHooked = 0;
+// #158 gh_rttest_rawsub: let GhRtTest submit through the ORIGINAL vtable entry. The
+// probe runs from inside Hook_CQExecute, so submitting on the game's queue re-enters
+// that hook while submitting on one of ours does not -- an untested difference between
+// the fatal cell and both surviving cells. Returns null before the vtable is hooked.
+static void* GhCqOrig(int slot)
+{ return (slot >= 0 && slot < 20) ? g_cqVtOrig[slot] : nullptr; }
 
 // #158: which submission does the GPU stop INSIDE?
 //
@@ -6507,8 +12984,1581 @@ static ULONGLONG GhMsSinceFirstSubmit()
 }
 static volatile LONG64 g_gpuBusyMs = 0;
 
-static void __stdcall Hook_CQExecute(ID3D12CommandQueue* self, UINT n, ID3D12CommandList* const* l)
+// ------------------------------------------------------------- #158 Map tracing
+// The debug layer's second severity-1 class, six times per run:
+//   ID3D12Resource::Map: Map and Unmap can not be called on a resource associated
+//   with a heap that has the CPU page properties of
+//   D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE. Heaps of the type
+//   D3D12_HEAP_TYPE_DEFAULT should be assumed to have these properties.
+// The game logs "Is UMA: Yes / Using Cpu Buffer Optimize: Yes" and then maps
+// DEFAULT-heap resources. The question the diag cannot answer is whether that Map
+// FAILS at runtime -- leaving the guest writing through a pointer it never got --
+// or SUCCEEDS and hands back memory the GPU does not actually read from. Those are
+// very different bugs, and only one of them is ours to fix.
+//
+// gh_map_trace.txt=1 names every Map on a DEFAULT / NOT_AVAILABLE heap with its
+// result; =2 names every Map at all.
+static unsigned GhMapTraceMode()
+{ static const unsigned m = (unsigned)GhCfgNum(L"gh_map_trace.txt", "GH_MAP_TRACE", 0); return m; }
+
+static void* g_resVtOrig[16]{};
+static volatile LONG g_resHooked = 0;
+static volatile LONG g_mapCalls = 0, g_mapFails = 0, g_mapDefault = 0, g_mapDefaultOk = 0;
+
+static const char* GhCpuPageName(D3D12_CPU_PAGE_PROPERTY p)
 {
+    switch (p){
+        case D3D12_CPU_PAGE_PROPERTY_UNKNOWN:       return "UNKNOWN";
+        case D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE: return "NOT_AVAILABLE";
+        case D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE: return "WRITE_COMBINE";
+        case D3D12_CPU_PAGE_PROPERTY_WRITE_BACK:    return "WRITE_BACK";
+        default:                                    return "?";
+    }
+}
+
+static HRESULT __stdcall Hook_ResMap(ID3D12Resource* self, UINT sub,
+                                     const D3D12_RANGE* rr, void** pp)
+{
+    auto orig = (HRESULT (__stdcall*)(ID3D12Resource*, UINT, const D3D12_RANGE*, void**))
+                g_resVtOrig[8];
+    HRESULT hr = orig(self, sub, rr, pp);
+    InterlockedIncrement(&g_mapCalls);
+    if (FAILED(hr)) InterlockedIncrement(&g_mapFails);
+    if (!GhMapTraceMode()) return hr;
+
+    D3D12_HEAP_PROPERTIES hp{};
+    D3D12_HEAP_FLAGS hf = D3D12_HEAP_FLAG_NONE;
+    const bool haveHp = SUCCEEDED(self->GetHeapProperties(&hp, &hf));
+    // A placed resource answers with its heap's properties; a reserved one refuses.
+    const bool suspect = haveHp && (hp.Type == D3D12_HEAP_TYPE_DEFAULT ||
+                                    hp.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE);
+    if (suspect){
+        InterlockedIncrement(&g_mapDefault);
+        if (SUCCEEDED(hr)) InterlockedIncrement(&g_mapDefaultOk);
+    }
+    if (!suspect && GhMapTraceMode() < 2) return hr;
+
+    LONG k = suspect ? g_mapDefault : g_mapCalls;
+    if (k <= 48 || (k % 512) == 0){
+        D3D12_RESOURCE_DESC rd = self->GetDesc();
+        Diag(std::string(suspect ? "MAPSUSPECT" : "MAP") +
+             " #" + std::to_string((long)k) +
+             " res=" + Hex((uint64_t)(uintptr_t)self) +
+             " sub=" + std::to_string((unsigned)sub) +
+             " hr=" + Hex((uint32_t)hr) +
+             " ptr=" + Hex((uint64_t)(uintptr_t)(pp ? *pp : nullptr)) +
+             (haveHp ? (" heaptype=" + std::to_string((int)hp.Type) +
+                        " cpupage=" + std::string(GhCpuPageName(hp.CPUPageProperty)) +
+                        " pool=" + std::to_string((int)hp.MemoryPoolPreference))
+                     : std::string(" heapprops=none")) +
+             " dim=" + std::to_string((int)rd.Dimension) +
+             " w=" + std::to_string((unsigned long long)rd.Width) +
+             " h=" + std::to_string((unsigned)rd.Height) +
+             " fmt=" + std::to_string((int)rd.Format) +
+             " rflags=" + Hex((uint32_t)rd.Flags) +
+             " range=" + (rr ? (Hex((uint64_t)rr->Begin) + ".." + Hex((uint64_t)rr->End))
+                             : std::string("whole")));
+    }
+    return hr;
+}
+
+static void GhMapStats(const char* when)
+{
+    if (!GhMapTraceMode()) return;
+    Diag(std::string("MAPSTATS ") + when +
+         " calls=" + std::to_string((long)g_mapCalls) +
+         " failed=" + std::to_string((long)g_mapFails) +
+         " on_default_or_unmappable=" + std::to_string((long)g_mapDefault) +
+         " of_which_SUCCEEDED=" + std::to_string((long)g_mapDefaultOk));
+}
+
+// Every resource from one device shares a vtable, so hook it once.
+// ---------------------------------------------------------------- #158 object lifetime
+// The fatal draw's bindings are byte-for-byte what they were on the four
+// executions that succeeded -- same PSO, same 3 vertices, same 240x135 viewport
+// and scissor, same descriptor heaps, same SRVs, same render target -- and those
+// four each ran in 16ms or less before the fifth never returned. An identical
+// draw with identical inputs does not execute differently; a 36-instruction
+// pixel shader with no dynamic flow control cannot spin. What is left is that it
+// is reading memory that stopped being there, and in D3D12 the one way that
+// happens is the app releasing a resource before the GPU has finished with it --
+// the runtime keeps no reference on behalf of an in-flight command list. The
+// game gets this right on Windows because it decides "the GPU is done" from
+// frame progress, and here that progress runs through our D3D11On12 present on a
+// second queue.
+//
+// So: record every D3D12 object whose refcount reaches zero, stamped with the
+// same global op index the breadcrumb counts, and dump the last of them at the
+// hang. A `res=` from the fatal draw's BIND line that appears here with a `g`
+// below the breadcrumb's `started=` is a use-after-free, and the answer.
+// gh_obj_life.txt=1. Off by default: it puts a hooked Release on every resource.
+static unsigned GhObjLife()
+{ static const unsigned v = (unsigned)GhCfgNum(L"gh_obj_life.txt", "GH_OBJ_LIFE", 0); return v; }
+
+struct GhFreedObj { void* p; LONG g; };
+static GhFreedObj     g_freed[8192]{};
+static volatile LONG  g_freedN = 0, g_freedLost = 0;
+
+static void GhFreedNote(void* p)
+{
+    const LONG i = InterlockedIncrement(&g_freedN) - 1;
+    if (i < 0 || i >= 8192){ InterlockedIncrement(&g_freedLost); return; }
+    const LONG g = InterlockedCompareExchange(&g_bcSeq, 0, 0);
+    g_freed[i].p = p;
+    g_freed[i].g = g;
+    if (i < 24 || (i % 256) == 0)
+        Diag("OBJFREE res=" + Hex((uint64_t)(uintptr_t)p) +
+             " at g=" + std::to_string((long)g) +
+             " n=" + std::to_string((long)i + 1));
+}
+
+// Placed, committed and reserved resources do not necessarily share one vtable,
+// and the existing Map hook takes only the first it sees. Getting that wrong
+// here would look exactly like "nothing was ever freed", which is the answer we
+// are trying to test, so carry up to eight and match on the object's own vtable.
+// Read the vtable BEFORE calling through: at refcount zero the object is gone.
+static void*         g_relVt[8]{};
+static void*         g_relOrig[8]{};
+static volatile LONG g_relVtN = 0;
+static volatile LONG g_relCalls = 0;
+
+static ULONG __stdcall Hook_ObjRelease(IUnknown* self)
+{
+    void** vt = self ? *(void***)self : nullptr;
+    void*  orig = nullptr;
+    const LONG n = InterlockedCompareExchange(&g_relVtN, 0, 0);
+    for (LONG i = 0; i < n && i < 8; ++i)
+        if (g_relVt[i] == (void*)vt){ orig = g_relOrig[i]; break; }
+    // Never guess at a Release. An unrecognised vtable means the table moved
+    // under us, and returning a made-up refcount would corrupt the caller.
+    if (!orig) return 1;
+    InterlockedIncrement(&g_relCalls);
+    const ULONG rc = ((ULONG (__stdcall*)(IUnknown*))orig)(self);
+    if (rc == 0) GhFreedNote(self);
+    return rc;
+}
+
+static void GhHookObjRelease(IUnknown* o)
+{
+    if (!o || !GhObjLife()) return;
+    void** vt = *(void***)o;
+    const LONG n = InterlockedCompareExchange(&g_relVtN, 0, 0);
+    for (LONG i = 0; i < n && i < 8; ++i) if (g_relVt[i] == (void*)vt) return;
+    if (n >= 8){
+        static LONG warned = 0;
+        if (InterlockedIncrement(&warned) == 1)
+            Diag("OBJLIFE more than 8 resource vtables -- coverage is partial, run is suspect");
+        return;
+    }
+    DWORD old = 0;
+    if (!VirtualProtect(vt, sizeof(void*) * 4, PAGE_READWRITE, &old)){
+        Diag("OBJLIFE vtable protect failed err=" + Hex(GetLastError()));
+        return;
+    }
+    // Publish the original before the hook goes live, or a Release racing us
+    // finds the slot filled and no orig to call.
+    g_relVt[n]   = (void*)vt;
+    g_relOrig[n] = vt[2];
+    InterlockedExchange(&g_relVtN, n + 1);
+    vt[2] = (void*)&Hook_ObjRelease;
+    VirtualProtect(vt, sizeof(void*) * 4, old, &old);
+    Diag("OBJLIFE Release hooked on vtable " + Hex((uint64_t)(uintptr_t)vt) +
+         " (" + std::to_string((long)n + 1) + " of 8)");
+}
+
+static void GhObjLifeStats(const char* where)
+{
+    if (!GhObjLife()) return;
+    const LONG n = InterlockedCompareExchange(&g_freedN, 0, 0);
+    // The positive control: a zero here with zero Release calls means the hook
+    // never ran, which is not the same finding as "the game frees nothing".
+    Diag(std::string("OBJLIFE at ") + where +
+         " vtables=" + std::to_string((long)InterlockedCompareExchange(&g_relVtN, 0, 0)) +
+         " releases=" + std::to_string((long)InterlockedCompareExchange(&g_relCalls, 0, 0)) +
+         " freed=" + std::to_string((long)n) +
+         " lost=" + std::to_string((long)InterlockedCompareExchange(&g_freedLost, 0, 0)));
+    const LONG lo = n > 32 ? n - 32 : 0;
+    for (LONG i = lo; i < n && i < 8192; ++i)
+        Diag("  OBJLIFE freed[" + std::to_string((long)i) + "] res=" +
+             Hex((uint64_t)(uintptr_t)g_freed[i].p) +
+             " at g=" + std::to_string((long)g_freed[i].g));
+}
+
+static void GhHookResourceVtable(ID3D12Resource* r)
+{
+    if (!r || !GhMapTraceMode()) return;
+    if (InterlockedCompareExchange(&g_resHooked, 1, 0) != 0) return;
+    void** vt = *(void***)r;
+    DWORD old = 0;
+    if (!VirtualProtect(vt, sizeof(void*) * 16, PAGE_READWRITE, &old)){
+        Diag("D3D12 resource vtable protect failed err=" + Hex(GetLastError()));
+        InterlockedExchange(&g_resHooked, 0);
+        return;
+    }
+    g_resVtOrig[8] = vt[8]; vt[8] = (void*)&Hook_ResMap;
+    VirtualProtect(vt, sizeof(void*) * 16, old, &old);
+    Diag("D3D12 resource vtable hooked (Map) mode=" + std::to_string(GhMapTraceMode()));
+}
+
+// ---------------------------------------------------------------- #158 RT/DS init
+// The debug layer named three resources -- two unnamed and one
+// 'SwapChain-Matched DepthStencil' -- as "not initialized but used in
+// DrawInstanced", all on command list 0x278AF372690, which is exactly the list in
+// SUBMITSTALL #47. D3D12 requires a render-target or depth-stencil resource to be
+// initialized with a Discard, Clear or Copy before anything else reads it;
+// otherwise its compression metadata (DCC/HTILE on this hardware) is undefined,
+// and a depth block fed garbage hierarchical-Z wedges with no fault to report.
+// That matches every constraint the other nine hypotheses failed: instantaneous,
+// in range, between draws, owned by no op or pipeline.
+//
+// So do the initialization the runtime asks for, before the guest's first
+// submission can touch them. gh_rtds_init.txt: 1 = DiscardResource (needs no
+// descriptor and works for any format), 2 = ClearRenderTargetView /
+// ClearDepthStencilView where the format is directly viewable, Discard otherwise.
+static unsigned GhRtDsInitMode()
+{ static const unsigned m = (unsigned)GhCfgNum(L"gh_rtds_init.txt", "GH_RTDS_INIT", 0); return m; }
+
+// mode 3 additionally zeroes DEFAULT-heap BUFFERS. Modes 1 and 2 only ever covered the
+// 2077 render-target and depth surfaces; vertex, index, constant, structured and
+// ExecuteIndirect argument buffers were never touched, and the record has zero hits for
+// buffer initialisation. Garbage in an index buffer or an indirect argument buffer is
+// the textbook cause of a permanent, instant, resolution-independent GPU freeze -- which
+// is exactly the measured signature (no ramp, no degradation, flat in surface area, 720p
+// makes no difference, DRED returns nothing).
+//
+// The ordering that makes this SAFE rather than destructive: a buffer is recorded at
+// creation, when it provably holds nothing, and zeroed by the pre-submit flush, which
+// runs before the guest's ExecuteCommandLists and WAITS for its own fence. The game
+// cannot have filled the buffer in between, because filling it needs a submission that
+// this flush precedes. Only DEFAULT-heap buffers qualify: UPLOAD buffers are filled by
+// CPU memcpy with no submission to hide behind, so zeroing one really could destroy live
+// data, and they are skipped.
+struct GhRtDsNote {
+    ID3D12Resource*       res;
+    D3D12_RESOURCE_STATES st;
+    DXGI_FORMAT           fmt;
+    bool                  ds;
+    bool                  buf;
+    UINT64                bytes;
+};
+static GhRtDsNote g_rtds[65536]{};
+static volatile LONG g_rtdsN = 0;      // recorded
+static volatile LONG g_rtdsDone = 0;   // already initialized
+static volatile LONG g_rtdsOver = 0;   // dropped for want of table space -- never silent
+static volatile LONG64 g_rtdsBufBytes = 0;
+static SRWLOCK g_rtdsLk = SRWLOCK_INIT;
+
+
+// #158: how many of the resources created with ALLOW_RENDER_TARGET are ever
+// actually rendered into? A surface that only gets sampled still costs the driver
+// its render-target metadata. Every RT-flagged texture is recorded at creation and
+// marked when an RTV is built on it; what is left unmarked is the sampled-only set.
+//   gh_rt_audit = 1   audit only
+//   gh_strip_rt = 1   strip ALLOW_RENDER_TARGET from creations NOT in gh_rt_keep.txt
+static unsigned GhRtAudit()
+{ static const unsigned n = GhCfgNum(L"gh_rt_audit.txt", "GH_RT_AUDIT", 0); return n; }
+static unsigned GhStripRt()
+{ static const unsigned n = GhCfgNum(L"gh_strip_rt.txt", "GH_STRIP_RT", 0); return n; }
+struct GhRtAuditNote {
+    void* res; UINT64 w; UINT h; unsigned fmt, flags, mips, dim, samp; LONG rtv; LONG stripped;
+};
+#define GH_RTAUDIT_MAX 8192
+static GhRtAuditNote g_rtAudit[GH_RTAUDIT_MAX]{};
+static volatile LONG g_rtAuditN = 0, g_rtAuditOver = 0, g_rtAuditRtv = 0, g_rtAuditStrip = 0,
+                     g_rtAuditViol = 0;
+static SRWLOCK g_rtAuditLk = SRWLOCK_INIT;
+static LONG GhRtAuditCreate(void* res, const D3D12_RESOURCE_DESC* rd, bool stripped)
+{
+    if ((!GhRtAudit() && !GhStripRt()) || !res || !rd) return -1;
+    if (rd->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return -1;
+    if (!stripped && !(rd->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) return -1;
+    AcquireSRWLockExclusive(&g_rtAuditLk);
+    LONG n = g_rtAuditN, idx = -1;
+    if (n < GH_RTAUDIT_MAX){
+        g_rtAudit[n] = { res, rd->Width, rd->Height, (unsigned)rd->Format,
+                         (unsigned)rd->Flags, (unsigned)rd->MipLevels,
+                         (unsigned)rd->Dimension, (unsigned)rd->SampleDesc.Count,
+                         0, stripped ? 1L : 0L };
+        g_rtAuditN = n + 1; idx = n;
+    } else InterlockedIncrement(&g_rtAuditOver);
+    ReleaseSRWLockExclusive(&g_rtAuditLk);
+    return idx;
+}
+static void GhRtAuditRtv(void* res)
+{
+    if ((!GhRtAudit() && !GhStripRt()) || !res) return;
+    AcquireSRWLockExclusive(&g_rtAuditLk);
+    for (LONG i = g_rtAuditN - 1; i >= 0; --i)          // newest entry wins: a freed
+        if (g_rtAudit[i].res == res){                   // pointer can be handed out again
+            if (!g_rtAudit[i].rtv){ g_rtAudit[i].rtv = 1; InterlockedIncrement(&g_rtAuditRtv); }
+            if (g_rtAudit[i].stripped){
+                const LONG v = InterlockedIncrement(&g_rtAuditViol);
+                if (v <= 8)
+                    Diag("STRIPRT VIOLATION: an RTV was built on a resource we stripped, idx=" +
+                         std::to_string((long)i) + " " + std::to_string((unsigned long long)g_rtAudit[i].w) +
+                         "x" + std::to_string((unsigned long)g_rtAudit[i].h) +
+                         " fmt=" + std::to_string((unsigned long)g_rtAudit[i].fmt));
+            }
+            break;
+        }
+    ReleaseSRWLockExclusive(&g_rtAuditLk);
+}
+static void GhRtAuditDump(const char* when)
+{
+    if (!GhRtAudit() && !GhStripRt()) return;
+    AcquireSRWLockExclusive(&g_rtAuditLk);
+    const LONG n = g_rtAuditN;
+    LONG rtv = 0, nortv = 0;
+    std::string keep;                       // the indices that really are render targets
+    std::string shapes;                     // what the sampled-only ones look like
+    struct { UINT64 w; UINT h; unsigned fmt, mips; LONG n; } sh[48]{}; LONG shn = 0;
+    for (LONG i = 0; i < n; ++i){
+        if (g_rtAudit[i].rtv){
+            ++rtv;
+            if (keep.size() < 3500) keep += std::to_string((long)i) + ",";
+            continue;
+        }
+        ++nortv;
+        LONG j = 0;
+        for (; j < shn; ++j)
+            if (sh[j].w == g_rtAudit[i].w && sh[j].h == g_rtAudit[i].h &&
+                sh[j].fmt == g_rtAudit[i].fmt && sh[j].mips == g_rtAudit[i].mips) break;
+        if (j < shn) ++sh[j].n;
+        else if (shn < 48){ sh[shn] = { g_rtAudit[i].w, g_rtAudit[i].h, g_rtAudit[i].fmt,
+                                        g_rtAudit[i].mips, 1 }; ++shn; }
+    }
+    for (LONG j = 0; j < shn; ++j)
+        shapes += " " + std::to_string((unsigned long long)sh[j].w) + "x" +
+                  std::to_string((unsigned long)sh[j].h) + "/f" +
+                  std::to_string((unsigned long)sh[j].fmt) + "/m" +
+                  std::to_string((unsigned long)sh[j].mips) + "=" +
+                  std::to_string((long)sh[j].n);
+    ReleaseSRWLockExclusive(&g_rtAuditLk);
+    Diag(std::string("RTAUDIT ") + when +
+         " rt_flagged=" + std::to_string((long)n) +
+         " overflow=" + std::to_string((long)InterlockedCompareExchange(&g_rtAuditOver,0,0)) +
+         " got_an_rtv=" + std::to_string((long)rtv) +
+         " sampled_only=" + std::to_string((long)nortv) +
+         " stripped=" + std::to_string((long)InterlockedCompareExchange(&g_rtAuditStrip,0,0)) +
+         " violations=" + std::to_string((long)InterlockedCompareExchange(&g_rtAuditViol,0,0)));
+    Diag("RTAUDITSHAPES " + std::string(when) + " distinct=" +
+         std::to_string((long)shn) + shapes);
+    Diag("RTAUDITKEEP " + keep);
+    // The keep-list itself: the shapes an RTV was actually built on.
+    {
+        AcquireSRWLockExclusive(&g_rtAuditLk);
+        struct { UINT64 w; UINT h; unsigned fmt, mips; LONG n; } rs[64]{}; LONG rn = 0;
+        for (LONG i = 0; i < n; ++i){
+            if (!g_rtAudit[i].rtv) continue;
+            LONG j = 0;
+            for (; j < rn; ++j)
+                if (rs[j].w == g_rtAudit[i].w && rs[j].h == g_rtAudit[i].h &&
+                    rs[j].fmt == g_rtAudit[i].fmt && rs[j].mips == g_rtAudit[i].mips) break;
+            if (j < rn) ++rs[j].n;
+            else if (rn < 64){ rs[rn] = { g_rtAudit[i].w, g_rtAudit[i].h, g_rtAudit[i].fmt,
+                                          g_rtAudit[i].mips, 1 }; ++rn; }
+        }
+        std::string rl;
+        for (LONG j = 0; j < rn; ++j)
+            rl += " " + std::to_string((unsigned long long)rs[j].w) + " " +
+                  std::to_string((unsigned long)rs[j].h) + " " +
+                  std::to_string((unsigned long)rs[j].fmt) + " " +
+                  std::to_string((unsigned long)rs[j].mips);
+        ReleaseSRWLockExclusive(&g_rtAuditLk);
+        Diag("RTAUDITRTVSHAPES distinct=" + std::to_string((long)rn) + rl);
+    }
+}
+// The keep-list from a previous audit run. Keyed on the SHAPE (w,h,format,mips),
+// never on creation order -- resources are created on several threads, so the
+// ordering is not reproducible across runs. That is the trap the per-barrier index
+// fell into. Shape collisions only ever fail SAFE: a sampled-only surface that
+// happens to share a shape with a real render target simply is not stripped.
+// File format: whitespace/comma separated quadruples  w h fmt mips
+static bool GhRtKeepHas(const D3D12_RESOURCE_DESC* rd)
+{
+    struct Shape { unsigned w, h, fmt, mips; };
+    static std::vector<Shape> keep;
+    static bool loaded = false;
+    if (!loaded){
+        loaded = true;
+        std::wstring path = std::wstring(kLocalState) + L"gh_rt_keep.txt";
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE){
+            std::string all; char raw[8192]; DWORD got = 0;
+            while (ReadFile(h, raw, sizeof raw, &got, nullptr) && got) all.append(raw, got);
+            CloseHandle(h);
+            std::vector<unsigned> nums; unsigned cur = 0; bool any = false;
+            for (char c : all){
+                if (c >= '0' && c <= '9'){ cur = cur * 10 + (unsigned)(c - '0'); any = true; }
+                else if (any){ nums.push_back(cur); cur = 0; any = false; }
+            }
+            if (any) nums.push_back(cur);
+            for (size_t i = 0; i + 3 < nums.size(); i += 4)
+                keep.push_back({ nums[i], nums[i+1], nums[i+2], nums[i+3] });
+            Diag("STRIPRT keep-list loaded: " + std::to_string(keep.size()) + " shapes");
+        } else Diag("STRIPRT keep-list gh_rt_keep.txt ABSENT -- nothing will be stripped");
+    }
+    if (!rd) return true;
+    for (const Shape& k : keep)
+        if (k.w == (unsigned)rd->Width && k.h == (unsigned)rd->Height &&
+            k.fmt == (unsigned)rd->Format && k.mips == (unsigned)rd->MipLevels) return true;
+    return false;
+}
+// Strip ALLOW_RENDER_TARGET from a texture that no run has ever built an RTV on.
+static const D3D12_RESOURCE_DESC* GhStripRtDesc(D3D12_RESOURCE_DESC* out,
+                                                const D3D12_RESOURCE_DESC* rd, bool* stripped)
+{
+    *stripped = false;
+    if (!GhStripRt() || !rd) return rd;
+    if (rd->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return rd;
+    if (!(rd->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) return rd;
+    if (GhRtKeepHas(rd)) return rd;
+    *out = *rd;
+    out->Flags = (D3D12_RESOURCE_FLAGS)((unsigned)out->Flags &
+                                        ~(unsigned)D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    *stripped = true;
+    const LONG n = InterlockedIncrement(&g_rtAuditStrip);
+    if (n <= 6 || (n % 512) == 0)
+        Diag("STRIPRT n=" + std::to_string((long)n) + " " +
+             std::to_string((unsigned long long)rd->Width) + "x" +
+             std::to_string((unsigned long)rd->Height) +
+             " fmt=" + std::to_string((unsigned long)rd->Format) +
+             " mips=" + std::to_string((unsigned long)rd->MipLevels) +
+             " flags=" + Hex((uint32_t)rd->Flags) + " -> " + Hex((uint32_t)out->Flags));
+    return out;
+}
+// #158 gh_fmt_probe bits 1 and 4. Takes ALLOW_UNORDERED_ACCESS off the descriptor before
+// the runtime sees it. Deliberately a separate pass from GhStripRtDesc: that one removes
+// ALLOW_RENDER_TARGET and is scored on completely different questions, and mixing the two
+// would make a run that set both impossible to read.
+static const D3D12_RESOURCE_DESC* GhFmtProbeDesc(D3D12_RESOURCE_DESC* out,
+                                                 const D3D12_RESOURCE_DESC* rd)
+{
+    const unsigned bits = GhFmtProbe();
+    if (!(bits & 5) || !rd) return rd;
+    if (rd->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return rd;
+    if (!(rd->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return rd;
+    const bool byFmt = (bits & 1) && rd->Format == DXGI_FORMAT_R11G11B10_FLOAT;
+    const bool byRt  = (bits & 4) && (rd->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    if (!byFmt && !byRt) return rd;
+    *out = *rd;
+    out->Flags = (D3D12_RESOURCE_FLAGS)((unsigned)out->Flags &
+                                        ~(unsigned)D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    const LONG n = InterlockedIncrement(&g_fmtProbeN);
+    if (n <= 8 || (n % 256) == 0)
+        Diag("FMTPROBE n=" + std::to_string((long)n) +
+             " " + std::to_string((unsigned long long)rd->Width) + "x" +
+             std::to_string((unsigned long)rd->Height) +
+             " fmt=" + std::to_string((unsigned long)rd->Format) +
+             " flags=" + Hex((uint32_t)rd->Flags) + " -> " + Hex((uint32_t)out->Flags) +
+             (byFmt ? " by=fmt26" : " by=anyrt"));
+    return out;
+}
+static void GhRtDsRecord(ID3D12Resource* r, const D3D12_RESOURCE_DESC* rd,
+                         D3D12_RESOURCE_STATES st)
+{
+    const unsigned mode = GhRtDsInitMode();
+    if (!mode || !r || !rd) return;
+    const bool rt = (rd->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0;
+    const bool ds = (rd->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
+    bool buf = false;
+    if (rd->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER){
+        if (mode < 3 || !rd->Width) return;
+        // GetHeapProperties works for committed and placed resources alike, so the
+        // heap type does not have to be threaded through five creation hooks. A
+        // reserved resource returns a failure and is skipped, which is correct: its
+        // tiles may be unmapped and writing to one would fault.
+        D3D12_HEAP_PROPERTIES hp{}; D3D12_HEAP_FLAGS hf{};
+        if (FAILED(r->GetHeapProperties(&hp, &hf))) return;
+        if (hp.Type != D3D12_HEAP_TYPE_DEFAULT) return;
+        buf = true;
+    } else if (!rt && !ds) return;
+    AcquireSRWLockExclusive(&g_rtdsLk);
+    LONG n = g_rtdsN;
+    if (n < (LONG)(sizeof g_rtds / sizeof g_rtds[0])){
+        g_rtds[n].res = r; g_rtds[n].st = st; g_rtds[n].fmt = rd->Format; g_rtds[n].ds = ds;
+        g_rtds[n].buf = buf; g_rtds[n].bytes = buf ? rd->Width : 0;
+        g_rtdsN = n + 1;
+    } else {
+        InterlockedIncrement(&g_rtdsOver);
+    }
+    ReleaseSRWLockExclusive(&g_rtdsLk);
+}
+
+// A typeless resource cannot be viewed directly; name the obvious concrete view
+// for the formats this guest actually creates, and fall back to Discard for the
+// rest rather than guessing.
+static DXGI_FORMAT GhRtDsViewFormat(DXGI_FORMAT f, bool ds)
+{
+    switch (f){
+        case DXGI_FORMAT_R32G8X24_TYPELESS:    return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        case DXGI_FORMAT_R32_TYPELESS:         return ds ? DXGI_FORMAT_D32_FLOAT : DXGI_FORMAT_R32_FLOAT;
+        case DXGI_FORMAT_R24G8_TYPELESS:       return DXGI_FORMAT_D24_UNORM_S8_UINT;
+        case DXGI_FORMAT_R16_TYPELESS:         return ds ? DXGI_FORMAT_D16_UNORM : DXGI_FORMAT_R16_FLOAT;
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS:return DXGI_FORMAT_R32G32B32A32_FLOAT;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS:return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS:    return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:    return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_R16G16_TYPELESS:      return DXGI_FORMAT_R16G16_FLOAT;
+        case DXGI_FORMAT_R32G32_TYPELESS:      return DXGI_FORMAT_R32G32_FLOAT;
+        case DXGI_FORMAT_R8_TYPELESS:          return DXGI_FORMAT_R8_UNORM;
+        case DXGI_FORMAT_R8G8_TYPELESS:        return DXGI_FORMAT_R8G8_UNORM;
+        case DXGI_FORMAT_UNKNOWN:              return DXGI_FORMAT_UNKNOWN;
+        default:                               return f;   // already concrete
+    }
+}
+
+static com_ptr<ID3D12CommandQueue>        g_rtdsQ;
+static com_ptr<ID3D12CommandAllocator>    g_rtdsAlloc;
+static com_ptr<ID3D12GraphicsCommandList> g_rtdsCl;
+static com_ptr<ID3D12Fence>               g_rtdsFence;
+static com_ptr<ID3D12DescriptorHeap>      g_rtdsRtvHeap, g_rtdsDsvHeap;
+static com_ptr<ID3D12Resource>            g_rtdsZero;   // mode 3: a zero-filled source
+static UINT64 g_rtdsFenceVal = 0;
+static bool   g_rtdsBroken = false;
+static const UINT64 kRtdsZeroBytes = 4ull << 20;   // copied in chunks of this size
+
+static bool GhRtDsEnsureObjects(ID3D12Device* dev)
+{
+    if (g_rtdsBroken) return false;
+    if (g_rtdsCl) return true;
+    D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    HRESULT hr = dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), g_rtdsQ.put_void());
+    if (SUCCEEDED(hr))
+        hr = dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                         __uuidof(ID3D12CommandAllocator), g_rtdsAlloc.put_void());
+    if (SUCCEEDED(hr))
+        hr = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_rtdsAlloc.get(), nullptr,
+                                    __uuidof(ID3D12GraphicsCommandList), g_rtdsCl.put_void());
+    if (SUCCEEDED(hr)) hr = g_rtdsCl->Close();
+    if (SUCCEEDED(hr))
+        hr = dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), g_rtdsFence.put_void());
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.NumDescriptors = 1;
+    if (SUCCEEDED(hr)){
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        hr = dev->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap), g_rtdsRtvHeap.put_void());
+    }
+    if (SUCCEEDED(hr)){
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        hr = dev->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap), g_rtdsDsvHeap.put_void());
+    }
+    // mode 3: one UPLOAD buffer, mapped once and zeroed once, is the source every
+    // buffer copy reads from. An UPLOAD resource is permanently GENERIC_READ, so it
+    // needs no barriers of its own and cannot perturb the transition census.
+    if (SUCCEEDED(hr) && GhRtDsInitMode() >= 3 && !g_rtdsZero){
+        D3D12_HEAP_PROPERTIES zp{}; zp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC zd{};
+        zd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        zd.Width = kRtdsZeroBytes; zd.Height = 1; zd.DepthOrArraySize = 1;
+        zd.MipLevels = 1; zd.Format = DXGI_FORMAT_UNKNOWN;
+        zd.SampleDesc.Count = 1; zd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        hr = dev->CreateCommittedResource(&zp, D3D12_HEAP_FLAG_NONE, &zd,
+                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                          __uuidof(ID3D12Resource), g_rtdsZero.put_void());
+        if (SUCCEEDED(hr)){
+            void* p = nullptr; D3D12_RANGE none{ 0, 0 };
+            hr = g_rtdsZero->Map(0, &none, &p);
+            if (SUCCEEDED(hr) && p){ memset(p, 0, (size_t)kRtdsZeroBytes); g_rtdsZero->Unmap(0, nullptr); }
+        }
+        if (FAILED(hr)) Diag("RTDSINIT zero-source FAILED hr=" + Hex((uint32_t)hr));
+    }
+    if (FAILED(hr)){
+        Diag("RTDSINIT setup FAILED hr=" + Hex((uint32_t)hr) + " -- disabling");
+        g_rtdsBroken = true;
+        return false;
+    }
+    Diag("RTDSINIT ready mode=" + std::to_string(GhRtDsInitMode()) +
+         " q=" + Hex((uint64_t)(uintptr_t)g_rtdsQ.get()) +
+         " zerosrc=" + Hex((uint64_t)(uintptr_t)g_rtdsZero.get()));
+    return true;
+}
+
+// Runs on the guest's thread just before its own ExecuteCommandLists, and waits
+// for the GPU, so every resource is initialized before any guest work can read it.
+static void GhRtDsFlush(const char* where)
+{
+    const unsigned mode = GhRtDsInitMode();
+    if (!mode) return;
+    ID3D12Device* dev = g_gfx.d12.get();
+    if (!dev) return;
+
+    AcquireSRWLockExclusive(&g_rtdsLk);
+    LONG from = g_rtdsDone, to = g_rtdsN;
+    g_rtdsDone = to;
+    ReleaseSRWLockExclusive(&g_rtdsLk);
+    if (from >= to) return;
+    if (!GhRtDsEnsureObjects(dev)){ return; }
+
+    if (FAILED(g_rtdsAlloc->Reset()) || FAILED(g_rtdsCl->Reset(g_rtdsAlloc.get(), nullptr))){
+        Diag("RTDSINIT reset failed -- disabling");
+        g_rtdsBroken = true;
+        return;
+    }
+    const UINT rtvInc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    (void)rtvInc;
+    unsigned nDiscard = 0, nClear = 0, nSkip = 0, nBuf = 0;
+    UINT64 bufBytes = 0;
+    for (LONG i = from; i < to; ++i){
+        const GhRtDsNote& e = g_rtds[i];
+        if (!e.res){ ++nSkip; continue; }
+        // mode 3: a buffer takes the copy path instead. COPY_DEST, zeroed from the
+        // shared upload source in 4 MB chunks, then straight back to the state the
+        // game created it in -- two transitions per buffer, exactly like a surface.
+        if (e.buf){
+            if (!g_rtdsZero || !e.bytes){ ++nSkip; continue; }
+            const bool needB = (e.st != D3D12_RESOURCE_STATE_COPY_DEST);
+            D3D12_RESOURCE_BARRIER bb{};
+            bb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            bb.Transition.pResource   = e.res;
+            bb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            if (needB){
+                bb.Transition.StateBefore = e.st;
+                bb.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+                g_rtdsCl->ResourceBarrier(1, &bb);
+            }
+            for (UINT64 off = 0; off < e.bytes; off += kRtdsZeroBytes){
+                const UINT64 chunk = (e.bytes - off < kRtdsZeroBytes) ? (e.bytes - off)
+                                                                      : kRtdsZeroBytes;
+                g_rtdsCl->CopyBufferRegion(e.res, off, g_rtdsZero.get(), 0, chunk);
+            }
+            if (needB){
+                bb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                bb.Transition.StateAfter  = e.st;
+                g_rtdsCl->ResourceBarrier(1, &bb);
+            }
+            ++nBuf; bufBytes += e.bytes;
+            continue;
+        }
+        const D3D12_RESOURCE_STATES want = e.ds ? D3D12_RESOURCE_STATE_DEPTH_WRITE
+                                                : D3D12_RESOURCE_STATE_RENDER_TARGET;
+        const bool needBarrier = (e.st != want);
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource   = e.res;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        if (needBarrier){
+            b.Transition.StateBefore = e.st; b.Transition.StateAfter = want;
+            g_rtdsCl->ResourceBarrier(1, &b);
+        }
+        const DXGI_FORMAT vf = GhRtDsViewFormat(e.fmt, e.ds);
+        bool cleared = false;
+        if (mode >= 2 && vf != DXGI_FORMAT_UNKNOWN){
+            if (e.ds){
+                D3D12_DEPTH_STENCIL_VIEW_DESC dv{};
+                dv.Format = vf; dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+                D3D12_CPU_DESCRIPTOR_HANDLE h = g_rtdsDsvHeap->GetCPUDescriptorHandleForHeapStart();
+                dev->CreateDepthStencilView(e.res, &dv, h);
+                // Asking to clear stencil on a depth-only format is invalid usage,
+                // and this whole knob exists to REMOVE validation errors.
+                UINT cf = D3D12_CLEAR_FLAG_DEPTH;
+                if (vf == DXGI_FORMAT_D24_UNORM_S8_UINT || vf == DXGI_FORMAT_D32_FLOAT_S8X24_UINT)
+                    cf |= D3D12_CLEAR_FLAG_STENCIL;
+                g_rtdsCl->ClearDepthStencilView(h, (D3D12_CLEAR_FLAGS)cf, 1.0f, 0, 0, nullptr);
+                cleared = true;
+            } else {
+                D3D12_RENDER_TARGET_VIEW_DESC rv{};
+                rv.Format = vf; rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+                D3D12_CPU_DESCRIPTOR_HANDLE h = g_rtdsRtvHeap->GetCPUDescriptorHandleForHeapStart();
+                dev->CreateRenderTargetView(e.res, &rv, h);
+                const float black[4] = { 0.f, 0.f, 0.f, 0.f };
+                g_rtdsCl->ClearRenderTargetView(h, black, 0, nullptr);
+                cleared = true;
+            }
+        }
+        if (cleared) ++nClear;
+        else { g_rtdsCl->DiscardResource(e.res, nullptr); ++nDiscard; }
+        if (needBarrier){
+            b.Transition.StateBefore = want; b.Transition.StateAfter = e.st;
+            g_rtdsCl->ResourceBarrier(1, &b);
+        }
+    }
+    if (bufBytes) InterlockedAdd64(&g_rtdsBufBytes, (LONG64)bufBytes);
+    if (FAILED(g_rtdsCl->Close())){
+        Diag("RTDSINIT close failed -- disabling");
+        g_rtdsBroken = true;
+        return;
+    }
+    // Call the ORIGINAL ExecuteCommandLists: our own submission must not be
+    // counted, traced or dropped by the instrumentation on this same vtable.
+    ID3D12CommandList* lists[1] = { (ID3D12CommandList*)g_rtdsCl.get() };
+    if (g_cqVtOrig[10])
+        ((void (__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*))
+            g_cqVtOrig[10])(g_rtdsQ.get(), 1, lists);
+    else
+        g_rtdsQ->ExecuteCommandLists(1, lists);
+    const UINT64 v = ++g_rtdsFenceVal;
+    if (SUCCEEDED(g_rtdsQ->Signal(g_rtdsFence.get(), v))){
+        for (int spin = 0; spin < 3000 && g_rtdsFence->GetCompletedValue() < v; ++spin)
+            Sleep(1);
+    }
+    static LONG flushes = 0;
+    LONG k = InterlockedIncrement(&flushes);
+    if (k <= 16 || (k % 64) == 0)
+        Diag("RTDSINIT flush#" + std::to_string((long)k) + " at " + where +
+             " range=[" + std::to_string((long)from) + "," + std::to_string((long)to) + ")" +
+             " cleared=" + std::to_string(nClear) +
+             " discarded=" + std::to_string(nDiscard) +
+             " bufzeroed=" + std::to_string(nBuf) +
+             " bufMB=" + std::to_string((unsigned long long)(bufBytes >> 20)) +
+             " bufMBtot=" + std::to_string((unsigned long long)
+                 (InterlockedCompareExchange64(&g_rtdsBufBytes, 0, 0) >> 20)) +
+             " over=" + std::to_string((long)InterlockedCompareExchange(&g_rtdsOver, 0, 0)) +
+             " skipped=" + std::to_string(nSkip) +
+             " fence=" + std::to_string((unsigned long long)g_rtdsFence->GetCompletedValue()) +
+             "/" + std::to_string((unsigned long long)v));
+}
+
+// #158 gh_barr_reloc. A ring of loader-owned allocator/list pairs, one per command
+// list type, so the guest's captured barriers can be re-recorded and submitted on the
+// guest's own queue inside the guest's own ExecuteCommandLists call. GhRtDsFlush is the
+// template for the create/reset/close/submit sequence; the difference that matters is
+// that this submits on the GUEST's queue, not on a loader queue, so queue, order and
+// submission boundaries are all preserved and the recording object is the only variable.
+struct GhRelSlot {
+    com_ptr<ID3D12CommandAllocator>    alloc;
+    com_ptr<ID3D12GraphicsCommandList> cl;
+    UINT64 fenceVal;
+};
+static const int kRelRing = 64;
+static GhRelSlot g_relRing[4][kRelRing];
+static com_ptr<ID3D12Fence> g_relFence;
+static volatile LONG64 g_relFenceVal = 0;
+static int g_relNext[4] = { 0, 0, 0, 0 };
+static SRWLOCK g_relLk = SRWLOCK_INIT;
+static bool g_relBroken = false;
+
+// The list to prepend for this submission, or nullptr to submit the guest's lists
+// unchanged. On success *slotOut names the ring slot so the caller can fence it.
+static ID3D12GraphicsCommandList* GhBarrRelocBuild(ID3D12CommandQueue* q, UINT n,
+                                                   ID3D12CommandList* const* l,
+                                                   int* typeOut, int* slotOut)
+{
+    if (g_relBroken || !q || !n || !l) return nullptr;
+    LONG batches = 0;
+    for (UINT i = 0; i < n; ++i)
+        if (GhCLNote* nt = GhCLFind(l[i])) batches += nt->relBatchN;
+    if (batches <= 0) return nullptr;
+
+    com_ptr<ID3D12Device> dev;
+    if (FAILED(q->GetDevice(__uuidof(ID3D12Device), dev.put_void())) || !dev) return nullptr;
+    const D3D12_COMMAND_QUEUE_DESC qd = q->GetDesc();
+    const int ty = (int)qd.Type;
+    if (ty < 0 || ty > 3) return nullptr;
+
+    AcquireSRWLockExclusive(&g_relLk);
+    if (!g_relFence && FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                               __uuidof(ID3D12Fence), g_relFence.put_void()))){
+        Diag("BARRRELOC CreateFence failed -- disabling relocation");
+        g_relBroken = true;
+        ReleaseSRWLockExclusive(&g_relLk);
+        return nullptr;
+    }
+    const UINT64 done = g_relFence->GetCompletedValue();
+    GhRelSlot* sl = nullptr;
+    int slot = -1;
+    for (int t = 0; t < kRelRing; ++t){
+        const int c = (g_relNext[ty] + t) % kRelRing;
+        GhRelSlot& s2 = g_relRing[ty][c];
+        if (s2.cl && s2.fenceVal > done) continue;   // still in flight
+        sl = &s2; slot = c; break;
+    }
+    if (!sl){
+        if (InterlockedIncrement(&g_relStarve) == 1)
+            Diag("BARRRELOC ring starved -- guest lists keep their own barriers");
+        ReleaseSRWLockExclusive(&g_relLk);
+        return nullptr;
+    }
+    g_relNext[ty] = (slot + 1) % kRelRing;
+    // Reserve it under the same lock that picked it. Without this a second
+    // ExecuteCommandLists on another thread would see the old fence value, choose the
+    // same slot, and Reset the allocator out from under a list already being recorded
+    // -- which loses barriers and would make a "survives" result partly an artifact.
+    sl->fenceVal = ~(UINT64)0;
+    if (!sl->cl){
+        if (FAILED(dev->CreateCommandAllocator((D3D12_COMMAND_LIST_TYPE)ty,
+                __uuidof(ID3D12CommandAllocator), sl->alloc.put_void())) ||
+            FAILED(dev->CreateCommandList(0, (D3D12_COMMAND_LIST_TYPE)ty, sl->alloc.get(), nullptr,
+                __uuidof(ID3D12GraphicsCommandList), sl->cl.put_void()))){
+            Diag("BARRRELOC CreateCommandList failed -- disabling relocation");
+            g_relBroken = true;
+            sl->alloc = nullptr; sl->cl = nullptr;
+            ReleaseSRWLockExclusive(&g_relLk);
+            return nullptr;
+        }
+        sl->cl->Close();
+    }
+    ReleaseSRWLockExclusive(&g_relLk);
+
+    if (FAILED(sl->alloc->Reset()) || FAILED(sl->cl->Reset(sl->alloc.get(), nullptr))){
+        Diag("BARRRELOC reset failed -- disabling relocation");
+        g_relBroken = true;
+        return nullptr;
+    }
+    LONG nb = 0;
+    for (UINT i = 0; i < n; ++i){
+        GhCLNote* nt = GhCLFind(l[i]);
+        if (!nt || nt->relBatchN <= 0) continue;
+        LONG off = 0;
+        for (LONG b = 0; b < nt->relBatchN; ++b){
+            const UINT cnt = nt->relBatch[b];
+            if (off + (LONG)cnt > nt->relN) break;      // truncated capture, do not read past
+            const D3D12_RESOURCE_BARRIER* arr = nt->relBuf + off;
+            // Same breadcrumb the guest's own barriers carried, so `started=K` still
+            // names the batch the GPU stopped inside -- which is what makes this
+            // experiment readable rather than only pass/fail.
+            const LONG bck = GhBcBarrierBefore(sl->cl.get(), ty);
+            GhBarrBcNote(bck, sl->cl.get(), cnt, arr);
+            sl->cl->ResourceBarrier(cnt, arr);
+            GhBcBarrierAfter(sl->cl.get(), bck);
+            off += (LONG)cnt;
+            ++nb;
+        }
+    }
+    if (FAILED(sl->cl->Close())){
+        Diag("BARRRELOC Close failed -- inconsistent captured barrier state");
+        g_relBroken = true;
+        return nullptr;
+    }
+    *typeOut = ty;
+    *slotOut = slot;
+    (void)nb;
+    return sl->cl.get();
+}
+
+// Fence the slot on the guest's queue so it can be recycled. gh_submit_sync already
+// signals this queue on every submission, so this adds no new KIND of traffic.
+static void GhBarrRelocSignal(ID3D12CommandQueue* q, int ty, int slot)
+{
+    if (!g_relFence || ty < 0 || slot < 0) return;
+    const UINT64 v = (UINT64)InterlockedIncrement64(&g_relFenceVal);
+    g_relRing[ty][slot].fenceVal = v;
+    if (g_cqVtOrig[14])
+        ((HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64))
+            g_cqVtOrig[14])(q, g_relFence.get(), v);
+    else
+        q->Signal(g_relFence.get(), v);
+}
+// #158 gh_cl_rec. Build one loader-owned list holding the guest's ENTIRE recorded
+// stream for this submission, replayed in call order across the submitted lists. Its own
+// ring, its own fence: this must not share state with the barrier relocation, so the two
+// can be compared without either perturbing the other.
+static GhRelSlot g_recRing[4][kRelRing];
+static com_ptr<ID3D12Fence> g_recFence;
+static volatile LONG64 g_recFenceVal = 0;
+static int g_recNext[4] = { 0, 0, 0, 0 };
+static SRWLOCK g_recLk = SRWLOCK_INIT;
+static bool g_recBroken = false;
+static volatile LONG g_recStarve = 0;
+static volatile LONG g_recPieces = 0;   // #158 gh_cl_split: loader-owned lists SUBMITTED
+
+// Take one free slot from the recorder's ring and hand back a list that is Reset and
+// ready to record. Factored out of GhRecBuild so gh_cl_split can take N of them; the
+// reservation rule (fenceVal = ~0 under the lock, before unlocking) is the one that
+// stopped two concurrent submissions sharing a slot and silently losing commands.
+static GhRelSlot* GhRecTakeSlot(ID3D12Device* dev, int ty, int* slotOut)
+{
+    AcquireSRWLockExclusive(&g_recLk);
+    if (!g_recFence && FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                               __uuidof(ID3D12Fence), g_recFence.put_void()))){
+        Diag("CLREC CreateFence failed -- disabling stream relocation");
+        g_recBroken = true; ReleaseSRWLockExclusive(&g_recLk); return nullptr;
+    }
+    const UINT64 done = g_recFence->GetCompletedValue();
+    GhRelSlot* sl = nullptr; int slot = -1;
+    for (int t = 0; t < kRelRing; ++t){
+        const int c = (g_recNext[ty] + t) % kRelRing;
+        GhRelSlot& s2 = g_recRing[ty][c];
+        if (s2.cl && s2.fenceVal > done) continue;
+        sl = &s2; slot = c; break;
+    }
+    if (!sl){
+        if (InterlockedIncrement(&g_recStarve) == 1)
+            Diag("CLREC ring starved -- guest lists keep their own commands");
+        ReleaseSRWLockExclusive(&g_recLk); return nullptr;
+    }
+    g_recNext[ty] = (slot + 1) % kRelRing;
+    sl->fenceVal = ~(UINT64)0;              // reserve before unlocking; see BARRRELOC
+    if (!sl->cl){
+        if (FAILED(dev->CreateCommandAllocator((D3D12_COMMAND_LIST_TYPE)ty,
+                __uuidof(ID3D12CommandAllocator), sl->alloc.put_void())) ||
+            FAILED(dev->CreateCommandList(0, (D3D12_COMMAND_LIST_TYPE)ty, sl->alloc.get(), nullptr,
+                __uuidof(ID3D12GraphicsCommandList), sl->cl.put_void()))){
+            Diag("CLREC CreateCommandList failed -- disabling stream relocation");
+            g_recBroken = true; sl->alloc = nullptr; sl->cl = nullptr;
+            ReleaseSRWLockExclusive(&g_recLk); return nullptr;
+        }
+        // Our replay list shares the guest's vtable, so without this it would record
+        // the stream into itself the moment we replayed the first command.
+        if (GhCLNote* on = GhCLFind(sl->cl.get())) on->recIsOurs = 1;
+        sl->cl->Close();
+        InterlockedIncrement(&g_recLists);
+    }
+    ReleaseSRWLockExclusive(&g_recLk);
+
+    if (FAILED(sl->alloc->Reset()) || FAILED(sl->cl->Reset(sl->alloc.get(), nullptr))){
+        Diag("CLREC Reset failed -- disabling stream relocation");
+        g_recBroken = true; return nullptr;
+    }
+    if (GhCLNote* on = GhCLFind(sl->cl.get())) on->recIsOurs = 1;   // Reset cleared the note
+    *slotOut = slot;
+    return sl;
+}
+
+// Replay the global op range [from, to) of this submission -- the stream of every guest
+// list in it, concatenated in submission order -- into one loader-owned list.
+static LONG GhRecReplayGlobalRange(ID3D12GraphicsCommandList* d, UINT n,
+                                   ID3D12CommandList* const* l, LONG from, LONG to)
+{
+    LONG base = 0, done = 0;
+    for (UINT i = 0; i < n; ++i){
+        GhCLNote* nt = GhCLFind(l[i]);
+        if (!nt || nt->ropN <= 0) continue;
+        const LONG lo = (from > base) ? (from - base) : 0;
+        const LONG hi = (to - base < nt->ropN) ? (to - base) : nt->ropN;
+        if (hi > lo) done += GhRecReplay(d, nt, false, lo, hi);
+        base += nt->ropN;
+        if (base >= to) break;
+    }
+    return done;
+}
+
+// Returns the number of loader-owned lists written into out[], in submission order.
+// One list for gh_cl_rec and gh_cl_dup; N for gh_cl_split=N.
+static int GhRecBuild(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* l,
+                      int* typeOut, int* slots, ID3D12GraphicsCommandList** out, int maxOut)
+{
+    if (g_recBroken || !q || !n || !l || !out || maxOut <= 0) return 0;
+    LONG ops = 0;
+    for (UINT i = 0; i < n; ++i)
+        if (GhCLNote* nt = GhCLFind(l[i])) ops += nt->ropN;
+    if (ops <= 0) return 0;
+
+    com_ptr<ID3D12Device> dev;
+    if (FAILED(q->GetDevice(__uuidof(ID3D12Device), dev.put_void())) || !dev) return 0;
+    const int ty = (int)q->GetDesc().Type;
+    if (ty < 0 || ty > 3) return 0;
+    *typeOut = ty;
+
+    // Splitting only applies to the relocation arrangement. Duplication deliberately
+    // chains its copies back to back in one list, which is the relationship the guest's
+    // own consecutive frames already have, and cutting that would change the experiment.
+    int pieces = 1;
+    if (!GhClDup() && GhClSplit() > 1){
+        pieces = (int)GhClSplit();
+        if (pieces > maxOut) pieces = maxOut;
+        if ((LONG)pieces > ops) pieces = (int)ops;   // never emit an empty piece
+    }
+    const LONG per = (ops + pieces - 1) / pieces;
+
+    int made = 0;
+    for (int p = 0; p < pieces; ++p){
+        int slot = -1;
+        GhRelSlot* sl = GhRecTakeSlot(dev.get(), ty, &slot);
+        if (!sl){
+            // A partial split would submit a truncated stream, which is a corrupted
+            // experiment rather than a negative one. Bail out and let the guest's own
+            // lists carry their commands, exactly as the starve path already does.
+            if (made) Diag("CLREC split abandoned after " + std::to_string(made) +
+                           "/" + std::to_string(pieces) + " pieces -- run is VOID");
+            return 0;
+        }
+        if (GhClDup()){
+            const unsigned k = GhClDup();
+            for (unsigned c = 0; c < k; ++c)
+                for (UINT i = 0; i < n; ++i)
+                    if (GhCLNote* nt = GhCLFind(l[i])) GhRecReplay(sl->cl.get(), nt, true);
+        } else {
+            GhRecReplayGlobalRange(sl->cl.get(), n, l, (LONG)p * per, (LONG)(p + 1) * per);
+        }
+        if (FAILED(sl->cl->Close())){
+            Diag("CLREC Close failed -- the replayed stream is inconsistent, run is VOID");
+            g_recBroken = true; return 0;
+        }
+        slots[made] = slot;
+        out[made]   = sl->cl.get();
+        ++made;
+    }
+    if (pieces > 1){
+        static LONG shown = 0;
+        const LONG s = InterlockedIncrement(&shown);
+        if (s <= 8 || (s % 64) == 0)
+            Diag("CLSPLIT sub=" + std::to_string((long)s) +
+                 " pieces=" + std::to_string(made) +
+                 " ops=" + std::to_string((long)ops) +
+                 " per=" + std::to_string((long)per));
+    }
+    return made;
+}
+
+// All the pieces of one submission retire together, so they share a single fence value:
+// N pieces must not mean N extra GPU signals, or the split would be adding queue work of
+// its own and stop being a pure redistribution.
+static void GhRecSignalMany(ID3D12CommandQueue* q, int ty, const int* slots, int count)
+{
+    if (!g_recFence || ty < 0 || count <= 0) return;
+    const UINT64 v = (UINT64)InterlockedIncrement64(&g_recFenceVal);
+    for (int i = 0; i < count; ++i)
+        if (slots[i] >= 0) g_recRing[ty][slots[i]].fenceVal = v;
+    InterlockedAdd(&g_recPieces, (LONG)count);
+    if (g_cqVtOrig[14])
+        ((HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64))
+            g_cqVtOrig[14])(q, g_recFence.get(), v);
+    else
+        q->Signal(g_recFence.get(), v);
+}
+
+static void GhRecSignal(ID3D12CommandQueue* q, int ty, int slot)
+{
+    if (!g_recFence || ty < 0 || slot < 0) return;
+    const UINT64 v = (UINT64)InterlockedIncrement64(&g_recFenceVal);
+    g_recRing[ty][slot].fenceVal = v;
+    if (g_cqVtOrig[14])
+        ((HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64))
+            g_cqVtOrig[14])(q, g_recFence.get(), v);
+    else
+        q->Signal(g_recFence.get(), v);
+}
+
+static void GhClRecStats(const char* where)
+{
+    if (!GhClRec() && !GhClDup() && !GhSubCensus()) return;
+    Diag(std::string("CLRECSTATS at ") + where +
+         " census=" + std::to_string((long)GhSubCensus()) +
+         " split=" + std::to_string((long)GhClSplit()) +
+         " dup=" + std::to_string((long)GhClDup()) +
+         " dupOps=" + std::to_string((long)InterlockedCompareExchange(&g_recDupOps, 0, 0)) +
+         " dupCopies=" + std::to_string((long)InterlockedCompareExchange(&g_recDupCopies, 0, 0)) +
+         " ops=" + std::to_string((long)InterlockedCompareExchange(&g_recOps, 0, 0)) +
+         " replays=" + std::to_string((long)InterlockedCompareExchange(&g_recReplays, 0, 0)) +
+         " lists=" + std::to_string((long)InterlockedCompareExchange(&g_recLists, 0, 0)) +
+         " pieces=" + std::to_string((long)InterlockedCompareExchange(&g_recPieces, 0, 0)) +
+         " starved=" + std::to_string((long)InterlockedCompareExchange(&g_recStarve, 0, 0)) +
+         " overflow=" + std::to_string((long)InterlockedCompareExchange(&g_recOverflow, 0, 0)) +
+         " broken=" + std::to_string((long)(g_recBroken ? 1 : 0)));
+}
+
+// ---- #158: give the guest a different queue -----------------------------------
+// The in-situ probe (loader 0.0.291.0) put OUR command list, OUR PSO and OUR shaders
+// through the GAME'S queue and it died in one to three submissions, while the same
+// list on a queue we created survived 24,000 draws. The queue descs are byte-identical
+// and the vtable is shared, so neither the creation parameters nor the loader's own
+// hook is the difference -- what is left is the queue OBJECT.
+//
+//   gh_queue_sub = 1     every DIRECT queue the guest creates is shadowed by one the
+//                        loader creates with the same desc, and the guest's
+//                        ExecuteCommandLists / Signal / Wait are redirected onto it.
+//                        This is the CONTROL: the guest's own object is never used,
+//                        but a fresh queue does not stay fresh, so on its own this
+//                        should reproduce the hang unchanged. If it does not, the
+//                        redirection itself changed something and the experiment
+//                        below is void.
+//   gh_queue_rotate = N  additionally retire the substitute every N guest submissions
+//                        and replace it with a brand-new one, draining to idle first.
+//                        If the fault is bound to state the queue accumulates, this
+//                        resets it before the budget runs out.
+static unsigned GhQueueSub()
+{ static const unsigned n = (unsigned)GhCfgNum(L"gh_queue_sub.txt", "GH_QUEUE_SUB", 0); return n; }
+static unsigned GhQueueRotate()
+{ static const unsigned n = (unsigned)GhCfgNum(L"gh_queue_rotate.txt", "GH_QUEUE_ROTATE", 0); return n; }
+
+struct GhQSubEnt {
+    ID3D12CommandQueue*         guest;      // what the guest was handed
+    com_ptr<ID3D12CommandQueue> sub;        // what its work actually goes to
+    com_ptr<ID3D12Fence>        drain;
+    ID3D12Device*               dev;
+    D3D12_COMMAND_QUEUE_DESC    desc;
+    UINT64                      drainVal;
+    LONG                        subs, rots;
+};
+static GhQSubEnt g_qsub[8]{};
+static volatile LONG g_qsubN = 0;
+static SRWLOCK g_qsubLk = SRWLOCK_INIT;
+// Retired substitutes are never released. GhQSubFor hands a RAW pointer back to a
+// caller that uses it after dropping the lock, so dropping the last reference during
+// a rotation would be a use-after-free on any other guest thread submitting to the
+// same queue -- and it would look exactly like a GPU fault, which is the one thing
+// this experiment must not manufacture.
+static com_ptr<ID3D12CommandQueue> g_qsubRetired[64];
+static volatile LONG g_qsubRetiredN = 0;
+
+// Returns the queue the guest's work should actually go to, or nullptr for "leave it
+// alone". A substitute is never itself redirected -- the vtable is shared, so without
+// that check the hook would recurse into itself forever.
+static ID3D12CommandQueue* GhQSubFor(ID3D12CommandQueue* q)
+{
+    if (!q || !GhQueueSub()) return nullptr;
+    ID3D12CommandQueue* out = nullptr;
+    AcquireSRWLockShared(&g_qsubLk);
+    const LONG nq = InterlockedCompareExchange(&g_qsubN, 0, 0);
+    for (LONG i = 0; i < nq; ++i){
+        if (g_qsub[i].sub.get() == q){ out = nullptr; break; }
+        if (g_qsub[i].guest == q){ out = g_qsub[i].sub.get(); break; }
+    }
+    ReleaseSRWLockShared(&g_qsubLk);
+    return out;
+}
+
+// Called once per guest submission, before the work goes down.
+static void GhQSubTick(ID3D12CommandQueue* guest)
+{
+    const unsigned every = GhQueueRotate();
+    if (!every || !GhQueueSub() || !guest) return;
+    AcquireSRWLockExclusive(&g_qsubLk);
+    const LONG nq = InterlockedCompareExchange(&g_qsubN, 0, 0);
+    for (LONG i = 0; i < nq; ++i){
+        GhQSubEnt& e = g_qsub[i];
+        if (e.guest != guest) continue;
+        if ((unsigned)(++e.subs) < every) break;
+        e.subs = 0;
+        // Drain the outgoing queue to idle first. A queue with work still in flight
+        // cannot be retired without abandoning that work, and the point is to hand
+        // the guest a queue with no history -- not to lose its submissions.
+        if (e.drain && e.sub){
+            const UINT64 want = ++e.drainVal;
+            ((HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64))
+                g_cqVtOrig[14])(e.sub.get(), e.drain.get(), want);
+            if (e.drain->GetCompletedValue() < want){
+                HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (ev){
+                    e.drain->SetEventOnCompletion(want, ev);
+                    WaitForSingleObject(ev, 5000);
+                    CloseHandle(ev);
+                }
+            }
+        }
+        const LONG rn = InterlockedCompareExchange(&g_qsubRetiredN, 0, 0);
+        if (rn >= (LONG)(sizeof(g_qsubRetired) / sizeof(g_qsubRetired[0]))){
+            Diag("QROTATE retired-queue table full -- rotation STOPS here, the rest "
+                 "of this run is a gh_queue_sub control");
+            break;
+        }
+        com_ptr<ID3D12CommandQueue> fresh;
+        auto mk = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_COMMAND_QUEUE_DESC*,
+                                        REFIID, void**))g_d12vtOrig[8];
+        HRESULT hr = mk ? mk(e.dev, &e.desc, __uuidof(ID3D12CommandQueue), fresh.put_void())
+                        : E_FAIL;
+        if (SUCCEEDED(hr) && fresh){
+            g_qsubRetired[rn] = e.sub;                 // keep the old one alive forever
+            InterlockedIncrement(&g_qsubRetiredN);
+            Diag("QROTATE guest=" + Hex((uint64_t)(uintptr_t)e.guest) +
+                 " " + Hex((uint64_t)(uintptr_t)e.sub.get()) +
+                 " -> " + Hex((uint64_t)(uintptr_t)fresh.get()) +
+                 " rot#" + std::to_string((long)(++e.rots)) +
+                 " every=" + std::to_string(every));
+            e.sub = fresh;
+        } else {
+            // Never let this fail quietly: a rotation that did not happen makes the
+            // run a plain gh_queue_sub control wearing the wrong label.
+            Diag("QROTATE FAILED hr=" + Hex((uint32_t)hr) +
+                 " -- this run is a gh_queue_sub control, NOT a rotation");
+        }
+        break;
+    }
+    ReleaseSRWLockExclusive(&g_qsubLk);
+}
+
+// Registered from Hook_D12CreateCQ. Only the guest's DIRECT queues: the loader's own
+// presentation queue (g_gfx.queue) must keep submitting to itself or the swapchain
+// loses its work.
+static void GhQSubRegister(ID3D12Device* dev, const D3D12_COMMAND_QUEUE_DESC* desc,
+                           ID3D12CommandQueue* q)
+{
+    if (!GhQueueSub() || !q || !dev || !desc) return;
+    if (desc->Type != D3D12_COMMAND_LIST_TYPE_DIRECT) return;
+    if (q == g_gfx.queue.get()) return;
+    AcquireSRWLockExclusive(&g_qsubLk);
+    const LONG nq = InterlockedCompareExchange(&g_qsubN, 0, 0);
+    if (nq < (LONG)(sizeof(g_qsub) / sizeof(g_qsub[0]))){
+        GhQSubEnt& e = g_qsub[nq];
+        e.guest = q; e.dev = dev; e.desc = *desc;
+        e.drainVal = 0; e.subs = 0; e.rots = 0;
+        auto mk = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_COMMAND_QUEUE_DESC*,
+                                        REFIID, void**))g_d12vtOrig[8];
+        HRESULT hr = mk ? mk(dev, desc, __uuidof(ID3D12CommandQueue), e.sub.put_void())
+                        : E_FAIL;
+        if (SUCCEEDED(hr) && e.sub){
+            dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                             e.drain.put_void());
+            Diag("QSUB registered guest=" + Hex((uint64_t)(uintptr_t)q) +
+                 " -> sub=" + Hex((uint64_t)(uintptr_t)e.sub.get()) +
+                 " type=" + std::to_string((int)desc->Type) +
+                 " flags=" + Hex((uint32_t)desc->Flags) +
+                 " slot=" + std::to_string((long)nq));
+            InterlockedIncrement(&g_qsubN);
+        } else {
+            e.guest = nullptr;
+            Diag("QSUB create failed hr=" + Hex((uint32_t)hr) +
+                 " -- the guest keeps its own queue, this run is a CONTROL");
+        }
+    }
+    ReleaseSRWLockExclusive(&g_qsubLk);
+}
+
+// #158. The census proved submission #34 is bit-identical to #22 -- which COMPLETED --
+// in every identity it can hash: 24/24 root VAs, 73/73 table handles, 38/38 resources,
+// 28/28 CPU handles, same PSOs, same root signatures. What it cannot see is CONTENTS.
+// These are small constant buffers (24 addresses inside 1184 bytes) and the same address
+// holds different bytes on every pass. A constant that goes bad on the third use of
+// buffer A -- a NaN, an index that runs off the end of the n=128 SRV range, a count that
+// overruns -- would be invisible to every instrument built so far and would produce
+// exactly this signature. So dump the bytes behind every root-descriptor VA of a
+// submission and diff #22 against #34.
+//
+// Needs gh_va_check, because g_bufVa (the VA -> buffer map) is only populated when that
+// is on. A CBVDUMP line reading `unresolved` on every VA means VACHK was left at 0.
+static unsigned GhCbvDump()
+{ static const unsigned n = GhCfgNum(L"gh_cbv_dump.txt", "GH_CBV_DUMP", 0); return n; }
+// #158. w7 of the 240x135 constant block counts 2,3,4,5,6,7 across the six pyramid
+// submissions and the GPU hard-stops on the one where it reaches 7. Pin it: rewrite the
+// value at submit time, before the GPU reads it, and see whether the wall travels with
+// the counter or stays at submission #34. The block is identified by its own contents
+// (w8==240.0f && w9==135.0f), not by an address, so it is found in both frame buffers.
+static unsigned GhPinW7()
+{ static const unsigned n = GhCfgNum(L"gh_pin_w7.txt", "GH_PIN_W7", 0); return n; }
+static volatile LONG g_pinW7Hits = 0;
+// Pinning the integer alone left the wall exactly where it was, but w0 and w1 kept
+// counting (w1 = n/90, n = 1..6), so only the integer had been cleared. This pins the
+// whole differing set to submission #22's bytes -- #22 being the last execution of this
+// buffer that COMPLETED -- which makes #34 identical to #22 in contents as well as
+// identity. w0/w1 in the counter block, and the single float that moves in the fourth
+// differing buffer, identified by its own neighbours (-2.0, 3.0, -12.0).
+static unsigned GhPinW01()
+{ static const unsigned n = GhCfgNum(L"gh_pin_w01.txt", "GH_PIN_W01", 0); return n; }
+static volatile LONG g_pinW01Hits = 0;
+
+static ID3D12Resource* GhVaFindBuf(UINT64 va, UINT64* offOut, UINT64* leftOut)
+{
+    ID3D12Resource* found = nullptr; UINT64 off = 0, left = 0;
+    AcquireSRWLockShared(&g_bufVaLk);
+    LONG n = g_bufVaN; if (n > 16384) n = 16384;
+    // Newest first: a VA freed and handed to a later buffer must resolve to the later one.
+    for (LONG i = n - 1; i >= 0; --i){
+        if (va >= g_bufVa[i].lo && va < g_bufVa[i].hi){
+            found = g_bufVa[i].res; off = va - g_bufVa[i].lo; left = g_bufVa[i].hi - va;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_bufVaLk);
+    if (offOut) *offOut = off;
+    if (leftOut) *leftOut = left;
+    return found;
+}
+
+static void GhCbvDumpEmit(LONG seq, UINT n, ID3D12CommandList* const* l)
+{
+    const unsigned lim = GhCbvDump();
+    const unsigned pin = GhPinW7();
+    // The pin has to run on EVERY submission, not only the ones being dumped.
+    const bool doDump = lim && (unsigned)seq <= lim;
+    if ((!doDump && !pin) || !n || !l) return;
+    UINT64 seen[256]; int nseen = 0; int nres = 0, nmapfail = 0, nunres = 0;
+    int nroot = 0, nvb = 0, ntbl = 0;
+    // Emit one VA's bytes, deduped. Declared up front because the constants arrive by
+    // three different routes and all three funnel here.
+    auto emit = [&](LONG sq, unsigned via, UINT64 va){
+        if (!va || nseen >= 256) return;
+        for (int q = 0; q < nseen; ++q) if (seen[q] == va) return;
+        seen[nseen++] = va;
+        UINT64 off = 0, left = 0;
+        ID3D12Resource* r = GhVaFindBuf(va, &off, &left);
+        std::string m = "CBVDUMP #" + std::to_string((long)sq) +
+                        " via=" + std::to_string(via) +
+                        " va=" + Hex(va) +
+                        " res=" + Hex((uint64_t)(uintptr_t)r) +
+                        " off=" + std::to_string((unsigned long long)off);
+        if (!r){ ++nunres; Diag(m + " unresolved"); return; }
+        unsigned len = 64; if (left < len) len = (unsigned)left;
+        if (!len){ Diag(m + " zerolen"); return; }
+        void* p = nullptr;
+        D3D12_RANGE rd{ (SIZE_T)off, (SIZE_T)off + len };
+        HRESULT hr = r->Map(0, &rd, &p);
+        if (FAILED(hr) || !p){ ++nmapfail; Diag(m + " maphr=" + Hex((uint32_t)hr)); return; }
+        unsigned char* bb = (unsigned char*)p + off;
+        bool wrote = false, wroteLo = false;
+        // Pin BEFORE the hexdump, so the dumped bytes are what the GPU will actually read.
+        if (pin && via == 3 && len >= 40){
+            float w8 = 0, w9 = 0;
+            std::memcpy(&w8, bb + 32, 4); std::memcpy(&w9, bb + 36, 4);
+            if (w8 == 240.0f && w9 == 135.0f){
+                UINT32 old = 0; std::memcpy(&old, bb + 28, 4);
+                if (GhPinW01()){
+                    // #22's exact bytes: w0 = 0.111111, w1 = 0.0444444
+                    const UINT32 p0 = 0x3DE38E3Au, p1 = 0x3D360B61u;
+                    UINT32 o0 = 0, o1 = 0;
+                    std::memcpy(&o0, bb + 0, 4); std::memcpy(&o1, bb + 4, 4);
+                    if (o0 != p0 || o1 != p1){
+                        std::memcpy(bb + 0, &p0, 4); std::memcpy(bb + 4, &p1, 4);
+                        wroteLo = true;
+                        InterlockedIncrement(&g_pinW01Hits);
+                    }
+                }
+                if (old != pin){
+                    const UINT32 nv = pin;
+                    std::memcpy(bb + 28, &nv, 4);
+                    wrote = true;
+                    const LONG k = InterlockedIncrement(&g_pinW7Hits);
+                    if (k <= 8 || (k % 64) == 0)
+                        Diag("PINW7 #" + std::to_string((long)sq) + " n=" + std::to_string((long)k) +
+                             " va=" + Hex(va) + " old=" + std::to_string((unsigned long)old) +
+                             " new=" + std::to_string((unsigned long)nv));
+                }
+            }
+        }
+        if (pin && GhPinW01() && via == 3 && len >= 24){
+            float f0 = 0, f1 = 0, f4 = 0;
+            std::memcpy(&f0, bb + 0, 4); std::memcpy(&f1, bb + 4, 4); std::memcpy(&f4, bb + 16, 4);
+            if (f0 == -2.0f && f1 == 3.0f && f4 == -12.0f){
+                const UINT32 p3 = 0x3E51963Cu;      // #22's value, 0.204639
+                UINT32 o3 = 0; std::memcpy(&o3, bb + 12, 4);
+                if (o3 != p3){
+                    std::memcpy(bb + 12, &p3, 4);
+                    wroteLo = true;
+                    InterlockedIncrement(&g_pinW01Hits);
+                }
+            }
+        }
+        char hx[132];
+        for (unsigned q = 0; q < len; ++q) std::snprintf(hx + q * 2, 3, "%02X", bb[q]);
+        hx[len * 2] = 0;
+        // Widen the written range to cover w0/w1 when those were pinned too.
+        D3D12_RANGE nw{ 0, 0 };
+        if (wrote || wroteLo){
+            nw.Begin = (SIZE_T)(off + (wroteLo ? 0 : 28));
+            nw.End   = (SIZE_T)(off + (wrote ? 32 : 20));
+        }
+        r->Unmap(0, &nw);
+        ++nres;
+        if (doDump) Diag(m + " len=" + std::to_string(len) + " b=" + hx);
+    };
+    for (UINT i = 0; i < n; ++i){
+        GhCLNote* nt = GhCLFind(l[i]);
+        if (!nt || nt->ropN <= 0) continue;
+        for (LONG k = 0; k < nt->ropN && nseen < 64; ++k){
+            const GhRecOp& o = nt->rops[k];
+            // via=1: 38/40/42 = SetGraphics/ComputeRoot CBV / SRV / UAV. The HEAVY
+            // submission has none of these -- checked, it emits no line at all -- so
+            // this route alone would have measured only the light submissions.
+            if (o.slot == 38 || o.slot == 40 || o.slot == 42){
+                ++nroot; emit(seq, 1, o.a[1]); continue;
+            }
+            // via=2: index and vertex buffer views. These are the 24 the census counts
+            // in `uniqVA` for the heavy submission -- geometry, not constants.
+            if (o.slot == 43){
+                const D3D12_INDEX_BUFFER_VIEW* v = (const D3D12_INDEX_BUFFER_VIEW*)GhRecAt(nt, o.off);
+                if (v){ ++nvb; emit(seq, 2, (UINT64)v->BufferLocation); }
+                continue;
+            }
+            if (o.slot == 44){
+                const D3D12_VERTEX_BUFFER_VIEW* v = (const D3D12_VERTEX_BUFFER_VIEW*)GhRecAt(nt, o.off);
+                if (v) for (UINT q = 0; q < o.nA; ++q){ ++nvb; emit(seq, 2, (UINT64)v[q].BufferLocation); }
+                continue;
+            }
+            // via=3: where this game's constants ACTUALLY are -- CBV descriptors inside
+            // descriptor tables (31/32 = SetGraphics/ComputeRootDescriptorTable). The
+            // BIND lines show them as `[0]CBV res=0x0`: a CBV descriptor names no
+            // resource, only a GPU address, which GhDescPut stores in `va`.
+            if (o.slot == 31 || o.slot == 32){
+                UINT inc = 32;
+                const UINT64 cpu0 = GhGpuHandleToCpu(o.a[1], &inc);
+                if (!cpu0) continue;
+                ++ntbl;
+                // 67 tables were walked and not one CBV with an address came back, while
+                // 464 CBVs were created and passed their VA check. So say out loud what
+                // the walk sees rather than guessing which of note/kind/va is missing.
+                if (doDump && ntbl <= 3){
+                    std::string pm = "CBVPROBE #" + std::to_string((long)seq) +
+                                     " tbl=" + Hex(o.a[1]) + " cpu0=" + Hex(cpu0) +
+                                     " inc=" + std::to_string((unsigned)inc);
+                    for (unsigned q = 0; q < 8; ++q){
+                        const GhDescNote* dn = GhDescGet(cpu0 + (UINT64)q * inc);
+                        pm += " [" + std::to_string(q) + "]";
+                        if (!dn) pm += "none";
+                        else pm += "k=" + std::to_string((unsigned)dn->kind) +
+                                   ",va=" + Hex(dn->va) +
+                                   ",res=" + Hex((uint64_t)(uintptr_t)dn->res);
+                    }
+                    Diag(pm);
+                }
+                for (unsigned q = 0; q < 16; ++q){
+                    const GhDescNote* dn = GhDescGet(cpu0 + (UINT64)q * inc);
+                    if (dn && dn->kind == 1 && dn->va) emit(seq, 3, dn->va);
+                }
+                continue;
+            }
+        }
+    }
+    if (nseen && (doDump || pin))
+        Diag("CBVDUMPSTATS #" + std::to_string((long)seq) +
+             " vas=" + std::to_string(nseen) +
+             " dumped=" + std::to_string(nres) +
+             " unresolved=" + std::to_string(nunres) +
+             " mapfail=" + std::to_string(nmapfail) +
+             " root=" + std::to_string(nroot) +
+             " vbib=" + std::to_string(nvb) +
+             " tbls=" + std::to_string(ntbl) +
+             " descdrop=" + std::to_string((long)InterlockedCompareExchange(&g_descDrop, 0, 0)) +
+             " pinned=" + std::to_string((long)InterlockedCompareExchange(&g_pinW7Hits, 0, 0)) +
+             " pinnedLo=" + std::to_string((long)InterlockedCompareExchange(&g_pinW01Hits, 0, 0)));
+}
+
+// ------------------------------------------------ #158 gh_dup_submit / gh_dup_nth
+// The mirror of gh_skip_submit: execute ONE named submission's own command lists a
+// SECOND time, on the same queue, through the original vtable entry. Nothing here is
+// rebuilt and nothing is replayed -- these are the guest's own list objects handed to
+// ExecuteCommandLists again, which is exactly what the game itself already does four
+// times over with this very list.
+//
+// Why this and not gh_cl_dup: that knob duplicates EVERY submission, so it multiplies
+// the light submissions alongside the heavy ones and cannot tell "the fifth execution
+// of the heavy list" apart from "the Nth execution of anything non-empty". That is why
+// its K=2 row (three heavy executions, dead) sits in tension with the law drawn from
+// the skip cells. GREENHOUSE.md named a per-submission duplicate as the instrument
+// needed to settle it, and it was never built.
+//
+// The law says the GPU dies on the FIFTH EXECUTED heavy submission. Duplicate an early
+// heavy one and the fifth execution must arrive one heavy submission EARLIER. That is
+// a prediction that moves in a named direction, which is the whole point of it.
+//
+// Two ways to name the target, because the submission schedule drifts between runs:
+//   gh_dup_submit=N   absolute submission index (seq), when the log says it is stable
+//   gh_dup_nth=K      the Kth HEAVY submission, by SHAPE (draws/disp/indirect)
+// The shape form needs the recorder awake (gh_sub_census or gh_cl_rec), or GhCLFind
+// carries no ops and every submission reads as light. DUPSCAN says which it saw.
+//
+// STATE-LEGALITY, stated up front: re-executing a list re-runs its 48 transitions, and
+// a lying StateBefore is a different bug that would void the run rather than answer it.
+// The reason it should be safe here is that the GAME re-executes this same list object
+// four times with no re-recording, so its transitions have to be self-consistent -- but
+// only if nothing between executions moves those resources back. Run the cell with the
+// debug layer on (DBG=1): a state mismatch on the duplicate is exactly what it catches,
+// and a run that reports one is void, not a negative.
+static unsigned GhDupSubmit()
+{ static const unsigned n = GhCfgNum(L"gh_dup_submit.txt", "GH_DUP_SUBMIT", 0); return n; }
+static unsigned GhDupNth()
+{ static const unsigned n = GhCfgNum(L"gh_dup_nth.txt", "GH_DUP_NTH", 0); return n; }
+// gh_skip_nth: BITMASK over heavy occurrences -- bit0 = the 1st heavy submission,
+// bit1 = the 2nd, and so on. gh_skip_nth=3 drops the first TWO. gh_skip_submit names
+// one absolute seq; this names occurrences by shape, so it survives the schedule drift
+// that made SK34_a skip nothing, and it is the only way to ask for more than one.
+static unsigned GhSkipNth()
+{ static const unsigned n = GhCfgNum(L"gh_skip_nth.txt", "GH_SKIP_NTH", 0); return n; }
+// HEAVY IS A SHAPE, NOT A SIZE. v0.0.325.0 classified on ops>=300 and caught a
+// LOAD-TIME submission (ops=1077, draws=0) -- the load submissions are BIGGER than the
+// render one, so the threshold selected in the wrong direction entirely. The render
+// pyramid submission is ops=326/327 draws=24 disp=6 indirect=1, every occurrence.
+static const LONG kHeavyDraws = 20;
+static const LONG kHeavyDisp  = 6;
+static volatile LONG g_dupHeavySeen = 0;
+static volatile LONG g_dupDone = 0;
+
+// #165. Ghost of Tsushima stops with no exception, no device-removed and no exit:
+// the main thread enters ONE D3D12 call, that call makes a win32u kernel call, and
+// it has not returned fifteen seconds later when the OS kills the app. Two runs
+// named the same call from the guest side -- ID3D12Device::CreateDescriptorHeap,
+// slot 14, reached through the game's wrapper at GUEST+0x4fb6b0 -- but the loader
+// had no line for it at all: Hook_D12CreateDH logs only on failure, and its DESCHEAP
+// line is gated behind three knobs none of this title's cells set.
+//
+// Thread stacks are the wrong instrument here. GhLiveStack suspends its target and
+// calls GetThreadContext, which does not return while that thread sits in a kernel
+// call, so the liveness sampler blocks on exactly the thread it is trying to
+// observe -- that is why the diag shows a 16 s hole with no "(same xN)" line. The
+// memory sampler blocks the same way on QueryVideoMemoryInfo. Both instruments go
+// dark precisely when the thing they measure happens.
+//
+// So record the call from the CALLER instead: one word saying which D3D12 method is
+// outstanding, one timestamp, one thread id. A watchdog that never touches the
+// graphics stack reads those three and says how long the call has been running. An
+// outstanding call is normal; an outstanding call at 3 s is the wall.
+static volatile LONG64  g_d12CallT0   = 0;   // GetTickCount64 at entry, 0 = idle
+static const char* volatile g_d12CallName = nullptr;
+static volatile LONG    g_d12CallTid  = 0;
+static volatile LONG    g_d12CallSeq  = 0;
+// #165. The name of the method is not enough once the method is a create: seven
+// CreateCommittedResource calls succeed and the eighth never returns, and the
+// per-call Diag runs AFTER the call, so the one that hangs is the one never
+// described. Let the caller stash a compact description at entry; the watchdog
+// prints it with the OUTSTANDING line. Only the slot owner writes it, and only
+// between claiming and releasing the slot, so a plain buffer is enough.
+static char g_d12CallInfo[192];
+struct GhD12CallScope {
+    const ULONGLONG t0;
+    const bool mine;
+    explicit GhD12CallScope(const char* name)
+        : t0(GetTickCount64()),
+          // Nested/concurrent calls are ordinary; the watchdog wants the one that
+          // is stuck, and a call that never returns is never displaced by a later
+          // one. First writer owns the slot until it returns.
+          mine(InterlockedCompareExchange64(&g_d12CallT0, (LONG64)t0, 0) == 0)
+    {
+        if (mine){
+            g_d12CallInfo[0] = 0;
+            g_d12CallName = name;
+            InterlockedExchange(&g_d12CallTid, (LONG)GetCurrentThreadId());
+            InterlockedIncrement(&g_d12CallSeq);
+        }
+    }
+    // Compact caller-supplied detail for the watchdog, e.g. the resource desc.
+    void Info(const std::string& d) const {
+        if (!mine) return;
+        const size_t n = d.size() < sizeof(g_d12CallInfo) - 1 ? d.size() : sizeof(g_d12CallInfo) - 1;
+        std::memcpy(g_d12CallInfo, d.c_str(), n);
+        g_d12CallInfo[n] = 0;
+    }
+    ~GhD12CallScope(){
+        if (mine){
+            const ULONGLONG dt = GetTickCount64() - t0;
+            g_d12CallInfo[0] = 0;
+            InterlockedExchange64(&g_d12CallT0, 0);
+            // Only the ones that hurt: an ordinary create is microseconds, and a
+            // line per call would bury the run.
+            if (dt >= 250)
+                Diag(std::string("D3D12 SLOWCALL returned ") + (g_d12CallName ? g_d12CallName : "?") +
+                     " after " + std::to_string((unsigned long long)dt) + "ms tid=" +
+                     std::to_string((unsigned long)GetCurrentThreadId()));
+        }
+    }
+};
+// Reads the three words above and nothing else -- no D3D12, no DXGI, no thread
+// suspension -- so it keeps reporting while every other instrument is blocked.
+static void GhD12CallWatchdog()
+{
+    LONG lastSeq = -1; unsigned reportedAt = 0;
+    while (!g_guestDone){
+        const LONG64 t0 = InterlockedCompareExchange64(&g_d12CallT0, 0, 0);
+        const LONG seq = InterlockedCompareExchange(&g_d12CallSeq, 0, 0);
+        if (seq != lastSeq){ lastSeq = seq; reportedAt = 0; }
+        if (t0){
+            const unsigned dt = (unsigned)(GetTickCount64() - (ULONGLONG)t0);
+            // First shout at 3 s, then every 5 s, so a permanent stall keeps
+            // saying so right up to the moment the app is killed.
+            if (dt >= 3000 && dt >= reportedAt + 5000){
+                reportedAt = dt;
+                Diag("D3D12 SLOWCALL " + std::string(g_d12CallName ? g_d12CallName : "?") +
+                     " OUTSTANDING " + std::to_string(dt) + "ms tid=" +
+                     std::to_string((unsigned long)InterlockedCompareExchange(&g_d12CallTid, 0, 0)) +
+                     (g_d12CallInfo[0] ? std::string(" ") + g_d12CallInfo : std::string()));
+            }
+        }
+        Sleep(500);
+    }
+}
+static void __stdcall Hook_CQExecute(ID3D12CommandQueue* self_, UINT n, ID3D12CommandList* const* l)
+{
+    GhD12CallScope _s("ExecuteCommandLists");
+    // #158: everything below -- the relocation signals, the stall fence, the logging
+    // -- must name the queue the work actually went to, so the swap happens here and
+    // once, rather than at each call site.
+    ID3D12CommandQueue* self = self_;
+    GhQSubTick(self_);
+    if (ID3D12CommandQueue* sq = GhQSubFor(self_)) self = sq;
+    // #158: initialize any render-target/depth-stencil resource created since the
+    // last submission BEFORE the guest's work can read it. Waits on the GPU, so
+    // the ordering is guaranteed rather than hoped for.
+    GhRtDsFlush("pre-submit");
     LONG seq = InterlockedIncrement(&g_eclCount);
     InterlockedAdd(&g_eclLists, (LONG)n);
     InterlockedExchange64(&g_eclTick, (LONG64)GetTickCount64());
@@ -6521,6 +14571,10 @@ static void __stdcall Hook_CQExecute(ID3D12CommandQueue* self, UINT n, ID3D12Com
         for (UINT i = 0; i < n && i < 8; ++i) m += "\n    [" + std::to_string(i) + "] " + GhCLSummary(l[i]);
         Diag(m);
     }
+    // #158 gh_sub_census. Emitted BEFORE the submission goes down, so the fatal one --
+    // which never retires -- still gets its line. Changes nothing about the stream.
+    GhSubCensusEmit(seq, n, l);
+    GhCbvDumpEmit(seq, n, l);
     // bit 3: swallow the guest's submissions entirely. Ours still go through --
     // g_gfx.queue is the one the blit and 11on12 use, and dropping that would
     // change what is on screen rather than what the GPU is asked to do. Fences
@@ -6531,6 +14585,52 @@ static void __stdcall Hook_CQExecute(ID3D12CommandQueue* self, UINT n, ID3D12Com
         if (k <= 4 || (k % 256) == 0)
             Diag("GPUSUBMIT DROPPED by gh_op_mask bit3 n=" + std::to_string((long)k) +
                  " q=" + Hex((uint64_t)(uintptr_t)self));
+        return;
+    }
+    // #158. One shape classifier shared by gh_skip_nth and gh_dup_nth, run before any
+    // early return so a SKIPPED occurrence still consumes its heavy index and the
+    // numbering means the same thing in every cell.
+    const unsigned dupSeqK = GhDupSubmit();
+    const unsigned dupNth  = GhDupNth();
+    const unsigned skipNth = GhSkipNth();
+    LONG shOps = 0, shDraws = 0, shDisp = 0, shInd = 0, shNth = 0;
+    if ((dupSeqK || dupNth || skipNth) && self != g_gfx.queue.get()){
+        for (UINT i = 0; i < n; ++i){
+            GhCLNote* nt = GhCLFind(l[i]);
+            if (!nt) continue;
+            shOps += nt->ropN;
+            for (LONG k = 0; k < nt->ropN; ++k){
+                const int sl = (int)nt->rops[k].slot;
+                if (sl == 12 || sl == 13) ++shDraws;
+                else if (sl == 14)        ++shDisp;
+                else if (sl == 59)        ++shInd;
+            }
+        }
+        if (shDraws >= kHeavyDraws && shDisp >= kHeavyDisp && shInd >= 1){
+            shNth = InterlockedIncrement(&g_dupHeavySeen);
+            // Proof of life for both knobs AND the per-run heavy census used to score
+            // them: a cell that never fired reads differently from one that fired on
+            // the wrong submission. A knob that produces no line has tested nothing.
+            if (shNth <= 16)
+                Diag("DUPSCAN heavy#" + std::to_string((long)shNth) +
+                     " seq=" + std::to_string((long)seq) +
+                     " ops=" + std::to_string((long)shOps) +
+                     " draws=" + std::to_string((long)shDraws) +
+                     " disp=" + std::to_string((long)shDisp) +
+                     " ind=" + std::to_string((long)shInd) +
+                     " lists=" + std::to_string((unsigned long)n));
+        } else if (shOps > 0 && shNth == 0 && seq <= 64){
+            Diag("DUPSCAN light seq=" + std::to_string((long)seq) +
+                 " ops=" + std::to_string((long)shOps) +
+                 " draws=" + std::to_string((long)shDraws) +
+                 " disp=" + std::to_string((long)shDisp) +
+                 " ind=" + std::to_string((long)shInd));
+        }
+    }
+    if (skipNth && shNth && shNth <= 31 && (skipNth & (1u << (unsigned)(shNth - 1)))){
+        Diag("GPUSUBMIT #" + std::to_string((long)seq) +
+             " SKIPPED by gh_skip_nth heavy#" + std::to_string((long)shNth) +
+             " ops=" + std::to_string((long)shOps));
         return;
     }
     // Drop ONE named submission. The op-mask bisect could only ever drop whole
@@ -6544,12 +14644,133 @@ static void __stdcall Hook_CQExecute(ID3D12CommandQueue* self, UINT n, ID3D12Com
         Diag("GPUSUBMIT #" + std::to_string((long)seq) + " SKIPPED by gh_skip_submit");
         return;
     }
-    ((void (__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*))g_cqVtOrig[10])(self, n, l);
+    // #158. The same probe, on the GUEST's device and after the game has built its
+    // state: gh_rttest_at = the submission index to run it at. Our own device eats
+    // 3000 of these transitions without blinking, so if the guest's device dies on
+    // them the difference is the device state, not the operation.
+    {
+        static const unsigned at = GhCfgNum(L"gh_rttest_at.txt", "GH_RTTEST_AT", 0);
+        static volatile LONG done = 0;
+        if (at && (unsigned)seq >= at && InterlockedCompareExchange(&done, 1, 0) == 0){
+            com_ptr<ID3D12Device> gd;
+            if (SUCCEEDED(self->GetDevice(__uuidof(ID3D12Device), gd.put_void())) && gd){
+                Diag("RTTEST in-situ at submission #" + std::to_string((long)seq));
+                GhRtTest(gd.get(), self);
+            }
+        }
+    }
+    {
+        int relTy = -1, relSlot = -1;
+        ID3D12GraphicsCommandList* rel = GhBarrReloc()
+            ? GhBarrRelocBuild(self, n, l, &relTy, &relSlot) : nullptr;
+        int recTy = -1;
+        int recSlots[kSplitMax];
+        ID3D12GraphicsCommandList* recCl[kSplitMax];
+        int recN = 0;
+        if (!rel && (GhClRec() || GhClDup() || GhClSplit()))
+            recN = GhRecBuild(self, n, l, &recTy, recSlots, recCl, kSplitMax);
+        if (rel || recN){
+            std::vector<ID3D12CommandList*> v;
+            v.reserve((size_t)n + (size_t)(rel ? 1 : recN));
+            if (rel) v.push_back((ID3D12CommandList*)rel);  // the guest's barriers, relocated
+            // The pieces go down in submission order, ahead of the guest's own (now
+            // empty) lists -- the same arrangement gh_cl_rec already validated.
+            for (int p = 0; p < recN; ++p) v.push_back((ID3D12CommandList*)recCl[p]);
+            for (UINT i = 0; i < n; ++i) v.push_back(l[i]);
+            ((void (__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*))
+                g_cqVtOrig[10])(self, (UINT)v.size(), v.data());
+            GhBarrRelocSignal(self, relTy, relSlot);
+            GhRecSignalMany(self, recTy, recSlots, recN);
+            static LONG relN = 0;
+            const LONG rk = InterlockedIncrement(&relN);
+            if (rk <= 8 || (rk % 64) == 0)
+                Diag("BARRRELOC #" + std::to_string((long)seq) +
+                     " sub=" + std::to_string((long)rk) +
+                     " lists=" + std::to_string((unsigned)n) +
+                     " slot=" + std::to_string(relSlot) +
+                     " type=" + std::to_string(relTy) +
+                     " batches=" + std::to_string((long)InterlockedCompareExchange(&g_relBatch, 0, 0)) +
+                     " barriers=" + std::to_string((long)InterlockedCompareExchange(&g_relBarr, 0, 0)));
+        } else {
+            ((void (__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*))g_cqVtOrig[10])(self, n, l);
+        }
+    }
+    // #158 gh_dup_submit / gh_dup_nth: one extra, LEGAL execution of THIS submission.
+    //
+    // v0.0.325.0 submitted the duplicate back-to-back, and D3D12 rejected it outright:
+    //   id=553 "Failed to execute a command list ... because the command queue fence has
+    //   not advanced past previous executions of the command list."
+    // Two executions of one list object may not be in flight at once, so that build
+    // added no execution at all -- it only looked like it had. The game's own four
+    // re-executions are each separated by a fence wait, and this does the same, using
+    // the fence machinery gh_submit_sync already owns. If the fence cannot be had, or
+    // the first execution never retires, we do NOT submit: an illegal duplicate
+    // measures nothing and poisons the rest of the run.
+    //
+    // Both sides are fenced. Waiting for the DUPLICATE to retire as well keeps the game
+    // from colliding with it at its own next execution of the same list, and it reports
+    // the duplicate's GPU time -- if the second execution is itself the one that dies,
+    // that wait times out and says so, which would contradict the law outright.
+    {
+        const bool hit = (dupSeqK && (unsigned)seq == dupSeqK) ||
+                         (dupNth && shNth && (unsigned)shNth == dupNth);
+        if (hit && InterlockedCompareExchange(&g_dupDone, 1, 0) == 0){
+            const std::string who = std::string(dupSeqK ? "gh_dup_submit" : "gh_dup_nth") +
+                                    " heavy#" + std::to_string((long)shNth) +
+                                    " ops=" + std::to_string((long)shOps);
+            GhSubmitSync* ss = GhSubmitSyncFor(self);
+            if (!ss){
+                Diag("DUPSUB #" + std::to_string((long)seq) + " ABORTED no fence " + who);
+            } else {
+                auto fenceWait = [&](const char* what) -> long {
+                    const UINT64 want = ++ss->v;
+                    ((HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64))
+                         g_cqVtOrig[14])(self, ss->f, want);
+                    const ULONGLONG t0 = GetTickCount64();
+                    DWORD wr = WAIT_OBJECT_0;
+                    if (ss->f->GetCompletedValue() < want && ss->e){
+                        ss->f->SetEventOnCompletion(want, ss->e);
+                        wr = WaitForSingleObject(ss->e, 5000);
+                    }
+                    const long dt = (long)(GetTickCount64() - t0);
+                    if (wr != WAIT_OBJECT_0){
+                        Diag("DUPSUB #" + std::to_string((long)seq) + " " + what +
+                             " NEVER RETIRED waited=" + std::to_string(dt) + "ms " + who);
+                        return -1;
+                    }
+                    return dt;
+                };
+                const long dt1 = fenceWait("first-execution");
+                if (dt1 >= 0){
+                    ((void (__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*))
+                        g_cqVtOrig[10])(self, n, l);
+                    const long dt2 = fenceWait("duplicate");
+                    Diag("GPUSUBMIT #" + std::to_string((long)seq) + " DUPLICATED by " + who +
+                         " lists=" + std::to_string((unsigned long)n) +
+                         " wait1=" + std::to_string(dt1) + "ms" +
+                         " wait2=" + std::to_string(dt2) + "ms");
+                }
+            }
+        }
+    }
     // Drain right after the submission that may have been the last one. The
     // heartbeat is once a second and the device can die between two of its ticks.
     GhDrainInfoQueue();
 
+    // #158: the death submission moves (95-116) but the wall clock at it does not
+    // (~10s after the first guest submission, every run). Those two only ever move
+    // together, so nothing so far can say whether the budget being spent is WORK or
+    // TIME. gh_submit_delay_ms=N sleeps N ms after each guest submission has
+    // retired: it stretches the same submission sequence over several times the
+    // wall clock without changing one command. If the device then still dies at
+    // submission ~100, the budget is work; if it dies at ~10s and a far lower
+    // submission index, it is a clock, and every barrier result today is a proxy
+    // for how fast the game gets through its loading loop.
+    static const unsigned subDelay = GhCfgNum(L"gh_submit_delay_ms.txt",
+                                              "GH_SUBMIT_DELAY_MS", 0);
+
     static const unsigned subSync = GhCfgNum(L"gh_submit_sync.txt", "GH_SUBMIT_SYNC", 0);
+    if (subDelay && self != g_gfx.queue.get()) Sleep(subDelay);
     if (subSync && self != g_gfx.queue.get()){
         if (GhSubmitSync* ss = GhSubmitSyncFor(self)){
             static const unsigned toms = GhCfgNum(L"gh_submit_timeout_ms.txt",
@@ -6560,7 +14781,34 @@ static void __stdcall Hook_CQExecute(ID3D12CommandQueue* self, UINT n, ID3D12Com
             const ULONGLONG t0 = GetTickCount64();
             if (ss->f->GetCompletedValue() < want && ss->e){
                 ss->f->SetEventOnCompletion(want, ss->e);
-                WaitForSingleObject(ss->e, toms);
+                // #158. The width bisect refuted a poison surface: BOTH halves of the
+                // barrier stream hang, and removing either roughly doubles the lists
+                // reached first. That leaves one question the logs cannot answer,
+                // because this wait blocks blind for the whole timeout: during the
+                // ~5s that ends in a TDR, is the GPU FROZEN on one barrier batch, or
+                // still crawling through them? The barrier breadcrumb already tells
+                // us how far the GPU got -- sample it while waiting instead of after.
+                if (!GhBcBarriers() || !g_bcCpu){
+                    WaitForSingleObject(ss->e, toms);
+                } else {
+                    const unsigned step = 250;
+                    unsigned waited = 0, ticks = 0, flat = 0;
+                    LONG last = -1;
+                    while (waited < toms){
+                        if (WaitForSingleObject(ss->e, step) == WAIT_OBJECT_0) break;
+                        waited += step;
+                        const LONG fin = (LONG)g_bcCpu[3];
+                        if (fin != last){ last = fin; flat = 0; } else ++flat;
+                        if (ticks == 1 && GhVaCheckOn()) GhVaStats("barrprogress");
+                        if (++ticks <= 4 || (ticks % 4) == 0)
+                            Diag("BARRPROGRESS #" + std::to_string((long)seq) +
+                                 " waited=" + std::to_string((unsigned long)waited) + "ms" +
+                                 " started=" + std::to_string((unsigned long)g_bcCpu[2]) +
+                                 " finished=" + std::to_string((unsigned long)g_bcCpu[3]) +
+                                 " draws=" + std::to_string((unsigned long)g_bcCpu[1]) +
+                                 " flatticks=" + std::to_string((unsigned long)flat));
+                    }
+                }
             }
             const ULONGLONG dt = GetTickCount64() - t0;
             const bool done = ss->f->GetCompletedValue() >= want;
@@ -6586,12 +14834,38 @@ static void __stdcall Hook_CQExecute(ID3D12CommandQueue* self, UINT n, ID3D12Com
                     m += "\n    [" + std::to_string(i) + "] " + GhCLSummary(l[i]);
                 Diag(m);
                 GhBreadcrumbDump(done ? "submit-slow" : "submit-stall");
+                // #158. One-shot, stall only: by here the GPU is already gone, so
+                // suspending the guest to walk its stacks costs nothing. This names
+                // the thread that presented and shows what it is blocked on.
+                if (!done){
+                    static volatile LONG dumped = 0;
+                    if (InterlockedCompareExchange(&dumped, 1, 0) == 0){
+                        Diag("PRESENTER tid=" + std::to_string((long)InterlockedCompareExchange(&g_presentTid, 0, 0)) +
+                             " presents=" + std::to_string((long)InterlockedCompareExchange(&g_presentN, 0, 0)) +
+                             " lastPresentMsAgo=" + std::to_string((long long)((LONG64)GetTickCount64() -
+                                 InterlockedCompareExchange64(&g_presentTick, 0, 0))));
+                        GhProfDump("stall");
+            GhDumpAllThreads("submit-stall");
+                    }
+                }
+                if (GhVaCheckOn()) GhVaStats(done ? "submit-slow" : "submit-stall");
+                GhMapStats(done ? "submit-slow" : "submit-stall");
+                GhIndDump(done ? "submit-slow" : "submit-stall");
+                GhBarrSelStats(done ? "submit-slow" : "submit-stall");
+                GhRtAuditDump(done ? "submit-slow" : "submit-stall");
+                GhCommitRtStats(done ? "submit-slow" : "submit-stall");
+                GhCommitRtAllStats(done ? "submit-slow" : "submit-stall");
+                GhAliasStats(done ? "submit-slow" : "submit-stall");
+                GhNarrowStats(done ? "submit-slow" : "submit-stall");
+                GhReinitStats(done ? "submit-slow" : "submit-stall");
             }
         }
     }
 }
-static HRESULT __stdcall Hook_CQSignal(ID3D12CommandQueue* self, ID3D12Fence* f, UINT64 v)
+static HRESULT __stdcall Hook_CQSignal(ID3D12CommandQueue* self_, ID3D12Fence* f, UINT64 v)
 {
+    ID3D12CommandQueue* self = self_;
+    if (ID3D12CommandQueue* sq = GhQSubFor(self_)) self = sq;
     GhHookFence(f);
     GhNoteSignal(f, v);
     // The fence value the GPU stops at is the only name the hang has. Printing
@@ -6604,8 +14878,10 @@ static HRESULT __stdcall Hook_CQSignal(ID3D12CommandQueue* self, ID3D12Fence* f,
              " from=" + NameForCodeAddr((uintptr_t)_ReturnAddress()));
     return ((HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64))g_cqVtOrig[14])(self, f, v);
 }
-static HRESULT __stdcall Hook_CQWait(ID3D12CommandQueue* self, ID3D12Fence* f, UINT64 v)
+static HRESULT __stdcall Hook_CQWait(ID3D12CommandQueue* self_, ID3D12Fence* f, UINT64 v)
 {
+    ID3D12CommandQueue* self = self_;
+    if (ID3D12CommandQueue* sq = GhQSubFor(self_)) self = sq;
     GhHookFence(f);
     GhNoteWait(self, f, v);
     // Name the caller. The fence that blocks our queue in every run was never
@@ -6689,19 +14965,206 @@ static void GhHookCommandQueue(ID3D12CommandQueue* q)
     Diag("D3D12 queue vtable hooked (UpdateTileMappings, CopyTileMappings, ExecuteCommandLists, Signal, Wait)");
 }
 
+// #158 gh_no_gpu_timeout: create the guest's queues with
+// D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT, so the OS watchdog does not reset the
+// device out from under the fatal submission. Every D3D12_COMMAND_QUEUE_DESC in this
+// loader has always been zero-initialized, so this flag has never once been set and
+// every observation ever made of this hang is capped at the ~5 s watchdog. With it off
+// the loader-side wait (gh_submit_timeout_ms) and its 250 ms BARRPROGRESS sampling
+// become an unbounded probe: does the submission EVER retire, or is it truly wedged?
+//   1 = DIRECT queues only, 2 = every queue type.
+// DANGER: if the GPU is genuinely wedged the console UI may freeze with no OS recovery.
+// Run this last in a session; recover with a long press on the power button.
+static unsigned GhNoGpuTimeout()
+{ static const unsigned n = (unsigned)GhCfgNum(L"gh_no_gpu_timeout.txt", "GH_NO_GPU_TIMEOUT", 0); return n; }
+
+// #160. Is there a hard ceiling on command queues on this device? The guest's
+// fifth queue was refused with E_OUTOFMEMORY on a device that had never executed
+// a command list, and the loader itself already holds two or three queues on the
+// same device -- so "you may have N queues, total" fits the evidence exactly and
+// nothing else does. Measure the ceiling directly instead of inferring it: create
+// queues until one is refused, report the index and the removed-reason, then hand
+// them all back and report whether the device survived the experiment.
+//
+// This is a PROBE, not a fix. It consumes the very resource it measures, so it
+// runs once, before the guest has asked for anything, and only when the knob is
+// set. gh_queue_probe = how many to try (0 = off); gh_queue_probe_type = the
+// D3D12_COMMAND_LIST_TYPE to ask for (0 = DIRECT, 1 = BUNDLE, 2 = COPY, 3 = COMPUTE).
+// #163. Creating a COPY (D3D12_COMMAND_LIST_TYPE_COPY) command queue KILLS the
+// device in this container. Measured directly, from a virgin device, with no game
+// involved and zero submissions: one COPY queue is created successfully and
+// reports drr=0 at that instant, and microseconds later every call on the device
+// returns DXGI_ERROR_DEVICE_REMOVED with GetDeviceRemovedReason() = DEVICE_HUNG.
+// Twelve DIRECT queues in a row are fine; two COMPUTE queues are fine; one COPY
+// queue is fatal, every time (probe cells "2", "22", "23", "2003").
+//
+// That is what killed Ghost of Tsushima: it makes 3 DIRECT queues, then a COPY
+// queue, and its next call -- a COMPUTE queue -- reports the corpse as
+// E_OUTOFMEMORY, which the game shows as "out of video memory". Spider-Man only
+// ever asked for DIRECT queues, which is why five months of D3D12 work never hit
+// this.
+//
+// The workaround is type promotion: give the guest a DIRECT queue where it asked
+// for COPY, and promote its COPY allocators and COPY lists to match. DIRECT is a
+// strict superset -- every command legal on a copy queue is legal on a direct one,
+// and the resource states a copy queue can use (COMMON / COPY_SOURCE / COPY_DEST)
+// are all legal there too -- so the recorded work is unchanged. What the guest
+// loses is the asynchrony: copies now serialise against graphics on one queue.
+// That is a real cost and it is the right trade against a dead device.
+//
+// All three creations must move together or the runtime rejects the mismatch, so
+// this is read once and applied at the queue, the allocator and the list.
+// 0 = off, 1 = promote COPY only, 2 = promote COPY and COMPUTE. Level 2 exists
+// because promoting only COPY moved the death one call along: with the copy queue
+// gone the game's next request, an async COMPUTE queue, killed the device instead
+// (drrbefore=0x0, so that call did it) -- even though two COMPUTE queues in a row
+// are fine on a virgin device. Whatever the real precondition is, DIRECT is a
+// superset of both, so promoting both sidesteps the class.
+static unsigned GhCopyAsDirect()
+{ static const unsigned n = (unsigned)GhCfgNum(L"gh_copy_as_direct.txt", "GH_COPY_AS_DIRECT", 1); return n; }
+
+static bool GhTypeNeedsPromote(D3D12_COMMAND_LIST_TYPE t)
+{
+    const unsigned lvl = GhCopyAsDirect();
+    if (!lvl) return false;
+    return t == D3D12_COMMAND_LIST_TYPE_COPY ||
+           (lvl >= 2 && t == D3D12_COMMAND_LIST_TYPE_COMPUTE);
+}
+
+static D3D12_COMMAND_LIST_TYPE GhPromoteCopy(D3D12_COMMAND_LIST_TYPE t, const char* where)
+{
+    if (!GhTypeNeedsPromote(t)) return t;
+    static volatile LONG n = 0;
+    if (InterlockedIncrement(&n) <= 12)
+        Diag(std::string("COPYPROMOTE ") + where + " type=" + std::to_string((int)t) +
+             " -> DIRECT");
+    return D3D12_COMMAND_LIST_TYPE_DIRECT;
+}
+
+static void GhQueueCeilingProbe(ID3D12Device* dev)
+{
+    static LONG once = 0;
+    const unsigned reps = (unsigned)GhCfgNum(L"gh_queue_probe.txt", "GH_QUEUE_PROBE", 0);
+    if (!dev || !reps || InterlockedExchange(&once, 1)) return;
+    // gh_queue_probe_type is read as a DIGIT SEQUENCE, not a single type: 3 means
+    // "one COMPUTE queue", 23 means "a COPY queue and then a COMPUTE queue", 2003
+    // means COPY, DIRECT, DIRECT, COMPUTE. Sequence matters because the failure
+    // this probe exists to explain is a combination, not a count -- twelve DIRECT
+    // queues and two COMPUTE queues each succeed alone on a virgin device, while
+    // the game's own 3xDIRECT + COPY + COMPUTE refuses the last one and takes the
+    // device with it. gh_queue_probe is how many times to repeat the sequence.
+    // A LEADING 9 is a sentinel and is dropped, so a sequence that starts with
+    // DIRECT survives being read as a number: 90003 means DIRECT,DIRECT,DIRECT,
+    // COMPUTE, which plain 0003 could never express.
+    unsigned code = (unsigned)GhCfgNum(L"gh_queue_probe_type.txt", "GH_QUEUE_PROBE_TYPE", 0);
+    std::vector<int> seq;
+    if (!code) seq.push_back(0);
+    else { char b[16]; std::snprintf(b, sizeof(b), "%u", code);
+           for (const char* c = (b[0] == '9' ? b + 1 : b); *c; ++c) seq.push_back(*c - '0');
+           if (seq.empty()) seq.push_back(0); }
+
+    std::vector<ID3D12CommandQueue*> held;
+    unsigned made = 0; HRESULT hr = S_OK; int failType = -1;
+    for (unsigned r = 0; r < reps && SUCCEEDED(hr); ++r){
+        for (int t : seq){
+            D3D12_COMMAND_QUEUE_DESC qd{};
+            qd.Type = (D3D12_COMMAND_LIST_TYPE)t;
+            ID3D12CommandQueue* q = nullptr;
+            hr = dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), (void**)&q);
+            // Sample the device after EVERY creation: the interesting failure kills
+            // the device on the call that fails, so "which one" is the whole answer.
+            const uint32_t drr = (uint32_t)dev->GetDeviceRemovedReason();
+            if (FAILED(hr) || !q || drr != 0){
+                failType = t;
+                Diag("QUEUEPROBE stopped at type=" + std::to_string(t) +
+                     " index=" + std::to_string(made) +
+                     " hr=" + Hex((uint32_t)hr) + " drr=" + Hex(drr));
+                if (q) q->Release();
+                hr = FAILED(hr) ? hr : E_FAIL;
+                break;
+            }
+            held.push_back(q); ++made;
+        }
+    }
+    Diag("QUEUEPROBE seqlen=" + std::to_string((int)seq.size()) +
+         " reps=" + std::to_string(reps) +
+         " made=" + std::to_string(made) +
+         " failtype=" + std::to_string(failType) +
+         " stophr=" + Hex((uint32_t)hr) +
+         " drr=" + Hex((uint32_t)dev->GetDeviceRemovedReason()));
+    for (auto* q : held) q->Release();
+    // The half that says whether the ceiling is a LEASE or a LIFETIME: if a queue
+    // can be made again after the release, the resource is recyclable and holding
+    // fewer spares buys the guest room. If not, it is per-process and no amount of
+    // tidying helps.
+    D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = (D3D12_COMMAND_LIST_TYPE)seq.back();
+    ID3D12CommandQueue* again = nullptr;
+    const HRESULT hr2 = dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue),
+                                                (void**)&again);
+    Diag("QUEUEPROBE after-release type=" + std::to_string(seq.back()) +
+         " hr=" + Hex((uint32_t)hr2) +
+         " drr=" + Hex((uint32_t)dev->GetDeviceRemovedReason()));
+    if (again) again->Release();
+}
+
 static HRESULT __stdcall Hook_D12CreateCQ(ID3D12Device* self, const D3D12_COMMAND_QUEUE_DESC* d,
                                           REFIID riid, void** pp)
 {
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_COMMAND_QUEUE_DESC*,
                                       REFIID, void**))g_d12vtOrig[8];
-    HRESULT hr = orig(self, d, riid, pp);
-    if (FAILED(hr)) GhD12Failed(self, "CreateCommandQueue", hr);
-    else if (pp && *pp){
-        Diag("D3D12 CreateCommandQueue q=" + Hex((uint64_t)(uintptr_t)*pp) +
+    D3D12_COMMAND_QUEUE_DESC patched{};
+    const D3D12_COMMAND_QUEUE_DESC* use = d;
+    if (d && GhTypeNeedsPromote(d->Type)){
+        patched = *d;
+        patched.Type = GhPromoteCopy(patched.Type, "queue");
+        use = &patched;
+    }
+    const unsigned ngt = GhNoGpuTimeout();
+    if (ngt && d && (ngt >= 2 || d->Type == D3D12_COMMAND_LIST_TYPE_DIRECT)){
+        patched = *use;
+        patched.Flags = (D3D12_COMMAND_QUEUE_FLAGS)
+            (patched.Flags | D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT);
+        use = &patched;
+    }
+    // #160. Ghost of Tsushima's fifth queue came back E_OUTOFMEMORY with the
+    // device simultaneously reporting DEVICE_HUNG, after ZERO submissions -- so
+    // "the GPU hung on some work" cannot be the explanation and the desc that was
+    // refused is the whole evidence. Sample the removed-reason BEFORE the call
+    // too: without it we cannot tell a call that FAILED on a dead device from a
+    // call that KILLED a live one, and those are different bugs.
+    static volatile LONG s_cqMade = 0;
+    const uint32_t drrBefore = (uint32_t)self->GetDeviceRemovedReason();
+    HRESULT hr = orig(self, use, riid, pp);
+    if (FAILED(hr)){
+        Diag("D3D12 CreateCommandQueue REFUSED hr=" + Hex((uint32_t)hr) +
              " type=" + std::to_string(d ? (int)d->Type : -1) +
              " prio=" + std::to_string(d ? (int)d->Priority : 0) +
-             " flags=" + Hex((uint32_t)(d ? d->Flags : (D3D12_COMMAND_QUEUE_FLAGS)0)));
+             " flags=" + Hex((uint32_t)(use ? use->Flags : (D3D12_COMMAND_QUEUE_FLAGS)0)) +
+             " nodemask=" + Hex((uint32_t)(d ? d->NodeMask : 0)) +
+             " guestqueuesmade=" + std::to_string((long)s_cqMade) +
+             " drrbefore=" + Hex(drrBefore));
+        GhD12Failed(self, "CreateCommandQueue", hr);
+        // The knob must never be able to fail silently: if this console's runtime
+        // rejects the flag, say so instead of leaving a mystery E_INVALIDARG.
+        if (use == &patched)
+            Diag("NOGPUTIMEOUT REJECTED hr=" + Hex((uint32_t)hr) +
+                 " type=" + std::to_string((int)patched.Type) +
+                 " -- the flag is not supported here, that IS the answer");
+    }
+    else if (pp && *pp){
+        InterlockedIncrement(&s_cqMade);
+        Diag("D3D12 CreateCommandQueue q=" + Hex((uint64_t)(uintptr_t)*pp) +
+             " n=" + std::to_string((long)s_cqMade) +
+             " type=" + std::to_string(d ? (int)d->Type : -1) +
+             " prio=" + std::to_string(d ? (int)d->Priority : 0) +
+             " flags=" + Hex((uint32_t)(use ? use->Flags : (D3D12_COMMAND_QUEUE_FLAGS)0)) +
+             " askedflags=" + Hex((uint32_t)(d ? d->Flags : (D3D12_COMMAND_QUEUE_FLAGS)0)) +
+             " notimeout=" + std::to_string((int)(use == &patched)));
         GhHookCommandQueue((ID3D12CommandQueue*)*pp);
+        GhQSubRegister(self, use, (ID3D12CommandQueue*)*pp);
+        // #158: counts aggregate across queues on purpose -- the question is which
+        // API appears at frame 26, not which queue it appeared on.
+        if (GhApiProfOn()) GhProfHookVtbl(*pp, 19, &g_profQ, "q");
     }
     return hr;
 }
@@ -6710,8 +15173,11 @@ static HRESULT __stdcall Hook_D12CreateCA(ID3D12Device* self, D3D12_COMMAND_LIST
 {
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, D3D12_COMMAND_LIST_TYPE,
                                       REFIID, void**))g_d12vtOrig[9];
+    t = GhPromoteCopy(t, "allocator");
     HRESULT hr = orig(self, t, riid, pp);
     if (FAILED(hr)) GhD12Failed(self, "CreateCommandAllocator", hr);
+    // #158 gh_cl_reloc needs to see the guest declare its allocator's contents dead.
+    else if (pp && *pp && GhClReloc()) GhHookCommandAllocator((ID3D12CommandAllocator*)*pp);
     return hr;
 }
 static HRESULT __stdcall Hook_D12CreateCL(ID3D12Device* self, UINT node, D3D12_COMMAND_LIST_TYPE t,
@@ -6719,11 +15185,38 @@ static HRESULT __stdcall Hook_D12CreateCL(ID3D12Device* self, UINT node, D3D12_C
 {
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, UINT, D3D12_COMMAND_LIST_TYPE,
         ID3D12CommandAllocator*, ID3D12PipelineState*, REFIID, void**))g_d12vtOrig[12];
-    HRESULT hr = orig(self, node, t, alloc, init, riid, pp);
+    // #158 gh_cl_reloc. A list is born in the RECORDING state, so its first frame of
+    // commands goes into whatever allocator is named here -- and a relocation that only
+    // covered Reset would leave that first recording in the guest's memory. Substitute
+    // here too, so the whole stream really is the whole stream.
+    t = GhPromoteCopy(t, "list");
+    ID3D12CommandAllocator* useA = alloc;
+    if (GhClReloc() && alloc)
+        if (ID3D12CommandAllocator* sa = GhClSubstitute(alloc, self, (LONG)t)) useA = sa;
+    HRESULT hr = orig(self, node, t, useA, init, riid, pp);
     if (FAILED(hr)) GhD12Failed(self, "CreateCommandList", hr);
     else if (pp && *pp){
         GhCLAdd((ID3D12CommandList*)*pp, t);
-        if (t == D3D12_COMMAND_LIST_TYPE_DIRECT) GhHookCommandList((ID3D12CommandList*)*pp);
+        // #158. Before any draw can be relocated, the exact set of list methods this
+        // game calls has to be known: a relocated draw that is missing one piece of
+        // pipeline state renders wrong or faults, and that is indistinguishable from
+        // the theory being wrong. GhProfHookVtbl counts every slot generically -- it
+        // emits a per-slot thunk that tail-jumps to the original, so it needs no
+        // signatures and cannot perturb behaviour. 60 slots is the whole of
+        // ID3D12GraphicsCommandList (9 inherited + 51 of its own, ExecuteIndirect
+        // last at 59). DIRECT only, and only the first one: they share a vtable.
+        if (GhClCensus() && t == D3D12_COMMAND_LIST_TYPE_DIRECT &&
+            InterlockedCompareExchange(&g_clCensusDone, 1, 0) == 0)
+            GhProfHookVtbl(*pp, 60, &g_profCL, "cl");
+        // #158. 0.0.261.0 started hooking every list vtable class, not just DIRECT.
+        // That is correct, but it also put COPY lists through every hook we own for
+        // the first time -- and the one configuration that used to survive stopped
+        // surviving. gh_hook_direct_only=1 restores the pre-0.0.261.0 hooking exactly,
+        // so the regression can be pinned on the fix or cleared of it.
+        static const unsigned dirOnly =
+            GhCfgNum(L"gh_hook_direct_only.txt", "GH_HOOK_DIRECT_ONLY", 0);
+        if (!dirOnly || t == D3D12_COMMAND_LIST_TYPE_DIRECT)
+            GhHookCommandList((ID3D12CommandList*)*pp);
     }
     return hr;
 }
@@ -6732,9 +15225,49 @@ static HRESULT __stdcall Hook_D12CreateDH(ID3D12Device* self, const D3D12_DESCRI
 {
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_DESCRIPTOR_HEAP_DESC*,
                                       REFIID, void**))g_d12vtOrig[14];
-    HRESULT hr = orig(self, d, riid, pp);
-    if (SUCCEEDED(hr) && pp && *pp && GhDescTrackOn())
+    // #165. Say what was ASKED FOR before the call, not only what came back: the
+    // call the game hangs in never comes back, so a line written afterwards is a
+    // line that never appears. Bounded, because a title may create hundreds.
+    {
+        static volatile LONG n = 0;
+        if (d && InterlockedIncrement(&n) <= 48)
+            Diag("D3D12 CreateDescriptorHeap ask type=" + std::to_string((int)d->Type) +
+                 " num=" + std::to_string((unsigned)d->NumDescriptors) +
+                 " flags=" + Hex((uint32_t)d->Flags) +
+                 " node=" + Hex((uint32_t)d->NodeMask) +
+                 " tid=" + std::to_string((unsigned long)GetCurrentThreadId()));
+    }
+    HRESULT hr;
+    { GhD12CallScope _s("CreateDescriptorHeap"); hr = orig(self, d, riid, pp); }
+    if (SUCCEEDED(hr) && pp && *pp && (GhDescTrackOn() || GhVaCheckOn() || GhSubCensus())){
         GhDHAdd(self, (ID3D12DescriptorHeap*)*pp, d);
+        {   // #158: the deep bind map needs the heap's real extent to tell a slot
+            // that was simply never written from one that is past the end of the heap.
+            const GhDHNote& dn = g_dh[(g_dhN > 0 && g_dhN <= 128) ? g_dhN - 1 : 0];
+            Diag("DESCHEAP type=" + std::to_string((unsigned)d->Type) +
+                 " num=" + std::to_string((unsigned)d->NumDescriptors) +
+                 " inc=" + std::to_string((unsigned)dn.inc) +
+                 " flags=" + Hex((uint32_t)d->Flags) +
+                 " cpu0=" + Hex(dn.cpu0) + " gpu0=" + Hex(dn.gpu0) +
+                 " gpuend=" + Hex(dn.gpu0 ? dn.gpu0 + (UINT64)dn.inc * dn.num : 0));
+        }
+        // The heap ranges were never logged; without them a bad table handle has
+        // nothing to be out of range OF.
+        if (GhVaCheckOn()){
+            LONG i = g_dhN - 1;
+            if (i >= 0 && i < 128)
+                Diag("DESCHEAP #" + std::to_string((long)i) +
+                     " obj=" + Hex((uint64_t)(uintptr_t)g_dh[i].obj) +
+                     " type=" + std::to_string((int)d->Type) +
+                     " num=" + std::to_string((unsigned)d->NumDescriptors) +
+                     " inc=" + std::to_string((unsigned)g_dh[i].inc) +
+                     " cpu0=" + Hex(g_dh[i].cpu0) +
+                     " gpu0=" + Hex(g_dh[i].gpu0) +
+                     " gpuend=" + Hex(g_dh[i].gpu0 ? g_dh[i].gpu0 +
+                                      (UINT64)g_dh[i].inc * g_dh[i].num : 0) +
+                     " flags=" + Hex((uint32_t)d->Flags));
+        }
+    }
     if (FAILED(hr)){
         GhD12Failed(self, "CreateDescriptorHeap", hr);
         if (d) Diag("  descheap type=" + std::to_string((int)d->Type) +
@@ -6763,6 +15296,114 @@ static HRESULT __stdcall Hook_D12CreateFence(ID3D12Device* self, UINT64 init,
 // placement the driver was servicing when it wrote into memory that was never
 // mapped. Both also carry the L1->L0 pool translation that gh_no_uma bit 0 owes
 // the guest -- see GhFixUmaHeapProps.
+// ---------------------------------------------------------------- #158 RT compression
+// The bisect lands on one state class: with barriers isolated, dropping every
+// TRANSITION that touches D3D12_RESOURCE_STATE_RENDER_TARGET makes the device live
+// (256 submissions, 9 presents); dropping depth-only or UAV-only does not. And
+// ClearRenderTargetView alone hangs it too. What those two share, and what a buffer
+// copy does not touch, is the render target's COMPRESSION METADATA -- DCC on this
+// hardware. A transition into or out of RENDER_TARGET makes the driver decompress or
+// resummarise it, and a clear rewrites it; both are internal driver shader work in a
+// container whose driver shader compiler is already known broken (SC_DLL, #151).
+//
+// D3D12 has no "no compression" flag, but it has an equivalent: a resource created
+// with ALLOW_SIMULTANEOUS_ACCESS must be readable by several queues with no
+// transition, so drivers allocate it uncompressed. Adding it to the game's render
+// targets is therefore a real candidate fix, not just a probe.
+//   gh_no_rt_compress = 1  add ALLOW_SIMULTANEOUS_ACCESS to single-sampled,
+//                          non-depth textures that ask for ALLOW_RENDER_TARGET
+//   gh_no_rt_compress = 2  mode 1, and the same for UAV-only textures. CLEARCENSUS
+//                          showed ClearUnorderedAccessViewUint is 1103 of this
+//                          game's clears against 83 ClearRenderTargetView, and mode
+//                          1 covers 1198 of 1198 colour targets yet still buys only
+//                          one frame -- so the untreated UAV set is where the
+//                          remaining clear traffic lives. SIMULTANEOUS_ACCESS is
+//                          legal with UNORDERED_ACCESS; it is illegal only with
+//                          ALLOW_DEPTH_STENCIL and with MSAA, both excluded below.
+static unsigned GhNoRtCompress()
+{ static const unsigned m = (unsigned)GhCfgNum(L"gh_no_rt_compress.txt", "GH_NO_RT_COMPRESS", 0); return m; }
+
+static volatile LONG g_noRtN = 0;
+static const D3D12_RESOURCE_DESC* GhFixRtDesc(D3D12_RESOURCE_DESC* out,
+                                              const D3D12_RESOURCE_DESC* rd)
+{
+    // Ahead of the knob gate on purpose: the census is a property of the game's
+    // resource set, not of the fix, so a control cell reports the same denominators.
+    if (rd && rd->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER){
+        const bool ds  = (rd->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
+        const bool rt  = (rd->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0;
+        if (ds){
+            // k is the increment's own return value: a re-read races the other
+            // ~53 guest threads and would print the wrong ordinal, or none.
+            const LONG k = InterlockedIncrement(&g_resDs);
+            if (k <= 4)
+                Diag("DSRES #" + std::to_string((long)k) +
+                     " w=" + std::to_string((unsigned long long)rd->Width) +
+                     " h=" + std::to_string((unsigned long)rd->Height) +
+                     " fmt=" + std::to_string((int)rd->Format) +
+                     " samples=" + std::to_string((unsigned)rd->SampleDesc.Count) +
+                     " flags=" + Hex((uint32_t)rd->Flags));
+        } else if (rt){
+            InterlockedIncrement(&g_resRt);
+            if (rd->SampleDesc.Count > 1) InterlockedIncrement(&g_resRtMsaa);
+        } else if (rd->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS){
+            InterlockedIncrement(&g_resUavOnly);
+        }
+    }
+    if (!GhNoRtCompress() || !rd) return rd;
+    if (rd->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return rd;
+    if (GhNoRtCompress() >= 2
+        && !(rd->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+        && !(rd->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+        && (rd->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+        && rd->SampleDesc.Count <= 1
+        && !(rd->Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)){
+        *out = *rd;
+        out->Flags |= D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+        const LONG u = InterlockedIncrement(&g_noUavN);
+        if (u <= 4 || (u % 256) == 0)
+            Diag("NOUAVCOMPRESS #" + std::to_string((long)u) +
+                 " w=" + std::to_string((unsigned long long)rd->Width) +
+                 " h=" + std::to_string((unsigned long)rd->Height) +
+                 " fmt=" + std::to_string((int)rd->Format) +
+                 " flags=" + Hex((uint32_t)rd->Flags) + " -> " + Hex((uint32_t)out->Flags));
+        return out;
+    }
+    if (!(rd->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) return rd;
+    if (rd->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) return rd;   // illegal pair
+    if (rd->SampleDesc.Count > 1) return rd;                              // illegal with MSAA
+    if (rd->Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) return rd;
+    *out = *rd;
+    out->Flags |= D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    LONG k = InterlockedIncrement(&g_noRtN);
+    if (k <= 4 || (k % 256) == 0)
+        Diag("NORTCOMPRESS #" + std::to_string((long)k) + " w=" + std::to_string((unsigned long long)rd->Width) +
+             " h=" + std::to_string((unsigned long)rd->Height) +
+             " fmt=" + std::to_string((int)rd->Format) +
+             " flags=" + Hex((uint32_t)rd->Flags) + " -> " + Hex((uint32_t)out->Flags));
+    return out;
+}
+
+// #158: prints in every run, next to CLTABLE, so the depth share of the clear
+// traffic can be read off a control as easily as off an NC cell.
+static void GhClearCensus(const char* where)
+{
+    Diag(std::string("CLEARCENSUS at ") + where +
+         " rtv="   + std::to_string((long)InterlockedCompareExchange(&g_clrRtv,  0, 0)) +
+         " dsv="   + std::to_string((long)InterlockedCompareExchange(&g_clrDsv,  0, 0)) +
+         " uavu="  + std::to_string((long)InterlockedCompareExchange(&g_clrUavU, 0, 0)) +
+         " uavf="  + std::to_string((long)InterlockedCompareExchange(&g_clrUavF, 0, 0)) +
+         " | res rt="   + std::to_string((long)InterlockedCompareExchange(&g_resRt,     0, 0)) +
+         " ds="         + std::to_string((long)InterlockedCompareExchange(&g_resDs,     0, 0)) +
+         " rtMsaa="     + std::to_string((long)InterlockedCompareExchange(&g_resRtMsaa, 0, 0)) +
+         " uavOnly="     + std::to_string((long)InterlockedCompareExchange(&g_resUavOnly, 0, 0)) +
+         " uncompressed=" + std::to_string((long)InterlockedCompareExchange(&g_noRtN,   0, 0)) +
+         " uavUncompressed=" + std::to_string((long)InterlockedCompareExchange(&g_noUavN, 0, 0)) +
+         " | uavClr onRT="  + std::to_string((long)InterlockedCompareExchange(&g_uavClrRt,      0, 0)) +
+         " plain="          + std::to_string((long)InterlockedCompareExchange(&g_uavClrPlain,   0, 0)) +
+         " null="           + std::to_string((long)InterlockedCompareExchange(&g_uavClrUnknown, 0, 0)));
+}
+
 static HRESULT __stdcall Hook_D12CreateCommitted(ID3D12Device* self,
     const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC* rd,
     D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID riid, void** pp)
@@ -6770,9 +15411,32 @@ static HRESULT __stdcall Hook_D12CreateCommitted(ID3D12Device* self,
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*,
         D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
         const D3D12_CLEAR_VALUE*, REFIID, void**))g_d12vtOrig[27];
+    GhD12CallScope _s("CreateCommittedResource");
+    _s.Info("heap=" + std::to_string(hp ? (int)hp->Type : -1) +
+            " flags=" + Hex((uint32_t)hf) +
+            " dim=" + std::to_string(rd ? (int)rd->Dimension : -1) +
+            " w=" + std::to_string(rd ? (unsigned long long)rd->Width : 0ull) +
+            " h=" + std::to_string(rd ? (unsigned)rd->Height : 0u) +
+            " d=" + std::to_string(rd ? (unsigned)rd->DepthOrArraySize : 0u) +
+            " mips=" + std::to_string(rd ? (unsigned)rd->MipLevels : 0u) +
+            " fmt=" + std::to_string(rd ? (int)rd->Format : -1) +
+            " rflags=" + Hex((uint32_t)(rd ? rd->Flags : 0)) +
+            " st=" + Hex((uint32_t)st));
     D3D12_HEAP_PROPERTIES fixedHp{};
     if (GhFixUmaHeapProps(&fixedHp, hp, "CreateCommittedResource")) hp = &fixedHp;
+    D3D12_RESOURCE_DESC fixedRd{};
+    rd = GhFixRtDesc(&fixedRd, rd);
+    D3D12_RESOURCE_DESC strippedRd{}; bool didStrip = false;
+    const D3D12_RESOURCE_DESC* auditRd = rd;
+    rd = GhStripRtDesc(&strippedRd, rd, &didStrip);
+    D3D12_RESOURCE_DESC probeRd{};
+    rd = GhFmtProbeDesc(&probeRd, rd);
     HRESULT hr = orig(self, hp, hf, rd, st, cv, riid, pp);
+    if (SUCCEEDED(hr) && pp && *pp) GhRtAuditCreate(*pp, auditRd, didStrip);
+    if (SUCCEEDED(hr) && pp && *pp) GhVaRegister((ID3D12Resource*)*pp, rd);
+    if (SUCCEEDED(hr) && pp && *pp) GhRtDsRecord((ID3D12Resource*)*pp, rd, st);
+    if (SUCCEEDED(hr) && pp && *pp) GhHookResourceVtable((ID3D12Resource*)*pp);
+    if (SUCCEEDED(hr) && pp && *pp) GhHookObjRelease((IUnknown*)*pp);
     static LONG n = 0;
     if (InterlockedIncrement(&n) <= 24 || FAILED(hr))
         Diag("D3D12 CreateCommittedResource heap=" + std::to_string(hp ? (int)hp->Type : -1) +
@@ -6786,15 +15450,62 @@ static HRESULT __stdcall Hook_D12CreateCommitted(ID3D12Device* self,
              " hr=" + Hex((uint32_t)hr));
     return hr;
 }
+// #158. Returns the first return address on the stack that lies inside the mapped
+// guest image, i.e. the guest code that called us. Image-relative offsets drop
+// straight into an objdump of the same exe on the dev box.
+static bool PtrInLastGame(uintptr_t p);   // defined far below
+static uintptr_t GhGuestCallerRva()
+{
+    using Fn = USHORT (NTAPI*)(ULONG, ULONG, PVOID*, PULONG);
+    static Fn cap = (Fn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"),
+                                       "RtlCaptureStackBackTrace");
+    if (!cap) return 0;
+    void* fr[32]{};
+    USHORT n = cap(0, 32, fr, nullptr);
+    for (USHORT i = 0; i < n; ++i)
+        if (PtrInLastGame((uintptr_t)fr[i])) return (uintptr_t)fr[i];
+    return 0;
+}
 static HRESULT __stdcall Hook_D12CreateHeap(ID3D12Device* self,
     const D3D12_HEAP_DESC* hd, REFIID riid, void** pp)
 {
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_HEAP_DESC*,
                                       REFIID, void**))g_d12vtOrig[28];
+    GhD12CallScope _s("CreateHeap");
     // #158: a running total, because the interesting question about the heap that
     // fails is never its own size -- it is how much the guest already holds.
-    static volatile LONG64 heapBytes = 0;
-    static volatile LONG   heapCount = 0;
+    volatile LONG64& heapBytes = g_heapBytes;
+    volatile LONG&   heapCount = g_heapCount;
+
+    // #158. The wall sits at a heap COUNT (~2057-2063) that barely moves when the
+    // byte total does: 720p died at 2057 heaps carrying 250 MB less than 1080p's
+    // 2063. If the limit really counts allocations rather than bytes, then taking
+    // N heaps up front must move the game's death N heaps earlier while adding
+    // almost nothing to the total -- 64 KiB each, so 500 of them cost 32 MiB
+    // against a wall at ~2.0 GiB. If instead nothing moves, the count is innocent
+    // and the byte total is back in play.
+    {
+        static const unsigned pre = GhCfgNum(L"gh_heap_preload.txt", "GH_HEAP_PRELOAD", 0);
+        static volatile LONG preDone = 0;
+        if (pre && InterlockedCompareExchange(&preDone, 1, 0) == 0){
+            D3D12_HEAP_DESC dd{};
+            dd.SizeInBytes = 0x10000;
+            dd.Alignment   = 0x10000;
+            dd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;   // never CUSTOM, so #159's L1 trap cannot apply
+            dd.Flags = D3D12_HEAP_FLAG_NONE;
+            unsigned ok = 0; HRESULT last = S_OK;
+            for (unsigned i = 0; i < pre; ++i){
+                ID3D12Heap* h = nullptr;
+                last = orig(self, &dd, __uuidof(ID3D12Heap), (void**)&h);
+                if (FAILED(last) || !h) break;
+                ++ok;   // deliberately never released: the point is to hold them
+            }
+            Diag("HEAPPRELOAD asked=" + std::to_string((long)pre) +
+                 " got=" + std::to_string((long)ok) +
+                 " lasthr=" + Hex((uint32_t)last) +
+                 " bytes=" + Hex((uint64_t)((uint64_t)ok * 0x10000)));
+        }
+    }
 
     // The hang reproduces at the same place every run -- ~2052 heaps, ~1.93 GiB --
     // and does NOT move when the advertised VRAM budget is halved, so it is a hard
@@ -6819,6 +15530,46 @@ static HRESULT __stdcall Hook_D12CreateHeap(ID3D12Device* self,
             return E_OUTOFMEMORY;
         }
     }
+
+    // #158. The game presents exactly 26 frames and then a CreateHeap never
+    // returns. If a guest call site starts asking for heaps only at frame 26, that
+    // site names the subsystem that begins on frame 26. Log each distinct site once.
+    {
+        const uintptr_t site = GhGuestCallerRva();
+        static uintptr_t seen[96]{};
+        static LONG nseen = 0;
+        static SRWLOCK lk = SRWLOCK_INIT;
+        bool fresh = false;
+        AcquireSRWLockExclusive(&lk);
+        bool have = false;
+        for (LONG i = 0; i < nseen; ++i) if (seen[i] == site){ have = true; break; }
+        if (!have && nseen < 96){ seen[nseen++] = site; fresh = true; }
+        ReleaseSRWLockExclusive(&lk);
+        if (fresh)
+            Diag("HEAPSITE new frame=" + std::to_string((long)InterlockedCompareExchange(&g_presentN, 0, 0)) +
+                 " site=" + Hex((uint64_t)site) +
+                 " nheaps=" + std::to_string((long)InterlockedCompareExchange(&g_heapCount, 0, 0)) +
+                 " size=" + (hd ? Hex((uint64_t)hd->SizeInBytes) : std::string("null")) +
+                 " type=" + std::to_string(hd ? (int)hd->Properties.Type : -1));
+    }
+
+    // #158. The existing log line prints AFTER orig() returns, so the one request
+    // that matters -- the heap whose CreateHeap never comes back -- is the only one
+    // never printed. From frame 15 on there are only a handful of heaps, so print
+    // the descriptor BEFORE the call. The last CREATEHEAP-PRE with no matching
+    // "D3D12 CreateHeap" line after it is the request that hung.
+    if (hd && InterlockedCompareExchange(&g_presentN, 0, 0) >= 15)
+        Diag("CREATEHEAP-PRE frame=" + std::to_string((long)InterlockedCompareExchange(&g_presentN, 0, 0)) +
+             " n=" + std::to_string((long)InterlockedCompareExchange(&g_heapCount, 0, 0)) +
+             " size=" + Hex((uint64_t)hd->SizeInBytes) +
+             " align=" + Hex((uint64_t)hd->Alignment) +
+             " type=" + std::to_string((int)hd->Properties.Type) +
+             " cpupage=" + std::to_string((int)hd->Properties.CPUPageProperty) +
+             " pool=" + std::to_string((int)hd->Properties.MemoryPoolPreference) +
+             " creation=" + Hex((uint32_t)hd->Properties.CreationNodeMask) +
+             " visible=" + Hex((uint32_t)hd->Properties.VisibleNodeMask) +
+             " flags=" + Hex((uint32_t)hd->Flags) +
+             " tid=" + std::to_string(GetCurrentThreadId()));
 
     D3D12_HEAP_DESC fixedHd{};
     if (hd){
@@ -6848,6 +15599,104 @@ static HRESULT __stdcall Hook_D12CreateHeap(ID3D12Device* self,
     }
     return hr;
 }
+
+// #158: placed render targets that ALIAS. The game places many resources at the
+// same offset in the same heap and issues zero aliasing barriers all run, so a
+// surface can inherit whatever compression metadata the previous tenant of that
+// memory left behind. Metadata work on such a surface -- which is exactly what a
+// transition out of RENDER_TARGET and a fast clear are -- would then read garbage.
+// Giving the aliased ones their own committed allocation breaks that inheritance.
+//   gh_commit_rt = 0   audit only: count the aliasing placements and their cost
+//   gh_commit_rt = N   also convert them, spending at most N megabytes
+static unsigned GhCommitRt()
+{ static const unsigned n = GhCfgNum(L"gh_commit_rt.txt", "GH_COMMIT_RT", 0); return n; }
+static bool GhCommitRtOn()
+{ static const bool on = GhCfgNum(L"gh_commit_rt_on.txt", "GH_COMMIT_RT_ON", 0) != 0 ||
+                         GhCommitRt() != 0; return on; }
+// #158. gh_commit_rt only ever converts a placement that OVERLAPS a previous
+// tenant, and the aliased set and the transitioned set were measured to be
+// disjoint -- so the surfaces that actually carry the per-frame RENDER_TARGET
+// transitions have never been given their own allocation by anything. Those are
+// the nineteen BARRRESDESC names: 2D, one mip, one slice, one sample,
+// ALLOW_RENDER_TARGET, 1920x1080 down to 15x9, about 100 MB all told.
+// gh_commit_rt_all = N converts every such placement to a committed resource,
+// spending at most N megabytes. Placed and committed differ in who owns the
+// backing store, and therefore in where the driver may keep a surface's
+// compression metadata -- which is the one thing every probe says the GPU dies
+// on. Not a visual compromise: same resolution, same formats, same passes.
+static unsigned GhCommitRtAll()
+{ static const unsigned n = GhCfgNum(L"gh_commit_rt_all.txt", "GH_COMMIT_RT_ALL", 0); return n; }
+static volatile LONG   g_commitAllN = 0, g_commitAllFail = 0;
+static volatile LONG64 g_commitAllBytes = 0;
+struct GhHeapUse { void* heap; UINT64 lo, hi; void* res; };
+#define GH_HEAPUSE_MAX 8192
+static GhHeapUse g_heapUse[GH_HEAPUSE_MAX]{};
+static volatile LONG g_heapUseN = 0;
+static volatile LONG g_aliasN = 0, g_commitN = 0, g_commitFail = 0;
+static volatile LONG64 g_aliasBytes = 0, g_commitBytes = 0;
+static SRWLOCK g_heapUseLk = SRWLOCK_INIT;
+// Records the placement and says whether it lands on memory a previous placement
+// in the same heap already used.
+//
+// #158. It also hands back OUR row in the table and the resources that already
+// hold the range. That second output is the whole point: the game places twelve
+// to fourteen differently-sized render targets at offset 0 of one heap -- the
+// dynamic-resolution variants of one pyramid level -- and renders to the FIRST
+// and widest of them. Returning "alias" only for placements 2..N therefore
+// flagged exactly the twelve surfaces the game never draws into, and never the
+// one it does. The breadcrumb says the GPU dies inside a barrier on that first
+// surface, so naming the prior occupants is what lets the fix reach it.
+static bool GhHeapUseNote(void* heap, UINT64 lo, UINT64 hi,
+                          LONG* slotOut = nullptr, void** prior = nullptr,
+                          LONG priorMax = 0, LONG* priorN = nullptr)
+{
+    bool alias = false;
+    AcquireSRWLockExclusive(&g_heapUseLk);
+    const LONG n = g_heapUseN;
+    for (LONG i = 0; i < n; ++i)
+        if (g_heapUse[i].heap == heap && lo < g_heapUse[i].hi && g_heapUse[i].lo < hi){
+            alias = true;
+            if (prior && priorN && g_heapUse[i].res && *priorN < priorMax)
+                prior[(*priorN)++] = g_heapUse[i].res;
+        }
+    if (n < GH_HEAPUSE_MAX){
+        g_heapUse[n] = { heap, lo, hi, nullptr }; g_heapUseN = n + 1;
+        if (slotOut) *slotOut = n;
+    }
+    ReleaseSRWLockExclusive(&g_heapUseLk);
+    return alias;
+}
+// Back-fills the resource pointer once the placement has actually succeeded.
+static void GhHeapUseSetRes(LONG slot, void* res)
+{
+    if (slot < 0 || !res) return;
+    AcquireSRWLockExclusive(&g_heapUseLk);
+    if (slot < g_heapUseN) g_heapUse[slot].res = res;
+    ReleaseSRWLockExclusive(&g_heapUseLk);
+}
+static void GhCommitRtStats(const char* when)
+{
+    if (!GhCommitRtOn()) return;
+    Diag(std::string("COMMITRTSTATS ") + when +
+         " budget_mb=" + std::to_string((unsigned long)GhCommitRt()) +
+         " aliasing_placements=" + std::to_string((long)InterlockedCompareExchange(&g_aliasN,0,0)) +
+         " aliasing_mb=" + std::to_string((long long)(InterlockedCompareExchange64(&g_aliasBytes,0,0) >> 20)) +
+         " converted=" + std::to_string((long)InterlockedCompareExchange(&g_commitN,0,0)) +
+         " converted_mb=" + std::to_string((long long)(InterlockedCompareExchange64(&g_commitBytes,0,0) >> 20)) +
+         " failed=" + std::to_string((long)InterlockedCompareExchange(&g_commitFail,0,0)) +
+         " ranges=" + std::to_string((long)InterlockedCompareExchange(&g_heapUseN,0,0)));
+}
+static void GhCommitRtAllStats(const char* when)
+{
+    if (!GhCommitRtAll()) return;
+    Diag(std::string("COMMITRTALLSTATS ") + when +
+         " budget_mb=" + std::to_string((unsigned long)GhCommitRtAll()) +
+         " converted=" + std::to_string((long)InterlockedCompareExchange(&g_commitAllN,0,0)) +
+         " converted_mb=" + std::to_string((long long)(InterlockedCompareExchange64(&g_commitAllBytes,0,0) >> 20)) +
+         " failed=" + std::to_string((long)InterlockedCompareExchange(&g_commitAllFail,0,0)));
+}
+static unsigned GhCommitRtW()
+{ static const unsigned n = GhCfgNum(L"gh_commit_rt_w.txt", "GH_COMMIT_RT_W", 0); return n; }
 static HRESULT __stdcall Hook_D12CreatePlaced(ID3D12Device* self, ID3D12Heap* heap,
     UINT64 off, const D3D12_RESOURCE_DESC* rd, D3D12_RESOURCE_STATES st,
     const D3D12_CLEAR_VALUE* cv, REFIID riid, void** pp)
@@ -6855,6 +15704,118 @@ static HRESULT __stdcall Hook_D12CreatePlaced(ID3D12Device* self, ID3D12Heap* he
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, ID3D12Heap*, UINT64,
         const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*,
         REFIID, void**))g_d12vtOrig[29];
+    GhD12CallScope _s("CreatePlacedResource");
+    D3D12_RESOURCE_DESC fixedRd{};
+    rd = GhFixRtDesc(&fixedRd, rd);
+    D3D12_RESOURCE_DESC strippedRd{}; bool didStrip = false;
+    const D3D12_RESOURCE_DESC* auditRd = rd;
+    rd = GhStripRtDesc(&strippedRd, rd, &didStrip);
+    D3D12_RESOURCE_DESC probeRd{};
+    rd = GhFmtProbeDesc(&probeRd, rd);
+    // An aliasing placement of a render target gets its own allocation instead.
+    bool aliasedPlacement = false;
+    LONG  useSlot = -1;                       // #158: our row in the occupant table
+    void* aliasPrior[32]{}; LONG aliasPriorN = 0;
+    if ((GhCommitRtOn() || GhAliasFix() || GhAliasReinit()) && heap && rd &&
+        rd->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+        (rd->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)){
+        const D3D12_RESOURCE_ALLOCATION_INFO ai = self->GetResourceAllocationInfo(0, 1, rd);
+        const bool collides = GhHeapUseNote(heap, off, off + ai.SizeInBytes,
+                                            &useSlot, aliasPrior, 32, &aliasPriorN);
+        // #158. The earlier occupants are the surfaces the game actually renders
+        // to, and they are invisible to the "landed on used memory" test because
+        // they landed first. Mode 3 flags them here, when the collision that
+        // proves they are aliased finally happens.
+        if (GhAliasFix() == 3 || GhAliasReinit())
+            for (LONG pz = 0; pz < aliasPriorN; ++pz) GhAliasNote(aliasPrior[pz]);
+        if (collides){
+            aliasedPlacement = true;
+            InterlockedIncrement(&g_aliasN);
+            InterlockedAdd64(&g_aliasBytes, (LONG64)ai.SizeInBytes);
+            const LONG64 spent = InterlockedCompareExchange64(&g_commitBytes, 0, 0);
+            const LONG64 budget = (LONG64)GhCommitRt() << 20;
+            if (budget && spent + (LONG64)ai.SizeInBytes <= budget){
+                D3D12_HEAP_DESC hd = heap->GetDesc();
+                D3D12_HEAP_PROPERTIES hp = hd.Properties, fixedHp{};
+                if (GhFixUmaHeapProps(&fixedHp, &hp, "CommitRt")) hp = fixedHp;
+                auto origC = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*,
+                    D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
+                    const D3D12_CLEAR_VALUE*, REFIID, void**))g_d12vtOrig[27];
+                HRESULT hc = origC(self, &hp, D3D12_HEAP_FLAG_NONE, rd, st, cv, riid, pp);
+                const LONG cn = SUCCEEDED(hc) ? InterlockedIncrement(&g_commitN)
+                                              : InterlockedIncrement(&g_commitFail);
+                if (cn <= 6 || (cn % 128) == 0)
+                    Diag(std::string(SUCCEEDED(hc) ? "COMMITRT n=" : "COMMITRT FAILED n=") +
+                         std::to_string((long)cn) +
+                         " heap=" + Hex((uint64_t)(uintptr_t)heap) +
+                         " off=" + Hex((uint64_t)off) +
+                         " " + std::to_string((unsigned long long)rd->Width) + "x" +
+                         std::to_string((unsigned long)rd->Height) +
+                         " fmt=" + std::to_string((unsigned long)rd->Format) +
+                         " bytes=" + std::to_string((unsigned long long)ai.SizeInBytes) +
+                         " hr=" + Hex((uint32_t)hc));
+                if (SUCCEEDED(hc)){
+                    InterlockedAdd64(&g_commitBytes, (LONG64)ai.SizeInBytes);
+                    if (pp && *pp) GhHeapUseSetRes(useSlot, *pp);
+                    if (pp && *pp) GhRtAuditCreate(*pp, auditRd, didStrip);
+                    if (pp && *pp) GhVaRegister((ID3D12Resource*)*pp, rd);
+                    if (pp && *pp) GhRtDsRecord((ID3D12Resource*)*pp, rd, st);
+                    if (pp && *pp) GhHookResourceVtable((ID3D12Resource*)*pp);
+                    if (pp && *pp) GhHookObjRelease((IUnknown*)*pp);
+                    return hc;
+                }
+            }
+        }
+    }
+    // #158. Give the transitioning render targets their own allocation. See the
+    // comment on GhCommitRtAll: the aliasing path above can never reach them.
+    // #158. gh_commit_rt_w = the widest surface worth converting. The earlier
+    // attempts at this test failed on memory, not on the hypothesis: 512 MB
+    // exhausted the budget mid-run and 1536 MB died before reaching the wall.
+    // But the surfaces that actually hang are the small ones -- a 960-wide blur
+    // pyramid down to 15 -- so a WIDTH filter buys the whole fatal family for a
+    // few tens of megabytes and leaves the 1920-wide targets placed. That takes
+    // our demand-commit pager (#145), the most non-standard thing in this
+    // process, out from under the operation the GPU dies inside.
+    if (!aliasedPlacement && GhCommitRtAll() && heap && rd &&
+        (!GhCommitRtW() || rd->Width <= (UINT64)GhCommitRtW()) &&
+        rd->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        rd->MipLevels == 1 && rd->DepthOrArraySize == 1 &&
+        rd->SampleDesc.Count == 1 &&
+        (rd->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)){
+        const D3D12_RESOURCE_ALLOCATION_INFO ai = self->GetResourceAllocationInfo(0, 1, rd);
+        const LONG64 spent  = InterlockedCompareExchange64(&g_commitAllBytes, 0, 0);
+        const LONG64 budget = (LONG64)GhCommitRtAll() << 20;
+        if (spent + (LONG64)ai.SizeInBytes <= budget){
+            D3D12_HEAP_DESC hd = heap->GetDesc();
+            D3D12_HEAP_PROPERTIES hp = hd.Properties, fixedHp{};
+            if (GhFixUmaHeapProps(&fixedHp, &hp, "CommitRtAll")) hp = fixedHp;
+            auto origC = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*,
+                D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
+                const D3D12_CLEAR_VALUE*, REFIID, void**))g_d12vtOrig[27];
+            HRESULT hc = origC(self, &hp, D3D12_HEAP_FLAG_NONE, rd, st, cv, riid, pp);
+            const LONG cn = SUCCEEDED(hc) ? InterlockedIncrement(&g_commitAllN)
+                                          : InterlockedIncrement(&g_commitAllFail);
+            if (cn <= 24 || (cn % 128) == 0)
+                Diag(std::string(SUCCEEDED(hc) ? "COMMITRTALL n=" : "COMMITRTALL FAILED n=") +
+                     std::to_string((long)cn) +
+                     " " + std::to_string((unsigned long long)rd->Width) + "x" +
+                     std::to_string((unsigned long)rd->Height) +
+                     " fmt=" + std::to_string((unsigned long)rd->Format) +
+                     " flags=" + Hex((uint32_t)rd->Flags) +
+                     " bytes=" + std::to_string((unsigned long long)ai.SizeInBytes) +
+                     " hr=" + Hex((uint32_t)hc));
+            if (SUCCEEDED(hc)){
+                InterlockedAdd64(&g_commitAllBytes, (LONG64)ai.SizeInBytes);
+                if (pp && *pp) GhRtAuditCreate(*pp, auditRd, didStrip);
+                if (pp && *pp) GhVaRegister((ID3D12Resource*)*pp, rd);
+                if (pp && *pp) GhRtDsRecord((ID3D12Resource*)*pp, rd, st);
+                if (pp && *pp) GhHookResourceVtable((ID3D12Resource*)*pp);
+                if (pp && *pp) GhHookObjRelease((IUnknown*)*pp);
+                return hc;
+            }
+        }
+    }
     static LONG n = 0;
     LONG i = InterlockedIncrement(&n);
     bool loud = (i <= 32);
@@ -6870,6 +15831,13 @@ static HRESULT __stdcall Hook_D12CreatePlaced(ID3D12Device* self, ID3D12Heap* he
              " fmt=" + std::to_string(rd ? (int)rd->Format : -1) +
              " flags=" + Hex((uint32_t)(rd ? rd->Flags : 0)));
     HRESULT hr = orig(self, heap, off, rd, st, cv, riid, pp);
+    if (SUCCEEDED(hr) && pp && *pp) GhHeapUseSetRes(useSlot, *pp);
+    if (SUCCEEDED(hr) && pp && *pp && aliasedPlacement) GhAliasNote(*pp);
+    if (SUCCEEDED(hr) && pp && *pp) GhRtAuditCreate(*pp, auditRd, didStrip);
+    if (SUCCEEDED(hr) && pp && *pp) GhVaRegister((ID3D12Resource*)*pp, rd);
+    if (SUCCEEDED(hr) && pp && *pp) GhRtDsRecord((ID3D12Resource*)*pp, rd, st);
+    if (SUCCEEDED(hr) && pp && *pp) GhHookResourceVtable((ID3D12Resource*)*pp);
+    if (SUCCEEDED(hr) && pp && *pp) GhHookObjRelease((IUnknown*)*pp);
     if (loud || FAILED(hr)) Diag("  CreatePlacedResource -> hr=" + Hex((uint32_t)hr));
     if (!loud && SUCCEEDED(hr) && pp && *pp)
         Diag("PLACED res=" + Hex((uint64_t)(uintptr_t)*pp) +
@@ -6902,7 +15870,22 @@ static HRESULT __stdcall Hook_D12CreateReserved(ID3D12Device* self,
 {
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_RESOURCE_DESC*,
         D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**))g_d12vtOrig[30];
+    D3D12_RESOURCE_DESC fixedRd{};
+    rd = GhFixRtDesc(&fixedRd, rd);
+    D3D12_RESOURCE_DESC strippedRd{}; bool didStrip = false;
+    const D3D12_RESOURCE_DESC* auditRd = rd;
+    rd = GhStripRtDesc(&strippedRd, rd, &didStrip);
+    D3D12_RESOURCE_DESC probeRd{};
+    rd = GhFmtProbeDesc(&probeRd, rd);
     HRESULT hr = orig(self, rd, st, cv, riid, pp);
+    if (SUCCEEDED(hr) && pp && *pp) GhRtAuditCreate(*pp, auditRd, didStrip);
+    // A reserved resource owns its address range but its tiles may be unmapped, so
+    // registering it can only mask a fault, never invent one. This game creates
+    // none; it is here so the registry stays honest if one ever appears.
+    if (SUCCEEDED(hr) && pp && *pp) GhVaRegister((ID3D12Resource*)*pp, rd);
+    if (SUCCEEDED(hr) && pp && *pp) GhRtDsRecord((ID3D12Resource*)*pp, rd, st);
+    if (SUCCEEDED(hr) && pp && *pp) GhHookResourceVtable((ID3D12Resource*)*pp);
+    if (SUCCEEDED(hr) && pp && *pp) GhHookObjRelease((IUnknown*)*pp);
     static LONG n = 0;
     LONG i = InterlockedIncrement(&n);
     if (i <= 24 || (i % 64) == 0 || FAILED(hr))
@@ -7120,6 +16103,34 @@ static void GhLogMemoryBudget(const char* where)
     if (GlobalMemoryStatusEx(&ms))
         ln += " availphys=" + Hex((uint64_t)ms.ullAvailPhys) +
               " availpage=" + Hex((uint64_t)ms.ullAvailPageFile);
+    // #158. Bytes are the wrong axis for "what does the driver allocate per barrier".
+    // A kernel object leaked per operation shows up as a HANDLE, and a driver
+    // allocation made kernel-side shows up in the non-paged pool quota -- neither of
+    // which need move the app's commit at all. Both are exact counts, not samples.
+    {
+        struct GhPMC {
+            DWORD cb, PageFaultCount;
+            SIZE_T PeakWorkingSetSize, WorkingSetSize;
+            SIZE_T QuotaPeakPagedPoolUsage, QuotaPagedPoolUsage;
+            SIZE_T QuotaPeakNonPagedPoolUsage, QuotaNonPagedPoolUsage;
+            SIZE_T PagefileUsage, PeakPagefileUsage;
+        };
+        HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+        auto pGPMI = k32 ? (BOOL (WINAPI*)(HANDLE, GhPMC*, DWORD))
+                               GetProcAddress(k32, "K32GetProcessMemoryInfo") : nullptr;
+        auto pGPHC = k32 ? (BOOL (WINAPI*)(HANDLE, PDWORD))
+                               GetProcAddress(k32, "GetProcessHandleCount") : nullptr;
+        GhPMC pmc{}; pmc.cb = sizeof pmc;
+        if (pGPMI && pGPMI(GetCurrentProcess(), &pmc, sizeof pmc))
+            ln += " ws=" + Hex((uint64_t)pmc.WorkingSetSize) +
+                  " paged=" + Hex((uint64_t)pmc.QuotaPagedPoolUsage) +
+                  " nonpaged=" + Hex((uint64_t)pmc.QuotaNonPagedPoolUsage) +
+                  " pagefile=" + Hex((uint64_t)pmc.PagefileUsage) +
+                  " faults=" + std::to_string((unsigned long)pmc.PageFaultCount);
+        DWORD nh = 0;
+        if (pGPHC && pGPHC(GetCurrentProcess(), &nh))
+            ln += " handles=" + std::to_string((unsigned long)nh);
+    }
     // Ask the real adapter directly rather than through any proxy of ours.
     com_ptr<IDXGIFactory4> f;
     if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory4), f.put_void())) && f){
@@ -7300,8 +16311,9 @@ struct GhUmdVaRec {
 static GhUmdVaRec  g_umdVa[256]{};
 static volatile LONG g_umdVaN = 0;
 
-static bool GhVaTraceOn()
-{ static const bool on = GhCfgNum(L"gh_va_trace.txt", "GH_VA_TRACE", 0) != 0; return on; }
+static unsigned GhVaTraceMode()
+{ static const unsigned m = (unsigned)GhCfgNum(L"gh_va_trace.txt", "GH_VA_TRACE", 0); return m; }
+static bool GhVaTraceOn(){ return GhVaTraceMode() != 0; }
 
 static void GhUmdVaNote(unsigned kind, void* addr, SIZE_T size, DWORD type, DWORD prot,
                         void* ret, DWORD err, NTSTATUS st)
@@ -7375,6 +16387,371 @@ static bool GhPatchHostImport(HMODULE mod, const char* fn, void* repl, void** or
     return any;
 }
 
+// #158 dose curve. The budget turned out to be LOGARITHMIC in the draw-packet rate --
+// doses 0/1/2/4 of gh_degen_draw give an exact arithmetic series in six columns -- which is
+// the signature of a resource that grows GEOMETRICALLY with a fixed number of growths.  To
+// see such a pool we have to watch the allocator the D3D12 UMD actually uses, and MT_a showed
+// we were not: umd12ddi.dll imports NONE of VirtualAlloc / VirtualFree /
+// NtAllocateVirtualMemory by those names ("[umd12ddi va=0 vf=0 nt=0]"), so the IAT patch found
+// nothing to swap and the only records in the ring came from D3D12Core and dxgi.
+//
+// Rather than guess the name, enumerate: at gh_va_trace>=2 this prints every memory-shaped
+// import the module really has, so the next build can hook exactly the right one.  Bounded by
+// the name filter, and it runs once at install.
+static void GhDumpHostImports(HMODULE mod, const char* tag)
+{
+    if (!mod) return;
+    auto* dos = (IMAGE_DOS_HEADER*)mod;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    auto* nt = (IMAGE_NT_HEADERS*)((BYTE*)mod + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress || !dir.Size){ Diag(std::string("VAIMPORTS ") + tag + " (no import dir)"); return; }
+    static const char* kWant[] = { "Alloc", "Free", "Virtual", "Heap", "Map", "Section", "Reserve", "Commit" };
+    int hits = 0;
+    for (auto* imp = (IMAGE_IMPORT_DESCRIPTOR*)((BYTE*)mod + dir.VirtualAddress);
+         imp->Name; ++imp){
+        if (!imp->FirstThunk) continue;
+        const char* dll = (const char*)mod + imp->Name;
+        auto* names = (IMAGE_THUNK_DATA*)((BYTE*)mod +
+                        (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
+        std::string ln;
+        for (; names->u1.AddressOfData; ++names){
+            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
+            const char* fn = (const char*)((IMAGE_IMPORT_BY_NAME*)((BYTE*)mod + names->u1.AddressOfData))->Name;
+            bool want = false;
+            for (const char* w : kWant) if (strstr(fn, w)){ want = true; break; }
+            if (!want) continue;
+            ++hits;
+            ln += " "; ln += fn;
+            if (ln.size() > 700){ Diag(std::string("VAIMPORTS ") + tag + " " + dll + ":" + ln); ln.clear(); }
+        }
+        if (!ln.empty()) Diag(std::string("VAIMPORTS ") + tag + " " + dll + ":" + ln);
+    }
+    Diag(std::string("VAIMPORTS ") + tag + " memory-shaped imports=" + std::to_string(hits));
+}
+
+// #158. VA2_a answered where the D3D12 driver's memory comes from, and the answer moves the
+// whole question: **umd12ddi.dll imports no allocator at all** -- its only memory-shaped
+// imports are FreeLibrary, RtlVirtualUnwind and the critical-section family. It never calls
+// VirtualAlloc, HeapAlloc or any D3DKMT allocation entry point. It is handed its memory
+// through the UMD callback table, and the module that actually allocates is D3D12Core:
+//
+//   D3D12Core  api-ms-win-core-heap-l1-1-0.dll: HeapAlloc HeapReAlloc HeapFree HeapSize
+//                                               HeapCreate HeapDestroy HeapCompact HeapValidate
+//              api-ms-win-core-memory-l1-1-0.dll: VirtualAlloc VirtualFree VirtualProtect
+//                                                 VirtualQuery CreateFileMappingW MapViewOfFile
+//
+// A PRIVATE HEAP the runtime creates itself, plus the compact/validate calls that only code
+// managing its own heap makes. That is the right shape for the resource the dose curve
+// implies: something that grows geometrically and has a fixed number of growths in it. And
+// it lines up with the fault we already have on the record -- umd12ddi writing four bytes
+// past the end of a committed range is what a block handed out from a heap whose commit has
+// not kept up looks like from the consumer's side.
+//
+// gh_va_trace>=3 counts that traffic. Counters only on the hot path (HeapAlloc/HeapFree are
+// called far more often than VirtualAlloc), plus a small ring of the LARGE requests, which is
+// where a doubling would show. A NULL return is counted separately: a failed allocation just
+// before the wall would be the answer outright.
+static volatile LONG64 g_chAllocN = 0, g_chAllocB = 0, g_chReallocN = 0, g_chReallocB = 0;
+static volatile LONG64 g_chFreeN = 0, g_chFailN = 0, g_chMaxReq = 0;
+struct GhChBig { SIZE_T req; void* ret; unsigned kind; };   // 1 alloc, 2 realloc
+static GhChBig g_chBig[64]{};
+static volatile LONG g_chBigN = 0;
+static const SIZE_T kGhChBigMin = 256 * 1024;
+
+typedef LPVOID (WINAPI *PFN_GhHA)(HANDLE, DWORD, SIZE_T);
+typedef LPVOID (WINAPI *PFN_GhHRA)(HANDLE, DWORD, LPVOID, SIZE_T);
+typedef BOOL   (WINAPI *PFN_GhHF)(HANDLE, DWORD, LPVOID);
+typedef HANDLE (WINAPI *PFN_GhHC)(DWORD, SIZE_T, SIZE_T);
+static PFN_GhHA  g_chHaOrig  = nullptr;
+static PFN_GhHRA g_chHraOrig = nullptr;
+static PFN_GhHF  g_chHfOrig  = nullptr;
+static PFN_GhHC  g_chHcOrig  = nullptr;
+
+static void GhChNoteBig(SIZE_T req, void* ret, unsigned kind)
+{
+    if (req < kGhChBigMin) return;
+    LONG i = InterlockedIncrement(&g_chBigN) - 1;
+    GhChBig& x = g_chBig[(size_t)i & 63];
+    x.req = req; x.ret = ret; x.kind = kind;
+}
+static LPVOID WINAPI Hook_CoreHeapAlloc(HANDLE h, DWORD f, SIZE_T n)
+{
+    LPVOID r = g_chHaOrig ? g_chHaOrig(h, f, n) : HeapAlloc(h, f, n);
+    InterlockedIncrement64(&g_chAllocN);
+    InterlockedAdd64(&g_chAllocB, (LONG64)n);
+    if (!r) InterlockedIncrement64(&g_chFailN);
+    for (;;){ LONG64 m = g_chMaxReq; if ((LONG64)n <= m) break;
+              if (InterlockedCompareExchange64(&g_chMaxReq, (LONG64)n, m) == m) break; }
+    GhChNoteBig(n, r, 1);
+    return r;
+}
+static LPVOID WINAPI Hook_CoreHeapReAlloc(HANDLE h, DWORD f, LPVOID p, SIZE_T n)
+{
+    LPVOID r = g_chHraOrig ? g_chHraOrig(h, f, p, n) : HeapReAlloc(h, f, p, n);
+    InterlockedIncrement64(&g_chReallocN);
+    InterlockedAdd64(&g_chReallocB, (LONG64)n);
+    if (!r) InterlockedIncrement64(&g_chFailN);
+    GhChNoteBig(n, r, 2);
+    return r;
+}
+static BOOL WINAPI Hook_CoreHeapFree(HANDLE h, DWORD f, LPVOID p)
+{
+    InterlockedIncrement64(&g_chFreeN);
+    return g_chHfOrig ? g_chHfOrig(h, f, p) : HeapFree(h, f, p);
+}
+static HANDLE WINAPI Hook_CoreHeapCreate(DWORD opt, SIZE_T init, SIZE_T maxs)
+{
+    HANDLE r = g_chHcOrig ? g_chHcOrig(opt, init, maxs) : HeapCreate(opt, init, maxs);
+    Diag("COREHEAP HeapCreate opt=" + Hex((uint32_t)opt) +
+         " initial=" + Hex((uint64_t)init) + " max=" + Hex((uint64_t)maxs) +
+         (maxs ? " (fixed)" : " (GROWABLE)") + " -> " + Hex((uint64_t)(uintptr_t)r));
+    return r;
+}
+
+static void GhCoreHeapStats(const char* when)
+{
+    if (GhVaTraceMode() < 3) return;
+    Diag(std::string("COREHEAP ") + when +
+         " allocs=" + std::to_string((long long)InterlockedCompareExchange64(&g_chAllocN, 0, 0)) +
+         " allocMB=" + std::to_string((long long)(InterlockedCompareExchange64(&g_chAllocB, 0, 0) >> 20)) +
+         " reallocs=" + std::to_string((long long)InterlockedCompareExchange64(&g_chReallocN, 0, 0)) +
+         " reallocMB=" + std::to_string((long long)(InterlockedCompareExchange64(&g_chReallocB, 0, 0) >> 20)) +
+         " frees=" + std::to_string((long long)InterlockedCompareExchange64(&g_chFreeN, 0, 0)) +
+         " FAILED=" + std::to_string((long long)InterlockedCompareExchange64(&g_chFailN, 0, 0)) +
+         " maxreq=" + Hex((uint64_t)InterlockedCompareExchange64(&g_chMaxReq, 0, 0)) +
+         " big=" + std::to_string((long)InterlockedCompareExchange(&g_chBigN, 0, 0)));
+}
+
+// The large-request ring, newest last. A pool that doubles prints its own doubling here.
+static void GhCoreHeapBigDump(const char* when)
+{
+    if (GhVaTraceMode() < 3) return;
+    LONG n = InterlockedCompareExchange(&g_chBigN, 0, 0);
+    if (n <= 0){ Diag(std::string("COREHEAPBIG ") + when + " (no request >= 256 KB)"); return; }
+    LONG first = n > 64 ? n - 64 : 0;
+    for (LONG i = first; i < n; ++i){
+        const GhChBig& x = g_chBig[(size_t)i & 63];
+        Diag("  COREHEAPBIG #" + std::to_string((long)i) +
+             (x.kind == 2 ? " HeapReAlloc" : " HeapAlloc") +
+             " req=" + Hex((uint64_t)x.req) +
+             " (" + std::to_string((unsigned long long)(x.req >> 10)) + " KB)" +
+             " ret=" + Hex((uint64_t)(uintptr_t)x.ret));
+    }
+}
+
+static void GhInstallCoreHeapTrace()
+{
+    if (GhVaTraceMode() < 3) return;
+    static LONG done = 0;
+    if (InterlockedCompareExchange(&done, 1, 0) != 0) return;
+    HMODULE h = GetModuleHandleW(L"D3D12Core.dll");
+    if (!h){ Diag("COREHEAP install: D3D12Core absent"); return; }
+    bool a  = GhPatchHostImport(h, "HeapAlloc",   (void*)&Hook_CoreHeapAlloc,   (void**)&g_chHaOrig);
+    bool ra = GhPatchHostImport(h, "HeapReAlloc", (void*)&Hook_CoreHeapReAlloc, (void**)&g_chHraOrig);
+    bool f  = GhPatchHostImport(h, "HeapFree",    (void*)&Hook_CoreHeapFree,    (void**)&g_chHfOrig);
+    bool c  = GhPatchHostImport(h, "HeapCreate",  (void*)&Hook_CoreHeapCreate,  (void**)&g_chHcOrig);
+    Diag(std::string("COREHEAP install D3D12Core base=") + Hex((uint64_t)(uintptr_t)h) +
+         " alloc=" + (a ? "1" : "0") + " realloc=" + (ra ? "1" : "0") +
+         " free=" + (f ? "1" : "0") + " create=" + (c ? "1" : "0"));
+}
+
+
+// #158 mode 4.  Two results closed the user-mode CPU allocators, and between them they say the
+// growing resource is not in user-mode memory at all:
+//
+//   CH_a   D3D12Core's heap traffic is flat -- HeapCreate never called, HeapReAlloc never
+//          called, 15 MB across 71k allocations, largest single request 128 KB, zero failures.
+//   CH_a   the same run's VATRACE ring holds 28 records total, every one of them the SAME
+//          64 KB scratch page being committed and released ("addr=0x0 size=0x10000 type=0x3000
+//          ... ret=0x1D0BD880000" then MEM_RELEASE of that address, over and over).
+//          VirtualAlloc grows by nothing.
+//   VA2_a  umd12ddi imports no allocator of any kind, and -- the part worth noticing -- NEITHER
+//          D3D12Core NOR umd12ddi statically imports any D3DKMT* entry point.  The mode-2 filter
+//          keys on "Alloc", so D3DKMTCreateAllocation would have matched had it been there.
+//
+// So the kernel graphics interface is reached some way we have not looked at: resolved
+// dynamically, forwarded through a module we never dumped, or issued directly.  Guessing the
+// name is what cost us the mode-1 round, so mode 4 enumerates instead:
+//
+//   (1) the FULL import table of each D3D module, unfiltered -- every dependency and every
+//       name, so the kernel path names itself; and
+//   (2) the section-object trio dxgi does import (ZwCreateSection / ZwMapViewOfSection /
+//       ZwUnmapViewOfSection) plus CreateFileMappingW / MapViewOfFile, which is how shared and
+//       GPU-visible memory is actually mapped, counted in the same shape as COREHEAP.
+static void GhDumpAllImports(HMODULE mod, const char* tag)
+{
+    if (!mod) return;
+    auto* dos = (IMAGE_DOS_HEADER*)mod;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    auto* nt = (IMAGE_NT_HEADERS*)((BYTE*)mod + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress || !dir.Size){ Diag(std::string("VAIMPALL ") + tag + " (no import dir)"); return; }
+    int total = 0, dlls = 0;
+    for (auto* imp = (IMAGE_IMPORT_DESCRIPTOR*)((BYTE*)mod + dir.VirtualAddress);
+         imp->Name; ++imp){
+        if (!imp->FirstThunk) continue;
+        const char* dll = (const char*)mod + imp->Name;
+        auto* names = (IMAGE_THUNK_DATA*)((BYTE*)mod +
+                        (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
+        std::string ln; int n = 0;
+        for (; names->u1.AddressOfData; ++names){
+            ++n; ++total;
+            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)){
+                ln += " #" + std::to_string((unsigned long long)IMAGE_ORDINAL(names->u1.Ordinal));
+            } else {
+                ln += " ";
+                ln += (const char*)((IMAGE_IMPORT_BY_NAME*)((BYTE*)mod + names->u1.AddressOfData))->Name;
+            }
+            if (ln.size() > 700){ Diag(std::string("VAIMPALL ") + tag + " " + dll + ":" + ln); ln.clear(); }
+        }
+        ++dlls;
+        Diag(std::string("VAIMPALL ") + tag + " " + dll + "(" + std::to_string(n) + "):" + ln);
+    }
+    Diag(std::string("VAIMPALL ") + tag + " dlls=" + std::to_string(dlls) +
+         " imports=" + std::to_string(total));
+}
+
+// The section/mapping surface.  Primitive parameter types only -- no winternl.h -- so the
+// signatures cannot drift against whatever SDK headers this TU already pulled in.
+typedef LONG   (NTAPI  *PFN_GhZwCS)(PHANDLE, ACCESS_MASK, void*, PLARGE_INTEGER, ULONG, ULONG, HANDLE);
+typedef LONG   (NTAPI  *PFN_GhZwMV)(HANDLE, HANDLE, PVOID*, ULONG_PTR, SIZE_T, PLARGE_INTEGER,
+                                    PSIZE_T, int, ULONG, ULONG);
+typedef LONG   (NTAPI  *PFN_GhZwUV)(HANDLE, PVOID);
+typedef HANDLE (WINAPI *PFN_GhCFM)(HANDLE, LPSECURITY_ATTRIBUTES, DWORD, DWORD, DWORD, LPCWSTR);
+typedef LPVOID (WINAPI *PFN_GhMVF)(HANDLE, DWORD, DWORD, DWORD, SIZE_T);
+static PFN_GhZwCS g_secCsOrig  = nullptr;
+static PFN_GhZwMV g_secMvOrig  = nullptr;
+static PFN_GhZwUV g_secUvOrig  = nullptr;
+static PFN_GhCFM  g_secCfmOrig = nullptr;
+static PFN_GhMVF  g_secMvfOrig = nullptr;
+
+static volatile LONG64 g_secCsN = 0, g_secCsB = 0, g_secMvN = 0, g_secMvB = 0;
+static volatile LONG64 g_secUvN = 0, g_secFailN = 0, g_secMaxB = 0;
+struct GhSecRec { LONG64 size; void* base; unsigned kind; LONG st; };  // 1 create, 2 map, 3 filemap, 4 mapview
+static GhSecRec g_secRing[96]{};
+static volatile LONG g_secRingN = 0;
+
+static void GhSecNote(LONG64 size, void* base, unsigned kind, LONG st)
+{
+    LONG i = InterlockedIncrement(&g_secRingN) - 1;
+    GhSecRec& x = g_secRing[(size_t)i % 96];
+    x.size = size; x.base = base; x.kind = kind; x.st = st;
+    for (;;){ LONG64 m = g_secMaxB; if (size <= m) break;
+              if (InterlockedCompareExchange64(&g_secMaxB, size, m) == m) break; }
+}
+static LONG NTAPI Hook_SecCreate(PHANDLE h, ACCESS_MASK a, void* oa, PLARGE_INTEGER maxsz,
+                                 ULONG prot, ULONG attr, HANDLE file)
+{
+    LONG64 want = maxsz ? (LONG64)maxsz->QuadPart : 0;
+    LONG st = g_secCsOrig ? g_secCsOrig(h, a, oa, maxsz, prot, attr, file) : (LONG)0xC0000002;
+    InterlockedIncrement64(&g_secCsN);
+    InterlockedAdd64(&g_secCsB, want);
+    if (st < 0) InterlockedIncrement64(&g_secFailN);
+    GhSecNote(want, (void*)(uintptr_t)prot, 1, st);
+    return st;
+}
+static LONG NTAPI Hook_SecMap(HANDLE sec, HANDLE proc, PVOID* base, ULONG_PTR zb, SIZE_T commit,
+                              PLARGE_INTEGER off, PSIZE_T view, int inh, ULONG at, ULONG prot)
+{
+    LONG st = g_secMvOrig ? g_secMvOrig(sec, proc, base, zb, commit, off, view, inh, at, prot)
+                          : (LONG)0xC0000002;
+    InterlockedIncrement64(&g_secMvN);
+    LONG64 got = view ? (LONG64)*view : 0;
+    InterlockedAdd64(&g_secMvB, got);
+    if (st < 0) InterlockedIncrement64(&g_secFailN);
+    GhSecNote(got, base ? *base : nullptr, 2, st);
+    return st;
+}
+static LONG NTAPI Hook_SecUnmap(HANDLE proc, PVOID base)
+{
+    InterlockedIncrement64(&g_secUvN);
+    return g_secUvOrig ? g_secUvOrig(proc, base) : (LONG)0xC0000002;
+}
+static HANDLE WINAPI Hook_SecFileMap(HANDLE f, LPSECURITY_ATTRIBUTES sa, DWORD prot,
+                                     DWORD hi, DWORD lo, LPCWSTR nm)
+{
+    HANDLE r = g_secCfmOrig ? g_secCfmOrig(f, sa, prot, hi, lo, nm)
+                            : CreateFileMappingW(f, sa, prot, hi, lo, nm);
+    LONG64 sz = ((LONG64)hi << 32) | (LONG64)lo;
+    InterlockedIncrement64(&g_secCsN);
+    InterlockedAdd64(&g_secCsB, sz);
+    if (!r) InterlockedIncrement64(&g_secFailN);
+    GhSecNote(sz, r, 3, 0);
+    return r;
+}
+static LPVOID WINAPI Hook_SecMapView(HANDLE m, DWORD acc, DWORD hi, DWORD lo, SIZE_T n)
+{
+    LPVOID r = g_secMvfOrig ? g_secMvfOrig(m, acc, hi, lo, n) : MapViewOfFile(m, acc, hi, lo, n);
+    InterlockedIncrement64(&g_secMvN);
+    InterlockedAdd64(&g_secMvB, (LONG64)n);
+    if (!r) InterlockedIncrement64(&g_secFailN);
+    GhSecNote((LONG64)n, r, 4, 0);
+    return r;
+}
+
+static void GhSecStats(const char* when)
+{
+    if (GhVaTraceMode() < 4) return;
+    Diag(std::string("SECTRACE ") + when +
+         " creates=" + std::to_string((long long)InterlockedCompareExchange64(&g_secCsN, 0, 0)) +
+         " createMB=" + std::to_string((long long)(InterlockedCompareExchange64(&g_secCsB, 0, 0) >> 20)) +
+         " maps=" + std::to_string((long long)InterlockedCompareExchange64(&g_secMvN, 0, 0)) +
+         " mapMB=" + std::to_string((long long)(InterlockedCompareExchange64(&g_secMvB, 0, 0) >> 20)) +
+         " unmaps=" + std::to_string((long long)InterlockedCompareExchange64(&g_secUvN, 0, 0)) +
+         " FAILED=" + std::to_string((long long)InterlockedCompareExchange64(&g_secFailN, 0, 0)) +
+         " maxsize=" + Hex((uint64_t)InterlockedCompareExchange64(&g_secMaxB, 0, 0)) +
+         " recs=" + std::to_string((long)InterlockedCompareExchange(&g_secRingN, 0, 0)));
+}
+static void GhSecBigDump(const char* when)
+{
+    if (GhVaTraceMode() < 4) return;
+    LONG n = InterlockedCompareExchange(&g_secRingN, 0, 0);
+    if (n <= 0){ Diag(std::string("SECRING ") + when + " (no section traffic)"); return; }
+    LONG first = n > 96 ? n - 96 : 0;
+    static const char* kKind[] = { "?", "ZwCreateSection", "ZwMapViewOfSection",
+                                  "CreateFileMappingW", "MapViewOfFile" };
+    for (LONG i = first; i < n; ++i){
+        const GhSecRec& x = g_secRing[(size_t)i % 96];
+        Diag("  SECRING #" + std::to_string((long)i) + " " +
+             kKind[x.kind < 5 ? x.kind : 0] +
+             " size=" + Hex((uint64_t)x.size) +
+             " (" + std::to_string((unsigned long long)((uint64_t)x.size >> 10)) + " KB)" +
+             " p=" + Hex((uint64_t)(uintptr_t)x.base) +
+             " st=" + Hex((uint32_t)x.st));
+    }
+}
+
+static void GhInstallSecTrace()
+{
+    if (GhVaTraceMode() < 4) return;
+    static LONG done = 0;
+    if (InterlockedCompareExchange(&done, 1, 0) != 0) return;
+    struct { const wchar_t* w; const char* a; } mods[] = {
+        { L"dxgi.dll", "dxgi" }, { L"D3D12Core.dll", "D3D12Core" },
+        { L"d3d12.dll", "d3d12" }, { L"umd12ddi.dll", "umd12ddi" },
+    };
+    std::string ln;
+    for (auto& m : mods){
+        HMODULE h = GetModuleHandleW(m.w);
+        if (!h) continue;
+        bool cs = GhPatchHostImport(h, "ZwCreateSection",      (void*)&Hook_SecCreate,  (void**)&g_secCsOrig)
+               || GhPatchHostImport(h, "NtCreateSection",      (void*)&Hook_SecCreate,  (void**)&g_secCsOrig);
+        bool mv = GhPatchHostImport(h, "ZwMapViewOfSection",   (void*)&Hook_SecMap,     (void**)&g_secMvOrig)
+               || GhPatchHostImport(h, "NtMapViewOfSection",   (void*)&Hook_SecMap,     (void**)&g_secMvOrig);
+        bool uv = GhPatchHostImport(h, "ZwUnmapViewOfSection", (void*)&Hook_SecUnmap,   (void**)&g_secUvOrig)
+               || GhPatchHostImport(h, "NtUnmapViewOfSection", (void*)&Hook_SecUnmap,   (void**)&g_secUvOrig);
+        bool fm = GhPatchHostImport(h, "CreateFileMappingW",   (void*)&Hook_SecFileMap, (void**)&g_secCfmOrig);
+        bool vw = GhPatchHostImport(h, "MapViewOfFile",        (void*)&Hook_SecMapView, (void**)&g_secMvfOrig);
+        ln += std::string(" [") + m.a + " cs=" + (cs?"1":"0") + " mv=" + (mv?"1":"0") +
+              " uv=" + (uv?"1":"0") + " cfm=" + (fm?"1":"0") + " mvf=" + (vw?"1":"0") + "]";
+        GhDumpAllImports(h, m.a);
+    }
+    Diag("SECTRACE install" + (ln.empty() ? std::string(" (no D3D module loaded)") : ln));
+}
+
 static void GhInstallUmdVaTrace()
 {
     if (!GhVaTraceOn()) return;
@@ -7386,16 +16763,34 @@ static void GhInstallUmdVaTrace()
         { L"d3d12.dll", "d3d12" },
         { L"dxgi.dll", "dxgi" },
     };
+    // The plain names first, then the ones a UWP/app-container UMD is likelier to use:
+    // VirtualAlloc2 and the *FromApp variants are what shipping code calls when the classic
+    // entry points are not in the API set.  A name that is not imported costs nothing.
+    static const char* kAllocNames[] = { "VirtualAlloc", "VirtualAlloc2", "VirtualAllocFromApp",
+                                         "VirtualAlloc2FromApp" };
+    static const char* kFreeNames[]  = { "VirtualFree", "VirtualFreeEx" };
     std::string ln = "VATRACE install";
     for (const auto& m : mods){
         HMODULE h = GetModuleHandleW(m.w);
         if (!h){ ln += std::string(" [") + m.a + " absent]"; continue; }
-        bool a = GhPatchHostImport(h, "VirtualAlloc",  (void*)&Hook_UmdVirtualAlloc, (void**)&g_umdVaOrig);
-        bool f = GhPatchHostImport(h, "VirtualFree",   (void*)&Hook_UmdVirtualFree,  (void**)&g_umdVfOrig);
+        std::string got;
+        bool a = false;
+        for (const char* nm : kAllocNames)
+            if (GhPatchHostImport(h, nm, (void*)&Hook_UmdVirtualAlloc, (void**)&g_umdVaOrig)){
+                a = true; got += std::string("+") + nm;
+            }
+        bool f = false;
+        for (const char* nm : kFreeNames)
+            if (GhPatchHostImport(h, nm, (void*)&Hook_UmdVirtualFree, (void**)&g_umdVfOrig)){
+                f = true; got += std::string("+") + nm;
+            }
         bool n = GhPatchHostImport(h, "NtAllocateVirtualMemory",
                                    (void*)&Hook_UmdNtAlloc, (void**)&g_umdNtOrig);
+        if (n) got += "+NtAllocateVirtualMemory";
         ln += std::string(" [") + m.a + " base=" + Hex((uint64_t)(uintptr_t)h) +
-              " va=" + (a ? "1" : "0") + " vf=" + (f ? "1" : "0") + " nt=" + (n ? "1" : "0") + "]";
+              " va=" + (a ? "1" : "0") + " vf=" + (f ? "1" : "0") + " nt=" + (n ? "1" : "0") +
+              (got.empty() ? std::string(" NOTHING-PATCHED") : (" " + got)) + "]";
+        if (GhVaTraceMode() >= 2) GhDumpHostImports(h, m.a);
     }
     Diag(ln);
 }
@@ -7426,6 +16821,8 @@ static void GhUmdVaDump(int want)
 static void GhHookD12Device(ID3D12Device* dev)
 {
     GhInstallUmdVaTrace();
+    GhInstallCoreHeapTrace();   // #158 gh_va_trace>=3
+    GhInstallSecTrace();        // #158 gh_va_trace>=4
     GhUploadHeapRoundTrip(dev);
     GhBreadcrumbInit(dev);
     if (!dev || InterlockedCompareExchange(&g_d12vtHooked, 1, 0) != 0) return;
@@ -7444,6 +16841,7 @@ static void GhHookD12Device(ID3D12Device* dev)
     g_d12vtOrig[19] = vt[19]; vt[19] = (void*)&Hook_D12CreateUAV;
     g_d12vtOrig[20] = vt[20]; vt[20] = (void*)&Hook_D12CreateRTV;
     g_d12vtOrig[21] = vt[21]; vt[21] = (void*)&Hook_D12CreateDSV;
+    g_d12vtOrig[22] = vt[22]; vt[22] = (void*)&Hook_D12CreateSampler;
     g_d12vtOrig[23] = vt[23]; vt[23] = (void*)&Hook_D12CopyDesc;
     g_d12vtOrig[24] = vt[24]; vt[24] = (void*)&Hook_D12CopyDescSimple;
     g_d12vtOrig[27] = vt[27]; vt[27] = (void*)&Hook_D12CreateCommitted;
@@ -7460,6 +16858,9 @@ static void GhHookD12Device(ID3D12Device* dev)
     g_d12vtOrig[35] = vt[35]; vt[35] = (void*)&Hook_D12Evict;
     VirtualProtect(vt, sizeof(void*) * 50, old, &old);
     Diag("D3D12 vtable hooked GPS/CPS/CFS/RS/RTV/CCR/CH/CPR/OEHFA");
+    // #158: layer the profiler over the finished vtable, so a counted call chains
+    // into our hook where there is one and into the driver where there is not.
+    if (GhApiProfOn()) GhProfHookVtbl(dev, 44, &g_profDev, "dev");
     // #158: does this runtime support existing heaps at all? The guest never asks
     // -- it infers the path from UMA -- so ask on its behalf, once.
     {
@@ -7474,6 +16875,49 @@ static void GhHookD12Device(ID3D12Device* dev)
              " resourceheaptier=" + std::to_string((int)o.ResourceHeapTier) +
              " conservativeraster=" + std::to_string((int)o.ConservativeRasterizationTier) +
              " hr=" + Hex((uint32_t)ohr));
+        Diag("D3D12 OPTIONS2 typeduavload=" + std::to_string((int)o.TypedUAVLoadAdditionalFormats) +
+             " rovs=" + std::to_string((int)o.ROVsSupported) +
+             " minprec=" + Hex((uint32_t)o.MinPrecisionSupport) +
+             " crossnode=" + std::to_string((int)o.CrossNodeSharingTier) +
+             " stdswizzle=" + std::to_string((int)o.StandardSwizzle64KBSupported));
+        // #158 root signature version. Never asked before, and it decides whether the
+        // 1.1 static-descriptor promise is even in play: under 1.1 static descriptors are
+        // the DEFAULT, and out-of-bounds access to a BUFFER view through one is undefined
+        // -- possible device reset -- because the driver may promote it to a root
+        // descriptor, which has no bounds checking at all. HighestVersion is IN/OUT and
+        // clamps DOWN, the same trap D3D12_FEATURE_SHADER_MODEL set in #151, so log what
+        // was asked for as well as what came back.
+        {
+            D3D12_FEATURE_DATA_ROOT_SIGNATURE rs{};
+            rs.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
+            HRESULT rhr = dev->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &rs, sizeof rs);
+            Diag("D3D12 ROOTSIG asked=0x2 got=" + Hex((uint32_t)rs.HighestVersion) +
+                 " hr=" + Hex((uint32_t)rhr));
+        }
+        // #158 format landmine. The depth-downsample chain the GPU dies inside writes
+        // R11G11B10_FLOAT (26) targets created ALLOW_RENDER_TARGET|ALLOW_UNORDERED_ACCESS
+        // (flags=0x5 in every BIND line). Typed UAV load and store on anything but
+        // R32_FLOAT/R32_UINT/R32_SINT is OPTIONAL in D3D12, so a resource can be created
+        // with the UAV flag on a format whose typed UAV path the hardware does not have.
+        // The guest asks FORMAT_SUPPORT for only two formats all run, so ask on its behalf
+        // for every format the chain actually touches. Support1 bit 0x80000 is
+        // TYPED_UNORDERED_ACCESS_VIEW; Support2 0x40 is UAV_TYPED_LOAD, 0x80 UAV_TYPED_STORE.
+        {
+            static const UINT kFmts[] = { 26, 41, 28, 54, 10, 24, 12, 17, 42, 2 };
+            for (UINT fi = 0; fi < _countof(kFmts); ++fi){
+                D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{};
+                fs.Format = (DXGI_FORMAT)kFmts[fi];
+                HRESULT fhr = dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof fs);
+                Diag("D3D12 FMTCAP fmt=" + std::to_string((unsigned)kFmts[fi]) +
+                     " sup1=" + Hex((uint32_t)fs.Support1) +
+                     " sup2=" + Hex((uint32_t)fs.Support2) +
+                     " rt=" + std::to_string((int)((fs.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) != 0)) +
+                     " typeduav=" + std::to_string((int)((fs.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) != 0)) +
+                     " uavload=" + std::to_string((int)((fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0)) +
+                     " uavstore=" + std::to_string((int)((fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0)) +
+                     " hr=" + Hex((uint32_t)fhr));
+            }
+        }
         D3D12_FEATURE_DATA_ARCHITECTURE arch{};
         HRESULT ahr = dev->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &arch, sizeof arch);
         Diag("D3D12 ARCHITECTURE uma=" + std::to_string((int)arch.UMA) +
@@ -7554,6 +16998,7 @@ static HRESULT WINAPI Bed_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL
 
     if (dev && EnsureBridge() && g_gfx.d12 && fl <= g_gfx.d12Level){
         GhHookD12Device(g_gfx.d12.get());
+        GhQueueCeilingProbe(g_gfx.d12.get());
         HRESULT qi = g_gfx.d12->QueryInterface(riid, dev);
         Diag("BED D3D12CreateDevice fl=" + Hex((uint32_t)fl) + " adapter=" +
              (adapter ? "given" : "default") + " iid=" + Hex(riid.Data1) +
@@ -8001,6 +17446,63 @@ static int WINAPI Bed_MessageBoxA(HWND, const char* text, const char* cap, UINT 
          "] " + std::string(text ? text : ""));
     DiagGuestBacktrace("MessageBoxA");
     return 1;   // IDOK
+}
+
+// #165. Ghost of Tsushima will not start because it cannot verify a signature.
+// Its PlayStation PC SDK loader Authenticode-checks PsPcSdk.dll before loading
+// it, and in this app container that check can never succeed: WinVerifyTrust
+// looks its policy provider up in the registry and BOTH keys are absent --
+//   HKLM\SOFTWARE\Microsoft\Cryptography\Providers\Trust\Certificate\
+//                                      {00AAC56B-CD44-11D0-8CC2-00C04FC295EE}
+//   HKLM\SYSTEM\CurrentControlSet\Services\WinTrust\TrustProviders
+// (both logged as REG ... [miss] immediately before the message box). So the
+// call returns a provider error, the game puts up
+//   "The program can't start becuase PlayStation(R) PC SDK Runtime is missing"
+// and scePsPcInitialize returns 0x8a80010d.
+//
+// That failure is also the whole of the run's "silent death". After the box the
+// main thread never comes back to its pump; the loading threads finish what they
+// were given and wait on it; the process sits at 0% CPU with a healthy idle GPU
+// for ~17 s, and then the Xbox app model kills it. No exception, no exit call,
+// no device removal -- which is exactly why every in-process instrument saw
+// nothing.
+//
+// Call the real WinVerifyTrust FIRST and keep its answer when it has one. Two
+// reasons, not one: a container that can verify should verify, and the caller
+// walks the state handle afterwards (WTHelperProvDataFromStateData ->
+// GetProvSignerFromChain -> GetProvCertFromChain) to read the signer's
+// certificate -- a fabricated success with no state data would fail there
+// instead, one call later. Only a failed verification is turned into
+// ERROR_SUCCESS. This is not stepping around a decision anyone made about this
+// file: it is Sony's own signed DLL, staged by us, and there is no trust
+// provider in the container to ask.
+typedef LONG (WINAPI *PFN_WinVerifyTrust)(HWND, GUID*, LPVOID);
+static LONG WINAPI Bed_WinVerifyTrust(HWND hwnd, GUID* action, LPVOID data)
+{
+    static PFN_WinVerifyTrust real = [] {
+        HMODULE m = LoadLibraryW(L"wintrust.dll");
+        return m ? (PFN_WinVerifyTrust)GetProcAddress(m, "WinVerifyTrust") : nullptr;
+    }();
+    LONG rv = real ? real(hwnd, action, data) : (LONG)0x800B0001; // TRUST_E_PROVIDER_UNKNOWN
+    // WINTRUST_DATA is versioned by cbStruct; read the two fields that say what
+    // this call was for, and only when the struct is big enough to hold them.
+    unsigned uiChoice = 0, stateAction = 0; void* state = nullptr;
+    if (data){
+        const DWORD cb = *(const DWORD*)data;
+        if (cb >= 0x40){
+            uiChoice    = *(const DWORD*)((const char*)data + 24);
+            stateAction = *(const DWORD*)((const char*)data + 48);
+            state       = *(void* const*)((const char*)data + 56);
+        }
+    }
+    static volatile LONG n = 0;
+    if (InterlockedIncrement(&n) <= 16)
+        Diag("BED WinVerifyTrust action=" + Hex(action ? (uint32_t)action->Data1 : 0u) +
+             " uichoice=" + std::to_string(uiChoice) +
+             " stateaction=" + std::to_string(stateAction) +
+             " real=" + Hex((uint32_t)rv) + " state=" + Hex((uint64_t)(uintptr_t)state) +
+             (rv ? " -> forcing ERROR_SUCCESS" : ""));
+    return rv ? 0 : rv;
 }
 // Focus/visibility queries Unity cross-checks when deciding gAppActive. All
 // report the game window as the active, focused, visible, non-minimized one so
@@ -9230,6 +18732,26 @@ static unsigned GhCfgNum(const wchar_t* file, const char* envName, unsigned dflt
     return v ? (unsigned)v : dflt;
 }
 
+// See the declaration above: same reader, but a present zero stays zero.
+static unsigned GhCfgNumZ(const wchar_t* file, const char* envName, unsigned dflt)
+{
+    char buf[32] = {};
+    if (GetEnvironmentVariableA(envName, buf, sizeof buf) > 0 && buf[0])
+        return (unsigned)strtoul(buf, nullptr, 10);
+    std::wstring path = std::wstring(kLocalState) + file;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return dflt;
+    char raw[64] = {}; DWORD got = 0;
+    ReadFile(h, raw, sizeof raw - 1, &got, nullptr);
+    CloseHandle(h);
+    char ascii[64] = {}; size_t n = 0;
+    for (DWORD i = 0; i < got && n < sizeof ascii - 1; ++i)
+        if (raw[i] >= '0' && raw[i] <= '9') ascii[n++] = raw[i];
+    if (!n) return dflt;                       // file exists but holds no digits
+    return (unsigned)strtoul(ascii, nullptr, 10);
+}
+
 // 0 = report the truth. Otherwise the megabytes to report as installed/total.
 static unsigned GhSysMemMb()
 {
@@ -10357,6 +19879,76 @@ static BOOL WINAPI Bed_GetPhysicallyInstalledSystemMemory(PULONGLONG kb)
     return ok;
 }
 
+
+// ---------------------------------------------------------------------------
+// #169: DirectStorage owns the FIRST DXIL shader the driver ever sees.
+//
+// With the shader-model cap raised (gh_ddi_sm), runs 74 and 75 both die in the
+// same place and it is not a game shader: dstoragecore's GDeflate decompression
+// compute shader, CSkind=DXIL/6.5, taken straight to
+// CreateComputePipelineState -> 0x887A0005 and DXGI_ERROR_DRIVER_INTERNAL_ERROR.
+// It happens identically with and without the SC_DLL stage-gate patch, so it is
+// the driver's own DXIL path, and it happens before Tsushima compiles a single
+// shader of its own -- which makes it a stopper, not a finding.
+//
+// DirectStorage will decompress on the CPU instead, and DStorageSetConfiguration
+// is how you ask. It has to be called before the first factory exists, so the
+// only reliable place is in front of the guest's DStorageGetFactory.
+//
+//   gh_ds_nogpu = 1  disable GPU decompression AND its metacommand (CPU path)
+//                 2  disable only the metacommand, leave GPU decompression
+//                 3  leave the configuration alone and refuse DirectStorage's
+//                    DXIL compute PSO instead -- works whatever version of
+//                    DSTORAGE_CONFIGURATION this dstorage.dll actually reads
+// ---------------------------------------------------------------------------
+static unsigned GhDsNoGpu()
+{ static const unsigned v = GhCfgNum(L"gh_ds_nogpu.txt", "GH_DS_NOGPU", 0); return v; }
+
+// DSTORAGE_CONFIGURATION, with slack on the end: a newer dstorage.dll may read
+// more fields than this build knows about, and it must not read our stack.
+struct GhDStorageConfig {
+    UINT32 NumSubmitThreads;
+    INT32  NumBuiltInCpuDecompressionThreads;
+    BOOL   DisableBypassIO;
+    BOOL   DisableTelemetry;
+    BOOL   DisableGpuDecompressionMetacommand;
+    BOOL   DisableGpuDecompression;
+    UINT32 reserved[8];
+};
+
+static HRESULT WINAPI Bed_DStorageGetFactory(REFIID riid, void** ppv)
+{
+    static LONG once = 0;
+    const unsigned mode = GhDsNoGpu();
+    // Mode 3 does its work at the PSO instead; do not also disable the
+    // metacommand here, which would push DirectStorage TOWARDS the shader path.
+    if (mode && mode <= 2 && InterlockedCompareExchange(&once, 1, 0) == 0){
+        HMODULE h = GetModuleHandleW(L"dstorage.dll");
+        if (!h) h = LoadLibraryW(L"dstorage.dll");
+        FARPROC sp = h ? GetProcAddress(h, "DStorageSetConfiguration") : nullptr;
+        if (!sp && h) sp = GhSelfMapExport(h, "DStorageSetConfiguration");
+        if (sp){
+            GhDStorageConfig c{};
+            c.DisableGpuDecompressionMetacommand = TRUE;
+            c.DisableGpuDecompression = (mode == 1) ? TRUE : FALSE;
+            using SetCfg = HRESULT (WINAPI*)(const GhDStorageConfig*);
+            HRESULT hr = ((SetCfg)sp)(&c);
+            Diag("DSCFG mode=" + std::to_string(mode) +
+                 " nogpu=" + std::to_string((int)c.DisableGpuDecompression) +
+                 " nometacmd=1 -> hr=" + Hex((uint32_t)hr));
+        } else {
+            Diag("DSCFG DStorageSetConfiguration not resolvable -- GPU path stays on");
+        }
+    }
+    HMODULE h = GetModuleHandleW(L"dstorage.dll");
+    if (!h) h = LoadLibraryW(L"dstorage.dll");
+    FARPROC gp = h ? GetProcAddress(h, "DStorageGetFactory") : nullptr;
+    if (!gp && h) gp = GhSelfMapExport(h, "DStorageGetFactory");
+    if (!gp){ Diag("DSCFG no real DStorageGetFactory"); return E_NOINTERFACE; }
+    using GetFac = HRESULT (WINAPI*)(REFIID, void**);
+    return ((GetFac)gp)(riid, ppv);
+}
+
 static const std::unordered_map<std::string, void*>& ShimTable()
 {
     static const std::unordered_map<std::string, void*> t = {
@@ -10391,6 +19983,7 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"D3D11CreateDevice",             (void*)&Bed_D3D11CreateDevice},
         {"D3D11CreateDeviceAndSwapChain", (void*)&Bed_D3D11CreateDeviceAndSwapChain},
         {"D3D12CreateDevice",             (void*)&Bed_D3D12CreateDevice},
+        {"DStorageGetFactory",            (void*)&Bed_DStorageGetFactory},
         {"CreateDXGIFactory",             (void*)&Bed_CreateDXGIFactory},
         {"CreateDXGIFactory1",            (void*)&Bed_CreateDXGIFactory1},
         {"CreateDXGIFactory2",            (void*)&Bed_CreateDXGIFactory2},
@@ -10436,6 +20029,7 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"SetWindowPos",       (void*)&Bed_SetWindowPos},
         {"MessageBoxW",        (void*)&Bed_MessageBoxW},
         {"MessageBoxA",        (void*)&Bed_MessageBoxA},
+        {"WinVerifyTrust",     (void*)&Bed_WinVerifyTrust},
         {"crs_start_handler",  (void*)&Bed_crs_start_handler},
         // #141 memory accounting -- see the beds above.
         {"VirtualAlloc",       (void*)&Bed_VirtualAlloc},
@@ -10516,6 +20110,7 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"SetCursorPos",       (void*)&Bed_SetCursorPos},
         {"ShowCursor",         (void*)&Bed_ShowCursor},
         {"ClipCursor",         (void*)&Bed_ClipCursor},
+        {"GetFileType",        (void*)&Hook_GetFileType},
         {"LoadLibraryA",               (void*)&Bed_LoadLibraryA},
         {"LoadLibraryW",               (void*)&Bed_LoadLibraryW},
         {"LoadLibraryExW",             (void*)&Bed_LoadLibraryExW},
@@ -10541,10 +20136,35 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"SetFileAttributesW",         (void*)&Bed_SetFileAttributesW},
         {"CreateHardLinkW",            (void*)&Bed_CreateHardLinkW},
         {"FindFirstFileW",             (void*)&Bed_FindFirstFileW},
+        {"FindFirstFileExW",           (void*)&Bed_FindFirstFileExW},
+        {"FindFirstFileA",             (void*)&Bed_FindFirstFileA},
+        {"FindFirstFileExA",           (void*)&Bed_FindFirstFileExA},
         {"GetCurrentDirectoryW",       (void*)&Bed_GetCurrentDirectoryW},
         {"SetCurrentDirectoryW",       (void*)&Bed_SetCurrentDirectoryW},
         {"GetTempPathW",               (void*)&Bed_GetTempPathW},
         {"GetFullPathNameW",           (void*)&Bed_GetFullPathNameW},
+        // #164: the known-folder family has to be reachable from the guest EXE's
+        // own IAT, not only from PatchModuleForGuest -- exactly the #155 mistake,
+        // repeated. The beds existed and were correct; nothing that mattered ever
+        // reached them, because a game asks for its folders from the exe.
+        //
+        // Ghost of Tsushima is the case that made it visible. Its statically
+        // linked PlayStation PC SDK stub builds
+        //   <ProgramData>\Sony Interactive Entertainment Inc\PSPC_SDK\S22
+        // via SHELL32!SHGetKnownFolderPath(FOLDERID_ProgramData) at GUEST+0xd25d80,
+        // through the exe's own IAT slot 0x1410eab28. That went to the container's
+        // real shell32, which answers nothing for ProgramData, so the builder
+        // returned 0x8a800004, the runtime search never started, and the game put
+        // up "PlayStation(R) PC SDK Runtime is missing" and exited with
+        // scePsPcInitialize failed: 8a80010d -- a failure two API layers away from
+        // its cause. A tracepoint proved the builder ran while the diag showed no
+        // SHGetKnownFolderPath call at all: the tell that a bed is unreachable.
+        //
+        // The exe imports exactly these three, and the same gap is why its save
+        // path (SHGetFolderPathW + SHCreateDirectoryExW) fails too.
+        {"SHGetKnownFolderPath",       (void*)&Bed_SHGetKnownFolderPath},
+        {"SHGetFolderPathW",           (void*)&Bed_SHGetFolderPathW},
+        {"SHCreateDirectoryExW",       (void*)&Bed_SHCreateDirectoryExW},
         // Registry + security
         {"RegOpenKeyExW",              (void*)&Bed_RegOpenKeyExW},
         {"RegOpenKeyExA",              (void*)&Bed_RegOpenKeyExA},
@@ -10644,6 +20264,8 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"MoveFileExW", (void*)&Bed_MoveFileExW}, {"ReplaceFileW", (void*)&Bed_ReplaceFileW},
         {"CreateDirectoryW", (void*)&Bed_CreateDirectoryW}, {"RemoveDirectoryW", (void*)&Bed_RemoveDirectoryW},
         {"FindFirstFileW", (void*)&Bed_FindFirstFileW}, {"GetFullPathNameW", (void*)&Bed_GetFullPathNameW},
+        {"FindFirstFileExW", (void*)&Bed_FindFirstFileExW},
+        {"FindFirstFileA", (void*)&Bed_FindFirstFileA}, {"FindFirstFileExA", (void*)&Bed_FindFirstFileExA},
         {"GetStdHandle", (void*)&Bed_GetStdHandle}, {"WriteFile", (void*)&Bed_WriteFile},
         {"GetProcAddress", (void*)&Bed_GetProcAddress},
         {"LoadLibraryA", (void*)&Bed_LoadLibraryA},
@@ -10717,6 +20339,7 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"SetWindowPos",       (void*)&Bed_SetWindowPos},
         {"MessageBoxW",        (void*)&Bed_MessageBoxW},
         {"MessageBoxA",        (void*)&Bed_MessageBoxA},
+        {"WinVerifyTrust",     (void*)&Bed_WinVerifyTrust},
         {"crs_start_handler",  (void*)&Bed_crs_start_handler},
         // #141 memory accounting -- see the beds above.
         {"VirtualAlloc",       (void*)&Bed_VirtualAlloc},
@@ -10762,6 +20385,7 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"D3D11CreateDevice",             (void*)&Bed_D3D11CreateDevice},
         {"D3D11CreateDeviceAndSwapChain", (void*)&Bed_D3D11CreateDeviceAndSwapChain},
         {"D3D12CreateDevice",             (void*)&Bed_D3D12CreateDevice},
+        {"DStorageGetFactory",            (void*)&Bed_DStorageGetFactory},
         {"CreateDXGIFactory",             (void*)&Bed_CreateDXGIFactory},
         {"CreateDXGIFactory1",            (void*)&Bed_CreateDXGIFactory1},
         {"CreateDXGIFactory2",            (void*)&Bed_CreateDXGIFactory2},
@@ -11014,8 +20638,16 @@ static HMODULE LoadGuestDll(const char* dll)
     }
     // LOAD_WITH_ALTERED_SEARCH_PATH so the DLL's OWN dependencies resolve from
     // its own directory (mono's EmbedRuntime\ has MonoPosixHelper.dll etc.).
+    // #165: time every attempt. Tsushima's PsPcSdk.dll takes SEVENTEEN SECONDS
+    // to load and freezes the whole app while it does -- the Windows loader lock
+    // is held across the whole thing, so no other thread can load a DLL, start,
+    // or in our case draw a frame, and the shell suspends and kills us. Which of
+    // the four attempts below spends the time is the question; a millisecond
+    // count on each line answers it without another instrument.
+    const ULONGLONG tLoad0 = GetTickCount64();
     HMODULE m = LoadLibraryExW(full.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     DWORD e1 = m ? 0 : GetLastError();
+    const ULONGLONG tAlt = GetTickCount64() - tLoad0;
     // The bare-name fallback below is a LAST resort, and it overwrites the error
     // from the attempt that actually mattered -- which is how bink2w64.dll spent
     // two rounds looking like ERROR_MOD_NOT_FOUND when that was just the
@@ -11032,7 +20664,9 @@ static HMODULE LoadGuestDll(const char* dll)
         Diag("  GUESTDLL attempts " + std::string(full.begin(), full.end()) +
              " attrs=" + Hex((uint32_t)attrs) +
              " altered=" + Hex((uint32_t)e1) + " searchdirs=" + Hex((uint32_t)e2) +
-             " plain=" + Hex((uint32_t)e3) + (m ? " -> RECOVERED" : ""));
+             " plain=" + Hex((uint32_t)e3) + (m ? " -> RECOVERED" : "") +
+             " altered_ms=" + std::to_string((unsigned long long)tAlt) +
+             " total_ms=" + std::to_string((unsigned long long)(GetTickCount64() - tLoad0)));
     }
     if (!m && !isAbs) m = LoadLibraryA(dll);   // last resort: normal search by bare name
     // #146: the loader found the file and bound every import, then the DLL's own
@@ -11041,13 +20675,18 @@ static HMODULE LoadGuestDll(const char* dll)
     if (!m && GetFileAttributesW(full.c_str()) != INVALID_FILE_ATTRIBUTES &&
         GhCfgNum(L"gh_selfmap.txt", "GH_SELFMAP", 1)){
         if (HMODULE sm = GhSelfMapDll(full, dll)){
-            Diag(std::string("GUESTDLL self-mapped ") + dll + " -> " + Hex((uintptr_t)sm));
+            Diag(std::string("GUESTDLL self-mapped ") + dll + " -> " + Hex((uintptr_t)sm) +
+                 " ms=" + std::to_string((unsigned long long)(GetTickCount64() - tLoad0)));
             RepublishGuestTls(dll);
             return sm;
         }
     }
-    Diag(std::string(m ? "GUESTDLL loaded " : "GUESTDLL FAILED ") + dll +
-         (m ? "" : " err=" + Hex(GetLastError())));
+    {
+        const ULONGLONG dt = GetTickCount64() - tLoad0;
+        Diag(std::string(m ? "GUESTDLL loaded " : "GUESTDLL FAILED ") + dll +
+             (m ? "" : " err=" + Hex(GetLastError())) +
+             " ms=" + std::to_string((unsigned long long)dt));
+    }
     // A loaded module may have brought its own TLS directory with it, in which
     // case ntdll just replaced our array. Put our slot back before the guest
     // touches a thread-local again.
@@ -11057,6 +20696,43 @@ static HMODULE LoadGuestDll(const char* dll)
     return m;
 }
 
+// #162. Windows pins a statically-imported DLL for the life of the process: the
+// reference lives in the loader's module dependency graph and a FreeLibrary can
+// never drop it. We bind static imports by LoadLibrary and hold exactly ONE
+// reference, and FreeLibrary is not bedded -- so one guest call unmaps the image
+// and every IAT thunk into it points at freed memory. Ghost of Tsushima does
+// precisely this: it probes libxess.dll and amd_fidelityfx_dx12.dll, unloads the
+// upscaler backends it will not use (the teardown module list drops 9 -> 7), and
+// then calls amd_fidelityfx_dx12.dll!ffxQuery through the exe's own static IAT,
+// taking an execute AV in MEM_FREE memory. Probe-then-unload is how every modern
+// upscaler backend behaves, so this is general, not one title's quirk.
+//
+// Only ever call this where we are binding a STATIC import. A guest's own
+// LoadLibrary must stay unpinned -- there the guest owns the lifetime and a game
+// that unloads and reloads a module is entitled to expect that to work.
+// GET_MODULE_HANDLE_EX_FLAG_PIN takes a reference FreeLibrary cannot release; it
+// is not a handle we have to give back. A self-mapped module (#146) is not a
+// real loader module, so this fails for it -- harmlessly, since ntdll cannot
+// unmap one either.
+static void PinGuestModule(HMODULE m, const char* dll)
+{
+    if (!m) return;
+    static SRWLOCK lk = SRWLOCK_INIT;
+    static std::vector<HMODULE> pinned;          // one line per module, not per import
+    AcquireSRWLockExclusive(&lk);
+    bool first = true;
+    for (HMODULE h : pinned) if (h == m){ first = false; break; }
+    if (first) pinned.push_back(m);
+    ReleaseSRWLockExclusive(&lk);
+    if (!first) return;
+    HMODULE keep = nullptr;
+    const BOOL ok = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN |
+                                       GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                                       (LPCWSTR)m, &keep);
+    Diag(std::string("GUESTDLL pinned ") + dll + " " + Hex((uintptr_t)m) +
+         (ok ? "" : " FAILED err=" + Hex(GetLastError())));
+}
+
 static void* ResolveImport(const char* dll, const char* fn)
 {
     auto& tbl = ShimTable();
@@ -11064,6 +20740,7 @@ static void* ResolveImport(const char* dll, const char* fn)
     if (it != tbl.end()) return it->second;
     HMODULE m = LoadGuestDll(dll);
     if (!m) return nullptr;
+    PinGuestModule(m, dll);
     return (void*)GetProcAddress(m, fn);
 }
 
@@ -11328,6 +21005,26 @@ static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
     return r;                              // thread is leaving anyway.
 }
 
+// Copy an OutputDebugString payload out of a pointer the driver owns. Its own
+// function because MSVC rejects __try in any function that also needs C++ object
+// unwinding (C2712), and the VEH body is full of std::string.
+static bool GhCopyDbgStr(const void* ptr, size_t len, bool wide, char* out, size_t cap)
+{
+    if (!ptr || !len || !out || !cap) return false;
+    __try {
+        if (!wide){
+            size_t n = len < cap - 1 ? len : cap - 1;
+            memcpy(out, ptr, n); out[n] = 0;
+        } else {
+            const wchar_t* w = (const wchar_t*)ptr;
+            size_t n = 0;
+            while (n < cap - 1 && n < len && w[n]) { out[n] = (char)(w[n] & 0x7F); ++n; }
+            out[n] = 0;
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
 {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
@@ -11376,11 +21073,289 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
         DiagDelayLoadFailure(code, (const void*)ep->ExceptionRecord->ExceptionInformation[0]);
         return EXCEPTION_CONTINUE_SEARCH;
     }
+    // #163. The filter below is right for repair, but it made a whole class of
+    // failure invisible: Tsushima's main thread parks forever inside dstorage.dll
+    // on a stack whose tail is RtlDispatchException, and no VEH line was ever
+    // printed because the raise was not an access violation. Say what these are
+    // -- deduped by (code, address) and hard-capped, because C++ EH is ordinary
+    // traffic in a game and a flood would bury the one that matters. Log only;
+    // the search continues exactly as before.
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+        code != EXCEPTION_PRIV_INSTRUCTION && code != EXCEPTION_IN_PAGE_ERROR &&
+        code != 0xC0000409 && code != EXCEPTION_BREAKPOINT &&
+        code != (DWORD)EXCEPTION_SINGLE_STEP) {
+        // ---------------------------------------------------------------------
+        // The driver has been telling us why, and we were throwing it away.
+        //
+        // 0x40010006 DBG_PRINTEXCEPTION_C is not a fault -- it is
+        // OutputDebugStringA. Run 86 caught umd12ddi.dll raising one with a
+        // 316-character message (`p0=0x13C`) from inside CreateComputePipelineState,
+        // immediately before the shader compile failed and removed the device.
+        // ExceptionInformation[0] is the length including the NUL and [1] is the
+        // ANSI string; we logged only the length.
+        //
+        // These must NOT go through the (code, at) dedup below: every message the
+        // UMD prints comes from the same RaiseException site, so deduping keeps
+        // the first one and silently drops the rest. Cap the count instead, and
+        // print the text.
+        if (code == 0x40010006 || code == 0x4001000A){
+            static LONG nDbgStr = 0;
+            if (InterlockedIncrement(&nDbgStr) <= 256 &&
+                ep->ExceptionRecord->NumberParameters >= 2){
+                const size_t len = (size_t)ep->ExceptionRecord->ExceptionInformation[0];
+                const void*  ptr = (const void*)ep->ExceptionRecord->ExceptionInformation[1];
+                char buf[4096];
+                std::string txt = GhCopyDbgStr(ptr, len, code == 0x4001000A,
+                                               buf, sizeof(buf))
+                                  ? std::string(buf) : std::string("<unreadable>");
+                while (!txt.empty() && (txt.back() == '\0' || txt.back() == '\n' ||
+                                        txt.back() == '\r')) txt.pop_back();
+                for (auto& c : txt) if (c == '\n' || c == '\r') c = ' ';
+                // Name the caller: the message is only useful if we know which
+                // module printed it. Frame 2 is past RaiseException's own frames.
+                void* bt[8] = {};
+                const USHORT n2 = RtlCaptureStackBackTrace(0, 8, bt, nullptr);
+                std::string who;
+                for (USHORT k = 0; k < n2; ++k){
+                    const std::string nm = NameForCodeAddr((uintptr_t)bt[k]);
+                    if (nm.find("ntdll") == std::string::npos &&
+                        nm.find("KERNELBASE") == std::string::npos &&
+                        nm.find("p0_spike_host") == std::string::npos){ who = nm; break; }
+                }
+                Diag("DBGSTR " + (who.empty() ? std::string("?") : who) + ": " + txt);
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        static SRWLOCK lk = SRWLOCK_INIT;
+        static struct { DWORD code; uintptr_t at; } seen[24] = {};
+        static int nSeen = 0;
+        const uintptr_t at = (uintptr_t)ep->ExceptionRecord->ExceptionAddress;
+        bool fresh = false;
+        AcquireSRWLockExclusive(&lk);
+        int i = 0;
+        for (; i < nSeen; ++i) if (seen[i].code == code && seen[i].at == at) break;
+        if (i == nSeen && nSeen < (int)(sizeof(seen)/sizeof(seen[0]))) {
+            seen[nSeen].code = code; seen[nSeen].at = at; ++nSeen; fresh = true;
+        }
+        ReleaseSRWLockExclusive(&lk);
+        if (fresh){
+            // The address alone said "KERNELBASE" and nothing more. The stack is
+            // what identifies the caller and the call, so print it here rather
+            // than making the next run guess.
+            void* bt[24] = {};
+            const USHORT nbt = RtlCaptureStackBackTrace(0, 24, bt, nullptr);
+            for (USHORT k = 0; k < nbt; ++k)
+                Diag("  raise#" + std::to_string(k) + " " +
+                     NameForCodeAddr((uintptr_t)bt[k]) + GhNearestExport((uintptr_t)bt[k]));
+        }
+        if (fresh)
+            Diag("VEH raise code=" + Hex(code) + " at=" + NameForCodeAddr(at) +
+                 " tid=" + std::to_string(GetCurrentThreadId()) +
+                 " flags=" + Hex((uint32_t)ep->ExceptionRecord->ExceptionFlags) +
+                 " nparm=" + std::to_string(ep->ExceptionRecord->NumberParameters) +
+                 " p0=" + Hex((uint64_t)(ep->ExceptionRecord->NumberParameters > 0
+                                         ? ep->ExceptionRecord->ExceptionInformation[0] : 0)));
+    }
+    // #163. STRICT HANDLE CHECKS, and the one-line fix for the whole class.
+    //
+    // #163. THE STRICT-HANDLE-CHECK FIX. A UWP app container runs with strict
+    // handle checks always on. When a syscall is handed a handle that is not in
+    // the process handle table, the kernel does not simply fail it: it redirects
+    // the user-mode return to ntdll!KiRaiseUserExceptionDispatcher, which raises
+    // STATUS_INVALID_HANDLE. On a desktop that raise does not exist -- the status
+    // just flows back and the Win32 wrapper turns it into a failure return.
+    //
+    // Ghost of Tsushima died on exactly this. dstorage.dll calls GetFileType on a
+    // stale handle from inside its own DllMain; nothing in a third-party DLL
+    // expects a raise there, so no handler existed anywhere up the stack, and the
+    // thread parked forever in the unhandled-exception path with the guest's main
+    // thread behind it until the OS killed the app:
+    //
+    //   LoadLibraryExW -> LdrLoadDll -> DllMain(dstorage.dll)
+    //     dstorage+0x166AF .. +0xD73D -> KERNELBASE!GetFileType+0x79
+    //       KiRaiseUserExceptionDispatcher -> RtlRaiseException 0xC0000008
+    //
+    // Continuing is not a fudge, it is the desktop contract. KiRaiseUserException-
+    // Dispatcher was entered on a stack the kernel arranged so that its own RET
+    // lands back at the API's return address with the NTSTATUS in EAX. Resuming
+    // where RtlRaiseException was called from therefore does exactly what a
+    // desktop machine does: GetFileType sees a failed status, returns
+    // FILE_TYPE_UNKNOWN, and sets ERROR_INVALID_HANDLE.
+    //
+    // Deliberately narrow. Only this status, only when the record carries no
+    // parameters (the dispatcher's signature -- a genuine in-process raise of the
+    // same code would carry its own), and only while the exception is continuable.
+    // We never invent a handle or hide a real fault; the caller still fails.
+    if (code == (DWORD)0xC0000008 /*STATUS_INVALID_HANDLE*/ &&
+        ep->ExceptionRecord->NumberParameters == 0 &&
+        !(ep->ExceptionRecord->ExceptionFlags & EXCEPTION_NONCONTINUABLE)) {
+        static LONG n = 0;
+        const LONG k = InterlockedIncrement(&n);
+        if (k <= 8)
+            Diag("STRICTHANDLE #" + std::to_string(k) + " STATUS_INVALID_HANDLE raised at " +
+                 NameForCodeAddr((uintptr_t)ep->ExceptionRecord->ExceptionAddress) +
+                 GhNearestExport((uintptr_t)ep->ExceptionRecord->ExceptionAddress) +
+                 " tid=" + std::to_string(GetCurrentThreadId()) +
+                 " -- continuing, as a desktop process would");
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     // Only care about genuine faults, not C++/debug/scripting exceptions.
     if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
         code != EXCEPTION_PRIV_INSTRUCTION && code != EXCEPTION_IN_PAGE_ERROR &&
         code != 0xC0000409 /*STACK_BUFFER_OVERRUN/fastfail*/)
         return EXCEPTION_CONTINUE_SEARCH;
+
+    // -----------------------------------------------------------------------
+    // #160. A thread we did not create can still run guest code: an engine
+    // thread dispatching a callback the game registered, a driver worker calling
+    // back, a pool thread. None of those passed through Bed_CreateThread, so
+    // ntdll's TLS array for them has nothing at kGuestTlsIndex and the guest's
+    // `mov rbx,[rax+_tls_index*8]` yields NULL. The next access faults on the
+    // bare TLS OFFSET -- a tiny absolute address. Ghost of Tsushima died reading
+    // [0x160] on a thread whose id is LOWER than the guest's main thread, i.e.
+    // one that existed before the guest did and could never have been shimmed.
+    //
+    // Repair it here rather than trying to intercept every way a thread can be
+    // born: give this thread its block, publish it, and then put the block
+    // pointer into the register the faulting instruction was about to use, so the
+    // SAME instruction re-executes and succeeds.
+    //
+    // The first version of this rewound RIP to the `mov r64, gs:[0x58]` that opens
+    // the sequence and let the whole lookup re-run. That is WRONG, and Ghost of
+    // Tsushima proved it: MSVC interleaves the TLS load with unrelated register
+    // shuffling, so re-running the sequence re-runs those too.
+    //
+    //     1404c0feb: mov  %rdx,%rbx          <- caller's 2nd argument, saved
+    //     1404c0ff7: mov  $0x15c,%edx        <- rdx CLOBBERED with the TLS offset
+    //     1404c0fff: mov  (%rax,%rcx,8),%rcx
+    //     1404c1003: mov  (%rdx,%rcx,1),%eax <- faults, block is null
+    //
+    // Rewinding to 0x1404c0fe2 re-executes `mov %rdx,%rbx` with rdx already
+    // holding 0x15c, so the caller's argument becomes the constant 0x15c and the
+    // function later faults comparing a string at address 0x15c. A rewind is only
+    // safe if the intervening instructions are idempotent, and nothing tells us
+    // that they are. Patching the one register is idempotent by construction.
+    //
+    // Finding the register needs a small amount of decoding, but only enough to
+    // reach the ModRM/SIB: the effective address is base + index*scale + disp, and
+    // the block is whichever of base/index is currently zero (the others sum to
+    // the offset, which is why the fault address equals the offset). Decode
+    // prefixes -> REX -> opcode -> ModRM -> SIB, take the register numbers, and
+    // require EXACTLY ONE of them to be zero. If that is not clear-cut we say so
+    // and let the fault stand -- a wrong CONTINUE_EXECUTION turns a wild pointer
+    // into an endless fault loop, and a loud crash beats a silent corruption.
+    //
+    // Deliberately narrow for the same reason: data faults only, the target must
+    // lie inside the guest's own TLS block size, RIP must be inside the guest
+    // image, the array must genuinely be missing our slot, and each thread gets a
+    // small fixed number of repairs before we stop trying.
+    // #126: with a real OS index this repair is not just unnecessary, it is
+    // WRONG -- `missing` tests kGuestTlsIndex, which nobody publishes any more,
+    // so it would fire on every unrelated AV and re-install the very fake array
+    // the donor DLL exists to replace. Off entirely when ntdll owns the slot.
+    if (code == EXCEPTION_ACCESS_VIOLATION && g_tlsActive && !g_tlsReal && g_tlsTotalSize &&
+        g_guestImageBase && ep->ExceptionRecord->NumberParameters >= 2 &&
+        ep->ExceptionRecord->ExceptionInformation[0] != 8 /*not a DEP fault*/) {
+        static thread_local int t_tlsRepairs = 0;
+        const uintptr_t tgt = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+        const uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+        const uintptr_t lo  = (uintptr_t)g_guestImageBase;
+        const uintptr_t hi  = lo + g_guestImageSize;
+        void** teb  = (void**)NtCurrentTeb();
+        void** cur  = (void**)teb[0x58 / sizeof(void*)];
+        const bool missing = !(cur && ReadableEntries(cur, kGuestTlsIndex + 1) > kGuestTlsIndex &&
+                               cur[kGuestTlsIndex]);
+        // #163. `tgt < g_tlsTotalSize` was too narrow. When the TLS slot holds a
+        // NULL the effective address is a small offset and the gate matches, but
+        // when it holds garbage the address is arbitrary -- Tsushima's thread pool
+        // faults at GUEST+0x810A85 (`cmpb $0,(%rax,%rbx,1)`, rbx straight out of
+        // gs:0x58[index]) with the address reported as -1, so the repair never
+        // fired and the AV went unhandled: faultrep.dll took the thread, the main
+        // thread waited on it forever, and the OS killed the app. Accept -1 too;
+        // every other condition (guest RIP, our slot genuinely missing, per-thread
+        // budget) still has to hold, and the register decode below is what decides
+        // whether there is anything safe to patch.
+        const bool tlsShapedAddr = tgt < g_tlsTotalSize || tgt == (uintptr_t)-1;
+        if (tlsShapedAddr && rip >= lo && rip < hi && missing && t_tlsRepairs < 8) {
+            ++t_tlsRepairs;
+            const bool installed = t_guestTlsBlock ? (RepublishGuestTls("veh tls repair"), true)
+                                                   : InstallGuestTlsForThread();
+            void** now = (void**)teb[0x58 / sizeof(void*)];
+            void* block = (now && ReadableEntries(now, kGuestTlsIndex + 1) > kGuestTlsIndex)
+                          ? now[kGuestTlsIndex] : nullptr;
+
+            // --- decode just far enough to name the base/index registers ---
+            int baseReg = -1, idxReg = -1;
+            {
+                const uint8_t* q = (const uint8_t*)rip;
+                const uint8_t* end = q + 15;                 // no x86 insn is longer
+                uint8_t rex = 0;
+                for (; q < end; ++q){                        // legacy prefixes
+                    const uint8_t b = *q;
+                    if (b == 0x66 || b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3 ||
+                        b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 ||
+                        b == 0x64 || b == 0x65) continue;
+                    break;
+                }
+                if (q < end && (*q & 0xF0) == 0x40){ rex = *q; ++q; }
+                if (q < end && *q == 0x0F){                  // 2- and 3-byte opcodes
+                    ++q;
+                    if (q < end && (*q == 0x38 || *q == 0x3A)) ++q;
+                }
+                if (q < end){
+                    ++q;                                     // step over the opcode byte
+                    if (q < end){
+                        const uint8_t modrm = *q++;
+                        const int mod = modrm >> 6, rm = modrm & 7;
+                        if (mod != 3){                       // must be a memory operand
+                            if (rm == 4 && q < end){         // SIB
+                                const uint8_t sib = *q++;
+                                const int b = sib & 7, x = (sib >> 3) & 7;
+                                if (!(b == 5 && mod == 0)) baseReg = b | ((rex & 1) ? 8 : 0);
+                                if (!(x == 4 && !(rex & 2)))  idxReg = x | ((rex & 2) ? 8 : 0);
+                            } else if (!(rm == 5 && mod == 0)){   // rm==5,mod==0 is RIP-rel
+                                baseReg = rm | ((rex & 1) ? 8 : 0);
+                            }
+                        }
+                    }
+                }
+            }
+            DWORD64* const gpr[16] = {
+                &ep->ContextRecord->Rax, &ep->ContextRecord->Rcx, &ep->ContextRecord->Rdx,
+                &ep->ContextRecord->Rbx, &ep->ContextRecord->Rsp, &ep->ContextRecord->Rbp,
+                &ep->ContextRecord->Rsi, &ep->ContextRecord->Rdi, &ep->ContextRecord->R8,
+                &ep->ContextRecord->R9,  &ep->ContextRecord->R10, &ep->ContextRecord->R11,
+                &ep->ContextRecord->R12, &ep->ContextRecord->R13, &ep->ContextRecord->R14,
+                &ep->ContextRecord->R15 };
+            // A register holding a TLS block that was never published is either
+            // NULL or a kernel-space-looking value; a register holding a real
+            // struct offset (rax=0x160 at the Tsushima site) is neither. Patch the
+            // one that cannot be a valid user pointer, and only when exactly one of
+            // the two qualifies -- an ambiguous pair means we do not know enough.
+            auto notAPointer = [](DWORD64 v){
+                return v == 0 || v >= 0xFFFF800000000000ull;
+            };
+            int patch = -1;
+            const bool baseBad = baseReg >= 0 && notAPointer(*gpr[baseReg]);
+            const bool idxBad  = idxReg  >= 0 && notAPointer(*gpr[idxReg]);
+            if (baseBad != idxBad) patch = baseBad ? baseReg : idxReg;
+
+            Diag("TLS REPAIR tid=" + std::to_string(GetCurrentThreadId()) +
+                 " at=" + NameForCodeAddr(rip) + " offset=" + Hex((uint32_t)tgt) +
+                 " base=" + std::to_string(baseReg) +
+                 "(" + (baseReg >= 0 ? Hex((uintptr_t)*gpr[baseReg]) : std::string("-")) + ")"
+                 " index=" + std::to_string(idxReg) +
+                 "(" + (idxReg >= 0 ? Hex((uintptr_t)*gpr[idxReg]) : std::string("-")) + ")" +
+                 " patch=" + std::to_string(patch) +
+                 " installed=" + std::to_string(installed ? 1 : 0) +
+                 " block=" + Hex((uintptr_t)block) +
+                 " n=" + std::to_string(t_tlsRepairs));
+            if (block && patch >= 0) {
+                *gpr[patch] = (DWORD64)(uintptr_t)block;
+                return EXCEPTION_CONTINUE_EXECUTION;   // same RIP: idempotent
+            }
+        }
+    }
     // #140. The console's display UMD faults writing a page inside its own heap
     // that is RESERVED and never COMMITTED -- something failed a commit and the
     // driver never checked. Commit it here and let the write retry. Either answer
@@ -11403,6 +21378,14 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
         // gh_no_repair.txt=1 disables both repairs, which turns the paper-over
         // into an honest crash dump with registers and a backtrace.
         static const bool noRepair = GhCfgNum(L"gh_no_repair.txt", "GH_NO_REPAIR", 0) != 0;
+        // #158. How much to hand the driver per repair. The CPU only faults on the
+        // byte it writes, so committing a page at a time keeps the CPU happy while
+        // leaving the rest of the driver's buffer uncommitted -- and the GPU has no
+        // fault handler. If the driver has promised the GPU a range longer than what
+        // the CPU has touched, the GPU reads unbacked pages and stops dead, which is
+        // exactly the shape of this hang. 0 = the old behaviour (16 MB commit cap,
+        // 1 MB map).
+        static const unsigned repairMb = GhCfgNum(L"gh_repair_mb.txt", "GH_REPAIR_MB", 0);
         const uintptr_t faultRip = (uintptr_t)ep->ExceptionRecord->ExceptionAddress;
         auto neighbours = [&](uintptr_t base) {
             std::string out;
@@ -11461,7 +21444,8 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
             walkAlloc(tgt);
             GhUmdVaDump(10);
             LONG n = InterlockedIncrement(&g_commitRepairs);
-            SIZE_T want = mbi.RegionSize > (16u << 20) ? (SIZE_T)(16u << 20) : mbi.RegionSize;
+            const SIZE_T cap = repairMb ? (SIZE_T)repairMb << 20 : (SIZE_T)(16u << 20);
+            SIZE_T want = mbi.RegionSize > cap ? cap : mbi.RegionSize;
             void* got = (n <= 256 && !noRepair)
                       ? VirtualAlloc(mbi.BaseAddress, want, MEM_COMMIT, PAGE_READWRITE)
                       : nullptr;
@@ -11488,7 +21472,8 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
         else if (mbi.State == MEM_FREE && tgt >= 0x10000){   // never map the null page
             LONG n = InterlockedIncrement(&g_commitRepairs);
             uintptr_t base = tgt & ~(uintptr_t)0xFFFF;      // allocation granularity
-            SIZE_T want = mbi.RegionSize < (SIZE_T)(1u << 20) ? mbi.RegionSize : (SIZE_T)(1u << 20);
+            const SIZE_T mcap = repairMb ? (SIZE_T)repairMb << 20 : (SIZE_T)(1u << 20);
+            SIZE_T want = mbi.RegionSize < mcap ? mbi.RegionSize : mcap;
             const std::string nb = neighbours(base);
             if (base >= 0x10000) walkAlloc(base - 0x1000);
             GhUmdVaDump(10);
@@ -11497,6 +21482,7 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
                                    : nullptr;
             Diag("MAP REPAIR #" + std::to_string((int)n) + " at=" + Hex((uint64_t)tgt) +
                  " base=" + Hex((uint64_t)base) + " bytes=" + Hex((uint64_t)want) +
+                 " freeregion=" + Hex((uint64_t)mbi.RegionSize) +
                  " rip=" + Hex((uint64_t)faultRip) + " " + NameForCodeAddr(faultRip) +
                  " tid=" + std::to_string((unsigned long)GetCurrentThreadId()) + nb +
                  (got ? std::string(" ok") : " FAILED err=" + Hex(GetLastError())));
@@ -11516,7 +21502,11 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
             if (got) return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
-    if (InterlockedIncrement(&g_vehLogged) > 4) return EXCEPTION_CONTINUE_SEARCH;
+    {
+        static const long vehMax =
+            (long)GhCfgNum(L"gh_veh_max.txt", "GH_VEH_MAX", 4);
+        if (InterlockedIncrement(&g_vehLogged) > vehMax) return EXCEPTION_CONTINUE_SEARCH;
+    }
 
     void* addr = ep->ExceptionRecord->ExceptionAddress;
     std::string line = "VEH fault code=" + Hex(code) + " at=" + Hex((uint64_t)addr);
@@ -11586,6 +21576,15 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
     Diag("  r8=" + Hex(c->R8) + " r9=" + Hex(c->R9) + " r12=" + Hex(c->R12) +
          " r14=" + Hex(c->R14) + " r15=" + Hex(c->R15));
     Diag("  tid=" + std::to_string(GetCurrentThreadId()) + " rip=" + Hex(c->Rip));
+    // The faulting instruction, verbatim. A register dump alone cannot say which
+    // operand computed the bad address; sixteen bytes at RIP decode to exactly
+    // that, and they cost nothing -- RIP is executable by definition.
+    {
+        std::string ib = "  insn";
+        for (int k = 0; k < 16; ++k)
+            ib += " " + Hex((uint32_t)((const unsigned char*)(uintptr_t)c->Rip)[k]);
+        Diag(ib);
+    }
     uintptr_t ret = 0;
     __try { ret = *(uintptr_t*)c->Rsp; }
     __except (EXCEPTION_EXECUTE_HANDLER) { ret = 0; }
@@ -11986,6 +21985,233 @@ static void GhPollPokeRequest()
     });
 }
 
+// #163. GhDumpAllThreads is far too heavy to run on a cadence: 39 threads, each
+// suspended and stack-walked, takes long enough that the trigger uploads behind
+// it are simply skipped, and its cost perturbs the very timing being measured.
+// This is the light version -- RIP only, one line for the whole process -- so it
+// can run every second and still be there for the last sample before the app
+// disappears. It answers "hung or exited", and if hung, in whose code.
+//
+// The output is deliberately one line per tick, and repeated identical lines are
+// collapsed to a count, because the interesting part is the LAST few ticks and a
+// per-thread-per-tick log would push them out of a diag we can pull.
+// Returns the stack as one line rather than logging it, so the caller can
+// suppress repeats -- the useful signal is the LAST distinct stack before the
+// app disappears, and an unfiltered per-tick log buries it.
+static std::string GhLiveStack(DWORD tid)
+{
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                          THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!h) return "";
+    uintptr_t frames[24] = {}; int nf = 0; DWORD64 rip = 0, rsp = 0; bool ok = false;
+    if (SuspendThread(h) != (DWORD)-1){
+        ok = GhCaptureStack(h, frames, 24, &nf, &rip, &rsp);
+        ResumeThread(h);
+    }
+    CloseHandle(h);
+    if (!ok) return "";
+    std::string line;
+    for (int i = 0; i < nf && i < 20; ++i) line += " | " + NameForCodeAddr(frames[i]);
+    return line;
+}
+
+// #165. A stack walk is the wrong instrument for a stall caused by the loader
+// lock. GhCaptureStack unwinds with RtlLookupFunctionEntry, and that takes the
+// loader's module-data lock -- so when a guest thread holds that lock
+// exclusively, OUR SAMPLER BLOCKS TOO. Run 54 is the proof: the sample stamped
+// t=7016ms did not reach the diag until after the keep-alive present at
+// 16485ms, and nothing was sampled again before the app died. The instrument
+// shared the fate of the thing it was measuring, and the ~10 s window we most
+// need to see is the one window it cannot report.
+//
+// This one cannot deadlock. It suspends a thread, reads RIP/RSP straight out of
+// the CONTEXT, and resumes -- no unwinding, no loader call, nothing that can
+// wait on a lock a suspended thread might be holding. Names are resolved
+// AFTERWARDS, with every thread running again, and NameForCodeAddr walks the
+// PEB list itself rather than asking the loader. One line per thread is enough
+// to say which threads are parked in the same ntdll wait and which one is not.
+// #166. Two hazards in the first version, both fixed here.
+//
+// (1) IT ALLOCATED WHILE A THREAD WAS SUSPENDED. `rows.push_back(...)` sat
+//     between SuspendThread and ResumeThread, so if the suspended thread
+//     happened to hold the CRT heap lock and the vector needed to grow, the
+//     census deadlocked against a thread only it could release. Never observed
+//     firing, but it is the exact shape of bug this instrument exists to find,
+//     and an instrument that can hang the app it is measuring is worthless.
+//     Everything is now sized BEFORE the first suspend; the suspended window
+//     contains nothing but GetThreadContext and ReadProcessMemory.
+//
+// (2) IT COULD NOT SAY WHY A THREAD WAS PARKED. Run 59 put all 53 threads in
+//     ntdll, which names the wait primitive and nothing else. The callers are
+//     what identify the subsystem -- but GhCaptureStack unwinds with
+//     RtlLookupFunctionEntry, which takes the loader lock, which is precisely
+//     what deadlocked the liveness sampler in #165.
+//
+//     So: scan, do not unwind. While the thread is suspended we copy a window
+//     of its stack with ReadProcessMemory (no faults, no SEH, partial reads
+//     handled) and resolve nothing. Afterwards, with every thread running, we
+//     keep the qwords that land inside a mapped module's image and print them
+//     in stack order. That over-reports -- stale return addresses and spilled
+//     function pointers survive the filter -- so it is a set of CANDIDATE
+//     callers, not a call stack, and it is labelled SCAN to keep that honest.
+//     For naming which subsystem a parked thread belongs to it is plenty: a
+//     thread waiting inside the job manager and a thread waiting inside
+//     dstorage do not share candidates.
+struct GhRipRow {
+    DWORD   tid;
+    DWORD64 rip, rsp;
+    bool    got;
+    SIZE_T  nBytes;                // of stack actually read
+};
+
+// Module ranges, snapshotted once per census with every thread running. Walks
+// the PEB by hand exactly as NameForCodeAddr does, so it takes no loader lock.
+// GhModRange itself is declared with CollectLastGameRanges, further down.
+struct GhModRange { uintptr_t lo, hi; };
+static void GhSnapModRanges(std::vector<GhModRange>& out);  // defined with GhLdrEntry, below
+
+static bool GhInAnyMod(const std::vector<GhModRange>& m, uintptr_t a)
+{
+    for (const GhModRange& r : m) if (a >= r.lo && a < r.hi) return true;
+    return false;
+}
+
+static void GhRipCensus(const char* why)
+{
+    // Stamped BEFORE the first suspend. The header used to be built after the
+    // loop, so its timestamp was the PUBLISH time -- and on run 57 that made a
+    // sample taken at ~17 s read as t=33312ms, which is how "the main thread is
+    // in steamclient64" got mistaken for a reading of the idle window it was
+    // nowhere near. Same trap that made the liveness sampler unreadable.
+    const unsigned long long tSample = GhUpMs();
+    const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+
+    // Phase 1: enumerate. Nothing is suspended yet, so allocation is safe.
+    std::vector<DWORD> tids;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te{}; te.dwSize = sizeof te;
+    if (Thread32First(snap, &te)){
+        do {
+            if (te.th32OwnerProcessID == pid && te.th32ThreadID != self)
+                tids.push_back(te.th32ThreadID);
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    const unsigned long long tEnum = GhUpMs();
+
+    // Phase 2: size every buffer up front. After this line and until the
+    // sampling loop is done, not one byte is allocated.
+    const unsigned words = GhCfgNum(L"gh_rip_stack.txt", "GH_RIP_STACK", 0);
+    const size_t   nW    = words > 4096 ? 4096 : words;   // qwords per thread
+    std::vector<GhRipRow>  rows(tids.size());
+    std::vector<DWORD64>   stk(tids.size() * nW);
+    std::string            out;
+    out.reserve(16384);
+
+    // Phase 3: sample. Suspended window holds only GetThreadContext and RPM.
+    const HANDLE me = GetCurrentProcess();
+    for (size_t i = 0; i < tids.size(); ++i){
+        GhRipRow& r = rows[i];
+        r.tid = tids[i];
+        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, r.tid);
+        if (!h) continue;
+        if (SuspendThread(h) != (DWORD)-1){
+            CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
+            if (GetThreadContext(h, &c)){
+                r.got = true; r.rip = c.Rip; r.rsp = c.Rsp;
+                // ReadProcessMemory rather than a raw copy: a stack window can
+                // run into the guard page, and RPM reports that as a short read
+                // instead of raising. Halve on failure so one bad tail does not
+                // cost the whole thread's window.
+                for (size_t take = nW; take; take /= 2){
+                    SIZE_T got = 0;
+                    if (ReadProcessMemory(me, (LPCVOID)c.Rsp, &stk[i * nW],
+                                          take * 8, &got) && got){
+                        r.nBytes = got; break;
+                    }
+                }
+            }
+            ResumeThread(h);
+        }
+        CloseHandle(h);
+    }
+    const unsigned long long tSusp = GhUpMs();
+
+    // Phase 4: resolve and publish, with everything running again. Diag takes a
+    // lock of its own and touches the filesystem, so not one name is resolved
+    // and not one byte is written before here.
+    //
+    // And batched. Every Diag is its own CreateFile/Write/Close, so the first
+    // version of this spent 89 of them on an 88-thread census and took SIXTEEN
+    // SECONDS to publish -- the gap between the t=15594ms and t=33312ms ticks in
+    // run 57 is the instrument, not the app. A census that costs more than the
+    // interval it is sampling at cannot report a cadence.
+    std::vector<GhModRange> mods;
+    if (nW) GhSnapModRanges(mods);
+    out = "RIPCENSUS " + std::string(why) + " t=" + std::to_string(tSample) +
+          "ms threads=" + std::to_string(rows.size()) +
+          " (enum " + std::to_string(tEnum - tSample) +
+          "ms sample " + std::to_string(tSusp - tEnum) +
+          "ms published " + std::to_string(GhUpMs()) + "ms)";
+    for (size_t i = 0; i < rows.size(); ++i){
+        const GhRipRow& r = rows[i];
+        out += "\n  RIP tid=" + std::to_string(r.tid) +
+               (r.tid == g_guestWorkerTid ? " MAIN" : (r.tid == g_uiTid ? " UI  " : "     "));
+        if (!r.got){ out += " (no context)"; continue; }
+        out += " " + NameForCodeAddr((uintptr_t)r.rip) + " rsp=" + Hex((uint64_t)r.rsp);
+        // Candidate callers, stack order, deduped, guest frames always kept.
+        int shown = 0; uintptr_t last = 0;
+        for (size_t k = 0; k < r.nBytes / 8 && shown < 14; ++k){
+            const uintptr_t v = (uintptr_t)stk[i * nW + k];
+            if (v == last || !GhInAnyMod(mods, v)) continue;
+            last = v;
+            out += "\n    SCAN " + NameForCodeAddr(v);
+            ++shown;
+        }
+        if (out.size() >= 12288){ Diag(out); out.clear(); }
+    }
+    if (!out.empty()) Diag(out);
+}
+
+// The first version of this walked every thread in the process each tick. With
+// ~58 threads the suspend/resume traffic alone made a "700 ms" cadence run at
+// several seconds, so it produced ONE stack in a 20 s window and missed the end
+// entirely -- the only part that matters. This one samples exactly two threads:
+// the guest's main thread, and whoever last drove D3D12. Repeats collapse, so
+// what survives in the diag is the sequence of DISTINCT states and, last of all,
+// whatever the app was doing when it vanished.
+static void GhLivenessSample()
+{
+    static ULONGLONG t0 = 0; if (!t0) t0 = GetTickCount64();
+    static std::string lastMain, lastD3d; static int repeat = 0, tick = 0, stallTicks = 0;
+    ++tick;
+    const DWORD dt = (DWORD)(GetTickCount64() - t0);
+    const DWORD d3d = (DWORD)InterlockedCompareExchange(&g_lastD3DTid, 0, 0);
+    const std::string m = g_guestWorkerTid ? GhLiveStack(g_guestWorkerTid) : std::string();
+    const std::string d = (d3d && d3d != g_guestWorkerTid) ? GhLiveStack(d3d) : std::string();
+    // #163. When the same two stacks persist, the app is stalled, not slow. Fire
+    // ONE full all-thread dump at that moment: the main thread is parked in
+    // WaitForSingleObject(INFINITE) on an event some other thread owes it, and
+    // the only way to name that thread is to see every stack at once. One-shot,
+    // because the dump is heavy enough to distort what it is measuring.
+    if (m == lastMain && !m.empty() && ++stallTicks == 6){
+        Diag("LIVE stalled " + std::to_string(stallTicks) + " ticks; dumping all threads");
+        GhDumpAllThreads("stalled");
+    }
+    if (m != lastMain) stallTicks = 0;
+    if (m == lastMain && d == lastD3d && (tick % 20) != 0){ ++repeat; return; }
+    if (repeat) Diag("LIVE  (same x" + std::to_string(repeat) + ")");
+    repeat = 0; lastMain = m; lastD3d = d;
+    Diag("LIVE t=" + std::to_string(dt) + "ms main tid=" + std::to_string(g_guestWorkerTid) + m);
+    if (!d.empty()) Diag("LIVE t=" + std::to_string(dt) + "ms d3d  tid=" + std::to_string(d3d) + d);
+    if (g_uiTid && g_uiTid != g_guestWorkerTid && g_uiTid != d3d){
+        const std::string u = GhLiveStack(g_uiTid);
+        if (!u.empty()) Diag("LIVE t=" + std::to_string(dt) + "ms ui   tid=" +
+                             std::to_string(g_uiTid) + u);
+    }
+}
+
 static void GhPollThreadDumpRequest()
 {
     std::wstring p = std::wstring(kLocalState) + L"gh_dumpthreads.txt";
@@ -12027,8 +22253,29 @@ static void SnapshotHostThreads()
                 // so it needs to still be alive when the guest goes quiet.
                 unsigned lim = GhCfgNum(L"gh_memsample_n.txt", "GH_MEMSAMPLE_N", 4800);
                 for (unsigned i = 0; i < lim && !g_guestDone; ++i){
-                    GhLogMemoryBudget("sample");
+                    // #165: deadline first. GhLogMemoryBudget asks the adapter for
+                    // its video-memory info, which blocks behind a wedged graphics
+                    // stack -- so with the dump second, the one run that needed the
+                    // dump was the one run that could not take it.
                     GhPollThreadDumpRequest();
+                    // #163. A dump triggered by "the stacks stopped changing"
+                    // proved unreliable -- one failed stack capture resets the
+                    // counter and the dump never fires. A deadline does not
+                    // care: gh_dump_at_ms names a wall-clock moment after guest
+                    // start, and the run either reaches it or does not.
+                    {
+                        static const unsigned at =
+                            (unsigned)GhCfgNum(L"gh_dump_at_ms.txt", "GH_DUMP_AT_MS", 0);
+                        static ULONGLONG t0 = GetTickCount64();
+                        static bool done = false;
+                        if (at && !done && GetTickCount64() - t0 >= at){
+                            done = true;
+                            Diag("THREADS timed dump at " + std::to_string(at) + " ms");
+                            GhDumpModules("timed");
+                            GhDumpAllThreads("timed");
+                        }
+                    }
+                    GhLogMemoryBudget("sample");
                     GhPollWatchRequest();
                     GhPollPokeRequest();
                     if (g_fpTrapMax && g_fpTrapHits == 0) GhFpTrapArmAllThreads();
@@ -12040,6 +22287,28 @@ static void SnapshotHostThreads()
             // not stall activation. Opt-in, so an ordinary launch never sees it.
             std::thread([]{ GhProbeFileBackedArena(); }).detach();
             std::thread([]{ GhProbeAwe(); }).detach();          // #148
+            // #163: light RIP-only liveness trace. Own thread, own cadence, so
+            // it keeps sampling while the 3 s loop above is inside a dump.
+            // #165. Not behind gh_live_ms: the liveness sampler blocks on
+            // GetThreadContext against a thread inside a kernel call, which is
+            // exactly the case this watchdog exists to report. It must not share
+            // that fate, or its cadence.
+            std::thread([]{ GhD12CallWatchdog(); }).detach();
+            std::thread([]{
+                const unsigned ms = (unsigned)GhCfgNum(L"gh_live_ms.txt", "GH_LIVE_MS", 0);
+                if (!ms) return;
+                Diag("LIVE sampler on, every " + std::to_string(ms) + " ms");
+                while (!g_guestDone){ GhLivenessSample(); Sleep(ms); }
+            }).detach();
+            // #165. The RIP census gets its own thread and its own cadence for
+            // the reason it exists: it has to keep reporting through exactly the
+            // stall that stops the liveness sampler above.
+            std::thread([]{
+                const unsigned ms = (unsigned)GhCfgNum(L"gh_rip_ms.txt", "GH_RIP_MS", 0);
+                if (!ms) return;
+                Diag("RIPCENSUS on, every " + std::to_string(ms) + " ms");
+                while (!g_guestDone){ GhRipCensus("tick"); Sleep(ms); }
+            }).detach();
         }
     }
 }
@@ -12083,8 +22352,7 @@ static bool PathIsLastGame(const std::wstring& p)
     return !g_lastGameDir.empty() && StartsWithNoCase(p, g_lastGameDir);
 }
 
-struct GhModRange { uintptr_t lo, hi; };
-static std::vector<GhModRange> g_lastGameRanges;
+static std::vector<GhModRange> g_lastGameRanges;   // GhModRange is declared with the RIP census, above
 
 static void CollectLastGameRanges()
 {
@@ -12126,6 +22394,63 @@ static bool PtrInLastGame(uintptr_t p)
 // first guest frame and report only our own bed, which is the one thing we
 // already know.
 // ---------------------------------------------------------------------------
+// #163. The stalls in this title all end inside a module our own GUESTDLL bed
+// never logged, so "which modules are actually mapped" stopped being a question
+// we could answer from the load trace. Walk the PEB list directly -- it is the
+// same list NameForCodeAddr resolves against, so the two agree by construction.
+static void GhDumpModules(const char* why)
+{
+    BYTE* teb = (BYTE*)NtCurrentTeb();
+    BYTE* peb = *(BYTE**)(teb + 0x60);
+    BYTE* ldr = peb ? *(BYTE**)(peb + 0x18) : nullptr;
+    if (!ldr){ Diag(std::string("MODLIST (") + why + ") no PEB ldr"); return; }
+    auto* head = (LIST_ENTRY*)(ldr + 0x10);
+    int n = 0;
+    Diag(std::string("MODLIST (") + why + ")");
+    for (LIST_ENTRY* e = head->Flink; e && e != head && n < 512; e = e->Flink, ++n){
+        auto* ent = CONTAINING_RECORD(e, GhLdrEntry, InLoadOrder);
+        std::wstring w(ent->FullDllName.Buffer ? ent->FullDllName.Buffer : L"",
+                       ent->FullDllName.Buffer ? ent->FullDllName.Length / sizeof(wchar_t) : 0);
+        Diag("  MOD " + Hex((uintptr_t)ent->DllBase) + " +" + Hex((uint32_t)ent->SizeOfImage) +
+             " " + std::string(w.begin(), w.end()));
+    }
+    Diag("MODLIST n=" + std::to_string(n));
+}
+
+// #163. `KERNELBASE.dll+0xCA1A9` names a location but not a function, and the
+// whole question was WHICH KERNELBASE call dstorage.dll was making when it
+// raised STATUS_INVALID_HANDLE. There are no symbols in the container, but every
+// system DLL carries its export table: the nearest export at or below an address
+// is not the true function start when a symbol is private, yet for the public
+// Win32 surface it is exactly right.
+static std::string GhNearestExport(uintptr_t a)
+{
+    HMODULE m = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR)a, &m) || !m) return "";
+    auto* dos = (IMAGE_DOS_HEADER*)m;
+    if (dos->e_lfanew <= 0) return "";
+    auto* nt = (IMAGE_NT_HEADERS*)((BYTE*)m + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return "";
+    const auto& dd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dd.VirtualAddress || !dd.Size) return "";
+    auto* ex = (IMAGE_EXPORT_DIRECTORY*)((BYTE*)m + dd.VirtualAddress);
+    auto* names = (DWORD*)((BYTE*)m + ex->AddressOfNames);
+    auto* ords  = (WORD*)((BYTE*)m + ex->AddressOfNameOrdinals);
+    auto* funcs = (DWORD*)((BYTE*)m + ex->AddressOfFunctions);
+    const DWORD rva = (DWORD)(a - (uintptr_t)m);
+    DWORD best = 0; const char* bn = nullptr;
+    for (DWORD i = 0; i < ex->NumberOfNames; ++i){
+        const DWORD f = funcs[ords[i]];
+        // A forwarder's "address" points inside the export directory itself.
+        if (f >= dd.VirtualAddress && f < dd.VirtualAddress + dd.Size) continue;
+        if (f <= rva && f >= best){ best = f; bn = (const char*)m + names[i]; }
+    }
+    if (!bn) return "";
+    return std::string(" [") + bn + "+" + Hex((uint32_t)(rva - best)) + "]";
+}
+
 static std::string NameForCodeAddr(uintptr_t a)
 {
     if (!a) return "0";
@@ -12154,6 +22479,26 @@ static std::string NameForCodeAddr(uintptr_t a)
     }
     return s;
 }
+
+static void GhSnapModRanges(std::vector<GhModRange>& out)
+{
+    out.clear();
+    if (g_guestImageBase)
+        out.push_back({ (uintptr_t)g_guestImageBase,
+                        (uintptr_t)g_guestImageBase + g_guestImageSize });
+    BYTE* teb = (BYTE*)NtCurrentTeb();
+    BYTE* peb = *(BYTE**)(teb + 0x60);
+    BYTE* ldr = peb ? *(BYTE**)(peb + 0x18) : nullptr;
+    if (!ldr) return;
+    auto* head = (LIST_ENTRY*)(ldr + 0x10);
+    int n = 0;
+    for (LIST_ENTRY* e = head->Flink; e && e != head && n < 512; e = e->Flink, ++n){
+        auto* ent = CONTAINING_RECORD(e, GhLdrEntry, InLoadOrder);
+        uintptr_t lo = (uintptr_t)ent->DllBase;
+        if (lo) out.push_back({ lo, lo + ent->SizeOfImage });
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Guest tracepoints -- the debugger we do not have.
@@ -12908,6 +23253,7 @@ static bool MapAndRun(std::vector<uint8_t>& file)
             for (; oft->u1.AddressOfData; ++oft, ++ft){
                 if (IMAGE_SNAP_BY_ORDINAL64(oft->u1.Ordinal)){
                     HMODULE m = LoadGuestDll(dll);
+                    if (m) PinGuestModule(m, dll);
                     void* p = m ? (void*)GetProcAddress(m, (LPCSTR)(oft->u1.Ordinal & 0xFFFF)) : nullptr;
                     if (!p){ char ord[24]; std::snprintf(ord,sizeof(ord),"#%u",(unsigned)(oft->u1.Ordinal&0xFFFF)); p=MakeStub(dll,ord); stubbed++; }
                     else real++;
@@ -12948,6 +23294,8 @@ static bool MapAndRun(std::vector<uint8_t>& file)
     // After protections, before the entry point: the image is final and nothing
     // guest-side has run yet.
     ArmGuestTracepoints(base, imageSize);
+    GhPatchPsPcTrustCheck(base, imageSize);
+    GhPatchPsPcInit(base, imageSize);        // #164
 
     // Register SEH unwind info for the guest's code range.
     auto& excDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
@@ -13101,6 +23449,7 @@ static bool MapChildImage(const std::vector<uint8_t>& file, uint8_t** outBase, v
             for (; oft->u1.AddressOfData; ++oft, ++ft){
                 if (IMAGE_SNAP_BY_ORDINAL64(oft->u1.Ordinal)){
                     HMODULE m = LoadGuestDll(dll);
+                    if (m) PinGuestModule(m, dll);
                     ft->u1.Function = (ULONGLONG)(m ? GetProcAddress(m, (LPCSTR)(oft->u1.Ordinal & 0xFFFF)) : nullptr);
                     continue;
                 }
@@ -13353,10 +23702,17 @@ static BOOL WINAPI Bed_GetExitCodeProcess(HANDLE h, LPDWORD ec)
 // requires 2 ("play"), and the game exits cleanly with code 0 having never started.
 // Verified on the console: with the flag it skips straight past and reaches
 // RegisterClassEx / CreateWindowEx / CreateSwapChainForHwnd.
+//
+// Ghost of Tsushima Director's Cut is the same Nixxes PC port frontend -- it ships
+// the same crs-* crash/video helpers beside the exe -- so it takes the same flag
+// for the same reason. Listed here rather than set through ghcmd.txt because
+// ghcmd.txt replaces the WHOLE command line, which pins the launcher slot to one
+// title and hands the next game the previous one's argv[0].
 static std::wstring GuestExtraArgs(const std::wstring& exePath)
 {
     static const struct { const wchar_t* exe; const wchar_t* args; } kExtra[] = {
-        { L"spider-man.exe", L" -nolauncher" },
+        { L"spider-man.exe",       L" -nolauncher" },
+        { L"ghostoftsushima.exe",  L" -nolauncher" },
     };
     size_t sl = exePath.find_last_of(L"\\/");
     std::wstring base = (sl == std::wstring::npos) ? exePath : exePath.substr(sl + 1);
@@ -14152,6 +24508,40 @@ static void RunGuest()
         std::wstring exeBase = (dot != std::wstring::npos) ? fname.substr(0, dot) : fname;
         if (!g_guestDir.empty()) g_guestDataDir = g_guestDir + exeBase + L"_Data\\";
         Diag("guestDataDir=" + std::string(g_guestDataDir.begin(), g_guestDataDir.end()));
+
+        // #167: the working directory a real launcher hands a game is the game's
+        // own install directory -- Steam sets it, and an engine is entitled to
+        // build every data path from it. Ghost of Tsushima does exactly that:
+        // GetCurrentDirectory() + "cache_pc\\psarc\\<name>.psarc" for all 63
+        // archives. Our virtual cwd was a scratch folder (C:\work, mapped to
+        // LocalState\vfs\C\work), so every one of those opens landed in an EMPTY
+        // directory: nothing mounted, the "all_shaders" asset stayed Unloaded,
+        // startup phase 2 returned false and the game called exit(1).
+        //
+        // Only when the guest's directory is WRITABLE, and that is measured, not
+        // guessed: create a temp file there and delete it. Two of our four guest
+        // sources are read-only -- the package (\WindowsApps) and a plugged-in USB
+        // folder -- and for those, moving the cwd would turn every relative WRITE
+        // from a success in the vfs mirror into a failure, the opposite trade. A
+        // drive letter cannot tell them apart either: the D: dev-scratch guest is
+        // reported as "USB/ABSOLUTE" by the same branch that reports E:.
+        const bool cwdGuest = GhCfgNumZ(L"gh_cwd_guest.txt", "GH_CWD_GUEST", 1) != 0;
+        bool writable = false;
+        if (cwdGuest && !g_guestDir.empty()){
+            std::wstring probe = g_guestDir + L"gh_cwdprobe.tmp";
+            HANDLE h = CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                   FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+            if (h != INVALID_HANDLE_VALUE){ writable = true; CloseHandle(h); }
+            else Diag("VCWD guest dir not writable err=" + Hex(GetLastError()));
+        }
+        if (writable){
+            std::wstring cwd = g_guestDir;
+            while (cwd.size() > 3 && (cwd.back()==L'\\' || cwd.back()==L'/')) cwd.pop_back();
+            g_vCwd = cwd;
+        }
+        Diag("VCWD=" + std::string(g_vCwd.begin(), g_vCwd.end()) +
+             (cwdGuest ? (writable ? "" : " (guest dir read-only -- scratch cwd kept)")
+                       : " (gh_cwd_guest=0)"));
     }
 #ifdef GH_LAUNCHER
     // Facepunch/Steamworks read SteamAppId before SteamAPI_Init. Launcher QR
@@ -14234,6 +24624,7 @@ static void RunGuest()
     // (which binds the real export, bypassing our IAT/GPA beds) routes drive-root
     // saves through the VFS. Install now, before any guest DLL (esp. Mono) loads.
     InstallFileHooks();
+    GhFixStdHandles();
     // Restore this guest's own registry first, THEN seed Steam on top: the Steam
     // cold-client keys are per-run facts (our pid, our install path) and must win
     // over whatever last run happened to persist.
@@ -14252,6 +24643,23 @@ static void RunGuest()
         // A Steam-downloaded Unity tree is unpatched. Dedicated slots were
         // patched at pack time; this is a no-op there (already renamed).
         PatchGuestTreeForContainer();
+
+        // #168: bring the DXIL shader back end up HERE, on the loader's own
+        // thread with nothing else running. The old gh_scdxil_preload did this
+        // from inside the guest's first CreateGraphicsPipelineState and never
+        // returned (#163). Off unless gh_scdxil says otherwise.
+        GhScdxilBringUp();
+
+        // #169 Stage 0. Read-only, off unless gh_ddi_probe says otherwise. Runs
+        // here rather than only from EnsureBridge because 0a needs scdxil (just
+        // brought up, one line above) and 0c wants D3D12Core's import table
+        // before ANY device negotiates caps. Idempotent -- EnsureBridge's call
+        // is the backstop for the paths that never reach this point.
+        GhDdiInstall();
+
+        // #170. One signed DXIL <= 6.5 compute PSO, on a throwaway device,
+        // before the guest exists. Off unless gh_dxil_ctl says otherwise.
+        GhDxilControl();
 
         // ghwmm.dll: our WINMM replacement for the multimedia-timer functions the
         // container's slim WINMM lacks. Mono's import name is binary-patched
@@ -14519,6 +24927,60 @@ static void ResetGuestForRelaunch()
 #ifdef GH_LAUNCHER
 #include "gh_input.h"
 #include "launcher_ui.h"
+
+// ---------------------------------------------------------------------------
+// #165. Keep the swapchain alive while the guest has not presented yet.
+// ---------------------------------------------------------------------------
+// Ghost of Tsushima spends tens of seconds loading before its first Present,
+// and somewhere in that window the whole process stops -- every thread, not one
+// slow call -- and is then terminated. The app's last visible act is the
+// picker's final frame; from LauncherPickGuest returning to the guest's first
+// Present, NOTHING in this process presents. That is the only property of the
+// window we can name, and it is the same shape as #132.
+//
+// So present a status frame about once a second from the UI pump for exactly as
+// long as the guest has produced no frame of its own. g_presentN is incremented
+// at the top of GfxPresent, which is the only route a guest present can take,
+// so the first guest frame switches this off permanently: LuiPresent and
+// GfxPresent both run the "exactly one wrapped back buffer is acquired"
+// acquire/release dance on the SAME g_gfx.swap, and only one of them may be
+// running it at a time. g_gfx itself is built once, by BuildBridgeOnUi on this
+// same UI thread, before the guest thread starts, so nothing rebuilds it
+// underneath us. The overlay is excluded because it blits into the guest's own
+// frame and assumes the guest is the one presenting.
+//
+// Knob-gated (default OFF) because it is a candidate FIX, not an instrument: the
+// PLM handlers in App::Run are the instrument and they cost nothing. A value
+// above 1 is the interval in ms.
+static void GhKeepAlivePresent()
+{
+    static int mode = -1;
+    if (mode < 0){
+        mode = (int)GhCfgNum(L"gh_keepalive.txt", "GH_KEEPALIVE", 0);
+        if (mode) Diag("KEEPALIVE armed, interval=" +
+                       std::to_string(mode > 1 ? mode : 1000) + "ms");
+    }
+    if (mode <= 0) return;
+    if (!g_guestRunning || g_overlayOpen) return;
+    if (InterlockedCompareExchange(&g_presentN, 0, 0) != 0) return;
+    static ULONGLONG last = 0;
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG iv  = (ULONGLONG)(mode > 1 ? mode : 1000);
+    if (last && now - last < iv) return;
+    last = now;
+    static int n = 0;
+    ++n;
+    // Bake the status frame ONCE. Drawing it costs D2D and DirectWrite work that
+    // can take the Windows loader lock, and the loader lock is exactly what the
+    // guest's 17-second LoadLibrary is holding -- runs 42/43/44 all stop this
+    // presenter dead at frame #4, the moment the SDK load starts. Presenting an
+    // already-baked texture only touches resident d3d11on12/dxgi code.
+    if (n == 1) LuiDrawStatus(L"Starting \u2026");
+    LuiPresent();
+    if (n <= 8 || (n % 10) == 0)
+        Diag("KEEPALIVE present #" + std::to_string(n) + " at " +
+             std::to_string(GhUpMs()) + "ms");
+}
 #endif
 
 struct App : implements<App, IFrameworkView, IFrameworkViewSource>
@@ -14536,6 +24998,42 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
 #endif
         CoreWindow window = CoreWindow::GetForCurrentThread();
         window.Activate();
+        // #165. Ghost of Tsushima is killed ~45 s after launch, and for the ~17 s
+        // before that the WHOLE process is frozen: 0% CPU at every WDP poll, a
+        // frozen working set, no new diag bytes, byte-identical HDMI captures --
+        // and our D3D12 watchdog, a bare Sleep(500) loop that touches no
+        // graphics, misses three ticks and only shouts once when it thaws. Every
+        // thread stopping at once is what an app-model SUSPEND looks like, and
+        // the one thing this app stops doing during the guest's long startup is
+        // PRESENTING. These handlers are the evidence: if a Suspending or
+        // EnteredBackground line lands in the middle of the frozen window, the
+        // app model is doing it and the keep-alive presenter below is the fix;
+        // if nothing fires, the freeze is something else and the presenter is
+        // measuring nothing. Every line is timestamped off the same g_procT0 the
+        // harness's poll table is read against.
+        try {
+            CoreApplication::Suspending([](winrt::Windows::Foundation::IInspectable const&,
+                                           winrt::Windows::ApplicationModel::SuspendingEventArgs const&){
+                Diag("PLM Suspending at " + std::to_string(GhUpMs()) + "ms");
+            });
+            CoreApplication::Resuming([](winrt::Windows::Foundation::IInspectable const&,
+                                         winrt::Windows::Foundation::IInspectable const&){
+                Diag("PLM Resuming at " + std::to_string(GhUpMs()) + "ms");
+            });
+            CoreApplication::EnteredBackground([](winrt::Windows::Foundation::IInspectable const&,
+                     winrt::Windows::ApplicationModel::EnteredBackgroundEventArgs const&){
+                Diag("PLM EnteredBackground at " + std::to_string(GhUpMs()) + "ms");
+            });
+            CoreApplication::LeavingBackground([](winrt::Windows::Foundation::IInspectable const&,
+                     winrt::Windows::ApplicationModel::LeavingBackgroundEventArgs const&){
+                Diag("PLM LeavingBackground at " + std::to_string(GhUpMs()) + "ms");
+            });
+            window.VisibilityChanged([](CoreWindow const&, VisibilityChangedEventArgs const& e){
+                Diag(std::string("PLM VisibilityChanged visible=") + (e.Visible() ? "1" : "0") +
+                     " at " + std::to_string(GhUpMs()) + "ms");
+            });
+            Diag("STAGE=plm_hooked");
+        } catch (...) { Diag("STAGE=plm_hook_failed"); }
         // On Xbox the gamepad B button raises a system BackRequested event; left
         // unhandled, the shell "backs out" of the app and terminates it (looks like
         // B quits the game from anywhere). Swallow it here so B stays an ordinary
@@ -14670,17 +25168,37 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
             g_guestRunning = true;
             std::thread([]{
                 g_guestWorkerTid = GetCurrentThreadId();
+                GhProbePsPcDeps();          // #165, knob-gated
                 RunGuest();
                 g_guestDone = true;
             }).detach();
+            // #165. Time every step of the pump. A step that never blocks never
+            // prints, so this is silent on a healthy run and names the culprit on
+            // the run where the UI thread goes dark for eleven seconds and the
+            // shell suspends us for not presenting.
+            struct UiStep {
+                const char* const name;
+                const ULONGLONG   t0;
+                explicit UiStep(const char* n) : name(n), t0(GetTickCount64()) {}
+                ~UiStep(){
+                    const ULONGLONG dt = GetTickCount64() - t0;
+                    if (dt >= 300)
+                        Diag(std::string("UIPUMP ") + name + " blocked " +
+                             std::to_string((unsigned long long)dt) + "ms, ending at " +
+                             std::to_string(GhUpMs()) + "ms");
+                }
+            };
+            g_uiTid = GetCurrentThreadId();
             while (!g_guestDone){
-                window.Dispatcher().ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
-                PollGamepadOnUi();
-                PollSyntheticPad();
-                OverlayPollChord();
-                OverlayTick();
-                OverlayPadToMouse();
-                GhAudioTick();
+                { UiStep _s("ProcessEvents");
+                  window.Dispatcher().ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent); }
+                { UiStep _s("PollGamepadOnUi");  PollGamepadOnUi();  }
+                { UiStep _s("PollSyntheticPad"); PollSyntheticPad(); }
+                { UiStep _s("OverlayPollChord"); OverlayPollChord(); }
+                { UiStep _s("OverlayTick");      OverlayTick();      }
+                { UiStep _s("OverlayPadToMouse");OverlayPadToMouse();}
+                { UiStep _s("GhAudioTick");      GhAudioTick();      }
+                { UiStep _s("GhKeepAlivePresent"); GhKeepAlivePresent(); }   // #165
                 (void)&PollPointerOnUi;
                 Sleep(20);
             }

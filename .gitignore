@@ -62,3 +62,8 @@ __pycache__/
 *.pyc
 .venv/
 .grok/
+
+# Session status notes written for the user mid-run. Prose about the state of a
+# task, not repo content -- GREENHOUSE.md is where anything durable goes.
+claudeghostbtw
+claudespidey*

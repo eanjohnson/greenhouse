@@ -103,6 +103,26 @@ for stub in opengl32_stub:opengl32 ghwmm:ghwmm; do
           /DLL /ENTRY:_DllMainCRTStartup
   rm -f "$STAGE/guest/${dst}.lib" "$STAGE/guest/${dst}.exp"
 done
+
+# #126: real per-module TLS. Each ghtlsN.dll is an identical DLL whose only job
+# is to own a large __declspec(thread) reserve, so the OS assigns it a genuine
+# TLS index and maintains a block for every thread. The loader points a guest
+# module's _tls_index at one of these instead of faking index 128. One DLL per
+# guest module that needs an index; the loader loads only the ones it uses.
+echo "== build TLS index donors (ghtls0..3) =="
+for n in 0 1 2 3; do
+  clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \
+    /std:c++20 /EHsc /MT /O2 /LD \
+    /imsvc "$SDK/crt/include" /imsvc "$SDK/sdk/include/$SDKVER/ucrt" \
+    /imsvc "$SDK/sdk/include/$SDKVER/um" /imsvc "$SDK/sdk/include/$SDKVER/shared" \
+    "$GH/corpus/shims/ghtls.cpp" \
+    -o "$STAGE/guest/ghtls${n}.dll" \
+    /link /libpath:"$SDK/crt/lib/x86_64" /libpath:"$SDK/sdk/lib/um/x86_64" /libpath:"$SDK/sdk/lib/ucrt/x86_64" \
+          kernel32.lib libcmt.lib libvcruntime.lib libucrt.lib \
+          /DLL /ENTRY:_DllMainCRTStartup
+  rm -f "$STAGE/guest/ghtls${n}.lib" "$STAGE/guest/ghtls${n}.exp"
+done
+ls -la "$STAGE/guest/ghtls0.dll"
 ls -la "$STAGE/guest/steam_api64.dll" "$STAGE/guest/steamclient64.dll" "$STAGE/guest/tier0_s64.dll" "$STAGE/guest/vstdlib_s64.dll" \
        "$STAGE/guest/opengl32.dll" "$STAGE/guest/ghwmm.dll" 2>/dev/null || true
 

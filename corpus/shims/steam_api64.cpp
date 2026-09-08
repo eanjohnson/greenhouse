@@ -1559,6 +1559,40 @@ static bool gh_engine_wait_ready(DWORD ms) {
 // longer prefixes first, since "SteamUser" also prefixes "SteamUserStats".
 // Anything without a dedicated slot goes through GetISteamGenericInterface, which
 // is what the real steam_api does with it too.
+// A sentinel is only safe for the flat C API, which passes the interface pointer
+// back as an opaque `self` our wrappers ignore. A native C++ consumer instead
+// reads slot 0 of what it assumes is a vtable, so when the engine cannot serve an
+// interface the honest fallback is not a char -- it is a real object whose vtable
+// is full of harmless answers. Only Remote Play has one so far, because it is the
+// only interface a game has been observed to call before anything else and the
+// truthful answer on a console with no Remote Play is simply "no sessions".
+//
+// Hand-rolled rather than a C++ class with virtuals so the ABI is explicit. On
+// x64 the callee never cleans the stack, so one zero-returning stub serves every
+// slot regardless of its real arity. The two exceptions are spelled out:
+//   - GetSessionSteamID returns CSteamID, which MSVC returns through a HIDDEN
+//     POINTER passed in rdx (it has a constructor, so it is not trivially
+//     copyable); the stub must zero that buffer and return it in rax.
+//   - GetSessionClientName returns a string a caller may hand straight to strlen,
+//     so it returns "" and never nullptr.
+// Twelve slots covers VERSION001 (7 methods) through the newest without needing
+// to know which one the engine was built against.
+static uint64_t gh_rp_zero(void*)                 { return 0; }
+static void*    gh_rp_steamid(void*, void* ret)   { if (ret) *(uint64_t*)ret = 0; return ret; }
+static const char* gh_rp_name(void*, uint32_t)    { return ""; }
+static void* const g_rp_vtbl[12] = {
+    (void*)&gh_rp_zero,     // 0 GetSessionCount            -> 0 sessions
+    (void*)&gh_rp_zero,     // 1 GetSessionID
+    (void*)&gh_rp_steamid,  // 2 GetSessionSteamID          -> CSteamID(0), via retptr
+    (void*)&gh_rp_name,     // 3 GetSessionClientName       -> ""
+    (void*)&gh_rp_zero,     // 4 GetSessionClientFormFactor
+    (void*)&gh_rp_zero,     // 5 BGetSessionClientResolution -> false
+    (void*)&gh_rp_zero,     // 6 BSendRemotePlayTogetherInvite / BStartRemotePlayTogether
+    (void*)&gh_rp_zero, (void*)&gh_rp_zero, (void*)&gh_rp_zero,
+    (void*)&gh_rp_zero, (void*)&gh_rp_zero,
+};
+static void* const* g_rp_fallback = g_rp_vtbl;   // the object IS its vtable pointer
+
 struct GhIfaceRoute { const char* prefix; int slot; bool useUser; void* sentinel; };
 static const GhIfaceRoute kGhIfaceRoutes[] = {
     { "SteamUserStats",                       GH_SC_GetISteamGenericInterface, true,  &g_iface_stats },
@@ -1584,7 +1618,15 @@ static const GhIfaceRoute kGhIfaceRoutes[] = {
     { "SteamNetworkingMessages",              GH_SC_GetISteamGenericInterface, true,  &g_iface_netmessages },
     { "SteamNetworking",                      GH_SC_GetISteamGenericInterface, true,  &g_iface_networking },
     { "SteamParties",                         GH_SC_GetISteamGenericInterface, true,  &g_iface_parties },
-    { "SteamRemotePlay",                      GH_SC_GetISteamGenericInterface, true,  &g_iface_remoteplay },
+    // Both spellings of the same family. SteamInternal_FindOrCreateUserInterface
+    // is handed the SDK's literal version string, and for Remote Play that string
+    // is SCREAMING_CASE ("STEAMREMOTEPLAY_INTERFACE_VERSION001") while the flat
+    // accessors are named SteamRemotePlay_v00N. Only the CamelCase prefix was
+    // listed, so a native C++ consumer fell past every route to the bare
+    // one-byte sentinel -- Ghost of Tsushima calls GetSessionCount() (vtable slot
+    // 0) at startup and died reading a null vtable out of it.
+    { "STEAMREMOTEPLAY_INTERFACE_VERSION",    GH_SC_GetISteamGenericInterface, true,  &g_rp_fallback },
+    { "SteamRemotePlay",                      GH_SC_GetISteamGenericInterface, true,  &g_rp_fallback },
     { "SteamGameSearch",                      GH_SC_GetISteamGenericInterface, true,  &g_iface_gamesearch },
     { "STEAMAPPLIST_INTERFACE_VERSION",       GH_SC_GetISteamGenericInterface, true,  &g_iface_applist },
     { "STEAMHTMLSURFACE_INTERFACE_VERSION",   GH_SC_GetISteamGenericInterface, true,  &g_iface_html },

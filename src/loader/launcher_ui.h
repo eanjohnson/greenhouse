@@ -1285,7 +1285,11 @@ static void LauncherShowCrash(const std::wstring& title, const std::wstring& rea
                 fail ? g_lui.brWarn.get() : g_lui.brFg.get());
         LuiText(reason.c_str(), g_lui.fmtSmall.get(), D2D1::RectF(84, 124, W - 80, 172),
                 g_lui.brAccent.get());
+#ifdef GH_RELEASE
+        LuiText(L"recent log  (last lines)", g_lui.fmtSmall.get(),
+#else
         LuiText(L"loader_diag.txt  (last lines)", g_lui.fmtSmall.get(),
+#endif
                 D2D1::RectF(84, 176, W - 80, 212), g_lui.brDim.get());
 
         g_lui.fmtLog->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
