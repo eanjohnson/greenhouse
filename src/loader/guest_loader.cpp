@@ -65,6 +65,7 @@
 #include <vector>
 #include <deque>
 #include <unordered_map>
+#include <set>
 
 #ifdef GH_X86_GUEST
 // The x86 track's guest instruction clock, forward-declared so the graphics
@@ -6925,6 +6926,185 @@ static bool GhSubstShader(D3D12_SHADER_BYTECODE* bc)
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// #181. Record-and-replay for PSO creation.
+//
+// #180 settled that the driver will compile 555 pipelines back to back when WE
+// drive it, and Tsushima still dies inside its 332nd. So the difference is in
+// WHAT the game asks for, not how much: real root signatures, real render-target
+// state, real input layouts, and a real interleaving of graphics and compute that
+// a compute-only soak cannot express. Recording every desc the game submits, in
+// order, and replaying it from the launcher turns a five-minute game launch into
+// a two-minute experiment against that exact sequence.
+//
+// The record keys shaders by their ORIGINAL container digest -- the same key the
+// #173 substitution uses -- so replay resolves each stage out of the staged
+// corpus (gh_lo_<key>.bin, the lowered blob the driver actually saw) and falls
+// back to gh_ps_<key>.bin, which the recorder writes for any shader that has no
+// lowered form. Root signatures are recorded as the guest's own serialized bytes
+// and rebuilt through the same rewrite path on replay.
+// ---------------------------------------------------------------------------
+static bool GhPsoRecOn()
+{
+    static const bool on = GhCfgNum(L"gh_pso_record.txt", "GH_PSO_RECORD", 0) != 0;
+    return on;
+}
+
+#pragma pack(push, 4)
+struct GhPsoRecHdr {
+    uint32_t magic;      // 'PREC'
+    uint32_t size;       // whole record, header included
+    uint32_t idx;        // 1-based ordinal across BOTH entry points
+    uint32_t kind;       // 0 = graphics, 1 = compute
+    uint32_t nIL;        // input elements following the header (graphics only)
+    uint32_t rsBytes;    // serialized root-signature bytes following those
+    uint32_t descBytes;  // sizeof(D3D12_GRAPHICS_PIPELINE_STATE_DESC) as recorded
+    uint32_t pad;
+    char     key[5][40]; // VS,PS,DS,HS,GS  (compute: key[0] = CS)
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC gd;  // pointer fields are meaningless
+};
+struct GhPsoRecIL {
+    char     semantic[32];
+    uint32_t index, format, slot, offset, cls, step;
+};
+#pragma pack(pop)
+
+static std::mutex g_psoRecMu;
+static std::map<const void*, std::vector<uint8_t>> g_psoRecRs;   // root signature -> guest blob
+
+// Remember the bytes a root signature was built from, so a replay can rebuild it.
+static void GhPsoRecRootSig(void* rs, const void* blob, SIZE_T len)
+{
+    if (!GhPsoRecOn() || !rs || !blob || !len) return;
+    std::lock_guard<std::mutex> lk(g_psoRecMu);
+    g_psoRecRs[rs].assign((const uint8_t*)blob, (const uint8_t*)blob + len);
+}
+
+// Stage a shader the corpus has no lowered form for, once per key.
+static void GhPsoRecStash(const void* code, SIZE_T n, char keyOut[40])
+{
+    keyOut[0] = 0;
+    if (!code || n < 20) return;
+    char key[33];
+    if (!GhShaderKey(code, n, key)) return;
+    std::memcpy(keyOut, key, 33);
+
+    static std::set<std::string> seen;
+    {
+        std::lock_guard<std::mutex> lk(g_psoRecMu);
+        if (!seen.insert(key).second) return;
+    }
+    std::wstring wkey;
+    for (const char* c = key; *c; ++c) wkey.push_back((wchar_t)*c);
+    if (GetFileAttributesW((std::wstring(kLocalState) + L"gh_lo_" + wkey + L".bin").c_str())
+            != INVALID_FILE_ATTRIBUTES)
+        return;                                  // the lowered blob is already staged
+    HANDLE h = CreateFileW((std::wstring(kLocalState) + L"gh_ps_" + wkey + L".bin").c_str(),
+                           GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD wrote = 0;
+    WriteFile(h, code, (DWORD)n, &wrote, nullptr);
+    CloseHandle(h);
+}
+
+static void GhPsoRecAppend(const void* rec, size_t n)
+{
+    std::lock_guard<std::mutex> lk(g_psoRecMu);
+    // The file is append-only within a run and truncated at the start of one, so a
+    // second recording never replays as the first run's sequence plus its own.
+    static bool truncated = false;
+    if (!truncated){
+        truncated = true;
+        DeleteFileW((std::wstring(kLocalState) + L"gh_psorec.bin").c_str());
+    }
+    HANDLE h = CreateFileW((std::wstring(kLocalState) + L"gh_psorec.bin").c_str(),
+                           FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    SetFilePointer(h, 0, nullptr, FILE_END);
+    DWORD wrote = 0;
+    WriteFile(h, rec, (DWORD)n, &wrote, nullptr);
+    CloseHandle(h);
+}
+
+static volatile LONG g_psoRecSeq = 0;
+
+// Called from the graphics hook with the guest's ORIGINAL desc, before any
+// substitution, so the recorded keys are corpus keys.
+static void GhPsoRecordGfx(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d)
+{
+    if (!GhPsoRecOn() || !d) return;
+    GhPsoRecHdr h{};
+    h.magic = 0x43455250;                       // 'PREC'
+    h.idx   = (uint32_t)InterlockedIncrement(&g_psoRecSeq);
+    h.kind  = 0;
+    h.descBytes = (uint32_t)sizeof(h.gd);
+    h.gd    = *d;
+    const D3D12_SHADER_BYTECODE* bc[5] = { &d->VS, &d->PS, &d->DS, &d->HS, &d->GS };
+    for (int i = 0; i < 5; ++i)
+        GhPsoRecStash(bc[i]->pShaderBytecode, bc[i]->BytecodeLength, h.key[i]);
+
+    std::vector<GhPsoRecIL> il;
+    if (d->InputLayout.pInputElementDescs && d->InputLayout.NumElements){
+        for (UINT i = 0; i < d->InputLayout.NumElements && i < 64; ++i){
+            const D3D12_INPUT_ELEMENT_DESC& e = d->InputLayout.pInputElementDescs[i];
+            GhPsoRecIL r{};
+            if (e.SemanticName){
+                std::strncpy(r.semantic, e.SemanticName, sizeof(r.semantic) - 1);
+                r.semantic[sizeof(r.semantic) - 1] = 0;
+            }
+            r.index = e.SemanticIndex; r.format = (uint32_t)e.Format;
+            r.slot = e.InputSlot;      r.offset = e.AlignedByteOffset;
+            r.cls = (uint32_t)e.InputSlotClass; r.step = e.InstanceDataStepRate;
+            il.push_back(r);
+        }
+    }
+    h.nIL = (uint32_t)il.size();
+
+    std::vector<uint8_t> rs;
+    if (d->pRootSignature){
+        std::lock_guard<std::mutex> lk(g_psoRecMu);
+        auto it = g_psoRecRs.find(d->pRootSignature);
+        if (it != g_psoRecRs.end()) rs = it->second;
+    }
+    h.rsBytes = (uint32_t)rs.size();
+    h.size = (uint32_t)(sizeof(h) + il.size() * sizeof(GhPsoRecIL) + rs.size());
+
+    std::vector<uint8_t> buf(h.size);
+    std::memcpy(buf.data(), &h, sizeof(h));
+    if (!il.empty())
+        std::memcpy(buf.data() + sizeof(h), il.data(), il.size() * sizeof(GhPsoRecIL));
+    if (!rs.empty())
+        std::memcpy(buf.data() + sizeof(h) + il.size() * sizeof(GhPsoRecIL), rs.data(), rs.size());
+    GhPsoRecAppend(buf.data(), buf.size());
+}
+
+static void GhPsoRecordCs(const D3D12_COMPUTE_PIPELINE_STATE_DESC* d)
+{
+    if (!GhPsoRecOn() || !d) return;
+    GhPsoRecHdr h{};
+    h.magic = 0x43455250;
+    h.idx   = (uint32_t)InterlockedIncrement(&g_psoRecSeq);
+    h.kind  = 1;
+    h.descBytes = (uint32_t)sizeof(h.gd);
+    h.gd.NodeMask = d->NodeMask;
+    h.gd.Flags    = d->Flags;
+    GhPsoRecStash(d->CS.pShaderBytecode, d->CS.BytecodeLength, h.key[0]);
+    std::vector<uint8_t> rs;
+    if (d->pRootSignature){
+        std::lock_guard<std::mutex> lk(g_psoRecMu);
+        auto it = g_psoRecRs.find(d->pRootSignature);
+        if (it != g_psoRecRs.end()) rs = it->second;
+    }
+    h.rsBytes = (uint32_t)rs.size();
+    h.size = (uint32_t)(sizeof(h) + rs.size());
+    std::vector<uint8_t> buf(h.size);
+    std::memcpy(buf.data(), &h, sizeof(h));
+    if (!rs.empty()) std::memcpy(buf.data() + sizeof(h), rs.data(), rs.size());
+    GhPsoRecAppend(buf.data(), buf.size());
+}
+
 static void GhDumpFailedShader(const char* tag, const void* code, SIZE_T n,
                                ID3D12Device* dev)
 {
@@ -7433,6 +7613,8 @@ static void GhDxilSoak(const D3D12_ROOT_SIGNATURE_DESC& rsd, ID3D12Device* first
     if (!faulters.empty()) Diag("DXILSOAK faulters: " + faulters);
 }
 
+static void GhPsoReplay(ID3D12Device* dev);   // #181, defined after the bindless rewrite it reuses
+
 static void GhDxilControl()
 {
     static const unsigned mode = GhCfgNum(L"gh_dxil_ctl.txt", "GH_DXIL_CTL", 0);
@@ -7444,7 +7626,7 @@ static void GhDxilControl()
         // Mode 6 (#180) reads the staged gh_lo_*.bin corpus instead of one blob,
         // so a missing control shader is not a reason for it to stop.
         Diag("DXILCTL no gh_dxil_ctl.bin (or too small)");
-        if (mode != 6) return;
+        if (mode != 6 && mode != 7) return;
         blob.clear();
     }
     uint64_t feat = 0;
@@ -7457,6 +7639,10 @@ static void GhDxilControl()
 
     ID3D12Device* dev = GhCompileOnlyDevice();
     if (!dev){ Diag("DXILCTL no device"); return; }
+
+    // Mode 7 (#181) needs nothing this function builds: every root signature and
+    // every shader comes out of the recorded sequence.
+    if (mode == 7){ GhPsoReplay(dev); return; }
 
     // E2's other half: how big a SHADER-VISIBLE CBV_SRV_UAV heap will this console
     // actually create? The spec says tier 2 allows 1,000,000 and we measured
@@ -9065,6 +9251,10 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
                    + std::to_string(e.SemanticIndex) + " f=" + std::to_string((int)e.Format) + "]";
             }
         }
+        // #181: record the guest's OWN desc, before every rewrite below, so the
+        // keys in the record are corpus keys and the replay reproduces what the
+        // game asked for rather than what we made of it.
+        GhPsoRecordGfx(d);
         if (d->CachedPSO.pCachedBlob && d->CachedPSO.CachedBlobSizeInBytes){
             local = *d;
             local.CachedPSO = {};
@@ -9342,6 +9532,8 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
         m += " cached=" + std::to_string((unsigned)d->CachedPSO.CachedBlobSizeInBytes);
     }
     Diag(m);
+
+    GhPsoRecordCs(d);   // #181, before substitution: see GhPsoRecordGfx
 
     // #173: hand the driver the lowered blob if one is staged, and do it BEFORE
     // the screen below so the screen judges what the driver will actually see --
@@ -9827,9 +10019,185 @@ static HRESULT __stdcall Hook_D12CreateRS(ID3D12Device* self, UINT node,
         std::lock_guard<std::mutex> lk(g_ghRsMu);
         g_ghRsBindless[*pp] = where;
     }
+    // #181: keep the guest's OWN serialized bytes against the object it produced,
+    // so a replay can rebuild the same signature through the same rewrite path.
+    if (SUCCEEDED(hr) && pp && *pp) GhPsoRecRootSig(*pp, blob, len);
     Diag("  CreateRootSignature -> hr=" + Hex((uint32_t)hr) +
          (rewrote ? " (bindless ranges appended)" : ""));
     return hr;
+}
+
+// #181, the replay half. Walks gh_psorec.bin in recorded order and re-issues every
+// PSO the game issued -- graphics and compute interleaved exactly as they were --
+// out of the launcher, with no guest, no Steam and no psarc. This is the only rig
+// that can put the question #180 left open ("what does the GAME do that the soak
+// does not?") to the console in two minutes instead of five.
+static const std::vector<uint8_t>* GhReplayBlob(const char* key)
+{
+    if (!key || !key[0]) return nullptr;
+    static std::map<std::string, std::vector<uint8_t>> cache;
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second.empty() ? nullptr : &it->second;
+    std::wstring wkey;
+    for (const char* c = key; *c; ++c) wkey.push_back((wchar_t)*c);
+    std::vector<uint8_t> b;
+    // The lowered blob first: that is what the driver actually saw in the run
+    // being replayed. gh_ps_ is the recorder's stash for shaders with no lowered
+    // form, which the driver saw unmodified.
+    ReadWholeFile(std::wstring(kLocalState) + L"gh_lo_" + wkey + L".bin", b, true);
+    if (b.empty())
+        ReadWholeFile(std::wstring(kLocalState) + L"gh_ps_" + wkey + L".bin", b, true);
+    it = cache.emplace(key, std::move(b)).first;
+    return it->second.empty() ? nullptr : &it->second;
+}
+
+static void GhPsoReplay(ID3D12Device* dev)
+{
+    if (!dev){ Diag("PSOREPLAY no device"); return; }
+    std::vector<uint8_t> rec;
+    if (!ReadWholeFile(std::wstring(kLocalState) + L"gh_psorec.bin", rec, true) || rec.empty()){
+        Diag("PSOREPLAY no gh_psorec.bin staged -- run the game once with gh_pso_record=1");
+        return;
+    }
+    const unsigned maxN = GhCfgNum(L"gh_dxil_soak_max.txt", "GH_DXIL_SOAK_MAX", 0);
+    const unsigned reps = GhCfgNum(L"gh_dxil_soak_reps.txt", "GH_DXIL_SOAK_REPS", 1);
+
+    // Root signatures, rebuilt once per distinct serialized blob and through the
+    // same rewrite the guest's own call went through.
+    std::map<std::vector<uint8_t>, winrt::com_ptr<ID3D12RootSignature>> rsCache;
+    auto getRs = [&](const uint8_t* p, uint32_t n) -> ID3D12RootSignature* {
+        if (!p || !n) return nullptr;
+        std::vector<uint8_t> k(p, p + n);
+        auto it = rsCache.find(k);
+        if (it != rsCache.end()) return it->second.get();
+        std::vector<uint8_t> rw;
+        GhBindlessRoot where{};
+        const bool rewrote = GhRsBindless() && GhAppendBindlessRanges(p, n, rw, &where);
+        winrt::com_ptr<ID3D12RootSignature> rs;
+        HRESULT hr = dev->CreateRootSignature(0, rewrote ? rw.data() : p,
+                                              rewrote ? rw.size() : (SIZE_T)n,
+                                              __uuidof(ID3D12RootSignature), rs.put_void());
+        if (FAILED(hr) && rewrote)
+            hr = dev->CreateRootSignature(0, p, n, __uuidof(ID3D12RootSignature), rs.put_void());
+        if (FAILED(hr)) Diag("PSOREPLAY CreateRootSignature hr=" + Hex((uint32_t)hr));
+        it = rsCache.emplace(std::move(k), rs).first;
+        return it->second.get();
+    };
+
+    unsigned n = 0, gfx = 0, cs = 0, created = 0, failed = 0, faults = 0, missing = 0;
+    const ULONGLONG t0 = GetTickCount64();
+    bool stop = false;
+    Diag("PSOREPLAY start bytes=" + std::to_string((unsigned)rec.size()) +
+         " reps=" + std::to_string(reps) + " max=" + std::to_string(maxN));
+
+    for (unsigned rep = 0; rep < reps && !stop; ++rep){
+        size_t off = 0;
+        while (off + sizeof(GhPsoRecHdr) <= rec.size()){
+            GhPsoRecHdr h{};
+            std::memcpy(&h, rec.data() + off, sizeof(h));
+            if (h.magic != 0x43455250 || h.size < sizeof(h) || off + h.size > rec.size()){
+                Diag("PSOREPLAY malformed record at " + std::to_string((unsigned)off));
+                break;
+            }
+            const uint8_t* body = rec.data() + off + sizeof(h);
+            off += h.size;
+            if (maxN && n >= maxN){ Diag("PSOREPLAY cap"); stop = true; break; }
+
+            ID3D12RootSignature* rs = getRs(body + (size_t)h.nIL * sizeof(GhPsoRecIL), h.rsBytes);
+            winrt::com_ptr<ID3D12PipelineState> pso;
+            DWORD fault = 0;
+            HRESULT hr = E_FAIL;
+            std::string what;
+            const ULONGLONG t1 = GetTickCount64();
+
+            if (h.kind == 1){
+                const std::vector<uint8_t>* b = GhReplayBlob(h.key[0]);
+                if (!b){ ++missing; continue; }
+                D3D12_COMPUTE_PIPELINE_STATE_DESC cd{};
+                cd.pRootSignature = rs;
+                cd.CS = { b->data(), b->size() };
+                cd.NodeMask = h.gd.NodeMask;
+                cd.Flags = h.gd.Flags;
+                hr = GhTryCreateCPS(dev, &cd, pso.put_void(), &fault);
+                ++cs;
+                what = "cs";
+            } else {
+                D3D12_GRAPHICS_PIPELINE_STATE_DESC gd = h.gd;
+                gd.pRootSignature = rs;
+                gd.CachedPSO = {};
+                gd.StreamOutput = {};
+                D3D12_SHADER_BYTECODE* slot[5] = { &gd.VS, &gd.PS, &gd.DS, &gd.HS, &gd.GS };
+                bool ok = true;
+                for (int i = 0; i < 5; ++i){
+                    *slot[i] = {};
+                    if (!h.key[i][0]) continue;
+                    const std::vector<uint8_t>* b = GhReplayBlob(h.key[i]);
+                    if (!b){ ok = false; break; }
+                    *slot[i] = { b->data(), b->size() };
+                }
+                if (!ok){ ++missing; continue; }
+                std::vector<D3D12_INPUT_ELEMENT_DESC> ie;
+                std::vector<std::string> names;
+                if (h.nIL){
+                    names.reserve(h.nIL); ie.reserve(h.nIL);
+                    for (uint32_t i = 0; i < h.nIL; ++i){
+                        GhPsoRecIL r{};
+                        std::memcpy(&r, body + (size_t)i * sizeof(GhPsoRecIL), sizeof(r));
+                        r.semantic[sizeof(r.semantic) - 1] = 0;
+                        names.emplace_back(r.semantic);
+                        D3D12_INPUT_ELEMENT_DESC e{};
+                        e.SemanticIndex = r.index;
+                        e.Format = (DXGI_FORMAT)r.format;
+                        e.InputSlot = r.slot;
+                        e.AlignedByteOffset = r.offset;
+                        e.InputSlotClass = (D3D12_INPUT_CLASSIFICATION)r.cls;
+                        e.InstanceDataStepRate = r.step;
+                        ie.push_back(e);
+                    }
+                    // Names are assigned after the vector has stopped growing, or
+                    // reallocation would leave every pointer dangling.
+                    for (uint32_t i = 0; i < h.nIL; ++i) ie[i].SemanticName = names[i].c_str();
+                    gd.InputLayout = { ie.data(), (UINT)ie.size() };
+                } else {
+                    gd.InputLayout = {};
+                }
+                auto orig = (GhGpsFn)g_d12vtOrig[10];
+                hr = orig ? GhTryCreateGPS(orig, dev, &gd, __uuidof(ID3D12PipelineState),
+                                           pso.put_void(), &fault)
+                          : dev->CreateGraphicsPipelineState(&gd, __uuidof(ID3D12PipelineState),
+                                                             pso.put_void());
+                ++gfx;
+                what = "gfx";
+            }
+
+            const ULONGLONG ms = GetTickCount64() - t1;
+            const HRESULT drr = dev->GetDeviceRemovedReason();
+            ++n;
+            if (pso) ++created; else ++failed;
+            if (fault) ++faults;
+            Diag("PSOREPLAY n=" + std::to_string(n) + " rep=" + std::to_string(rep) +
+                 " idx=" + std::to_string(h.idx) + " " + what +
+                 " key=" + std::string(h.key[0][0] ? h.key[0] : "-").substr(0, 8) +
+                 "/" + std::string(h.key[1][0] ? h.key[1] : "-").substr(0, 8) +
+                 " il=" + std::to_string(h.nIL) +
+                 " rs=" + std::to_string(h.rsBytes) +
+                 " nRT=" + std::to_string(h.gd.NumRenderTargets) +
+                 " ms=" + std::to_string((unsigned)ms) +
+                 " hr=" + Hex((uint32_t)hr) +
+                 (fault ? " FAULT=" + Hex((uint32_t)fault) : "") +
+                 " drr=" + Hex((uint32_t)drr) + (pso ? " CREATED" : " none"));
+            if (drr != S_OK){
+                Diag("PSOREPLAY DEVICE REMOVED at n=" + std::to_string(n) +
+                     " idx=" + std::to_string(h.idx) + " drr=" + Hex((uint32_t)drr));
+                stop = true; break;
+            }
+        }
+    }
+    Diag("PSOREPLAY done n=" + std::to_string(n) + " gfx=" + std::to_string(gfx) +
+         " cs=" + std::to_string(cs) + " created=" + std::to_string(created) +
+         " failed=" + std::to_string(failed) + " faults=" + std::to_string(faults) +
+         " missing=" + std::to_string(missing) +
+         " elapsed_ms=" + std::to_string((unsigned long long)(GetTickCount64() - t0)));
 }
 
 // #158. A descriptor is an opaque handle, so the only thing the bind shadow can say
