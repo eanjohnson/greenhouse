@@ -6973,6 +6973,50 @@ static HRESULT GhCallCpsGuarded(GhCpsRawFn fn, ID3D12Device* dev,
     return hr;
 }
 
+// Four blobs in the corpus do not fault -- they take the DEVICE down, with
+// 0x887A0020 (DRIVER_INTERNAL_ERROR). #180's soak compiles them with no game at
+// all and gets the same answer every time, and #175 traced it to wave intrinsics
+// the console's own DXIL back end cannot lower, so this is the driver refusing
+// the shader and not our backporter producing a bad one. A removed device
+// poisons the whole process, so unlike a fault these cannot be caught after the
+// fact: they have to never reach the driver at all.
+//
+// Keyed by the ORIGINAL container digest, which is what the corpus filenames and
+// every SHADERSUB line already speak. gh_pso_deny.txt in LocalState replaces the
+// built-in list when it exists, so the list is editable without a rebuild.
+static bool GhPsoDenied(const void* code, SIZE_T n)
+{
+    if (!code || n < 20) return false;
+    char key[33];
+    if (!GhShaderKey(code, n, key)) return false;
+
+    static std::mutex mu;
+    static std::vector<std::string> deny;
+    static bool loaded = false;
+    std::lock_guard<std::mutex> lk(mu);
+    if (!loaded){
+        loaded = true;
+        std::vector<uint8_t> f;
+        if (ReadWholeFile(std::wstring(kLocalState) + L"gh_pso_deny.txt", f, true) && !f.empty()){
+            std::string cur;
+            for (size_t i = 0; i <= f.size(); ++i){
+                const char c = (i < f.size()) ? (char)f[i] : '\n';
+                if (std::isxdigit((unsigned char)c))
+                    cur.push_back((char)std::tolower((unsigned char)c));
+                else { if (cur.size() == 32) deny.push_back(cur); cur.clear(); }
+            }
+        } else {
+            deny.assign({ "fa29971ed902b2fad02cec2d64a0052a",
+                          "44c53d006f299116f79ffbbf00f818d3",
+                          "4acdac3ea5b31940d101db7bd4ff712f",
+                          "86d22de2bf57fcd4874bafdda58d734c" });
+        }
+        Diag("PSODENY list of " + std::to_string((unsigned)deny.size()) + " shaders");
+    }
+    for (const std::string& k : deny) if (k == key) return true;
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // #181. Record-and-replay for PSO creation.
 //
@@ -9748,6 +9792,31 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
 
     GhPsoRecordCs(d);   // #181, before substitution: see GhPsoRecordGfx
     GhPsoCanaryTick(self);   // #181 cell J
+
+    // #182. A blob that removes the device cannot be survived, only avoided. Do
+    // it on the ORIGINAL bytes, before substitution, because that is the digest
+    // the deny list and the corpus are both keyed by.
+    if (GhPsoGuard() >= 2 && d && pp && GhPsoDenied(d->CS.pShaderBytecode, d->CS.BytecodeLength)){
+        D3D12_SHADER_BYTECODE nop{};
+        static volatile LONG ndeny = 0;
+        const LONG k = InterlockedIncrement(&ndeny);
+        if (GhNoopComputeShader(&nop)){
+            D3D12_COMPUTE_PIPELINE_STATE_DESC sd = *d;
+            sd.CS = nop;
+            sd.CachedPSO = D3D12_CACHED_PIPELINE_STATE{};
+            DWORD f = 0;
+            const HRESULT hs = GhCallCpsGuarded((GhCpsRawFn)orig, self, &sd, riid, pp, &f);
+            Diag("  PSODENY n=" + std::to_string((long)k) +
+                 " CS=" + std::to_string((unsigned)d->CS.BytecodeLength) +
+                 " stood in hr=" + Hex((uint32_t)hs) + (f ? " FAULT=" + Hex((uint32_t)f) : "") +
+                 " drr=" + Hex((uint32_t)self->GetDeviceRemovedReason()) +
+                 (SUCCEEDED(hs) && *pp ? " STOOD IN" : " none"));
+            if (SUCCEEDED(hs)) return hs;
+        } else {
+            Diag("  PSODENY n=" + std::to_string((long)k) + " no no-op shader available");
+        }
+        return E_FAIL;
+    }
 
     // #173: hand the driver the lowered blob if one is staged, and do it BEFORE
     // the screen below so the screen judges what the driver will actually see --
