@@ -6927,6 +6927,53 @@ static bool GhSubstShader(D3D12_SHADER_BYTECODE* bc)
 }
 
 // ---------------------------------------------------------------------------
+// #182. The compute path called the driver BARE.
+//
+// #181 cell J settled the asymmetry that had been unexplained since #178: the
+// launcher takes the identical `newbe.DLL+0x95EA8` access violation, returns
+// E_FAIL, and goes on to create seven more pipelines with a healthy device --
+// while the game vanishes on the spot, no unwind, no handler, no further line
+// of log. The difference was never the driver and never the shader. The
+// graphics hook wraps its call in GhTryCreateGPS; the soak and the replay wrap
+// theirs in GhTryCreateCPSRaw; the COMPUTE hook, the one path the game dies in,
+// called `orig(...)` with nothing on the stack. So the AV walked straight past
+// us into the guest's own crash handler, which does what a shipped game's crash
+// handler does.
+//
+// Every fatal shader we have chased -- a94e9376, 67fdde2f, 44c53d00 -- is a
+// compute shader. This is that missing __except, in its own function because a
+// function with __try may hold no object that needs unwinding.
+// ---------------------------------------------------------------------------
+typedef HRESULT (__stdcall* GhCpsRawFn)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*,
+                                        REFIID, void**);
+
+// 0 = call the driver bare, as every build before this one did.
+// 1 = catch a driver fault and return E_FAIL to the guest.
+// 2 = also stand a do-nothing compute shader in the refused pipeline's place, so
+//     the guest receives a valid non-null ID3D12PipelineState and keeps running.
+static unsigned GhPsoGuard()
+{
+    static const unsigned v = GhCfgNum(L"gh_pso_guard.txt", "GH_PSO_GUARD", 0);
+    return v;
+}
+
+static HRESULT GhCallCpsGuarded(GhCpsRawFn fn, ID3D12Device* dev,
+                                const D3D12_COMPUTE_PIPELINE_STATE_DESC* d,
+                                REFIID riid, void** pp, DWORD* faultCode)
+{
+    *faultCode = 0;
+    if (!GhPsoGuard()) return fn(dev, d, riid, pp);
+    HRESULT hr = E_FAIL;
+    __try {
+        hr = fn(dev, d, riid, pp);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *faultCode = GetExceptionCode();
+        hr = E_FAIL;
+    }
+    return hr;
+}
+
+// ---------------------------------------------------------------------------
 // #181. Record-and-replay for PSO creation.
 //
 // #180 settled that the driver will compile 555 pipelines back to back when WE
@@ -9765,20 +9812,30 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
     const bool serialize = GhPsoSerialize();
     if (serialize) AcquireSRWLockExclusive(&g_psoLock);
     HRESULT hr = E_FAIL;
+    DWORD cpsFault = 0;
     {
         // #181 cell I: same call, one dedicated loader thread.
-        typedef HRESULT (__stdcall* CpsFn)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*,
-                                           REFIID, void**);
-        struct Ctx { CpsFn fn; ID3D12Device* dev;
+        // #182: and never bare -- GhCallCpsGuarded is the __except the graphics
+        // path has had since #169 and this one never did.
+        struct Ctx { GhCpsRawFn fn; ID3D12Device* dev;
                      const D3D12_COMPUTE_PIPELINE_STATE_DESC* d;
-                     const IID* riid; void** pp; HRESULT hr; }
-            ctx{ (CpsFn)orig, self, d, &riid, pp, E_FAIL };
-        auto run = [](void* v){ Ctx* c = (Ctx*)v; c->hr = c->fn(c->dev, c->d, *c->riid, c->pp); };
+                     const IID* riid; void** pp; HRESULT hr; DWORD* fault; }
+            ctx{ (GhCpsRawFn)orig, self, d, &riid, pp, E_FAIL, &cpsFault };
+        auto run = [](void* v){ Ctx* c = (Ctx*)v;
+            c->hr = GhCallCpsGuarded(c->fn, c->dev, c->d, *c->riid, c->pp, c->fault); };
         if (!GhPsoMarshal() || !GhPsoMarshalRun(run, &ctx))
-            ctx.hr = orig(self, d, riid, pp);
+            ctx.hr = GhCallCpsGuarded(ctx.fn, self, d, riid, pp, &cpsFault);
         hr = ctx.hr;
     }
     if (serialize) ReleaseSRWLockExclusive(&g_psoLock);
+    if (cpsFault){
+        static volatile LONG nfault = 0;
+        Diag("  CreateComputePipelineState SURVIVED a driver fault n=" +
+             std::to_string((long)InterlockedIncrement(&nfault)) +
+             " code=" + Hex((uint32_t)cpsFault) +
+             " drr=" + Hex((uint32_t)self->GetDeviceRemovedReason()) +
+             " CS=" + std::to_string(d ? (unsigned)d->CS.BytecodeLength : 0u));
+    }
     {
         static volatile LONG cpsIdx = 0;
         std::string res = "  CreateComputePipelineState -> hr=" + Hex((uint32_t)hr);
@@ -9788,6 +9845,29 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
             if (d) res += " cs=" + std::to_string((unsigned long long)d->CS.BytecodeLength);
         }
         Diag(res);
+    }
+    // #182 gh_pso_guard=2. The guest ignores the HRESULT and dereferences the
+    // pipeline it asked for (#173), so returning E_FAIL only moves the crash one
+    // call along. A shader that declares nothing satisfies any root signature, so
+    // it can stand in for the one the driver refused: this effect does not run,
+    // and everything after it does.
+    if (cpsFault && d && GhPsoGuard() >= 2 && pp && !*pp){
+        D3D12_SHADER_BYTECODE nop{};
+        if (GhNoopComputeShader(&nop)){
+            D3D12_COMPUTE_PIPELINE_STATE_DESC sd = *d;
+            sd.CS = nop;
+            sd.CachedPSO = D3D12_CACHED_PIPELINE_STATE{};
+            DWORD f2 = 0;
+            const HRESULT hs = GhCallCpsGuarded((GhCpsRawFn)orig, self, &sd, riid, pp, &f2);
+            static volatile LONG nstand = 0;
+            Diag("  PSOSTANDIN n=" + std::to_string((long)InterlockedIncrement(&nstand)) +
+                 " hr=" + Hex((uint32_t)hs) + (f2 ? " FAULT=" + Hex((uint32_t)f2) : "") +
+                 " drr=" + Hex((uint32_t)self->GetDeviceRemovedReason()) +
+                 (SUCCEEDED(hs) && pp && *pp ? " STOOD IN" : " none"));
+            if (SUCCEEDED(hs)) hr = hs;
+        } else {
+            Diag("  PSOSTANDIN no no-op shader; the guest gets a null pipeline");
+        }
     }
     if (FAILED(hr) && d){
         // #168: the runtime's own words for WHY. The info queue carries driver and
