@@ -22434,6 +22434,55 @@ static bool GhNewbeScanFault(EXCEPTION_POINTERS* ep)
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// #183. What is the guest THROWING?
+//
+// Tsushima's main thread nests one C++ throw inside the handler for the last
+// one and never unwinds: the LIVE sampler shows RaiseException -> guest handler
+// -> RtlDispatchException -> RaiseException repeating, and 64 MB of stack going
+// down at ~110 KB/s. The exception record already carries everything needed to
+// NAME the thrown type. MSVC puts the magic in ExceptionInformation[0], the
+// thrown object in [1], the ThrowInfo in [2] and the module base in [3]; every
+// pointer inside the ThrowInfo chain is an RVA against that base.
+//
+// Raw pointer walking with no C++ object live, because __try may hold none.
+static bool GhCxxThrowInfo(const EXCEPTION_RECORD* er, char* type, size_t typeCap,
+                           char* what, size_t whatCap)
+{
+    type[0] = 0; what[0] = 0;
+    if (!er || er->ExceptionCode != 0xE06D7363 || er->NumberParameters < 4) return false;
+    if (er->ExceptionInformation[0] != 0x19930520) return false;
+    bool ok = false;
+    __try {
+        const BYTE* base = (const BYTE*)er->ExceptionInformation[3];
+        const BYTE* obj  = (const BYTE*)er->ExceptionInformation[1];
+        const uint32_t* ti = (const uint32_t*)er->ExceptionInformation[2];
+        if (!base || !ti || !ti[3]) return false;
+        const uint32_t* cta = (const uint32_t*)(base + ti[3]);
+        const uint32_t n = cta[0];
+        if (!n || n > 64) return false;
+        // Entry 0 is the thrown type itself; the rest are its bases.
+        const uint32_t* ct = (const uint32_t*)(base + cta[1]);
+        // TypeDescriptor on x64: void* pVFTable; void* spare; char name[].
+        const char* nm = (const char*)(base + ct[1]) + 16;
+        size_t k = 0; while (nm[k] && k + 1 < typeCap){ type[k] = nm[k]; ++k; }
+        type[k] = 0;
+        ok = true;
+        // Derived from std::exception? Then offset 8 is __std_exception_data,
+        // whose first field is the what() string.
+        for (uint32_t i = 0; i < n; ++i){
+            const uint32_t* c = (const uint32_t*)(base + cta[1 + i]);
+            const char* bn = (const char*)(base + c[1]) + 16;
+            if (strstr(bn, "exception@std@@")){
+                const char* w = *(const char* const*)(obj + 8);
+                if (w){ size_t j = 0; while (w[j] && j + 1 < whatCap){ what[j] = w[j]; ++j; } what[j] = 0; }
+                break;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    return ok;
+}
+
 static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
 {
     // #145 demand-commit, first and cheapest. It has to run ahead of the
@@ -22585,6 +22634,44 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
             }
             return EXCEPTION_CONTINUE_SEARCH;
         }
+        // #183. Every C++ throw leaves from the same address inside
+        // RaiseException, so the (code, address) dedup below collapses an entire
+        // exception storm into a single line. Key these by TYPE, and count them:
+        // the type, the count and the first thrower's stack are the whole
+        // question.
+        if (code == 0xE06D7363){
+            static volatile LONG nthrow = 0;
+            const LONG kt = InterlockedIncrement(&nthrow);
+            char tn[256], wt[256];
+            if (GhCxxThrowInfo(ep->ExceptionRecord, tn, sizeof(tn), wt, sizeof(wt))){
+                static SRWLOCK tl = SRWLOCK_INIT;
+                static char seenT[16][256] = {};
+                static int nT = 0;
+                bool freshT = false;
+                AcquireSRWLockExclusive(&tl);
+                int j = 0;
+                for (; j < nT; ++j) if (!strcmp(seenT[j], tn)) break;
+                if (j == nT && nT < 16){
+                    strncpy(seenT[nT], tn, sizeof(seenT[0]) - 1); ++nT; freshT = true;
+                }
+                ReleaseSRWLockExclusive(&tl);
+                if (freshT || (kt % 256) == 1)
+                    Diag("CXXTHROW n=" + std::to_string((long)kt) +
+                         " tid=" + std::to_string(GetCurrentThreadId()) +
+                         " type=" + tn +
+                         (wt[0] ? std::string(" what=\"") + wt + "\"" : std::string()));
+                if (freshT){
+                    void* bt[16] = {};
+                    const USHORT nb = RtlCaptureStackBackTrace(0, 16, bt, nullptr);
+                    for (USHORT b = 0; b < nb; ++b)
+                        Diag("  throw#" + std::to_string(b) + " " +
+                             NameForCodeAddr((uintptr_t)bt[b]));
+                }
+            } else if (kt <= 4){
+                Diag("CXXTHROW n=" + std::to_string((long)kt) + " ThrowInfo unreadable");
+            }
+        }
+
         static SRWLOCK lk = SRWLOCK_INIT;
         static struct { DWORD code; uintptr_t at; } seen[24] = {};
         static int nSeen = 0;
@@ -22605,7 +22692,7 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
             const USHORT nbt = RtlCaptureStackBackTrace(0, 24, bt, nullptr);
             for (USHORT k = 0; k < nbt; ++k)
                 Diag("  raise#" + std::to_string(k) + " " +
-                     NameForCodeAddr((uintptr_t)bt[k]) + GhNearestExport((uintptr_t)bt[k]));
+                     NameForCodeAddr((uintptr_t)bt[k]));   // #183: names itself now
         }
         if (fresh)
             Diag("VEH raise code=" + Hex(code) + " at=" + NameForCodeAddr(at) +
@@ -22653,7 +22740,6 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
         if (k <= 8)
             Diag("STRICTHANDLE #" + std::to_string(k) + " STATUS_INVALID_HANDLE raised at " +
                  NameForCodeAddr((uintptr_t)ep->ExceptionRecord->ExceptionAddress) +
-                 GhNearestExport((uintptr_t)ep->ExceptionRecord->ExceptionAddress) +
                  " tid=" + std::to_string(GetCurrentThreadId()) +
                  " -- continuing, as a desktop process would");
         return EXCEPTION_CONTINUE_EXECUTION;
@@ -23949,7 +24035,12 @@ static std::string NameForCodeAddr(uintptr_t a)
                        ent->FullDllName.Buffer ? ent->FullDllName.Length / sizeof(wchar_t) : 0);
         size_t sl = w.find_last_of(L"\\/");
         if (sl != std::wstring::npos) w = w.substr(sl + 1);
-        return s + " " + std::string(w.begin(), w.end()) + "+" + Hex((uint32_t)(a - lo));
+        // #183. Every stack this log prints is module+offset, which is only
+        // readable with the DLL in hand -- and the console's system DLLs are
+        // not in our hand. #163 already built the nearest-export lookup for
+        // exactly this; it was just never wired into the common formatter.
+        return s + " " + std::string(w.begin(), w.end()) + "+" +
+               Hex((uint32_t)(a - lo)) + GhNearestExport(a);
     }
     return s;
 }
