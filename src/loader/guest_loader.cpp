@@ -22447,9 +22447,9 @@ static bool GhNewbeScanFault(EXCEPTION_POINTERS* ep)
 //
 // Raw pointer walking with no C++ object live, because __try may hold none.
 static bool GhCxxThrowInfo(const EXCEPTION_RECORD* er, char* type, size_t typeCap,
-                           char* what, size_t whatCap)
+                           char* what, size_t whatCap, char* raw = nullptr, size_t rawCap = 0)
 {
-    type[0] = 0; what[0] = 0;
+    type[0] = 0; what[0] = 0; if (raw && rawCap) raw[0] = 0;
     if (!er || er->ExceptionCode != 0xE06D7363 || er->NumberParameters < 4) return false;
     if (er->ExceptionInformation[0] != 0x19930520) return false;
     bool ok = false;
@@ -22468,23 +22468,40 @@ static bool GhCxxThrowInfo(const EXCEPTION_RECORD* er, char* type, size_t typeCa
         size_t k = 0; while (nm[k] && k + 1 < typeCap){ type[k] = nm[k]; ++k; }
         type[k] = 0;
         ok = true;
-        // #183. _com_error is not polymorphic: its first member IS the HRESULT,
-        // and the HRESULT is the entire content of the complaint. wil's
-        // ResultException wraps a FailureInfo, whose hr sits after the vptr and
-        // the FailureType/lineNumber pair. Print whatever we can reach; a wrong
-        // guess costs a junk number in one field, not a fault.
+        // #183. The first pass read the HRESULT from offset 0 and got
+        // 0xAD6DF468 -- the low half of a vptr, not an HRESULT. The console's
+        // own D3D12Core settles the layout: its throw-on-failure helper at
+        // +0x8ED0 builds the object as
+        //     lea rax,[+0x24F468] ; mov [rsp+0x20],rax   -- vptr at 0
+        //     mov [rsp+0x28],ecx                         -- HRESULT at 8
+        //     movdqu [rsp+0x30],xmm0                     -- 16 zero bytes
+        // so the HRESULT is at offset 8 and the object is 32 bytes. Print the
+        // object's head alongside it so the layout stays checkable from the log.
+        static const char hexd[] = "0123456789ABCDEF";
         if (strstr(type, "_com_error")){
-            const uint32_t hr = *(const uint32_t*)obj;
-            static const char hexd[] = "0123456789ABCDEF";
+            const uint32_t hr = *(const uint32_t*)(obj + 8);
             char b[16]; b[0] = 'h'; b[1] = 'r'; b[2] = '='; b[3] = '0'; b[4] = 'x';
             for (int q = 0; q < 8; ++q) b[5 + q] = hexd[(hr >> (28 - 4 * q)) & 0xF];
             b[13] = 0;
             size_t z = 0; while (b[z] && z + 1 < whatCap){ what[z] = b[z]; ++z; }
             what[z] = 0;
         }
+        // The first few throws also carry 48 raw bytes of the object, so a
+        // wrong offset shows itself instead of printing a plausible number.
+        if (raw && rawCap > 8){
+            size_t z = 0;
+            for (int q = 0; q < 48 && z + 3 < rawCap; ++q){
+                const BYTE by = obj[q];
+                raw[z++] = hexd[by >> 4]; raw[z++] = hexd[by & 0xF];
+                if ((q & 7) == 7) raw[z++] = ' ';
+            }
+            raw[z] = 0;
+        }
         // Derived from std::exception? Then offset 8 is __std_exception_data,
-        // whose first field is the what() string.
-        for (uint32_t i = 0; i < n; ++i){
+        // whose first field is the what() string. Not for _com_error: offset 8
+        // is its HRESULT, so reading it as a char* would either fault or
+        // overwrite the one field that matters with rubbish.
+        for (uint32_t i = 0; i < n && !strstr(type, "_com_error"); ++i){
             const uint32_t* c = (const uint32_t*)(base + cta[1 + i]);
             const char* bn = (const char*)(base + c[1]) + 16;
             if (strstr(bn, "exception@std@@")){
@@ -22525,6 +22542,21 @@ static uintptr_t GhRaiseSite(void** bt, USHORT nb)
         if (!skip) return (uintptr_t)bt[b];
     }
     return nb ? (uintptr_t)bt[0] : 0;
+}
+
+// #183. The site alone is not enough. Every D3D12Core throw in this run leaves
+// from the one shared helper at +0x8F08, so a site key collapses ~23000 throws
+// from many different callers into a single entry and only the first caller's
+// chain is ever dumped. Hash the whole captured chain instead: different
+// callers of the same helper then get different keys and each gets one dump.
+static uint64_t GhStackKey(void** bt, USHORT nb)
+{
+    uint64_t h = 1469598103934665603ULL;
+    for (USHORT b = 0; b < nb; ++b){
+        uintptr_t v = (uintptr_t)bt[b];
+        for (int q = 0; q < 8; ++q){ h ^= (v >> (q * 8)) & 0xFF; h *= 1099511628211ULL; }
+    }
+    return h;
 }
 
 static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
@@ -22686,35 +22718,44 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
         if (code == 0xE06D7363){
             static volatile LONG nthrow = 0;
             const LONG kt = InterlockedIncrement(&nthrow);
-            char tn[256], wt[256];
-            if (GhCxxThrowInfo(ep->ExceptionRecord, tn, sizeof(tn), wt, sizeof(wt))){
+            char tn[256], wt[256], rawb[160] = {};
+            // Only the first few throws pay for the raw object dump; after that
+            // the layout is either confirmed or the log already showed it wrong.
+            const bool wantRaw = (kt <= 6);
+            if (GhCxxThrowInfo(ep->ExceptionRecord, tn, sizeof(tn), wt, sizeof(wt),
+                               wantRaw ? rawb : nullptr, wantRaw ? sizeof(rawb) : 0)){
                 // Everything here throws _com_error -- D3D12Core, the guest,
                 // 11on12 -- so keying on the type alone showed the first site
                 // and hid every other one. Key on the SITE: the first frame
                 // that is not the dispatch machinery. Resolving it costs one
                 // GetModuleHandleEx per throw and no allocation, which matters
                 // at the ~165 throws/second this is running at.
-                void* bt[20] = {};
-                const USHORT nb = RtlCaptureStackBackTrace(0, 20, bt, nullptr);
+                // 40 frames, not 20: the previous capture ran out inside
+                // d3d11.dll and never reached the caller that started this.
+                void* bt[40] = {};
+                const USHORT nb = RtlCaptureStackBackTrace(0, 40, bt, nullptr);
                 const uintptr_t site = GhRaiseSite(bt, nb);
+                const uint64_t sk = GhStackKey(bt, nb);
                 static SRWLOCK tl = SRWLOCK_INIT;
-                static struct { uintptr_t site; char type[64]; } seenT[32] = {};
+                static struct { uint64_t key; long n; } seenT[64] = {};
                 static int nT = 0;
-                bool freshT = false;
+                bool freshT = false; long nAtKey = 0;
                 AcquireSRWLockExclusive(&tl);
                 int j = 0;
-                for (; j < nT; ++j)
-                    if (seenT[j].site == site && !strncmp(seenT[j].type, tn, 63)) break;
-                if (j == nT && nT < 32){
-                    seenT[nT].site = site;
-                    strncpy(seenT[nT].type, tn, 63); ++nT; freshT = true;
-                }
+                for (; j < nT; ++j) if (seenT[j].key == sk) break;
+                if (j == nT && nT < 64){ seenT[nT].key = sk; ++nT; freshT = true; }
+                if (j < 64) nAtKey = ++seenT[j].n;
                 ReleaseSRWLockExclusive(&tl);
-                if (freshT || (kt % 512) == 1)
+                // Report each chain again every 4096 throws, so the log says
+                // which chain is the storm rather than only that one exists.
+                if (freshT || (nAtKey && (nAtKey % 4096) == 0))
                     Diag("CXXTHROW n=" + std::to_string((long)kt) +
+                         " chain=" + Hex((uint32_t)(sk >> 32)) +
+                         " nchain=" + std::to_string(nAtKey) +
                          " tid=" + std::to_string(GetCurrentThreadId()) +
                          " type=" + tn +
                          (wt[0] ? std::string(" ") + wt : std::string()) +
+                         (rawb[0] ? std::string(" obj=") + rawb : std::string()) +
                          " site=" + NameForCodeAddr(site));
                 if (freshT){
                     for (USHORT b = 0; b < nb; ++b)
@@ -23618,9 +23659,14 @@ static std::string GhLiveStack(DWORD tid)
     HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
                           THREAD_QUERY_INFORMATION, FALSE, tid);
     if (!h) return "";
-    uintptr_t frames[24] = {}; int nf = 0; DWORD64 rip = 0, rsp = 0; bool ok = false;
+    // #183. 160 frames for the guest worker, 24 for everyone else. Its stack
+    // shows RaiseException <- GUEST+0xD1995B repeating, and 24 frames cannot
+    // say whether that cycle is 3 deep or 3000 -- which is the whole question,
+    // because the same thread is eating 110-140 KB of stack per second.
+    uintptr_t frames[160] = {}; int nf = 0; DWORD64 rip = 0, rsp = 0; bool ok = false;
+    const int cap = (tid == g_guestWorkerTid) ? 160 : 24;
     if (SuspendThread(h) != (DWORD)-1){
-        ok = GhCaptureStack(h, frames, 24, &nf, &rip, &rsp);
+        ok = GhCaptureStack(h, frames, cap, &nf, &rip, &rsp);
         ResumeThread(h);
     }
     CloseHandle(h);
@@ -23635,6 +23681,19 @@ static std::string GhLiveStack(DWORD tid)
     if (tid == g_guestWorkerTid && g_guestStackLow && rsp > g_guestStackLow)
         line += " free=" + std::to_string((unsigned long long)(((uintptr_t)rsp - g_guestStackLow) >> 10)) +
                 "K/" + std::to_string((unsigned long long)((g_guestStackHigh - g_guestStackLow) >> 20)) + "M";
+    // Name the deepest repeat in the walk. If one address accounts for most of
+    // a 160-frame stack, the descent is recursion and the frame size falls out
+    // of (bytes consumed / repeats); if nothing repeats, it is not recursion.
+    if (tid == g_guestWorkerTid && nf > 2){
+        uintptr_t top = 0; int topN = 0;
+        for (int i = 0; i < nf; ++i){
+            int c = 0;
+            for (int j = 0; j < nf; ++j) if (frames[j] == frames[i]) ++c;
+            if (c > topN){ topN = c; top = frames[i]; }
+        }
+        line += " depth=" + std::to_string(nf) + " rep=" + std::to_string(topN) + "x";
+        if (topN > 1) line += NameForCodeAddr(top);
+    }
     for (int i = 0; i < nf && i < 20; ++i) line += " | " + NameForCodeAddr(frames[i]);
     return line;
 }
