@@ -215,6 +215,9 @@ static bool      g_guestExited   = false;
 static volatile bool g_guestCrashed = false;
 static std::string   g_guestFailWhy;              // human reason for the launcher crash screen
 static DWORD         g_guestWorkerTid = 0;
+// #183. The guest worker's stack bounds, up here rather than beside the live
+// sampler because the VEH census below reports headroom at the moment of a raise.
+static uintptr_t     g_guestStackLow = 0, g_guestStackHigh = 0;
 // #165. The shell kills the app ~30 s in, and the keep-alive presenter stops at
 // frame #4 (t~16.6 s) in EVERY run -- so it is the UI thread that goes quiet,
 // not the guest, and the live sampler has never once looked at it.
@@ -12328,8 +12331,35 @@ static HRESULT __stdcall Hook_CLReset(ID3D12GraphicsCommandList* self,
             if (ID3D12CommandAllocator* sa = GhClSubstitute(a, dev.get(), nt->type))
                 useA = sa;
     }
-    return ((HRESULT (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*,
-                                  ID3D12PipelineState*))GhClOrig(self, 10))(self, useA, pso);
+    // #183. The C++ throw storm -- ~165 a second, tens of thousands in a run --
+    // comes out of exactly this call. Two chains, both starting at one guest
+    // address, both landing on D3D12Core's throw-on-failure helper, one of them
+    // through its "CreateAllocation2 - StandardAllocation" path, and the thrown
+    // _com_error carries 0x80070057. What that does NOT say is whether the
+    // throw escapes: D3D12Core catches at its API boundary, so Reset may still
+    // be returning S_OK and the throws may be internal control flow. Say which,
+    // with the count and the first few arguments, and the question is closed.
+    const HRESULT rhr = ((HRESULT (__stdcall*)(ID3D12GraphicsCommandList*,
+                                               ID3D12CommandAllocator*,
+                                               ID3D12PipelineState*))GhClOrig(self, 10))
+                        (self, useA, pso);
+    if (FAILED(rhr)){
+        static volatile LONG nbad = 0;
+        const LONG k = InterlockedIncrement(&nbad);
+        if (k <= 8 || (k % 4096) == 0)
+            Diag("CLRESET FAILED hr=" + Hex((uint32_t)rhr) + " n=" + std::to_string((long)k) +
+                 " tid=" + std::to_string(GetCurrentThreadId()) +
+                 " list=" + Hex((uint64_t)(uintptr_t)self) +
+                 " alloc=" + Hex((uint64_t)(uintptr_t)useA) +
+                 (useA != a ? std::string(" (substituted for ") +
+                              Hex((uint64_t)(uintptr_t)a) + ")" : std::string()) +
+                 " pso=" + Hex((uint64_t)(uintptr_t)pso));
+    } else {
+        static volatile LONG nok = 0;
+        const LONG k = InterlockedIncrement(&nok);
+        if ((k % 8192) == 1) Diag("CLRESET ok n=" + std::to_string((long)k));
+    }
+    return rhr;
 }
 static void __stdcall Hook_CLDraw(ID3D12GraphicsCommandList* self, UINT a, UINT b, UINT c, UINT d)
 {
@@ -22561,6 +22591,39 @@ static uint64_t GhStackKey(void** bt, USHORT nb)
 
 static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
 {
+    // #183. The guest main thread's live stack is a five-frame cycle -- guest
+    // raises, the dispatcher calls a guest handler, that handler raises again --
+    // repeating past the 160-frame walk limit, and 53 MB of its 64 MB stack is
+    // gone. Yet the raise census further down records NOTHING from that guest
+    // address, because it runs behind a filter that excludes access violations,
+    // illegal and privileged instructions, in-page errors, 0xC0000409,
+    // breakpoints and single-steps. A raise using one of those codes is
+    // invisible to it. Count every exception this handler is ever handed on
+    // that one thread, ahead of every filter and every repair, and report the
+    // stack headroom at the moment of the raise so the code that is eating the
+    // stack names itself.
+    if (g_guestWorkerTid && GetCurrentThreadId() == g_guestWorkerTid){
+        static SRWLOCK cl = SRWLOCK_INIT;
+        static struct { DWORD code; long n; } cc[24] = {};
+        static int nc = 0;
+        const DWORD c0 = ep->ExceptionRecord->ExceptionCode;
+        long v = 0; bool fresh0 = false;
+        AcquireSRWLockExclusive(&cl);
+        int q = 0;
+        for (; q < nc; ++q) if (cc[q].code == c0) break;
+        if (q == nc && nc < 24){ cc[nc].code = c0; ++nc; fresh0 = true; }
+        if (q < 24) v = ++cc[q].n;
+        ReleaseSRWLockExclusive(&cl);
+        if (fresh0 || (v && (v % 8192) == 0)){
+            const uintptr_t sp = (uintptr_t)ep->ContextRecord->Rsp;
+            const unsigned long long freeK =
+                (g_guestStackLow && sp > g_guestStackLow) ? (sp - g_guestStackLow) >> 10 : 0;
+            Diag("MAINEXC code=" + Hex(c0) + " n=" + std::to_string(v) +
+                 " free=" + std::to_string(freeK) + "K flags=" +
+                 Hex((uint32_t)ep->ExceptionRecord->ExceptionFlags) +
+                 " at=" + NameForCodeAddr((uintptr_t)ep->ExceptionRecord->ExceptionAddress));
+        }
+    }
     // #145 demand-commit, first and cheapest. It has to run ahead of the
     // reentrancy guard below, or a first touch taken inside one of our own
     // probes would be handed to the crash reporter as a genuine fault.
@@ -23652,7 +23715,6 @@ static void GhPollPokeRequest()
 // moment it starts (GetCurrentThreadStackLimits reports the whole RESERVATION,
 // not the currently-committed part, which is what we need to measure headroom
 // against). Read by the liveness sampler below.
-static uintptr_t g_guestStackLow = 0, g_guestStackHigh = 0;
 
 static std::string GhLiveStack(DWORD tid)
 {
