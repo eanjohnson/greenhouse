@@ -22468,6 +22468,20 @@ static bool GhCxxThrowInfo(const EXCEPTION_RECORD* er, char* type, size_t typeCa
         size_t k = 0; while (nm[k] && k + 1 < typeCap){ type[k] = nm[k]; ++k; }
         type[k] = 0;
         ok = true;
+        // #183. _com_error is not polymorphic: its first member IS the HRESULT,
+        // and the HRESULT is the entire content of the complaint. wil's
+        // ResultException wraps a FailureInfo, whose hr sits after the vptr and
+        // the FailureType/lineNumber pair. Print whatever we can reach; a wrong
+        // guess costs a junk number in one field, not a fault.
+        if (strstr(type, "_com_error")){
+            const uint32_t hr = *(const uint32_t*)obj;
+            static const char hexd[] = "0123456789ABCDEF";
+            char b[16]; b[0] = 'h'; b[1] = 'r'; b[2] = '='; b[3] = '0'; b[4] = 'x';
+            for (int q = 0; q < 8; ++q) b[5 + q] = hexd[(hr >> (28 - 4 * q)) & 0xF];
+            b[13] = 0;
+            size_t z = 0; while (b[z] && z + 1 < whatCap){ what[z] = b[z]; ++z; }
+            what[z] = 0;
+        }
         // Derived from std::exception? Then offset 8 is __std_exception_data,
         // whose first field is the what() string.
         for (uint32_t i = 0; i < n; ++i){
@@ -22481,6 +22495,36 @@ static bool GhCxxThrowInfo(const EXCEPTION_RECORD* er, char* type, size_t typeCa
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { }
     return ok;
+}
+
+// #183. WHO raised this? Every raise in this log leaves from the same address
+// inside RaiseException, so keying a dedup on the exception address collapses
+// an entire storm into one line. The first frame that is not the raise/dispatch
+// machinery is the real site. One GetModuleHandleEx per frame and no
+// allocation, which matters at the hundreds of raises per second seen here.
+static uintptr_t GhRaiseSite(void** bt, USHORT nb)
+{
+    static HMODULE boring[5] = {};
+    static bool init = false;
+    if (!init){
+        boring[0] = GetModuleHandleW(L"ntdll.dll");
+        boring[1] = GetModuleHandleW(L"KERNELBASE.dll");
+        boring[2] = GetModuleHandleW(L"ucrtbase.dll");
+        boring[3] = GetModuleHandleW(L"vcruntime140.dll");
+        boring[4] = GetModuleHandleW(nullptr);
+        init = true;
+    }
+    for (USHORT b = 0; b < nb; ++b){
+        HMODULE m = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                (LPCWSTR)bt[b], &m))
+            return (uintptr_t)bt[b];        // not in any module: the guest image
+        bool skip = false;
+        for (int q = 0; q < 5; ++q) if (m && m == boring[q]) skip = true;
+        if (!skip) return (uintptr_t)bt[b];
+    }
+    return nb ? (uintptr_t)bt[0] : 0;
 }
 
 static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
@@ -22644,25 +22688,35 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
             const LONG kt = InterlockedIncrement(&nthrow);
             char tn[256], wt[256];
             if (GhCxxThrowInfo(ep->ExceptionRecord, tn, sizeof(tn), wt, sizeof(wt))){
+                // Everything here throws _com_error -- D3D12Core, the guest,
+                // 11on12 -- so keying on the type alone showed the first site
+                // and hid every other one. Key on the SITE: the first frame
+                // that is not the dispatch machinery. Resolving it costs one
+                // GetModuleHandleEx per throw and no allocation, which matters
+                // at the ~165 throws/second this is running at.
+                void* bt[20] = {};
+                const USHORT nb = RtlCaptureStackBackTrace(0, 20, bt, nullptr);
+                const uintptr_t site = GhRaiseSite(bt, nb);
                 static SRWLOCK tl = SRWLOCK_INIT;
-                static char seenT[16][256] = {};
+                static struct { uintptr_t site; char type[64]; } seenT[32] = {};
                 static int nT = 0;
                 bool freshT = false;
                 AcquireSRWLockExclusive(&tl);
                 int j = 0;
-                for (; j < nT; ++j) if (!strcmp(seenT[j], tn)) break;
-                if (j == nT && nT < 16){
-                    strncpy(seenT[nT], tn, sizeof(seenT[0]) - 1); ++nT; freshT = true;
+                for (; j < nT; ++j)
+                    if (seenT[j].site == site && !strncmp(seenT[j].type, tn, 63)) break;
+                if (j == nT && nT < 32){
+                    seenT[nT].site = site;
+                    strncpy(seenT[nT].type, tn, 63); ++nT; freshT = true;
                 }
                 ReleaseSRWLockExclusive(&tl);
-                if (freshT || (kt % 256) == 1)
+                if (freshT || (kt % 512) == 1)
                     Diag("CXXTHROW n=" + std::to_string((long)kt) +
                          " tid=" + std::to_string(GetCurrentThreadId()) +
                          " type=" + tn +
-                         (wt[0] ? std::string(" what=\"") + wt + "\"" : std::string()));
+                         (wt[0] ? std::string(" ") + wt : std::string()) +
+                         " site=" + NameForCodeAddr(site));
                 if (freshT){
-                    void* bt[16] = {};
-                    const USHORT nb = RtlCaptureStackBackTrace(0, 16, bt, nullptr);
                     for (USHORT b = 0; b < nb; ++b)
                         Diag("  throw#" + std::to_string(b) + " " +
                              NameForCodeAddr((uintptr_t)bt[b]));
@@ -22672,18 +22726,27 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
             }
         }
 
+        // #183. Keyed on the SITE rather than the raise address: RaiseException
+        // is the address of every one of these, so the old key showed the first
+        // raiser and hid all the rest. The per-site count is the other half of
+        // the answer -- a storm and a one-off look identical without it.
         static SRWLOCK lk = SRWLOCK_INIT;
-        static struct { DWORD code; uintptr_t at; } seen[24] = {};
+        static struct { DWORD code; uintptr_t site; long n; } seen[32] = {};
         static int nSeen = 0;
-        const uintptr_t at = (uintptr_t)ep->ExceptionRecord->ExceptionAddress;
-        bool fresh = false;
+        void* rbt[20] = {};
+        const USHORT rnb = RtlCaptureStackBackTrace(0, 20, rbt, nullptr);
+        const uintptr_t at = GhRaiseSite(rbt, rnb);
+        bool fresh = false; long nAtSite = 0;
         AcquireSRWLockExclusive(&lk);
         int i = 0;
-        for (; i < nSeen; ++i) if (seen[i].code == code && seen[i].at == at) break;
+        for (; i < nSeen; ++i) if (seen[i].code == code && seen[i].site == at) break;
         if (i == nSeen && nSeen < (int)(sizeof(seen)/sizeof(seen[0]))) {
-            seen[nSeen].code = code; seen[nSeen].at = at; ++nSeen; fresh = true;
+            seen[nSeen].code = code; seen[nSeen].site = at; ++nSeen; fresh = true;
         }
+        if (i < (int)(sizeof(seen)/sizeof(seen[0]))) nAtSite = ++seen[i].n;
         ReleaseSRWLockExclusive(&lk);
+        // Say so again every 4096 raises, so a storm reports its own size.
+        const bool periodic = (nAtSite && (nAtSite % 4096) == 0);
         if (fresh){
             // The address alone said "KERNELBASE" and nothing more. The stack is
             // what identifies the caller and the call, so print it here rather
@@ -22694,8 +22757,9 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
                 Diag("  raise#" + std::to_string(k) + " " +
                      NameForCodeAddr((uintptr_t)bt[k]));   // #183: names itself now
         }
-        if (fresh)
-            Diag("VEH raise code=" + Hex(code) + " at=" + NameForCodeAddr(at) +
+        if (fresh || periodic)
+            Diag("VEH raise code=" + Hex(code) + " n=" + std::to_string(nAtSite) +
+                 " site=" + NameForCodeAddr(at) +
                  " tid=" + std::to_string(GetCurrentThreadId()) +
                  " flags=" + Hex((uint32_t)ep->ExceptionRecord->ExceptionFlags) +
                  " nparm=" + std::to_string(ep->ExceptionRecord->NumberParameters) +
