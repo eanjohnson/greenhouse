@@ -22623,6 +22623,44 @@ static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
                  Hex((uint32_t)ep->ExceptionRecord->ExceptionFlags) +
                  " at=" + NameForCodeAddr((uintptr_t)ep->ExceptionRecord->ExceptionAddress));
         }
+        // #183. The first 0xC0000409 is the only one that carries information;
+        // every later one is its own echo. It arrives with the stack still full,
+        // so a frame's GS cookie mismatched while some ORDINARY exception was
+        // being dispatched through it. Three facts name the cause and none of
+        // them survives to the second raise: the value of the cookie global now,
+        // the guest frame the dispatcher was standing on, and the raise that
+        // walked into it. Print all three, once.
+        if (fresh0 && c0 == 0xC0000409u && g_guestImageBase){
+            const uint64_t ck  = *(const volatile uint64_t*)(g_guestImageBase + 0x1988190);
+            const uint64_t ckc = *(const volatile uint64_t*)(g_guestImageBase + 0x1988188);
+            Diag("GSFAIL cookie=" + Hex(ck) + " compl=" + Hex(ckc) +
+                 " sum=" + Hex((uint64_t)(ck + ckc)) +
+                 " (on-disk default 0x00002B992DDFA232, complement must be ~cookie)");
+            void* bt[48] = {};
+            const USHORT nb = RtlCaptureStackBackTrace(0, 48, bt, nullptr);
+            for (USHORT b = 0; b < nb; ++b)
+                Diag("  gsfail#" + std::to_string(b) + " " +
+                     NameForCodeAddr((uintptr_t)bt[b]));
+        }
+        // #183 gh_gs_ignore, default 0 = off. If the cookie check is failing for
+        // an environmental reason rather than a real smashed frame, the guest is
+        // killing a healthy process: __report_gsfailure raises NONCONTINUABLE
+        // 0xC0000409, that raise dispatches through the same frame, the check
+        // fails again, and the cycle eats 4141 bytes of stack a turn until the
+        // 64 MB is gone. Continuing execution at the raise point returns through
+        // RaiseException into __security_check_cookie's caller exactly as if the
+        // check had passed. Clear NONCONTINUABLE first, or ntdll answers our
+        // continue with STATUS_NONCONTINUABLE_EXCEPTION. Only ever for this one
+        // code on this one thread, and only when asked for.
+        if (c0 == 0xC0000409u && GhCfgNum(L"gh_gs_ignore.txt", "GH_GS_IGNORE", 0)){
+            static volatile LONG ngs = 0;
+            const LONG k = InterlockedIncrement(&ngs);
+            if (k <= 4 || (k % 4096) == 0)
+                Diag("GSIGNORE n=" + std::to_string((long)k) +
+                     " at=" + NameForCodeAddr((uintptr_t)ep->ExceptionRecord->ExceptionAddress));
+            ep->ExceptionRecord->ExceptionFlags &= ~(DWORD)EXCEPTION_NONCONTINUABLE;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
     }
     // #145 demand-commit, first and cheapest. It has to run ahead of the
     // reentrancy guard below, or a first touch taken inside one of our own
