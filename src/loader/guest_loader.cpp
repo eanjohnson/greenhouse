@@ -11137,6 +11137,11 @@ struct GhCLNote {
     volatile LONG work;      // shader-running ops since Reset, 1-based; see GhWorkIndex
     void*   lastPso;
     LONG    type;
+    // #184. GhPromoteCopy runs before GhCLAdd, so .type above is the type the
+    // list was actually CREATED with -- which, with gh_copy_as_direct on, is
+    // DIRECT for lists the guest asked to be COPY or COMPUTE. The question the
+    // crash asks is what the guest REQUESTED, so keep that too; -1 = unknown.
+    LONG    reqType;
     // #158. The breadcrumb names the draw the GPU stopped inside; this names what
     // that draw was reading. Root descriptors are raw GPU addresses and descriptor
     // tables are raw heap handles, so a stale or out-of-range one here is a GPU
@@ -11203,7 +11208,8 @@ static void GhCLTableStats(const char* where)
          " clprobe=" + std::to_string((long)InterlockedCompareExchange(&g_clProbe, 0, 0)) +
          " cap=512 probes=16");
 }
-static void GhCLAdd(ID3D12CommandList* cl, D3D12_COMMAND_LIST_TYPE t)
+static void GhCLAdd(ID3D12CommandList* cl, D3D12_COMMAND_LIST_TYPE t,
+                    LONG reqT = -1)
 {
     AcquireSRWLockExclusive(&g_clLock);
     size_t i = GhCLSlot(cl);
@@ -11211,6 +11217,7 @@ static void GhCLAdd(ID3D12CommandList* cl, D3D12_COMMAND_LIST_TYPE t)
         if (g_clNotes[i].cl == cl) break;
         if (!g_clNotes[i].cl){
             g_clNotes[i] = GhCLNote{}; g_clNotes[i].type = (LONG)t;
+            g_clNotes[i].reqType = reqT;
             // .cl publishes the note. Written last, and atomically, so the unlocked
             // reader above cannot see a half-built slot.
             InterlockedExchangePointer((void* volatile*)&g_clNotes[i].cl, cl);
@@ -13756,11 +13763,364 @@ static void __stdcall Hook_CLCopyBufferRegion(ID3D12GraphicsCommandList* self,
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT64,
                         ID3D12Resource*, UINT64, UINT64))GhClOrig(self, 15))(self, d, dOff, sr, sOff, n);
 }
+// #184. Tsushima dies on a NULL dereference at umd12ddi+0x3732D, reached through
+// D3D12Core from this hook. The driver's command-recording function decides which
+// of three object shapes it is copying from a 3-bit tag at arg+0x20 -- and the
+// register it then dereferences is only non-null for tag 4, while the measured tag
+// is 1. Our hook forwards every argument verbatim, so whatever the driver decided,
+// it decided from what the guest handed us. Rather than chase that argument another
+// three frames into driver internals, record the call at our own boundary and print
+// it from the fault dump. Per-thread, because ~53 guest threads record copies and a
+// single global would be clobbered between the faulting call and the VEH.
+struct GhCopyTexLoc {
+    void*  res;
+    UINT32 type;            // D3D12_TEXTURE_COPY_TYPE: 0 = subresource, 1 = footprint
+    UINT32 sub;             // when type == 0
+    UINT64 off;             // when type == 1: PlacedFootprint.Offset
+    UINT32 fmt, w, h, d, rp;//   ... and its D3D12_SUBRESOURCE_FOOTPRINT
+    // The resource's own description. The driver's 3-bit tag is almost certainly
+    // D3D12_RESOURCE_DIMENSION (1 = BUFFER, 2/3/4 = TEXTURE1D/2D/3D), so this is
+    // the field that decides the branch we die on.
+    UINT32 dim, rfmt, rw, rh, rdepth, rmips, rflags, rlayout;
+    UINT32 descOk;
+};
+struct GhCopyTexRec {
+    volatile LONG      live;      // 1 = inside the forwarding call right now
+    DWORD              tid;
+    ID3D12CommandList* cl;
+    LONG               clType, clReqType;
+    UINT               dx, dy, dz;
+    UINT               nbox;      // 0 = pSrcBox was null, else 6 values follow
+    UINT               box[6];
+    GhCopyTexLoc       dst, src;
+    UINT64             seq;       // this thread's CopyTextureRegion count
+};
+static GhCopyTexRec g_ctr[16]{};
+static volatile LONG g_ctrN = 0;
+static inline GhCopyTexRec& GhCtrSlot(DWORD tid){ return g_ctr[(tid >> 2) & 15]; }
+static void GhCtrFillLoc(GhCopyTexLoc& L, const void* p)
+{
+    L = GhCopyTexLoc{};
+    if (!p) return;
+    const BYTE* b = (const BYTE*)p;
+    L.res  = *(void* const*)(b + 0x00);
+    L.type = *(const UINT32*)(b + 0x08);
+    L.sub  = *(const UINT32*)(b + 0x10);
+    L.off  = *(const UINT64*)(b + 0x10);
+    L.fmt  = *(const UINT32*)(b + 0x18);
+    L.w    = *(const UINT32*)(b + 0x1C);
+    L.h    = *(const UINT32*)(b + 0x20);
+    L.d    = *(const UINT32*)(b + 0x24);
+    L.rp   = *(const UINT32*)(b + 0x28);
+    if (L.res){
+        // GetDesc on a live resource is a plain virtual call, but this runs on the
+        // guest's hot path and a torn pResource would fault inside it, so keep the
+        // same guard every other guest-pointer read in this file uses.
+        __try {
+            D3D12_RESOURCE_DESC rd = ((ID3D12Resource*)L.res)->GetDesc();
+            L.dim = (UINT32)rd.Dimension;  L.rfmt   = (UINT32)rd.Format;
+            L.rw  = (UINT32)rd.Width;      L.rh     = rd.Height;
+            L.rdepth = rd.DepthOrArraySize; L.rmips = rd.MipLevels;
+            L.rflags = (UINT32)rd.Flags;   L.rlayout = (UINT32)rd.Layout;
+            L.descOk = 1;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { L.descOk = 0; }
+    }
+}
+static void GhCtrNote(ID3D12CommandList* self, const void* d, UINT x, UINT y, UINT z,
+                      const void* sr, const void* box)
+{
+    const DWORD tid = GetCurrentThreadId();
+    GhCopyTexRec& r = GhCtrSlot(tid);
+    r.live = 0;
+    r.tid = tid; r.cl = self; r.dx = x; r.dy = y; r.dz = z;
+    r.clType = -2; r.clReqType = -2;
+    if (GhCLNote* n = GhCLFind(self)){ r.clType = n->type; r.clReqType = n->reqType; }
+    if (box){ r.nbox = 6; for (int i = 0; i < 6; ++i) r.box[i] = ((const UINT*)box)[i]; }
+    else      r.nbox = 0;
+    GhCtrFillLoc(r.dst, d);
+    GhCtrFillLoc(r.src, sr);
+    ++r.seq;
+    InterlockedIncrement(&g_ctrN);
+    // One line per distinct shape, so the log says which shapes the driver survives
+    // and which one is new at the moment of death -- even if the record below is
+    // stale by the time the fault dump reads it.
+    {
+        const UINT64 key = (UINT64)(r.dst.type & 7)       |
+                           ((UINT64)(r.src.type & 7) << 3)  |
+                           ((UINT64)(r.dst.dim  & 7) << 6)  |
+                           ((UINT64)(r.src.dim  & 7) << 9)  |
+                           ((UINT64)(r.clType   & 7) << 12) |
+                           ((UINT64)(r.clReqType& 7) << 15) |
+                           ((UINT64)(r.nbox ? 1 : 0) << 18);
+        static UINT64 seen[32]{}; static LONG nseen = 0;
+        static SRWLOCK lk = SRWLOCK_INIT;
+        bool have = false;
+        AcquireSRWLockExclusive(&lk);
+        for (LONG q = 0; q < nseen; ++q) if (seen[q] == key){ have = true; break; }
+        if (!have && nseen < 32) seen[nseen++] = key;
+        ReleaseSRWLockExclusive(&lk);
+        if (!have && nseen <= 32 && GhCfgNumZ(L"gh_copytex_rec.txt", "GH_COPYTEX_REC", 1))
+            Diag("COPYTEXSHAPE dstType=" + std::to_string((long)r.dst.type) +
+                 " srcType=" + std::to_string((long)r.src.type) +
+                 " dstDim=" + std::to_string((long)r.dst.dim) +
+                 " srcDim=" + std::to_string((long)r.src.dim) +
+                 " clType=" + std::to_string((long)r.clType) +
+                 " req=" + std::to_string((long)r.clReqType) +
+                 " box=" + std::to_string((long)r.nbox) +
+                 " n=" + std::to_string((long)InterlockedCompareExchange(&g_ctrN, 0, 0)));
+    }
+    r.live = 1;
+}
+static void GhCtrLocDump(const char* tag, const GhCopyTexLoc& L)
+{
+    std::string l = std::string("    ") + tag + " res=" + Hex((uint64_t)(uintptr_t)L.res) +
+        " type=" + std::to_string((long)L.type);
+    if (L.type == 0) l += " sub=" + std::to_string((long)L.sub);
+    else l += " off=" + Hex((uint64_t)L.off) + " fmt=" + std::to_string((long)L.fmt) +
+              " w=" + std::to_string((long)L.w) + " h=" + std::to_string((long)L.h) +
+              " d=" + std::to_string((long)L.d) + " rp=" + std::to_string((long)L.rp);
+    Diag(l);
+    if (L.res)
+        Diag(std::string("      ") + tag + ".desc ok=" + std::to_string((long)L.descOk) +
+             " dim=" + std::to_string((long)L.dim) + " fmt=" + std::to_string((long)L.rfmt) +
+             " w=" + std::to_string((long)L.rw) + " h=" + std::to_string((long)L.rh) +
+             " depth=" + std::to_string((long)L.rdepth) + " mips=" + std::to_string((long)L.rmips) +
+             " layout=" + std::to_string((long)L.rlayout) +
+             " flags=" + Hex((uint32_t)L.rflags));
+}
+static void GhCtrDump()
+{
+    const DWORD tid = GetCurrentThreadId();
+    const GhCopyTexRec& r = GhCtrSlot(tid);
+    if (r.tid != tid || !r.seq){
+        Diag("  COPYTEX none recorded on tid " + std::to_string((unsigned long)tid) +
+             " (total=" + std::to_string((long)InterlockedCompareExchange(&g_ctrN, 0, 0)) + ")");
+        return;
+    }
+    Diag("  COPYTEX tid=" + std::to_string((unsigned long)tid) +
+         " live=" + std::to_string((long)r.live) +
+         " seq=" + std::to_string((unsigned long long)r.seq) +
+         " total=" + std::to_string((long)InterlockedCompareExchange(&g_ctrN, 0, 0)) +
+         " cl=" + Hex((uint64_t)(uintptr_t)r.cl) +
+         " clType=" + std::to_string((long)r.clType) +
+         " req=" + std::to_string((long)r.clReqType) +
+         " dst=" + std::to_string((long)r.dx) + "," + std::to_string((long)r.dy) +
+         "," + std::to_string((long)r.dz));
+    GhCtrLocDump("dst", r.dst);
+    GhCtrLocDump("src", r.src);
+    if (r.nbox)
+        Diag("    srcBox l=" + std::to_string((long)r.box[0]) + " t=" + std::to_string((long)r.box[1]) +
+             " f=" + std::to_string((long)r.box[2]) + " r=" + std::to_string((long)r.box[3]) +
+             " b=" + std::to_string((long)r.box[4]) + " bk=" + std::to_string((long)r.box[5]));
+    else
+        Diag("    srcBox = null");
+}
+// #184. What the fault dump and the static RE together say, and what each of the
+// three modes below does about it.
+//
+// umd12ddi's copy emitter at +0x348B0 classifies both of its surfaces from a
+// 3-bit tag, and keeps one register per shape: r14 for the destination-shaped
+// tag-4 surface (a multi-plane depth-stencil), rdi for the source's. Tag 4 is
+// the planar one -- confirmed on the console, where the D32_FLOAT_S8X24_UINT
+// destination's driver record (resource+0x1C0) has tag 4 and the R8_UINT source's
+// has tag 1. At +0x3710B the emitter gates a whole region on the DESTINATION
+// being planar:
+//     test rdi,rdi                       ; je +0x3746D   (not planar -> generic path)
+//     test dword [rdi+0x1c],0x20000000   ; je +0x3746D
+// and then, at +0x3732D, reads [r14+0x78] -- the SOURCE's planar record --
+// unconditionally. Every sibling block in the same function guards that same read
+// with "test r14,r14 / je", so this one path is simply missing the check. r14 is
+// null for any ordinary single-plane source, so Tsushima copying its
+// compute-written R8_UINT stencil image into plane 1 of its depth buffer faults
+// the driver on the guest's own thread.
+//
+//   gh_copytex_ds = 1  drop the copy. A diagnostic, not a fix: it proves this call
+//                      is the death and shows how far the run gets without it.
+//   gh_copytex_ds = 2  route it through a DEFAULT-heap buffer, so the driver sees
+//                      texture->buffer then buffer->plane instead of one
+//                      texture->plane. Semantically identical, and it costs the
+//                      game nothing if the driver's linear path is whole.
+//   gh_copytex_ds = 3  repair the driver: patch the gate at +0x3710B to require
+//                      the source's planar record too, so the missing check is
+//                      there and the emitter falls to its own generic path.
+static LONG GhCopyTexDsMode()
+{
+    static LONG v = -1;
+    // #184 default 3: repair the driver's missing NULL check. Modes 0 (off) and
+    // 1 (drop the copy) stay reachable as diagnostics; mode 2 (buffer hop) is a
+    // measured dead end -- the defect keys off the DESTINATION, so the second leg
+    // faults exactly like the first.
+    if (v < 0) v = (LONG)GhCfgNumZ(L"gh_copytex_ds.txt", "GH_COPYTEX_DS", 3);
+    return v;
+}
+static bool GhPatchUmdPlanarCopy()
+{
+    static LONG once = 0; static bool done = false;
+    if (InterlockedCompareExchange(&once, 1, 0) != 0) return done;
+    HMODULE m = GetModuleHandleW(L"umd12ddi.dll");
+    if (!m){ Diag("UMDPATCH umd12ddi.dll not loaded"); return false; }
+    BYTE* const base = (BYTE*)m;
+    BYTE* const gate = base + 0x3710B;
+    // Verify before writing: these RVAs were read off THIS console's driver.
+    static const BYTE kWant[] = { 0x48,0x85,0xFF,                    // test rdi,rdi
+                                  0x0F,0x84,0x59,0x03,0x00,0x00,     // je  +0x3746D
+                                  0xF7,0x47,0x1C,0x00,0x00,0x00,0x20 };
+    if (memcmp(gate, kWant, sizeof(kWant)) != 0){
+        std::string got;
+        for (size_t i = 0; i < sizeof(kWant); ++i) got += Hex((uint32_t)gate[i]) + " ";
+        Diag("UMDPATCH signature mismatch at umd12ddi+0x3710B, got " + got + "-- not patching");
+        return false;
+    }
+    // The replacement needs 23 bytes and the site has 9, so the check goes in the
+    // module's own alignment padding. This build of umd12ddi has exactly three
+    // int3 runs long enough, all in .text, so the scan asks for no more than it
+    // needs; the jump is module-relative either way.
+    BYTE* cave = nullptr;
+    {
+        auto* dos = (IMAGE_DOS_HEADER*)base;
+        auto* nt  = (IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
+        IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+        for (UINT i = 0; i < nt->FileHeader.NumberOfSections && !cave; ++i){
+            if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+            BYTE* s = base + sec[i].VirtualAddress;
+            const DWORD n = sec[i].Misc.VirtualSize;
+            DWORD run = 0;
+            for (DWORD k = 0; k < n; ++k){
+                if (s[k] == 0xCC){ if (++run >= 23){ cave = s + k - run + 1; break; } }
+                else run = 0;
+            }
+        }
+    }
+    if (!cave){ Diag("UMDPATCH no 23-byte int3 run in umd12ddi"); return false; }
+
+    BYTE* const L    = base + 0x3746D;     // the emitter's own non-planar path
+    BYTE* const back = base + 0x37114;     // the flag test we displaced past
+    BYTE tr[23];
+    int o = 0;
+    tr[o++] = 0x48; tr[o++] = 0x85; tr[o++] = 0xFF;               // test rdi,rdi
+    tr[o++] = 0x0F; tr[o++] = 0x84;
+    { int32_t r = (int32_t)(L - (cave + o + 4)); memcpy(tr + o, &r, 4); o += 4; }
+    tr[o++] = 0x4D; tr[o++] = 0x85; tr[o++] = 0xF6;               // test r14,r14
+    tr[o++] = 0x0F; tr[o++] = 0x84;
+    { int32_t r = (int32_t)(L - (cave + o + 4)); memcpy(tr + o, &r, 4); o += 4; }
+    tr[o++] = 0xE9;
+    { int32_t r = (int32_t)(back - (cave + o + 4)); memcpy(tr + o, &r, 4); o += 4; }
+
+    DWORD prot = 0;
+    if (!VirtualProtect(cave, sizeof(tr), PAGE_EXECUTE_READWRITE, &prot)){
+        Diag("UMDPATCH VirtualProtect(cave) failed err=" + Hex(GetLastError())); return false;
+    }
+    memcpy(cave, tr, sizeof(tr));
+    VirtualProtect(cave, sizeof(tr), prot, &prot);
+
+    BYTE site[9];
+    site[0] = 0xE9;
+    { int32_t r = (int32_t)(cave - (gate + 5)); memcpy(site + 1, &r, 4); }
+    site[5] = site[6] = site[7] = site[8] = 0x90;
+    if (!VirtualProtect(gate, sizeof(site), PAGE_EXECUTE_READWRITE, &prot)){
+        Diag("UMDPATCH VirtualProtect(gate) failed err=" + Hex(GetLastError())); return false;
+    }
+    memcpy(gate, site, sizeof(site));
+    VirtualProtect(gate, sizeof(site), prot, &prot);
+    FlushInstructionCache(GetCurrentProcess(), base, 0x40000);
+    Diag("UMDPATCH umd12ddi+0x3710B -> cave+" + Hex((uint32_t)(uint64_t)(cave - base)) +
+         " (planar-destination copy now also requires a planar source)");
+    done = true;
+    return done;
+}
+// gh_copytex_ds=2. One DEFAULT-heap buffer, grown on demand, shared by every
+// re-routed copy and serialised by the barriers around it. These copies are rare
+// (Tsushima makes one per frame), so a second buffer would buy nothing.
+static ID3D12Resource* g_dsHop = nullptr;
+static UINT64          g_dsHopSize = 0;
+static SRWLOCK         g_dsHopLock = SRWLOCK_INIT;
+static bool GhCopyDsViaBuffer(ID3D12GraphicsCommandList* self,
+                              const D3D12_TEXTURE_COPY_LOCATION* dst, UINT x, UINT y, UINT z,
+                              const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* box)
+{
+    if (!src || !src->pResource || src->Type != D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX)
+        return false;
+    ID3D12Device* dev = nullptr;
+    if (FAILED(self->GetDevice(IID_PPV_ARGS(&dev))) || !dev) return false;
+    const D3D12_RESOURCE_DESC sd = src->pResource->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+    UINT   rows = 0; UINT64 rowSize = 0, total = 0;
+    dev->GetCopyableFootprints(&sd, src->SubresourceIndex, 1, 0, &fp, &rows, &rowSize, &total);
+    bool ok = false;
+    AcquireSRWLockExclusive(&g_dsHopLock);
+    if (total && (!g_dsHop || g_dsHopSize < total)){
+        if (g_dsHop){ g_dsHop->Release(); g_dsHop = nullptr; g_dsHopSize = 0; }
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = total; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_dsHop));
+        Diag("COPYTEXHOP buffer " + std::to_string((unsigned long long)total) +
+             " bytes hr=" + Hex((uint32_t)hr));
+        if (FAILED(hr)) g_dsHop = nullptr; else g_dsHopSize = total;
+    }
+    if (g_dsHop){
+        auto orig = (void (__stdcall*)(ID3D12GraphicsCommandList*, const void*, UINT, UINT, UINT,
+                                       const void*, const void*))GhClOrig(self, 16);
+        D3D12_TEXTURE_COPY_LOCATION lin{};
+        lin.pResource = g_dsHop;
+        lin.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        lin.PlacedFootprint = fp;
+        orig(self, &lin, 0, 0, 0, src, box);
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = g_dsHop;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        auto barr = (void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
+                                       const D3D12_RESOURCE_BARRIER*))GhClOrig(self, 26);
+        barr(self, 1, &b);
+        orig(self, dst, x, y, z, &lin, nullptr);
+        std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+        barr(self, 1, &b);
+        ok = true;
+    }
+    ReleaseSRWLockExclusive(&g_dsHopLock);
+    dev->Release();
+    return ok;
+}
 static void __stdcall Hook_CLCopyTextureRegion(ID3D12GraphicsCommandList* self,
     const void* d, UINT x, UINT y, UINT z, const void* sr, const void* box)
 {
     GhBarrFlushPending(self);
     if (GhOpMask() & 16) return;
+    GhCtrNote(self, d, x, y, z, sr, box);
+    // #184. The one shape the driver cannot record: a copy INTO a plane of a
+    // multi-plane depth-stencil surface from an ordinary single-plane one.
+    if (const LONG dsm = GhCopyTexDsMode()){
+        const GhCopyTexRec& r = GhCtrSlot(GetCurrentThreadId());
+        if (r.dst.res && (r.dst.rflags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
+            r.dst.type == 0 && r.dst.sub >= r.dst.rmips * (r.dst.rdepth ? r.dst.rdepth : 1)){
+            static volatile LONG hit = 0;
+            const LONG n = InterlockedIncrement(&hit);
+            if (n <= 4)
+                Diag("COPYTEXDS mode=" + std::to_string((long)dsm) + " n=" + std::to_string((long)n) +
+                     " dstsub=" + std::to_string((long)r.dst.sub) +
+                     " dstfmt=" + std::to_string((long)r.dst.rfmt) +
+                     " srcfmt=" + std::to_string((long)r.src.rfmt));
+            if (dsm == 1) return;
+            if (dsm == 2 && GhCopyDsViaBuffer(self,
+                    (const D3D12_TEXTURE_COPY_LOCATION*)d, x, y, z,
+                    (const D3D12_TEXTURE_COPY_LOCATION*)sr, (const D3D12_BOX*)box))
+                return;
+            // Patch once, then let the call through: the driver now sends a
+            // planar-destination / single-plane-source copy down its own general
+            // emitter at +0x3746D instead of the planar one that derefs a NULL
+            // source record. If the driver's bytes are not the ones we read off
+            // this console, there is nothing safe to call -- drop the copy rather
+            // than take the access violation.
+            if (dsm == 3 && !GhPatchUmdPlanarCopy()) return;
+        }
+    }
     if (!GhRecCap16(self, d, x, y, z, sr, box))
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, const void*, UINT, UINT, UINT,
                         const void*, const void*))GhClOrig(self, 16))(self, d, x, y, z, sr, box);
@@ -16499,6 +16859,7 @@ static HRESULT __stdcall Hook_D12CreateCL(ID3D12Device* self, UINT node, D3D12_C
     // commands goes into whatever allocator is named here -- and a relocation that only
     // covered Reset would leave that first recording in the guest's memory. Substitute
     // here too, so the whole stream really is the whole stream.
+    const D3D12_COMMAND_LIST_TYPE reqT = t;   // #184: before promotion
     t = GhPromoteCopy(t, "list");
     ID3D12CommandAllocator* useA = alloc;
     if (GhClReloc() && alloc)
@@ -16506,7 +16867,7 @@ static HRESULT __stdcall Hook_D12CreateCL(ID3D12Device* self, UINT node, D3D12_C
     HRESULT hr = orig(self, node, t, useA, init, riid, pp);
     if (FAILED(hr)) GhD12Failed(self, "CreateCommandList", hr);
     else if (pp && *pp){
-        GhCLAdd((ID3D12CommandList*)*pp, t);
+        GhCLAdd((ID3D12CommandList*)*pp, t, (LONG)reqT);
         // #158. Before any draw can be relocated, the exact set of list methods this
         // game calls has to be known: a relocated draw that is missing one piece of
         // pipeline state renders wrong or faults, and that is indistinguishable from
@@ -23374,6 +23735,7 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
     }
     // Resolve to module + offset so the address is meaningful across ASLR.
     HMODULE mod = nullptr;
+    uint64_t umdOff = 0;            // nonzero once we know the fault is in umd12ddi
     if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            (LPCWSTR)addr, &mod) && mod){
@@ -23381,6 +23743,8 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
         std::wstring mw(mp, n); size_t sl = mw.find_last_of(L"\\/");
         std::string base = std::string(mw.begin()+(sl==std::wstring::npos?0:sl+1), mw.end());
         line += " (" + base + "+" + Hex((uint64_t)addr - (uint64_t)mod) + ")";
+        if (_stricmp(base.c_str(), "umd12ddi.dll") == 0)
+            umdOff = (uint64_t)addr - (uint64_t)mod;
     }
 #if defined(GH_X86_GUEST) && defined(GH_X86_JIT)
     else {
@@ -23442,6 +23806,69 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
     __try { ret = *(uintptr_t*)c->Rsp; }
     __except (EXCEPTION_EXECUTE_HANDLER) { ret = 0; }
     Diag("  ret=" + NameForCodeAddr(ret));
+    // A register dump names the instruction; only the stack names the CALL. The
+    // driver reaches its command-recording code through a DDI function table, so
+    // there is no static caller to find -- the chain D3D12Core -> umd12ddi and the
+    // guest frame above it exist only at runtime. GhGsCollect already does this
+    // walk (it is how #183 named the entry frame); here we want the names, not
+    // the cookie arithmetic.
+    if (GhCfgNumZ(L"gh_veh_stack.txt", "GH_VEH_STACK", 1)){
+        static GhGsRec vrecs[48];
+        const int vn = GhGsCollect(c, vrecs, 48);
+        Diag("  VEHWALK n=" + std::to_string(vn));
+        for (int i = 0; i < vn; ++i){
+            std::string l = "    veh#" + std::to_string(i) + " " +
+                            NameForCodeAddr(vrecs[i].rip);
+            if (vrecs[i].imgBase)
+                l += " fn=+" + Hex((uint32_t)vrecs[i].fnRva) +
+                     " est=" + Hex(vrecs[i].est);
+            Diag(l);
+        }
+    }
+    // #184. The D3D12 call the driver is inside, as the guest made it. The driver's
+    // branch is decided by arguments we forward untouched, so this names the copy
+    // without another frame of driver RE.
+    if (umdOff) GhCtrDump();
+    // The one frame we already reverse-engineered. umd12ddi's command-recording
+    // function at +0x348B0 is entered with six arguments and immediately does
+    //   rcx = arg6; if (((*(DWORD*)(rcx+0x20) >> 11) & 7) == 4) r14 = align8(rcx+0x47);
+    //   else r14 = 0;
+    // and +0x3732D then reads [r14+0x78] unconditionally. So a null r14 there is
+    // arg6 carrying the wrong 3-bit tag, and arg6 is the object to look at. Its
+    // frame is confirmed intact when rbp-rsp == 0x120 (lea rbp,[rsp-0x130] then
+    // sub rsp,0x250 over five pushes), which is the only case we decode.
+    if (umdOff >= 0x348B0 && umdOff < 0x37CF9 && (c->Rbp - c->Rsp) == 0x120){
+        const uintptr_t R = (uintptr_t)(c->Rbp + 0x158);   // the return address slot
+        Diag("  UMDFRAME retslot=" + Hex(R) + " (fn=+0x348B0 +" +
+             Hex((uint32_t)(umdOff - 0x348B0)) + ")");
+        static const struct { const char* n; uint32_t off; } kSlots[] = {
+            {"a1/rcx", 0x08}, {"a2/rdx", 0x10}, {"a3/r8 (clobbered)", 0x18},
+            {"a4/r9 (clobbered)", 0x20}, {"a5", 0x28}, {"a6", 0x30},
+        };
+        uintptr_t a6 = 0;
+        for (auto& sl : kSlots){
+            uintptr_t v = 0;
+            if (!SafeQword(R + sl.off, &v)){ Diag(std::string("    ") + sl.n + " unreadable"); continue; }
+            Diag(std::string("    ") + sl.n + " = " + Hex((uint64_t)v));
+            if (sl.off == 0x30) a6 = v;
+        }
+        if (a6 >= 0x10000){
+            uintptr_t tag = 0;
+            if (SafeQword(a6 + 0x20, &tag))
+                Diag("    a6+0x20 dword = " + Hex((uint32_t)tag) +
+                     "  tag=(>>11)&7 = " + std::to_string((unsigned)((tag >> 11) & 7)) +
+                     "  (r14 is null for every value except 4)");
+            std::string d;
+            for (int k = 0; k < 18; ++k){
+                uintptr_t v = 0;
+                d += " " + (SafeQword(a6 + (uintptr_t)k * 8, &v) ? Hex((uint64_t)v) : std::string("??"));
+                if ((k & 3) == 3){ Diag("    a6+" + Hex((uint32_t)((k - 3) * 8)) + d); d.clear(); }
+            }
+            if (!d.empty()) Diag("    a6+0x80" + d);
+        } else {
+            Diag("    a6 is not a pointer");
+        }
+    }
     // The first four integer-argument registers usually point at something that
     // names the call: a COM object (whose first qword is its vtable), an IID, or
     // an out-parameter. Sixteen bytes of each is enough to read an IID straight
