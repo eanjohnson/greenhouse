@@ -22589,6 +22589,71 @@ static uint64_t GhStackKey(void** bt, USHORT nb)
     return h;
 }
 
+// #183. RtlCaptureStackBackTrace stops dead at the guest's __GSHandlerCheck, so
+// the first 0xC0000409 named its own five frames and nothing underneath them --
+// not the dispatcher, not the exception being dispatched, and not the frame the
+// cookie check rejected. RtlVirtualUnwind goes all the way. While walking, redo
+// for every frame exactly what __GSHandlerCheckCommon does:
+//     framebase = EstablisherFrame, adjusted by the alignment pair when bit 2 of
+//                 the GS handler data is set
+//     stored    = *(ULONG64*)(framebase + (gsd & ~7))
+//     calc      = (EstablisherFrame + (UNWIND_INFO[3] & 0xF0)) ^ stored
+// and calc must equal __security_cookie. The frame where it does not is the one
+// that started this. Plain types and one __try only -- a function that unwinds
+// C++ objects cannot host __try, and a corrupt frame must abort the walk rather
+// than the process.
+struct GhGsRec {
+    uintptr_t rip; DWORD64 est, imgBase; DWORD fnRva, hndRva, gsd;
+    uint64_t stored, calc; BYTE has;
+};
+
+static int GhGsCollect(const CONTEXT* start, GhGsRec* out, int cap)
+{
+    CONTEXT ctx = *start;
+    int n = 0;
+    __try {
+        while (n < cap && ctx.Rip){
+            GhGsRec* r = out + n;
+            memset(r, 0, sizeof(*r));
+            r->rip = (uintptr_t)ctx.Rip;
+            ++n;
+            DWORD64 prevRsp = ctx.Rsp, imgBase = 0;
+            PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(ctx.Rip, &imgBase, nullptr);
+            if (!rf){
+                // Same leaf rule as GhCaptureStack: no unwind info, so [rsp] is
+                // the return address. True for our stubs and for the guest's
+                // hand-written failure thunk at GUEST+0x440C50.
+                DWORD64 ra = *(DWORD64*)ctx.Rsp;
+                if (!ra) break;
+                ctx.Rip = ra; ctx.Rsp += 8;
+            } else {
+                PVOID hd = nullptr; DWORD64 est = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, imgBase, ctx.Rip, rf,
+                                 &ctx, &hd, &est, nullptr);
+                r->imgBase = imgBase; r->est = est; r->fnRva = rf->BeginAddress;
+                const BYTE* ui = (const BYTE*)(imgBase + rf->UnwindData);
+                const BYTE fl = (BYTE)(ui[0] >> 3), nc = ui[2], fr = ui[3];
+                if (fl & 3){
+                    // The handler RVA follows the unwind codes, padded to an
+                    // even count; the handler's own data follows the RVA.
+                    const DWORD* aft = (const DWORD*)(ui + 4 + 2 * ((nc + 1) & ~1));
+                    const DWORD* g = aft + 1;
+                    r->hndRva = aft[0]; r->gsd = g[0]; r->has = 1;
+                    DWORD64 fb = est;
+                    if (g[0] & 4)
+                        fb = (DWORD64)(((INT64)est + (INT32)g[1]) &
+                                       (INT64)(-(INT32)g[2]));
+                    r->stored = *(const uint64_t*)(fb + (g[0] & ~7u));
+                    r->calc = (est + (fr & 0xF0)) ^ r->stored;
+                    r->has = 2;
+                }
+            }
+            if (!ctx.Rip || ctx.Rsp <= prevRsp) break;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    return n;
+}
+
 static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
 {
     // #183. The guest main thread's live stack is a five-frame cycle -- guest
@@ -22636,11 +22701,21 @@ static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
             Diag("GSFAIL cookie=" + Hex(ck) + " compl=" + Hex(ckc) +
                  " sum=" + Hex((uint64_t)(ck + ckc)) +
                  " (on-disk default 0x00002B992DDFA232, complement must be ~cookie)");
-            void* bt[48] = {};
-            const USHORT nb = RtlCaptureStackBackTrace(0, 48, bt, nullptr);
-            for (USHORT b = 0; b < nb; ++b)
-                Diag("  gsfail#" + std::to_string(b) + " " +
-                     NameForCodeAddr((uintptr_t)bt[b]));
+            static GhGsRec recs[64];
+            const int nr = GhGsCollect(ep->ContextRecord, recs, 64);
+            for (int i = 0; i < nr; ++i){
+                const GhGsRec& r = recs[i];
+                std::string l = "  gsw#" + std::to_string(i) + " " +
+                                NameForCodeAddr(r.rip);
+                if (r.imgBase)
+                    l += " fn=+" + Hex((uint32_t)r.fnRva) + " est=" + Hex(r.est);
+                if (r.has)
+                    l += " hnd=" + NameForCodeAddr((uintptr_t)(r.imgBase + r.hndRva));
+                if (r.has == 2)
+                    l += " gsd=" + Hex((uint32_t)r.gsd) + " stored=" + Hex(r.stored) +
+                         " calc=" + Hex(r.calc) + (r.calc == ck ? " GSOK" : " GSBAD");
+                Diag(l);
+            }
         }
         // #183 gh_gs_ignore, default 0 = off. If the cookie check is failing for
         // an environmental reason rather than a real smashed frame, the guest is
