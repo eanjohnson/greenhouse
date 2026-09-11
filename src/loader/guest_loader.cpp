@@ -22610,13 +22610,28 @@ struct GhGsRec {
 static int GhGsCollect(const CONTEXT* start, GhGsRec* out, int cap)
 {
     CONTEXT ctx = *start;
-    int n = 0;
+    // Run 0.0.431.0 returned n=0 with the walk clearly reachable, which is the
+    // classic __try pitfall: a counter the compiler keeps in a register inside
+    // the guarded body reads back stale in and after __except. The first frame
+    // is KERNELBASE's RaiseException and cannot fail to be recorded, so a zero
+    // return means a fault later in the walk lost every frame before it.
+    // volatile forces the count to memory, and then a fault costs one frame
+    // instead of the whole walk.
+    volatile int n = 0;
+    // The walk's own stack, for the bounds check below. The guest worker's are
+    // already known; for any other thread take them from the TEB.
+    DWORD64 lo = g_guestStackLow, hi = g_guestStackHigh;
+    if (!lo || !hi || ctx.Rsp < lo || ctx.Rsp >= hi){
+        const NT_TIB* tib = (const NT_TIB*)NtCurrentTeb();
+        lo = (DWORD64)(uintptr_t)tib->StackLimit;
+        hi = (DWORD64)(uintptr_t)tib->StackBase;
+    }
     __try {
         while (n < cap && ctx.Rip){
             GhGsRec* r = out + n;
             memset(r, 0, sizeof(*r));
             r->rip = (uintptr_t)ctx.Rip;
-            ++n;
+            n = n + 1;
             DWORD64 prevRsp = ctx.Rsp, imgBase = 0;
             PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(ctx.Rip, &imgBase, nullptr);
             if (!rf){
@@ -22643,9 +22658,18 @@ static int GhGsCollect(const CONTEXT* start, GhGsRec* out, int cap)
                     if (g[0] & 4)
                         fb = (DWORD64)(((INT64)est + (INT32)g[1]) &
                                        (INT64)(-(INT32)g[2]));
-                    r->stored = *(const uint64_t*)(fb + (g[0] & ~7u));
-                    r->calc = (est + (fr & 0xF0)) ^ r->stored;
-                    r->has = 2;
+                    // Only a GS handler's data begins with a cookie offset. For
+                    // __CxxFrameHandler4 the same dword is a FuncInfo RVA in the
+                    // megabytes, so reading at framebase+that walks off the stack
+                    // and faults -- which is what lost run 0.0.431.0's whole walk.
+                    // A cookie lives in its own frame, so require an offset that
+                    // could be one and an address inside this thread's stack.
+                    const DWORD64 at = fb + (g[0] & ~7u);
+                    if ((g[0] & ~7u) < 0x10000 && at >= lo && at + 8 <= hi){
+                        r->stored = *(const uint64_t*)at;
+                        r->calc = (est + (fr & 0xF0)) ^ r->stored;
+                        r->has = 2;
+                    }
                 }
             }
             if (!ctx.Rip || ctx.Rsp <= prevRsp) break;
@@ -22703,6 +22727,9 @@ static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
                  " (on-disk default 0x00002B992DDFA232, complement must be ~cookie)");
             static GhGsRec recs[64];
             const int nr = GhGsCollect(ep->ContextRecord, recs, 64);
+            Diag("GSWALK n=" + std::to_string(nr) +
+                 " rip0=" + Hex((uint64_t)ep->ContextRecord->Rip) +
+                 " rsp0=" + Hex((uint64_t)ep->ContextRecord->Rsp));
             for (int i = 0; i < nr; ++i){
                 const GhGsRec& r = recs[i];
                 std::string l = "  gsw#" + std::to_string(i) + " " +
@@ -25007,6 +25034,79 @@ static bool MapAndRun32(const std::vector<uint8_t>& file)
 }
 #endif
 
+// #183. Tsushima's PE entry point at GUEST+0x408AF0 is itself /GS-protected:
+//     mov rax,[__security_cookie] ; xor rax,rsp ; mov [rsp+0x30],rax
+// and it runs BEFORE anything calls __security_init_cookie, so the cookie it
+// stores is derived from the image's on-disk default. The CRT then randomises
+// the global from inside that very frame. From that moment the bottom frame of
+// the guest's main thread disagrees with every other frame, and the run 0.0.432.0
+// walk shows it exactly: five guest frames GSOK against the live cookie
+// 0x70DBD4D343AC, and the entry frame alone computing 0x2B992DDFA232 -- the
+// default, to the bit.
+//
+// Nothing notices until an exception is dispatched all the way down. Then
+// __GSHandlerCheck runs on the entry frame, fails, and __report_gsfailure raises
+// NONCONTINUABLE 0xC0000409 -- which is dispatched down the same stack, reaches
+// the same frame, and fails again. 4141 bytes of stack a turn until the 64 MB is
+// gone. On a real desktop the same frame is just as stale; it never matters
+// because nothing there dispatches an unclaimed exception past the CRT's own
+// __except.
+//
+// The repair is the guest's own: seed the cookie before calling the entry point.
+// __security_init_cookie recomputes ONLY when it still finds the default
+// (0x140D1A911: cmp against 0x2B992DDFA232, jne past the store), so a value
+// planted now is the value the whole process keeps, the entry prologue included.
+// Generic, not Tsushima-specific: the cookie's address is a standard PE load
+// config field and that guard is in every MSVC x64 CRT.
+static void GhSeedGuestCookie(uint8_t* base, IMAGE_NT_HEADERS64* nt)
+{
+    if (!GhCfgNumZ(L"gh_gs_seed.txt", "GH_GS_SEED", 1)) return;
+    const auto& d = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+    if (!d.Size || !d.VirtualAddress){ Diag("GSSEED no load config"); return; }
+    auto* lc = (IMAGE_LOAD_CONFIG_DIRECTORY64*)(base + d.VirtualAddress);
+    const DWORD need = (DWORD)(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, SecurityCookie) + 8);
+    if (lc->Size < need || !lc->SecurityCookie){ Diag("GSSEED no cookie field"); return; }
+    // The field is a VA against the image's preferred base, not an RVA.
+    const uintptr_t va = (uintptr_t)lc->SecurityCookie;
+    const uintptr_t pref = (uintptr_t)nt->OptionalHeader.ImageBase;
+    if (va < pref || va - pref >= nt->OptionalHeader.SizeOfImage){
+        Diag("GSSEED cookie VA " + Hex((uint64_t)va) + " outside the image");
+        return;
+    }
+    uint64_t* ck = (uint64_t*)(base + (va - pref));
+    const uint64_t kDefault = 0x00002B992DDFA232ULL;
+    if (*ck != kDefault){
+        Diag("GSSEED cookie already " + Hex(*ck) + ", left alone");
+        return;
+    }
+    // Same shape the CRT would produce: 48 bits, never zero, never the default,
+    // because __security_check_cookie also rejects a nonzero top word. The CRT
+    // mixes the same sources -- tick count, performance counter, thread and
+    // process id, a stack address -- so this is its recipe, not a weaker one.
+    LARGE_INTEGER qpc{}; QueryPerformanceCounter(&qpc);
+    FILETIME ft{}; GetSystemTimePreciseAsFileTime(&ft);
+    uint64_t v = (uint64_t)qpc.QuadPart;
+    v ^= ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    v ^= (uint64_t)GetTickCount64() << 17;
+    v ^= (uint64_t)(uintptr_t)&qpc << 23;
+    v ^= (uint64_t)GetCurrentThreadId() << 41;
+    v ^= (uint64_t)GetCurrentProcessId() << 5;
+    // splitmix64's finaliser, so neighbouring counters do not give neighbouring
+    // cookies.
+    v ^= v >> 30; v *= 0xBF58476D1CE4E5B9ULL;
+    v ^= v >> 27; v *= 0x94D049BB133111EBULL;
+    v ^= v >> 31;
+    v &= 0x0000FFFFFFFFFFFFULL;
+    if (!v || v == kDefault) v = kDefault + 1;
+    DWORD old = 0;
+    VirtualProtect(ck, 16, PAGE_READWRITE, &old);
+    *(ck - 1) = ~v;      // the complement MSVC keeps in the word below
+    *ck = v;
+    if (old) VirtualProtect(ck, 16, old, &old);
+    Diag("GSSEED cookie at " + Hex((uint64_t)(uintptr_t)ck) + " GUEST+" +
+         Hex((uint32_t)(va - pref)) + " " + Hex(kDefault) + " -> " + Hex(v));
+}
+
 static bool MapAndRun(std::vector<uint8_t>& file)
 {
 #ifdef GH_LAUNCHER
@@ -25174,6 +25274,9 @@ static bool MapAndRun(std::vector<uint8_t>& file)
 
     RunGuestTlsCallbacks(base);
 
+    // #183. Before the entry point, not after: its own prologue is the first
+    // reader of the cookie.
+    GhSeedGuestCookie(base, nt);
 
     // Call the entry point, guarded so guest exit() returns here. SEH lives in
     // CallGuestEntry (no C++ unwind objects) so an AV cannot kill the process.
