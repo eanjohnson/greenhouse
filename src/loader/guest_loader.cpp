@@ -9397,6 +9397,52 @@ static bool GhNoopComputeShader(D3D12_SHADER_BYTECODE* out)
     return ok;
 }
 
+// #188 axis (b). The vertex half of the same idea: a shader that reads nothing
+// and collapses every vertex onto one point. Reading nothing is what makes it a
+// universal stand-in -- no input layout, no root signature and no descriptor
+// table can disagree with a shader that binds none of them -- and collapsing the
+// position means that even if a draw bound to it is allowed through, every
+// primitive is degenerate and the rasterizer throws it away before any pixel is
+// shaded. There is deliberately no pixel-shader counterpart: a NULL PS is legal
+// in every configuration, so one stand-in covers depth-only passes and
+// multiple-render-target passes alike, whereas a PS writing SV_Target0 would be
+// invalid the moment NumRenderTargets is zero.
+static bool GhNoopVertexShader(D3D12_SHADER_BYTECODE* out)
+{
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static com_ptr<ID3DBlob> blob;
+    static bool tried = false;
+    AcquireSRWLockExclusive(&lock);
+    if (!tried){
+        tried = true;
+        HMODULE dc = GetModuleHandleA("d3dcompiler_47.dll");
+        if (!dc) dc = LoadLibraryA("d3dcompiler_47.dll");
+        using CompileFn = HRESULT (WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const void*, void*,
+                                            LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+        auto compile = dc ? (CompileFn)GetProcAddress(dc, "D3DCompile") : nullptr;
+        if (!compile){
+            Diag("PSOSTANDIN no D3DCompile err=" + Hex(GetLastError()));
+        } else {
+            static const char kHlsl[] =
+                "float4 vsmain() : SV_POSITION { return float4(0,0,0,1); }\n";
+            com_ptr<ID3DBlob> err;
+            HRESULT hr = compile(kHlsl, sizeof(kHlsl) - 1, "ghnoopvs.hlsl", nullptr, nullptr,
+                                 "vsmain", "vs_5_0", 0, 0, blob.put(), err.put());
+            Diag("PSOSTANDIN vs compile hr=" + Hex((uint32_t)hr) + " bytes=" +
+                 std::to_string(blob ? (unsigned)blob->GetBufferSize() : 0u) +
+                 (FAILED(hr) && err ? std::string(" err=") + (const char*)err->GetBufferPointer()
+                                    : std::string()));
+        }
+    }
+    bool ok = (bool)blob;
+    if (ok){
+        out->pShaderBytecode = blob->GetBufferPointer();
+        out->BytecodeLength  = blob->GetBufferSize();
+    }
+    ReleaseSRWLockExclusive(&lock);
+    return ok;
+}
+
 // Compile a trivial VS/PS on-device and build the simplest legal PSO over them.
 // If THIS succeeds, the driver compiles DXBC fine and the fault is something in
 // the guest's desc; if it crashes too, the D3D12 path really is unusable and the
@@ -9607,6 +9653,294 @@ static void GhPsoDumpAt(void* pso, LONG g)
 static unsigned GhNullPs()
 { static const unsigned v = (unsigned)GhCfgNum(L"gh_null_ps.txt", "GH_NULL_PS", 0); return v; }
 static volatile LONG g_nullPsN = 0;   // PSOs actually stripped; the knob's proof of life
+
+// ---------------------------------------------------------------- #188 axis (b)
+// The guest ignores CreateGraphicsPipelineState's HRESULT and stores whatever
+// came back in the out parameter (#173), then dereferences it. Axis (a) closed
+// the shader corpus so there is nothing left for #186's screen to refuse, and
+// that is the fix; this is the other half, and it is a DIAGNOSTIC lever rather
+// than a shipping answer: when a pipeline cannot be made for any reason, hand
+// back a valid pipeline that draws nothing, so the process survives to reach
+// whatever the NEXT wall is instead of dying on our own null.
+//
+//   gh_pso_standin = 0  off -- E_FAIL and a null pipeline, as before
+//                    1  serve a stand-in, and drop the draws bound to it
+//                    2  also serve one after the device has been removed, where
+//                       nothing new can be created and only a cached object exists
+//                    3  as 2, but let the stand-in's draws run (the control that
+//                       says whether dropping them mattered)
+//
+// GhCfgNumZ, so 0 stays expressible.
+static unsigned GhPsoStandIn()
+{
+    static const unsigned v = (unsigned)GhCfgNumZ(L"gh_pso_standin.txt", "GH_PSO_STANDIN", 0);
+    return v;
+}
+
+// Every stand-in we hand out, so the draw path can recognise one. A fixed array
+// rather than a container: this is read on the hot draw path from every recording
+// thread, and the count is normally zero, which costs one load. Pointers are
+// never removed -- the cache holds a reference for the life of the process, so a
+// pointer in here can never be reused by a different object.
+static const int kStandInMax = 128;
+static ID3D12PipelineState* volatile g_standIn[kStandInMax];
+static volatile LONG g_standInN = 0;
+static void GhStandInNote(ID3D12PipelineState* p)
+{
+    if (!p) return;
+    const LONG i = InterlockedIncrement(&g_standInN) - 1;
+    if (i < kStandInMax) InterlockedExchangePointer((void**)&g_standIn[i], p);
+}
+static bool GhIsStandIn(void* p)
+{
+    if (!p) return false;
+    LONG n = InterlockedCompareExchange(&g_standInN, 0, 0);
+    if (n > kStandInMax) n = kStandInMax;
+    for (LONG i = 0; i < n; ++i)
+        if ((void*)g_standIn[i] == p) return true;
+    return false;
+}
+
+// One stand-in per output-merger shape. The shape is what PSO creation actually
+// validates -- render-target formats, depth format, sample count, topology class
+// -- and the root signature has to be the guest's own because a pipeline carries
+// one. Everything else about the desc is irrelevant once the shaders read
+// nothing. The cache exists for two reasons: creating a pipeline per refusal
+// would be its own compile storm, and, more importantly, mode 2 needs an object
+// that was built while the device was still alive.
+struct GhStandInKey {
+    ID3D12RootSignature* rs;
+    UINT nrt, samples, quality, topo;
+    UINT rtv[8], dsv;
+};
+static SRWLOCK g_standInLock = SRWLOCK_INIT;
+static std::vector<std::pair<GhStandInKey, ID3D12PipelineState*>> g_standInCache;
+
+static GhStandInKey GhStandInKeyOf(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d)
+{
+    GhStandInKey k{};                       // zero-filled: memcmp compares padding too
+    if (!d) return k;
+    k.rs      = d->pRootSignature;
+    k.nrt     = d->NumRenderTargets > 8 ? 8 : d->NumRenderTargets;
+    k.samples = d->SampleDesc.Count;
+    k.quality = d->SampleDesc.Quality;
+    k.topo    = (UINT)d->PrimitiveTopologyType;
+    k.dsv     = (UINT)d->DSVFormat;
+    for (UINT i = 0; i < k.nrt; ++i) k.rtv[i] = (UINT)d->RTVFormats[i];
+    // A patch topology with no hull or domain shader is not a legal pipeline, and
+    // the stand-in has neither, so those descs are served by the triangle entry.
+    if (k.topo == (UINT)D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH)
+        k.topo = (UINT)D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    return k;
+}
+
+// Build (or find) the stand-in for this desc. Returns nullptr without touching
+// the driver if the device is already removed -- after a removal every create
+// fails, and asking again only adds a line to the log.
+static ID3D12PipelineState* GhStandInFor(ID3D12Device* dev, GhGpsFn orig,
+                                         const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d)
+{
+    if (!dev || !orig || !d) return nullptr;
+    const GhStandInKey key = GhStandInKeyOf(d);
+    AcquireSRWLockExclusive(&g_standInLock);
+    for (auto& e : g_standInCache)
+        if (memcmp(&e.first, &key, sizeof(key)) == 0){
+            ID3D12PipelineState* hit = e.second;
+            ReleaseSRWLockExclusive(&g_standInLock);
+            return hit;
+        }
+    ReleaseSRWLockExclusive(&g_standInLock);
+
+    D3D12_SHADER_BYTECODE vs{};
+    if (!GhNoopVertexShader(&vs)) return nullptr;
+
+    // Keep the guest's output-merger state, because the formats in the key and
+    // the state that reads them have to agree; replace every programmable stage
+    // and everything that feeds one. The input layout goes because our VS reads
+    // no vertex attributes, the stream output goes with the geometry shader, and
+    // the cached blob goes because it describes the pipeline we are NOT building.
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC sd = *d;
+    sd.VS = vs;
+    sd.PS = D3D12_SHADER_BYTECODE{};
+    sd.GS = D3D12_SHADER_BYTECODE{};
+    sd.HS = D3D12_SHADER_BYTECODE{};
+    sd.DS = D3D12_SHADER_BYTECODE{};
+    sd.StreamOutput = D3D12_STREAM_OUTPUT_DESC{};
+    sd.InputLayout = D3D12_INPUT_LAYOUT_DESC{};
+    sd.CachedPSO = D3D12_CACHED_PIPELINE_STATE{};
+    sd.PrimitiveTopologyType = (D3D12_PRIMITIVE_TOPOLOGY_TYPE)key.topo;
+    sd.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+
+    void* made = nullptr;
+    DWORD fault = 0;
+    const HRESULT hr = GhTryCreateGPS(orig, dev, &sd, __uuidof(ID3D12PipelineState),
+                                      &made, &fault);
+    static volatile LONG built = 0, failed = 0;
+    if (FAILED(hr) || !made){
+        const LONG nf = InterlockedIncrement(&failed);
+        if (nf <= 8)
+            Diag("  PSOSTANDIN build FAILED hr=" + Hex((uint32_t)hr) +
+                 (fault ? " FAULT=" + Hex((uint32_t)fault) : "") +
+                 " nrt=" + std::to_string((unsigned long)key.nrt) +
+                 " rtv0=" + std::to_string((unsigned long)key.rtv[0]) +
+                 " dsv=" + std::to_string((unsigned long)key.dsv) +
+                 " samples=" + std::to_string((unsigned long)key.samples) +
+                 " topo=" + std::to_string((unsigned long)key.topo) +
+                 " drr=" + Hex((uint32_t)dev->GetDeviceRemovedReason()) +
+                 " n=" + std::to_string((long)nf));
+        return nullptr;
+    }
+    ID3D12PipelineState* pso = (ID3D12PipelineState*)made;
+    AcquireSRWLockExclusive(&g_standInLock);
+    // Somebody may have built the same shape while we were compiling. Keep both
+    // -- ours is already registered as a stand-in, and the cache is bounded by
+    // the number of output-merger shapes the game uses, not by the refusal count.
+    g_standInCache.emplace_back(key, pso);           // the cache's own reference
+    const size_t cached = g_standInCache.size();
+    ReleaseSRWLockExclusive(&g_standInLock);
+    GhStandInNote(pso);
+    Diag("  PSOSTANDIN built n=" + std::to_string((long)InterlockedIncrement(&built)) +
+         " pso=" + Hex((uint64_t)(uintptr_t)pso) +
+         " shapes=" + std::to_string((unsigned long)cached) +
+         " nrt=" + std::to_string((unsigned long)key.nrt) +
+         " rtv0=" + std::to_string((unsigned long)key.rtv[0]) +
+         " dsv=" + std::to_string((unsigned long)key.dsv) +
+         " samples=" + std::to_string((unsigned long)key.samples) +
+         " topo=" + std::to_string((unsigned long)key.topo));
+    return pso;
+}
+
+// The last resort for mode 2: any stand-in at all. After a device removal the
+// formats no longer matter -- every command recorded against the dead device is
+// discarded -- and the only thing that still matters is that the guest gets a
+// pointer it can dereference instead of a null.
+static ID3D12PipelineState* GhStandInAny()
+{
+    ID3D12PipelineState* p = nullptr;
+    AcquireSRWLockExclusive(&g_standInLock);
+    if (!g_standInCache.empty()) p = g_standInCache.back().second;
+    ReleaseSRWLockExclusive(&g_standInLock);
+    return p;
+}
+
+// The single exit every refusal in the graphics hook goes through. Returns true
+// when *pp has been filled, in which case the caller returns S_OK: a guest that
+// ignores the HRESULT would ignore a failure code here too, and returning S_OK
+// keeps the object and the status telling the same story.
+static bool GhGpsServeStandIn(ID3D12Device* dev, GhGpsFn orig,
+                              const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d,
+                              REFIID riid, void** pp, const char* why)
+{
+    const unsigned mode = GhPsoStandIn();
+    if (!mode || !pp) return false;
+    // Only the pipeline-state interface can be served. The guest asks for nothing
+    // else here, but a stand-in for an interface we did not build would be a
+    // wrong pointer rather than a missing one, which is worse.
+    if (riid != __uuidof(ID3D12PipelineState)) return false;
+
+    const HRESULT removed = dev ? dev->GetDeviceRemovedReason() : S_OK;
+    ID3D12PipelineState* pso = nullptr;
+    if (removed == S_OK) pso = GhStandInFor(dev, orig, d);
+    if (!pso && mode >= 2)   pso = GhStandInAny();
+    if (!pso){
+        static volatile LONG miss = 0;
+        const LONG n = InterlockedIncrement(&miss);
+        if (n <= 8)
+            Diag(std::string("  PSOSTANDIN none for ") + why +
+                 " drr=" + Hex((uint32_t)removed) +
+                 " n=" + std::to_string((long)n) + "; the guest gets a null pipeline");
+        return false;
+    }
+    pso->AddRef();                                   // the guest's own reference
+    *pp = pso;
+    static volatile LONG served = 0;
+    const LONG n = InterlockedIncrement(&served);
+    if (n <= 16 || (n % 64) == 0)
+        Diag(std::string("  PSOSTANDIN served ") + why +
+             " pso=" + Hex((uint64_t)(uintptr_t)pso) +
+             " drr=" + Hex((uint32_t)removed) +
+             " n=" + std::to_string((long)n) +
+             (removed == S_OK ? "" : " (cached; device already removed)"));
+    return true;
+}
+
+// The compute half. Simpler than the graphics one because a compute pipeline has
+// no output-merger shape to match -- a no-op CS over the guest's own root
+// signature is legal for every dispatch -- so one object per root signature
+// covers everything, and in practice that is one object.
+static SRWLOCK g_cpsStandInLock = SRWLOCK_INIT;
+static std::vector<std::pair<ID3D12RootSignature*, ID3D12PipelineState*>> g_cpsStandInCache;
+static ID3D12PipelineState* GhCpsStandInFor(ID3D12Device* dev, GhCpsRawFn orig,
+                                            const D3D12_COMPUTE_PIPELINE_STATE_DESC* d)
+{
+    if (!dev || !orig || !d) return nullptr;
+    AcquireSRWLockExclusive(&g_cpsStandInLock);
+    for (auto& e : g_cpsStandInCache)
+        if (e.first == d->pRootSignature){
+            ID3D12PipelineState* hit = e.second;
+            ReleaseSRWLockExclusive(&g_cpsStandInLock);
+            return hit;
+        }
+    ReleaseSRWLockExclusive(&g_cpsStandInLock);
+
+    D3D12_SHADER_BYTECODE nop{};
+    if (!GhNoopComputeShader(&nop)) return nullptr;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC sd = *d;
+    sd.CS = nop;
+    sd.CachedPSO = D3D12_CACHED_PIPELINE_STATE{};
+    sd.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+    void* made = nullptr;
+    DWORD fault = 0;
+    const HRESULT hr = GhCallCpsGuarded(orig, dev, &sd, __uuidof(ID3D12PipelineState),
+                                        &made, &fault);
+    if (FAILED(hr) || !made){
+        static volatile LONG failed = 0;
+        const LONG nf = InterlockedIncrement(&failed);
+        if (nf <= 8)
+            Diag("  PSOSTANDIN cs build FAILED hr=" + Hex((uint32_t)hr) +
+                 (fault ? " FAULT=" + Hex((uint32_t)fault) : "") +
+                 " drr=" + Hex((uint32_t)dev->GetDeviceRemovedReason()) +
+                 " n=" + std::to_string((long)nf));
+        return nullptr;
+    }
+    ID3D12PipelineState* pso = (ID3D12PipelineState*)made;
+    AcquireSRWLockExclusive(&g_cpsStandInLock);
+    g_cpsStandInCache.emplace_back(d->pRootSignature, pso);
+    ReleaseSRWLockExclusive(&g_cpsStandInLock);
+    GhStandInNote(pso);
+    static volatile LONG built = 0;
+    Diag("  PSOSTANDIN cs built n=" + std::to_string((long)InterlockedIncrement(&built)) +
+         " pso=" + Hex((uint64_t)(uintptr_t)pso));
+    return pso;
+}
+static bool GhCpsServeStandIn(ID3D12Device* dev, GhCpsRawFn orig,
+                              const D3D12_COMPUTE_PIPELINE_STATE_DESC* d,
+                              REFIID riid, void** pp, const char* why)
+{
+    const unsigned mode = GhPsoStandIn();
+    if (!mode || !pp) return false;
+    if (riid != __uuidof(ID3D12PipelineState)) return false;
+    const HRESULT removed = dev ? dev->GetDeviceRemovedReason() : S_OK;
+    ID3D12PipelineState* pso = nullptr;
+    if (removed == S_OK) pso = GhCpsStandInFor(dev, orig, d);
+    if (!pso && mode >= 2){
+        AcquireSRWLockExclusive(&g_cpsStandInLock);
+        if (!g_cpsStandInCache.empty()) pso = g_cpsStandInCache.back().second;
+        ReleaseSRWLockExclusive(&g_cpsStandInLock);
+    }
+    if (!pso) return false;
+    pso->AddRef();
+    *pp = pso;
+    static volatile LONG served = 0;
+    const LONG n = InterlockedIncrement(&served);
+    if (n <= 16 || (n % 64) == 0)
+        Diag(std::string("  PSOSTANDIN cs served ") + why +
+             " pso=" + Hex((uint64_t)(uintptr_t)pso) +
+             " drr=" + Hex((uint32_t)removed) +
+             " n=" + std::to_string((long)n) +
+             (removed == S_OK ? "" : " (cached; device already removed)"));
+    return true;
+}
 
 static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** pp)
@@ -9875,6 +10209,11 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
                  " VS=" + std::to_string((unsigned long long)use->VS.BytecodeLength) +
                  " PS=" + std::to_string((unsigned long long)use->PS.BytecodeLength) +
                  "; E_FAIL without calling the driver");
+            // #188 axis (b). Axis (a) should mean this branch is never taken at
+            // all -- cell A screened nothing -- but a shader the corpus has not
+            // met yet still lands here, and a null pipeline is the one outcome
+            // the guest cannot survive.
+            if (GhGpsServeStandIn(self, orig, use, riid, pp, "screened")) return S_OK;
             return E_FAIL;
         }
     }
@@ -9888,6 +10227,7 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     if (InterlockedCompareExchange(&faulted, 0, 0) >= faultBudget){
         if (pp) *pp = nullptr;
         Diag("  CreateGraphicsPipelineState skipped (already faulted); E_FAIL");
+        if (GhGpsServeStandIn(self, orig, d, riid, pp, "post-fault")) return S_OK;
         return E_FAIL;
     }
 
@@ -9940,6 +10280,7 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
              " HS=" + std::to_string(use ? (unsigned long long)use->HS.BytecodeLength : 0ull) +
              " DS=" + std::to_string(use ? (unsigned long long)use->DS.BytecodeLength : 0ull) +
              "; returning E_FAIL");
+        if (GhGpsServeStandIn(self, orig, use, riid, pp, "faulted")) return S_OK;
         return E_FAIL;
     }
     // Print the object pointer and the shader sizes: a GPUSUBMIT line records
@@ -9962,6 +10303,16 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
                                                d->PS.pShaderBytecode, d->PS.BytecodeLength);
         if (d) res += " vs=" + std::to_string((unsigned long long)d->VS.BytecodeLength) +
                       " ps=" + std::to_string((unsigned long long)d->PS.BytecodeLength);
+        // #188 axis (b). Build the first stand-in now, off a desc the driver
+        // has just accepted, rather than at the first refusal: by then the
+        // device may already be removed, and after a removal nothing can be
+        // created at all (see d3d12-removed-device-poisons-process). This is the
+        // object mode 2 hands out when there is no live device left to ask.
+        if (GhPsoStandIn() && use){
+            static LONG warmed = 0;
+            if (InterlockedCompareExchange(&warmed, 1, 0) == 0)
+                GhStandInFor(self, orig, use);
+        }
         if (d && GhSkipPsShaderSizes(d->VS.BytecodeLength, d->PS.BytecodeLength)){
             InterlockedExchangePointer((void**)&g_skipPso, *pp);
             res += " <<< gh_skip_vs/ps MATCHED -- every draw bound to this pipeline"
@@ -10023,6 +10374,12 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
         GhDumpFailedShader("vs", d->VS.pShaderBytecode, d->VS.BytecodeLength, self);
         GhDumpFailedShader("ps", d->PS.pShaderBytecode, d->PS.BytecodeLength, self);
     }
+    // #188 axis (b). The commonest refusal of all in cell A: the driver returned
+    // 0x887A0020 because the device had already died in EXECUTION (#189), and the
+    // four SHADERFAIL pipelines were only the messengers. Nothing can be built
+    // here, so mode 2 hands back one that was.
+    if (FAILED(hr) && (!pp || !*pp) &&
+        GhGpsServeStandIn(self, orig, use, riid, pp, "failed")) return S_OK;
     return hr;
 }
 static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
@@ -10171,6 +10528,14 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
             res += " CREATED pso=" + Hex((uint64_t)(uintptr_t)*pp) +
                    " cidx=" + std::to_string((long)InterlockedIncrement(&cpsIdx));
             if (d) res += " cs=" + std::to_string((unsigned long long)d->CS.BytecodeLength);
+            // #188 axis (b): build the compute stand-in now, for the same reason
+            // the graphics one is built off the first accepted desc -- after a
+            // removal there is no device left to build anything with.
+            if (GhPsoStandIn() && d){
+                static LONG warmed = 0;
+                if (InterlockedCompareExchange(&warmed, 1, 0) == 0)
+                    GhCpsStandInFor(self, (GhCpsRawFn)orig, d);
+            }
         }
         Diag(res);
     }
@@ -10192,7 +10557,12 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
                  " hr=" + Hex((uint32_t)hs) + (f2 ? " FAULT=" + Hex((uint32_t)f2) : "") +
                  " drr=" + Hex((uint32_t)self->GetDeviceRemovedReason()) +
                  (SUCCEEDED(hs) && pp && *pp ? " STOOD IN" : " none"));
-            if (SUCCEEDED(hs)) hr = hs;
+            if (SUCCEEDED(hs)){
+                hr = hs;
+                // #188 axis (b): the #182 stand-in is a stand-in too, so the
+                // dispatch path should know it and be able to drop its work.
+                if (pp && *pp) GhStandInNote((ID3D12PipelineState*)*pp);
+            }
         } else {
             Diag("  PSOSTANDIN no no-op shader; the guest gets a null pipeline");
         }
@@ -10230,6 +10600,12 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
             if (SUCCEEDED(hr2)) hr = hr2;
         }
     }
+    // #188 axis (b). Last, after every repair above has had its turn: if the
+    // guest is still holding a null it will dereference it, and mode 2 can hand
+    // back an object built before the device died even though nothing can be
+    // built now.
+    if (FAILED(hr) && (!pp || !*pp) &&
+        GhCpsServeStandIn(self, (GhCpsRawFn)orig, d, riid, pp, "failed")) return S_OK;
     return hr;
 }
 // #158: gh_no_uma.txt, read once. Both the capability answer below and the heap
@@ -12346,6 +12722,24 @@ static LONG GhWorkIndex(ID3D12CommandList* self)
 }
 static bool GhWorkOpDropped(ID3D12CommandList* self, LONG idx)
 {
+    // #188 axis (b). A stand-in pipeline collapses every vertex onto one point
+    // and has no pixel shader, so a draw bound to it already produces nothing;
+    // dropping it as well costs the driver the work of proving that. Mode 3 lets
+    // those draws through -- the control that says whether dropping them was
+    // load-bearing or merely tidy.
+    if (GhPsoStandIn() && GhPsoStandIn() < 3 &&
+        InterlockedCompareExchange(&g_standInN, 0, 0) > 0){
+        const GhCLNote* n = GhCLFind(self);
+        if (n && GhIsStandIn(n->lastPso)){
+            static LONG dropped = 0;
+            LONG dn = InterlockedIncrement(&dropped);
+            if (dn <= 4 || (dn % 256) == 0)
+                Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " w=" + std::to_string((long)idx) +
+                     " DROPPED by gh_pso_standin pso=" + Hex((uint64_t)(uintptr_t)n->lastPso) +
+                     " n=" + std::to_string((long)dn));
+            return true;
+        }
+    }
     if (g_skipPso){
         const GhCLNote* n = GhCLFind(self);
         if (n && n->lastPso == g_skipPso){
