@@ -41,6 +41,7 @@ handle's type, and `lower66` is what collapses them.
 | `wavecensus.py` | per-blob census of every `dx.op.wave*`/`quad*`, scored against #175 |
 | `mkcontrols.py` | builds + signs one control shader per wave op, and refuses a control dxc folded its intrinsic out of |
 | `rebake.py` | runs the width-1 / CS-LOD passes over already-baked containers |
+| `bake.py` | the bulk baker: a directory of `gh_sh_miss_*.bin` -> a directory of staged `gh_lo_*.bin` |
 | `wavesweep.sh` | the #175 console sweep, ordered by how many blobs each cell unblocks |
 
 ## Beyond the opcode table: three more 6.6 walls
@@ -150,3 +151,40 @@ The 921 pixel and 908 vertex shaders in the same dump are not yet triaged.
 real input and the driver accepts and genuinely compiles the result (its own
 `SC_DLL` timer reported 52.2 ms). Whether a lowered shader *computes* what it
 should is a separate question that only a frame can answer.
+
+## Staging a corpus that does not fit LocalState (#188)
+
+One 900 s run of Ghost of Tsushima asks for **2,270** SM 6.6 shaders the 380-blob
+psarc corpus has never seen -- 35.6 MB once lowered, against a ~35 MB LocalState
+quota the diag and the game's own log already share. There is no offline
+shortcut: none of the 2,270 keys appears anywhere in the game's `_gfx`/`_blobs`/
+`_gfxu` containers, which hold only 388 distinct digests between them.
+
+So the corpus moved off the quota. The loop is:
+
+1. **Harvest.** Run with `gh_shader_sub=1`; every shader the cache misses is
+   written out as `gh_sh_miss_<key>.bin`. From loader 0.0.445.0 these land in
+   `D:\DevelopmentFiles\ghmiss`, not in LocalState.
+2. **Bake.** `GH_DXC=... bake.py <dumps> <out>` -- two phases, `GH_WAVE_SIZE=64`
+   first and the lossy `GH_WAVE1`/`GH_CS_LOD0` passes only where a blob still
+   carries one of #175's four fatal opcodes. 2,270/2,270 baked, 2,072 on phase 1.
+3. **Stage.** Upload into `D:\DevelopmentFiles\ghlo` over WDP
+   (`knownfolderid=DevelopmentFiles`, no `packagefullname`).
+
+`GhLoweredBlob` reads LocalState first and `D:` second, so a single blob can
+still be overridden in place without restaging the set. `gh_corpus_dev=0`
+(harness slot 192) puts everything back in LocalState.
+
+**WDP cannot create a directory under `DevelopmentFiles`** -- an upload to a
+missing path is `500 / 'The system cannot find the path specified.'`, and
+*listing* a missing path still answers `200` with an empty `Items`. The loader
+makes both directories at startup (`GhCorpusDirs`) and logs
+`CORPUSDIR D:\DevelopmentFiles ghlo=ok ghmiss=ok`; check for that line before
+believing a staging run.
+
+**The 2,270 baked blobs are not in this repo.** They are 35.6 MB of *derived*
+output -- `bake.py` regenerates them from the dumps -- and committing them would
+more than double a 30 MB repository, which is the same trade the BoxedWine tree
+is kept out for. They live on the host at
+`~/.claude/jobs/49fb5998/tmp/_ghlo188` (baked) and `_miss188` (the dumps they
+came from), and on the console at `D:\DevelopmentFiles\ghlo`.

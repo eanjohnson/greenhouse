@@ -106,6 +106,16 @@ static const wchar_t* kLocalState =
 // is a separate ~2GB userdata pool; Steam downloads must land here to use the
 // slider. Proven writable in-process (GhProbeUsb T2).
 static const wchar_t* kDevGames = L"D:\\DevelopmentFiles\\gh_games\\";
+// #188. The lowered-shader corpus outgrew LocalState. LocalState is a ~35 MB
+// QUOTA (#187 measured it), shared with the game's own log and our diag, and one
+// 900 s run of Tsushima asks for 2,270 SM 6.6 shaders the corpus has never seen
+// -- 35.6 MB once lowered, on top of the 5 MB already staged. D: is the
+// Dev-Mode scratch the game itself is installed on, it has gigabytes, and WDP
+// serves it as the "DevelopmentFiles" known folder, so the host can stage
+// straight into it. WDP will not CREATE either directory, so the loader does.
+static const wchar_t* kDevRoot   = L"D:\\DevelopmentFiles\\";
+static const wchar_t* kDevCorpus = L"D:\\DevelopmentFiles\\ghlo\\";
+static const wchar_t* kDevDumps  = L"D:\\DevelopmentFiles\\ghmiss\\";
 
 #ifdef GH_LAUNCHER
 // Launcher's on-screen picker writes the chosen guest here; RunGuest reads it as
@@ -451,6 +461,13 @@ static unsigned GhDsNoGpu();              // #169: keep DirectStorage's DXIL out
 // rest in every run ever launched by the harness. Convert one knob at a time,
 // each with its own control cell.
 static unsigned GhCfgNumZ(const wchar_t* file, const char* envName, unsigned dflt);
+// #188. Defined next to the corpus reader further down; declared here so the
+// loader's own startup can make D:\DevelopmentFiles\ghlo and \ghmiss before the
+// host has anything to stage into them. WDP uploads into an existing
+// DevelopmentFiles subdirectory but will not create one, so this call is what
+// unblocks staging.
+static const std::wstring& GhDumpDir();
+static const std::wstring& GhCorpusDir();
 static void GhCheckDeviceRemoved(const char* where,
                                  ID3D12Device* dev = nullptr); // #158 removal + DRED
 static std::string GhLazyStats();                             // #145 demand-commit counters
@@ -4093,6 +4110,10 @@ static bool EnsureBridge()
     // the only window in which the caps negotiation has not happened yet.
     GhDdiInstall();
 
+    // #188: backstop only -- the primary call is on the loader thread next to
+    // the other one, because a D3D12 guest never builds this bridge at all.
+    GhDumpDir();
+
     HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_dispatcher.RunAsync(CoreDispatcherPriority::Normal, [done]{
         try { BuildBridgeOnUi(); }
@@ -6956,6 +6977,58 @@ static std::string GhScreenWho(const char* stage, const void* code, SIZE_T n, ui
 // offline today) and the loader cannot disagree about what a shader is called, and
 // an on-device translator can later fill the same directory behind the same key
 // without any of this changing.
+// #188. Where a shader we could not substitute gets written, and where the
+// staged corpus may also live. 1 (the default) = D:, the Dev-Mode scratch, which
+// is not quota-bound; 0 = LocalState, the pre-#188 behaviour. Reads always try
+// BOTH, LocalState first, so a single blob can still be overridden in place
+// without restaging the whole corpus. GhCfgNumZ, because the default is nonzero
+// and 0 has to stay expressible.
+static bool GhCorpusOnDev()
+{
+    static const bool on = GhCfgNumZ(L"gh_corpus_dev.txt", "GH_CORPUS_DEV", 1) != 0;
+    return on;
+}
+// The directory shader dumps go to, created on first use. Falls back to
+// LocalState when the knob is off or D: refused us -- a dump that cannot be
+// written is a blob that never comes back off the console, so this must not
+// fail shut.
+// One resolution for both directories, so the log says once, in one line, where
+// the corpus is read from and where dumps go. Neither may fail shut: a corpus we
+// cannot read is every pipeline refused, and a dump we cannot write is a shader
+// that never comes off the console. The ladder is subdirectory -> the
+// DevelopmentFiles root (which exists already, and which WDP can upload into
+// even though it cannot create anything under it) -> LocalState.
+struct GhCorpusDirs { std::wstring read, dump; };
+static const GhCorpusDirs& GhCorpusDirsGet()
+{
+    static const GhCorpusDirs dirs = []{
+        if (!GhCorpusOnDev()){
+            Diag("CORPUSDIR gh_corpus_dev=0 -- corpus and dumps stay in LocalState");
+            return GhCorpusDirs{ kLocalState, kLocalState };
+        }
+        // Beside the game's tree, not inside it: gh_games is mapped into the
+        // guest's VFS, and the corpus is ours, not the game's. CreateDirectoryW
+        // is given the path WITHOUT its trailing separator.
+        auto mk = [](const wchar_t* p)->DWORD{
+            std::wstring d(p);
+            while (!d.empty() && d.back() == L'\\') d.pop_back();
+            if (CreateDirectoryW(d.c_str(), nullptr)) return 0;
+            const DWORD e = GetLastError();
+            return e == ERROR_ALREADY_EXISTS ? 0 : e;
+        };
+        const DWORD eLo = mk(kDevCorpus);
+        const DWORD eMi = mk(kDevDumps);
+        // Both outcomes are logged: a silent success is indistinguishable from a
+        // call that never happened, and that is exactly how cell p1 was read wrong.
+        Diag("CORPUSDIR D:\\DevelopmentFiles ghlo=" + (eLo ? "err " + Hex(eLo) : std::string("ok")) +
+             " ghmiss=" + (eMi ? "err " + Hex(eMi) : std::string("ok")) +
+             (eLo || eMi ? "  -- falling back to the DevelopmentFiles root" : ""));
+        return GhCorpusDirs{ eLo ? kDevRoot : kDevCorpus, eMi ? kDevRoot : kDevDumps };
+    }();
+    return dirs;
+}
+static const std::wstring& GhDumpDir()    { return GhCorpusDirsGet().dump; }
+static const std::wstring& GhCorpusDir()  { return GhCorpusDirsGet().read; }
 static bool GhShaderSubOn()
 {
     static const bool on = GhCfgNum(L"gh_shader_sub.txt", "GH_SHADER_SUB", 0) != 0;
@@ -7001,6 +7074,9 @@ static const std::vector<uint8_t>* GhLoweredBlob(const void* code, SIZE_T n)
         ReadWholeFile(std::wstring(kLocalState) + L"gh_lo_" + wkey + L".bin", blob, true);
         if (blob.empty())
             ReadWholeFile(std::wstring(kLocalState) + L"ghlo\\" + wkey + L".bin", blob, true);
+        // #188: and D:, where a corpus too big for the quota is staged.
+        if (blob.empty())
+            ReadWholeFile(GhCorpusDir() + L"gh_lo_" + wkey + L".bin", blob, true);
         static volatile LONG hits = 0, misses = 0;
         const LONG k = blob.empty() ? InterlockedIncrement(&misses)
                                     : InterlockedIncrement(&hits);
@@ -7032,7 +7108,7 @@ static const std::vector<uint8_t>* GhLoweredBlob(const void* code, SIZE_T n)
         uint64_t mfeat = 0;
         GhDxilFeat(code, n, &mfeat);
         if (blob.empty() && (GhDxilSm(code, n) > 0x65 || (mfeat & 0x4000))){
-            std::wstring path = std::wstring(kLocalState) + L"gh_sh_miss_" + wkey + L".bin";
+            std::wstring path = GhDumpDir() + L"gh_sh_miss_" + wkey + L".bin";
             HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
             if (h != INVALID_HANDLE_VALUE){
@@ -7244,6 +7320,8 @@ static void GhPsoRecStash(const void* code, SIZE_T n, char keyOut[40])
     std::wstring wkey;
     for (const char* c = key; *c; ++c) wkey.push_back((wchar_t)*c);
     if (GetFileAttributesW((std::wstring(kLocalState) + L"gh_lo_" + wkey + L".bin").c_str())
+            != INVALID_FILE_ATTRIBUTES ||
+        GetFileAttributesW((GhCorpusDir() + L"gh_lo_" + wkey + L".bin").c_str())
             != INVALID_FILE_ATTRIBUTES)
         return;                                  // the lowered blob is already staged
     HANDLE h = CreateFileW((std::wstring(kLocalState) + L"gh_ps_" + wkey + L".bin").c_str(),
@@ -7370,7 +7448,7 @@ static void GhDumpFailedShader(const char* tag, const void* code, SIZE_T n,
             std::swprintf(name, 80, L"gh_sh_%hs_%hs.bin", tag, key);
         else
             std::swprintf(name, 80, L"gh_failed_%hs%ld.bin", tag, (long)i);
-        std::wstring path = std::wstring(kLocalState) + name;
+        std::wstring path = GhDumpDir() + name;              // #188: D: by default
         HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h != INVALID_HANDLE_VALUE){
@@ -27355,6 +27433,14 @@ static void RunGuest()
         // before ANY device negotiates caps. Idempotent -- EnsureBridge's call
         // is the backstop for the paths that never reach this point.
         GhDdiInstall();
+
+        // #188. Make D:\DevelopmentFiles\ghlo and \ghmiss. This has to run
+        // HERE and not only from EnsureBridge: EnsureBridge builds the
+        // LAUNCHER's presentation bridge, and a D3D12 guest like Tsushima never
+        // reaches it -- cell p1 (loader 0.0.444.0) created 275 pipelines and
+        // neither directory existed afterwards. \ghlo in particular has to be
+        // there BEFORE the host stages into it, and the host cannot make it.
+        GhDumpDir();
 
         // #170. One signed DXIL <= 6.5 compute PSO, on a throwaway device,
         // before the guest exists. Off unless gh_dxil_ctl says otherwise.
