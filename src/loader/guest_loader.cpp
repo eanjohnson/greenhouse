@@ -6772,8 +6772,20 @@ static std::string GhDxilFeatNames(uint64_t f)
 // access violation with SEH unwinds out of newbe.DLL while it holds its own
 // locks, and every later compile then waits on them forever. A clean E_FAIL
 // leaves the back end usable for the shaders it CAN build.
+//
+// #186 makes this DEFAULT ON (2), which is the whole repair. The scdxil path
+// has no non-fatal failure mode: when its newbe.DLL back end throws on a module
+// it cannot lower, SC_DLL rethrows sc::dxil::DxilError, umd12ddi turns that into
+// hr=0x887A0005, and the device is REMOVED -- and per #180 a removed device
+// poisons the process for good (D3D12CreateDevice itself returns 0x887A0020
+// afterwards). So the one compile the back end cannot do does not cost a
+// pipeline, it costs the run, and every pipeline that would have come after it.
+// A screen in front of the compiler is the only place a failure here can still
+// be a failure rather than a death, because it is the last point at which we
+// still own the thread. GhCfgNumZ, not GhCfgNum: now that the default is
+// nonzero, 0 has to stay expressible to turn the screen back off.
 static unsigned GhDxilScreen()
-{ static const unsigned v = GhCfgNum(L"gh_dxil_screen.txt", "GH_DXIL_SCREEN", 0); return v; }
+{ static const unsigned v = GhCfgNumZ(L"gh_dxil_screen.txt", "GH_DXIL_SCREEN", 2); return v; }
 // The DXIL part's declared shader model, as 0xMm (0x66 for 6.6), or 0 if this
 // is not a DXIL container. Screening on THIS rather than on features is the
 // honest test against a back end whose opcode table stops at DXIL 1.5: SM 6.6
@@ -6799,10 +6811,38 @@ static unsigned GhDxilMaxSm()
 static uint64_t GhDxilMask()
 {
     // Default: the two SM 6.6 dynamic-resource bits, which are what indexes the
-    // back end's opcode table off its end (DXIL 1.5 stops at opcode 215).
-    // GhCfgNumZ, not GhCfgNum: 0 is a value this knob must be able to express --
-    // it is how you ask for the shader-model screen with no feature screen.
-    static const unsigned v = GhCfgNumZ(L"gh_dxil_mask.txt", "GH_DXIL_MASK", 0x6000000);
+    // back end's opcode table off its end (DXIL 1.5 stops at opcode 215), plus
+    // SFI0 WaveOps (0x4000).
+    //
+    // #186 adds WaveOps, and it is the bit that matters. #175 measured four DXIL
+    // opcodes that REMOVE THE DEVICE on this back end -- 112 waveGetLaneCount,
+    // 119 waveActiveOp, 121 wavePrefixOp, 123 quadOp -- with twelve-line control
+    // shaders containing nothing of ours, at shader models the console accepts.
+    // The shader model is therefore the wrong question and always was; a DXIL 6.2
+    // container killed the run in #185. WaveOps is the SFI0 bit every one of those
+    // four sets, so it is the cheapest thing we can read that covers all of them:
+    // it needs only the container's feature word, which is a fixed-offset field,
+    // where naming the opcode exactly would mean parsing LLVM bitcode on the
+    // guest's PSO thread.
+    //
+    // It over-refuses, and the cost of that was measured rather than guessed.
+    // SFI0 says "this module uses wave ops"; it does not say WHICH, and the
+    // opcode is the entire difference between 111/113 (which every Tsushima
+    // pipeline uses and the console creates happily) and 112/119/121/123 (which
+    // remove the device). Reading the opcode means decoding LLVM bitcode on the
+    // guest's PSO thread -- the intrinsic names are not even scannable, since the
+    // value symbol table packs them at six bits per character.
+    //
+    // So the screen uses provenance instead, which is free and is the same
+    // question asked from the other end: GhIsCorpusBlob exempts any shader the
+    // baker supplied. Cell U measured what happens without that exemption --
+    // 33 lowered blobs still declare WaveOps (honestly: lane-solo leaves 111 and
+    // 113 alone), 9 pipelines were refused at startup, the game's pipeline-cache
+    // load failed and the run produced 16 compute PSOs and no frames at all.
+    // With the exemption the same mask refuses only containers we have never
+    // lowered, which is exactly the #185 class: unknown wave usage, no bake, and
+    // a back end with no non-fatal way to say no.
+    static const unsigned v = GhCfgNumZ(L"gh_dxil_mask.txt", "GH_DXIL_MASK", 0x6004000);
     return (uint64_t)v;
 }
 
@@ -6831,6 +6871,23 @@ static bool GhShaderKey(const void* code, SIZE_T n, char out[33])
     return true;
 }
 
+// #186: which shader in a pipeline tripped the screen, and under what key.
+// A refusal that only prints a feature word tells you a run was saved but not
+// what to lower next; the key is the name the corpus files a blob under, and
+// GhLoweredBlob has already written the bytes to gh_sh_miss_<key>.bin by the
+// time we get here. Together they turn "the screen fired" into a work item.
+static std::string GhScreenWho(const char* stage, const void* code, SIZE_T n, uint64_t mask)
+{
+    if (!code || !n) return std::string();
+    uint64_t f = 0;
+    if (!GhDxilFeat(code, n, &f) || !(f & mask)) return std::string();
+    char key[33] = {0};
+    std::string o = std::string(" ") + stage + "=";
+    o += GhShaderKey(code, n, key) ? key : "unsigned";
+    o += "/" + GhShaderKind(code, n) + "/" + Hex((uint64_t)(f & mask));
+    return o;
+}
+
 // #173, the substitution half of the backporter. A shader the console refuses is
 // looked up by its container digest in LocalState\gh_lo_<key>.bin and, if a lowered
 // SM 6.5 blob is staged there, that blob is handed to the driver instead.
@@ -6843,6 +6900,22 @@ static bool GhShaderSubOn()
 {
     static const bool on = GhCfgNum(L"gh_shader_sub.txt", "GH_SHADER_SUB", 0) != 0;
     return on;
+}
+
+// #186: the bytecode pointers GhLoweredBlob has handed back, i.e. the shaders
+// the driver sees that came out of OUR corpus rather than the game's psarc.
+// The screen needs this to tell a wave-op container it has never seen from one
+// the baker already reduced -- see GhDxilMask for why that distinction is the
+// whole difference between a refusal that saves a run and one that wastes it.
+static std::set<const void*>& GhCorpusPtrs()
+{ static std::set<const void*> s; return s; }          // guarded by GhLoweredBlob's mutex
+static std::mutex& GhCorpusMu()
+{ static std::mutex m; return m; }
+static bool GhIsCorpusBlob(const void* p)
+{
+    if (!p) return false;
+    std::lock_guard<std::mutex> lk(GhCorpusMu());
+    return GhCorpusPtrs().count(p) != 0;
 }
 
 static const std::vector<uint8_t>* GhLoweredBlob(const void* code, SIZE_T n)
@@ -6911,6 +6984,15 @@ static const std::vector<uint8_t>* GhLoweredBlob(const void* code, SIZE_T n)
             }
         }
         it = cache.emplace(key, std::move(blob)).first;
+        // #186: remember the bytes themselves, not just the key. The screen
+        // downstream sees a raw pointer with no provenance, and the substituted
+        // container's OWN digest differs from the key it is filed under, so the
+        // key cannot be recovered from the bytes. std::map never moves a mapped
+        // value, so data() stays valid for the life of the process.
+        if (!it->second.empty()){
+            std::lock_guard<std::mutex> lk2(GhCorpusMu());
+            GhCorpusPtrs().insert((const void*)it->second.data());
+        }
     }
     return it->second.empty() ? nullptr : &it->second;
 }
@@ -9604,12 +9686,24 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     }
 
     if (GhDxilScreen() >= 2 && use){
+        // #186: a shader the corpus supplied is exempt. It is not that a lowered
+        // blob is harmless by definition -- 33 of them still declare WaveOps,
+        // honestly, because lane-solo leaves ops 111 waveGetLaneIndex and 113
+        // waveAnyTrue in place. It is that those two are the ONLY wave opcodes
+        // the baker lets through, and the console creates every pipeline using
+        // them. The unknown container is the dangerous one, and this is the only
+        // place we can still tell the two apart.
+        auto featOf = [](const D3D12_SHADER_BYTECODE& b, uint64_t* out) -> void {
+            *out = 0;
+            if (GhIsCorpusBlob(b.pShaderBytecode)) return;
+            GhDxilFeat(b.pShaderBytecode, b.BytecodeLength, out);
+        };
         uint64_t all = 0, f = 0;
-        GhDxilFeat(use->VS.pShaderBytecode, use->VS.BytecodeLength, &f); all |= f;
-        GhDxilFeat(use->PS.pShaderBytecode, use->PS.BytecodeLength, &f); all |= f;
-        GhDxilFeat(use->GS.pShaderBytecode, use->GS.BytecodeLength, &f); all |= f;
-        GhDxilFeat(use->HS.pShaderBytecode, use->HS.BytecodeLength, &f); all |= f;
-        GhDxilFeat(use->DS.pShaderBytecode, use->DS.BytecodeLength, &f); all |= f;
+        featOf(use->VS, &f); all |= f;
+        featOf(use->PS, &f); all |= f;
+        featOf(use->GS, &f); all |= f;
+        featOf(use->HS, &f); all |= f;
+        featOf(use->DS, &f); all |= f;
         unsigned sm = 0;
         if (const unsigned cap = GhDxilMaxSm()){
             const unsigned smv[5] = {
@@ -9621,14 +9715,25 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
             for (unsigned v : smv) if (v > sm) sm = v;
             if (sm <= cap) sm = 0;      // within the back end's reach
         }
+        // A corpus blob is at or under the cap by construction; do not let a
+        // stale header on one of ours trip the model screen either.
+        if (GhIsCorpusBlob(use->VS.pShaderBytecode) && GhIsCorpusBlob(use->PS.pShaderBytecode))
+            sm = 0;
         if ((all & GhDxilMask()) || sm){
             static volatile LONG screened = 0;
             const LONG k = InterlockedIncrement(&screened);
             if (pp) *pp = nullptr;
+            const uint64_t m = GhDxilMask();
+            const std::string who =
+                GhScreenWho("VS", use->VS.pShaderBytecode, use->VS.BytecodeLength, m) +
+                GhScreenWho("PS", use->PS.pShaderBytecode, use->PS.BytecodeLength, m) +
+                GhScreenWho("GS", use->GS.pShaderBytecode, use->GS.BytecodeLength, m) +
+                GhScreenWho("HS", use->HS.pShaderBytecode, use->HS.BytecodeLength, m) +
+                GhScreenWho("DS", use->DS.pShaderBytecode, use->DS.BytecodeLength, m);
             Diag("  CreateGraphicsPipelineState SCREENED n=" + std::to_string((long)k) +
                  " feat=" + Hex((uint64_t)all) + "(" + GhDxilFeatNames(all) + ")" +
-                 " hit=" + Hex((uint64_t)(all & GhDxilMask())) +
-                 " sm=" + Hex((uint32_t)sm) +
+                 " hit=" + Hex((uint64_t)(all & m)) +
+                 " sm=" + Hex((uint32_t)sm) + who +
                  " VS=" + std::to_string((unsigned long long)use->VS.BytecodeLength) +
                  " PS=" + std::to_string((unsigned long long)use->PS.BytecodeLength) +
                  "; E_FAIL without calling the driver");
@@ -9871,7 +9976,7 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
 
     // #169: the same screen the graphics path uses -- refuse in front of the
     // compiler rather than let it fault and take its own locks down with it.
-    if (GhDxilScreen() >= 2 && d){
+    if (GhDxilScreen() >= 2 && d && !GhIsCorpusBlob(d->CS.pShaderBytecode)){
         uint64_t f = 0;
         GhDxilFeat(d->CS.pShaderBytecode, d->CS.BytecodeLength, &f);
         unsigned sm = 0;
@@ -9885,7 +9990,9 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
             if (pp) *pp = nullptr;
             Diag("  CreateComputePipelineState SCREENED n=" + std::to_string((long)k) +
                  " feat=" + Hex((uint64_t)f) + "(" + GhDxilFeatNames(f) + ")" +
+                 " hit=" + Hex((uint64_t)(f & GhDxilMask())) +
                  " sm=" + Hex((uint32_t)sm) +
+                 GhScreenWho("CS", d->CS.pShaderBytecode, d->CS.BytecodeLength, GhDxilMask()) +
                  " CS=" + std::to_string((unsigned long long)d->CS.BytecodeLength) +
                  "; E_FAIL without calling the driver");
             return E_FAIL;

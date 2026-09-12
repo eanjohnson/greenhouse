@@ -60,3 +60,29 @@ Two consequences worth keeping:
   "SM > 6.5 **or** the container declares WaveOps".
 - **A miss is dumped before the driver is called**, so a run reports the blobs it
   could not cover even when a later one takes the device down.
+
+## What a lowered blob still declares, and why the screen ignores it (#186)
+
+33 of the 381 lowered blobs still set the SFI0 **WaveOps** bit. That is not a
+stale flag left behind by the baker -- it is true. Disassembling all 33 shows
+exactly two wave opcodes surviving lane-solo lowering:
+
+| opcode | intrinsic | why it survives |
+|---|---|---|
+| 111 | `waveGetLaneIndex` | lane-solo answers it directly; measured CREATED in the #175 sweep |
+| 113 | `waveAnyTrue` | a single-lane wave makes it the identity on its own predicate |
+
+Both compile on this console -- every Tsushima pipeline uses them and all 664
+are created. The four that do NOT compile (112 `waveGetLaneCount`,
+119 `waveActiveOp`, 121 `wavePrefixOp`, 123 `quadOp`) are precisely the ones
+`lower66.py` rewrites away, so no lowered blob contains them.
+
+This is why the loader's `gh_dxil_screen` exempts corpus blobs instead of
+screening on the WaveOps bit alone. SFI0 says a module uses wave ops; it does
+not say which, and the opcode is the whole difference between a pipeline that
+creates and one that removes the device. The bit cannot separate them, and the
+names cannot be scanned for either -- DXIL's value symbol table packs them at
+six bits per character, so `quadOp` does not appear as ASCII anywhere in the
+container. Provenance answers the same question for free: what the baker
+produced has been reduced to 111/113 by construction, and what the baker has
+never seen could be anything.
