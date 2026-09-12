@@ -17880,6 +17880,74 @@ static void GhCheckDeviceRemoved(const char* where, ID3D12Device* dev)
         Diag("DRED pagefault va=" + Hex((uint64_t)pf.PageFaultVA));
 }
 
+// #187. Where does the app's commit actually go? The MEMORY line gives the total
+// and the lazy pager reports its own share, but neither says how much is the guest
+// arena, how much is driver/runtime private, and how much is images and sections.
+// One VirtualQuery walk answers all three at once, and the largest regions name
+// the owner by base address. gh_va_census.txt=N runs it on every Nth MEMORY
+// sample (the walk is cheap but not free); 0 is off.
+static unsigned GhVaCensusEvery()
+{ static const unsigned v = GhCfgNum(L"gh_va_census.txt", "GH_VA_CENSUS", 0); return v; }
+
+static void GhVaCensus(const char* when)
+{
+    const unsigned every = GhVaCensusEvery();
+    if (!every) return;
+    static LONG n = 0;
+    if ((InterlockedIncrement(&n) - 1) % (LONG)every) return;
+
+    struct Reg { uint8_t* base; uint64_t size; DWORD type, prot; };
+    Reg top[12]{};
+    uint64_t cImage = 0, cMapped = 0, cPrivate = 0, cPrivExec = 0, reserved = 0;
+    // On this UMA console a D3D12 heap the CPU can see is PAGE_WRITECOMBINE, and
+    // it is charged to the app's PRIVATE commit as well as to viduse -- the same
+    // bytes twice against one 5 GiB container. Bucket them so the split is a
+    // measurement rather than an inference from the top-N list.
+    uint64_t cWC = 0; unsigned long nWC = 0;
+    unsigned long nreg = 0;
+
+    SYSTEM_INFO si{}; GetSystemInfo(&si);
+    uint8_t* p   = (uint8_t*)si.lpMinimumApplicationAddress;
+    uint8_t* end = (uint8_t*)si.lpMaximumApplicationAddress;
+    MEMORY_BASIC_INFORMATION mbi{};
+    while (p < end && VirtualQuery(p, &mbi, sizeof mbi) == sizeof mbi){
+        const uint64_t rs = (uint64_t)mbi.RegionSize;
+        if (mbi.State == MEM_COMMIT){
+            ++nreg;
+            if      (mbi.Type == MEM_IMAGE)  cImage  += rs;
+            else if (mbi.Type == MEM_MAPPED) cMapped += rs;
+            else {
+                cPrivate += rs;
+                if (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                   PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+                    cPrivExec += rs;
+                if (mbi.Protect & PAGE_WRITECOMBINE){ cWC += rs; ++nWC; }
+            }
+            if (rs > top[11].size){          // keep the largest dozen, insertion sorted
+                int i = 11;
+                while (i > 0 && top[i - 1].size < rs){ top[i] = top[i - 1]; --i; }
+                top[i] = Reg{ (uint8_t*)mbi.BaseAddress, rs, mbi.Type, mbi.Protect };
+            }
+        } else if (mbi.State == MEM_RESERVE) reserved += rs;
+        uint8_t* next = (uint8_t*)mbi.BaseAddress + rs;
+        if (next <= p) break;                // never spin on an answer that does not advance
+        p = next;
+    }
+    auto MB = [](uint64_t b){ return std::to_string((unsigned long long)(b >> 20)); };
+    Diag(std::string("VACENSUS ") + when +
+         " imageMB=" + MB(cImage) + " mappedMB=" + MB(cMapped) +
+         " privateMB=" + MB(cPrivate) + " privexecMB=" + MB(cPrivExec) +
+         " privwcMB=" + MB(cWC) + " privwcN=" + std::to_string(nWC) +
+         " reservedMB=" + MB(reserved) + " regions=" + std::to_string(nreg));
+    for (unsigned i = 0; i < 12 && top[i].size; ++i)
+        Diag("  VACENSUS #" + std::to_string((unsigned long)i) +
+             " base=" + Hex((uint64_t)(uintptr_t)top[i].base) +
+             " MB=" + MB(top[i].size) +
+             " type=" + (top[i].type == MEM_IMAGE  ? "image"  :
+                         top[i].type == MEM_MAPPED ? "mapped" : "private") +
+             " prot=" + Hex((uint32_t)top[i].prot));
+}
+
 static void GhLogMemoryBudget(const char* where)
 {
     GhCheckDeviceRemoved(where);
@@ -17938,6 +18006,7 @@ static void GhLogMemoryBudget(const char* where)
     }
     ln += GhLazyStats();
     Diag(ln);
+    GhVaCensus(where);
 }
 
 // #158. The repairs above say something specific and testable: every one of them
