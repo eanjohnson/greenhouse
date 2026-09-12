@@ -6887,7 +6887,18 @@ static const std::vector<uint8_t>* GhLoweredBlob(const void* code, SIZE_T n)
         // we had not baked comes back off the console named by the same digest the
         // baker uses, so the next bake covers it. One write per distinct key, and
         // only for a container we would have had to lower anyway.
-        if (blob.empty() && GhDxilSm(code, n) > 0x65){
+        // The gate used to be `SM > 6.5` alone, on the theory that anything the
+        // console's own back end already accepts needs no bake. #185 disproves
+        // that: FidelityFX builds its FSR3 shaders inside ffxCreateContext, so
+        // they never appear in the game's psarc corpus, and its SPD pass is a
+        // DXIL 6.2 container using 144 quadOps. Wave and quad intrinsics take the
+        // device down at ANY shader model (#175 measured op 123 on a twelve-line
+        // cs_6_5 control), so the shader model is the wrong question -- a miss
+        // that declares WaveOps has to come back off the console too, or the
+        // corpus silently stops being closed and the next run dies in newbe.
+        uint64_t mfeat = 0;
+        GhDxilFeat(code, n, &mfeat);
+        if (blob.empty() && (GhDxilSm(code, n) > 0x65 || (mfeat & 0x4000))){
             std::wstring path = std::wstring(kLocalState) + L"gh_sh_miss_" + wkey + L".bin";
             HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);

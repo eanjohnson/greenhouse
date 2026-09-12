@@ -1,7 +1,7 @@
 {
  "note": "Backported DXIL for Ghost of Tsushima (app 2215430). Keys are the ORIGINAL SM 6.6 container digest (bytes [4:20]); the loader looks up gh_lo_<key>.bin by that key, so filenames must not be renamed.",
  "lowered": {
-  "count": 380,
+  "count": 381,
   "what": "the complete corpus: stage this for maximum coverage. Only ops 111 waveGetLaneIndex and 113 waveAnyTrue remain, both measured CREATED by #175.",
   "all_pass_dxv": true,
   "wave_ops_remaining": [
@@ -341,8 +341,8 @@
   ]
  },
  "approximate": {
-  "count": 55,
-  "what": "lowered/ holds a LANE-SOLO rewrite of these; exact/ holds the un-approximated original, which is correct but contains wave ops the console has not been measured on (or has been measured to die on). Swap one back in per #175 sweep cell that passes.",
+  "count": 56,
+  "what": "lowered/ holds a LANE-SOLO rewrite of these; exact/ holds the un-approximated original, which is correct but contains wave ops the console has not been measured on (or has been measured to die on). Swap one back in per #175 sweep cell that passes. #185 adds gh_lo_95067cca...: AMD FidelityFX FSR3's SPD pass, which reaches us from ffxCreateContext rather than the game's psarc corpus, and whose 144 quadOps (op 123) remove the device -- measured on the twelve-line QuadReadAcrossX control.",
   "names": [
    "gh_lo_027d28e809755df0c3830e61c6357b14.bin",
    "gh_lo_0ab0e824482a2c67aafa73ecc61596fd.bin",
