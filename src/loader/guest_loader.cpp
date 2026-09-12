@@ -130,6 +130,40 @@ static const ULONGLONG g_procT0 = GetTickCount64();
 static unsigned long long GhUpMs(){ return (unsigned long long)(GetTickCount64() - g_procT0); }
 static std::mutex g_diagRingMu;
 static std::deque<std::string> g_diagRing;   // last N Diag lines for the launcher crash screen
+// #187. LocalState is a QUOTA, not a disk, and it is about 35 MB. The loader's log
+// and the GAME's own log live in it together, so every megabyte this file takes is
+// a megabyte the game cannot write -- and the game's log is where the death record
+// is. Cell AB proved the cost: with the log volume trimmed elsewhere the diag grew
+// to 28.45 MB, filled the quota, and truncated Tsushima's own log to 12 KB, losing
+// the one line that says WHY the device went away. So the diag now runs on a budget
+// that leaves the game room, set here and adjustable per run (gh_diag_cap_mb), and
+// the budget is read once at init rather than through GhCfgNum inside Diag, because
+// GhCfgNum is declared further down the file than Diag, so read the knob here with
+// the same three Win32 calls it uses.
+static uint64_t GhDiagCapBytes()
+{
+    unsigned mb = 16;
+    char env[32] = {};
+    if (GetEnvironmentVariableA("GH_DIAG_CAP_MB", env, sizeof env) > 0 && env[0])
+        mb = (unsigned)strtoul(env, nullptr, 10);
+    else {
+        std::wstring path = std::wstring(kLocalState) + L"gh_diag_cap_mb.txt";
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE){
+            char raw[64] = {}; DWORD got = 0;
+            ReadFile(h, raw, sizeof raw - 1, &got, nullptr);
+            CloseHandle(h);
+            char ascii[64] = {}; size_t n = 0;
+            for (DWORD i = 0; i < got && n < sizeof ascii - 1; ++i)
+                if (raw[i] >= '0' && raw[i] <= '9') ascii[n++] = raw[i];
+            if (n){ unsigned long v = strtoul(ascii, nullptr, 10); if (v) mb = (unsigned)v; }
+        }
+    }
+    if (mb < 1)   mb = 1;
+    if (mb > 512) mb = 512;      // the old 64 MB behaviour is still expressible
+    return (uint64_t)mb * 1024 * 1024;
+}
 static void Diag(const std::string& s)
 {
     DWORD savedErr = GetLastError();
@@ -153,7 +187,7 @@ static void Diag(const std::string& s)
     // filling the console's storage. Counted, not stat()ed, so it costs nothing.
     static std::atomic<uint64_t> written{0};
     static std::atomic<bool>     capped{false};
-    const uint64_t kCap = 64ull * 1024 * 1024;
+    static const uint64_t kCap = GhDiagCapBytes();
     if (capped.load(std::memory_order_relaxed)){ SetLastError(savedErr); return; }
     if (written.fetch_add(s.size() + 2, std::memory_order_relaxed) > kCap){
         capped.store(true, std::memory_order_relaxed);
@@ -172,6 +206,8 @@ static void Diag(const std::string& s)
     // counted and reported rather than invisible.
     static const std::wstring kPath = std::wstring(kLocalState) + L"loader_diag.txt";
     static std::atomic<uint64_t> dropped{0};
+    static std::atomic<uint64_t> wfailed{0};
+    static std::atomic<uint32_t> lastWriteErr{0};
     HANDLE h = INVALID_HANDLE_VALUE;
     for (int attempt = 0; attempt < 40; ++attempt){
         h = CreateFileW(kPath.c_str(), FILE_APPEND_DATA,
@@ -184,17 +220,41 @@ static void Diag(const std::string& s)
     if (h != INVALID_HANDLE_VALUE)
     {
         std::string line = capped.load(std::memory_order_relaxed)
-            ? ("DIAG CAPPED at 64MB -- suppressing further output (guest is likely "
-               "in a retry loop; the lines above it repeat)\r\n")
+            ? ("DIAG CAPPED at " + std::to_string(kCap >> 20) +
+               "MB -- suppressing further output so the GAME's log keeps its share "
+               "of the LocalState quota (the lines above here repeat)\r\n")
             : (s + "\r\n");
         // Report accumulated drops on the next line that does get through, so a
         // gap in the log is visible instead of silent.
         uint64_t d = dropped.exchange(0, std::memory_order_relaxed);
         if (d) line = "DIAG DROPPED " + std::to_string(d) +
                       " line(s) -- log was locked\r\n" + line;
+        uint64_t wf = wfailed.exchange(0, std::memory_order_relaxed);
+        if (wf) line = "DIAG WRITEFAILED " + std::to_string(wf) +
+                       " line(s) -- err=" +
+                       std::to_string((unsigned)lastWriteErr.load(std::memory_order_relaxed)) +
+                       " (0x70 = LocalState quota full)\r\n" + line;
         SetFilePointer(h, 0, nullptr, FILE_END);
-        DWORD w = 0; WriteFile(h, line.data(), (DWORD)line.size(), &w, nullptr);
+        DWORD w = 0;
+        BOOL ok = WriteFile(h, line.data(), (DWORD)line.size(), &w, nullptr);
+        DWORD werr = ok ? 0 : GetLastError();
         CloseHandle(h);
+        // #187. This return value was thrown away, and that is how three runs in a
+        // row lied. When LocalState hits its quota WriteFile fails with
+        // ERROR_DISK_FULL and the line simply evaporates -- no DIAG CAPPED, no
+        // DIAG DROPPED, just a log that stops mid-run and looks like a process that
+        // stopped running. A full quota is now latched immediately (there is no
+        // point fighting the game for the last byte) and counted, so the NEXT run's
+        // first line says how much was lost.
+        if (!ok || w != (DWORD)line.size()){
+            wfailed.fetch_add(1, std::memory_order_relaxed);
+            if (werr == ERROR_DISK_FULL || werr == ERROR_HANDLE_DISK_FULL){
+                lastWriteErr.store(werr, std::memory_order_relaxed);
+                capped.store(true, std::memory_order_relaxed);
+            } else if (werr){
+                lastWriteErr.store(werr, std::memory_order_relaxed);
+            }
+        }
     }
     SetLastError(savedErr);
 #endif  // GH_RELEASE
@@ -10254,11 +10314,45 @@ static HRESULT __stdcall Hook_D12CheckFeature(ID3D12Device* self, D3D12_FEATURE 
         InterlockedIncrement(&g_fmtProbeLie);
         extra += " [forced typeduavload=0]";
     }
+    // #187. This one line was 327,608 lines and 21.89 MB of a 28.45 MB log -- 77% of
+    // it -- and it filled the LocalState quota, which starved the GAME's log of the
+    // record of its own death. The bulk is all FORMAT_SUPPORT: #158 assumed the guest
+    // asked "exactly twice in a whole run", and it asks a hundred thousand times,
+    // re-querying the same formats every frame and getting the same answer. The
+    // ANSWER is what we wanted, not the frequency, so say each distinct answer once
+    // and count the repeats. Nothing observable is lost: a format whose support
+    // changes mid-run still logs, because the key includes the support bits.
+    bool say = true;
+    if (f == D3D12_FEATURE_FORMAT_SUPPORT && SUCCEEDED(hr) && data &&
+        sz >= sizeof(D3D12_FEATURE_DATA_FORMAT_SUPPORT)){
+        auto* fs = (D3D12_FEATURE_DATA_FORMAT_SUPPORT*)data;
+        static std::mutex fmtMu;
+        static std::set<std::pair<uint32_t, uint64_t>> fmtSeen;
+        static LONG fmtRepeat = 0;
+        const uint64_t sup = ((uint64_t)(uint32_t)fs->Support2 << 32) |
+                             (uint64_t)(uint32_t)fs->Support1;
+        bool fresh;
+        {
+            std::lock_guard<std::mutex> lk(fmtMu);
+            fresh = fmtSeen.insert({(uint32_t)fs->Format, sup}).second;
+        }
+        if (!fresh){
+            say = false;
+            // A heartbeat every 64K repeats, so the log still shows this is live
+            // traffic rather than a hook that stopped being called.
+            LONG r = InterlockedIncrement(&fmtRepeat);
+            if ((r & 0xFFFF) == 0)
+                Diag("D3D12 CheckFeatureSupport FORMAT_SUPPORT repeats=" +
+                     std::to_string((long long)r) + " distinct=" +
+                     std::to_string((unsigned long long)fmtSeen.size()) +
+                     " (answers unchanged; logged once each)");
+        }
+    }
     static LONG n = 0;
-    if (InterlockedIncrement(&n) <= 16 || f == D3D12_FEATURE_SHADER_MODEL ||
+    if (say && (InterlockedIncrement(&n) <= 16 || f == D3D12_FEATURE_SHADER_MODEL ||
         f == D3D12_FEATURE_ARCHITECTURE || f == D3D12_FEATURE_ARCHITECTURE1 ||
         f == D3D12_FEATURE_EXISTING_HEAPS || f == D3D12_FEATURE_FORMAT_SUPPORT ||
-        f == D3D12_FEATURE_D3D12_OPTIONS)
+        f == D3D12_FEATURE_D3D12_OPTIONS))
         Diag("D3D12 CheckFeatureSupport f=" + std::to_string((int)f) +
              " hr=" + Hex((uint32_t)hr) + extra);
     return hr;
@@ -17628,12 +17722,20 @@ static HRESULT __stdcall Hook_D12CreatePlaced(ID3D12Device* self, ID3D12Heap* he
     if (SUCCEEDED(hr) && pp && *pp) GhHookResourceVtable((ID3D12Resource*)*pp);
     if (SUCCEEDED(hr) && pp && *pp) GhHookObjRelease((IUnknown*)*pp);
     if (loud || FAILED(hr)) Diag("  CreatePlacedResource -> hr=" + Hex((uint32_t)hr));
-    if (!loud && SUCCEEDED(hr) && pp && *pp)
-        Diag("PLACED res=" + Hex((uint64_t)(uintptr_t)*pp) +
-             " heap=" + Hex((uint64_t)(uintptr_t)heap) +
-             " off=" + Hex((uint64_t)off) +
-             " w=" + std::to_string(rd ? (unsigned long long)rd->Width : 0ull) +
-             " dim=" + std::to_string(rd ? (int)rd->Dimension : -1));
+    // #187 log budget: every placement, once each, was 1.16 MB of a quota the game
+    // needs. The placements matter as a population, not individually -- keep the
+    // first 512 in full and then one in every 64, which preserves the shape.
+    if (!loud && SUCCEEDED(hr) && pp && *pp){
+        static LONG placedN = 0;
+        LONG k = InterlockedIncrement(&placedN);
+        if (k <= 512 || (k & 63) == 0)
+            Diag("PLACED n=" + std::to_string((long long)k) +
+                 " res=" + Hex((uint64_t)(uintptr_t)*pp) +
+                 " heap=" + Hex((uint64_t)(uintptr_t)heap) +
+                 " off=" + Hex((uint64_t)off) +
+                 " w=" + std::to_string(rd ? (unsigned long long)rd->Width : 0ull) +
+                 " dim=" + std::to_string(rd ? (int)rd->Dimension : -1));
+    }
     return hr;
 }
 // #158. Three device entry points nothing has ever looked at, and each of them
@@ -17736,6 +17838,23 @@ static HRESULT __stdcall Hook_D12OpenHeapAddr(ID3D12Device* self, const void* ad
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const void*, REFIID,
                                       void**))g_d12vtOrig[48];
     HRESULT hr = orig(self, addr, riid, pp);
+    // #187 log budget. The guest calls this thousands of times and the answer never
+    // changes; the diagnostic value is in the FIRST few (with their VirtualQuery
+    // region dumps) and in the count. Log the first 64 and then only when the HRESULT
+    // itself changes, with a heartbeat every 4096 so silence is not mistaken for the
+    // hook having stopped.
+    {
+        static LONG seen = 0;
+        static LONG lastHr = 0x7FFFFFFF;
+        LONG k = InterlockedIncrement(&seen);
+        LONG prev = InterlockedExchange(&lastHr, (LONG)hr);
+        if (k > 64 && prev == (LONG)hr && (k & 0xFFF) != 0) return hr;
+        if (k > 64 && prev == (LONG)hr){
+            Diag("D3D12 OpenExistingHeapFromAddress calls=" + std::to_string((long long)k) +
+                 " hr=" + Hex((uint32_t)hr) + " (unchanged; logged once)");
+            return hr;
+        }
+    }
     std::string ln = "D3D12 OpenExistingHeapFromAddress addr=" + Hex((uint64_t)(uintptr_t)addr) +
                      " hr=" + Hex((uint32_t)hr);
     // #158: this fails E_INVALIDARG every time, and it is not a side show. The
