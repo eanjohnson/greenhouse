@@ -64,6 +64,8 @@
 #include <string>
 #include <vector>
 #include <deque>
+#include <list>
+#include <memory>
 #include <unordered_map>
 #include <set>
 
@@ -4606,6 +4608,47 @@ static void GhProfDump(const char* why)
 }
 
 static volatile LONG64 g_heapBytes = 0;   // #158, shared with Hook_D12CreateHeap
+
+// #201. heapMB only ever counted CreateHeap, so every committed and placed
+// resource in the process has been invisible to the FRAME line. #200 measured
+// the container gaining ~100 MB of pagefile commit over 25 minutes with the
+// working set FLAT (+1.3 MB) and viduse up 150 MB -- commit reserved and never
+// touched, which is the shape of resource creation and of almost nothing else.
+// Without these counters nothing in the log can say whether that memory is the
+// game's, ours, or resources already released and merely being recycled.
+// #201: the lowered-blob cache's own footprint, so the fix has a trace. A knob
+// whose effect cannot be seen in the log makes its cell void, and the whole
+// point of this one is a number that used to only ever go up.
+static volatile LONG64 g_loResidentB = 0;  // bytes the LRU is holding right now
+static volatile LONG   g_loDistinct  = 0;  // distinct keys ever loaded
+static volatile LONG   g_loEvicted   = 0;  // blobs dropped from the LRU
+static volatile LONG   g_loReread    = 0;  // re-reads caused by an eviction
+static volatile LONG64 g_resBytes = 0;   // cumulative, committed + placed
+static volatile LONG   g_resN     = 0;
+static volatile LONG64 g_resBufB  = 0;
+static volatile LONG   g_resBufN  = 0;
+static volatile LONG   g_resTexN  = 0;
+static bool GhResCensus()
+{ static const bool on = GhCfgNumZ(L"gh_res_census.txt", "GH_RES_CENSUS", 1) != 0; return on; }
+static void GhResCount(ID3D12Device* dev, const D3D12_RESOURCE_DESC* rd)
+{
+    if (!rd || !GhResCensus()) return;
+    InterlockedIncrement(&g_resN);
+    if (rd->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER){
+        // A buffer's Width IS its byte size, so this costs nothing.
+        InterlockedIncrement(&g_resBufN);
+        InterlockedAdd64(&g_resBufB,  (LONG64)rd->Width);
+        InterlockedAdd64(&g_resBytes, (LONG64)rd->Width);
+        return;
+    }
+    InterlockedIncrement(&g_resTexN);
+    if (!dev) return;
+    // Only the driver knows what a texture actually costs. Device slot 25 is not
+    // one we hook, so this cannot re-enter, and it is one query against a create
+    // that has already done far more work than this.
+    D3D12_RESOURCE_ALLOCATION_INFO ai = dev->GetResourceAllocationInfo(0, 1, rd);
+    if (ai.SizeInBytes != UINT64_MAX) InterlockedAdd64(&g_resBytes, (LONG64)ai.SizeInBytes);
+}
 static volatile LONG   g_heapCount = 0;
 static LONG GhEclNow();                   // #158, defined with g_eclCount below
 static volatile LONG g_presentTid = 0;
@@ -5250,6 +5293,21 @@ static HRESULT GfxPresent(UINT sync)
              " ecl=" + std::to_string((long)e) + " decl=" + std::to_string((long)(e - s_lastEcl)) +
              " heaps=" + std::to_string((long)h) + " dheaps=" + std::to_string((long)(h - s_lastHeaps)) +
              " heapMB=" + std::to_string((long long)(InterlockedCompareExchange64(&g_heapBytes, 0, 0) >> 20)) +
+             // #201: the resources heapMB never saw. If these track the container's
+             // commit growth, the leak is resource creation; if they run far ahead
+             // of it, resources are being released and the growth is the driver's.
+             " res=" + std::to_string((long)InterlockedCompareExchange(&g_resN, 0, 0)) +
+             " resMB=" + std::to_string((long long)(InterlockedCompareExchange64(&g_resBytes, 0, 0) >> 20)) +
+             " buf=" + std::to_string((long)InterlockedCompareExchange(&g_resBufN, 0, 0)) +
+             " bufMB=" + std::to_string((long long)(InterlockedCompareExchange64(&g_resBufB, 0, 0) >> 20)) +
+             " tex=" + std::to_string((long)InterlockedCompareExchange(&g_resTexN, 0, 0)) +
+             // #201: loKB is the number that used to be a one-way ratchet. It is
+             // capped by gh_lo_cache_mb now; loN is how many distinct blobs have
+             // been through it, and the two diverging is the fix working.
+             " loKB=" + std::to_string((long long)(InterlockedCompareExchange64(&g_loResidentB, 0, 0) >> 10)) +
+             " loN=" + std::to_string((long)InterlockedCompareExchange(&g_loDistinct, 0, 0)) +
+             " loEvict=" + std::to_string((long)InterlockedCompareExchange(&g_loEvicted, 0, 0)) +
+             " loReread=" + std::to_string((long)InterlockedCompareExchange(&g_loReread, 0, 0)) +
              " dt=" + std::to_string((unsigned long long)(s_lastMs ? now - s_lastMs : 0)) + "ms" +
              // #158. The cross-queue waits are the only part of the per-frame path
              // not cleared, and they cannot be cleared by removal -- every psync
@@ -7132,8 +7190,16 @@ static bool GhShaderSubOn()
 // The screen needs this to tell a wave-op container it has never seen from one
 // the baker already reduced -- see GhDxilMask for why that distinction is the
 // whole difference between a refusal that saves a run and one that wastes it.
-static std::set<const void*>& GhCorpusPtrs()
-{ static std::set<const void*> s; return s; }          // guarded by GhLoweredBlob's mutex
+//
+// #201: refcounted, and scoped to ONE PSO create. This used to be a plain set of
+// pointers into blobs that lived for the life of the process -- which is exactly
+// what stopped the cache below from ever giving anything back. Every reader
+// (GhIsCorpusBlob) runs inside the create that registered the pointer, so ending
+// the registration with the create is both tighter and safer: a permanent set
+// would keep answering "yes" for an address a later, unrelated allocation had
+// since been handed, and the screen would exempt a shader it has never seen.
+static std::map<const void*, int>& GhCorpusPtrs()
+{ static std::map<const void*, int> m; return m; }
 static std::mutex& GhCorpusMu()
 { static std::mutex m; return m; }
 static bool GhIsCorpusBlob(const void* p)
@@ -7142,44 +7208,148 @@ static bool GhIsCorpusBlob(const void* p)
     std::lock_guard<std::mutex> lk(GhCorpusMu());
     return GhCorpusPtrs().count(p) != 0;
 }
+static void GhCorpusAddRef(const void* p)
+{
+    if (!p) return;
+    std::lock_guard<std::mutex> lk(GhCorpusMu());
+    ++GhCorpusPtrs()[p];
+}
+static void GhCorpusRelease(const void* p)
+{
+    if (!p) return;
+    std::lock_guard<std::mutex> lk(GhCorpusMu());
+    auto it = GhCorpusPtrs().find(p);
+    if (it != GhCorpusPtrs().end() && --it->second <= 0) GhCorpusPtrs().erase(it);
+}
 
-static const std::vector<uint8_t>* GhLoweredBlob(const void* code, SIZE_T n)
+using GhBlobPtr = std::shared_ptr<const std::vector<uint8_t>>;
+
+// Holds every lowered blob handed out for one PSO create alive across the driver
+// call, and keeps its pointer answerable by GhIsCorpusBlob for exactly that
+// long. One of these lives on the stack of each create; when it goes, so does
+// the last reason to keep the bytes resident.
+struct GhBlobHold {
+    std::vector<GhBlobPtr> keep;
+    GhBlobHold() = default;
+    GhBlobHold(const GhBlobHold&)            = delete;
+    GhBlobHold& operator=(const GhBlobHold&) = delete;
+    void add(const GhBlobPtr& b)
+    {
+        if (!b || b->empty()) return;
+        keep.push_back(b);
+        GhCorpusAddRef((const void*)b->data());
+    }
+    ~GhBlobHold()
+    {
+        for (auto& b : keep) if (b && !b->empty()) GhCorpusRelease((const void*)b->data());
+    }
+};
+
+// How much lowered bytecode may stay resident BETWEEN PSO creates. The cache
+// this replaces was unbounded and held every blob for the life of the process:
+// #200 measured it at 25.7 MB across 1,847 distinct shaders by the time the run
+// died -- against 13.2 MB of container headroom. So our own cache was nearly
+// twice the margin the driver's shader compiler needed and could not get, and
+// it was still growing (8.5 -> 25.7 MB over the last 25 minutes, ~20% of all
+// the commit the process gained in that time).
+//
+// Blobs are now handed out as shared_ptr and dropped when the create that asked
+// for them finishes. This many MB of the hottest ones are kept resident anyway,
+// because the game re-creates the same pipeline 2.31 times on average and a
+// re-read would otherwise cost a file open inside PSO creation. 0 = keep nothing
+// between creates and re-read every time; the corpus lives on D: with no quota.
+static unsigned GhLoCacheMB()
+{ static const unsigned v = GhCfgNumZ(L"gh_lo_cache_mb.txt", "GH_LO_CACHE_MB", 8); return v; }
+
+static GhBlobPtr GhLoweredBlob(const void* code, SIZE_T n)
 {
     if (!GhShaderSubOn() || !code || n < 20) return nullptr;
     char key[33];
     if (!GhShaderKey(code, n, key)) return nullptr;
 
-    // Misses are cached too: this runs inside PSO creation, and a game that
-    // compiles two thousand pipelines must not pay a file open per pipeline.
+    enum { kUnknown = 0, kMiss = 1, kHit = 2 };
+    struct Entry {
+        std::weak_ptr<const std::vector<uint8_t>> weak;
+        std::list<std::pair<std::string, GhBlobPtr>>::iterator lruIt{};
+        bool inLru = false;
+        int  state = kUnknown;
+    };
     static std::mutex mu;
-    static std::map<std::string, std::vector<uint8_t>> cache;
+    static std::map<std::string, Entry> cache;
+    // The residency list, hottest last, holding the only strong reference the
+    // loader keeps once a create has finished. Dropping from it drops just that
+    // reference: a blob some other create is still using stays alive through
+    // that create's own GhBlobHold, so eviction can never pull bytes out from
+    // under the driver. A list (not a ring) so a re-use splices to the back in
+    // O(1) without the entry appearing twice and double-counting lruBytes.
+    static std::list<std::pair<std::string, GhBlobPtr>> lru;
+    static size_t lruBytes = 0;
+    // Each node carries its own key, so evicting one can clear that entry's
+    // claim directly instead of searching the map for whoever pointed here.
+    auto trim = [&]{
+        while (lruBytes > (size_t)GhLoCacheMB() * 1024 * 1024 && !lru.empty()){
+            lruBytes -= lru.front().second->size();
+            InterlockedAdd64(&g_loResidentB, -(LONG64)lru.front().second->size());
+            InterlockedIncrement(&g_loEvicted);
+            auto owner = cache.find(lru.front().first);
+            if (owner != cache.end()) owner->second.inLru = false;
+            lru.pop_front();
+        }
+    };
+
     std::lock_guard<std::mutex> lk(mu);
-    auto it = cache.find(key);
-    if (it == cache.end()){
-        std::vector<uint8_t> blob;
-        std::wstring wkey;
-        for (const char* c = key; *c; ++c) wkey.push_back((wchar_t)*c);
-        // Flat naming first. WDP's file API will not create a subdirectory under
-        // LocalState (every fsupload into ghlo\ returns 500), so the staged cache
-        // lives in the root as gh_lo_<key>.bin. The subdirectory is still read as a
-        // fallback, for an on-device translator that writes its own tree.
-        ReadWholeFile(std::wstring(kLocalState) + L"gh_lo_" + wkey + L".bin", blob, true);
-        if (blob.empty())
-            ReadWholeFile(std::wstring(kLocalState) + L"ghlo\\" + wkey + L".bin", blob, true);
-        // #188: and D:, where a corpus too big for the quota is staged.
-        if (blob.empty())
-            ReadWholeFile(GhCorpusDir() + L"gh_lo_" + wkey + L".bin", blob, true);
+    Entry& e = cache[key];
+
+    // A miss costs one file open, once, ever. This runs inside PSO creation and
+    // a game that compiles thousands of pipelines must not pay a probe per one.
+    if (e.state == kMiss) return nullptr;
+
+    if (e.state == kHit){
+        if (GhBlobPtr live = e.weak.lock()){
+            if (GhLoCacheMB()){                    // touch: keep the hot ones hot
+                if (e.inLru) lru.splice(lru.end(), lru, e.lruIt);
+                else { lru.emplace_back(key, live); e.lruIt = std::prev(lru.end());
+                       e.inLru = true; lruBytes += live->size();
+                       InterlockedAdd64(&g_loResidentB, (LONG64)live->size()); trim(); }
+            }
+            return live;
+        }
+        // Evicted since we last saw it. Fall through and read it again -- the
+        // key is already known good, so this is a plain re-read with no probe.
+        InterlockedIncrement(&g_loReread);
+    }
+
+    auto bytes = std::make_shared<std::vector<uint8_t>>();
+    std::wstring wkey;
+    for (const char* c = key; *c; ++c) wkey.push_back((wchar_t)*c);
+    // Flat naming first. WDP's file API will not create a subdirectory under
+    // LocalState (every fsupload into ghlo\ returns 500), so the staged cache
+    // lives in the root as gh_lo_<key>.bin. The subdirectory is still read as a
+    // fallback, for an on-device translator that writes its own tree.
+    ReadWholeFile(std::wstring(kLocalState) + L"gh_lo_" + wkey + L".bin", *bytes, true);
+    if (bytes->empty())
+        ReadWholeFile(std::wstring(kLocalState) + L"ghlo\\" + wkey + L".bin", *bytes, true);
+    // #188: and D:, where a corpus too big for the quota is staged.
+    if (bytes->empty())
+        ReadWholeFile(GhCorpusDir() + L"gh_lo_" + wkey + L".bin", *bytes, true);
+
+    const bool firstLook = (e.state == kUnknown);
+    e.state = bytes->empty() ? kMiss : kHit;
+    if (firstLook && !bytes->empty()) InterlockedIncrement(&g_loDistinct);
+
+    if (firstLook){
+        // Counted and logged once per DISTINCT key, which is what it always
+        // measured -- the old code logged on the path that filled the cache, and
+        // this is that same path. A re-read after eviction is not a new hit.
         static volatile LONG hits = 0, misses = 0;
-        const LONG k = blob.empty() ? InterlockedIncrement(&misses)
-                                    : InterlockedIncrement(&hits);
-        // Every HIT prints: the run's score IS the hit count, and the old
-        // "first 8 then every 200th" throttle capped the log at 8 and made the
-        // total unreadable. Misses stay throttled -- there are ~160 of them.
-        if (!blob.empty() || k <= 8 || (k % 50) == 0)
-            Diag(std::string("SHADERSUB ") + (blob.empty() ? "miss" : "HIT ") +
-                 " key=" + key + " bytes=" + std::to_string((unsigned)blob.size()) +
+        const LONG k = bytes->empty() ? InterlockedIncrement(&misses)
+                                      : InterlockedIncrement(&hits);
+        if (!bytes->empty() || k <= 8 || (k % 50) == 0)
+            Diag(std::string("SHADERSUB ") + (bytes->empty() ? "miss" : "HIT ") +
+                 " key=" + key + " bytes=" + std::to_string((unsigned)bytes->size()) +
                  " hits=" + std::to_string((long)InterlockedCompareExchange(&hits, 0, 0)) +
                  " misses=" + std::to_string((long)InterlockedCompareExchange(&misses, 0, 0)));
+
         // A miss is the only thing that still reaches the back end unlowered, and
         // an unlowered SM 6.6 shader is exactly what makes newbe.DLL read past the
         // end of its 214-entry opcode table (the +0x22E082 fault, rbx=0xDA=218).
@@ -7199,7 +7369,7 @@ static const std::vector<uint8_t>* GhLoweredBlob(const void* code, SIZE_T n)
         // corpus silently stops being closed and the next run dies in newbe.
         uint64_t mfeat = 0;
         GhDxilFeat(code, n, &mfeat);
-        if (blob.empty() && (GhDxilSm(code, n) > 0x65 || (mfeat & 0x4000))){
+        if (bytes->empty() && (GhDxilSm(code, n) > 0x65 || (mfeat & 0x4000))){
             std::wstring path = GhDumpDir() + L"gh_sh_miss_" + wkey + L".bin";
             HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -7211,18 +7381,24 @@ static const std::vector<uint8_t>* GhLoweredBlob(const void* code, SIZE_T n)
                      " bytes=" + std::to_string((unsigned long)wrote));
             }
         }
-        it = cache.emplace(key, std::move(blob)).first;
-        // #186: remember the bytes themselves, not just the key. The screen
-        // downstream sees a raw pointer with no provenance, and the substituted
-        // container's OWN digest differs from the key it is filed under, so the
-        // key cannot be recovered from the bytes. std::map never moves a mapped
-        // value, so data() stays valid for the life of the process.
-        if (!it->second.empty()){
-            std::lock_guard<std::mutex> lk2(GhCorpusMu());
-            GhCorpusPtrs().insert((const void*)it->second.data());
-        }
     }
-    return it->second.empty() ? nullptr : &it->second;
+
+    if (bytes->empty()) return nullptr;
+
+    e.weak = bytes;
+    if (GhLoCacheMB()){
+        lru.emplace_back(key, bytes);
+        e.lruIt  = std::prev(lru.end());
+        e.inLru  = true;
+        lruBytes += bytes->size();
+        InterlockedAdd64(&g_loResidentB, (LONG64)bytes->size());
+        trim();
+    }
+    // #201: no GhCorpusPtrs registration here. The pointer is registered by the
+    // GhBlobHold that the caller owns, and released when that create returns --
+    // see the comment on GhCorpusPtrs for why lifetime and answerability have to
+    // be the same thing now that the bytes can be freed.
+    return bytes;
 }
 
 // gh_pso_serialize funnels PSO creation through ONE lock. It used to be a static
@@ -7240,11 +7416,17 @@ static bool GhPsoSerialize()
 
 // Swap a bytecode slot in place if a lowered blob is staged for it. Returns true
 // if anything changed, so the caller only copies the PSO desc when it must.
-static bool GhSubstShader(D3D12_SHADER_BYTECODE* bc)
+//
+// #201: the blob is no longer immortal, so the caller has to say where its
+// lifetime ends. `hold` keeps it -- and its answer to GhIsCorpusBlob -- alive
+// until the create returns, which is the last moment either the driver or the
+// screen can still be looking at the bytes.
+static bool GhSubstShader(D3D12_SHADER_BYTECODE* bc, GhBlobHold& hold)
 {
     if (!bc || !bc->pShaderBytecode) return false;
-    const std::vector<uint8_t>* lo = GhLoweredBlob(bc->pShaderBytecode, bc->BytecodeLength);
-    if (!lo) return false;
+    GhBlobPtr lo = GhLoweredBlob(bc->pShaderBytecode, bc->BytecodeLength);
+    if (!lo || lo->empty()) return false;
+    hold.add(lo);
     bc->pShaderBytecode = lo->data();
     bc->BytecodeLength  = lo->size();
     return true;
@@ -10282,14 +10464,17 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
         }
     }
 
+    // Outlives every use of the substituted bytecode below: the screen reads it,
+    // then the driver compiles from it, and both finish before this returns.
+    GhBlobHold subHold;
     if (use && GhShaderSubOn()){
         if (use != &local){ local = *use; }
         bool any = false;
-        any |= GhSubstShader(&local.VS);
-        any |= GhSubstShader(&local.PS);
-        any |= GhSubstShader(&local.GS);
-        any |= GhSubstShader(&local.HS);
-        any |= GhSubstShader(&local.DS);
+        any |= GhSubstShader(&local.VS, subHold);
+        any |= GhSubstShader(&local.PS, subHold);
+        any |= GhSubstShader(&local.GS, subHold);
+        any |= GhSubstShader(&local.HS, subHold);
+        any |= GhSubstShader(&local.DS, subHold);
         if (any){
             static volatile LONG nsub = 0;
             const LONG k = InterlockedIncrement(&nsub);
@@ -10584,9 +10769,10 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
     // screening it on the 6.6 blob's features would refuse the very thing the
     // substitution exists to let through.
     D3D12_COMPUTE_PIPELINE_STATE_DESC subd;
+    GhBlobHold subHold;          // same lifetime rule as the graphics path
     if (d && GhShaderSubOn()){
         subd = *d;
-        if (GhSubstShader(&subd.CS)){
+        if (GhSubstShader(&subd.CS, subHold)){
             static volatile LONG nsub = 0;
             const LONG k = InterlockedIncrement(&nsub);
             if (k <= 8 || (k % 100) == 0)
@@ -18052,6 +18238,7 @@ static HRESULT __stdcall Hook_D12CreateCommitted(ID3D12Device* self,
         D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
         const D3D12_CLEAR_VALUE*, REFIID, void**))g_d12vtOrig[27];
     GhD12CallScope _s("CreateCommittedResource");
+    GhResCount(self, rd);
     _s.Info("heap=" + std::to_string(hp ? (int)hp->Type : -1) +
             " flags=" + Hex((uint32_t)hf) +
             " dim=" + std::to_string(rd ? (int)rd->Dimension : -1) +
@@ -18355,6 +18542,7 @@ static HRESULT __stdcall Hook_D12CreatePlaced(ID3D12Device* self, ID3D12Heap* he
         const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*,
         REFIID, void**))g_d12vtOrig[29];
     GhD12CallScope _s("CreatePlacedResource");
+    GhResCount(self, rd);
     D3D12_RESOURCE_DESC fixedRd{};
     rd = GhFixRtDesc(&fixedRd, rd);
     D3D12_RESOURCE_DESC strippedRd{}; bool didStrip = false;
