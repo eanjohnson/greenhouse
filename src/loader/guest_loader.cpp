@@ -365,6 +365,39 @@ static HANDLE WINAPI Bed_GetStdHandle(DWORD n){
     if (n == (DWORD)-12) return g_hErr;
     return GetStdHandle(n);
 }
+// ---------------------------------------------------------------------------
+// #193. Does the game's own log reach the disk?
+//
+// Tsushima's log is the only place the DEATH is described in the game's own
+// words -- cell D has it naming the failing CreateCommittedResource, the VMEM
+// budget and 0x887A0020. But in three of four cells the file stops MID-LINE at
+// exactly 12,458 bytes, three seconds into rendering, with none of the
+// 60-second "[Render] Working set: ... fps:" heartbeats that the run must have
+// produced over the following five minutes. Cell D differs only in that the
+// game reached its own D3D error handler.
+//
+// Two explanations fit, and they lead opposite ways:
+//   (a) the text never left the GAME's user-space buffer -- then the log is
+//       recoverable only when the game flushes it, and we should stop trying;
+//   (b) the game handed it to WriteFile and OUR path dropped it -- our bug,
+//       and fixing it hands us the death record for every cell.
+//
+// This decides between them without a knob. We already bed WriteFile, so count
+// what the guest hands us for the log handle, keep the last bytes it wrote, and
+// at the death sites compare the running byte total against the file's ACTUAL
+// size. bytes ~= filesize means (a). bytes >> filesize means (b).
+static volatile LONG64 g_logWrites   = 0;
+static volatile LONG64 g_logBytes    = 0;   // bytes the guest handed us
+static volatile LONG64 g_logWrote    = 0;   // bytes WriteFile reported written
+static volatile LONG   g_logFailed   = 0;
+static volatile LONG   g_logLastErr  = 0;
+static HANDLE          g_logHandle   = nullptr;
+static std::wstring    g_logPath;
+static volatile LONG64 g_logLastTick = 0;
+static SRWLOCK         g_logTailLock = SRWLOCK_INIT;
+static char            g_logTail[600];
+static volatile LONG   g_logTailLen  = 0;
+
 static BOOL WINAPI Bed_WriteFile(HANDLE h, LPCVOID buf, DWORD n, LPDWORD wrote, LPOVERLAPPED ov){
     if (h == g_hOut || h == g_hErr){
         g_capturedOut.append(reinterpret_cast<const char*>(buf), n);
@@ -373,9 +406,30 @@ static BOOL WINAPI Bed_WriteFile(HANDLE h, LPCVOID buf, DWORD n, LPDWORD wrote, 
         return TRUE;
     }
     GhLazyMaterialise(buf, n);        // #145: the kernel reads this buffer
-    BOOL ok = WriteFile(h, buf, n, wrote, ov);
+    // Never hand WriteFile a stack local for an OVERLAPPED write: the kernel
+    // may still be writing to it after we return.
+    DWORD   wroteLocal = 0;
+    LPDWORD pw = wrote ? wrote : (ov ? nullptr : &wroteLocal);
+    BOOL ok = WriteFile(h, buf, n, pw, ov);
     if (!ok && GetLastError() == ERROR_NOACCESS && GhLazyMaterialise(buf, n))
-        ok = WriteFile(h, buf, n, wrote, ov);
+        ok = WriteFile(h, buf, n, pw, ov);
+    // #193: one pointer compare on the hot path, everything else only for the log.
+    if (h && h == g_logHandle){
+        const DWORD w = (pw && !ov) ? *pw : 0;   // meaningless for an async write
+        InterlockedIncrement64(&g_logWrites);
+        InterlockedExchangeAdd64(&g_logBytes, (LONG64)n);
+        InterlockedExchangeAdd64(&g_logWrote, (LONG64)w);
+        InterlockedExchange64(&g_logLastTick, (LONG64)GetTickCount64());
+        if (!ok){ InterlockedIncrement(&g_logFailed);
+                  InterlockedExchange(&g_logLastErr, (LONG)GetLastError()); }
+        if (buf && n){
+            AcquireSRWLockExclusive(&g_logTailLock);
+            const DWORD keep = n < sizeof(g_logTail) ? n : (DWORD)sizeof(g_logTail);
+            memcpy(g_logTail, (const char*)buf + (n - keep), keep);
+            InterlockedExchange(&g_logTailLen, (LONG)keep);
+            ReleaseSRWLockExclusive(&g_logTailLock);
+        }
+    }
     return ok;
 }
 static BOOL WINAPI Bed_GetConsoleMode(HANDLE, LPDWORD){ return FALSE; }  // no console
@@ -801,6 +855,27 @@ static HANDLE WINAPI Bed_CreateFileW(LPCWSTR name, DWORD acc, DWORD share, LPSEC
     if (disp==CREATE_ALWAYS||disp==CREATE_NEW||disp==OPEN_ALWAYS) EnsureParentOf(real);
     HANDLE h = CreateFileW(real.c_str(), acc, share, sa, disp, flags, tmpl);
     VfsTrace("CreateFileW", name, real);
+    // #193: remember the GUEST's writable .log handle so Bed_WriteFile can
+    // account for it. Our own instrumentation files must never claim the slot:
+    // gh_shim.log is opened ~1,370 times a run with FILE_APPEND_DATA, which is
+    // exactly what the first version of this filter latched onto. The game opens
+    // its log once, GENERIC_WRITE, CREATE_ALWAYS. The census re-derives the path
+    // from the handle at dump time, so a recycled handle shows as a mismatch
+    // rather than as a silently wrong number.
+    if (h != INVALID_HANDLE_VALUE && (acc & GENERIC_WRITE) &&
+        real.size() > 4 && _wcsicmp(real.c_str() + real.size() - 4, L".log") == 0){
+        const size_t   cut  = real.find_last_of(L"\\/");
+        const wchar_t* leaf = real.c_str() + (cut == std::wstring::npos ? 0 : cut + 1);
+        if (_wcsnicmp(leaf, L"gh_", 3) != 0){
+            const bool isNew = (real != g_logPath);
+            g_logHandle = h;
+            if (isNew){
+                g_logPath = real;
+                Diag("LOGFILE handle=" + Hex((uint64_t)(uintptr_t)h) + " acc=" + Hex((uint32_t)acc) +
+                     " disp=" + std::to_string(disp) + " " + std::string(real.begin(), real.end()));
+            }
+        }
+    }
     return h;
 }
 static HANDLE WINAPI Bed_CreateFileA(LPCSTR name, DWORD acc, DWORD share, LPSECURITY_ATTRIBUTES sa,
@@ -18501,6 +18576,37 @@ static void GhDbgStrFlush(const char* why)
     Diag("DBGSTRRING end");
 }
 
+// #193: say whether the game's log actually reached the disk. bytes ~= filesize
+// means everything the guest handed us landed and the rest is stuck in the
+// game's own buffer; bytes >> filesize means we are losing writes.
+static void GhLogFileCensus(const char* why)
+{
+    HANDLE h = g_logHandle;
+    std::string ln = std::string("LOGFILE census at ") + why +
+        " writes=" + std::to_string((long long)InterlockedCompareExchange64(&g_logWrites, 0, 0)) +
+        " bytes="  + std::to_string((long long)InterlockedCompareExchange64(&g_logBytes,  0, 0)) +
+        " wrote="  + std::to_string((long long)InterlockedCompareExchange64(&g_logWrote,  0, 0)) +
+        " failed=" + std::to_string((long)InterlockedCompareExchange(&g_logFailed, 0, 0)) +
+        " lasterr=" + Hex((uint32_t)InterlockedCompareExchange(&g_logLastErr, 0, 0));
+    const LONG64 last = InterlockedCompareExchange64(&g_logLastTick, 0, 0);
+    ln += " sincelastwrite=" + (last ? std::to_string((long long)(GetTickCount64() - (ULONGLONG)last)) + "ms"
+                                     : std::string("never"));
+    Diag(ln);
+    // Nothing below may touch the handle. Measured on loader 0.0.451.0: any of
+    // GetFileSizeEx / GetFinalPathNameByHandleW / FlushFileBuffers on it never
+    // returns here, and this census runs on the device-removed path AHEAD of the
+    // breadcrumb, barrier and info-queue dumps -- a probe that does not return
+    // silently truncates the whole death record. The file's real size comes from
+    // the harness fetching it off the console, which is a better witness anyway.
+    if (!h){ Diag("LOGFILE census: no log handle was ever claimed"); return; }
+    AcquireSRWLockShared(&g_logTailLock);
+    const LONG n = InterlockedCompareExchange(&g_logTailLen, 0, 0);
+    std::string tail(g_logTail, g_logTail + (n > 0 ? n : 0));
+    ReleaseSRWLockShared(&g_logTailLock);
+    for (auto& c : tail) if (c == '\r' || c == '\n') c = '|';
+    if (!tail.empty()) Diag("LOGFILE last bytes the guest wrote: " + tail);
+}
+
 static void GhCheckDeviceRemoved(const char* where, ID3D12Device* dev)
 {
     // dev lets a caller ask about the device it actually holds -- the guest's
@@ -18513,6 +18619,7 @@ static void GhCheckDeviceRemoved(const char* where, ID3D12Device* dev)
     Diag(std::string("DEVICEREMOVED first seen at ") + where +
          " reason=" + Hex((uint32_t)r) + GhGpuProgress());
     GhDbgStrFlush(where);          // #192: what the driver said on the way down
+    GhLogFileCensus(where);        // #193: did the game's own log survive?
     GhBreadcrumbDump("device-removed");
     GhBarrDump("at-device-removed");
     GhDrainInfoQueue();
@@ -20063,6 +20170,7 @@ static int WINAPI Bed_MessageBoxW(HWND, const wchar_t* text, const wchar_t* cap,
     // never have fired. A dialog is rare enough to flush unconditionally, and
     // the ring keeps filling afterwards, so flushing twice costs nothing.
     GhDbgStrFlush("messagebox");
+    GhLogFileCensus("messagebox");
     // A game that puts up a message box has already made the decision behind it,
     // and the caller is the decision site. That is worth more than the text: this
     // title's user-visible strings are not in the exe (localisation data files), so
