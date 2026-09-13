@@ -18480,15 +18480,52 @@ static void GhCheckDeviceRemoved(const char* where, ID3D12Device* dev)
 static unsigned GhVaCensusEvery()
 { static const unsigned v = GhCfgNum(L"gh_va_census.txt", "GH_VA_CENSUS", 0); return v; }
 
-static void GhVaCensus(const char* when)
+// #189. Two changes, both because the run that dies is unobserved exactly where
+// it matters. Cell B3 put ~494 MB of commit on in its last 3.7 s with viduse
+// dead flat, no CreateHeap, and no MEMBIG entry -- and no census landed in that
+// window at all, because the census ran once per tenth MEMORY sample. So:
+//
+//   * the cadence goes adaptive. Once appused crosses gh_va_census_hot percent
+//     of applimit, EVERY sample gets a census whatever N says. The walk is the
+//     expensive part of the sampler, and it is worth paying for only near the
+//     ceiling -- which is the one place it was never paid.
+//   * the walk is diffed against the previous one. A top-12 list sorted by size
+//     barely moves while hundreds of megabytes arrive in 30 MB pieces; a list
+//     sorted by GROWTH names them. That is the whole point: the ~253 MB of B3's
+//     burst that is not the lazy pager has no owner in any instrument we have,
+//     and it has to name itself.
+//
+// gh_va_census_hot is read with GhCfgNumZ so 0 is expressible and means "never
+// go hot", i.e. bit-for-bit the old cadence.
+static unsigned GhVaCensusHotPct()
+{ static const unsigned v = (unsigned)GhCfgNumZ(L"gh_va_census_hot.txt", "GH_VA_CENSUS_HOT", 85); return v; }
+
+struct GhVaReg { uint64_t base, size; DWORD type, prot; };
+static SRWLOCK              g_vaCensusLock = SRWLOCK_INIT;
+static std::vector<GhVaReg> g_vaPrev;        // previous walk, ascending by base
+static ULONGLONG            g_vaPrevTick = 0;
+
+static const char* GhVaTypeName(DWORD t)
+{ return t == MEM_IMAGE ? "image" : t == MEM_MAPPED ? "mapped" : "private"; }
+
+static void GhVaCensus(const char* when, uint64_t appused, uint64_t applimit)
 {
     const unsigned every = GhVaCensusEvery();
     if (!every) return;
     static LONG n = 0;
-    if ((InterlockedIncrement(&n) - 1) % (LONG)every) return;
+    const LONG k = InterlockedIncrement(&n) - 1;
+    const unsigned hotPct = GhVaCensusHotPct();
+    const bool hot = hotPct && applimit && appused &&
+                     appused * 100 >= applimit * (uint64_t)hotPct;
+    if (!hot && (k % (LONG)every)) return;
 
-    struct Reg { uint8_t* base; uint64_t size; DWORD type, prot; };
-    Reg top[12]{};
+    AcquireSRWLockExclusive(&g_vaCensusLock);
+
+    const bool havePrev = !g_vaPrev.empty();
+    std::vector<GhVaReg> cur;
+    cur.reserve(g_vaPrev.size() + 256);
+
+    GhVaReg top[12]{};
     uint64_t cImage = 0, cMapped = 0, cPrivate = 0, cPrivExec = 0, reserved = 0;
     // On this UMA console a D3D12 heap the CPU can see is PAGE_WRITECOMBINE, and
     // it is charged to the app's PRIVATE commit as well as to viduse -- the same
@@ -18514,38 +18551,99 @@ static void GhVaCensus(const char* when)
                     cPrivExec += rs;
                 if (mbi.Protect & PAGE_WRITECOMBINE){ cWC += rs; ++nWC; }
             }
+            // VirtualQuery reports ascending, so cur is sorted by construction and
+            // the diff below is one merge pass with no sort.
+            cur.push_back(GhVaReg{ (uint64_t)(uintptr_t)mbi.BaseAddress, rs, mbi.Type, mbi.Protect });
             if (rs > top[11].size){          // keep the largest dozen, insertion sorted
                 int i = 11;
                 while (i > 0 && top[i - 1].size < rs){ top[i] = top[i - 1]; --i; }
-                top[i] = Reg{ (uint8_t*)mbi.BaseAddress, rs, mbi.Type, mbi.Protect };
+                top[i] = GhVaReg{ (uint64_t)(uintptr_t)mbi.BaseAddress, rs, mbi.Type, mbi.Protect };
             }
         } else if (mbi.State == MEM_RESERVE) reserved += rs;
         uint8_t* next = (uint8_t*)mbi.BaseAddress + rs;
         if (next <= p) break;                // never spin on an answer that does not advance
         p = next;
     }
+
+    // Growth since the previous walk. A region that kept its base and grew counts
+    // its increment; a base that was not there before counts whole and is marked
+    // NEW. Shrink and disappearance are summed but not listed -- the question is
+    // where the commit CAME from.
+    struct Grow { uint64_t base, delta, size; DWORD type, prot; bool fresh; };
+    Grow g[10]{};
+    uint64_t growTot = 0, growWC = 0, freedTot = 0;
+    unsigned long growN = 0, freshN = 0, freedN = 0;
+    auto note = [&](const GhVaReg& r, uint64_t delta, bool fresh){
+        growTot += delta; ++growN; if (fresh) ++freshN;
+        if (r.type != MEM_IMAGE && r.type != MEM_MAPPED && (r.prot & PAGE_WRITECOMBINE))
+            growWC += delta;
+        if (delta > g[9].delta){
+            int i = 9;
+            while (i > 0 && g[i - 1].delta < delta){ g[i] = g[i - 1]; --i; }
+            g[i] = Grow{ r.base, delta, r.size, r.type, r.prot, fresh };
+        }
+    };
+    if (havePrev){
+        size_t a = 0, b = 0;
+        while (a < g_vaPrev.size() || b < cur.size()){
+            if (b >= cur.size()){ freedTot += g_vaPrev[a].size; ++freedN; ++a; }
+            else if (a >= g_vaPrev.size()){ note(cur[b], cur[b].size, true); ++b; }
+            else if (g_vaPrev[a].base < cur[b].base){ freedTot += g_vaPrev[a].size; ++freedN; ++a; }
+            else if (g_vaPrev[a].base > cur[b].base){ note(cur[b], cur[b].size, true); ++b; }
+            else {
+                if      (cur[b].size > g_vaPrev[a].size) note(cur[b], cur[b].size - g_vaPrev[a].size, false);
+                else if (cur[b].size < g_vaPrev[a].size){ freedTot += g_vaPrev[a].size - cur[b].size; ++freedN; }
+                ++a; ++b;
+            }
+        }
+    }
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG ms  = g_vaPrevTick ? now - g_vaPrevTick : 0;
+
     auto MB = [](uint64_t b){ return std::to_string((unsigned long long)(b >> 20)); };
-    Diag(std::string("VACENSUS ") + when +
+    auto KB = [](uint64_t b){ return std::to_string((unsigned long long)(b >> 10)); };
+    Diag(std::string("VACENSUS ") + when + (hot ? " HOT" : "") +
          " imageMB=" + MB(cImage) + " mappedMB=" + MB(cMapped) +
          " privateMB=" + MB(cPrivate) + " privexecMB=" + MB(cPrivExec) +
          " privwcMB=" + MB(cWC) + " privwcN=" + std::to_string(nWC) +
          " reservedMB=" + MB(reserved) + " regions=" + std::to_string(nreg));
     for (unsigned i = 0; i < 12 && top[i].size; ++i)
         Diag("  VACENSUS #" + std::to_string((unsigned long)i) +
-             " base=" + Hex((uint64_t)(uintptr_t)top[i].base) +
+             " base=" + Hex(top[i].base) +
              " MB=" + MB(top[i].size) +
-             " type=" + (top[i].type == MEM_IMAGE  ? "image"  :
-                         top[i].type == MEM_MAPPED ? "mapped" : "private") +
+             " type=" + GhVaTypeName(top[i].type) +
              " prot=" + Hex((uint32_t)top[i].prot));
+    if (havePrev){
+        Diag("VACENSUS delta ms=" + std::to_string((unsigned long long)ms) +
+             " grewKB=" + KB(growTot) + " grewwcKB=" + KB(growWC) +
+             " freedKB=" + KB(freedTot) +
+             " grewN=" + std::to_string(growN) +
+             " freshN=" + std::to_string(freshN) +
+             " freedN=" + std::to_string(freedN));
+        for (unsigned i = 0; i < 10 && g[i].delta; ++i)
+            Diag("  VACENSUS +" + std::to_string((unsigned long)i) +
+                 " base=" + Hex(g[i].base) +
+                 " dKB=" + KB(g[i].delta) + " nowKB=" + KB(g[i].size) +
+                 (g[i].fresh ? " NEW" : " grew") +
+                 " type=" + GhVaTypeName(g[i].type) +
+                 " prot=" + Hex((uint32_t)g[i].prot));
+    }
+
+    g_vaPrev.swap(cur);
+    g_vaPrevTick = now;
+    ReleaseSRWLockExclusive(&g_vaCensusLock);
 }
 
 static void GhLogMemoryBudget(const char* where)
 {
     GhCheckDeviceRemoved(where);
     std::string ln = std::string("MEMORY ") + where;
+    // Kept as values too: #189's census needs the ratio to decide its cadence.
+    uint64_t appLimit = 0, appUsed = 0;
     __try {
-        ln += " applimit=" + Hex((uint64_t)winrt::Windows::System::MemoryManager::AppMemoryUsageLimit()) +
-              " appused="  + Hex((uint64_t)winrt::Windows::System::MemoryManager::AppMemoryUsage());
+        appLimit = (uint64_t)winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
+        appUsed  = (uint64_t)winrt::Windows::System::MemoryManager::AppMemoryUsage();
+        ln += " applimit=" + Hex(appLimit) + " appused=" + Hex(appUsed);
     } __except (EXCEPTION_EXECUTE_HANDLER) { ln += " applimit=?"; }
     MEMORYSTATUSEX ms{}; ms.dwLength = sizeof ms;
     if (GlobalMemoryStatusEx(&ms))
@@ -18597,7 +18695,7 @@ static void GhLogMemoryBudget(const char* where)
     }
     ln += GhLazyStats();
     Diag(ln);
-    GhVaCensus(where);
+    GhVaCensus(where, appUsed, appLimit);
 }
 
 // #158. The repairs above say something specific and testable: every one of them
