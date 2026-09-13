@@ -4623,6 +4623,21 @@ static volatile LONG64 g_loResidentB = 0;  // bytes the LRU is holding right now
 static volatile LONG   g_loDistinct  = 0;  // distinct keys ever loaded
 static volatile LONG   g_loEvicted   = 0;  // blobs dropped from the LRU
 static volatile LONG   g_loReread    = 0;  // re-reads caused by an eviction
+
+// #202. Where the loading screen's time actually goes. Ghost of Tsushima ships
+// a 16,192-entry pipeline cache (its own log: "Pipeline cache default.pso read
+// succesfully, read 16192 pipelines") and warms every one of them behind the
+// katana spinner, seven job threads deep and permanently saturated -- run A201
+// measured inflight=7 on 4,700 of 4,873 creates. At the rate that run sustained
+// the warm pass needs over two hours, which is why the spinner has never been
+// seen to end. The question the diag could not answer is whether those seconds
+// are spent in the driver's compiler or in our own pre-work in front of it, so
+// count both, in microseconds, and put them on the FRAME line.
+static volatile LONG64 g_psoDrvUs    = 0;  // inside the driver's create
+static volatile LONG64 g_psoPreUs    = 0;  // our screen/substitution/rewrite
+static volatile LONG   g_psoCalls    = 0;  // creates that reached the driver
+static volatile LONG   g_psoDup      = 0;  // creates answered from the dedup cache
+static volatile LONG64 g_psoDupSavUs = 0;  // driver time those answers avoided
 static volatile LONG64 g_resBytes = 0;   // cumulative, committed + placed
 static volatile LONG   g_resN     = 0;
 static volatile LONG64 g_resBufB  = 0;
@@ -5308,6 +5323,14 @@ static HRESULT GfxPresent(UINT sync)
              " loN=" + std::to_string((long)InterlockedCompareExchange(&g_loDistinct, 0, 0)) +
              " loEvict=" + std::to_string((long)InterlockedCompareExchange(&g_loEvicted, 0, 0)) +
              " loReread=" + std::to_string((long)InterlockedCompareExchange(&g_loReread, 0, 0)) +
+             // #202. psoN creates reached the driver and cost psoDrvMs; psoPreMs is
+             // what we spent in front of it. psoDup is how many creates never had
+             // to happen at all, and psoSavMs the driver time that bought back.
+             " psoN=" + std::to_string((long)InterlockedCompareExchange(&g_psoCalls, 0, 0)) +
+             " psoDrvMs=" + std::to_string((long long)(InterlockedCompareExchange64(&g_psoDrvUs, 0, 0) / 1000)) +
+             " psoPreMs=" + std::to_string((long long)(InterlockedCompareExchange64(&g_psoPreUs, 0, 0) / 1000)) +
+             " psoDup=" + std::to_string((long)InterlockedCompareExchange(&g_psoDup, 0, 0)) +
+             " psoSavMs=" + std::to_string((long long)(InterlockedCompareExchange64(&g_psoDupSavUs, 0, 0) / 1000)) +
              " dt=" + std::to_string((unsigned long long)(s_lastMs ? now - s_lastMs : 0)) + "ms" +
              // #158. The cross-queue waits are the only part of the per-frame path
              // not cleared, and they cannot be cleared by removal -- every psync
@@ -10225,6 +10248,205 @@ static bool GhCpsServeStandIn(ID3D12Device* dev, GhCpsRawFn orig,
     return true;
 }
 
+// #202. The loading screen is a 16,192-pipeline warm pass, and a fair share of
+// what it asks for it has already asked for. Run A201 saw 1,998 of 4,873
+// graphics creates repeat a descriptor it had already built -- 82% of them
+// within 64 creates of the first -- and every one of those repeats paid the full
+// price: our screen, our substitution, and then several seconds inside the
+// driver's compiler. A D3D12 pipeline state object is immutable and shareable,
+// so an identical descriptor has an identical answer, and handing back the one
+// we already hold is exact rather than approximate. The root signature pointer
+// is part of the key, so nothing is shared across root signatures.
+//
+// Bounded, because the alternative is the mistake #201 just finished paying for:
+// an unbounded cache of driver objects is commit we never give back, and 16,192
+// compiled pipelines is not something this container has room to hold twice.
+// The LRU is sized in ENTRIES rather than bytes because we cannot see what a PSO
+// costs the driver; 2048 is four times the window that holds 82% of the repeats.
+// 0 disables it entirely -- GhCfgNumZ, because the default is nonzero.
+static unsigned GhPsoDedup()
+{ static const unsigned v = GhCfgNumZ(L"gh_pso_dedup.txt", "GH_PSO_DEDUP", 2048); return v; }
+
+// #202. The per-create descriptor line is 460 bytes and the warm pass asks for
+// 16,192 pipelines, so at full verbosity it alone is 7.4 MB of a ~24 MB budget
+// that has to cover two and a half hours. Log every Nth, always keeping the
+// first 32 -- the throughput question is answered by psoN/psoDrvMs/psoDup on
+// the FRAME line now, and the full line is only needed to characterise the
+// descriptors, which the first few dozen and a periodic sample both do.
+// 1 (the default) is the old behaviour: every create, every field.
+static unsigned GhPsoLogEvery()
+{ static const unsigned v = GhCfgNumZ(L"gh_pso_log.txt", "GH_PSO_LOG", 1); return v; }
+static bool GhPsoLogThis(volatile LONG* counter)
+{
+    const unsigned every = GhPsoLogEvery();
+    const LONG k = InterlockedIncrement(counter);
+    return every <= 1 || k <= 32 || (k % (LONG)every) == 0;
+}
+
+// FNV-1a, two independent 64-bit lanes, so the key is 128 bits over ~16k
+// descriptors. Hashing raw struct bytes is safe here in the only direction that
+// matters: padding that differs makes two identical states MISS, which costs a
+// compile we would have done anyway, while a false HIT would need a collision on
+// differing content.
+struct GhPsoKey {
+    uint64_t a, b;
+    bool operator<(const GhPsoKey& o) const { return a != o.a ? a < o.a : b < o.b; }
+};
+struct GhPsoHasher {
+    uint64_t a = 1469598103934665603ull, b = 0x9E3779B97F4A7C15ull;
+    void add(const void* p, size_t n)
+    {
+        const uint8_t* q = (const uint8_t*)p;
+        for (size_t i = 0; i < n; ++i){
+            a = (a ^ q[i]) * 1099511628211ull;
+            b = (b ^ q[i]) * 0x100000001B3ull;
+            b = (b << 7) | (b >> 57);
+        }
+    }
+    // Length-prefixed, so two adjacent fields cannot be re-cut to look the same.
+    void field(const void* p, size_t n)
+    { const uint64_t k = (uint64_t)n; add(&k, sizeof k); if (p && n) add(p, n); }
+    GhPsoKey key() const { return GhPsoKey{ a, b }; }
+};
+
+static bool GhPsoKeyOfGfx(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, GhPsoKey* out)
+{
+    if (!d) return false;
+    GhPsoHasher h;
+    const void* rs = (const void*)d->pRootSignature;
+    h.field(&rs, sizeof rs);
+    const D3D12_SHADER_BYTECODE* st[5] = { &d->VS, &d->PS, &d->DS, &d->HS, &d->GS };
+    for (int i = 0; i < 5; ++i) h.field(st[i]->pShaderBytecode, (size_t)st[i]->BytecodeLength);
+    // Stream output: the entries are an array of structs holding a name POINTER,
+    // so hash each name's text rather than the pointer.
+    h.field(&d->StreamOutput.NumEntries, sizeof d->StreamOutput.NumEntries);
+    for (UINT i = 0; d->StreamOutput.pSODeclaration && i < d->StreamOutput.NumEntries; ++i){
+        const D3D12_SO_DECLARATION_ENTRY& e = d->StreamOutput.pSODeclaration[i];
+        h.field(e.SemanticName, e.SemanticName ? strlen(e.SemanticName) : 0);
+        h.add(&e.Stream, sizeof e.Stream);
+        h.add(&e.SemanticIndex, sizeof e.SemanticIndex);
+        h.add(&e.StartComponent, sizeof e.StartComponent);
+        h.add(&e.ComponentCount, sizeof e.ComponentCount);
+        h.add(&e.OutputSlot, sizeof e.OutputSlot);
+    }
+    h.field(d->StreamOutput.pBufferStrides,
+            (size_t)d->StreamOutput.NumStrides * sizeof(UINT));
+    h.add(&d->StreamOutput.RasterizedStream, sizeof d->StreamOutput.RasterizedStream);
+    h.field(&d->BlendState, sizeof d->BlendState);
+    h.field(&d->SampleMask, sizeof d->SampleMask);
+    h.field(&d->RasterizerState, sizeof d->RasterizerState);
+    h.field(&d->DepthStencilState, sizeof d->DepthStencilState);
+    // Same reason as the SO entries: the element descs carry semantic pointers.
+    h.field(&d->InputLayout.NumElements, sizeof d->InputLayout.NumElements);
+    for (UINT i = 0; d->InputLayout.pInputElementDescs && i < d->InputLayout.NumElements; ++i){
+        const D3D12_INPUT_ELEMENT_DESC& e = d->InputLayout.pInputElementDescs[i];
+        h.field(e.SemanticName, e.SemanticName ? strlen(e.SemanticName) : 0);
+        h.add(&e.SemanticIndex, sizeof e.SemanticIndex);
+        h.add(&e.Format, sizeof e.Format);
+        h.add(&e.InputSlot, sizeof e.InputSlot);
+        h.add(&e.AlignedByteOffset, sizeof e.AlignedByteOffset);
+        h.add(&e.InputSlotClass, sizeof e.InputSlotClass);
+        h.add(&e.InstanceDataStepRate, sizeof e.InstanceDataStepRate);
+    }
+    h.field(&d->IBStripCutValue, sizeof d->IBStripCutValue);
+    h.field(&d->PrimitiveTopologyType, sizeof d->PrimitiveTopologyType);
+    h.field(&d->NumRenderTargets, sizeof d->NumRenderTargets);
+    h.field(d->RTVFormats, sizeof d->RTVFormats);
+    h.field(&d->DSVFormat, sizeof d->DSVFormat);
+    h.field(&d->SampleDesc, sizeof d->SampleDesc);
+    h.field(&d->NodeMask, sizeof d->NodeMask);
+    h.field(&d->Flags, sizeof d->Flags);
+    // CachedPSO is deliberately absent: it is stripped before the driver sees the
+    // desc, and this game passes cached=0 on every create anyway.
+    *out = h.key();
+    return true;
+}
+
+static bool GhPsoKeyOfCps(const D3D12_COMPUTE_PIPELINE_STATE_DESC* d, GhPsoKey* out)
+{
+    if (!d) return false;
+    GhPsoHasher h;
+    const void* rs = (const void*)d->pRootSignature;
+    h.field(&rs, sizeof rs);
+    h.field(d->CS.pShaderBytecode, (size_t)d->CS.BytecodeLength);
+    h.field(&d->NodeMask, sizeof d->NodeMask);
+    h.field(&d->Flags, sizeof d->Flags);
+    *out = h.key();
+    return true;
+}
+
+// One LRU for both pipeline kinds. The key already separates them: a graphics
+// descriptor hashes five stages and a compute one hashes a single field count,
+// so no compute key can collide with a graphics key by construction.
+struct GhPsoDedupEntry {
+    ID3D12PipelineState* pso = nullptr;
+    std::list<GhPsoKey>::iterator lruIt{};
+    // Mean driver cost of the creates this key has answered, so the FRAME line
+    // can say what the cache is actually saving rather than assuming.
+    LONG64 drvUs = 0;
+};
+static std::mutex& GhPsoDedupMu(){ static std::mutex m; return m; }
+static std::map<GhPsoKey, GhPsoDedupEntry>& GhPsoDedupMap()
+{ static std::map<GhPsoKey, GhPsoDedupEntry> m; return m; }
+static std::list<GhPsoKey>& GhPsoDedupLru(){ static std::list<GhPsoKey> l; return l; }
+
+// Returns an AddRef'd pipeline for a descriptor we have already built, or null.
+static ID3D12PipelineState* GhPsoDedupLookup(const GhPsoKey& k)
+{
+    if (!GhPsoDedup()) return nullptr;
+    std::lock_guard<std::mutex> lk(GhPsoDedupMu());
+    auto it = GhPsoDedupMap().find(k);
+    if (it == GhPsoDedupMap().end() || !it->second.pso) return nullptr;
+    GhPsoDedupLru().splice(GhPsoDedupLru().end(), GhPsoDedupLru(), it->second.lruIt);
+    it->second.pso->AddRef();
+    InterlockedIncrement(&g_psoDup);
+    InterlockedExchangeAdd64(&g_psoDupSavUs, it->second.drvUs);
+    return it->second.pso;
+}
+
+// Publish a pipeline the driver has just built. Our own reference is what keeps
+// it alive past the game's Release; eviction drops that reference and nothing
+// else, so a pipeline the game is still holding is untouched.
+static void GhPsoDedupPublish(const GhPsoKey& k, ID3D12PipelineState* pso, LONG64 drvUs)
+{
+    if (!GhPsoDedup() || !pso) return;
+    std::lock_guard<std::mutex> lk(GhPsoDedupMu());
+    auto& m = GhPsoDedupMap();
+    auto& lru = GhPsoDedupLru();
+    auto it = m.find(k);
+    if (it != m.end()){
+        // Two threads compiled the same descriptor concurrently. Keep the one
+        // already published so every later hit answers with one object.
+        lru.splice(lru.end(), lru, it->second.lruIt);
+        return;
+    }
+    pso->AddRef();
+    lru.push_back(k);
+    GhPsoDedupEntry e;
+    e.pso   = pso;
+    e.lruIt = std::prev(lru.end());
+    e.drvUs = drvUs;
+    m.emplace(k, e);
+    while (m.size() > (size_t)GhPsoDedup() && !lru.empty()){
+        auto old = m.find(lru.front());
+        if (old != m.end()){
+            if (old->second.pso) old->second.pso->Release();
+            m.erase(old);
+        }
+        lru.pop_front();
+    }
+}
+
+// A tick of the microsecond clock the #202 accounting is kept in. GetTickCount64
+// is 16 ms granular, which is the same order as the thing being measured.
+static LONG64 GhNowUs()
+{
+    static LARGE_INTEGER freq = []{ LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f; }();
+    LARGE_INTEGER c{};
+    if (!freq.QuadPart || !QueryPerformanceCounter(&c)) return 0;
+    return (LONG64)((c.QuadPart * 1000000ll) / freq.QuadPart);
+}
+
 static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** pp)
 {
@@ -10252,6 +10474,35 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
         }
         ~InFlight(){ InterlockedDecrement(&cur()); }
     } inflight;
+
+    // #202. Before anything else costs anything. A hit here skips the screen,
+    // the substitution, the root-signature rewrite and the compile in one move,
+    // which is the whole point: the expensive part of a repeat is that it is
+    // indistinguishable from new work until you have already done it.
+    GhPsoKey dedupKey{};
+    bool dedupable = GhPsoDedup() && d && pp &&
+                     riid == __uuidof(ID3D12PipelineState) &&
+                     !d->CachedPSO.CachedBlobSizeInBytes &&
+                     GhPsoKeyOfGfx(d, &dedupKey);
+    // Unconditional, NOT gated on dedupable: a gh_pso_dedup=0 control has to
+    // keep the timing instrument, or the one cell that could attribute the cost
+    // is the one cell that cannot measure it.
+    const LONG64 tEnter = GhNowUs();
+    if (dedupable){
+        if (ID3D12PipelineState* hit = GhPsoDedupLookup(dedupKey)){
+            *pp = hit;
+            static volatile LONG shown = 0;
+            const LONG k = InterlockedIncrement(&shown);
+            if (k <= 8 || (k % 256) == 0)
+                Diag("  PSODEDUP gfx hit n=" + std::to_string((long)k) +
+                     " pso=" + Hex((uint64_t)(uintptr_t)hit) +
+                     " VS=" + std::to_string((unsigned)d->VS.BytecodeLength) +
+                     " PS=" + std::to_string((unsigned)d->PS.BytecodeLength) +
+                     " savedMs=" + std::to_string((long long)(
+                         InterlockedCompareExchange64(&g_psoDupSavUs, 0, 0) / 1000)));
+            return S_OK;
+        }
+    }
 
     // #158. The breadcrumb names the draw the GPU stopped inside, and the same
     // pixel shader had already run twenty times before it hung -- so the shader is
@@ -10381,7 +10632,10 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
             m += " (NULLPS)";
         }
     }
-    Diag(m);
+    {
+        static volatile LONG nlog = 0;
+        if (GhPsoLogThis(&nlog)) Diag(m);   // #202: throttled by gh_pso_log
+    }
 
     // Establish, once, whether this device can build ANY graphics PSO, using
     // shaders and a root signature of our own. That separates "the console's
@@ -10583,6 +10837,11 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     DWORD fault = 0;
     ++depth;
     HRESULT hr = E_FAIL;
+    // #202. Everything from entry to here is ours; everything between the two
+    // marks is the driver's. Splitting the two is what says whether the warm
+    // pass is slow because the console's compiler is slow or because we are
+    // standing in front of it.
+    const LONG64 tDrv0 = tEnter ? GhNowUs() : 0;
     {
         // #181 cell I: same call, one dedicated loader thread.
         struct Ctx { GhGpsFn fn; ID3D12Device* dev;
@@ -10594,6 +10853,12 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
         if (!GhPsoMarshal() || !GhPsoMarshalRun(run, &ctx))
             ctx.hr = GhTryCreateGPS(orig, self, use, riid, pp, &fault);
         hr = ctx.hr;
+    }
+    const LONG64 drvUs = tDrv0 ? (GhNowUs() - tDrv0) : 0;
+    if (tEnter){
+        InterlockedExchangeAdd64(&g_psoDrvUs, drvUs);
+        InterlockedExchangeAdd64(&g_psoPreUs, tDrv0 - tEnter);
+        InterlockedIncrement(&g_psoCalls);
     }
     --depth;
     if (serialize) ReleaseSRWLockExclusive(&g_psoLock);
@@ -10629,6 +10894,10 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     if (pp && *pp){
         res += " CREATED pso=" + Hex((uint64_t)(uintptr_t)*pp) +
                " idx=" + std::to_string((long)InterlockedIncrement(&psoIdx));
+        // #202. Only a pipeline the driver really built for this descriptor is
+        // published -- every stand-in and every refusal has already returned
+        // above, so nothing in the cache can be a substitute for something else.
+        if (dedupable) GhPsoDedupPublish(dedupKey, (ID3D12PipelineState*)*pp, drvUs);
         // Keep the bytecode by PSO pointer so gh_dump_pso_at can name an op, not a length.
         if (d && GhPsoKeepOn()) GhPsoKeep(*pp, d->VS.pShaderBytecode, d->VS.BytecodeLength,
                                                d->PS.pShaderBytecode, d->PS.BytecodeLength);
@@ -10718,6 +10987,27 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
 {
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*,
                                       REFIID, void**))g_d12vtOrig[11];
+    // #202, same rule as the graphics hook: a repeat is answered before it can
+    // cost anything. Compute is the smaller half of the warm pass (259 creates
+    // against 4,873 in A201) but the saving is the same shape.
+    GhPsoKey dedupKey{};
+    const bool dedupable = GhPsoDedup() && d && pp &&
+                           riid == __uuidof(ID3D12PipelineState) &&
+                           !d->CachedPSO.CachedBlobSizeInBytes &&
+                           GhPsoKeyOfCps(d, &dedupKey);
+    const LONG64 tEnter = GhNowUs();   // see the graphics hook: never gated
+    if (dedupable){
+        if (ID3D12PipelineState* hit = GhPsoDedupLookup(dedupKey)){
+            *pp = hit;
+            static volatile LONG shown = 0;
+            const LONG k = InterlockedIncrement(&shown);
+            if (k <= 8 || (k % 64) == 0)
+                Diag("  PSODEDUP cs hit n=" + std::to_string((long)k) +
+                     " pso=" + Hex((uint64_t)(uintptr_t)hit) +
+                     " CS=" + std::to_string((unsigned)d->CS.BytecodeLength));
+            return S_OK;
+        }
+    }
     std::string m = std::string("D3D12 CreateComputePipelineState CS=") +
                     (d ? std::to_string((unsigned)d->CS.BytecodeLength) : "?");
     if (d){
@@ -10733,7 +11023,10 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
         m += " flags=" + Hex((uint32_t)d->Flags);
         m += " cached=" + std::to_string((unsigned)d->CachedPSO.CachedBlobSizeInBytes);
     }
-    Diag(m);
+    {
+        static volatile LONG nlog = 0;
+        if (GhPsoLogThis(&nlog)) Diag(m);   // #202: throttled by gh_pso_log
+    }
 
     GhPsoRecordCs(d);   // #181, before substitution: see GhPsoRecordGfx
     GhPsoCanaryTick(self);   // #181 cell J
@@ -10843,6 +11136,7 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
     if (serialize) AcquireSRWLockExclusive(&g_psoLock);
     HRESULT hr = E_FAIL;
     DWORD cpsFault = 0;
+    const LONG64 tDrv0 = tEnter ? GhNowUs() : 0;   // #202: the driver's share
     {
         // #181 cell I: same call, one dedicated loader thread.
         // #182: and never bare -- GhCallCpsGuarded is the __except the graphics
@@ -10856,6 +11150,12 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
         if (!GhPsoMarshal() || !GhPsoMarshalRun(run, &ctx))
             ctx.hr = GhCallCpsGuarded(ctx.fn, self, d, riid, pp, &cpsFault);
         hr = ctx.hr;
+    }
+    const LONG64 drvUs = tDrv0 ? (GhNowUs() - tDrv0) : 0;
+    if (tEnter){
+        InterlockedExchangeAdd64(&g_psoDrvUs, drvUs);
+        InterlockedExchangeAdd64(&g_psoPreUs, tDrv0 - tEnter);
+        InterlockedIncrement(&g_psoCalls);
     }
     if (serialize) ReleaseSRWLockExclusive(&g_psoLock);
     if (cpsFault){
@@ -10873,6 +11173,10 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
             res += " CREATED pso=" + Hex((uint64_t)(uintptr_t)*pp) +
                    " cidx=" + std::to_string((long)InterlockedIncrement(&cpsIdx));
             if (d) res += " cs=" + std::to_string((unsigned long long)d->CS.BytecodeLength);
+            // #202. A faulted create can still leave a pipeline behind, and the
+            // stand-in below may replace it, so only a clean build is published.
+            if (dedupable && !cpsFault)
+                GhPsoDedupPublish(dedupKey, (ID3D12PipelineState*)*pp, drvUs);
             // #188 axis (b): build the compute stand-in now, for the same reason
             // the graphics one is built off the first accepted desc -- after a
             // removal there is no device left to build anything with.
