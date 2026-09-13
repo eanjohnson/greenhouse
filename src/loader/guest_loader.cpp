@@ -7318,7 +7318,16 @@ static bool GhPsoDenied(const void* code, SIZE_T n)
             deny.assign({ "fa29971ed902b2fad02cec2d64a0052a",
                           "44c53d006f299116f79ffbbf00f818d3",
                           "4acdac3ea5b31940d101db7bd4ff712f",
-                          "86d22de2bf57fcd4874bafdda58d734c" });
+                          "86d22de2bf57fcd4874bafdda58d734c",
+                          // #195. The graphics pair #194 named. newbe.DLL's
+                          // optimizer throws hlsl::Exception on the lowered
+                          // form of the second, and D3D12Core answers by
+                          // removing the device. Denying the VS is enough --
+                          // it is the first stage checked -- but both are
+                          // listed because either could turn up paired with a
+                          // different partner later.
+                          "42ab5eed7418a101078f8eb5ea293076",
+                          "6c9bda7610bbf88f725fa1c1be8c43a8" });
         }
         Diag("PSODENY list of " + std::to_string((unsigned)deny.size()) + " shaders");
     }
