@@ -98,7 +98,8 @@ static const GhBindlessSpace kGhBindlessSpaces[] = {
     { D3D12_DESCRIPTOR_RANGE_TYPE_SRV,        5088, "StructuredBuffer<stride=340>" },
     { D3D12_DESCRIPTOR_RANGE_TYPE_SRV,        5089, "Texture2D<4xU32>" },
     { D3D12_DESCRIPTOR_RANGE_TYPE_SRV,        5090, "StructuredBuffer<stride=60>" },
+    { D3D12_DESCRIPTOR_RANGE_TYPE_SRV,        5091, "StructuredBuffer<stride=376>" },
 };
 
 static const UINT kGhBindlessSpaceBase = 5000;
-static const UINT kGhBindlessSpaceCount = 91;
+static const UINT kGhBindlessSpaceCount = 92;

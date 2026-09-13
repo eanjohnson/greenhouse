@@ -497,6 +497,16 @@
    "%\"class.StructuredBuffer<Blob36>\" = type { %struct.Blob36 }"
   ]
  },
+ "StructuredBuffer<stride=376>": {
+  "cls": 0,
+  "elem": "!{i32 1, i32 376}",
+  "entry": "!{i32 @ID@, [0 x %\"class.StructuredBuffer<Blob376>\"]* undef, !\"\", i32 @SPACE@, i32 0, i32 -1, i32 12, i32 0, @ELEM@}",
+  "space": 5091,
+  "typedefs": [
+   "%struct.Blob376 = type { [94 x i32] }",
+   "%\"class.StructuredBuffer<Blob376>\" = type { %struct.Blob376 }"
+  ]
+ },
  "StructuredBuffer<stride=40>": {
   "cls": 0,
   "elem": "!{i32 1, i32 40}",

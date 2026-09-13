@@ -26628,6 +26628,76 @@ static void GhLivenessSample()
     }
 }
 
+// #202: what is the guest's main thread waiting ON? A thread dump names the
+// call (WaitForSingleObject) and the stack peek recovers the HANDLE, but a bare
+// handle value is not an answer: an auto-reset event nobody will ever set and a
+// manual-reset event that was already signalled look identical from outside.
+// NtQueryObject names the type and, where it has one, the object; a zero-timeout
+// wait says whether it is signalled right now. Both are read-only and cost a
+// syscall per listed handle every three seconds, so this rides the memory
+// sampler rather than any hot path.
+//
+//   gh_handles.txt : "<hexhandle> <label>" per line. NOT consumed -- the series
+//                    repeats until the file is emptied, which is what turns
+//                    "never signalled" into a statement instead of a guess.
+typedef LONG (NTAPI *PFN_NtQueryObject)(HANDLE, int, PVOID, ULONG, PULONG);
+
+static void GhPollHandleRequest()
+{
+    std::vector<uint8_t> ob;
+    if (!ReadWholeFile(std::wstring(kLocalState) + L"gh_handles.txt", ob, true)) return;
+    std::string text;
+    for (uint8_t c : ob) if (c) text += (char)c;       // UTF-16LE or ASCII alike
+
+    static PFN_NtQueryObject pQuery = (PFN_NtQueryObject)
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject");
+
+    size_t pos = 0;
+    while (pos <= text.size()){
+        size_t eol = text.find('\n', pos);
+        std::string line = text.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+        pos = (eol == std::string::npos) ? text.size() + 1 : eol + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+        size_t sp = line.find_first_of(" \t");
+        uintptr_t hv = (uintptr_t)strtoull(line.substr(0, sp).c_str(), nullptr, 16);
+        if (!hv) continue;
+        std::string label = (sp == std::string::npos) ? std::string() : line.substr(sp + 1);
+        HANDLE h = (HANDLE)hv;
+
+        std::string out = "HANDLE " + Hex((uint64_t)hv) + (label.empty() ? "" : " " + label);
+
+        DWORD flags = 0;
+        out += GetHandleInformation(h, &flags) ? " valid" : " INVALID err=" + Hex(GetLastError());
+
+        // ObjectTypeInformation = 2, ObjectNameInformation = 1. The buffer holds
+        // a UNICODE_STRING followed by its characters; 2 KB is more than any
+        // object name this process owns and keeps the whole thing on the stack.
+        if (pQuery){
+            for (int which = 0; which < 2; ++which){
+                alignas(16) uint8_t buf[2048] = {0};
+                ULONG need = 0;
+                LONG st = pQuery(h, which == 0 ? 2 : 1, buf, (ULONG)sizeof(buf), &need);
+                const wchar_t* w = *(const wchar_t* const*)(buf + 8);
+                USHORT len = *(const USHORT*)buf;
+                std::string v;
+                if (st >= 0 && w && len){
+                    for (USHORT i = 0; i < len / 2 && i < 240; ++i)
+                        v += (w[i] >= 32 && w[i] < 127) ? (char)w[i] : '?';
+                }
+                out += (which == 0 ? " type=" : " name=") + (v.empty() ? "-" : v);
+            }
+        }
+
+        DWORD wr = WaitForSingleObject(h, 0);
+        out += " state=" + std::string(wr == WAIT_OBJECT_0 ? "SIGNALED"
+                                     : wr == WAIT_TIMEOUT  ? "waiting"
+                                     : wr == WAIT_ABANDONED ? "abandoned" : "err")
+             + " wr=" + Hex((uint32_t)wr);
+        Diag(out);
+    }
+}
+
 static void GhPollThreadDumpRequest()
 {
     std::wstring p = std::wstring(kLocalState) + L"gh_dumpthreads.txt";
@@ -26696,6 +26766,7 @@ static void SnapshotHostThreads()
                     GhPollPokeRequest();
                     if (g_fpTrapMax && g_fpTrapHits == 0) GhFpTrapArmAllThreads();
                     GhPollPeekRequest();
+                    GhPollHandleRequest();
                     Sleep(3000);
                 }
             }).detach();
