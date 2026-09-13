@@ -25053,6 +25053,22 @@ struct GhGsRec {
     uint64_t stored, calc; BYTE has;
 };
 
+// #202. Read one qword out of a thread's stack, or refuse. Two things have to
+// be true and neither can be left to the caller's && chain: the address must lie
+// wholly inside the window, and the load must not happen unless it does. Written
+// as a noinline function with its own __try so the optimizer cannot hoist the
+// load above the test -- cell B202 died on exactly that, a load issued at
+// fb+0x1F8 while the compare that would have rejected it was still pending, one
+// qword past a dstoragecore thread's StackBase.
+static __declspec(noinline) bool GhReadStackU64(DWORD64 at, DWORD64 lo, DWORD64 hi,
+                                                uint64_t* out)
+{
+    if (at < lo || at + 8 > hi || at + 8 < at) return false;
+    __try { *out = *(const volatile uint64_t*)(uintptr_t)at; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return true;
+}
+
 static int GhGsCollect(const CONTEXT* start, GhGsRec* out, int cap)
 {
     CONTEXT ctx = *start;
@@ -25064,14 +25080,39 @@ static int GhGsCollect(const CONTEXT* start, GhGsRec* out, int cap)
     // volatile forces the count to memory, and then a fault costs one frame
     // instead of the whole walk.
     volatile int n = 0;
-    // The walk's own stack, for the bounds check below. The guest worker's are
-    // already known; for any other thread take them from the TEB.
-    DWORD64 lo = g_guestStackLow, hi = g_guestStackHigh;
+    // The bounds for the cookie read below. #202: this used to prefer the guest
+    // worker's stack whenever the WALKED context's Rsp happened to fall inside
+    // it, which is the wrong window for any other thread -- and the TEB is only
+    // right when the walked context belongs to the thread now running. Neither
+    // assumption is needed: VirtualQuery on the walked Rsp names that stack's
+    // own allocation exactly, for any thread, at one syscall per walk.
+    DWORD64 lo = 0, hi = 0;
+    {
+        MEMORY_BASIC_INFORMATION sb{};
+        if (VirtualQuery((LPCVOID)(uintptr_t)ctx.Rsp, &sb, sizeof sb) == sizeof sb &&
+            sb.State == MEM_COMMIT && sb.AllocationBase){
+            // Stacks commit downward inside one reservation: the committed span
+            // runs from this region's base to the end of the reservation. Walk
+            // the regions up from the allocation base to find where it ends.
+            lo = (DWORD64)(uintptr_t)sb.BaseAddress;
+            DWORD64 p = (DWORD64)(uintptr_t)sb.AllocationBase;
+            MEMORY_BASIC_INFORMATION q{};
+            while (VirtualQuery((LPCVOID)(uintptr_t)p, &q, sizeof q) == sizeof q &&
+                   (DWORD64)(uintptr_t)q.AllocationBase ==
+                       (DWORD64)(uintptr_t)sb.AllocationBase){
+                p = (DWORD64)(uintptr_t)q.BaseAddress + (DWORD64)q.RegionSize;
+            }
+            hi = p;
+        }
+    }
     if (!lo || !hi || ctx.Rsp < lo || ctx.Rsp >= hi){
+        // Last resort: this thread's own TEB. Correct whenever the walked
+        // context is this thread's, which is every VEH and every GS walk.
         const NT_TIB* tib = (const NT_TIB*)NtCurrentTeb();
         lo = (DWORD64)(uintptr_t)tib->StackLimit;
         hi = (DWORD64)(uintptr_t)tib->StackBase;
     }
+    if (ctx.Rsp < lo || ctx.Rsp >= hi){ lo = 0; hi = 0; }   // no window: no reads
     __try {
         while (n < cap && ctx.Rip){
             GhGsRec* r = out + n;
@@ -25111,8 +25152,10 @@ static int GhGsCollect(const CONTEXT* start, GhGsRec* out, int cap)
                     // A cookie lives in its own frame, so require an offset that
                     // could be one and an address inside this thread's stack.
                     const DWORD64 at = fb + (g[0] & ~7u);
-                    if ((g[0] & ~7u) < 0x10000 && at >= lo && at + 8 <= hi){
-                        r->stored = *(const uint64_t*)at;
+                    uint64_t got = 0;
+                    if ((g[0] & ~7u) < 0x10000 && lo && hi &&
+                        GhReadStackU64(at, lo, hi, &got)){
+                        r->stored = got;
                         r->calc = (est + (fr & 0xF0)) ^ r->stored;
                         r->has = 2;
                     }
@@ -25124,7 +25167,35 @@ static int GhGsCollect(const CONTEXT* start, GhGsRec* out, int cap)
     return n;
 }
 
+static LONG GhCrashObserverVehBody(EXCEPTION_POINTERS* ep);
+
 static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
+{
+    // #202. This handler reads memory the faulting code chose -- stack slots,
+    // sixteen bytes at RIP, unwind data -- so it can fault itself, and a fault
+    // raised inside a VEH handler is dispatched through the whole VEH chain
+    // again, arriving right back here. Cell B202 ended on that: one
+    // GhGsCollect read past a dstoragecore thread's StackBase, and the diag
+    // stops mid-line at that exact point with the process gone three minutes
+    // later. The bounds bug is fixed above; this is the blast radius. One line
+    // of evidence on re-entry -- which says the walker faulted again and where
+    // -- then out of the way, so the inner __try can do its job.
+    static thread_local int s_depth = 0;
+    if (s_depth > 0){
+        static long s_said = 0;
+        if (InterlockedIncrement(&s_said) <= 8)
+            Diag("VEH REENTRY depth=" + std::to_string(s_depth) +
+                 " code=" + Hex((uint32_t)ep->ExceptionRecord->ExceptionCode) +
+                 " at=" + Hex((uint64_t)(uintptr_t)ep->ExceptionRecord->ExceptionAddress) +
+                 " tid=" + std::to_string(GetCurrentThreadId()));
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    struct Pop { int* p; ~Pop(){ --*p; } } pop{ &s_depth };
+    ++s_depth;
+    return GhCrashObserverVehBody(ep);
+}
+
+static LONG GhCrashObserverVehBody(EXCEPTION_POINTERS* ep)
 {
     // #183. The guest main thread's live stack is a five-frame cycle -- guest
     // raises, the dispatcher calls a guest handler, that handler raises again --
