@@ -386,6 +386,7 @@ static HANDLE WINAPI Bed_GetStdHandle(DWORD n){
 // what the guest hands us for the log handle, keep the last bytes it wrote, and
 // at the death sites compare the running byte total against the file's ACTUAL
 // size. bytes ~= filesize means (a). bytes >> filesize means (b).
+static volatile LONG64 g_frameNo    = 0;   // #194: published by the present path
 static volatile LONG64 g_logWrites   = 0;
 static volatile LONG64 g_logBytes    = 0;   // bytes the guest handed us
 static volatile LONG64 g_logWrote    = 0;   // bytes WriteFile reported written
@@ -5230,6 +5231,7 @@ static HRESULT GfxPresent(UINT sync)
         if ((s_present_n % 60) == 0) GhCommitRtAllStats("frame");
         GhCoreHeapStats("frame");   // #158: the growth curve, one line per present
         GhSecStats("frame");        // #158: section traffic, one line per present
+        InterlockedExchange64(&g_frameNo, (LONG64)s_present_n);   // #194
         Diag("FRAME n=" + std::to_string((unsigned long long)s_present_n) +
              " ecl=" + std::to_string((long)e) + " decl=" + std::to_string((long)(e - s_lastEcl)) +
              " heaps=" + std::to_string((long)h) + " dheaps=" + std::to_string((long)(h - s_lastHeaps)) +
@@ -10211,6 +10213,51 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     // #173: substitute lowered blobs before the screen, for the same reason as the
     // compute path -- the screen must judge what the driver will actually see.
     // `local` may already be in use by an earlier rewrite, so copy only once.
+    // #195. The deny list belongs on BOTH entry points.
+    //
+    // #194 named the pipeline the device dies inside. A 19,284-byte pixel
+    // shader (original digest 6c9bda7610bbf88f725fa1c1be8c43a8) paired with a
+    // 7,892-byte vertex shader (42ab5eed7418a101078f8eb5ea293076), both
+    // substituted out of the #188 bake, and both first seen in the run at the
+    // pipeline the removal lands in: newbe.DLL throws hlsl::Exception out of
+    // NB_CreateOptimizer, scdxil rethrows it as sc::dxil::DxilError, SC_DLL and
+    // umd12ddi pass it up, and D3D12Core answers with "D3D12: Removing Device."
+    //
+    // Nothing downstream of that throw can be caught. The device is already
+    // gone by the time the exception reaches our frame, so the only repair is
+    // the one #186 already named: refuse in front of the driver.
+    //
+    // GhPsoDenied was written for exactly this and wired into the COMPUTE hook
+    // alone -- #175's four killers were all compute -- so no spelling of the
+    // list could ever refuse a graphics stage. The feature screen below cannot
+    // stand in for it either: it exempts a corpus blob by design (#186), and
+    // this killer IS a corpus blob.
+    //
+    // Keyed on the guest's ORIGINAL bytecode, before substitution, because that
+    // is the digest the corpus filenames and every SHADERSUB line speak.
+    if (GhPsoGuard() >= 2 && d && pp){
+        const D3D12_SHADER_BYTECODE* st[5] =
+            { &d->VS, &d->PS, &d->GS, &d->HS, &d->DS };
+        static const char* const kStage[5] = { "VS", "PS", "GS", "HS", "DS" };
+        for (int i = 0; i < 5; ++i){
+            if (!GhPsoDenied(st[i]->pShaderBytecode, st[i]->BytecodeLength)) continue;
+            static volatile LONG denied = 0;
+            const LONG k = InterlockedIncrement(&denied);
+            *pp = nullptr;
+            Diag(std::string("  PSODENY gfx n=") + std::to_string((long)k) +
+                 " stage=" + kStage[i] +
+                 " bytes=" + std::to_string((unsigned long long)st[i]->BytecodeLength) +
+                 " VS=" + std::to_string((unsigned long long)d->VS.BytecodeLength) +
+                 " PS=" + std::to_string((unsigned long long)d->PS.BytecodeLength) +
+                 "; E_FAIL without calling the driver");
+            // A null pipeline is the one outcome the guest cannot survive
+            // (#173/#174: it never reads the HRESULT), so the stand-in is not
+            // optional on this path.
+            if (GhGpsServeStandIn(self, orig, d, riid, pp, "denied")) return S_OK;
+            return E_FAIL;
+        }
+    }
+
     if (use && GhShaderSubOn()){
         if (use != &local){ local = *use; }
         bool any = false;
@@ -11704,10 +11751,74 @@ static void __stdcall Hook_D12CreateCBV(ID3D12Device* self,
     ((void (__stdcall*)(ID3D12Device*, const D3D12_CONSTANT_BUFFER_VIEW_DESC*,
         D3D12_CPU_DESCRIPTOR_HANDLE))g_d12vtOrig[17])(self, d, dest);
 }
+// #194. The removal lands at the same point in the game's own progression every
+// run: FRAME 2461..2730 and nheaps 233..242 across six cells whose appused at
+// death spans 700 MB and whose arena configurations differ completely. A death
+// indexed by PROGRESS and not by pressure is a death caused by a piece of work,
+// so record the first time each distinct SHAPE of GPU work appears. Whatever
+// first appears in the last hundred frames is a suspect; whatever first appeared
+// thousands of frames earlier is exonerated by its own survival. Shapes only --
+// never sizes or addresses, or every texture in the game is a "first".
+static SRWLOCK                            g_firstLock = SRWLOCK_INIT;
+static std::unordered_map<uint64_t, char> g_firstSeen;
+static volatile LONG                      g_firstN    = 0;
+
+static bool GhFirstsOn()
+{ static const bool on = GhCfgNumZ(L"gh_firsts.txt", "GH_FIRSTS", 1) != 0; return on; }
+
+// The hot path is one hash of a 64-bit key and no allocation -- this runs on
+// every barrier, and there are 327,328 of them in a run. The caller builds its
+// description string only when this says the shape is new.
+static bool GhFirstSeen(const char* kind, uint64_t key)
+{
+    if (!GhFirstsOn() || (unsigned)g_firstN >= 6000) return false;
+    uint64_t h = 1469598103934665603ull;
+    for (const char* p = kind; *p; ++p){ h ^= (unsigned char)*p; h *= 1099511628211ull; }
+    h ^= key + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    AcquireSRWLockExclusive(&g_firstLock);
+    const bool isNew = g_firstSeen.emplace(h, (char)1).second;
+    ReleaseSRWLockExclusive(&g_firstLock);
+    return isNew;
+}
+
+static void GhFirstSay(const char* kind, const std::string& what)
+{
+    Diag("FIRST #" + std::to_string((long)InterlockedIncrement(&g_firstN)) +
+         " frame=" + std::to_string((long long)InterlockedCompareExchange64(&g_frameNo, 0, 0)) +
+         " " + kind + " " + what);
+}
+
+#define GH_FIRST(kind, key, what) \
+    do { if (GhFirstSeen((kind), (uint64_t)(key))) GhFirstSay((kind), (what)); } while (0)
+
+// Shape, not size: dimension, format, flags, layout, sample count and whether it
+// is mipped. Width and height are deliberately absent.
+static uint64_t GhRdKey(const D3D12_RESOURCE_DESC* rd)
+{
+    if (!rd) return 1;
+    return ((uint64_t)rd->Dimension << 56) ^ ((uint64_t)rd->Format << 40) ^
+           ((uint64_t)rd->Flags << 20) ^ ((uint64_t)rd->Layout << 12) ^
+           ((uint64_t)rd->SampleDesc.Count << 4) ^ (uint64_t)(rd->MipLevels > 1 ? 1 : 0);
+}
+static std::string GhRdBrief(const D3D12_RESOURCE_DESC* rd)
+{
+    if (!rd) return "desc=null";
+    return "dim=" + std::to_string((int)rd->Dimension) +
+           " fmt=" + std::to_string((int)rd->Format) +
+           " flags=" + Hex((uint32_t)rd->Flags) +
+           " layout=" + std::to_string((int)rd->Layout) +
+           " samples=" + std::to_string((int)rd->SampleDesc.Count) +
+           " mipped=" + std::to_string((int)(rd->MipLevels > 1)) +
+           " arraydepth=" + std::to_string((int)rd->DepthOrArraySize);
+}
+
 static void __stdcall Hook_D12CreateSRV(ID3D12Device* self, ID3D12Resource* res,
     const D3D12_SHADER_RESOURCE_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE dest)
 {
     if (GhDescTrackOn()) GhDescPut((UINT64)dest.ptr, res, 2, d ? (unsigned)d->Format : 0u);
+    GH_FIRST("srv", ((uint64_t)(d ? (unsigned)d->Format : 0u) << 8) ^ (uint64_t)(d ? (unsigned)d->ViewDimension : 0u),
+             "fmt=" + std::to_string((int)(d ? (unsigned)d->Format : 0u)) +
+             " viewdim=" + std::to_string((int)(d ? (unsigned)d->ViewDimension : 0u)));
     ((void (__stdcall*)(ID3D12Device*, ID3D12Resource*,
         const D3D12_SHADER_RESOURCE_VIEW_DESC*,
         D3D12_CPU_DESCRIPTOR_HANDLE))g_d12vtOrig[18])(self, res, d, dest);
@@ -11717,6 +11828,9 @@ static void __stdcall Hook_D12CreateUAV(ID3D12Device* self, ID3D12Resource* res,
     D3D12_CPU_DESCRIPTOR_HANDLE dest)
 {
     if (GhDescTrackOn()) GhDescPut((UINT64)dest.ptr, res, 3, d ? (unsigned)d->Format : 0u);
+    GH_FIRST("uav", ((uint64_t)(d ? (unsigned)d->Format : 0u) << 8) ^ (uint64_t)(d ? (unsigned)d->ViewDimension : 0u),
+             "fmt=" + std::to_string((int)(d ? (unsigned)d->Format : 0u)) +
+             " viewdim=" + std::to_string((int)(d ? (unsigned)d->ViewDimension : 0u)));
     ((void (__stdcall*)(ID3D12Device*, ID3D12Resource*, ID3D12Resource*,
         const D3D12_UNORDERED_ACCESS_VIEW_DESC*,
         D3D12_CPU_DESCRIPTOR_HANDLE))g_d12vtOrig[19])(self, res, counter, d, dest);
@@ -11725,6 +11839,9 @@ static void __stdcall Hook_D12CreateDSV(ID3D12Device* self, ID3D12Resource* res,
     const D3D12_DEPTH_STENCIL_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE dest)
 {
     if (GhDescTrackOn()) GhDescPut((UINT64)dest.ptr, res, 5, d ? (unsigned)d->Format : 0u);
+    GH_FIRST("dsv", ((uint64_t)(d ? (unsigned)d->Format : 0u) << 8) ^ (uint64_t)(d ? (unsigned)d->ViewDimension : 0u),
+             "fmt=" + std::to_string((int)(d ? (unsigned)d->Format : 0u)) +
+             " viewdim=" + std::to_string((int)(d ? (unsigned)d->ViewDimension : 0u)));
     ((void (__stdcall*)(ID3D12Device*, ID3D12Resource*,
         const D3D12_DEPTH_STENCIL_VIEW_DESC*,
         D3D12_CPU_DESCRIPTOR_HANDLE))g_d12vtOrig[21])(self, res, d, dest);
@@ -13975,6 +14092,19 @@ static void __stdcall Hook_CLBarrier(ID3D12GraphicsCommandList* self, UINT num,
     GhAliasEmit(self, num, b);
     GhReinitScope reinit(self, num, b);          // #158: discards fire on every exit path
     if (GhCLNote* n = GhCLFind(self)) InterlockedAdd(&n->barriers, (LONG)num);
+    // #194: every distinct barrier shape, the first time it is ever recorded.
+    for (UINT gi = 0; b && gi < num; ++gi){
+        const D3D12_RESOURCE_BARRIER& gr = b[gi];
+        const bool tr = gr.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        const UINT bs = tr ? (UINT)gr.Transition.StateBefore : 0u;
+        const UINT as = tr ? (UINT)gr.Transition.StateAfter  : 0u;
+        const char* kind = tr ? "barrier-transition"
+                              : (gr.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV ? "barrier-uav"
+                                                                            : "barrier-alias");
+        GH_FIRST(kind, (((uint64_t)bs << 32) | (uint64_t)as) ^ ((uint64_t)gr.Flags << 60),
+                 "before=" + Hex((uint32_t)bs) + " after=" + Hex((uint32_t)as) +
+                 " flags=" + std::to_string((int)gr.Flags));
+    }
     // #158: barriers are what hangs this device. With every work-issuing call in
     // the list already dropped, keeping barriers still hangs it and dropping them
     // does not -- so the question is now WHICH barrier, and the answer needs the
@@ -14853,6 +14983,19 @@ static void __stdcall Hook_CLCopyTextureRegion(ID3D12GraphicsCommandList* self,
     GhBarrFlushPending(self);
     if (GhOpMask() & 16) return;
     GhCtrNote(self, d, x, y, z, sr, box);
+    // #194: the shape of every texture copy. #184's killer lived in exactly this
+    // call, so the record GhCtrNote just filled in is the one worth keying on.
+    {
+        const GhCopyTexRec& gr = GhCtrSlot(GetCurrentThreadId());
+        GH_FIRST("copytex", ((uint64_t)gr.dst.type << 56) ^ ((uint64_t)gr.src.type << 48) ^
+                            ((uint64_t)gr.dst.rfmt << 24) ^ ((uint64_t)gr.src.rfmt << 8) ^
+                            (uint64_t)(gr.dst.rflags & 0xFF),
+                 "dsttype=" + std::to_string((int)gr.dst.type) +
+                 " dstfmt=" + std::to_string((int)gr.dst.rfmt) +
+                 " dstflags=" + Hex((uint32_t)gr.dst.rflags) +
+                 " srctype=" + std::to_string((int)gr.src.type) +
+                 " srcfmt=" + std::to_string((int)gr.src.rfmt));
+    }
     // #184. The one shape the driver cannot record: a copy INTO a plane of a
     // multi-plane depth-stencil surface from an ordinary single-plane one.
     if (const LONG dsm = GhCopyTexDsMode()){
@@ -14896,6 +15039,7 @@ static void __stdcall Hook_CLCopyResource(ID3D12GraphicsCommandList* self,
 static void __stdcall Hook_CLResolveSubresource(ID3D12GraphicsCommandList* self,
     ID3D12Resource* d, UINT ds, ID3D12Resource* sr, UINT ss, DXGI_FORMAT f)
 {
+    GH_FIRST("resolve", (uint64_t)f, "fmt=" + std::to_string((int)f));
     GhBarrFlushPending(self);
     if (GhOpMask() & 16) return;
     if (!GhRecCap19(self, d, ds, sr, ss, f))
@@ -14931,6 +15075,7 @@ static void __stdcall Hook_CLClearDsv(ID3D12GraphicsCommandList* self,
     UINT nr, const D3D12_RECT* r)
 {
     InterlockedIncrement(&g_clrDsv);
+    GH_FIRST("cleardsv", (uint64_t)fl, "clearflags=" + Hex((uint32_t)fl));
     GhBarrFlushPending(self);
     if (GhOpMask() & 32) return;
     if (!GhRecCap47(self, h, fl, depth, st, nr, r))
@@ -17539,6 +17684,12 @@ static void GhQueueCeilingProbe(ID3D12Device* dev)
 static HRESULT __stdcall Hook_D12CreateCQ(ID3D12Device* self, const D3D12_COMMAND_QUEUE_DESC* d,
                                           REFIID riid, void** pp)
 {
+    // A COPY queue created late is a known device-killer here (gh_copy_as_direct).
+    GH_FIRST("cmdqueue", d ? (((uint64_t)d->Type << 32) ^ ((uint64_t)d->Flags << 8) ^
+                              (uint64_t)(unsigned)d->Priority) : 0,
+             "type=" + std::to_string((int)(d ? d->Type : -1)) +
+             " flags=" + Hex((uint32_t)(d ? d->Flags : 0)) +
+             " priority=" + std::to_string((int)(d ? d->Priority : 0)));
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_COMMAND_QUEUE_DESC*,
                                       REFIID, void**))g_d12vtOrig[8];
     D3D12_COMMAND_QUEUE_DESC patched{};
@@ -17653,6 +17804,9 @@ static HRESULT __stdcall Hook_D12CreateCL(ID3D12Device* self, UINT node, D3D12_C
 static HRESULT __stdcall Hook_D12CreateDH(ID3D12Device* self, const D3D12_DESCRIPTOR_HEAP_DESC* d,
                                           REFIID riid, void** pp)
 {
+    GH_FIRST("descheap", d ? (((uint64_t)d->Type << 16) ^ (uint64_t)d->Flags) : 0,
+             "type=" + std::to_string((int)(d ? d->Type : -1)) +
+             " flags=" + Hex((uint32_t)(d ? d->Flags : 0)));
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_DESCRIPTOR_HEAP_DESC*,
                                       REFIID, void**))g_d12vtOrig[14];
     // #165. Say what was ASKED FOR before the call, not only what came back: the
@@ -17838,6 +17992,9 @@ static HRESULT __stdcall Hook_D12CreateCommitted(ID3D12Device* self,
     const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC* rd,
     D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID riid, void** pp)
 {
+    GH_FIRST("committed", GhRdKey(rd) ^ ((uint64_t)(hp ? hp->Type : 0) << 60) ^ ((uint64_t)hf << 4),
+             GhRdBrief(rd) + " heaptype=" + std::to_string((int)(hp ? hp->Type : -1)) +
+             " heapflags=" + Hex((uint32_t)hf) + " state=" + Hex((uint32_t)st));
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*,
         D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
         const D3D12_CLEAR_VALUE*, REFIID, void**))g_d12vtOrig[27];
@@ -17899,6 +18056,15 @@ static uintptr_t GhGuestCallerRva()
 static HRESULT __stdcall Hook_D12CreateHeap(ID3D12Device* self,
     const D3D12_HEAP_DESC* hd, REFIID riid, void** pp)
 {
+    GH_FIRST("heap", hd ? (((uint64_t)hd->Properties.Type << 40) ^
+                           ((uint64_t)hd->Properties.CPUPageProperty << 32) ^
+                           ((uint64_t)hd->Properties.MemoryPoolPreference << 24) ^
+                           ((uint64_t)hd->Flags << 4) ^ (uint64_t)(hd->Alignment != 0)) : 0,
+             "type=" + std::to_string((int)(hd ? hd->Properties.Type : -1)) +
+             " cpupage=" + std::to_string((int)(hd ? hd->Properties.CPUPageProperty : -1)) +
+             " pool=" + std::to_string((int)(hd ? hd->Properties.MemoryPoolPreference : -1)) +
+             " flags=" + Hex((uint32_t)(hd ? hd->Flags : 0)) +
+             " aligned=" + std::to_string((int)(hd && hd->Alignment != 0)));
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_HEAP_DESC*,
                                       REFIID, void**))g_d12vtOrig[28];
     GhD12CallScope _s("CreateHeap");
@@ -18131,6 +18297,7 @@ static HRESULT __stdcall Hook_D12CreatePlaced(ID3D12Device* self, ID3D12Heap* he
     UINT64 off, const D3D12_RESOURCE_DESC* rd, D3D12_RESOURCE_STATES st,
     const D3D12_CLEAR_VALUE* cv, REFIID riid, void** pp)
 {
+    GH_FIRST("placed", GhRdKey(rd), GhRdBrief(rd) + " state=" + Hex((uint32_t)st));
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, ID3D12Heap*, UINT64,
         const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*,
         REFIID, void**))g_d12vtOrig[29];
@@ -18306,6 +18473,7 @@ static HRESULT __stdcall Hook_D12CreateReserved(ID3D12Device* self,
     const D3D12_RESOURCE_DESC* rd, D3D12_RESOURCE_STATES st,
     const D3D12_CLEAR_VALUE* cv, REFIID riid, void** pp)
 {
+    GH_FIRST("reserved", GhRdKey(rd), GhRdBrief(rd) + " state=" + Hex((uint32_t)st));
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_RESOURCE_DESC*,
         D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**))g_d12vtOrig[30];
     D3D12_RESOURCE_DESC fixedRd{};
