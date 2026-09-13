@@ -18425,6 +18425,82 @@ static void GhDrainInfoQueue()
     iq->ClearStoredMessages();
 }
 
+// #192. The driver explains its own device removals on the debug-string channel
+// (see the DBGSTR block in the VEH below), and we have never once captured one.
+// Measured on cell C: 243 of the 256 lines the old forward cap allowed were a
+// single SC_DLL per-shader compile-timing banner, ~380 bytes each, and the
+// budget was exhausted at diag line 52,480 of 203,811 -- so umd12ddi was silent
+// to us for the whole second half of the run, and the removal at line 201,835
+// was unexplained by construction.
+//
+// A forward cap is the wrong shape for this. The explanation is by definition
+// among the LAST things the driver says, so keep a ring of the most recent
+// messages and flush it when the removal is noticed, then switch to printing
+// live so whatever the driver adds afterwards is captured too.
+//
+// gh_dbgstr_nofilter is deliberately inverted: 0 (which is what the harness
+// writes for any knob it is not told about) means the filter is ON, and the
+// control cell that wants the old firehose sets 1. See GhCfgNumZ's note above
+// on why a knob whose default the harness cannot express is a bug class.
+static unsigned GhDbgStrMax()
+{ static const unsigned v = GhCfgNum(L"gh_dbgstr_max.txt",  "GH_DBGSTR_MAX",  256); return v; }
+static unsigned GhDbgStrRingN()
+{ static const unsigned v = GhCfgNum(L"gh_dbgstr_ring.txt", "GH_DBGSTR_RING", 256); return v; }
+static unsigned GhDbgStrPost()
+{ static const unsigned v = GhCfgNum(L"gh_dbgstr_post.txt", "GH_DBGSTR_POST", 256); return v; }
+static unsigned GhDbgStrNoFilter()
+{ static const unsigned v = GhCfgNum(L"gh_dbgstr_nofilter.txt", "GH_DBGSTR_NOFILTER", 0); return v; }
+
+static const unsigned kDbgStrRingMax = 1024;
+static SRWLOCK                 g_dbgStrLock = SRWLOCK_INIT;
+static std::vector<std::string> g_dbgStrRing;      // sized on first push
+static unsigned                g_dbgStrHead  = 0;  // next slot to write
+static unsigned long long      g_dbgStrTotal = 0;  // pushed ever, for overflow accounting
+static volatile LONG           g_dbgStrFiltered = 0;
+static volatile LONG           g_dbgStrLive     = 0;  // 1 once the ring has been flushed
+
+static void GhDbgStrNote(const std::string& line)
+{
+    unsigned n = GhDbgStrRingN();
+    if (!n) return;
+    if (n > kDbgStrRingMax) n = kDbgStrRingMax;
+    AcquireSRWLockExclusive(&g_dbgStrLock);
+    if (g_dbgStrRing.size() != (size_t)n){ g_dbgStrRing.assign(n, std::string()); g_dbgStrHead = 0; }
+    g_dbgStrRing[g_dbgStrHead] = line;
+    g_dbgStrHead = (g_dbgStrHead + 1) % n;
+    ++g_dbgStrTotal;
+    ReleaseSRWLockExclusive(&g_dbgStrLock);
+}
+
+// Copy under the lock, print outside it: a flush is dozens of Diag calls and a
+// DBGSTR can arrive on any thread while it runs.
+static void GhDbgStrFlush(const char* why)
+{
+    std::vector<std::string> out;
+    unsigned long long total = 0;
+    AcquireSRWLockExclusive(&g_dbgStrLock);
+    const size_t n = g_dbgStrRing.size();
+    total = g_dbgStrTotal;
+    if (n){
+        out.reserve(n);
+        for (size_t i = 0; i < n; ++i){          // oldest first
+            const std::string& l = g_dbgStrRing[(g_dbgStrHead + i) % n];
+            if (!l.empty()) out.push_back(l);
+        }
+    }
+    ReleaseSRWLockExclusive(&g_dbgStrLock);
+    // Arm live printing before the flush, not after: whatever the driver says
+    // while we are dumping is the most interesting thing it will ever say.
+    InterlockedExchange(&g_dbgStrLive, 1);
+    Diag(std::string("DBGSTRRING flush at ") + why +
+         " held=" + std::to_string((unsigned long)out.size()) +
+         " seen=" + std::to_string((unsigned long long)total) +
+         " filtered=" + std::to_string((unsigned long)InterlockedCompareExchange(&g_dbgStrFiltered, 0, 0)));
+    for (size_t i = 0; i < out.size(); ++i)
+        Diag("  DBGSTRRING " + std::to_string((unsigned long)i) + " " + out[i]);
+    Diag("DBGSTRRING end");
+}
+
 static void GhCheckDeviceRemoved(const char* where, ID3D12Device* dev)
 {
     // dev lets a caller ask about the device it actually holds -- the guest's
@@ -18436,6 +18512,7 @@ static void GhCheckDeviceRemoved(const char* where, ID3D12Device* dev)
     if (InterlockedCompareExchange(&g_devRemovedSeen, 1, 0) != 0) return;
     Diag(std::string("DEVICEREMOVED first seen at ") + where +
          " reason=" + Hex((uint32_t)r) + GhGpuProgress());
+    GhDbgStrFlush(where);          // #192: what the driver said on the way down
     GhBreadcrumbDump("device-removed");
     GhBarrDump("at-device-removed");
     GhDrainInfoQueue();
@@ -19980,6 +20057,12 @@ static int WINAPI Bed_MessageBoxW(HWND, const wchar_t* text, const wchar_t* cap,
     std::wstring t(text ? text : L""), c(cap ? cap : L"");
     Diag("BED MessageBoxW type=" + Hex(type) + " [" + std::string(c.begin(), c.end()) +
          "] " + std::string(t.begin(), t.end()));
+    // #192. The other way this title dies is its own fatal-error box -- B3 went
+    // out through "using more video memory than your system can currently
+    // support" with no device removal at all, so the removal-site flush would
+    // never have fired. A dialog is rare enough to flush unconditionally, and
+    // the ring keeps filling afterwards, so flushing twice costs nothing.
+    GhDbgStrFlush("messagebox");
     // A game that puts up a message box has already made the decision behind it,
     // and the caller is the decision site. That is worth more than the text: this
     // title's user-visible strings are not in the exe (localisation data files), so
@@ -24123,9 +24206,7 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
         // the first one and silently drops the rest. Cap the count instead, and
         // print the text.
         if (code == 0x40010006 || code == 0x4001000A){
-            static LONG nDbgStr = 0;
-            if (InterlockedIncrement(&nDbgStr) <= 256 &&
-                ep->ExceptionRecord->NumberParameters >= 2){
+            if (ep->ExceptionRecord->NumberParameters >= 2){
                 const size_t len = (size_t)ep->ExceptionRecord->ExceptionInformation[0];
                 const void*  ptr = (const void*)ep->ExceptionRecord->ExceptionInformation[1];
                 char buf[4096];
@@ -24135,6 +24216,16 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
                 while (!txt.empty() && (txt.back() == '\0' || txt.back() == '\n' ||
                                         txt.back() == '\r')) txt.pop_back();
                 for (auto& c : txt) if (c == '\n' || c == '\r') c = ' ';
+                // #192. Drop the one banner that was eating the whole budget
+                // before it costs a stack walk, a ring slot or a diag line. It
+                // is a per-shader compile TIMING report -- we time compiles
+                // ourselves -- and it is the only thing umd12ddi printed in the
+                // 256 lines the old cap allowed. Counted, so the drop is visible.
+                if (!GhDbgStrNoFilter() &&
+                    txt.find("SC_DLL - Shader Compilation") != std::string::npos){
+                    InterlockedIncrement(&g_dbgStrFiltered);
+                    return EXCEPTION_CONTINUE_SEARCH;
+                }
                 // Name the caller: the message is only useful if we know which
                 // module printed it. Frame 2 is past RaiseException's own frames.
                 void* bt[8] = {};
@@ -24146,7 +24237,18 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
                         nm.find("KERNELBASE") == std::string::npos &&
                         nm.find("p0_spike_host") == std::string::npos){ who = nm; break; }
                 }
-                Diag("DBGSTR " + (who.empty() ? std::string("?") : who) + ": " + txt);
+                const std::string line = "DBGSTR " + (who.empty() ? std::string("?") : who) + ": " + txt;
+                GhDbgStrNote(line);
+                // Two budgets, not one. Before the removal a forward cap keeps
+                // the log sane and the ring holds the tail; after it, every
+                // message is evidence and gets its own allowance.
+                if (InterlockedCompareExchange(&g_dbgStrLive, 0, 0)){
+                    static LONG nPost = 0;
+                    if ((unsigned)InterlockedIncrement(&nPost) <= GhDbgStrPost()) Diag(line);
+                } else {
+                    static LONG nDbgStr = 0;
+                    if ((unsigned)InterlockedIncrement(&nDbgStr) <= GhDbgStrMax()) Diag(line);
+                }
             }
             return EXCEPTION_CONTINUE_SEARCH;
         }
