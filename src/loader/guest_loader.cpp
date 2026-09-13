@@ -10621,6 +10621,19 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
                  GhScreenWho("CS", d->CS.pShaderBytecode, d->CS.BytecodeLength, GhDxilMask()) +
                  " CS=" + std::to_string((unsigned long long)d->CS.BytecodeLength) +
                  "; E_FAIL without calling the driver");
+            // #196. The mirror of #195, one hook over. The graphics screen has
+            // served the #190 stand-in since it was written (the "screened" call
+            // a few hundred lines up); this one never did, and returned a null
+            // pipeline to a guest that does not read the HRESULT (#173/#174).
+            //
+            // That is the whole of cells C/D/E: at frame ~2850 the game reaches a
+            // compute shader the #188 bake has not got (451b08b2..., 9864 bytes,
+            // DXIL 6.6, WaveOps|ResDescHeap|SmpDescHeap), the screen correctly
+            // refuses it, and the next thing the guest does is
+            // SetPipelineState(nullptr) -- D3D12Core reads [pso+0xCC] off a null
+            // and the app dies. Refusing was right; handing back a null was not.
+            if (GhCpsServeStandIn(self, (GhCpsRawFn)orig, d, riid, pp, "screened"))
+                return S_OK;
             return E_FAIL;
         }
     }
@@ -13311,6 +13324,22 @@ static void __stdcall Hook_CLSetPso(ID3D12GraphicsCommandList* self, ID3D12Pipel
     if (GhCLNote* n = GhCLFind(self)){ InterlockedIncrement(&n->psosets); n->lastPso = pso; }
     if (GhCLTraceOn())
         Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " SETPSO " + Hex((uint64_t)(uintptr_t)pso));
+    // #196. Belt to the stand-in's braces. SetPipelineState(nullptr) is legal in
+    // the API and D3D12Core here dereferences it anyway -- `mov edx,[rdx+0xCC]`
+    // with rdx=0, which is how cells C/D/E ended. Every stand-in above exists so
+    // the guest never holds a null, but this is the one call that turns a null
+    // the guest is holding into a fault inside the runtime, so it is also the
+    // cheapest place to make that impossible. Swallowing it leaves the previous
+    // pipeline bound, which is what a driver that checked would have to do too.
+    if (!pso && GhPsoGuard() >= 2){
+        static volatile LONG nnull = 0;
+        const LONG k = InterlockedIncrement(&nnull);
+        if (k <= 8 || (k % 256) == 0)
+            Diag("  CLSETPSO NULL swallowed n=" + std::to_string((long)k) +
+                 " cl=" + Hex((uint64_t)(uintptr_t)self) +
+                 "; D3D12Core reads [pso+0xCC] and this one is not there");
+        return;
+    }
     if (GhOpMask() & 65536) return;
     if (!GhRecCap25(self, pso))
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*))GhClOrig(self, 25))(self, pso);
