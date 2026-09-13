@@ -4,8 +4,9 @@
 Two phases, because the lossy passes are only spent where they are needed:
   1. GH_WAVE_SIZE=64 alone -- folding op 112 to a literal is free on a fixed target.
   2. + GH_WAVE1=1 GH_CS_LOD0=1, but ONLY for a blob phase 1 could not finish or
-     whose output still carries one of the four opcodes #175 measured as fatal
-     (112 waveGetLaneCount, 119 waveActiveOp, 121 wavePrefixOp, 123 quadOp).
+     whose output still carries an opcode measured as fatal on this console
+     (112 waveGetLaneCount, 119 waveActiveOp, 121 wavePrefixOp, 123 quadOp,
+     116 waveActiveBallot).
 
 Usage: GH_DXC=... bake.py <srcdir> <dstdir> [jobs]
 """
@@ -16,7 +17,24 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DXC  = os.environ['GH_DXC']
 SRC, DST = sys.argv[1], sys.argv[2]
 JOBS = int(sys.argv[3]) if len(sys.argv) > 3 else 14
-KILL = {'112', '119', '121', '123'}
+# The gate is "does this op survive the console's back end", NOT "did lowering
+# succeed" -- and #202 is what the difference costs. 116 waveActiveBallot lowers
+# cleanly to DXIL 1.5 and passes every validator, so phase 1 kept it in 515 of
+# the 9,408 blobs of the #198 bake. It also removes the device: a hand-written
+# cs_6_5 control whose entire body is `Out[t.x] = WaveActiveBallot(t.x > 3).x`
+# returns hr=0x887A0005 with drrBefore=0x0 and drrAfter=0x887A0020. #175 could
+# not tell it apart from the rest of the wave family and left it unmeasured, so
+# it was never on this list; the corpus that closed #198's gap therefore handed
+# the driver 515 shaders it cannot compile, and two cells died at psoN=682.
+# lower_wave1 already rewrites 116 (it drops the call and rewrites the
+# extractvalue reads), so escalating these blobs to phase 2 costs only the
+# lane-solo approximation, not a stand-in.
+#
+# It also explains #192/#194 after the fact. The graphics pair #195 put on the
+# deny list is 42ab5eed (VS, no wave ops at all) and 6c9bda76 (PS, 116 x6): the
+# PS was the killer and the VS was denied only for being the first stage the
+# guard checks. #192, #194 and #202's psoN=682 removal are one defect.
+KILL = {'112', '119', '121', '123', '116'}
 
 def key_of(path):
     with open(path, 'rb') as f:
