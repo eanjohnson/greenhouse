@@ -21772,6 +21772,31 @@ static bool                             g_arenaExec = false;
 static SIZE_T                           g_arenaChunk = 0;
 static uint64_t                         g_arenaCap   = 0;   // ceiling on bytes mapped at once
 
+// #191. The arena's 1024 MB is a HARD per-process ceiling (#144 measured it:
+// eight sections over the same file all failed at the identical cumulative
+// 1 GB). A hard ceiling is a budget to SPEND, not a service to offer
+// first-come -- and first-come is exactly what this was.
+//
+// Cells B3, C and D agree on the shape to the megabyte:
+//
+//     ARENA slice   0x40000000 handed to GUEST+0xE8815E on its FIRST ask
+//     LAZY promise  GUEST+0x4EEDD2  n=6  1762MB   <- declined, every time
+//     LAZY promise  GUEST+0x4D460E  n=1   548MB
+//     LAZY promise  GUEST+0xE8792A  n=2    64MB
+//
+// and #189 named 0x4EEDD2 as the site whose two NEW regions (481 MB + 160 MB)
+// are the late commit burst. It is dense -- lazysaved=0 means every page it was
+// promised got touched -- so it pays full private commit for all 1762 MB while
+// the one allocation that could have been free is spent on whoever asked first.
+//
+// gh_arena_site names the guest RVA (DECIMAL -- the config reader strips
+// non-digits, so 0x4EEDD2 is written as 5173458) that may draw on the arena.
+// Every other caller is declined before GhArenaTake, so the budget is still
+// unspent when the named site asks. 0 = the old first-come behaviour.
+static volatile LONG                    g_arenaSiteDecl = 0;
+static uint64_t GhArenaSite()
+{ static const uint64_t v = (uint64_t)GhCfgNumZ(L"gh_arena_site.txt", "GH_ARENA_SITE", 0); return v; }
+
 static void GhArenaLog(const std::string& msg);   // defined below
 
 // caller holds g_arenaMx
@@ -22301,11 +22326,27 @@ static LPVOID WINAPI Bed_VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWOR
                                 PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
         if ((type & MEM_RESERVE) && size >= (1u << 20) && GhArenaInit() && size >= g_arenaMin &&
             (g_arenaExec || !(prot & kExecProt))){
+            // #191: reserve the budget for the named guest site, if there is one.
+            bool eligible = true;
+            const uintptr_t ra   = (uintptr_t)_ReturnAddress();
+            const uint64_t  site = GhArenaSite();
+            if (site){
+                const bool inGuest = g_guestImageBase &&
+                                     ra >= (uintptr_t)g_guestImageBase &&
+                                     ra <  (uintptr_t)g_guestImageBase + g_guestImageSize;
+                const uint64_t rva = inGuest ? (uint64_t)(ra - (uintptr_t)g_guestImageBase) : 0;
+                eligible = inGuest && rva == site;
+                if (!eligible && (unsigned)InterlockedIncrement(&g_arenaSiteDecl) <= 60)
+                    GhArenaLog("site-declined size=" + Hex((uint64_t)size) +
+                               " from=" + NameForCodeAddr(ra) +
+                               " want=GUEST+" + Hex((uint32_t)site) + " -> real reserve");
+            }
+            if (eligible){
             if (void* v = GhArenaTake(size, addr)){
                 GhArenaLog("slice addr=" + Hex((uint64_t)(uintptr_t)v) + " size=" + Hex((uint64_t)size) +
                            " type=" + Hex((uint32_t)type) + " prot=" + Hex((uint32_t)prot) +
                            " handed=" + Hex(g_arenaHanded) +
-                           " from=" + NameForCodeAddr((uintptr_t)_ReturnAddress()));
+                           " from=" + NameForCodeAddr(ra));
                 return v;
             }
             uint64_t freeTot = 0, freeMax = 0;
@@ -22313,7 +22354,9 @@ static LPVOID WINAPI Bed_VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWOR
             GhArenaLog("slice DECLINED size=" + Hex((uint64_t)size) +
                        " handed=" + Hex(g_arenaHanded) + " cap=" + Hex(g_arenaCap) +
                        " at=" + Hex((uint64_t)(uintptr_t)addr) +
-                       " freetot=" + Hex(freeTot) + " freemax=" + Hex(freeMax) + " -> real reserve");
+                       " freetot=" + Hex(freeTot) + " freemax=" + Hex(freeMax) +
+                       " from=" + NameForCodeAddr(ra) + " -> real reserve");
+            }
         }
     }
     // #145 demand-commit. Answer a big MEM_COMMIT with a promise instead of
