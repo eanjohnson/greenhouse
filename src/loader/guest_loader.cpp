@@ -4970,6 +4970,10 @@ static bool GhCreateDeferredSwap()
     return true;
 }
 
+// #199 bit 64. GfxPresent is 6000 lines above GhRawInput(), and the frame log
+// is what capped cell D's diag at 16 MB before the probe window opened.
+static unsigned GhRawInput();
+
 static HRESULT GfxPresent(UINT sync)
 {
     GhWatchTick("GfxPresent");
@@ -5229,9 +5233,19 @@ static HRESULT GfxPresent(UINT sync)
         // run that SURVIVES printed nothing and could not be told from one where the
         // knob never fired. Dump them on a slow cadence instead.
         if ((s_present_n % 60) == 0) GhCommitRtAllStats("frame");
+        InterlockedExchange64(&g_frameNo, (LONG64)s_present_n);   // #194
+        // #199 bit 64. One line per present is right for a run that dies at frame
+        // 26; it is wrong for one that has to stay alive long enough to be driven.
+        // Cell D reached FRAME 19876 and the diag hit its 16 MB cap at t=~900s --
+        // before a single probe was sent, so the run that finally survived is the
+        // one run whose evidence was thrown away. Every 60th present keeps the
+        // curve and costs a sixtieth of the quota.
+        const bool logFrame = !(GhRawInput() & 64) || (s_present_n % 60) == 0;
+        if (!logFrame){
+            s_lastEcl = e; s_lastHeaps = h; s_lastMs = now;
+        } else {
         GhCoreHeapStats("frame");   // #158: the growth curve, one line per present
         GhSecStats("frame");        // #158: section traffic, one line per present
-        InterlockedExchange64(&g_frameNo, (LONG64)s_present_n);   // #194
         Diag("FRAME n=" + std::to_string((unsigned long long)s_present_n) +
              " ecl=" + std::to_string((long)e) + " decl=" + std::to_string((long)(e - s_lastEcl)) +
              " heaps=" + std::to_string((long)h) + " dheaps=" + std::to_string((long)(h - s_lastHeaps)) +
@@ -5251,6 +5265,7 @@ static HRESULT GfxPresent(UINT sync)
                  std::to_string((unsigned long long)(g_gfx.blitFence ? g_gfx.blitFence->GetCompletedValue() : 0)));
         s_lastEcl = e; s_lastHeaps = h; s_lastMs = now;
         GhProfDump("frame");   // #158: the frame-25 vs frame-26 diff
+        }
     }
     ++s_present_n;
 
@@ -20023,6 +20038,47 @@ static HRESULT WINAPI Bed_D3D11CreateDeviceAndSwapChain(
 // this by capturing the WndProc at RegisterClass time and synthesising the
 // activation sequence through the guest's own PeekMessage/DispatchMessage flow.
 static WNDPROC g_guestWndProc = nullptr;
+// A guest that registers more than one window class used to end up dispatching
+// through whichever class registered LAST, because both beds just assigned
+// g_guestWndProc and moved on. Tsushima registers two ("BED RegisterClassExW
+// captured WndProc" appears twice in every run) and creates exactly one window,
+// class "Reign" -- so every injected click, key and WM_INPUT may have been going
+// to a procedure that never draws anything. Keep the classes and let the window
+// that actually gets created choose, which is what CreateWindowEx means.
+static std::map<std::wstring, WNDPROC> g_wndClasses;
+static std::mutex                      g_wndClassMutex;
+static void GhClassRegister(const wchar_t* name, WNDPROC proc, const char* which)
+{
+    if (!proc) return;
+    std::wstring n = (name && (uintptr_t)name > 0xFFFF) ? name : L"(atom)";
+    {
+        std::lock_guard<std::mutex> lk(g_wndClassMutex);
+        g_wndClasses[n] = proc;
+    }
+    // First registration still wins the fallback, so a guest that never reaches
+    // CreateWindowEx behaves exactly as it did before this change.
+    if (!g_guestWndProc) g_guestWndProc = proc;
+    Diag(std::string("BED ") + which + " captured WndProc cls=" +
+         std::string(n.begin(), n.end()) + " proc=" + Hex((uint64_t)(uintptr_t)proc));
+}
+static void GhClassSelect(const std::wstring& n)
+{
+    WNDPROC p = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_wndClassMutex);
+        auto it = g_wndClasses.find(n);
+        if (it != g_wndClasses.end()) p = it->second;
+    }
+    if (!p){
+        Diag("BED CreateWindowEx cls=" + std::string(n.begin(), n.end()) +
+             " has no registered proc -- keeping " + Hex((uint64_t)(uintptr_t)g_guestWndProc));
+        return;
+    }
+    const bool changed = (p != g_guestWndProc);
+    g_guestWndProc = p;
+    Diag("BED WndProc now " + Hex((uint64_t)(uintptr_t)p) + " from cls=" +
+         std::string(n.begin(), n.end()) + (changed ? "  *** CHANGED ***" : "  (unchanged)"));
+}
 
 // ===========================================================================
 // Real USB keyboard & mouse forwarding.
@@ -20116,6 +20172,45 @@ static std::mutex                         g_rawMutex;
 static std::map<uintptr_t, RAWINPUT>      g_rawEvents;      // HRAWINPUT value -> event
 static uintptr_t                          g_rawNextHandle = 0x7A000001;
 static HANDLE                             g_rawMouseDev   = (HANDLE)0x1D000001;  // fake hDevice
+static HANDLE                             g_rawKbdDev     = (HANDLE)0x1D000002;  // #199, the keyboard half
+
+// #199. One knob, four bits. #197 established that Tsushima is idle at its own
+// modal reading our CURSOR (its reticle follows g_kmCurX/Y) while no button or
+// key can reach it, but it could not say WHICH of four defects is the gate --
+// so this build can test them apart instead of spending a 30-minute cell per
+// guess. Default 0 is byte-for-byte today's behaviour.
+//   1 = GetMessageW drains the injected queue instead of answering WM_QUIT
+//   2 = GetRawInputDeviceList reports a real keyboard + mouse (and DeviceInfo
+//       answers for them), instead of "this machine has no raw input devices"
+//   4 = KM_OnKey pushes a RIM_TYPEKEYBOARD raw packet, as the mouse path does
+//   8 = RegisterRawInputDevices logs the usages the guest asked for
+//  16 = HOLD the activation burst until gh_activate.txt is dropped in
+//       LocalState, instead of firing it at the guest's first pump call
+//  32 = count every drain and every WndProc dispatch on a ladder (instrument)
+//  64 = log one FRAME line per 60 presents instead of one per present, so a
+//       run that survives long enough to be driven still has diag quota left
+//       when the probes land (cell D capped at 16 MB before its first click)
+// Bit 2 is the one I expect to matter: the RECON census for the whole 1541 s
+// run has RegisterRawInputDevices and GetRawInputDeviceList but NEVER
+// GetRawInputData -- the game asked how many devices exist, was told none, and
+// never looked again.
+static unsigned GhRawInput()
+{
+    static const unsigned v = GhCfgNumZ(L"gh_rawinput.txt", "GH_RAWINPUT", 0);
+    return v;
+}
+
+// RECON_ONCE says a path was touched once, ever. #197 needed to know how OFTEN:
+// "the game polls GetAsyncKeyState every frame" and "the game called it at
+// startup and never again" are the same single line but completely different
+// bugs. One interlocked increment, logged on a ladder so it cannot flood.
+static void ReconCount(const char* tag, volatile LONG* n)
+{
+    const LONG k = InterlockedIncrement(n);
+    if (k == 1 || k == 10 || k == 100 || k == 1000 || k == 10000 || (k % 100000) == 0)
+        Diag(std::string("RECONN ") + tag + " n=" + std::to_string((long)k));
+}
+#define RECON_COUNT(tag) do{ static volatile LONG _n = 0; ReconCount(tag, &_n); }while(0)
 static unsigned                           g_rawPushed = 0, g_rawServed = 0;
 static void KM_Push(UINT msg, WPARAM wp, LPARAM lp);       // fwd (defined below)
 
@@ -20147,6 +20242,35 @@ static void PushRawMouse(USHORT buttonFlags, USHORT buttonData, LONG dx, LONG dy
         ++g_rawPushed;
     }
     KM_Push(WM_INPUT, 0 /*RIM_INPUT in low byte*/, (LPARAM)h);
+}
+
+// #199 bit 4. The keyboard mirror of PushRawMouse. Until now the ONLY raw packet
+// type this loader ever produced was RIM_TYPEMOUSE, so a guest that reads its
+// keyboard through raw input -- which is what an engine that calls
+// RegisterRawInputDevices is doing -- had no keyboard at all.
+static void PushRawKeyboard(USHORT vk, USHORT scan, bool down, bool extended)
+{
+    uintptr_t h;
+    {
+        std::lock_guard<std::mutex> lk(g_rawMutex);
+        h = g_rawNextHandle++;
+        RAWINPUT ri{};
+        ri.header.dwType  = RIM_TYPEKEYBOARD;
+        ri.header.dwSize  = sizeof(RAWINPUT);
+        ri.header.hDevice = g_rawKbdDev;
+        ri.header.wParam  = 0;                    // RIM_INPUT (foreground)
+        ri.data.keyboard.MakeCode         = scan;
+        ri.data.keyboard.Flags            = (USHORT)((down ? RI_KEY_MAKE : RI_KEY_BREAK) |
+                                                     (extended ? RI_KEY_E0 : 0));
+        ri.data.keyboard.Reserved         = 0;
+        ri.data.keyboard.VKey             = vk;
+        ri.data.keyboard.Message          = down ? WM_KEYDOWN : WM_KEYUP;
+        ri.data.keyboard.ExtraInformation = 0;
+        g_rawEvents[h] = ri;
+        while (g_rawEvents.size() > 512) g_rawEvents.erase(g_rawEvents.begin());
+        ++g_rawPushed;
+    }
+    KM_Push(WM_INPUT, 0, (LPARAM)h);
 }
 
 // Translate an edge-detected button set (+ wheel + relative motion) into one raw
@@ -20212,11 +20336,11 @@ static void KM_Push(UINT msg, WPARAM wp, LPARAM lp){
 }
 
 static ATOM   WINAPI Bed_RegisterClassExW(const WNDCLASSEXW* wc){
-    if (wc && wc->lpfnWndProc){ g_guestWndProc = wc->lpfnWndProc; Diag("BED RegisterClassExW captured WndProc"); }
+    if (wc) GhClassRegister(wc->lpszClassName, wc->lpfnWndProc, "RegisterClassExW");
     return (ATOM)1;
 }
 static ATOM   WINAPI Bed_RegisterClassW(const WNDCLASSW* wc){
-    if (wc && wc->lpfnWndProc){ g_guestWndProc = wc->lpfnWndProc; Diag("BED RegisterClassW captured WndProc"); }
+    if (wc) GhClassRegister(wc->lpszClassName, wc->lpfnWndProc, "RegisterClassW");
     return (ATOM)1;
 }
 static ATOM   WINAPI Bed_RegisterClassExA(const void*){ return (ATOM)1; }
@@ -20231,6 +20355,7 @@ static HWND   WINAPI Bed_CreateWindowExW(DWORD, LPCWSTR cls, LPCWSTR, DWORD styl
     Diag("BED CreateWindowExW cls=" + std::string(c.begin(), c.end()) +
          " style=" + Hex((uint32_t)style) + " at " + std::to_string(x) + "," + std::to_string(y) +
          " size " + std::to_string(w) + "x" + std::to_string(h));
+    GhClassSelect(c);
     return kFakeHwnd;
 }
 static HWND   WINAPI Bed_CreateWindowExA(DWORD, LPCSTR cls, LPCSTR, DWORD style,
@@ -20240,6 +20365,10 @@ static HWND   WINAPI Bed_CreateWindowExA(DWORD, LPCSTR cls, LPCSTR, DWORD style,
          ((cls && (uintptr_t)cls > 0xFFFF) ? cls : "(atom)") +
          " style=" + Hex((uint32_t)style) + " at " + std::to_string(x) + "," + std::to_string(y) +
          " size " + std::to_string(w) + "x" + std::to_string(h));
+    {
+        std::string a = (cls && (uintptr_t)cls > 0xFFFF) ? cls : "(atom)";
+        GhClassSelect(std::wstring(a.begin(), a.end()));
+    }
     return kFakeHwnd;
 }
 static BOOL   WINAPI Bed_DestroyWindow(HWND){ return TRUE; }
@@ -20280,8 +20409,38 @@ static const UINT g_injectMsgs[] = { WM_ACTIVATEAPP, WM_ACTIVATE, WM_SETFOCUS, W
 static int g_injectIdx = 0;
 static bool FillInjectedMsg(LPMSG m){
     if (!g_guestWndProc || !m) return false;
-    // Activation sequence first (flips Unity's gAppActive before any input).
-    if (g_injectIdx < (int)(sizeof(g_injectMsgs)/sizeof(g_injectMsgs[0]))){
+    const int kNInject = (int)(sizeof(g_injectMsgs)/sizeof(g_injectMsgs[0]));
+    // #199 bit 16. Activation is Unity's, and cell B measured what it costs
+    // Tsushima: fired at the first pump call it takes appused 4.59 -> 4.97 GiB
+    // of a 5.0 GiB container and the run dies of bad_alloc at FRAME 2851,
+    // before the modal cell C reaches at FRAME 8077 without it. Telling an
+    // engine it is foreground is what makes it start streaming. So hold the
+    // burst through init and let it be released at the one moment the answer
+    // matters -- when the modal is actually on screen and a click is waiting.
+    // One-shot pulse file, same shape as ghpad.txt: presence is the signal,
+    // and it is deleted so one upload is one release.
+    static bool g_actReleased = false;
+    if ((GhRawInput() & 16) && !g_actReleased){
+        static DWORD lastCheck = 0;
+        const DWORD now = GetTickCount();
+        if (now - lastCheck >= 500){
+            lastCheck = now;
+            std::wstring ap = std::wstring(kLocalState) + L"gh_activate.txt";
+            std::vector<uint8_t> ab;
+            if (ReadWholeFile(ap, ab, true)){
+                DeleteFileW(ap.c_str());
+                g_actReleased = true;
+                g_injectIdx   = 0;                 // re-arm, deliver it now
+                Diag("BED activation burst RELEASED by gh_activate.txt");
+            }
+        }
+        if (!g_actReleased && g_injectIdx < kNInject){
+            g_injectIdx = kNInject;                // held, not spent
+            static bool once = false;
+            if (!once){ once = true; Diag("BED activation burst HELD (gh_rawinput bit 16)"); }
+        }
+    }
+    if (g_injectIdx < kNInject){
         UINT msg = g_injectMsgs[g_injectIdx++];
         m->hwnd    = kFakeHwnd;
         m->message = msg;
@@ -20295,13 +20454,33 @@ static bool FillInjectedMsg(LPMSG m){
     if (!g_kmQueue.empty()){
         *m = g_kmQueue.front(); g_kmQueue.pop_front(); m->time = 0; m->pt = { g_kmCurX, g_kmCurY };
         static int drained = 0; if (++drained <= 12) Diag("RECON guest drained injected msg=" + Hex(m->message));
+        if (GhRawInput() & 32) RECON_COUNT("drained");
         return true;
     }
     return false;
 }
-static BOOL   WINAPI Bed_PeekMessageW(LPMSG m, HWND, UINT, UINT, UINT){ RECON_ONCE("PeekMessageW"); return FillInjectedMsg(m) ? TRUE : FALSE; }
+static BOOL   WINAPI Bed_PeekMessageW(LPMSG m, HWND, UINT, UINT, UINT){ RECON_COUNT("PeekMessageW"); return FillInjectedMsg(m) ? TRUE : FALSE; }
 static BOOL   WINAPI Bed_PeekMessageA(LPMSG m, HWND, UINT, UINT, UINT){ RECON_ONCE("PeekMessageA"); return FillInjectedMsg(m) ? TRUE : FALSE; }
-static BOOL   WINAPI Bed_GetMessageW(LPMSG m, HWND, UINT, UINT){ if(m) m->message = WM_QUIT; return 0; }
+// #199 bit 1. This was `if(m) m->message = WM_QUIT; return 0;` -- a stub that
+// told every caller the app was closing and never once looked at the queue the
+// CoreWindow handlers fill. Nothing else drains that queue either: the guest has
+// never called PeekMessageW in a whole run (#197's RECON census), so every
+// WM_KEYDOWN, WM_LBUTTONDOWN and WM_INPUT we pushed sat there unread.
+// GetMessage is defined to BLOCK until a message arrives; we bound the block and
+// answer WM_NULL instead, which is a legal GetMessage return and cannot wedge a
+// guest thread that turns out to need to do something else.
+static BOOL   WINAPI Bed_GetMessageW(LPMSG m, HWND, UINT, UINT){
+    RECON_COUNT("GetMessageW");
+    if (!(GhRawInput() & 1)){ if(m) m->message = WM_QUIT; return 0; }
+    if (!m) return 0;
+    for (int i = 0; i < 50; ++i){                 // ~100 ms
+        if (FillInjectedMsg(m)) return (m->message == WM_QUIT) ? 0 : TRUE;
+        Sleep(2);
+    }
+    m->hwnd = kFakeHwnd; m->message = WM_NULL; m->wParam = 0; m->lParam = 0;
+    m->time = 0; m->pt = { 0, 0 };
+    return TRUE;
+}
 static BOOL   WINAPI Bed_TranslateMessage(const MSG*){ return FALSE; }
 // Route dispatch to the captured guest WndProc so the synthetic activation
 // messages actually reach Unity's internal handler (a no-op dispatch would
@@ -20323,6 +20502,12 @@ static LRESULT WINAPI Bed_DispatchMessageW(const MSG* m){
             static int disp = 0; if (++disp <= 12) Diag("RECON dispatched to WndProc msg=" + Hex(m->message));
         }
         ClickDiagDispatch(m, "W");
+        if (GhRawInput() & 32){
+            RECON_COUNT("dispatchW");
+            if (m->message == WM_INPUT)      RECON_COUNT("dispatchW.WM_INPUT");
+            else if (m->message == WM_KEYDOWN)   RECON_COUNT("dispatchW.WM_KEYDOWN");
+            else if (m->message == WM_LBUTTONDOWN) RECON_COUNT("dispatchW.WM_LBUTTONDOWN");
+        }
         return g_guestWndProc(m->hwnd, m->message, m->wParam, m->lParam);
     }
     return 0;
@@ -20358,7 +20543,7 @@ static HWND   WINAPI Bed_SetCapture(HWND){ return nullptr; }
 static BOOL   WINAPI Bed_SetForegroundWindow(HWND){ return TRUE; }
 static BOOL   WINAPI Bed_MoveWindow(HWND, int, int, int, int, BOOL){ return TRUE; }
 static BOOL   WINAPI Bed_SetWindowPos(HWND, HWND, int, int, int, int, UINT){ return TRUE; }
-static HWND   WINAPI Bed_GetForegroundWindow(){ return kFakeHwnd; }
+static HWND   WINAPI Bed_GetForegroundWindow(){ if (GhRawInput() & 32) RECON_COUNT("GetForegroundWindow"); return kFakeHwnd; }
 // A program that quits early almost always says why first, and MessageBox is
 // where it says it. In this container that channel is a dead end -- the slim
 // Xbox user32 has nowhere to draw and no one to click -- so the one string the
@@ -20451,8 +20636,8 @@ static LONG WINAPI Bed_WinVerifyTrust(HWND hwnd, GUID* action, LPVOID data)
 // Focus/visibility queries Unity cross-checks when deciding gAppActive. All
 // report the game window as the active, focused, visible, non-minimized one so
 // the activation we inject is not immediately re-cleared.
-static HWND   WINAPI Bed_GetActiveWindow(){ return kFakeHwnd; }
-static HWND   WINAPI Bed_GetFocus(){ return kFakeHwnd; }
+static HWND   WINAPI Bed_GetActiveWindow(){ if (GhRawInput() & 32) RECON_COUNT("GetActiveWindow"); return kFakeHwnd; }
+static HWND   WINAPI Bed_GetFocus(){ if (GhRawInput() & 32) RECON_COUNT("GetFocus"); return kFakeHwnd; }
 static BOOL   WINAPI Bed_IsWindowVisible(HWND){ return TRUE; }
 static BOOL   WINAPI Bed_IsIconic(HWND){ return FALSE; }
 
@@ -20802,6 +20987,10 @@ static void KM_OnKey(winrt::Windows::UI::Core::KeyEventArgs const& e, bool down)
     if (down){ if (st.WasKeyDown) lp |= (LPARAM)1 << 30; }
     else     { lp |= ((LPARAM)1 << 30) | ((LPARAM)1 << 31); }
     KM_Push(down ? WM_KEYDOWN : WM_KEYUP, (WPARAM)vk, lp);
+    // #199 bit 4. Mirror the key as a raw packet too, the way KM_OnPointer has
+    // always mirrored buttons via PushRawFromButtons.
+    if (GhRawInput() & 4)
+        PushRawKeyboard((USHORT)vk, (USHORT)(st.ScanCode & 0xFF), down, st.IsExtendedKey);
 }
 static void KM_OnPointer(winrt::Windows::UI::Core::PointerEventArgs const& e){
     // Log on entry, before any property read, so "handler never fired" (no line)
@@ -21375,26 +21564,26 @@ static int WINAPI Bed_GetDeviceCaps(HDC, int idx){
 // otherwise g_kmActive is false and they fall back to the original neutrals --
 // "nothing pressed / cursor centred" -- so a padless, KB/M-less guest is unchanged.
 static SHORT WINAPI Bed_GetAsyncKeyState(int vk){
-    RECON_ONCE("GetAsyncKeyState");
+    RECON_COUNT("GetAsyncKeyState");
     if (vk < 0 || vk > 255) return 0;
     std::lock_guard<std::mutex> lk(g_kmMutex);
     return g_vkDown[vk] ? (SHORT)0x8000 : 0;   // high bit set = currently down
 }
 static SHORT WINAPI Bed_GetKeyState(int vk){
-    RECON_ONCE("GetKeyState");
+    RECON_ONCE("GetKeyState"); if (GhRawInput() & 32) RECON_COUNT("GetKeyState");
     if (vk < 0 || vk > 255) return 0;
     std::lock_guard<std::mutex> lk(g_kmMutex);
     return g_vkDown[vk] ? (SHORT)0xFF80 : 0;   // high bit set = down
 }
 static BOOL  WINAPI Bed_GetKeyboardState(PBYTE b){
-    RECON_ONCE("GetKeyboardState");
+    RECON_ONCE("GetKeyboardState"); if (GhRawInput() & 32) RECON_COUNT("GetKeyboardState");
     if(!b) return TRUE;
     std::lock_guard<std::mutex> lk(g_kmMutex);
     for (int i = 0; i < 256; ++i) b[i] = g_vkDown[i] ? (BYTE)0x80 : (BYTE)0;
     return TRUE;
 }
 static BOOL  WINAPI Bed_GetCursorPos(LPPOINT p){
-    RECON_ONCE("GetCursorPos");
+    RECON_COUNT("GetCursorPos");
     if(p){
         std::lock_guard<std::mutex> lk(g_kmMutex);
         p->x = g_kmActive ? g_kmCurX : (LONG)(g_winW/2);
@@ -21437,8 +21626,44 @@ static UINT WINAPI Bed_GetRawInputBuffer(void* pData, UINT* pcbSize, UINT /*cbSi
 // tries to allocate count*sizeof(RAWINPUTDEVICELIST) => a ~100 GB TempOverflow
 // and crashes. We bed the whole family to a consistent "no raw-input devices,
 // no data" state; the gamepad still works via Windows.Gaming.Input.
-static BOOL WINAPI Bed_RegisterRawInputDevices(const void*, UINT, UINT){ RECON_ONCE("RegisterRawInputDevices"); return TRUE; }
-static UINT WINAPI Bed_GetRawInputDeviceList(void* list, UINT* num, UINT){ RECON_ONCE("GetRawInputDeviceList"); if(num){ if(!list) *num=0; } return 0; }
+// #199 bit 8. Still always succeeds -- but say what was asked for. Usage page 1
+// usage 6 is the keyboard, usage 2 the mouse; knowing which the guest wants is
+// what tells us whether bit 2's device list is answering the right question.
+static BOOL WINAPI Bed_RegisterRawInputDevices(const RAWINPUTDEVICE* devs, UINT n, UINT cb){
+    RECON_COUNT("RegisterRawInputDevices");
+    if ((GhRawInput() & 8) && devs && cb == sizeof(RAWINPUTDEVICE)){
+        for (UINT i = 0; i < n && i < 8; ++i)
+            Diag("RAWREG usagePage=" + Hex((uint32_t)devs[i].usUsagePage) +
+                 " usage=" + Hex((uint32_t)devs[i].usUsage) +
+                 " flags=" + Hex((uint32_t)devs[i].dwFlags));
+    }
+    return TRUE;
+}
+// #199 bit 2. The old answer was a flat "this machine has no raw input devices",
+// and an engine told that reasonably never reads raw input again -- which is
+// exactly the shape #197 measured: RegisterRawInputDevices and
+// GetRawInputDeviceList both called, GetRawInputData never. Report the two
+// devices we can actually service.
+//
+// The (UINT)-1 error return stays OFF the table on every path. The note above
+// this family is load-bearing: Unity reads THIS return as a device count and
+// allocates count*sizeof(RAWINPUTDEVICELIST) from it, so a -1 becomes a ~100 GB
+// allocation and a crash. Every failure here answers 0.
+static UINT WINAPI Bed_GetRawInputDeviceList(RAWINPUTDEVICELIST* list, UINT* num, UINT cb){
+    RECON_COUNT("GetRawInputDeviceList");
+    if (!(GhRawInput() & 2)){ if(num){ if(!list) *num=0; } return 0; }
+    if (!num) return 0;
+    if (cb && cb != sizeof(RAWINPUTDEVICELIST)){ *num = 0; return 0; }
+    const UINT have = 2;
+    if (!list){ *num = have; return 0; }          // sizing call
+    if (*num < have){ *num = have; return 0; }    // deliberately 0, never (UINT)-1
+    list[0].hDevice = g_rawMouseDev; list[0].dwType = RIM_TYPEMOUSE;
+    list[1].hDevice = g_rawKbdDev;   list[1].dwType = RIM_TYPEKEYBOARD;
+    *num = have;
+    static bool once = false;
+    if (!once){ once = true; Diag("RAWLIST served 2 devices (mouse + keyboard)"); }
+    return have;
+}
 // Serve the synthetic raw-mouse events queued by PushRawMouse. hRawInput is the
 // handle we handed the game in the WM_INPUT lParam; look it up and copy the stored
 // RAWINPUT (RID_INPUT) or just its header (RID_HEADER). Unknown handles fall back
@@ -21455,7 +21680,11 @@ static UINT WINAPI Bed_GetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPVO
     }
     if (!found){ if (!pData && pcbSize) *pcbSize = 0; return 0; }
 
-    const UINT full = sizeof(RAWINPUTHEADER) + sizeof(RAWMOUSE);
+    // #199: size by the packet's own type. This was hard-wired to RAWMOUSE, which
+    // would have handed a keyboard packet back short.
+    const UINT full = sizeof(RAWINPUTHEADER) +
+                      (UINT)(ri.header.dwType == RIM_TYPEKEYBOARD ? sizeof(RAWKEYBOARD)
+                                                                  : sizeof(RAWMOUSE));
     if (uiCommand == RID_HEADER){
         if (!pData){ if (pcbSize) *pcbSize = sizeof(RAWINPUTHEADER); return 0; }
         if (!pcbSize || *pcbSize < sizeof(RAWINPUTHEADER)) return (UINT)-1;
@@ -21467,10 +21696,58 @@ static UINT WINAPI Bed_GetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPVO
     if (!pcbSize || *pcbSize < full) return (UINT)-1;
     memcpy(pData, &ri, full);
     { std::lock_guard<std::mutex> lk(g_rawMutex); ++g_rawServed;
-      static int n=0; if(++n<=20) Diag("CLICKDIAG GetRawInputData served flags=" + Hex(ri.data.mouse.usButtonFlags)); }
+      static int n=0; if(++n<=20) Diag(std::string("CLICKDIAG GetRawInputData served ") +
+          (ri.header.dwType == RIM_TYPEKEYBOARD
+             ? ("kbd vk=" + Hex((uint32_t)ri.data.keyboard.VKey) + " flags=" + Hex((uint32_t)ri.data.keyboard.Flags))
+             : ("mouse flags=" + Hex((uint32_t)ri.data.mouse.usButtonFlags)))); }
     return full;
 }
-static UINT WINAPI Bed_GetRawInputDeviceInfoW(void*, UINT, void* data, UINT* sz){ if(!data && sz) *sz=0; return 0; }
+// #199 bit 2. Once the device list names two devices the guest asks about them,
+// and answering "nothing" here is how a game decides the device it just found is
+// not usable after all. RIDI_DEVICENAME gets a plausible device path;
+// RIDI_DEVICEINFO gets a filled RID_DEVICE_INFO of the right type.
+static UINT WINAPI Bed_GetRawInputDeviceInfoW(HANDLE dev, UINT cmd, void* data, UINT* sz){
+    RECON_COUNT("GetRawInputDeviceInfoW");
+    if (!(GhRawInput() & 2)){ if(!data && sz) *sz=0; return 0; }
+    const bool kbd = (dev == g_rawKbdDev);
+    if (dev != g_rawKbdDev && dev != g_rawMouseDev){ if(!data && sz) *sz=0; return 0; }
+
+    if (cmd == RIDI_DEVICENAME){
+        const wchar_t* name = kbd ? L"\\\\?\\GHKBD#VID_0000&PID_0001#1#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}"
+                                  : L"\\\\?\\GHMOU#VID_0000&PID_0002#1#{378de44c-56ef-11d1-bc8c-00a0c91405dd}";
+        const UINT chars = (UINT)wcslen(name) + 1;
+        if (!data){ if (sz) *sz = chars; return 0; }
+        if (!sz || *sz < chars){ if (sz) *sz = chars; return 0; }
+        wcscpy_s((wchar_t*)data, *sz, name);
+        return chars;
+    }
+    if (cmd == RIDI_DEVICEINFO){
+        const UINT need = sizeof(RID_DEVICE_INFO);
+        if (!data){ if (sz) *sz = need; return 0; }
+        if (!sz || *sz < need){ if (sz) *sz = need; return 0; }
+        RID_DEVICE_INFO info{};
+        info.cbSize = sizeof(RID_DEVICE_INFO);
+        if (kbd){
+            info.dwType = RIM_TYPEKEYBOARD;
+            info.keyboard.dwType                 = 81;   // enhanced 101/102-key
+            info.keyboard.dwSubType              = 0;
+            info.keyboard.dwKeyboardMode         = 1;
+            info.keyboard.dwNumberOfFunctionKeys = 12;
+            info.keyboard.dwNumberOfIndicators   = 3;
+            info.keyboard.dwNumberOfKeysTotal    = 101;
+        } else {
+            info.dwType = RIM_TYPEMOUSE;
+            info.mouse.dwId                = 0;
+            info.mouse.dwNumberOfButtons   = 3;
+            info.mouse.dwSampleRate        = 125;
+            info.mouse.fHasHorizontalWheel = FALSE;
+        }
+        memcpy(data, &info, need);
+        return need;
+    }
+    if (!data && sz) *sz = 0;                      // RIDI_PREPARSEDDATA and friends
+    return 0;
+}
 // Honour cursor warps (games recentre the cursor each frame for mouse-look) so a
 // subsequent GetCursorPos reads back what the game set, not a stale forwarded pos.
 static BOOL  WINAPI Bed_SetCursorPos(int x, int y){
