@@ -23345,9 +23345,18 @@ static void* GhArenaTakeChunked(HANDLE sect, uint64_t off, uint64_t need, uint64
         done += take;
     }
     if (done == need) return ph;
-    // Unwind: the mapped chunks, then whatever placeholder is left.
+    // Unwind. The mapped chunks come back one at a time, and so does the rest of
+    // the reservation: the loop above already SPLIT the run at `done`, so what is
+    // left is two placeholders -- the chunk we failed on and the remainder behind
+    // it -- and releasing from `done` alone would leak the remainder. Harmless
+    // while this path was rare; with gh_arena_lru on it is taken for every slice
+    // and refusals are how the ceiling announces itself, so it is no longer rare.
     for (uint64_t u = 0; u < done; u += chunk) UnmapViewOfFile(ph + u);
-    if (done < need) VirtualFree(ph + done, 0, MEM_RELEASE);
+    for (uint64_t u = done; u < need; u += chunk){
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(ph + u, &mbi, sizeof mbi) != sizeof mbi) break;
+        if (!VirtualFree(ph + u, 0, MEM_RELEASE)) break;
+    }
     return nullptr;
 }
 
