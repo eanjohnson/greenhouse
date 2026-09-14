@@ -22954,7 +22954,12 @@ static std::map<uint64_t, uint64_t>     g_arenaFree;    // offset -> size, order
 // A slice is one reservation handed to the guest. `chunk` is 0 when it is a
 // single view and the chunk stride when it had to be built out of several --
 // see GhArenaTakeChunked for why that is the common case for anything big.
-struct GhArenaSlice { uint64_t off; uint64_t size; uint64_t chunk; };
+// #202 adds three fields for view recycling. `ph` marks a slice whose VA came
+// from a PLACEHOLDER reservation, which is what makes it evictable: its view can
+// be dropped with MEM_PRESERVE_PLACEHOLDER, returning the per-process view
+// budget while the ADDRESS stays reserved, and mapped back at the same address
+// later. `mapped` is 0 while the slice is evicted. `used` is the clock bit.
+struct GhArenaSlice { uint64_t off; uint64_t size; uint64_t chunk; bool ph; LONG mapped; LONG used; };
 static std::map<void*, GhArenaSlice> g_arenaLive;   // view base -> slice
 static SIZE_T                           g_arenaMin  = 0;
 static volatile LONG                    g_arenaLogs = 0;
@@ -22962,6 +22967,29 @@ static uint64_t                         g_arenaHanded = 0;
 static bool                             g_arenaExec = false;
 static SIZE_T                           g_arenaChunk = 0;
 static uint64_t                         g_arenaCap   = 0;   // ceiling on bytes mapped at once
+
+// #202 view recycling. The per-process ceiling (measured exactly 1024 MiB by
+// the gh_arena_recycle_probe cell) is on LIVE MAPPED VIEW, and cell Q proved the
+// charge is reversible: drop a view with MEM_PRESERVE_PLACEHOLDER and the
+// section will serve another. So the ceiling is a budget to CYCLE, not to spend
+// once -- which is the whole of #202, because the one caller that oversubscribes
+// it asks for 470 MiB, is refused, and asks again later.
+static unsigned        g_arenaLru       = 0;        // gh_arena_lru: 0 = old behaviour
+static DWORD volatile  g_arenaOwner     = 0;        // thread currently inside the arena lock
+static volatile LONG   g_arenaEvicts    = 0;
+static volatile LONG   g_arenaRefaults  = 0;
+static volatile LONG   g_arenaEvictFail = 0;
+static volatile LONG   g_arenaRemapFail = 0;
+static uint64_t        g_arenaEvictedB  = 0;        // bytes reserved but not mapped
+
+// Every acquisition of g_arenaMx goes through this, so GhArenaFault can tell
+// "another thread is in the arena" (wait for it) from "THIS thread is already in
+// the arena" (never recurse -- that is the deadlock the fault path must avoid).
+struct GhArenaLock {
+    std::lock_guard<std::mutex> lk;
+    GhArenaLock() : lk(g_arenaMx) { g_arenaOwner = GetCurrentThreadId(); }
+    ~GhArenaLock() { g_arenaOwner = 0; }
+};
 
 // #191. The arena's 1024 MB is a HARD per-process ceiling (#144 measured it:
 // eight sections over the same file all failed at the identical cumulative
@@ -22989,7 +23017,19 @@ static uint64_t GhArenaSite()
 { static const uint64_t v = (uint64_t)GhCfgNumZ(L"gh_arena_site.txt", "GH_ARENA_SITE", 0); return v; }
 
 static void GhArenaLog(const std::string& msg);   // defined below
+static bool GhArenaPlaceholderApi();              // #202, defined below
+// #202. The LRU's own channel. Diag, not GhArenaLog, because GhArenaLog stops
+// at 300 lines and the eviction record is the thing a cell is scored on -- but
+// capped all the same: LocalState's quota is shared with the game's log, and a
+// diag that fills it takes the death record down with it.
+static volatile LONG g_arenaLruLogs = 0;
+static void GhArenaLruLog(const std::string& m)
+{
+    if (InterlockedIncrement(&g_arenaLruLogs) <= 400) Diag("ARENALRU " + m);
+}
 static void GhArenaRecycleProbe();                 // #202, defined below
+static bool GhArenaFault(void* addr);               // #202 remap-on-access
+static bool GhArenaMaterialise(const void* addr, SIZE_T size);
 
 // caller holds g_arenaMx
 static bool GhArenaInit()
@@ -23009,6 +23049,14 @@ static bool GhArenaInit()
     // asking at the cap instead of paying for a failed 1 GB map-and-unwind on
     // every large reservation for the rest of the run.
     g_arenaCap = (uint64_t)GhCfgNum(L"gh_arena_cap_mb.txt", "GH_ARENA_CAP_MB", 1024) << 20;
+    // #202. Cell Q measured what this knob depends on: the 1024 MB is a budget
+    // for LIVE VIEW, and unmapping a placeholder-backed view returns it -- the
+    // section then serves a new view, the old slice comes back at the same VA,
+    // and its bytes survive the round trip. So with recycling on, g_arenaCap
+    // stops being a ceiling on how much the arena may hand out and becomes a
+    // ceiling on how much it may hold mapped at once; the real limit on handed
+    // bytes is the arena FILE, which g_arenaFree already enforces.
+    g_arenaLru = GhCfgNum(L"gh_arena_lru.txt", "GH_ARENA_LRU", 0);
 
     const wchar_t* dir = L"D:\\DevelopmentFiles\\";
     ULARGE_INTEGER avail{}, tot{}, freeb{};
@@ -23081,6 +23129,9 @@ static bool GhArenaInit()
          " chunk=" + Hex((uint64_t)g_arenaChunk) + " cap=" + Hex(g_arenaCap) +
          " sections=" + std::to_string(g_arenaMaps.size()) +
          " volfree=" + Hex((uint64_t)avail.QuadPart));
+    if (g_arenaLru) Diag("ARENALRU on cap=" + Hex(g_arenaCap) + " size=" + Hex(g_arenaSize) +
+                         " chunk=" + Hex((uint64_t)g_arenaChunk) +
+                         " ph-api=" + std::string(GhArenaPlaceholderApi() ? "yes" : "no"));
     GhLogMemoryBudget("arena-ready");
     GhArenaRecycleProbe();
     return true;
@@ -23300,6 +23351,72 @@ static void* GhArenaTakeChunked(HANDLE sect, uint64_t off, uint64_t need, uint64
     return nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// #202 view recycling.
+//
+// All three of these run with g_arenaMx held. None of them touches a byte of
+// guest memory -- they only map and unmap -- which is what keeps the fault path
+// from ever re-entering the arena lock through its own work.
+// ---------------------------------------------------------------------------
+
+// Drop a slice's view(s), keeping the address reserved. A chunked slice is
+// several views inside one placeholder run, so each chunk is dropped in turn.
+static bool GhArenaUnmapKeep(void* base, const GhArenaSlice& s)
+{
+    if (!g_uv2) return false;
+    const uint64_t step = s.chunk ? s.chunk : s.size;
+    bool ok = true;
+    for (uint64_t u = 0; u < s.size; u += step)
+        if (!g_uv2(GetCurrentProcess(), (uint8_t*)base + u, MEM_PRESERVE_PLACEHOLDER)) ok = false;
+    return ok;
+}
+
+// Put a slice's bytes back at the SAME address. On a partial failure everything
+// already mapped is dropped again: a half-mapped slice would fault forever,
+// because the fault handler would map the part that is already there and return
+// to the same faulting instruction.
+static bool GhArenaMapBack(void* base, const GhArenaSlice& s, HANDLE sect, DWORD pageProt)
+{
+    if (!g_mv3) return false;
+    const uint64_t step = s.chunk ? s.chunk : s.size;
+    for (uint64_t u = 0; u < s.size; u += step){
+        const uint64_t take = (s.size - u < step) ? (s.size - u) : step;
+        if (!g_mv3(sect, GetCurrentProcess(), (uint8_t*)base + u, s.off + u, (SIZE_T)take,
+                   MEM_REPLACE_PLACEHOLDER, pageProt, nullptr, 0)){
+            for (uint64_t v = 0; v < u; v += step)
+                g_uv2(GetCurrentProcess(), (uint8_t*)base + v, MEM_PRESERVE_PLACEHOLDER);
+            return false;
+        }
+    }
+    return true;
+}
+
+// Free at least `want` bytes of view budget, second-chance clock: pass 0 skips
+// (and clears) anything touched since the last sweep, pass 1 takes what is left.
+// `keep` is the slice the caller is working on and must never be evicted.
+static uint64_t GhArenaEvict(uint64_t want, void* keep)
+{
+    uint64_t freed = 0;
+    for (int pass = 0; pass < 2 && freed < want; ++pass){
+        for (auto& kv : g_arenaLive){
+            if (freed >= want) break;
+            if (kv.first == keep) continue;
+            GhArenaSlice& sl = kv.second;
+            if (!sl.ph || !sl.mapped) continue;
+            if (pass == 0 && sl.used){ sl.used = 0; continue; }
+            if (GhArenaUnmapKeep(kv.first, sl)){
+                sl.mapped = 0;
+                freed += sl.size;
+                g_arenaEvictedB += sl.size;
+                InterlockedIncrement(&g_arenaEvicts);
+            } else {
+                InterlockedIncrement(&g_arenaEvictFail);
+            }
+        }
+    }
+    return freed;
+}
+
 // caller holds g_arenaMx. wantAddr non-null means the guest demanded a fixed
 // address; if the mapping cannot honour it we return null and the caller falls
 // back to a real VirtualAlloc rather than moving the guest's memory under it.
@@ -23307,7 +23424,10 @@ static void* GhArenaTake(SIZE_T size, void* wantAddr)
 {
     const uint64_t kGran = 64u << 10;             // MapViewOfFile offset granularity
     uint64_t need = ((uint64_t)size + kGran - 1) & ~(kGran - 1);
-    if (g_arenaCap && g_arenaHanded + need > g_arenaCap) return nullptr;
+    // Without recycling the cap is final: a view handed out is a view held for
+    // the life of the slice. With recycling the cap is a working set, so the
+    // only thing that can refuse here is the file running out of free space.
+    if (!g_arenaLru && g_arenaCap && g_arenaHanded + need > g_arenaCap) return nullptr;
     for (auto it = g_arenaFree.begin(); it != g_arenaFree.end(); ++it){
         if (it->second < need) continue;
         uint64_t off = it->first;
@@ -23315,6 +23435,26 @@ static void* GhArenaTake(SIZE_T size, void* wantAddr)
         DWORD pageProt = g_arenaExec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
         void*    v     = nullptr;
         uint64_t chunk = 0;
+        bool     ph    = false;
+        // With recycling on, EVERY slice goes through the placeholder path, even
+        // one small enough for a plain MapViewOfFile. Only a placeholder-backed
+        // view can be dropped and put back at the SAME address later, and the
+        // guest holds raw pointers into these slices, so "same address" is not
+        // negotiable. A plain view would be a slice we could never evict -- i.e.
+        // budget spent for the rest of the run.
+        if (g_arenaLru && !wantAddr && GhArenaPlaceholderApi()){
+            HANDLE sect = g_arenaMaps.empty() ? g_arenaMap : g_arenaMaps[0];
+            chunk = (uint64_t)g_arenaChunk;
+            v = GhArenaTakeChunked(sect, off, need, chunk, pageProt);
+            if (!v){
+                // The ceiling is a budget to cycle, not a wall. Free what this
+                // slice needs out of the cold ones and ask the section again.
+                const uint64_t freed = GhArenaEvict(need, nullptr);
+                GhArenaLruLog("evict-for-take need=" + Hex(need) + " freed=" + Hex(freed));
+                if (freed) v = GhArenaTakeChunked(sect, off, need, chunk, pageProt);
+            }
+            if (v) ph = true; else chunk = 0;
+        }
         for (size_t si = 0; si < g_arenaMaps.size() && !v; ++si){
             HANDLE sect = g_arenaMaps[si];
             v = wantAddr
@@ -23338,7 +23478,7 @@ static void* GhArenaTake(SIZE_T size, void* wantAddr)
         if (!v) return nullptr;
         if (it->second == need) g_arenaFree.erase(it);
         else { uint64_t rest = it->second - need; g_arenaFree.erase(it); g_arenaFree[off + need] = rest; }
-        g_arenaLive[v] = { off, need, chunk };
+        g_arenaLive[v] = { off, need, chunk, ph, 1, 1 };
         g_arenaHanded += need;
         return v;
     }
@@ -23351,8 +23491,16 @@ static bool GhArenaGive(void* base)
     auto it = g_arenaLive.find(base);
     if (it == g_arenaLive.end()) return false;
     uint64_t off = it->second.off, size = it->second.size, chunk = it->second.chunk;
-    if (chunk){ for (uint64_t u = 0; u < size; u += chunk) UnmapViewOfFile((uint8_t*)base + u); }
-    else       UnmapViewOfFile(base);
+    if (it->second.ph && !it->second.mapped){
+        // An evicted slice still owns its VA as placeholders -- one per chunk,
+        // because GhArenaTakeChunked split the run. Releasing from the base
+        // would leave every chunk after the first reserved for the whole run.
+        const uint64_t step = chunk ? chunk : size;
+        g_arenaEvictedB -= size;
+        for (uint64_t u = 0; u < size; u += step) VirtualFree((uint8_t*)base + u, 0, MEM_RELEASE);
+    }
+    else if (chunk){ for (uint64_t u = 0; u < size; u += chunk) UnmapViewOfFile((uint8_t*)base + u); }
+    else            UnmapViewOfFile(base);
     g_arenaLive.erase(it);
     g_arenaHanded -= size;
     // Coalesce with the neighbours so a long session does not shred the file.
@@ -23370,6 +23518,79 @@ static bool GhArenaGive(void* base)
 }
 
 // caller holds g_arenaMx
+// ---------------------------------------------------------------------------
+// #202. The guest touched a slice we evicted. Put the bytes back at the same
+// address and let the faulting instruction run again.
+//
+// This runs from the VEH ahead of every crash-reporting path, so it has to be
+// cheap and it must never deadlock. The one deadlock available is this thread
+// already holding g_arenaMx; nothing under that lock reads guest memory, so it
+// cannot happen through our own work -- but it would be unrecoverable if it
+// ever did, so the owner check makes it impossible rather than unlikely.
+// ---------------------------------------------------------------------------
+static bool GhArenaRemapLocked(void* base, GhArenaSlice& sl)   // caller holds g_arenaMx
+{
+    HANDLE sect = g_arenaMaps.empty() ? g_arenaMap : g_arenaMaps[0];
+    DWORD  prot = g_arenaExec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
+    if (!GhArenaMapBack(base, sl, sect, prot)){
+        // Out of view budget for the slice we are being asked to restore. Make
+        // room out of the cold ones -- never out of this one -- and try again.
+        GhArenaEvict(sl.size, base);
+        if (!GhArenaMapBack(base, sl, sect, prot)){
+            InterlockedIncrement(&g_arenaRemapFail);
+            return false;                 // report it honestly; do not eat the fault
+        }
+    }
+    sl.mapped = 1;
+    sl.used   = 1;
+    g_arenaEvictedB -= sl.size;
+    InterlockedIncrement(&g_arenaRefaults);
+    return true;
+}
+
+static bool GhArenaFault(void* addr)
+{
+    if (!g_arenaLru || !g_arenaMap || !addr) return false;
+    if (g_arenaOwner == GetCurrentThreadId()) return false;
+    GhArenaLock lk;
+    auto it = g_arenaLive.upper_bound(addr);
+    if (it == g_arenaLive.begin()) return false;
+    --it;
+    GhArenaSlice& sl = it->second;
+    uint8_t* b = (uint8_t*)it->first;
+    if ((uint8_t*)addr < b || (uint8_t*)addr >= b + sl.size) return false;
+    if (!sl.ph) return false;             // a plain view: not ours to repair
+    if (sl.mapped){ sl.used = 1; return false; }   // mapped and still faulting: a real fault
+    const bool ok = GhArenaRemapLocked(it->first, sl);
+    if (ok && (g_arenaRefaults & 0xFF) == 1)
+        GhArenaLruLog("refault base=" + Hex((uint64_t)(uintptr_t)b) + " size=" + Hex(sl.size));
+    return ok;
+}
+
+// The kernel does not raise an AV when it writes into an evicted slice -- it
+// fails the call with ERROR_NOACCESS -- so the same call sites that have to
+// pre-commit lazy pages have to pre-map evicted slices. Hooked into the top of
+// GhLazyMaterialise so every existing caller is covered by one change.
+static bool GhArenaMaterialise(const void* addr, SIZE_T size)
+{
+    if (!g_arenaLru || !g_arenaMap || !addr || !size) return false;
+    if (g_arenaOwner == GetCurrentThreadId()) return false;
+    uint8_t* lo = (uint8_t*)addr;
+    uint8_t* hi = lo + size;
+    bool did = false;
+    GhArenaLock lk;
+    for (auto& kv : g_arenaLive){
+        GhArenaSlice& sl = kv.second;
+        if (!sl.ph) continue;
+        uint8_t* b = (uint8_t*)kv.first;
+        if (b + sl.size <= lo || b >= hi) continue;
+        sl.used = 1;
+        if (sl.mapped) continue;
+        if (GhArenaRemapLocked(kv.first, sl)) did = true;
+    }
+    return did;
+}
+
 static bool GhArenaFind(const void* p, void** base, SIZE_T* size)
 {
     for (auto& kv : g_arenaLive){
@@ -23526,7 +23747,12 @@ static bool GhLazyFault(void* addr)
 // raising something our VEH can catch.
 static bool GhLazyMaterialise(const void* addr, SIZE_T size)
 {
-    if (InterlockedCompareExchange(&g_lazyCount, 0, 0) == 0 || !addr || !size) return false;
+    // #202. Same contract, one layer lower: before a kernel write into this
+    // span can fail with ERROR_NOACCESS, make sure none of it is an evicted
+    // arena slice. Independent of the lazy pager below -- the arena serves the
+    // reservation, the pager serves the commit, and a buffer can need both.
+    const bool arena = GhArenaMaterialise(addr, size);
+    if (InterlockedCompareExchange(&g_lazyCount, 0, 0) == 0 || !addr || !size) return arena;
     uint8_t* lo = (uint8_t*)addr;
     uint8_t* hi = lo + size;
     bool did = false;
@@ -23609,7 +23835,7 @@ static SIZE_T WINAPI Bed_VirtualQuery(LPCVOID addr, PMEMORY_BASIC_INFORMATION mb
         }
     }
     if (r && mbi && len >= sizeof(MEMORY_BASIC_INFORMATION) && mbi->Type == MEM_MAPPED){
-        std::lock_guard<std::mutex> lk(g_arenaMx);
+        GhArenaLock lk;
         void* b = nullptr; SIZE_T sz = 0;
         if (GhArenaFind(addr, &b, &sz)){
             mbi->Type             = MEM_PRIVATE;
@@ -23624,7 +23850,7 @@ static SIZE_T WINAPI Bed_VirtualQuery(LPCVOID addr, PMEMORY_BASIC_INFORMATION mb
 static LPVOID WINAPI Bed_VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot)
 {
     {
-        std::lock_guard<std::mutex> lk(g_arenaMx);
+        GhArenaLock lk;
         // A commit landing inside a slice we already handed out is already
         // backed by the file. Say yes and touch nothing -- this is the call the
         // game makes thousands of times, and answering it from private commit
@@ -23680,6 +23906,13 @@ static LPVOID WINAPI Bed_VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWOR
                        " at=" + Hex((uint64_t)(uintptr_t)addr) +
                        " freetot=" + Hex(freeTot) + " freemax=" + Hex(freeMax) +
                        " from=" + NameForCodeAddr(ra) + " -> real reserve");
+            if (g_arenaLru)
+                GhArenaLruLog("declined evicts=" + std::to_string(g_arenaEvicts) +
+                              " refaults=" + std::to_string(g_arenaRefaults) +
+                              " evictfail=" + std::to_string(g_arenaEvictFail) +
+                              " remapfail=" + std::to_string(g_arenaRemapFail) +
+                              " evictedB=" + Hex(g_arenaEvictedB) +
+                              " handed=" + Hex(g_arenaHanded));
             }
         }
     }
@@ -23732,7 +23965,7 @@ static LPVOID WINAPI Bed_VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWOR
 static BOOL WINAPI Bed_VirtualFree(LPVOID addr, SIZE_T size, DWORD type)
 {
     {
-        std::lock_guard<std::mutex> lk(g_arenaMx);
+        GhArenaLock lk;
         if (type & MEM_RELEASE){
             if (GhArenaGive(addr)){
                 GhArenaLog("release addr=" + Hex((uint64_t)(uintptr_t)addr) +
@@ -25528,6 +25761,12 @@ static LONG GhCrashObserverVehBody(EXCEPTION_POINTERS* ep)
     if (ep->ExceptionRecord->ExceptionCode == (DWORD)EXCEPTION_ACCESS_VIOLATION &&
         ep->ExceptionRecord->NumberParameters >= 2 &&
         GhLazyFault((void*)ep->ExceptionRecord->ExceptionInformation[1]))
+        return EXCEPTION_CONTINUE_EXECUTION;
+    // #202 arena view recycling, for the same reason and in the same place: a
+    // touch on a slice whose view we dropped is a memory repair, not a fault.
+    if (ep->ExceptionRecord->ExceptionCode == (DWORD)EXCEPTION_ACCESS_VIOLATION &&
+        ep->ExceptionRecord->NumberParameters >= 2 &&
+        GhArenaFault((void*)ep->ExceptionRecord->ExceptionInformation[1]))
         return EXCEPTION_CONTINUE_EXECUTION;
     // #178: end a runaway scan in newbe.DLL by taking the driver's own
     // empty-array exit. Ahead of the page-commit handler below, which would
