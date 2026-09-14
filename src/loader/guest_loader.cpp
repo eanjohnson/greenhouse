@@ -23018,6 +23018,9 @@ static uint64_t GhArenaSite()
 
 static void GhArenaLog(const std::string& msg);   // defined below
 static bool GhArenaPlaceholderApi();              // #202, defined below
+using GhUnmapViewOfFile2_t = BOOL (WINAPI*)(HANDLE, PVOID, ULONG);
+static GhUnmapViewOfFile2_t g_uv2 = nullptr;
+
 // #202. The LRU's own channel. Diag, not GhArenaLog, because GhArenaLog stops
 // at 300 lines and the eviction record is the thing a cell is scored on -- but
 // capped all the same: LocalState's quota is shared with the game's log, and a
@@ -23129,9 +23132,14 @@ static bool GhArenaInit()
          " chunk=" + Hex((uint64_t)g_arenaChunk) + " cap=" + Hex(g_arenaCap) +
          " sections=" + std::to_string(g_arenaMaps.size()) +
          " volfree=" + Hex((uint64_t)avail.QuadPart));
-    if (g_arenaLru) Diag("ARENALRU on cap=" + Hex(g_arenaCap) + " size=" + Hex(g_arenaSize) +
-                         " chunk=" + Hex((uint64_t)g_arenaChunk) +
-                         " ph-api=" + std::string(GhArenaPlaceholderApi() ? "yes" : "no"));
+    if (g_arenaLru){
+        const bool ph = GhArenaPlaceholderApi();
+        Diag("ARENALRU on cap=" + Hex(g_arenaCap) + " size=" + Hex(g_arenaSize) +
+             " chunk=" + Hex((uint64_t)g_arenaChunk) +
+             " ph-api=" + std::string(ph ? "yes" : "no") +
+             " uv2=" + std::string(g_uv2 ? "yes" : "no") +
+             (ph && g_uv2 ? "" : "  *** CANNOT EVICT -- the cell is VOID ***"));
+    }
     GhLogMemoryBudget("arena-ready");
     GhArenaRecycleProbe();
     return true;
@@ -23176,9 +23184,15 @@ static bool GhArenaPlaceholderApi()
         if (kb){
             g_va2 = (GhVirtualAlloc2_t) GetProcAddress(kb, "VirtualAlloc2");
             g_mv3 = (GhMapViewOfFile3_t)GetProcAddress(kb, "MapViewOfFile3");
+            // UnmapViewOfFile2 belongs here and not in the recycle probe that
+            // first needed it: the probe is a diagnostic and is normally off,
+            // and with it off g_uv2 stayed null -- which silently turned every
+            // eviction into a failure and made gh_arena_lru a no-op. Resolve
+            // the whole placeholder API in one place, once.
+            g_uv2 = (GhUnmapViewOfFile2_t)GetProcAddress(kb, "UnmapViewOfFile2");
         }
         Diag(std::string("ARENA placeholder api va2=") + (g_va2 ? "yes" : "no") +
-             " mv3=" + (g_mv3 ? "yes" : "no"));
+             " mv3=" + (g_mv3 ? "yes" : "no") + " uv2=" + (g_uv2 ? "yes" : "no"));
     }
     return g_va2 && g_mv3;
 }
@@ -23208,9 +23222,6 @@ static bool GhArenaPlaceholderApi()
 //
 // The probe restores the arena to exactly the state it found it in.
 // ---------------------------------------------------------------------------
-using GhUnmapViewOfFile2_t = BOOL (WINAPI*)(HANDLE, PVOID, ULONG);
-static GhUnmapViewOfFile2_t g_uv2 = nullptr;
-
 static void GhArenaRecycleProbe()
 {
     const unsigned mb = GhCfgNum(L"gh_arena_recycle_probe.txt", "GH_ARENA_RECYCLE_PROBE", 0);
@@ -23221,11 +23232,7 @@ static void GhArenaRecycleProbe()
     const SIZE_T slice  = (SIZE_T)mb << 20;
     const DWORD  access = FILE_MAP_ALL_ACCESS | (g_arenaExec ? FILE_MAP_EXECUTE : 0);
     const DWORD  prot   = g_arenaExec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
-    if (!g_uv2){
-        if (HMODULE kb = GetModuleHandleW(L"kernelbase.dll"))
-            g_uv2 = (GhUnmapViewOfFile2_t)GetProcAddress(kb, "UnmapViewOfFile2");
-    }
-    const bool ph_api = GhArenaPlaceholderApi();
+    const bool ph_api = GhArenaPlaceholderApi();   // resolves g_uv2 too
     Diag("ARENARECYCLE begin slice=" + Hex((uint64_t)slice) +
          " uv2=" + std::string(g_uv2 ? "yes" : "no") +
          " mv3=" + std::string(ph_api ? "yes" : "no"));
