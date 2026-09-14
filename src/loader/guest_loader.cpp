@@ -23741,10 +23741,37 @@ static void* GhArenaTake(SIZE_T size, void* wantAddr)
 }
 
 // caller holds g_arenaMx
+// #202. A slice the guest gave back still has its address in whatever guest
+// structure held it. When a fault lands outside every live slice we need to be
+// able to say whether the address was ONCE ours -- "the guest is writing into
+// memory it freed" and "the address was never ours" are different bugs and the
+// decline below cannot otherwise tell them apart.
+struct GhArenaGone { void* base; uint64_t size; };
+static GhArenaGone g_arenaGone[64] = {};
+static unsigned    g_arenaGoneAt   = 0;     // ring cursor; g_arenaMx held
+static void GhArenaNoteGiven(void* base, uint64_t size)
+{
+    g_arenaGone[g_arenaGoneAt & 63].base = base;
+    g_arenaGone[g_arenaGoneAt & 63].size = size;
+    ++g_arenaGoneAt;
+}
+// Caller holds g_arenaMx. Returns the released slice containing addr, or null.
+static const GhArenaGone* GhArenaWasOurs(const void* addr)
+{
+    for (unsigned i = 0; i < 64; ++i){
+        const GhArenaGone& g = g_arenaGone[i];
+        if (!g.base || !g.size) continue;
+        if ((const uint8_t*)addr >= (const uint8_t*)g.base &&
+            (const uint8_t*)addr <  (const uint8_t*)g.base + g.size) return &g;
+    }
+    return nullptr;
+}
+
 static bool GhArenaGive(void* base)
 {
     auto it = g_arenaLive.find(base);
     if (it == g_arenaLive.end()) return false;
+    GhArenaNoteGiven(base, it->second.size);
     uint64_t off = it->second.off, size = it->second.size, chunk = it->second.chunk;
     if (it->second.ph){
         // A slice is now mapped chunk by chunk, so it comes down chunk by chunk:
@@ -23842,25 +23869,69 @@ static bool GhArenaRemapChunk(void* base, GhArenaSlice& sl, size_t i)   // calle
     return false;                       // report it honestly; do not eat the fault
 }
 
+// #202. Cells R, S and U all end on ONE access violation, in one guest memcpy,
+// inside a slice this arena handed out -- which means this function was asked to
+// repair it and said no. Every branch below used to return a bare false, so the
+// run-ending fault left no trace at all and the crash reporter got the blame.
+// Name the branch. Diagnostic only: no decision here changes.
+enum GhArenaDeclineWhy {
+    kAfOff = 0, kAfOwner, kAfNoSlice, kAfRange, kAfNotPh, kAfChunkOob, kAfResident, kAfRemap, kAfN
+};
+static const char* const kGhArenaWhy[kAfN] = {
+    "arena-off", "own-thread", "no-slice", "out-of-range",
+    "not-placeholder", "chunk-oob", "resident", "remap-failed"
+};
+static volatile LONG g_arenaFaultDecl[kAfN] = {};
+// Caller holds g_arenaMx for every reason except kAfOff/kAfOwner, so the
+// released-slice lookup below is safe. Rate limited: the first four of each
+// reason carry the detail, then one in 4096, because an unrelated AV anywhere
+// in the process reaches here and lands on no-slice/out-of-range.
+static bool GhArenaDecline(int why, const void* addr, const void* base, size_t ci, bool locked)
+{
+    const LONG k = InterlockedIncrement(&g_arenaFaultDecl[why]);
+    if (k > 4 && (k % 4096) != 0) return false;
+    std::string m = std::string("fault-decline why=") + kGhArenaWhy[why] +
+                    " n=" + std::to_string((long)k) +
+                    " addr=" + Hex((uint64_t)(uintptr_t)addr);
+    if (base) m += " base=" + Hex((uint64_t)(uintptr_t)base) + " chunk=" + std::to_string((unsigned long long)ci);
+    if (locked){
+        if (const GhArenaGone* g = GhArenaWasOurs(addr))
+            m += " WAS-OURS relbase=" + Hex((uint64_t)(uintptr_t)g->base) + " relsize=" + Hex(g->size);
+    }
+    // The paradox case: we believe the chunk is mapped and the guest faulted on
+    // it anyway. What the kernel thinks is then the only thing worth having.
+    if (why == kAfResident || why == kAfNotPh){
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(addr, &mbi, sizeof mbi) == sizeof mbi)
+            m += " q.state=" + Hex((uint32_t)mbi.State) + " q.prot=" + Hex((uint32_t)mbi.Protect) +
+                 " q.type=" + Hex((uint32_t)mbi.Type) + " q.alloc=" + Hex((uint64_t)(uintptr_t)mbi.AllocationBase) +
+                 " q.size=" + Hex((uint64_t)mbi.RegionSize);
+    }
+    GhArenaLruLog(m);
+    return false;
+}
+
 static bool GhArenaFault(void* addr)
 {
     if (!g_arenaLru || !g_arenaMap || !addr) return false;
-    if (g_arenaOwner == GetCurrentThreadId()) return false;
+    if (g_arenaOwner == GetCurrentThreadId()) return GhArenaDecline(kAfOwner, addr, nullptr, 0, false);
     GhArenaLock lk;
     auto it = g_arenaLive.upper_bound(addr);
-    if (it == g_arenaLive.begin()) return false;
+    if (it == g_arenaLive.begin()) return GhArenaDecline(kAfNoSlice, addr, nullptr, 0, true);
     --it;
     GhArenaSlice& sl = it->second;
     uint8_t* b = (uint8_t*)it->first;
-    if ((uint8_t*)addr < b || (uint8_t*)addr >= b + sl.size) return false;
-    if (!sl.ph) return false;             // a plain view: not ours to repair
+    if ((uint8_t*)addr < b || (uint8_t*)addr >= b + sl.size)
+        return GhArenaDecline(kAfRange, addr, b, 0, true);
+    if (!sl.ph) return GhArenaDecline(kAfNotPh, addr, b, 0, true);   // a plain view: not ours to repair
     sl.used = 1;
     const uint64_t st = GhArenaStep(sl);
     const size_t   ci = st ? (size_t)(((uint64_t)((uint8_t*)addr - b)) / st) : 0;
-    if (ci >= sl.cmap.size()) return false;
-    if (sl.cmap[ci]) return false;        // resident and still faulting: a real fault
+    if (ci >= sl.cmap.size()) return GhArenaDecline(kAfChunkOob, addr, b, ci, true);
+    if (sl.cmap[ci]) return GhArenaDecline(kAfResident, addr, b, ci, true);
     const bool ok = (g_arenaLru >= 2) ? GhArenaRemapChunk(it->first, sl, ci)
                                       : GhArenaRemapLocked(it->first, sl);
+    if (!ok) GhArenaDecline(kAfRemap, addr, b, ci, true);
     if (ok){
         InterlockedIncrement(&g_arenaRefaults);
         if ((g_arenaRefaults & 0xFF) == 1)
