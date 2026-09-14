@@ -23002,6 +23002,15 @@ static unsigned        g_arenaLru       = 0;        // gh_arena_lru: 0 = old beh
 static unsigned      g_arenaRetryMax = 0;             // gh_arena_retry: 0 = never retry
 static volatile LONG g_arenaRetries  = 0;
 static volatile LONG g_arenaStaleCmap = 0;   // cmap said mapped, the page disagreed
+// #202 cell Y. Cell X spent all 64 retries by FRAME 3716 and the run ended at
+// FRAME 3722, six frames later. A process-lifetime budget does not bound a
+// fault LOOP -- it switches the repair off for good after 64 faults it FIXED.
+// What has to be bounded is the guest making no PROGRESS, so the budget is now
+// consecutive faults at the SAME address, and any other address resets it.
+// Cell X's address histogram says this never fires in practice: the faults
+// march forward through the decompression buffer.
+static const void* g_arenaRetryAddr = nullptr;   // guarded by g_arenaMx
+static LONG        g_arenaRetrySame = 0;         // guarded by g_arenaMx
 static DWORD volatile  g_arenaOwner     = 0;        // thread currently inside the arena lock
 static volatile LONG   g_arenaEvicts    = 0;
 static volatile LONG   g_arenaRefaults  = 0;
@@ -23915,7 +23924,7 @@ static volatile LONG g_arenaFaultDecl[kAfN] = {};
 // reason carry the detail, then one in 4096, because an unrelated AV anywhere
 // in the process reaches here and lands on no-slice/out-of-range.
 static bool GhArenaDecline(int why, const void* addr, const void* base, size_t ci, bool locked,
-                           const char* extra = nullptr)
+                           const char* extra = nullptr, bool force = false)
 {
     const LONG k = InterlockedIncrement(&g_arenaFaultDecl[why]);
     // `resident` is the branch every run has ended on, so it gets a much larger
@@ -23924,10 +23933,16 @@ static bool GhArenaDecline(int why, const void* addr, const void* base, size_t c
     // unrelated AV anywhere in the process lands on no-slice/out-of-range --
     // keep the tight one.
     const LONG lim = (why == kAfResident) ? 64 : 4;
-    if (k > lim && (k % 4096) != 0) return false;
+    // `force` is for the lines a run ENDS on. Cell W lost its fatal decline to a
+    // limit of 4 and cell X lost its fatal decline to a limit of 64; a counter
+    // can always be outrun, so the terminal branches opt out rather than bid the
+    // number up again. Still bounded -- LocalState is a ~35 MB shared quota and
+    // a full log has faked a device removal before (#187).
+    if (k > (force ? 4096 : lim) && (k % 4096) != 0) return false;
     std::string m = std::string("fault-decline why=") + kGhArenaWhy[why] +
                     " n=" + std::to_string((long)k) +
-                    " addr=" + Hex((uint64_t)(uintptr_t)addr);
+                    " addr=" + Hex((uint64_t)(uintptr_t)addr) +
+                    " tid=" + std::to_string((unsigned long)GetCurrentThreadId());
     if (base) m += " base=" + Hex((uint64_t)(uintptr_t)base) + " chunk=" + std::to_string((unsigned long long)ci);
     if (locked){
         if (const GhArenaGone* g = GhArenaWasOurs(addr))
@@ -23979,19 +23994,28 @@ static bool GhArenaFault(void* addr)
         // the truth, and that it answers in two different ways.
         const int pr = GhArenaProbeWritable(addr);
         const char* pw = pr == 1 ? " probe=writable" : (pr == 0 ? " probe=read-only" : " probe=unreadable");
+        // Progress resets the budget. Everything below runs with g_arenaMx held,
+        // so the pair needs no interlock.
+        if (addr != g_arenaRetryAddr){ g_arenaRetryAddr = addr; g_arenaRetrySame = 0; }
         std::string ex = std::string(pw) + " retries=" + std::to_string((long)g_arenaRetries) +
+                         " same=" + std::to_string((long)g_arenaRetrySame) +
                          "/" + std::to_string((unsigned long)g_arenaRetryMax);
         if (pr == 1){
             // The page takes a write right now, so the fault was transient and
-            // the repair is to re-run the instruction. Cell W: 4 for 4, and the
-            // run went 660 frames past where every previous cell ended.
-            if (g_arenaRetryMax &&
-                InterlockedIncrement(&g_arenaRetries) <= (LONG)g_arenaRetryMax){
+            // the repair is to re-run the instruction. 68 for 68 across cells W
+            // and X, and the distance gained rises monotonically with the number
+            // of retries actually spent: V 0 -> FRAME 3240, W 4 -> 3660,
+            // X 64 -> 3720, every continuous counter moving with it.
+            if (g_arenaRetryMax && ++g_arenaRetrySame <= (LONG)g_arenaRetryMax){
+                InterlockedIncrement(&g_arenaRetries);
                 GhArenaDecline(kAfResident, addr, b, ci, true, (ex + " -> RETRY").c_str());
                 return true;
             }
+            // Only reachable now if ONE address refuses to make progress, which
+            // is a real live-lock and worth ending on. Forced: this is the line
+            // the run ends on, and it must never be swallowed again.
             return GhArenaDecline(kAfResident, addr, b, ci, true,
-                                  (ex + " -> BUDGET SPENT").c_str());
+                                  (ex + " -> LIVELOCK, budget spent").c_str(), true);
         }
         // The page will not take a write, so it is NOT resident and cmap is
         // stale -- cell W ended on exactly this, a preserved placeholder
@@ -24000,7 +24024,7 @@ static bool GhArenaFault(void* addr)
         // and fall through to the remap that should have run in the first place.
         sl.cmap[ci] = 0;
         InterlockedIncrement(&g_arenaStaleCmap);
-        GhArenaDecline(kAfResident, addr, b, ci, true, (ex + " -> STALE cmap, REMAP").c_str());
+        GhArenaDecline(kAfResident, addr, b, ci, true, (ex + " -> STALE cmap, REMAP").c_str(), true);
     }
     const bool ok = (g_arenaLru >= 2) ? GhArenaRemapChunk(it->first, sl, ci)
                                       : GhArenaRemapLocked(it->first, sl);
