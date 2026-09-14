@@ -507,10 +507,25 @@ static LONG CALLBACK gh_veh(EXCEPTION_POINTERS* ep) {
                     (unsigned long long)c->Rcx,(unsigned long long)c->Rdx,(unsigned long long)c->R8,
                     (unsigned long long)c->R9,(unsigned long long)c->Rax,(unsigned long long)c->Rsp);
             // Poor-man's backtrace: scan the stack for values that land in a module.
+            // #202 cell L. The __try below is NOT a bound. A first-chance AV raised
+            // inside a VEH is dispatched through the WHOLE VEH chain again before any
+            // SEH unwind reaches our __except -- and the loader's own crash observer is
+            // in that chain and calls Bed_exit for the guest worker. So one qword read
+            // past StackBase here does not cost a frame, it ends the run. Cell L died
+            // exactly this way at t=240 s: Rsp=0xC9D35FFED0 sat 0x130 bytes below a
+            // StackBase of 0xC9D3600000, the scan asked for sp[38], and the process was
+            // gone. The window is the faulting thread's own TEB -- correct here because
+            // a VEH always runs on the thread that faulted.
+            const NT_TIB* gh_tib = (const NT_TIB*)NtCurrentTeb();
+            const uintptr_t gh_slo = (uintptr_t)gh_tib->StackLimit;
+            const uintptr_t gh_shi = (uintptr_t)gh_tib->StackBase;
             uintptr_t* sp = (uintptr_t*)c->Rsp;
             int shown = 0;
             for (int i = 0; i < 64 && shown < 8; ++i) {
                 void* v = nullptr;
+                const uintptr_t at = (uintptr_t)(sp + i);
+                if (!gh_slo || !gh_shi || at < gh_slo ||
+                    at + sizeof(uintptr_t) > gh_shi || at + sizeof(uintptr_t) < at) break;
                 __try { v = (void*)sp[i]; } __except (EXCEPTION_EXECUTE_HANDLER) { break; }
                 if (gh_is_code_addr(v)) {
                     char s2[256]; gh_addr2sym(v, s2, sizeof(s2));

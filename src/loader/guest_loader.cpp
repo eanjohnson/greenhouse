@@ -850,11 +850,67 @@ static void VfsTrace(const char* api, const wchar_t* g, const std::wstring& r){
 }
 
 static std::wstring RedirectDriveRootSave(const std::wstring& raw); // defined with the file hooks
+
+// ---------------------------------------------------------------------------
+// #202/#204: the katana spinner is Tsushima's PSO-cache warm pass, and the pass
+// does not fit. `default.pso` is a loose 3,303,180-byte file in the game folder
+// holding 16,192 pipelines; the game reads it and creates every one of them
+// up front. At the 41.33 KiB of commit each that #200 measured, that is ~651 MiB
+// of pipelines that must all be live at once, and the run reaches the 5 GB
+// container ceiling before the pass ends.
+//
+// The engine already ships the answer: `user.pso` is absent on a fresh install
+// and the game says so and carries on --
+//     [Render] PSO cache file \user.pso not found, no pipelines read.
+// -- compiling pipelines lazily as the renderer actually asks for them. A
+// missing cache is a first-class supported state of this engine, not a
+// degraded one, and it costs nothing visually: it changes WHEN shaders compile,
+// not what anything looks like.
+//
+// So hide the file rather than touch it. The game opens it through our own VFS
+// (`VFS CreateFileW default.pso -> D:\DevelopmentFiles\gh_games\app_2215430\
+// default.pso`), so failing that one open with ERROR_FILE_NOT_FOUND is entirely
+// loader-side: the retail install is not modified, nothing is deleted, and
+// flipping the knob back restores the warm pass exactly.
+//
+//   gh_pso_cache_hide = 0  off (default) -- the warm pass runs
+//                       1  hide default.pso
+//                       2  hide every *.pso the guest opens for reading
+//
+// Write opens are never hidden, so the game can still SAVE user.pso on exit.
+// ---------------------------------------------------------------------------
+static unsigned GhPsoCacheHide()
+{ static const unsigned v = GhCfgNumZ(L"gh_pso_cache_hide.txt", "GH_PSO_CACHE_HIDE", 0); return v; }
+
+static bool GhHidePsoCache(const std::wstring& real, DWORD acc)
+{
+    const unsigned mode = GhPsoCacheHide();
+    if (!mode) return false;
+    if (acc & (GENERIC_WRITE | FILE_APPEND_DATA)) return false;   // leave the save path alone
+    const size_t cut  = real.find_last_of(L"\\/");
+    const std::wstring leaf = real.substr(cut == std::wstring::npos ? 0 : cut + 1);
+    if (leaf.size() < 4) return false;
+    if (_wcsicmp(leaf.c_str() + leaf.size() - 4, L".pso") != 0) return false;
+    if (mode == 1 && _wcsicmp(leaf.c_str(), L"default.pso") != 0) return false;
+    static volatile LONG n = 0;
+    const LONG k = InterlockedIncrement(&n);
+    if (k <= 8)
+        Diag("PSOCACHEHIDE n=" + std::to_string((long)k) + " mode=" + std::to_string(mode) +
+             " refusing " + std::string(real.begin(), real.end()) +
+             " -- the game will report it missing and compile lazily");
+    return true;
+}
+
 static HANDLE WINAPI Bed_CreateFileW(LPCWSTR name, DWORD acc, DWORD share, LPSECURITY_ATTRIBUTES sa,
                                      DWORD disp, DWORD flags, HANDLE tmpl){
     std::wstring mapped = name ? RedirectDriveRootSave(name) : L"";
     const wchar_t* use = mapped.empty() ? name : mapped.c_str();
     std::wstring real = MapToReal(use);
+    if (GhHidePsoCache(real, acc)){
+        VfsTrace("CreateFileW[HIDDEN]", name, real);
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
     if (disp==CREATE_ALWAYS||disp==CREATE_NEW||disp==OPEN_ALWAYS) EnsureParentOf(real);
     HANDLE h = CreateFileW(real.c_str(), acc, share, sa, disp, flags, tmpl);
     VfsTrace("CreateFileW", name, real);
@@ -888,6 +944,11 @@ static HANDLE WINAPI Bed_CreateFileA(LPCSTR name, DWORD acc, DWORD share, LPSECU
 }
 static HANDLE WINAPI Bed_CreateFile2(LPCWSTR name, DWORD acc, DWORD share, DWORD disp, LPCREATEFILE2_EXTENDED_PARAMETERS params){
     std::wstring real = MapToReal(name);
+    if (GhHidePsoCache(real, acc)){
+        VfsTrace("CreateFile2[HIDDEN]", name, real);
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
     if (disp==CREATE_ALWAYS||disp==CREATE_NEW||disp==OPEN_ALWAYS) EnsureParentOf(real);
     HANDLE h = CreateFile2(real.c_str(), acc, share, disp, params);
     VfsTrace("CreateFile2", name, real);
@@ -1323,7 +1384,11 @@ static BOOL WINAPI Bed_ReplaceFileW(LPCWSTR replaced, LPCWSTR replacement, LPCWS
     if (replaced){ std::wstring g(replaced); Diag("ReplaceFileW " + std::string(g.begin(),g.end()) + (r?" ok":(" err="+Hex(GetLastError())))); }
     return r; }
 static DWORD WINAPI Bed_GetFileAttributesW(LPCWSTR path){
-    std::wstring real = MapToReal(path); DWORD a = GetFileAttributesW(real.c_str());
+    std::wstring real = MapToReal(path);
+    // A probe must agree with the open, or the game sees the file exist and then
+    // fail to open, which is a different (and usually fatal) path from "absent".
+    if (GhHidePsoCache(real, 0)){ SetLastError(ERROR_FILE_NOT_FOUND); return INVALID_FILE_ATTRIBUTES; }
+    DWORD a = GetFileAttributesW(real.c_str());
     if (path && GhVfsTraceOn()){ std::wstring g(path); Diag("GetFileAttributesW " + std::string(g.begin(),g.end()) + (a==INVALID_FILE_ATTRIBUTES?" MISSING":" ok")); }
     return a; }
 static BOOL WINAPI Bed_SetFileAttributesW(LPCWSTR path, DWORD a){ return SetFileAttributesW(MapToReal(path).c_str(), a); }
@@ -1339,6 +1404,13 @@ static std::wstring MapFindPattern(LPCWSTR pattern){
     std::wstring pat = (s==std::wstring::npos)? p : p.substr(s+1);
     return MapToReal(dir.c_str()) + L"\\" + pat;
 }
+// gh_pso_cache_hide deliberately does NOT filter the Find family. FindNextFileW
+// and FindClose pass straight through to the real kernel32 (see the comment on
+// the handle below), so hiding a name here would have to be done in a bed we do
+// not own, and a first-result-only filter would be a half-hide -- worse than
+// none. It costs nothing in practice: the VFS trace shows Tsushima opens
+// `default.pso` by name (`VFS CreateFileW default.pso -> ...`), it never
+// enumerates the game folder looking for it.
 static HANDLE WINAPI Bed_FindFirstFileW(LPCWSTR pattern, LPWIN32_FIND_DATAW fd){
     std::wstring realPat = MapFindPattern(pattern);
     HANDLE h = FindFirstFileW(realPat.c_str(), fd);           // returns filenames only; no translation needed
@@ -10444,7 +10516,22 @@ static LONG64 GhNowUs()
     static LARGE_INTEGER freq = []{ LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f; }();
     LARGE_INTEGER c{};
     if (!freq.QuadPart || !QueryPerformanceCounter(&c)) return 0;
-    return (LONG64)((c.QuadPart * 1000000ll) / freq.QuadPart);
+    // #202. `c.QuadPart * 1000000` overflows int64 once the counter passes
+    // 9.22e12, which at a 10 MHz QPC is 10.7 days of uptime -- the timing would
+    // silently go negative and stay there. Split the divide so the product can
+    // never exceed 1e6 * freq.
+    return (LONG64)((c.QuadPart / freq.QuadPart) * 1000000ll
+                  + ((c.QuadPart % freq.QuadPart) * 1000000ll) / freq.QuadPart);
+}
+
+// #202. GhNowUs returns 0 when QueryPerformanceCounter fails, and a caller that
+// subtracts that from a real timestamp accumulates MINUS THE UPTIME. One such
+// sample took cell G's psoDrvMs to -70,843,961 ms -- 20.5 hours of negative
+// driver time, from a counter that was otherwise reading correctly. A delta is
+// only meaningful when both endpoints are; anything else contributes nothing.
+static inline LONG64 GhDeltaUs(LONG64 later, LONG64 earlier)
+{
+    return (later > 0 && earlier > 0 && later >= earlier) ? (later - earlier) : 0;
 }
 
 static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
@@ -10854,10 +10941,10 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
             ctx.hr = GhTryCreateGPS(orig, self, use, riid, pp, &fault);
         hr = ctx.hr;
     }
-    const LONG64 drvUs = tDrv0 ? (GhNowUs() - tDrv0) : 0;
+    const LONG64 drvUs = GhDeltaUs(GhNowUs(), tDrv0);
     if (tEnter){
         InterlockedExchangeAdd64(&g_psoDrvUs, drvUs);
-        InterlockedExchangeAdd64(&g_psoPreUs, tDrv0 - tEnter);
+        InterlockedExchangeAdd64(&g_psoPreUs, GhDeltaUs(tDrv0, tEnter));
         InterlockedIncrement(&g_psoCalls);
     }
     --depth;
@@ -11151,10 +11238,10 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
             ctx.hr = GhCallCpsGuarded(ctx.fn, self, d, riid, pp, &cpsFault);
         hr = ctx.hr;
     }
-    const LONG64 drvUs = tDrv0 ? (GhNowUs() - tDrv0) : 0;
+    const LONG64 drvUs = GhDeltaUs(GhNowUs(), tDrv0);
     if (tEnter){
         InterlockedExchangeAdd64(&g_psoDrvUs, drvUs);
-        InterlockedExchangeAdd64(&g_psoPreUs, tDrv0 - tEnter);
+        InterlockedExchangeAdd64(&g_psoPreUs, GhDeltaUs(tDrv0, tEnter));
         InterlockedIncrement(&g_psoCalls);
     }
     if (serialize) ReleaseSRWLockExclusive(&g_psoLock);
@@ -11358,6 +11445,21 @@ static HRESULT __stdcall Hook_D12CheckFeature(ID3D12Device* self, D3D12_FEATURE 
                     (fakedSm ? " FAKED real=" + Hex(realSm) : std::string());
         else if (f == D3D12_FEATURE_FEATURE_LEVELS && sz >= sizeof(D3D12_FEATURE_DATA_FEATURE_LEVELS))
             extra = " maxFL=" + Hex((uint32_t)((D3D12_FEATURE_DATA_FEATURE_LEVELS*)data)->MaxSupportedFeatureLevel);
+        // #202. Tsushima calls OpenExistingHeapFromAddress 11.5 times EVERY FRAME
+        // for the whole run -- ~2.4 million calls in A202 -- and every single one
+        // returns E_INVALIDARG, for memory that VirtualQuery says is MEM_PRIVATE,
+        // MEM_COMMIT, PAGE_READWRITE, 64 KB, at its own allocation base. That is
+        // precisely what the API documents as eligible, so the refusal is not
+        // about the pages. The game asks EXISTING_HEAPS exactly once and then
+        // trusts the answer forever, which makes the ANSWER the whole question --
+        // and we have only ever logged the HRESULT of the query, never the BOOL it
+        // wrote. Without this line "gh_no_uma bit 2 changed nothing" is
+        // uninterpretable: it cannot be told apart from "the console already said
+        // FALSE and the engine asked anyway". Report what the driver said, before
+        // any forcing below rewrites it.
+        else if (f == D3D12_FEATURE_EXISTING_HEAPS && sz >= sizeof(D3D12_FEATURE_DATA_EXISTING_HEAPS))
+            extra = " existingheaps=" +
+                    std::to_string((int)((D3D12_FEATURE_DATA_EXISTING_HEAPS*)data)->Supported);
         // #158 format landmine. The guest asks FORMAT_SUPPORT exactly twice in a whole
         // run and neither the format nor the answer has ever been in a log. The
         // depth-downsample chain that hangs writes R11G11B10_FLOAT (fmt 26) targets
@@ -19117,6 +19219,12 @@ static HRESULT __stdcall Hook_D12OpenHeapAddr(ID3D12Device* self, const void* ad
     }
     std::string ln = "D3D12 OpenExistingHeapFromAddress addr=" + Hex((uint64_t)(uintptr_t)addr) +
                      " hr=" + Hex((uint32_t)hr);
+    // #202. Which guest code is doing this 11.5 times a frame? A static scan for
+    // `call qword ptr [reg+0x180]` cannot answer it -- 130 of them match in this
+    // EXE and one is inside the fence wait at 0x4f9cf5, because +0x180 is just a
+    // vtable slot on some object. The caller's return address names the site
+    // exactly and costs one instruction.
+    ln += " from=" + NameForCodeAddr((uintptr_t)_ReturnAddress());
     // #158: this fails E_INVALIDARG every time, and it is not a side show. The
     // game's own log says "Is UMA: Yes" then "Using Cpu Buffer Optimize: Yes" --
     // it wraps its own CPU allocations as GPU heaps, and each refusal leaves it a
@@ -26713,6 +26821,24 @@ static void GhLivenessSample()
 //                    "never signalled" into a statement instead of a guess.
 typedef LONG (NTAPI *PFN_NtQueryObject)(HANDLE, int, PVOID, ULONG, PULONG);
 
+// #202. WaitForSingleObject(h, 0) is NOT a read-only probe. On an unowned
+// mutant it ACQUIRES ownership and never gives it back; on an auto-reset event
+// it CONSUMES the signal; on a semaphore it decrements the count; on a
+// synchronization timer it swallows the tick. The handle series below repeats
+// every three seconds for as long as gh_handles.txt is non-empty, so a single
+// mis-typed handle would not just perturb the guest, it would wedge it -- into
+// exactly the symptom (a thread waiting on something that never arrives) that
+// this instrument exists to explain. So: ask each object for its own state,
+// and keep the wait only for handle types that latch.
+typedef LONG (NTAPI *PFN_NtQueryEvent)(HANDLE, int, PVOID, ULONG, PULONG);
+typedef LONG (NTAPI *PFN_NtQuerySemaphore)(HANDLE, int, PVOID, ULONG, PULONG);
+typedef LONG (NTAPI *PFN_NtQueryMutant)(HANDLE, int, PVOID, ULONG, PULONG);
+typedef LONG (NTAPI *PFN_NtQueryTimer)(HANDLE, int, PVOID, ULONG, PULONG);
+struct GhEventBasicInfo     { LONG  Type; LONG  State; };        // Type 1 = auto-reset
+struct GhSemaphoreBasicInfo { ULONG CurrentCount; ULONG MaximumCount; };
+struct GhMutantBasicInfo    { LONG  CurrentCount; BOOLEAN OwnedByCaller; BOOLEAN AbandonedState; };
+struct GhTimerBasicInfo     { LARGE_INTEGER RemainingTime; BOOLEAN TimerState; };
+
 static void GhPollHandleRequest()
 {
     std::vector<uint8_t> ob;
@@ -26722,6 +26848,11 @@ static void GhPollHandleRequest()
 
     static PFN_NtQueryObject pQuery = (PFN_NtQueryObject)
         GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject");
+    static HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    static PFN_NtQueryEvent     pQEvent  = (PFN_NtQueryEvent)    GetProcAddress(ntdll, "NtQueryEvent");
+    static PFN_NtQuerySemaphore pQSem    = (PFN_NtQuerySemaphore)GetProcAddress(ntdll, "NtQuerySemaphore");
+    static PFN_NtQueryMutant    pQMutant = (PFN_NtQueryMutant)   GetProcAddress(ntdll, "NtQueryMutant");
+    static PFN_NtQueryTimer     pQTimer  = (PFN_NtQueryTimer)    GetProcAddress(ntdll, "NtQueryTimer");
 
     size_t pos = 0;
     while (pos <= text.size()){
@@ -26744,6 +26875,7 @@ static void GhPollHandleRequest()
         // ObjectTypeInformation = 2, ObjectNameInformation = 1. The buffer holds
         // a UNICODE_STRING followed by its characters; 2 KB is more than any
         // object name this process owns and keeps the whole thing on the stack.
+        std::string typeName;
         if (pQuery){
             for (int which = 0; which < 2; ++which){
                 alignas(16) uint8_t buf[2048] = {0};
@@ -26756,15 +26888,57 @@ static void GhPollHandleRequest()
                     for (USHORT i = 0; i < len / 2 && i < 240; ++i)
                         v += (w[i] >= 32 && w[i] < 127) ? (char)w[i] : '?';
                 }
+                if (which == 0) typeName = v;
                 out += (which == 0 ? " type=" : " name=") + (v.empty() ? "-" : v);
             }
         }
 
-        DWORD wr = WaitForSingleObject(h, 0);
-        out += " state=" + std::string(wr == WAIT_OBJECT_0 ? "SIGNALED"
-                                     : wr == WAIT_TIMEOUT  ? "waiting"
-                                     : wr == WAIT_ABANDONED ? "abandoned" : "err")
-             + " wr=" + Hex((uint32_t)wr);
+        // Read the state out of the object. Each of these four is a pure query:
+        // it reports the signal without taking it.
+        ULONG need = 0;
+        LONG  st   = -1;
+        if (typeName == "Event" && pQEvent){
+            GhEventBasicInfo bi{};
+            st = pQEvent(h, 0 /*EventBasicInformation*/, &bi, (ULONG)sizeof(bi), &need);
+            if (st >= 0)
+                out += std::string(" kind=") + (bi.Type == 1 ? "auto" : "manual")
+                     + " state=" + (bi.State ? "SIGNALED" : "waiting");
+        } else if (typeName == "Semaphore" && pQSem){
+            GhSemaphoreBasicInfo bi{};
+            st = pQSem(h, 0 /*SemaphoreBasicInformation*/, &bi, (ULONG)sizeof(bi), &need);
+            if (st >= 0)
+                out += " count=" + std::to_string(bi.CurrentCount) + "/"
+                     + std::to_string(bi.MaximumCount)
+                     + " state=" + (bi.CurrentCount ? "SIGNALED" : "waiting");
+        } else if (typeName == "Mutant" && pQMutant){
+            GhMutantBasicInfo bi{};
+            st = pQMutant(h, 0 /*MutantBasicInformation*/, &bi, (ULONG)sizeof(bi), &need);
+            if (st >= 0)
+                out += std::string(" owned=")
+                     + (bi.OwnedByCaller ? "self" : (bi.CurrentCount > 0 ? "no" : "other"))
+                     + (bi.AbandonedState ? " abandoned" : "")
+                     + " state=" + (bi.CurrentCount > 0 ? "SIGNALED" : "waiting");
+        } else if (typeName == "Timer" && pQTimer){
+            GhTimerBasicInfo bi{};
+            st = pQTimer(h, 0 /*TimerBasicInformation*/, &bi, (ULONG)sizeof(bi), &need);
+            if (st >= 0)
+                out += " remain=" + Hex((uint64_t)bi.RemainingTime.QuadPart)
+                     + " state=" + (bi.TimerState ? "SIGNALED" : "waiting");
+        } else if (typeName == "Thread" || typeName == "Process" || typeName == "Job"){
+            // These three latch: once signalled they stay signalled, and a
+            // zero-timeout wait takes nothing away from anyone.
+            DWORD wr = WaitForSingleObject(h, 0);
+            st = 0;
+            out += " state=" + std::string(wr == WAIT_OBJECT_0 ? "SIGNALED"
+                                         : wr == WAIT_TIMEOUT  ? "waiting" : "err")
+                 + " wr=" + Hex((uint32_t)wr);
+        } else {
+            // Unknown or unqueryable type. type= and name= above are already
+            // most of the answer; guessing here is how you deadlock the guest.
+            out += " state=not-probed (no side-effect-free query for this type)";
+            st = 0;
+        }
+        if (st < 0) out += " state=query-failed st=" + Hex((uint32_t)st);
         Diag(out);
     }
 }
