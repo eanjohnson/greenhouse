@@ -23239,7 +23239,17 @@ static bool GhArenaInit()
              " uv2=" + std::string(g_uv2 ? "yes" : "no") +
              (ph && g_uv2 ? "" : "  *** CANNOT EVICT -- the cell is VOID ***"));
     }
-    if (g_arenaLru >= 2){
+    // #202 cell AA. This gate used to be `>= 2`, which made the ballast DEAD CODE on the
+    // path we actually run. Cell Z added the drop-the-ballast fallback to
+    // GhArenaRemapLocked and it never fired once (`ballast=0`) -- not because spending the
+    // reserve does not help, but because under gh_arena_lru=1 the reserve was never
+    // ALLOCATED: g_arenaBallastSize stayed 0 and GhArenaBallastTake() was never called, so
+    // GhArenaBallastDrop() was right to refuse. The run-ender is err=1455
+    // ERROR_COMMITMENT_LIMIT on a refault's remap, which is precisely the moment a reserve
+    // exists for. Allocate it at >= 1 so the fallback shipped in 0.0.477.0 can reach it.
+    // NOT a route into gh_arena_lru >= 2 -- the chunked evictor below stays gated, cell T
+    // is a proven regression and stays retired.
+    if (g_arenaLru >= 1){
         g_arenaBallastSize = (uint64_t)GhCfgNum(L"gh_arena_ballast_mb.txt", "GH_ARENA_BALLAST_MB", 64) << 20;
         GhArenaBallastTake();
         Diag("ARENALRU v" + std::to_string(g_arenaLru) +
@@ -23755,7 +23765,7 @@ static void* GhArenaTake(SIZE_T size, void* wantAddr)
         g_arenaHanded += need;
         // If a refault had to spend the ballast, this is the first moment it
         // might be affordable again. Best effort; failing costs nothing.
-        if (g_arenaLru >= 2) GhArenaBallastTake();
+        if (g_arenaLru >= 1) GhArenaBallastTake();
         return v;
     }
     return nullptr;
@@ -23827,7 +23837,7 @@ static bool GhArenaGive(void* base)
         }
     }
     g_arenaFree[off] = size;
-    if (g_arenaLru >= 2) GhArenaBallastTake();   // budget just came back: re-arm the reserve
+    if (g_arenaLru >= 1) GhArenaBallastTake();   // budget just came back: re-arm the reserve
     return true;
 }
 
