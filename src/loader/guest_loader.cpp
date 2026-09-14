@@ -22989,6 +22989,7 @@ static uint64_t GhArenaSite()
 { static const uint64_t v = (uint64_t)GhCfgNumZ(L"gh_arena_site.txt", "GH_ARENA_SITE", 0); return v; }
 
 static void GhArenaLog(const std::string& msg);   // defined below
+static void GhArenaRecycleProbe();                 // #202, defined below
 
 // caller holds g_arenaMx
 static bool GhArenaInit()
@@ -23081,6 +23082,7 @@ static bool GhArenaInit()
          " sections=" + std::to_string(g_arenaMaps.size()) +
          " volfree=" + Hex((uint64_t)avail.QuadPart));
     GhLogMemoryBudget("arena-ready");
+    GhArenaRecycleProbe();
     return true;
 }
 
@@ -23128,6 +23130,137 @@ static bool GhArenaPlaceholderApi()
              " mv3=" + (g_mv3 ? "yes" : "no"));
     }
     return g_va2 && g_mv3;
+}
+
+// ---------------------------------------------------------------------------
+// #202 -- is the view budget reclaimable? (gh_arena_recycle_probe.txt = slice MiB)
+//
+// 32.24 named view recycling as the fix route for the ~470 MiB that the guest's
+// one dense call site (GUEST+0x4EEDD2) asks for and is refused three times a
+// run.  The whole route rests on an assumption nobody has tested: that the
+// per-process view budget -- ~996 MiB, refused with ERROR_COMMITMENT_LIMIT
+// (0x5AF) in cells K, M and O alike -- is RETURNED when a view is unmapped.
+// The arena is file-backed, so it is not obvious the charge behaves like commit
+// in both directions, and a charge that only ever climbs would make an LRU
+// worthless.  Answering that after writing the pager surgery is the expensive
+// order; answer it here instead, before the guest exists, with nothing of the
+// game's at stake.
+//
+// Two forms, because they are not the same question:
+//   (a) plain UnmapViewOfFile -- does the budget come back at all?
+//   (b) UnmapViewOfFile2(MEM_PRESERVE_PLACEHOLDER) + MapViewOfFile3(
+//       MEM_REPLACE_PLACEHOLDER) -- does it come back while the VA stays
+//       RESERVED?  Only (b) is usable as a fix: the guest holds raw pointers
+//       into these slices, so a recycled slice has to keep its address and
+//       fault its bytes back.  (b) also checks that the bytes survive the round
+//       trip, since a recycle that loses guest data is not a recycle.
+//
+// The probe restores the arena to exactly the state it found it in.
+// ---------------------------------------------------------------------------
+using GhUnmapViewOfFile2_t = BOOL (WINAPI*)(HANDLE, PVOID, ULONG);
+static GhUnmapViewOfFile2_t g_uv2 = nullptr;
+
+static void GhArenaRecycleProbe()
+{
+    const unsigned mb = GhCfgNum(L"gh_arena_recycle_probe.txt", "GH_ARENA_RECYCLE_PROBE", 0);
+    if (!mb) return;
+    HANDLE sect = g_arenaMaps.empty() ? g_arenaMap : g_arenaMaps[0];
+    if (!sect || !g_arenaSize) return;
+
+    const SIZE_T slice  = (SIZE_T)mb << 20;
+    const DWORD  access = FILE_MAP_ALL_ACCESS | (g_arenaExec ? FILE_MAP_EXECUTE : 0);
+    const DWORD  prot   = g_arenaExec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
+    if (!g_uv2){
+        if (HMODULE kb = GetModuleHandleW(L"kernelbase.dll"))
+            g_uv2 = (GhUnmapViewOfFile2_t)GetProcAddress(kb, "UnmapViewOfFile2");
+    }
+    const bool ph_api = GhArenaPlaceholderApi();
+    Diag("ARENARECYCLE begin slice=" + Hex((uint64_t)slice) +
+         " uv2=" + std::string(g_uv2 ? "yes" : "no") +
+         " mv3=" + std::string(ph_api ? "yes" : "no"));
+
+    // -- phase 1: fill to the ceiling, so every later map is competing for a
+    //    budget we know is exhausted.  Without this the probe proves nothing:
+    //    a map that succeeds with room to spare says nothing about reclaim.
+    std::vector<void*> got;
+    uint64_t off = 0;
+    DWORD    err = 0;
+    while (off + slice <= g_arenaSize){
+        void* v = MapViewOfFile(sect, access, (DWORD)(off >> 32), (DWORD)(off & 0xFFFFFFFF), slice);
+        if (!v){ err = GetLastError(); break; }
+        got.push_back(v);
+        off += slice;
+    }
+    Diag("ARENARECYCLE ceiling views=" + std::to_string(got.size()) +
+         " bytes=" + Hex((uint64_t)got.size() * slice) + " refused err=" + Hex(err));
+    if (got.empty() || !err){
+        // No refusal means we never reached the ceiling -- the probe is void,
+        // not a negative.  (A 2 GiB arena of 64 MiB slices cannot exhaust a
+        // budget bigger than itself.)
+        Diag("ARENARECYCLE void: never reached the ceiling");
+        for (void* v : got) UnmapViewOfFile(v);
+        return;
+    }
+
+    // -- phase 2 (a): drop some views, ask for the same file bytes back.
+    const size_t drop = got.size() < 4 ? 1 : 4;
+    for (size_t i = 0; i < drop; ++i){ UnmapViewOfFile(got[i]); got[i] = nullptr; }
+    size_t regained = 0;
+    for (size_t i = 0; i < drop; ++i){
+        const uint64_t o = (uint64_t)i * slice;
+        void* v = MapViewOfFile(sect, access, (DWORD)(o >> 32), (DWORD)(o & 0xFFFFFFFF), slice);
+        if (!v){ Diag("ARENARECYCLE remap-plain i=" + std::to_string(i) +
+                      " failed err=" + Hex(GetLastError())); break; }
+        got[i] = v; ++regained;
+    }
+    Diag("ARENARECYCLE plain dropped=" + std::to_string(drop) +
+         " regained=" + std::to_string(regained) + " VERDICT=" +
+         (regained == drop ? "budget-returns-on-unmap" : "budget-does-NOT-return"));
+
+    // -- phase 3 (b): the form a recycle actually needs -- view gone, VA kept.
+    if (g_uv2 && ph_api){
+        if (got[0]){ UnmapViewOfFile(got[0]); got[0] = nullptr; }   // make room
+        uint8_t* ph = (uint8_t*)g_va2(GetCurrentProcess(), nullptr, slice,
+                                      MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                                      PAGE_NOACCESS, nullptr, 0);
+        if (!ph){
+            Diag("ARENARECYCLE placeholder reserve failed err=" + Hex(GetLastError()));
+        } else if (!g_mv3(sect, GetCurrentProcess(), ph, 0, slice,
+                          MEM_REPLACE_PLACEHOLDER, prot, nullptr, 0)){
+            Diag("ARENARECYCLE ph-map failed err=" + Hex(GetLastError()));
+            VirtualFree(ph, 0, MEM_RELEASE);
+        } else {
+            *(volatile uint32_t*)ph = 0xA5A5A5A5u;      // sentinel: must survive
+            const BOOL u = g_uv2(GetCurrentProcess(), ph, MEM_PRESERVE_PLACEHOLDER);
+            Diag(std::string("ARENARECYCLE ph-unmap preserve ") +
+                 (u ? "ok" : "failed err=" + Hex(GetLastError())));
+            // Budget test: with that view gone, will the section serve another?
+            void* spare = MapViewOfFile(sect, access, 0, 0, slice);
+            Diag(std::string("ARENARECYCLE ph-budget ") +
+                 (spare ? "RETURNED lru-viable" : "NOT-returned err=" + Hex(GetLastError())));
+            if (spare) UnmapViewOfFile(spare);
+            // Fault test: same VA back, same bytes?
+            void* m2 = g_mv3(sect, GetCurrentProcess(), ph, 0, slice,
+                             MEM_REPLACE_PLACEHOLDER, prot, nullptr, 0);
+            if (!m2){
+                Diag("ARENARECYCLE ph-remap failed err=" + Hex(GetLastError()));
+                VirtualFree(ph, 0, MEM_RELEASE);
+            } else {
+                const uint32_t back = *(volatile uint32_t*)ph;
+                Diag("ARENARECYCLE ph-remap ok same-va=" +
+                     std::string(m2 == ph ? "yes" : "no") + " sentinel=" + Hex((uint64_t)back) +
+                     " bytes=" + std::string(back == 0xA5A5A5A5u ? "survived" : "LOST"));
+                *(volatile uint32_t*)ph = 0;            // leave the file as we found it
+                g_uv2(GetCurrentProcess(), ph, 0);
+            }
+        }
+    } else {
+        Diag("ARENARECYCLE ph-skip: placeholder unmap api unavailable");
+    }
+
+    for (void* v : got) if (v) UnmapViewOfFile(v);
+    GhLogMemoryBudget("arena-recycle-probe");
+    Diag("ARENARECYCLE end");
 }
 
 // caller holds g_arenaMx. Returns the base of a contiguous run of `need` bytes
