@@ -22993,6 +22993,14 @@ static uint64_t                         g_arenaCap   = 0;   // ceiling on bytes 
 // once -- which is the whole of #202, because the one caller that oversubscribes
 // it asks for 470 MiB, is refused, and asks again later.
 static unsigned        g_arenaLru       = 0;        // gh_arena_lru: 0 = old behaviour
+// #202 cell W. The resident paradox: our cmap says the chunk is mapped,
+// VirtualQuery says MEM_COMMIT | PAGE_READWRITE | MEM_MAPPED, and the guest
+// still took a WRITE access violation on the page. When the page itself says
+// it will take a write, the only honest reading is that the fault was
+// transient, and the repair is to re-run the instruction. Bounded, because a
+// retry that does not help is an infinite fault loop.
+static unsigned      g_arenaRetryMax = 0;             // gh_arena_retry: 0 = never retry
+static volatile LONG g_arenaRetries  = 0;
 static DWORD volatile  g_arenaOwner     = 0;        // thread currently inside the arena lock
 static volatile LONG   g_arenaEvicts    = 0;
 static volatile LONG   g_arenaRefaults  = 0;
@@ -23138,6 +23146,8 @@ static bool GhArenaInit()
     // ceiling on how much it may hold mapped at once; the real limit on handed
     // bytes is the arena FILE, which g_arenaFree already enforces.
     g_arenaLru = GhCfgNum(L"gh_arena_lru.txt", "GH_ARENA_LRU", 0);
+    // GhCfgNumZ, not GhCfgNum: the default is nonzero, so 0 has to be sayable.
+    g_arenaRetryMax = GhCfgNumZ(L"gh_arena_retry.txt", "GH_ARENA_RETRY", 64);
 
     const wchar_t* dir = L"D:\\DevelopmentFiles\\";
     ULARGE_INTEGER avail{}, tot{}, freeb{};
@@ -23874,6 +23884,23 @@ static bool GhArenaRemapChunk(void* base, GhArenaSlice& sl, size_t i)   // calle
 // repair it and said no. Every branch below used to return a bare false, so the
 // run-ending fault left no trace at all and the crash reporter got the blame.
 // Name the branch. Diagnostic only: no decision here changes.
+// Ask the page, not our bookkeeping. Kept free of C++ objects so the __try is
+// legal under /EHsc. The write puts back the byte it just read, so a page that
+// takes it is unchanged. Runs inside the VEH with g_arenaMx held: a fault in
+// here re-enters GhArenaFault on this same thread, which short-circuits at
+// kAfOwner because GhArenaLock has already published g_arenaOwner.
+//   1 = took a write   0 = read, refused the write   -1 = refused the read
+static int GhArenaProbeWritable(void* addr)
+{
+    volatile unsigned char* p = (volatile unsigned char*)addr;
+    unsigned char v = 0;
+    __try { v = *p; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    __try { *p = v; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return 1;
+}
+
 enum GhArenaDeclineWhy {
     kAfOff = 0, kAfOwner, kAfNoSlice, kAfRange, kAfNotPh, kAfChunkOob, kAfResident, kAfRemap, kAfN
 };
@@ -23886,7 +23913,8 @@ static volatile LONG g_arenaFaultDecl[kAfN] = {};
 // released-slice lookup below is safe. Rate limited: the first four of each
 // reason carry the detail, then one in 4096, because an unrelated AV anywhere
 // in the process reaches here and lands on no-slice/out-of-range.
-static bool GhArenaDecline(int why, const void* addr, const void* base, size_t ci, bool locked)
+static bool GhArenaDecline(int why, const void* addr, const void* base, size_t ci, bool locked,
+                           const char* extra = nullptr)
 {
     const LONG k = InterlockedIncrement(&g_arenaFaultDecl[why]);
     if (k > 4 && (k % 4096) != 0) return false;
@@ -23906,7 +23934,16 @@ static bool GhArenaDecline(int why, const void* addr, const void* base, size_t c
             m += " q.state=" + Hex((uint32_t)mbi.State) + " q.prot=" + Hex((uint32_t)mbi.Protect) +
                  " q.type=" + Hex((uint32_t)mbi.Type) + " q.alloc=" + Hex((uint64_t)(uintptr_t)mbi.AllocationBase) +
                  " q.size=" + Hex((uint64_t)mbi.RegionSize);
+        // Every cell splits the chunk exactly at the faulting page, so the
+        // region in FRONT of it is the other half of the answer.
+        MEMORY_BASIC_INFORMATION pv{};
+        if (addr > (const void*)4096 &&
+            VirtualQuery((const uint8_t*)addr - 4096, &pv, sizeof pv) == sizeof pv)
+            m += " p.base=" + Hex((uint64_t)(uintptr_t)pv.BaseAddress) +
+                 " p.state=" + Hex((uint32_t)pv.State) + " p.prot=" + Hex((uint32_t)pv.Protect) +
+                 " p.type=" + Hex((uint32_t)pv.Type) + " p.size=" + Hex((uint64_t)pv.RegionSize);
     }
+    if (extra) m += extra;
     GhArenaLruLog(m);
     return false;
 }
@@ -23928,7 +23965,21 @@ static bool GhArenaFault(void* addr)
     const uint64_t st = GhArenaStep(sl);
     const size_t   ci = st ? (size_t)(((uint64_t)((uint8_t*)addr - b)) / st) : 0;
     if (ci >= sl.cmap.size()) return GhArenaDecline(kAfChunkOob, addr, b, ci, true);
-    if (sl.cmap[ci]) return GhArenaDecline(kAfResident, addr, b, ci, true);
+    if (sl.cmap[ci]){
+        // Cells R/S/U/V all end here. Inference is out of road -- our map, the
+        // kernel's map and the guest's fault cannot all three be right -- so
+        // put the question to the page.
+        const int pr = GhArenaProbeWritable(addr);
+        const char* pw = pr == 1 ? " probe=writable" : (pr == 0 ? " probe=read-only" : " probe=unreadable");
+        std::string ex = std::string(pw) + " retries=" + std::to_string((long)g_arenaRetries) +
+                         "/" + std::to_string((unsigned long)g_arenaRetryMax);
+        if (pr == 1 && g_arenaRetryMax &&
+            InterlockedIncrement(&g_arenaRetries) <= (LONG)g_arenaRetryMax){
+            GhArenaDecline(kAfResident, addr, b, ci, true, (ex + " -> RETRY").c_str());
+            return true;                    // re-run the store; the page says it will take it
+        }
+        return GhArenaDecline(kAfResident, addr, b, ci, true, ex.c_str());
+    }
     const bool ok = (g_arenaLru >= 2) ? GhArenaRemapChunk(it->first, sl, ci)
                                       : GhArenaRemapLocked(it->first, sl);
     if (!ok) GhArenaDecline(kAfRemap, addr, b, ci, true);
