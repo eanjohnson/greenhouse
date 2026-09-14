@@ -22959,7 +22959,25 @@ static std::map<uint64_t, uint64_t>     g_arenaFree;    // offset -> size, order
 // be dropped with MEM_PRESERVE_PLACEHOLDER, returning the per-process view
 // budget while the ADDRESS stays reserved, and mapped back at the same address
 // later. `mapped` is 0 while the slice is evicted. `used` is the clock bit.
-struct GhArenaSlice { uint64_t off; uint64_t size; uint64_t chunk; bool ph; LONG mapped; LONG used; };
+// #202 v2 replaces `mapped` -- one bit for the whole slice -- with one bit per
+// CHUNK. That single bit is what let an eviction become unreversible: a 158 MiB
+// slice could only come back if 158 MiB of view budget came back with it, and
+// the budget is shared with the guest's own file mappings, so "there was room a
+// moment ago" is not a promise. Per chunk, a fault has to find 64 MiB, not 158.
+struct GhArenaSlice {
+    uint64_t off; uint64_t size; uint64_t chunk; bool ph; LONG used;
+    std::vector<uint8_t> cmap;          // 1 = chunk mapped, 0 = evicted placeholder
+};
+static inline size_t GhArenaNChunksN(uint64_t size, uint64_t step)
+{ return step ? (size_t)((size + step - 1) / step) : 0; }
+static inline uint64_t GhArenaStep(const GhArenaSlice& s){ return s.chunk ? s.chunk : s.size; }
+static inline size_t   GhArenaNChunks(const GhArenaSlice& s){ return GhArenaNChunksN(s.size, GhArenaStep(s)); }
+static inline uint64_t GhArenaChunkLen(const GhArenaSlice& s, size_t i)
+{ const uint64_t st = GhArenaStep(s), o = (uint64_t)i * st; return s.size - o < st ? s.size - o : st; }
+static inline bool GhArenaAnyMapped(const GhArenaSlice& s)
+{ for (uint8_t b : s.cmap) if (b) return true; return false; }
+static inline bool GhArenaAllMapped(const GhArenaSlice& s)
+{ for (uint8_t b : s.cmap) if (!b) return false; return true; }
 static std::map<void*, GhArenaSlice> g_arenaLive;   // view base -> slice
 static SIZE_T                           g_arenaMin  = 0;
 static volatile LONG                    g_arenaLogs = 0;
@@ -22981,6 +22999,27 @@ static volatile LONG   g_arenaRefaults  = 0;
 static volatile LONG   g_arenaEvictFail = 0;
 static volatile LONG   g_arenaRemapFail = 0;
 static uint64_t        g_arenaEvictedB  = 0;        // bytes reserved but not mapped
+// #202 v2. gh_arena_lru is a ladder now, not a flag:
+//   1  the cell R behaviour -- whole-slice eviction, whole-slice refault
+//   2  + per-chunk refault, escalating evict-and-retry, undo-on-failure,
+//      g_arenaCap enforced as a LIVE MAPPED ceiling, and a ballast view
+//   3  + lazy take: a slice is handed out with ONE chunk mapped and the rest
+//      promised, which is the only form in which the 470 MiB ask fits at all
+static volatile LONG   g_arenaBallastHits = 0;   // refaults that had to spend the ballast
+static void*           g_arenaBallast     = nullptr;
+static uint64_t        g_arenaBallastSize = 0;
+static volatile LONG   g_arenaUndone      = 0;   // chunks mapped back after a take failed anyway
+static volatile LONG   g_arenaEscalations = 0;   // evict-and-ask rounds past the first
+static volatile LONG   g_arenaLazyTakes   = 0;   // slices handed out partly promised
+static uint64_t        g_arenaPromisedB   = 0;   // bytes handed out but never yet mapped
+// The real ceiling is not gh_arena_cap_mb and it is not a constant. Cell Q
+// measured 1024 MiB with the guest barely started; cell R then watched a 256 MiB
+// view refused and a 158 MiB view granted moments later, because the budget is
+// shared with the guest's own file mappings -- 121 MB of exe, 63 psarc archives,
+// DirectStorage -- and those only grow. So v2 does not assume a ceiling: it
+// LEARNS one, from the live-mapped figure standing at the moment the section
+// says ERROR_COMMITMENT_LIMIT, and keeps the lowest it has seen.
+static uint64_t        g_arenaLiveCeil    = 0;
 
 // Every acquisition of g_arenaMx goes through this, so GhArenaFault can tell
 // "another thread is in the arena" (wait for it) from "THIS thread is already in
@@ -23030,6 +23069,45 @@ static void GhArenaLruLog(const std::string& m)
 {
     if (InterlockedIncrement(&g_arenaLruLogs) <= 400) Diag("ARENALRU " + m);
 }
+// #202 v2. The ballast is a view of the arena that is never handed to anybody.
+// Its only job is to be droppable: when a refault cannot find the budget to put
+// a chunk back, this is the budget, and it is ours rather than the guest's. It
+// is the difference between "the refault usually works" and "the refault works".
+static inline uint64_t GhArenaLiveMapped()
+{ return g_arenaHanded > g_arenaEvictedB ? g_arenaHanded - g_arenaEvictedB : 0; }
+
+// A refusal says ceiling < live + size, and that bound -- not `live` itself --
+// is what can be learned from it. Cells R and S both show why the distinction
+// matters: late in the run a 256 MiB view was refused with only 74 MiB of ours
+// resident, so the honest reading is "the ceiling is under 330 MiB", not "the
+// ceiling is 74". Recording `live` there would collapse the arena to nothing.
+static void GhArenaNoteRefusal(DWORD err, uint64_t size)
+{
+    if (err != 0x5AFu) return;                       // ERROR_COMMITMENT_LIMIT
+    const uint64_t cand = GhArenaLiveMapped() + size;
+    if (!g_arenaLiveCeil || cand < g_arenaLiveCeil){
+        g_arenaLiveCeil = cand;
+        GhArenaLruLog("live ceiling <= " + Hex(cand) + " (live=" + Hex(GhArenaLiveMapped()) +
+                      " asked=" + Hex(size) + " cap=" + Hex(g_arenaCap) + ")");
+    }
+}
+
+static bool GhArenaBallastTake()
+{
+    if (g_arenaBallast || !g_arenaBallastSize || !g_arenaMap) return g_arenaBallast != nullptr;
+    uint64_t sz = g_arenaBallastSize;
+    if (g_arenaSize && sz > g_arenaSize) sz = g_arenaSize;
+    g_arenaBallast = MapViewOfFile(g_arenaMap, FILE_MAP_READ, 0, 0, (SIZE_T)sz);
+    return g_arenaBallast != nullptr;
+}
+static bool GhArenaBallastDrop()
+{
+    if (!g_arenaBallast) return false;
+    UnmapViewOfFile(g_arenaBallast);
+    g_arenaBallast = nullptr;
+    return true;
+}
+
 static void GhArenaRecycleProbe();                 // #202, defined below
 static bool GhArenaFault(void* addr);               // #202 remap-on-access
 static bool GhArenaMaterialise(const void* addr, SIZE_T size);
@@ -23139,6 +23217,15 @@ static bool GhArenaInit()
              " ph-api=" + std::string(ph ? "yes" : "no") +
              " uv2=" + std::string(g_uv2 ? "yes" : "no") +
              (ph && g_uv2 ? "" : "  *** CANNOT EVICT -- the cell is VOID ***"));
+    }
+    if (g_arenaLru >= 2){
+        g_arenaBallastSize = (uint64_t)GhCfgNum(L"gh_arena_ballast_mb.txt", "GH_ARENA_BALLAST_MB", 64) << 20;
+        GhArenaBallastTake();
+        Diag("ARENALRU v" + std::to_string(g_arenaLru) +
+             " ballast=" + Hex(g_arenaBallastSize) +
+             " held=" + std::string(g_arenaBallast ? "yes" : "no") +
+             " lazy=" + std::string(g_arenaLru >= 3 ? "yes" : "no") +
+             (g_arenaBallast ? "" : "  *** no ballast: a refault has no reserve ***"));
     }
     GhLogMemoryBudget("arena-ready");
     GhArenaRecycleProbe();
@@ -23345,8 +23432,13 @@ static void* GhArenaTakeChunked(HANDLE sect, uint64_t off, uint64_t need, uint64
         }
         if (!g_mv3(sect, GetCurrentProcess(), at, off + done, (SIZE_T)take,
                    MEM_REPLACE_PLACEHOLDER, pageProt, nullptr, 0)){
+            const DWORD e = GetLastError();
+            // `done` bytes of this take are already mapped but not yet in
+            // g_arenaLive, so they have to be added by hand for the bound to be
+            // about the process and not about our bookkeeping.
+            GhArenaNoteRefusal(e, done + take);
             GhArenaLog("MapViewOfFile3 at=" + Hex((uint64_t)(uintptr_t)at) + " size=" + Hex(take) +
-                       " off=" + Hex(off + done) + " failed err=" + Hex(GetLastError()));
+                       " off=" + Hex(off + done) + " failed err=" + Hex(e));
             break;
         }
         done += take;
@@ -23375,34 +23467,62 @@ static void* GhArenaTakeChunked(HANDLE sect, uint64_t off, uint64_t need, uint64
 // from ever re-entering the arena lock through its own work.
 // ---------------------------------------------------------------------------
 
-// Drop a slice's view(s), keeping the address reserved. A chunked slice is
-// several views inside one placeholder run, so each chunk is dropped in turn.
-static bool GhArenaUnmapKeep(void* base, const GhArenaSlice& s)
+// Drop ONE chunk's view, keeping its address reserved as a placeholder. This is
+// the unit everything else in #202 v2 is built out of: the budget returned is
+// this chunk's bytes, and the address survives, which is what lets the guest go
+// on holding raw pointers into a slice that is only partly resident.
+static bool GhArenaDropChunk(void* base, GhArenaSlice& s, size_t i)
+{
+    if (!g_uv2 || i >= s.cmap.size() || !s.cmap[i]) return false;
+    if (!g_uv2(GetCurrentProcess(), (uint8_t*)base + (uint64_t)i * GhArenaStep(s),
+               MEM_PRESERVE_PLACEHOLDER)) return false;
+    s.cmap[i] = 0;
+    g_arenaEvictedB += GhArenaChunkLen(s, i);
+    return true;
+}
+
+// Put ONE chunk back at its own address.
+static bool GhArenaMapChunkBack(void* base, GhArenaSlice& s, size_t i, HANDLE sect, DWORD pageProt)
+{
+    if (i >= s.cmap.size()) return false;
+    if (s.cmap[i]) return true;
+    if (!g_mv3) return false;
+    const uint64_t st = GhArenaStep(s), take = GhArenaChunkLen(s, i);
+    if (!g_mv3(sect, GetCurrentProcess(), (uint8_t*)base + (uint64_t)i * st, s.off + (uint64_t)i * st,
+               (SIZE_T)take, MEM_REPLACE_PLACEHOLDER, pageProt, nullptr, 0)){
+        GhArenaNoteRefusal(GetLastError(), take);
+        return false;
+    }
+    s.cmap[i] = 1;
+    g_arenaEvictedB -= take;
+    return true;
+}
+
+// Whole-slice forms, kept because gh_arena_lru=1 is cell R's behaviour and has
+// to stay bit-for-bit comparable with it.
+static bool GhArenaUnmapKeep(void* base, GhArenaSlice& s)
 {
     if (!g_uv2) return false;
-    const uint64_t step = s.chunk ? s.chunk : s.size;
     bool ok = true;
-    for (uint64_t u = 0; u < s.size; u += step)
-        if (!g_uv2(GetCurrentProcess(), (uint8_t*)base + u, MEM_PRESERVE_PLACEHOLDER)) ok = false;
+    const size_t n = GhArenaNChunks(s);
+    for (size_t i = 0; i < n; ++i) if (s.cmap[i] && !GhArenaDropChunk(base, s, i)) ok = false;
     return ok;
 }
 
-// Put a slice's bytes back at the SAME address. On a partial failure everything
-// already mapped is dropped again: a half-mapped slice would fault forever,
-// because the fault handler would map the part that is already there and return
-// to the same faulting instruction.
-static bool GhArenaMapBack(void* base, const GhArenaSlice& s, HANDLE sect, DWORD pageProt)
+// On a partial failure everything THIS CALL mapped is dropped again: a slice the
+// caller believes is whole but is not would fault forever, because the handler
+// would map the part that is already there and return to the same instruction.
+static bool GhArenaMapBack(void* base, GhArenaSlice& s, HANDLE sect, DWORD pageProt)
 {
-    if (!g_mv3) return false;
-    const uint64_t step = s.chunk ? s.chunk : s.size;
-    for (uint64_t u = 0; u < s.size; u += step){
-        const uint64_t take = (s.size - u < step) ? (s.size - u) : step;
-        if (!g_mv3(sect, GetCurrentProcess(), (uint8_t*)base + u, s.off + u, (SIZE_T)take,
-                   MEM_REPLACE_PLACEHOLDER, pageProt, nullptr, 0)){
-            for (uint64_t v = 0; v < u; v += step)
-                g_uv2(GetCurrentProcess(), (uint8_t*)base + v, MEM_PRESERVE_PLACEHOLDER);
+    const size_t n = GhArenaNChunks(s);
+    std::vector<size_t> did;
+    for (size_t i = 0; i < n; ++i){
+        if (s.cmap[i]) continue;
+        if (!GhArenaMapChunkBack(base, s, i, sect, pageProt)){
+            for (size_t j : did) GhArenaDropChunk(base, s, j);
             return false;
         }
+        did.push_back(i);
     }
     return true;
 }
@@ -23410,27 +23530,87 @@ static bool GhArenaMapBack(void* base, const GhArenaSlice& s, HANDLE sect, DWORD
 // Free at least `want` bytes of view budget, second-chance clock: pass 0 skips
 // (and clears) anything touched since the last sweep, pass 1 takes what is left.
 // `keep` is the slice the caller is working on and must never be evicted.
-static uint64_t GhArenaEvict(uint64_t want, void* keep)
+// With v2 the unit is the chunk, so a 64 MiB ask costs one 64 MiB view and not
+// the 922 MiB slice that happened to be coldest. `out` records what went, so a
+// take that fails anyway can put it back.
+static uint64_t GhArenaEvict(uint64_t want, void* keep,
+                             std::vector<std::pair<void*, size_t>>* out = nullptr)
 {
+    const bool whole = g_arenaLru < 2;
     uint64_t freed = 0;
     for (int pass = 0; pass < 2 && freed < want; ++pass){
         for (auto& kv : g_arenaLive){
             if (freed >= want) break;
             if (kv.first == keep) continue;
             GhArenaSlice& sl = kv.second;
-            if (!sl.ph || !sl.mapped) continue;
+            if (!sl.ph || !GhArenaAnyMapped(sl)) continue;
             if (pass == 0 && sl.used){ sl.used = 0; continue; }
-            if (GhArenaUnmapKeep(kv.first, sl)){
-                sl.mapped = 0;
-                freed += sl.size;
-                g_arenaEvictedB += sl.size;
-                InterlockedIncrement(&g_arenaEvicts);
-            } else {
-                InterlockedIncrement(&g_arenaEvictFail);
+            const size_t n = GhArenaNChunks(sl);
+            for (size_t i = 0; i < n; ++i){
+                if (!sl.cmap[i]) continue;
+                const uint64_t len = GhArenaChunkLen(sl, i);
+                if (GhArenaDropChunk(kv.first, sl, i)){
+                    freed += len;
+                    InterlockedIncrement(&g_arenaEvicts);
+                    if (out) out->push_back(std::make_pair(kv.first, i));
+                } else {
+                    InterlockedIncrement(&g_arenaEvictFail);
+                }
+                if (!whole && freed >= want) break;
             }
         }
     }
     return freed;
+}
+
+// #202 v3. Reserve the whole span as one placeholder run, split it into chunks,
+// and map only the FIRST one. The rest are promised: the guest gets its
+// contiguous address range and the view budget is charged one chunk, not the
+// slice. This is the only shape in which the 470 MiB ask fits at all -- cell R
+// measured that ask being refused after we had just handed 922 MiB of view
+// BACK, so no amount of eviction buys it as a single resident block.
+static void* GhArenaTakeLazy(HANDLE sect, uint64_t off, uint64_t need, uint64_t chunk,
+                             DWORD pageProt, std::vector<uint8_t>& cmap)
+{
+    if (!GhArenaPlaceholderApi() || !chunk) return nullptr;
+    uint8_t* ph = (uint8_t*)g_va2(GetCurrentProcess(), nullptr, (SIZE_T)need,
+                                  MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+    if (!ph){
+        GhArenaLog("lazy placeholder reserve " + Hex(need) + " failed err=" + Hex(GetLastError()));
+        return nullptr;
+    }
+    const size_t n = GhArenaNChunksN(need, chunk);
+    // Split every chunk off the head of what is left, exactly as the eager path
+    // does, so each one owns its own reservation and can be mapped or dropped
+    // without disturbing its neighbours.
+    for (size_t i = 0; i + 1 < n; ++i){
+        if (!VirtualFree(ph + (uint64_t)i * chunk, (SIZE_T)chunk,
+                         MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)){
+            GhArenaLog("lazy split i=" + std::to_string(i) + " failed err=" + Hex(GetLastError()));
+            for (size_t j = 0; j <= i; ++j) VirtualFree(ph + (uint64_t)j * chunk, 0, MEM_RELEASE);
+            return nullptr;
+        }
+    }
+    cmap.assign(n, 0);
+    GhArenaSlice tmp{}; tmp.off = off; tmp.size = need; tmp.chunk = chunk; tmp.ph = true;
+    tmp.used = 1; tmp.cmap = cmap;
+    if (!GhArenaMapChunkBack(ph, tmp, 0, sect, pageProt)){
+        GhArenaEvict(chunk, nullptr);
+        if (!GhArenaMapChunkBack(ph, tmp, 0, sect, pageProt)){
+            for (size_t j = 0; j < n; ++j) VirtualFree(ph + (uint64_t)j * chunk, 0, MEM_RELEASE);
+            return nullptr;
+        }
+    }
+    // GhArenaMapChunkBack charged the whole slice's absence to nobody yet, so
+    // account for it here: everything but chunk 0 is promised, not mapped.
+    cmap = tmp.cmap;
+    // GhArenaMapChunkBack credited chunk 0 against g_arenaEvictedB as though it
+    // had been evicted, which it never was; adding the whole slice back leaves
+    // exactly the promised bytes -- everything but chunk 0 -- standing.
+    g_arenaEvictedB += need;
+    g_arenaPromisedB += need - GhArenaChunkLen(tmp, 0);
+    InterlockedIncrement(&g_arenaLazyTakes);
+    return ph;
 }
 
 // caller holds g_arenaMx. wantAddr non-null means the guest demanded a fixed
@@ -23458,16 +23638,68 @@ static void* GhArenaTake(SIZE_T size, void* wantAddr)
         // guest holds raw pointers into these slices, so "same address" is not
         // negotiable. A plain view would be a slice we could never evict -- i.e.
         // budget spent for the rest of the run.
+        std::vector<uint8_t> cmap;
         if (g_arenaLru && !wantAddr && GhArenaPlaceholderApi()){
             HANDLE sect = g_arenaMaps.empty() ? g_arenaMap : g_arenaMaps[0];
             chunk = (uint64_t)g_arenaChunk;
-            v = GhArenaTakeChunked(sect, off, need, chunk, pageProt);
+            // v2: g_arenaCap becomes what the commit message always claimed it
+            // was -- a ceiling on LIVE MAPPED bytes -- and we come down to it
+            // BEFORE asking. The section is then not the thing that has to say
+            // no, which matters because the budget is shared with the guest's
+            // own file mappings and every refusal we provoke is one it might
+            // have wanted.
+            if (g_arenaLru >= 2){
+                // Come down to the ceiling we have actually seen, not the knob,
+                // and leave the ballast affordable inside it.
+                uint64_t ceil = g_arenaLiveCeil ? g_arenaLiveCeil : g_arenaCap;
+                if (ceil > g_arenaBallastSize) ceil -= g_arenaBallastSize;
+                // Never squeeze below two chunks: one for the slice being taken
+                // and one for whatever the guest touches next. A working set
+                // smaller than that is a fault storm, not a cache.
+                if (chunk && ceil < chunk * 2) ceil = chunk * 2;
+                // A lazy take only maps its first chunk, so that is all the room
+                // it needs; an eager one needs the whole slice resident.
+                const uint64_t want = (g_arenaLru >= 3 && chunk && need > chunk) ? chunk : need;
+                const uint64_t live = GhArenaLiveMapped();
+                if (ceil && live + want > ceil) GhArenaEvict(live + want - ceil, nullptr);
+            }
+            if (g_arenaLru >= 3){
+                v = GhArenaTakeLazy(sect, off, need, chunk, pageProt, cmap);
+                if (!v){
+                    GhArenaEvict(chunk, nullptr);
+                    v = GhArenaTakeLazy(sect, off, need, chunk, pageProt, cmap);
+                }
+            }
             if (!v){
+                cmap.clear();
+                v = GhArenaTakeChunked(sect, off, need, chunk, pageProt);
+                std::vector<std::pair<void*, size_t>> undo;
                 // The ceiling is a budget to cycle, not a wall. Free what this
-                // slice needs out of the cold ones and ask the section again.
-                const uint64_t freed = GhArenaEvict(need, nullptr);
-                GhArenaLruLog("evict-for-take need=" + Hex(need) + " freed=" + Hex(freed));
-                if (freed) v = GhArenaTakeChunked(sect, off, need, chunk, pageProt);
+                // slice needs out of the cold ones and ask the section again --
+                // and keep asking: cell R evicted once, gave up, and declined a
+                // 470 MiB slice that was worth ~400 MiB of the #202 deficit.
+                for (int round = 0; !v && round < 8; ++round){
+                    const uint64_t freed = GhArenaEvict(need, nullptr,
+                                                        g_arenaLru >= 2 ? &undo : nullptr);
+                    GhArenaLruLog("evict-for-take need=" + Hex(need) + " freed=" + Hex(freed) +
+                                  " round=" + std::to_string(round));
+                    if (!freed) break;
+                    if (round) InterlockedIncrement(&g_arenaEscalations);
+                    v = GhArenaTakeChunked(sect, off, need, chunk, pageProt);
+                    if (g_arenaLru < 2) break;          // v1 asked exactly once
+                }
+                if (!v && !undo.empty()){
+                    // Those evictions bought nothing. Put them back rather than
+                    // leaving the guest a field of promises to fault into for a
+                    // slice it never got.
+                    for (size_t k = 0; k < undo.size(); ++k){
+                        auto f = g_arenaLive.find(undo[k].first);
+                        if (f == g_arenaLive.end()) continue;
+                        if (GhArenaMapChunkBack(undo[k].first, f->second, undo[k].second,
+                                                sect, pageProt))
+                            InterlockedIncrement(&g_arenaUndone);
+                    }
+                }
             }
             if (v) ph = true; else chunk = 0;
         }
@@ -23494,8 +23726,15 @@ static void* GhArenaTake(SIZE_T size, void* wantAddr)
         if (!v) return nullptr;
         if (it->second == need) g_arenaFree.erase(it);
         else { uint64_t rest = it->second - need; g_arenaFree.erase(it); g_arenaFree[off + need] = rest; }
-        g_arenaLive[v] = { off, need, chunk, ph, 1, 1 };
+        GhArenaSlice ns{};
+        ns.off = off; ns.size = need; ns.chunk = chunk; ns.ph = ph; ns.used = 1;
+        if (cmap.empty()) cmap.assign(GhArenaNChunksN(need, chunk ? chunk : need), 1);
+        ns.cmap = cmap;
+        g_arenaLive[v] = ns;
         g_arenaHanded += need;
+        // If a refault had to spend the ballast, this is the first moment it
+        // might be affordable again. Best effort; failing costs nothing.
+        if (g_arenaLru >= 2) GhArenaBallastTake();
         return v;
     }
     return nullptr;
@@ -23507,13 +23746,23 @@ static bool GhArenaGive(void* base)
     auto it = g_arenaLive.find(base);
     if (it == g_arenaLive.end()) return false;
     uint64_t off = it->second.off, size = it->second.size, chunk = it->second.chunk;
-    if (it->second.ph && !it->second.mapped){
-        // An evicted slice still owns its VA as placeholders -- one per chunk,
-        // because GhArenaTakeChunked split the run. Releasing from the base
-        // would leave every chunk after the first reserved for the whole run.
+    if (it->second.ph){
+        // A slice is now mapped chunk by chunk, so it comes down chunk by chunk:
+        // a resident one is unmapped, an evicted or promised one still owns its
+        // VA as a placeholder and is released. Releasing from the base would
+        // leave every chunk after the first reserved for the whole run.
         const uint64_t step = chunk ? chunk : size;
-        g_arenaEvictedB -= size;
-        for (uint64_t u = 0; u < size; u += step) VirtualFree((uint8_t*)base + u, 0, MEM_RELEASE);
+        const size_t   n    = GhArenaNChunks(it->second);
+        for (size_t i = 0; i < n; ++i){
+            uint8_t* cb = (uint8_t*)base + (uint64_t)i * step;
+            const uint64_t len = GhArenaChunkLen(it->second, i);
+            if (it->second.cmap[i]) UnmapViewOfFile(cb);
+            else {
+                g_arenaEvictedB -= len;
+                if (g_arenaPromisedB >= len) g_arenaPromisedB -= len;
+                VirtualFree(cb, 0, MEM_RELEASE);
+            }
+        }
     }
     else if (chunk){ for (uint64_t u = 0; u < size; u += chunk) UnmapViewOfFile((uint8_t*)base + u); }
     else            UnmapViewOfFile(base);
@@ -23530,6 +23779,7 @@ static bool GhArenaGive(void* base)
         }
     }
     g_arenaFree[off] = size;
+    if (g_arenaLru >= 2) GhArenaBallastTake();   // budget just came back: re-arm the reserve
     return true;
 }
 
@@ -23557,11 +23807,39 @@ static bool GhArenaRemapLocked(void* base, GhArenaSlice& sl)   // caller holds g
             return false;                 // report it honestly; do not eat the fault
         }
     }
-    sl.mapped = 1;
-    sl.used   = 1;
-    g_arenaEvictedB -= sl.size;
-    InterlockedIncrement(&g_arenaRefaults);
+    sl.used = 1;
     return true;
+}
+
+// #202 v2. Put back ONE chunk. The v1 form above had to find the whole slice's
+// bytes of view budget, and cell R ended on exactly that: a 158 MiB slice was
+// evicted, the guest wrote into it at 0x200B3E58549, the budget for 158 MiB was
+// not there, GhArenaFault returned false and the AV reached the crash reporter.
+// One chunk is 64 MiB at the default, and the ballast guarantees that much.
+static bool GhArenaRemapChunk(void* base, GhArenaSlice& sl, size_t i)   // caller holds g_arenaMx
+{
+    HANDLE sect = g_arenaMaps.empty() ? g_arenaMap : g_arenaMaps[0];
+    DWORD  prot = g_arenaExec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
+    if (GhArenaMapChunkBack(base, sl, i, sect, prot)){ sl.used = 1; return true; }
+    // Out of view budget for one chunk. Take it from the cold ones -- never from
+    // this slice -- and ask again.
+    GhArenaEvict(GhArenaChunkLen(sl, i), base);
+    if (GhArenaMapChunkBack(base, sl, i, sect, prot)){ sl.used = 1; return true; }
+    // Nothing cold left. Spend the ballast: this is the whole reason it is held.
+    // The budget is shared with the guest's own file mappings, so "there was
+    // room a moment ago" is not a promise, and a refault we cannot serve is an
+    // access violation the guest has no way to survive.
+    if (GhArenaBallastDrop()){
+        InterlockedIncrement(&g_arenaBallastHits);
+        if (GhArenaMapChunkBack(base, sl, i, sect, prot)){
+            sl.used = 1;
+            GhArenaLruLog("ballast spent base=" + Hex((uint64_t)(uintptr_t)base) +
+                          " chunk=" + std::to_string(i) + " hits=" + std::to_string(g_arenaBallastHits));
+            return true;
+        }
+    }
+    InterlockedIncrement(&g_arenaRemapFail);
+    return false;                       // report it honestly; do not eat the fault
 }
 
 static bool GhArenaFault(void* addr)
@@ -23576,10 +23854,20 @@ static bool GhArenaFault(void* addr)
     uint8_t* b = (uint8_t*)it->first;
     if ((uint8_t*)addr < b || (uint8_t*)addr >= b + sl.size) return false;
     if (!sl.ph) return false;             // a plain view: not ours to repair
-    if (sl.mapped){ sl.used = 1; return false; }   // mapped and still faulting: a real fault
-    const bool ok = GhArenaRemapLocked(it->first, sl);
-    if (ok && (g_arenaRefaults & 0xFF) == 1)
-        GhArenaLruLog("refault base=" + Hex((uint64_t)(uintptr_t)b) + " size=" + Hex(sl.size));
+    sl.used = 1;
+    const uint64_t st = GhArenaStep(sl);
+    const size_t   ci = st ? (size_t)(((uint64_t)((uint8_t*)addr - b)) / st) : 0;
+    if (ci >= sl.cmap.size()) return false;
+    if (sl.cmap[ci]) return false;        // resident and still faulting: a real fault
+    const bool ok = (g_arenaLru >= 2) ? GhArenaRemapChunk(it->first, sl, ci)
+                                      : GhArenaRemapLocked(it->first, sl);
+    if (ok){
+        InterlockedIncrement(&g_arenaRefaults);
+        if ((g_arenaRefaults & 0xFF) == 1)
+            GhArenaLruLog("refault base=" + Hex((uint64_t)(uintptr_t)b) +
+                          " chunk=" + std::to_string(ci) +
+                          " size=" + Hex(GhArenaChunkLen(sl, ci)));
+    }
     return ok;
 }
 
@@ -23601,8 +23889,22 @@ static bool GhArenaMaterialise(const void* addr, SIZE_T size)
         uint8_t* b = (uint8_t*)kv.first;
         if (b + sl.size <= lo || b >= hi) continue;
         sl.used = 1;
-        if (sl.mapped) continue;
-        if (GhArenaRemapLocked(kv.first, sl)) did = true;
+        if (GhArenaAllMapped(sl)) continue;
+        if (g_arenaLru < 2){
+            if (GhArenaRemapLocked(kv.first, sl)){ InterlockedIncrement(&g_arenaRefaults); did = true; }
+            continue;
+        }
+        // Only the chunks the caller is about to hand the kernel, not the whole
+        // slice: a DirectStorage read into 64 KB of a 470 MiB promise should
+        // cost one chunk of budget.
+        const uint64_t st = GhArenaStep(sl);
+        const size_t   n  = GhArenaNChunks(sl);
+        for (size_t i = 0; i < n; ++i){
+            if (sl.cmap[i]) continue;
+            uint8_t* cb = b + (uint64_t)i * st;
+            if (cb + GhArenaChunkLen(sl, i) <= lo || cb >= hi) continue;
+            if (GhArenaRemapChunk(kv.first, sl, i)){ InterlockedIncrement(&g_arenaRefaults); did = true; }
+        }
     }
     return did;
 }
@@ -23927,6 +24229,13 @@ static LPVOID WINAPI Bed_VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWOR
                               " refaults=" + std::to_string(g_arenaRefaults) +
                               " evictfail=" + std::to_string(g_arenaEvictFail) +
                               " remapfail=" + std::to_string(g_arenaRemapFail) +
+                              " esc=" + std::to_string(g_arenaEscalations) +
+                              " undone=" + std::to_string(g_arenaUndone) +
+                              " lazy=" + std::to_string(g_arenaLazyTakes) +
+                              " ballast=" + std::to_string(g_arenaBallastHits) +
+                              " promisedB=" + Hex(g_arenaPromisedB) +
+                              " liveceil=" + Hex(g_arenaLiveCeil) +
+                              " live=" + Hex(GhArenaLiveMapped()) +
                               " evictedB=" + Hex(g_arenaEvictedB) +
                               " handed=" + Hex(g_arenaHanded));
             }
