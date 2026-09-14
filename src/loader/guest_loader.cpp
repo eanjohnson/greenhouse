@@ -23016,6 +23016,7 @@ static volatile LONG   g_arenaEvicts    = 0;
 static volatile LONG   g_arenaRefaults  = 0;
 static volatile LONG   g_arenaEvictFail = 0;
 static volatile LONG   g_arenaRemapFail = 0;
+static volatile LONG   g_arenaRemapErr  = 0;   // GetLastError from the last failed remap
 static uint64_t        g_arenaEvictedB  = 0;        // bytes reserved but not mapped
 // #202 v2. gh_arena_lru is a ladder now, not a flag:
 //   1  the cell R behaviour -- whole-slice eviction, whole-slice refault
@@ -23850,6 +23851,26 @@ static bool GhArenaRemapLocked(void* base, GhArenaSlice& sl)   // caller holds g
         // room out of the cold ones -- never out of this one -- and try again.
         GhArenaEvict(sl.size, base);
         if (!GhArenaMapBack(base, sl, sect, prot)){
+            DWORD e = GetLastError();
+            // #202 cell Z. Spend the ballast, exactly as GhArenaRemapChunk does.
+            // It is held for this moment and nothing else -- but until now only
+            // the CHUNKED path could reach it, and that path is gated behind
+            // gh_arena_lru >= 2, which cell T proved a regression and which we
+            // do not re-run. So every cell in this series reports ballast=0: the
+            // reserve has never once been spent, and cell Y ended on this exact
+            // branch with the reserve still untouched.
+            if (GhArenaBallastDrop()){
+                InterlockedIncrement(&g_arenaBallastHits);
+                if (GhArenaMapBack(base, sl, sect, prot)){
+                    sl.used = 1;
+                    GhArenaLruLog("ballast spent base=" + Hex((uint64_t)(uintptr_t)base) +
+                                  " whole-slice size=" + Hex(sl.size) +
+                                  " hits=" + std::to_string(g_arenaBallastHits));
+                    return true;
+                }
+                e = GetLastError();
+            }
+            g_arenaRemapErr = (LONG)e;
             InterlockedIncrement(&g_arenaRemapFail);
             return false;                 // report it honestly; do not eat the fault
         }
@@ -24028,13 +24049,30 @@ static bool GhArenaFault(void* addr)
     }
     const bool ok = (g_arenaLru >= 2) ? GhArenaRemapChunk(it->first, sl, ci)
                                       : GhArenaRemapLocked(it->first, sl);
-    if (!ok) GhArenaDecline(kAfRemap, addr, b, ci, true);
+    if (!ok){
+        // Cell Y ended here and the line carried no error code, so the reason a
+        // repairable fault could not be repaired was unnameable. Forced: this is
+        // a run-ender, and the totals go with it because the RETRY limiter hides
+        // them (cell Y's highest LOGGED retries= was 63 of an unknown true total).
+        const std::string rx = " err=" + std::to_string((unsigned long)g_arenaRemapErr) +
+                               " remapfail=" + std::to_string((long)g_arenaRemapFail) +
+                               " ballast=" + std::to_string((long)g_arenaBallastHits) +
+                               " refaults=" + std::to_string((long)g_arenaRefaults) +
+                               " retries=" + std::to_string((long)g_arenaRetries) +
+                               " stale=" + std::to_string((long)g_arenaStaleCmap);
+        GhArenaDecline(kAfRemap, addr, b, ci, true, rx.c_str(), true);
+    }
     if (ok){
         InterlockedIncrement(&g_arenaRefaults);
         if ((g_arenaRefaults & 0xFF) == 1)
             GhArenaLruLog("refault base=" + Hex((uint64_t)(uintptr_t)b) +
                           " chunk=" + std::to_string(ci) +
-                          " size=" + Hex(GhArenaChunkLen(sl, ci)));
+                          " size=" + Hex(GhArenaChunkLen(sl, ci)) +
+                          " refaults=" + std::to_string((long)g_arenaRefaults) +
+                          " retries=" + std::to_string((long)g_arenaRetries) +
+                          " stale=" + std::to_string((long)g_arenaStaleCmap) +
+                          " remapfail=" + std::to_string((long)g_arenaRemapFail) +
+                          " ballast=" + std::to_string((long)g_arenaBallastHits));
     }
     return ok;
 }
