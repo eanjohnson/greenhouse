@@ -23001,6 +23001,7 @@ static unsigned        g_arenaLru       = 0;        // gh_arena_lru: 0 = old beh
 // retry that does not help is an infinite fault loop.
 static unsigned      g_arenaRetryMax = 0;             // gh_arena_retry: 0 = never retry
 static volatile LONG g_arenaRetries  = 0;
+static volatile LONG g_arenaStaleCmap = 0;   // cmap said mapped, the page disagreed
 static DWORD volatile  g_arenaOwner     = 0;        // thread currently inside the arena lock
 static volatile LONG   g_arenaEvicts    = 0;
 static volatile LONG   g_arenaRefaults  = 0;
@@ -23917,7 +23918,13 @@ static bool GhArenaDecline(int why, const void* addr, const void* base, size_t c
                            const char* extra = nullptr)
 {
     const LONG k = InterlockedIncrement(&g_arenaFaultDecl[why]);
-    if (k > 4 && (k % 4096) != 0) return false;
+    // `resident` is the branch every run has ended on, so it gets a much larger
+    // allowance: cell W spent its first four lines on faults it REPAIRED and
+    // then ended on a fifth the limiter swallowed. The noisy reasons -- an
+    // unrelated AV anywhere in the process lands on no-slice/out-of-range --
+    // keep the tight one.
+    const LONG lim = (why == kAfResident) ? 64 : 4;
+    if (k > lim && (k % 4096) != 0) return false;
     std::string m = std::string("fault-decline why=") + kGhArenaWhy[why] +
                     " n=" + std::to_string((long)k) +
                     " addr=" + Hex((uint64_t)(uintptr_t)addr);
@@ -23968,17 +23975,32 @@ static bool GhArenaFault(void* addr)
     if (sl.cmap[ci]){
         // Cells R/S/U/V all end here. Inference is out of road -- our map, the
         // kernel's map and the guest's fault cannot all three be right -- so
-        // put the question to the page.
+        // put the question to the page. Cell W says the page is the one telling
+        // the truth, and that it answers in two different ways.
         const int pr = GhArenaProbeWritable(addr);
         const char* pw = pr == 1 ? " probe=writable" : (pr == 0 ? " probe=read-only" : " probe=unreadable");
         std::string ex = std::string(pw) + " retries=" + std::to_string((long)g_arenaRetries) +
                          "/" + std::to_string((unsigned long)g_arenaRetryMax);
-        if (pr == 1 && g_arenaRetryMax &&
-            InterlockedIncrement(&g_arenaRetries) <= (LONG)g_arenaRetryMax){
-            GhArenaDecline(kAfResident, addr, b, ci, true, (ex + " -> RETRY").c_str());
-            return true;                    // re-run the store; the page says it will take it
+        if (pr == 1){
+            // The page takes a write right now, so the fault was transient and
+            // the repair is to re-run the instruction. Cell W: 4 for 4, and the
+            // run went 660 frames past where every previous cell ended.
+            if (g_arenaRetryMax &&
+                InterlockedIncrement(&g_arenaRetries) <= (LONG)g_arenaRetryMax){
+                GhArenaDecline(kAfResident, addr, b, ci, true, (ex + " -> RETRY").c_str());
+                return true;
+            }
+            return GhArenaDecline(kAfResident, addr, b, ci, true,
+                                  (ex + " -> BUDGET SPENT").c_str());
         }
-        return GhArenaDecline(kAfResident, addr, b, ci, true, ex.c_str());
+        // The page will not take a write, so it is NOT resident and cmap is
+        // stale -- cell W ended on exactly this, a preserved placeholder
+        // (MEM_RESERVE | PAGE_NOACCESS | MEM_PRIVATE) that cmap still called
+        // mapped. Believe the page, not the bookkeeping: mark the chunk absent
+        // and fall through to the remap that should have run in the first place.
+        sl.cmap[ci] = 0;
+        InterlockedIncrement(&g_arenaStaleCmap);
+        GhArenaDecline(kAfResident, addr, b, ci, true, (ex + " -> STALE cmap, REMAP").c_str());
     }
     const bool ok = (g_arenaLru >= 2) ? GhArenaRemapChunk(it->first, sl, ci)
                                       : GhArenaRemapLocked(it->first, sl);
