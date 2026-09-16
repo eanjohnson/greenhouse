@@ -23980,6 +23980,9 @@ static uint64_t        g_arenaPromisedB   = 0;   // bytes handed out but never y
 // LEARNS one, from the live-mapped figure standing at the moment the section
 // says ERROR_COMMITMENT_LIMIT, and keeps the lowest it has seen.
 static uint64_t        g_arenaLiveCeil    = 0;
+static uint64_t        g_arenaLiveHigh    = 0;   // #212: most view ever actually held
+static unsigned        g_arenaCeilFix     = 0;   // gh_arena_ceilfix
+static volatile LONG   g_arenaCeilIgnored = 0;
 
 // Every acquisition of g_arenaMx goes through this, so GhArenaFault can tell
 // "another thread is in the arena" (wait for it) from "THIS thread is already in
@@ -24034,20 +24037,74 @@ static void GhArenaLruLog(const std::string& m)
 // a chunk back, this is the budget, and it is ours rather than the guest's. It
 // is the difference between "the refault usually works" and "the refault works".
 static inline uint64_t GhArenaLiveMapped()
-{ return g_arenaHanded > g_arenaEvictedB ? g_arenaHanded - g_arenaEvictedB : 0; }
+{
+    const uint64_t live = g_arenaHanded > g_arenaEvictedB ? g_arenaHanded - g_arenaEvictedB : 0;
+    // #212: remember the most view we have ever actually held. A refusal cannot
+    // prove the ceiling is below a level we demonstrably sustained.
+    if (live > g_arenaLiveHigh) g_arenaLiveHigh = live;
+    return live;
+}
 
 // A refusal says ceiling < live + size, and that bound -- not `live` itself --
 // is what can be learned from it. Cells R and S both show why the distinction
 // matters: late in the run a 256 MiB view was refused with only 74 MiB of ours
 // resident, so the honest reading is "the ceiling is under 330 MiB", not "the
 // ceiling is 74". Recording `live` there would collapse the arena to nothing.
+//
+// #212 AMENDS THE ABOVE. The reasoning is right and the model is still wrong,
+// because ERROR_COMMITMENT_LIMIT is a PROCESS-WIDE, TIME-VARYING condition, not
+// a statement about the arena. Late in a run the container has no commit
+// headroom at all -- the game is holding 5 GB of heaps -- so MapViewOfFile3
+// fails no matter how little view WE hold. Cell SC6warm caught it exactly:
+//
+//   live ceiling <= 0x42400000 (live=0x3E400000)   1060 MB
+//   live ceiling <= 0x8A00000  (live=0x4A00000)     138 MB
+//   live ceiling <= 0x4000000  (live=0x0)            64 MB   <-- held ZERO view
+//   live ceiling <= 0x2E00000  (live=0x1800000)      46 MB
+//
+// The third line is the bug in one line: the arena held NOTHING, the map failed
+// for reasons that had nothing to do with it, and it taught itself a 64 MB
+// ceiling. Because the ratchet is monotonic-down and never recovers, every
+// slice after that is DECLINED -> "real reserve" -> real private commit at full
+// price. That is where ~625 MB of the container goes (see the attribution table
+// in GREENHOUSE.md 32.40).
+//
+// Erring high is strictly safer than erring low: a too-low ceiling GUARANTEES a
+// decline, while a too-high ceiling costs one failed MapViewOfFile3 call and
+// then declines anyway. So `gh_arena_ceilfix` adds two guards:
+//   (a) never learn a ceiling below the high-water mark we have actually held;
+//   (b) ignore a refusal entirely when live is far under that mark, because
+//       such a refusal is evidence about the container, not about us.
 static void GhArenaNoteRefusal(DWORD err, uint64_t size)
 {
     if (err != 0x5AFu) return;                       // ERROR_COMMITMENT_LIMIT
-    const uint64_t cand = GhArenaLiveMapped() + size;
+    const uint64_t live = GhArenaLiveMapped();
+    const uint64_t cand = live + size;
+
+    if (g_arenaCeilFix){
+        // (b) The arena is nowhere near its own high-water mark, so this
+        // refusal is the container being full, not our view total.
+        if (g_arenaLiveHigh && live + (live >> 1) < g_arenaLiveHigh){
+            if ((unsigned)InterlockedIncrement(&g_arenaCeilIgnored) <= 40)
+                GhArenaLruLog("ceiling refusal IGNORED (live=" + Hex(live) +
+                              " asked=" + Hex(size) + " high=" + Hex(g_arenaLiveHigh) +
+                              ") -- container-wide, not ours");
+            return;
+        }
+        // (a) Never learn a ceiling under a level we demonstrably sustained.
+        if (g_arenaLiveHigh && cand < g_arenaLiveHigh){
+            if (!g_arenaLiveCeil || g_arenaLiveHigh < g_arenaLiveCeil){
+                g_arenaLiveCeil = g_arenaLiveHigh;
+                GhArenaLruLog("live ceiling CLAMPED to high-water " + Hex(g_arenaLiveHigh) +
+                              " (refusal suggested " + Hex(cand) + ")");
+            }
+            return;
+        }
+    }
+
     if (!g_arenaLiveCeil || cand < g_arenaLiveCeil){
         g_arenaLiveCeil = cand;
-        GhArenaLruLog("live ceiling <= " + Hex(cand) + " (live=" + Hex(GhArenaLiveMapped()) +
+        GhArenaLruLog("live ceiling <= " + Hex(cand) + " (live=" + Hex(live) +
                       " asked=" + Hex(size) + " cap=" + Hex(g_arenaCap) + ")");
     }
 }
@@ -24098,6 +24155,13 @@ static bool GhArenaInit()
     // ceiling on how much it may hold mapped at once; the real limit on handed
     // bytes is the arena FILE, which g_arenaFree already enforces.
     g_arenaLru = GhCfgNum(L"gh_arena_lru.txt", "GH_ARENA_LRU", 0);
+    // #212: stop the live-ceiling ratchet from learning a ceiling out of a
+    // container-wide commit shortage. The ratchet bug is real and this
+    // repairs it reproducibly (CEIL1 and CEIL2 log byte-identical CLAMPED /
+    // IGNORED sequences), but it is MEMORY-NEUTRAL: at matched res~29,560 the
+    // two fix-on runs read appused 4,554 and 5,092 MB, straddling the fix-off
+    // run's 4,834 MB. Default 0 so the baseline stays reproducible.
+    g_arenaCeilFix = GhCfgNumZ(L"gh_arena_ceilfix.txt", "GH_ARENA_CEILFIX", 0);
     // GhCfgNumZ, not GhCfgNum: the default is nonzero, so 0 has to be sayable.
     g_arenaRetryMax = GhCfgNumZ(L"gh_arena_retry.txt", "GH_ARENA_RETRY", 64);
 
