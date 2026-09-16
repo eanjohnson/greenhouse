@@ -2790,7 +2790,18 @@ static void BuildBridgeOnUi()
     // #169: the LAST point before the process's first D3D12 device exists. The
     // guest never creates its own -- Bed_D3D12CreateDevice hands back this one --
     // so the shader-model cap has to be raised here or not at all.
-    GhDdiPatchShaderModelCap();
+    //
+    // #209: this is GhDdiInstall, not the bare cap patch, and the difference is
+    // the whole reason Stage 0 was untestable without a game. GhDdiInstall's
+    // FIRST action is GhDdiPatchShaderModelCap(), so at gh_ddi_probe=0 -- the
+    // default -- this is byte-for-byte the old behaviour. The other two call
+    // sites are EnsureBridge (explicitly "called from the guest WORKER thread")
+    // and the loader thread's guest bring-up, so in a Launcher session with no
+    // guest NEITHER runs and every DDI probe silently did nothing: three console
+    // runs came back with the knob correctly on disk, DDISM printed from HERE,
+    // and not one DDIPROBE line. Installing from the Launcher's own bridge makes
+    // Stage 0 a one-minute test instead of a game launch.
+    GhDdiInstall();
 
     auto fail = [](const char* where, HRESULT hr){
         g_gfx.failed = true;
@@ -9100,8 +9111,13 @@ static bool GhScdxilPatchScDll()
 //   0b what are these binaries, exactly (get them out for host RE)?
 //   0c which call produces 0x51?
 //
-//   gh_ddi_probe = 1  0a reads + 0b copies   (no calls, no hooks)
+//   gh_ddi_probe = 1  0a reads + 0b (scache resolve only)   (no calls, no hooks)
 //                  2  + 0c, wrap the UMD's adapter open and log the negotiation
+//              bit 4  + 0b's HEAVY copies of the whole graphics stack. Separate
+//                     because that is ~40 MB into a ~35 MB LocalState quota the
+//                     GAME's log shares ([[localstate-quota-starves-diag]]), and
+//                     every one of those modules is already pulled to the host.
+//                     Only set it to re-pull after a console OS update.
 //                  3  + actually CALL the stage query. DELIBERATELY SEPARATE:
 //                     its prototype is not public, and a wrong ABI guess faults
 //                     into our own VEH, which has killed the app before
@@ -9176,7 +9192,17 @@ static void GhDdiProbeDxilStages()
 // UMD need not live in System32, and guessing is how you RE the wrong binary.
 static void GhDdiCopyStackForRE()
 {
-    static const wchar_t* kMods[] = {
+    // #209: umd12ddi memoizes SCSimpleCompileShader behind a two-tier
+    // ShaderCache_* surface (local + remote), resolved by LoadLibraryW from
+    // exactly these two names. Neither is a static import, and when both fail
+    // the driver latches "1" and skips every cache call in silence -- which is
+    // why no launch has ever been cheaper than the first. These two are the
+    // only modules mode 1 copies: they are the only ones not already on the
+    // host, and between them they cost either nothing or a few hundred KB.
+    static const wchar_t* kCheap[] = { L"scache.dll", L"scache_lnm.dll" };
+    // The RE stack. ~40 MB, which does not fit the LocalState quota next to the
+    // game's own log, so it is opt-in and already spent -- see the knob comment.
+    static const wchar_t* kHeavy[] = {
         L"umd12ddi.dll", L"SC_DLL.dll", L"scdxil.dll",
         L"D3D12Core.dll", L"D3D12SDKLayers.dll", L"d3d12.dll",
         // #169 Stage 2: the DXIL back end itself is where the compile faults, so
@@ -9184,6 +9210,8 @@ static void GhDdiCopyStackForRE()
         // converter it sits behind.
         L"newbe.DLL", L"dxbc2dxil.dll",
     };
+    std::vector<const wchar_t*> kMods(std::begin(kCheap), std::end(kCheap));
+    if (GhDdiProbe() & 4) kMods.insert(kMods.end(), std::begin(kHeavy), std::end(kHeavy));
     std::wstring dir = std::wstring(kLocalState) + L"sys";
     CreateDirectoryW(dir.c_str(), nullptr);
     wchar_t sys[MAX_PATH] = {};
@@ -9208,6 +9236,30 @@ static void GhDdiCopyStackForRE()
                         : std::string(" copy FAILED err=") + Hex(GetLastError());
         }
         Diag("DDIPROBE 0b " + shown + tail);
+    }
+
+    // #209. Existence is not the question -- umd12ddi does LoadLibraryW, and the
+    // app container refuses plenty of DLLs that are plainly present (scdxil's
+    // DllMain is the precedent). Reproduce the driver's own resolve exactly:
+    // scache.dll first, scache_lnm.dll as its fallback, then the nine exports it
+    // asks for. Anything short of all nine leaves the driver on its cold path.
+    static const char* kCacheFns[] = {
+        "ShaderCache_Create", "ShaderCache_Destroy", "ShaderCache_ComputeLocalHashKey",
+        "ShaderCache_FindLocalValue", "ShaderCache_AddLocalValue", "ShaderCache_FreeValue",
+        "ShaderCache_FindRemoteValue", "ShaderCache_AddRemoteValue", "ShaderCache_Flush",
+    };
+    for (const wchar_t* d : kCheap){
+        std::string nm; for (const wchar_t* c = d; *c; ++c) nm += (char)*c;
+        HMODULE h = LoadLibraryW(d);
+        if (!h){ Diag("DDIPROBE 0b SCACHE LoadLibraryW " + nm + " FAILED err=" + Hex(GetLastError())); continue; }
+        std::string got; int n = 0;
+        for (const char* f : kCacheFns){
+            if (GetProcAddress(h, f)) { ++n; }
+            else { got += std::string(got.empty() ? "" : ",") + f; }
+        }
+        Diag("DDIPROBE 0b SCACHE LoadLibraryW " + nm + " OK base=" + Hex((uintptr_t)h) +
+             " exports=" + std::to_string(n) + "/9" +
+             (got.empty() ? std::string(" ALL PRESENT") : (" missing=" + got)));
     }
 }
 
@@ -22530,17 +22582,53 @@ static bool Bed_crs_start_handler()
 
 // A number from LocalState, with an environment override. Deliberately its own
 // tiny reader rather than ReadCfgW, which is defined much further down the file.
+// Every knob read says so, exactly once per knob file. This is not debug
+// scaffolding -- "was the knob actually read?" is the single most expensive
+// question in this project's history. A knob that is uploaded, acknowledged 200
+// by WDP, printed by the harness and then NOT seen by the loader produces a run
+// that looks completely normal and measures the previous configuration
+// ([[wdp-harness-silent-failures]], [[ghcfgnum-cannot-express-zero]]). #209 lost
+// three console runs to exactly that: gh_ddi_probe.txt was on disk with the
+// bytes 31 0a and GhDdiProbe() still came back 0, with nothing anywhere saying
+// which half was lying. One line per knob ends that class of question for good.
+//
+// Deduplicated by file name so a knob read on a hot path cannot flood the log,
+// and Diag is safe to call from here: it reads its own cap inline and never
+// calls back into GhCfgNum.
+static void GhCfgTrace(const wchar_t* file, const char* src, unsigned val,
+                       DWORD err, const char* raw)
+{
+    static SRWLOCK lk = SRWLOCK_INIT;
+    static std::vector<std::wstring>* seen = nullptr;
+    std::wstring w(file);
+    AcquireSRWLockExclusive(&lk);
+    if (!seen) seen = new std::vector<std::wstring>();
+    bool first = true;
+    for (const std::wstring& e : *seen) if (e == w){ first = false; break; }
+    if (first) seen->push_back(w);
+    ReleaseSRWLockExclusive(&lk);
+    if (!first) return;
+    std::string nm; for (const wchar_t* c = file; *c; ++c) nm += (char)*c;
+    std::string m = "CFG " + nm + " = " + std::to_string(val) + " (" + src + ")";
+    if (err)  m += " err=" + Hex(err);
+    if (raw && *raw) m += " raw=\"" + std::string(raw) + "\"";
+    Diag(m);
+}
+
 static unsigned GhCfgNum(const wchar_t* file, const char* envName, unsigned dflt)
 {
     char buf[32] = {};
     if (GetEnvironmentVariableA(envName, buf, sizeof buf) > 0){
         unsigned long v = strtoul(buf, nullptr, 10);
-        if (v) return (unsigned)v;
+        if (v){ GhCfgTrace(file, "env", (unsigned)v, 0, buf); return (unsigned)v; }
     }
     std::wstring path = std::wstring(kLocalState) + file;
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return dflt;
+    if (h == INVALID_HANDLE_VALUE){
+        GhCfgTrace(file, "default/NOFILE", dflt, GetLastError(), nullptr);
+        return dflt;
+    }
     char raw[64] = {}; DWORD got = 0;
     ReadFile(h, raw, sizeof raw - 1, &got, nullptr);
     CloseHandle(h);
@@ -22548,9 +22636,14 @@ static unsigned GhCfgNum(const wchar_t* file, const char* envName, unsigned dflt
     char ascii[64] = {}; size_t n = 0;
     for (DWORD i = 0; i < got && n < sizeof ascii - 1; ++i)
         if (raw[i] >= '0' && raw[i] <= '9') ascii[n++] = raw[i];
-    if (!n) return dflt;
+    if (!n){ GhCfgTrace(file, "default/NODIGITS", dflt, 0, nullptr); return dflt; }
     unsigned long v = strtoul(ascii, nullptr, 10);
-    return v ? (unsigned)v : dflt;
+    // NOTE the zero trap this reader still has, deliberately, for compatibility:
+    // a present "0" returns dflt, not 0. GhCfgNumZ is the honest reader. The
+    // trace says "file/ZERO->default" so that case can never be misread again.
+    if (!v){ GhCfgTrace(file, "file/ZERO->default", dflt, 0, ascii); return dflt; }
+    GhCfgTrace(file, "file", (unsigned)v, 0, ascii);
+    return (unsigned)v;
 }
 
 // See the declaration above: same reader, but a present zero stays zero.
