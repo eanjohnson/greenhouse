@@ -518,6 +518,10 @@ static unsigned GhDsNoGpu();              // #169: keep DirectStorage's DXIL out
 // rest in every run ever launched by the harness. Convert one knob at a time,
 // each with its own control cell.
 static unsigned GhCfgNumZ(const wchar_t* file, const char* envName, unsigned dflt);
+
+// #209. Defined with the D3D hook machinery, but called from GhDdiInstall too, so that a
+// Launcher-only session still emits the knob's CFG line and one "deferred" proof of life.
+static void GhInstallScacheShim();
 // #188. Defined next to the corpus reader further down; declared here so the
 // loader's own startup can make D:\DevelopmentFiles\ghlo and \ghmiss before the
 // host has anything to stage into them. WDP uploads into an existing
@@ -9493,6 +9497,10 @@ static void GhDdiInstall()
     // Stage 1 first: it must land before ANY D3D12 device negotiates caps, and
     // it is independent of the read-only Stage 0 probes.
     GhDdiPatchShaderModelCap();
+
+    // #209. Usually a no-op here -- umd12ddi is not loaded before the first device -- but it
+    // reads gh_scache, so the CFG line proves the knob arrived even when the DDI has not.
+    GhInstallScacheShim();
 
     if (!GhDdiProbe()) return;
 
@@ -20422,11 +20430,366 @@ static void GhUmdVaDump(int want)
     }
 }
 
+
+// ============================ #209: the ShaderCache_* pass-through shim =====================
+//
+// What this measures, and why it is the right next instrument.
+//
+// umd12ddi.dll memoizes the expensive half of a pipeline compile.  The function at
+// umd12ddi+0x00ca20 calls, in this order:
+//
+//     ShaderCache_FindLocalValue      (rva 0x00ce52)
+//     ShaderCache_FindRemoteValue     (rva 0x00d000)
+//     SC_DLL!SCSimpleCompileShader    (rva 0x00d249)   <-- the 537 ms, ONLY reached on a miss
+//     ShaderCache_ComputeLocalHashKey (rva 0x00d523)
+//     SC_DLL!SC_OutputHandle_GetShaderObject
+//     ShaderCache_AddLocalValue       (rva 0x00d723)
+//     ShaderCache_AddRemoteValue      (rva 0x00d8b5)
+//
+// The provider is real and it is HERE: cell SC1 measured, on this console, inside this app
+// container, `LoadLibraryW("scache.dll") OK base=0x7FFA22960000 exports=9/9 ALL PRESENT`.
+// scache.dll is 57,344 bytes of C:\Windows\system32, it derives its store path from the app
+// container SID via GetAppContainerFolderPath, and it keeps `%s.idx` / `%s.val` / `%s.lock`
+// on disk with an RPC tier behind Find/AddRemoteValue.  So the two-tier cache exists, and we
+// do NOT have to implement it.
+//
+// What is NOT known, and what only a run can answer:
+//
+//   1. does the driver ever CALL the cache in our process?  The gate at umd12ddi+0x4e590
+//      resolves the nine exports lazily, and on failure latches "1" and skips every cache call
+//      IN SILENCE -- which is the only reason this project has never seen a cheap launch.
+//   2. does ShaderCache_Create SUCCEED in the container?  The store lives in the same
+//      per-container folder pool whose ~35 MB quota has starved our own diag before
+//      ([[localstate-quota-starves-diag]]).
+//   3. does the local store SURVIVE a relaunch?  That is the whole 2.4-hour question: if
+//      FindLocalValue starts hitting on launch N+1, the warm pass is minutes, not hours.
+//
+// How it is built, and the two traps it is built around.
+//
+//   ARITY.  Every thunk takes five arguments and forwards five.  Five is not a guess: all nine
+//   export prologues were disassembled and the maximum observed argument count across the nine
+//   is 5 (Find/Add Local/Remote read the fifth at [rsp+0x28]; the other five are register-only).
+//   Forwarding five to a callee that reads four writes one stack slot the callee ignores, and
+//   reads one slot from our caller's own frame that the callee never sees -- both harmless.
+//   This is deliberately NOT a signature reconstruction: the #169 plan's own stop condition
+//   warns that a blind ABI guess faults into our VEH and has killed the app before.
+//
+//   TIMING.  umd12ddi is not loaded when GhDdiInstall runs (that is before the first device),
+//   so the shim installs from GhHookD12Device, where the DDI is certainly present.  The resolve
+//   may still have happened first, and cell SC proved it does: the resolve lives in the same
+//   function as the Create call (umd12ddi+0x4e590), it runs inside D3D12CreateDevice, and there
+//   is exactly ONE latch (umd12ddi+0x0f2ba8) that all eight call sites read -- CORRECTING an
+//   earlier note in this file that described eight independent latches; they are eight readers
+//   of one.  So the shim loads umd12ddi itself, ahead of D3D12Core, rather than waiting.
+//
+// Scoring: `SCACHE install`, then `SCACHE intercept <fn>` x9, then the census counters.  A run
+// with the knob on and no `SCACHE install` line is VOID, not a negative -- grep `CFG gh_scache`
+// first ([[loader-knob-reads-are-logged]]).
+static unsigned GhScacheMode()
+{
+    static const unsigned m = GhCfgNum(L"gh_scache.txt", "GH_SCACHE", 0);
+    return m;
+}
+
+enum { GH_SC_N = 9 };
+static const char* const kScNames[GH_SC_N] = {
+    "ShaderCache_Create",         "ShaderCache_Destroy",        "ShaderCache_ComputeLocalHashKey",
+    "ShaderCache_FindLocalValue", "ShaderCache_AddLocalValue",  "ShaderCache_FreeValue",
+    "ShaderCache_FindRemoteValue","ShaderCache_AddRemoteValue", "ShaderCache_Flush",
+};
+typedef uint64_t (*GhScFn5)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+static GhScFn5 g_scReal[GH_SC_N];
+static LONG    g_scCalls[GH_SC_N];
+static LONG    g_scRetNZ[GH_SC_N];   // Find* returns nonzero on a HIT (eax is tested at the site)
+static LONG    g_scTotal;
+static HMODULE g_scacheReal;
+
+static void GhScacheCensus(const char* why)
+{
+    std::string s = std::string("SCACHE census (") + why + ")";
+    for (int i = 0; i < GH_SC_N; ++i)
+        s += std::string(" ") + (kScNames[i] + 12) + "=" +
+             std::to_string((long)g_scCalls[i]) + "/nz" + std::to_string((long)g_scRetNZ[i]);
+    Diag(s);
+}
+
+// ---- gh_scache >= 2: resize the store the driver asks for --------------------------------
+//
+// The descriptor umd12ddi hands ShaderCache_Create is built on its own stack at
+// umd12ddi+0x4e590 and it is almost entirely ZEROES, which means scache.dll substitutes its
+// own defaults (read straight out of ShaderCache_Create's prologue at scache+0x2993..0x29e4):
+//
+//     +0x00 alloc fn      0  -> _o_malloc thunk
+//     +0x08 free  fn      0  -> _o_free thunk
+//     +0x10 flags         6  (bit2 = return the process-global singleton)
+//     +0x14               0x10017
+//     +0x18 store name    L"SCacheS"     -> <AppContainerFolder>\SCacheS.{idx,val,lock}
+//     +0x20               4
+//     +0x24               3  (0 here, cmove'd to 3 because D3D_DisableDiskShaderCache is absent)
+//     +0x28 bytes         0  -> 0x100000      1 MiB
+//     +0x2c entries       0  -> 0x80            128
+//     +0x30 bytes         0  -> 0x10000       64 KiB
+//     +0x34 entries       0  -> 0x10             16
+//     +0x38 bytes         0  -> 0x1000000     16 MiB
+//
+// 128 entries against this game's 16,192 pipelines is a 0.8% ceiling on the hit rate -- which
+// is a complete explanation for "no launch has ever been cheaper than the first" that costs
+// nothing to test, because every one of those five numbers is a field in a descriptor we are
+// now standing in front of.  gh_scache_x multiplies all five.  The store is a FILE written
+// through CreateFile2/WriteFile/SetFilePointerEx -- there is no CreateFileMapping in scache's
+// import table -- so a bigger store costs disk, not the 5 GiB commit budget.  What it MAY cost
+// is app-container quota, which is the same pool that has starved our own diag before
+// ([[localstate-quota-starves-diag]]); that is exactly what the cell measures.
+static unsigned GhScacheX()
+{
+    static const unsigned m = GhCfgNum(L"gh_scache_x.txt", "GH_SCACHE_X", 64);
+    return m;
+}
+
+struct GhScDescCopy { unsigned char b[0x40]; };
+
+// Isolated so /EHsc accepts __try: no C++ unwind objects may live in this frame.
+static bool GhScReadDesc(const void* src, void* dst)
+{
+    __try { memcpy(dst, src, 0x40); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Returns the descriptor to forward: either the caller's, or our resized copy.
+static uint64_t GhScResizeDesc(uint64_t desc, GhScDescCopy* tmp)
+{
+    if (GhScacheMode() < 2 || !desc) return desc;
+    const unsigned x = GhScacheX();
+    if (x <= 1) return desc;
+    if (!GhScReadDesc((const void*)(uintptr_t)desc, tmp->b)){
+        Diag("SCACHE Create descriptor unreadable -- forwarding the caller's pointer unchanged");
+        return desc;
+    }
+    static const struct { unsigned off; unsigned dflt; const char* nm; } kF[] = {
+        { 0x28, 0x100000,  "bytes0"   }, { 0x2c, 0x80, "entries0" },
+        { 0x30, 0x10000,   "bytes1"   }, { 0x34, 0x10, "entries1" },
+        { 0x38, 0x1000000, "bytes2"   },
+    };
+    std::string ln = "SCACHE Create resize x" + std::to_string(x);
+    for (const auto& f : kF){
+        unsigned* p = (unsigned*)(tmp->b + f.off);
+        unsigned  in = *p;
+        unsigned long long base = in ? (unsigned long long)in : (unsigned long long)f.dflt;
+        unsigned long long out = base * (unsigned long long)x;
+        if (out > 0xF0000000ull) out = 0xF0000000ull;     // it is a DWORD field
+        *p = (unsigned)out;
+        ln += std::string(" ") + f.nm + "=" + std::to_string((unsigned long long)base) +
+              "->" + std::to_string((unsigned long long)out);
+    }
+    Diag(ln);
+    return (uint64_t)(uintptr_t)tmp->b;
+}
+
+static uint64_t GhScDispatch(int i, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e)
+{
+    LONG n = InterlockedIncrement(&g_scCalls[i]);
+    LONG t = InterlockedIncrement(&g_scTotal);
+    GhScFn5 f = g_scReal[i];
+    GhScDescCopy tmp;
+    uint64_t orig = a;
+    if (i == 0 && n == 1) a = GhScResizeDesc(a, &tmp);   // index 0 is ShaderCache_Create
+    uint64_t r = f ? f(a, b, c, d, e) : 0;
+    // ShaderCache_Create returns an HRESULT (0x8007000E is its own OOM path at scache+0x2a13).
+    // If OUR resize is what made it fail -- the app-container folder has a quota we have not
+    // measured -- fall back to the driver's own descriptor rather than leaving the driver with
+    // no cache at all, which would be strictly worse than the 16 MiB it has today.
+    if (i == 0 && n == 1 && a != orig && r != 0){
+        Diag("SCACHE Create FAILED with the resized store -> " + Hex(r) +
+             "; retrying with the driver's own descriptor");
+        r = f ? f(orig, b, c, d, e) : 0;
+        Diag("SCACHE Create fallback -> " + Hex(r));
+    }
+    if (r) InterlockedIncrement(&g_scRetNZ[i]);
+    // The first four of each export carry the shape; after that only a heartbeat, because the
+    // game creates ~16,000 pipelines and the diag shares a ~35 MB quota with the game's log.
+    if (n <= 4 || (n & 2047) == 0)
+        Diag(std::string("SCACHE ") + (kScNames[i] + 12) + " #" + std::to_string((long)n) +
+             " a=" + Hex(a) + " b=" + Hex(b) + " c=" + Hex(c) +
+             " d=" + Hex(d) + " e=" + Hex(e) + " -> " + Hex(r));
+    if ((t & 4095) == 0) GhScacheCensus("periodic");
+    return r;
+}
+
+#define GH_SC_THUNK(ix) \
+    static uint64_t GhScT##ix(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) \
+    { return GhScDispatch(ix, a, b, c, d, e); }
+GH_SC_THUNK(0) GH_SC_THUNK(1) GH_SC_THUNK(2) GH_SC_THUNK(3) GH_SC_THUNK(4)
+GH_SC_THUNK(5) GH_SC_THUNK(6) GH_SC_THUNK(7) GH_SC_THUNK(8)
+#undef GH_SC_THUNK
+static void* const g_scThunk[GH_SC_N] = {
+    (void*)&GhScT0, (void*)&GhScT1, (void*)&GhScT2, (void*)&GhScT3, (void*)&GhScT4,
+    (void*)&GhScT5, (void*)&GhScT6, (void*)&GhScT7, (void*)&GhScT8,
+};
+
+static HMODULE (WINAPI *g_scLlwOrig)(LPCWSTR) = nullptr;
+static FARPROC (WINAPI *g_scGpaOrig)(HMODULE, LPCSTR) = nullptr;
+
+static bool GhScNameIs(const wchar_t* w, const char* a)
+{
+    if (!w || !a) return false;
+    for (;; ++w, ++a){
+        wchar_t lw = (*w >= L'A' && *w <= L'Z') ? (wchar_t)(*w + 32) : *w;
+        char    la = (*a >= 'A' && *a <= 'Z')   ? (char)(*a + 32)    : *a;
+        if (lw != (wchar_t)(unsigned char)la) return false;
+        if (!lw) return true;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #209 gh_scache >= 3 -- PUT THE STORE ON THE VOLUME THAT HAS ROOM.
+//
+// MEASURED 2026-09-16, and it is why cell SC4warm died at t=364 s with both logs
+// frozen: the LocalAppData volume (U:) is 3.0 GB TOTAL for every package on the
+// console, and it had ~4 MiB free.  A 4 MiB upload into \LocalState was refused
+// with ERROR_DISK_FULL (0x80070070) while the 43.7 MiB SCacheS.val that cell
+// SC2cold built sat in \AC; deleting that one file made 32 MiB uploads pass
+// again.  D:\DevelopmentFiles -- the Dev-Mode scratch the GAME is installed on --
+// took 32 MiB in the same minute.  Two volumes, and only one of them can hold a
+// shader cache sized for 16,192 pipelines.
+//
+// Read [[localstate-quota-starves-diag]] again in that light: the "~35 MB
+// LocalState quota" was never a per-package quota, it is this 3.0 GB volume with
+// everything else already on it.  Diag is unbuffered -- one CreateFileW /
+// WriteFile / CloseHandle per line -- so when the volume fills, every loader line
+// AND every line of the game's own log stops reaching disk while the process runs
+// on.  That is exactly the SC4warm signature: 421,874 bytes of diag, ending on a
+// clean newline, while WDP still saw the process at ws=4,016 MB two minutes later.
+// A cell that fills the volume is VOID, not a negative, because the instrument
+// goes away before the measurement does.
+//
+// scache.dll builds its store path in ONE place (scache+0x2100): OpenProcessToken
+// -> GetTokenInformation(0x1f) -> ConvertSidToStringSidW -> GetAppContainerFolderPath
+// -> "<folder>\<name>.idx/.val/.lock".  GetAppContainerFolderPath is a single IAT
+// entry (USERENV.dll, one import), and scache releases the result with
+// CoTaskMemFree -- which it also imports -- so the hook only has to hand back a
+// CoTaskMemAlloc'd string and everything downstream is unchanged.  We patch it on
+// scache's own IAT, not process-wide, so nothing else in the process is affected.
+// ---------------------------------------------------------------------------
+static const wchar_t kScStoreDir[] = L"D:\\DevelopmentFiles\\ghsc";
+
+static HRESULT (WINAPI *g_scAcfpOrig)(PCWSTR, PWSTR*) = nullptr;
+
+static HRESULT WINAPI Hook_ScAppContainerFolderPath(PCWSTR sid, PWSTR* out)
+{
+    if (GhScacheMode() >= 3 && out){
+        const size_t n = wcslen(kScStoreDir) + 1;
+        PWSTR p = (PWSTR)CoTaskMemAlloc(n * sizeof(wchar_t));
+        if (p){
+            memcpy(p, kScStoreDir, n * sizeof(wchar_t));
+            *out = p;
+            static LONG said = 0;
+            if (InterlockedCompareExchange(&said, 1, 0) == 0)
+                Diag("SCACHE store redirected to D:\\DevelopmentFiles\\ghsc"
+                     " (U: is a 3.0 GB volume shared by every package; D: has the game on it)");
+            return S_OK;
+        }
+        Diag("SCACHE redirect: CoTaskMemAlloc failed -- falling back to the AC folder");
+    }
+    return g_scAcfpOrig ? g_scAcfpOrig(sid, out) : E_FAIL;
+}
+
+// Called the moment umd12ddi's LoadLibraryW hands back scache's HMODULE, which is
+// before any export has been resolved and therefore long before the path is built.
+static void GhScInstallRedirect(HMODULE sc)
+{
+    if (!sc || GhScacheMode() < 3) return;
+    static LONG once = 0;
+    if (InterlockedCompareExchange(&once, 1, 0) != 0) return;
+    // WDP can upload into D:\DevelopmentFiles but cannot create a subdirectory
+    // there, so the loader makes this one -- same idiom as ghlo/ghmiss above.
+    DWORD mk = CreateDirectoryW(kScStoreDir, nullptr) ? 0 : GetLastError();
+    if (mk == ERROR_ALREADY_EXISTS) mk = 0;
+    bool ok = GhPatchHostImport(sc, "GetAppContainerFolderPath",
+                                (void*)&Hook_ScAppContainerFolderPath, (void**)&g_scAcfpOrig);
+    Diag(std::string("SCACHE redirect install dir=") + (mk ? "err " + Hex(mk) : std::string("ok")) +
+         " acfp=" + (ok ? "1" : "0") +
+         (ok ? "" : " -- scache does not import GetAppContainerFolderPath through its IAT;"
+                    " the redirect is VOID and the store stays in \\AC"));
+}
+
+static HMODULE WINAPI Hook_ScLoadLibraryW(LPCWSTR name)
+{
+    HMODULE h = g_scLlwOrig ? g_scLlwOrig(name) : LoadLibraryW(name);
+    if (name && (GhScNameIs(name, "scache.dll") || GhScNameIs(name, "scache_lnm.dll"))){
+        std::string nm; for (const wchar_t* c = name; *c; ++c) nm += (char)*c;
+        if (h) g_scacheReal = h;
+        Diag("SCACHE umd12ddi LoadLibraryW " + nm + " -> " + Hex((uint64_t)(uintptr_t)h) +
+             (h ? std::string("") : " err=" + Hex(GetLastError())));
+        GhScInstallRedirect(h);   // #209 gh_scache>=3, before the first export resolves
+    }
+    return h;
+}
+
+static FARPROC WINAPI Hook_ScGetProcAddress(HMODULE h, LPCSTR fn)
+{
+    FARPROC p = g_scGpaOrig ? g_scGpaOrig(h, fn) : GetProcAddress(h, fn);
+    if (h && h == g_scacheReal && fn && (uintptr_t)fn > 0xffff){
+        for (int i = 0; i < GH_SC_N; ++i){
+            if (strcmp(fn, kScNames[i]) != 0) continue;
+            if (!p){ Diag(std::string("SCACHE GetProcAddress ") + fn + " -> NULL (driver will latch disabled)"); break; }
+            g_scReal[i] = (GhScFn5)p;
+            Diag(std::string("SCACHE intercept ") + (kScNames[i] + 12) +
+                 " real=" + Hex((uint64_t)(uintptr_t)p) +
+                 " thunk=" + Hex((uint64_t)(uintptr_t)g_scThunk[i]));
+            return (FARPROC)g_scThunk[i];
+        }
+    }
+    return p;
+}
+
+static void GhInstallScacheShim()
+{
+    if (!GhScacheMode()) return;
+    static LONG done = 0;
+    if (InterlockedCompareExchange(&done, 0, 0) != 0) return;
+    HMODULE u = GetModuleHandleW(L"umd12ddi.dll");
+    // We have to be in front of ShaderCache_Create, and Create happens ONCE, inside
+    // D3D12CreateDevice, from umd12ddi+0x4e590 -- which is strictly before GhHookD12Device.
+    // Cell SC measured exactly that: `llw=1 gpa=1` and then not one `SCACHE intercept` in 644
+    // pipelines, because the resolve had already run.  So when the DDI is not loaded yet, load
+    // it OURSELVES and patch its IAT now; D3D12Core's own LoadLibrary then returns the same
+    // HMODULE (ntdll dedups by resolved path) and finds the imports already redirected.
+    bool preloaded = false;
+    if (!u){
+        u = LoadLibraryW(L"umd12ddi.dll");
+        preloaded = (u != nullptr);
+        if (!u){
+            static LONG said = 0;
+            if (InterlockedCompareExchange(&said, 1, 0) == 0)
+                Diag("SCACHE install deferred -- umd12ddi neither loaded nor loadable, err=" +
+                     Hex(GetLastError()));
+            return;
+        }
+    }
+    if (InterlockedCompareExchange(&done, 1, 0) != 0) return;
+    HMODULE already = GetModuleHandleW(L"scache.dll");
+    if (already) g_scacheReal = already;   // so a LATER call site's GetProcAddress still matches
+    GhScInstallRedirect(already);          // #209 gh_scache>=3; no-op when scache is not up yet
+    bool ll = GhPatchHostImport(u, "LoadLibraryW",   (void*)&Hook_ScLoadLibraryW,  (void**)&g_scLlwOrig);
+    bool gp = GhPatchHostImport(u, "GetProcAddress", (void*)&Hook_ScGetProcAddress, (void**)&g_scGpaOrig);
+    Diag(std::string("SCACHE install umd12ddi base=") + Hex((uint64_t)(uintptr_t)u) +
+         (preloaded ? " (WE preloaded it)" : " (already loaded)") +
+         " llw=" + (ll ? "1" : "0") + " gpa=" + (gp ? "1" : "0") +
+         " scacheAlreadyLoaded=" +
+         (already ? Hex((uint64_t)(uintptr_t)already) +
+                    " (LATE -- an already-run call site is past us; the other seven latches are not)"
+                  : std::string("no (EARLY -- every resolve is still ahead of us)")));
+    if (!ll || !gp)
+        Diag("SCACHE install INCOMPLETE -- umd12ddi does not import that name through its IAT;"
+             " the cell is VOID, not a negative");
+}
+
 static void GhHookD12Device(ID3D12Device* dev)
 {
     GhInstallUmdVaTrace();
     GhInstallCoreHeapTrace();   // #158 gh_va_trace>=3
     GhInstallSecTrace();        // #158 gh_va_trace>=4
+    GhInstallScacheShim();      // #209 gh_scache>=1
     GhUploadHeapRoundTrip(dev);
     GhBreadcrumbInit(dev);
     if (!dev || InterlockedCompareExchange(&g_d12vtHooked, 1, 0) != 0) return;
