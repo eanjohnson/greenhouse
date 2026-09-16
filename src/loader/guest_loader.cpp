@@ -532,6 +532,7 @@ static const std::wstring& GhCorpusDir();
 static void GhCheckDeviceRemoved(const char* where,
                                  ID3D12Device* dev = nullptr); // #158 removal + DRED
 static std::string GhLazyStats();                             // #145 demand-commit counters
+static void        GhLazyWhoDump(const char* where);          // #213 who promised it, who touched it
 static void GhIssuedPairsDump(const char* when);              // #158 executed-barrier tally
 static void GhBarrFlushPending(ID3D12GraphicsCommandList* self); // #158 coalescing
 // #158 one entry of the game's captured frame program; replayed by GhRtTest.
@@ -20245,6 +20246,7 @@ static void GhLogMemoryBudget(const char* where)
     }
     ln += GhLazyStats();
     Diag(ln);
+    GhLazyWhoDump(where);                         // #213
     GhVaCensus(where, appUsed, appLimit);
 }
 
@@ -25168,11 +25170,13 @@ static void GhArenaLog(const std::string& msg)
 // A per-granule bitmap makes the accounting honest (a second toucher must not
 // count the same granule twice) and is manipulated with lock-free bit-test-and-
 // set, so the fault path holds only the shared lock.
+struct GhLazyAcct;
 struct GhLazyRange {
-    uint8_t* base;
-    uint64_t size;
-    DWORD    prot;
-    LONG*    bits;        // one bit per granule, 1 = committed
+    uint8_t*     base;
+    uint64_t     size;
+    DWORD        prot;
+    LONG*        bits;        // one bit per granule, 1 = committed
+    GhLazyAcct*  acct;        // #213, null unless gh_lazy_who
 };
 static SRWLOCK                  g_lazyLock = SRWLOCK_INIT;
 static std::vector<GhLazyRange> g_lazy;              // sorted by base
@@ -25186,6 +25190,150 @@ static volatile LONG            g_lazyLogs      = 0;
 static bool                     g_lazyOn        = false;
 static uint64_t                 g_lazyGran      = 64u << 10;
 static uint64_t                 g_lazyMin       = 16ull << 20;
+
+// #213. `lazysaved` is the container's only free variable -- appused + lazysaved
+// is a constant ~5,089 MB (GREENHOUSE.md 32.41) -- and two runs of the SAME
+// binary with the SAME knobs land 493 MB apart on it. The counters above are
+// process-wide totals, so they can say how much was touched but never WHICH
+// promise or BY WHOM, and the promises are not interchangeable: one 548 MB
+// range and one 470 MB range are most of the spread between them.
+//
+// gh_lazy_who is read-only instrumentation; the pager behaves identically:
+//   1  per-range attribution -- each range remembers the guest RVA that asked
+//      for it, the bytes actually faulted in, and when the first and last
+//      granule landed
+//   2  + a census of the faulting RIPs, so the toucher is named too
+static unsigned g_lazyWho = 0;
+static LONG64   g_lazyT0  = 0;
+
+// #213. Our OWN shim runs an address-space sweep (gh_find_connected_ccm in
+// corpus/shims/gh_steam_engine.h) that reads every committed PAGE_READWRITE
+// region <= 512 MB in 64 KB chunks, looking for steamclient's CCMInterface.
+// PatchModuleForGuest(stm, "steam_api64.dll") rewrites the shim's IAT with
+// Bed_VirtualQuery, so that sweep sees the #145 MEM_RESERVE -> MEM_COMMIT
+// promise as real readable memory and reads all of it -- forcing a genuine
+// commit of every granule it touches. Measured (WHO1..WHO4): one 548 MB
+// guest range, worth 521.5 MB of the 5,120 MB container.
+//
+// The lie exists for the GUEST, which must believe it owns what it asked for.
+// Our own code has no such need, so by default we now report the truth -- plain
+// MEM_RESERVE -- when the return address lies inside the shim image, and the
+// scanner's own `State == MEM_COMMIT` filter skips the promise untouched.
+//
+// Measured, two matched pairs at matched res and heapMB (T0a/T1a, T0b/T1b):
+// appused -601.4 / -609.7 MB, container headroom 97 -> 699 MB and 108 -> 718 MB,
+// and steam_api64.dll+0x1FD7D falls out of the LAZYRIP census entirely (771 MB
+// -> absent). `lazysaved` stops being bimodal: 739.1 MB in both fixed runs.
+//
+// The knob is the ESCAPE HATCH, not the fix: gh_lazy_shim_lie=1 restores the
+// old behaviour for an A/B. It is deliberately default-0 and sensed that way
+// because run30N.py writes '0' for every slot a runargs does not supply -- a
+// default-ON knob here would be silently disabled by every pre-#213 runargs.
+static unsigned      g_lazyShimLie   = 0;
+static volatile LONG g_lazyTruthHits = 0;
+static uint8_t*      g_shimBase      = nullptr;
+static volatile LONG64 g_shimSize    = 0;      // nonzero == resolved
+
+static bool GhRaInShim(void* ra)
+{
+    if (!ra) return false;
+    LONG64 sz = InterlockedCompareExchange64(&g_shimSize, 0, 0);
+    if (!sz){
+        HMODULE h = GetModuleHandleA("steam_api64.dll");
+        if (!h) return false;                       // shim not up yet: nothing to protect
+        IMAGE_DOS_HEADER*   d  = (IMAGE_DOS_HEADER*)h;
+        IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)((uint8_t*)h + d->e_lfanew);
+        if (d->e_magic != IMAGE_DOS_SIGNATURE || nt->Signature != IMAGE_NT_SIGNATURE) return false;
+        g_shimBase = (uint8_t*)h;                   // base first; size is the guard
+        sz = (LONG64)nt->OptionalHeader.SizeOfImage;
+        InterlockedExchange64(&g_shimSize, sz);
+    }
+    return (uint8_t*)ra >= g_shimBase && (uint8_t*)ra < g_shimBase + (uint64_t)sz;
+}
+
+struct GhLazyAcct {
+    uint8_t*        base;
+    uint64_t        size;
+    uint64_t        site;        // return address of the guest that promised it
+    volatile LONG64 committed;
+    volatile LONG64 firstMs;
+    volatile LONG64 lastMs;
+    volatile LONG   faults;
+};
+static std::vector<GhLazyAcct*> g_lazyAcct;   // append-only, guarded by g_lazyLock
+
+// The fault path must not allocate and must not take a second lock, so the
+// toucher census is a fixed open-addressed table claimed with one interlocked
+// compare-exchange. A full table drops the sample rather than block.
+struct GhLazyRip { volatile LONG64 rip; volatile LONG64 bytes; volatile LONG n; };
+static GhLazyRip     g_lazyRip[256];       // the faulting instruction
+static GhLazyRip     g_lazyOwn[256];       // #213 who>=3: the guest frame behind it
+static GhLazyRip     g_lazyRet[256];       // #213 who>=3: the value at [rsp] -- the direct caller
+static GhLazyRip     g_lazyTid[256];       // #213 who>=3: which thread did the touching
+static volatile LONG g_lazyRipLost = 0;
+
+static void GhLazyNoteInto(GhLazyRip* tbl, uint64_t key, uint64_t bytes)
+{
+    if (!key) return;
+    const size_t mask = 255;
+    size_t h = (size_t)(((key >> 4) ^ (key >> 20)) & (uint64_t)mask);
+    for (size_t i = 0; i <= mask; ++i){
+        GhLazyRip& e = tbl[(h + i) & mask];
+        const LONG64 cur = InterlockedCompareExchange64(&e.rip, (LONG64)key, 0);
+        if (cur == 0 || cur == (LONG64)key){
+            InterlockedExchangeAdd64(&e.bytes, (LONG64)bytes);
+            InterlockedIncrement(&e.n);
+            return;
+        }
+    }
+    InterlockedIncrement(&g_lazyRipLost);
+}
+static inline void GhLazyNoteRip(uint64_t rip, uint64_t bytes){ GhLazyNoteInto(g_lazyRip, rip, bytes); }
+
+// #213 (who>=3). The faulting RIP names an instruction, and when that
+// instruction is inside a memcpy the answer is "a CRT" -- true and useless.
+// WHO1 measured 773 MB of 1,643 arriving through one such copy, so the owner
+// has to be recovered from the stack: the first return address in a bounded
+// window above RSP that lands inside the guest image is the game code that
+// wanted the page. Bounded by the TEB's own StackLimit/StackBase, because
+// scanning past StackBase is exactly what #207 costs.
+static void GhLazyNoteOwner(const CONTEXT* ctx, uint64_t bytes)
+{
+    if (!ctx || !g_guestImageBase) return;
+    BYTE* teb = (BYTE*)NtCurrentTeb();
+    uint8_t* hi = *(uint8_t**)(teb + 0x08);      // StackBase
+    uint8_t* lo = *(uint8_t**)(teb + 0x10);      // StackLimit
+    uint64_t* sp = (uint64_t*)(uintptr_t)ctx->Rsp;
+    if (!hi || !lo || (uint8_t*)sp < lo || (uint8_t*)sp >= hi) return;
+    const uint64_t gb = (uint64_t)(uintptr_t)g_guestImageBase;
+    const uint64_t ge = gb + (uint64_t)g_guestImageSize;
+    // WHO3 put 775 MB of 1,643 in "no guest frame", with a 48-qword window --
+    // 384 bytes, which one frame with a local buffer swallows whole. Widen it
+    // to 4 KB, and record the direct caller and the thread separately: if the
+    // touching thread is not a guest thread then no window depth would have
+    // found a guest frame, and that is the answer rather than a miss.
+    GhLazyNoteInto(g_lazyTid, (uint64_t)GetCurrentThreadId(), bytes);
+    if ((uint8_t*)(sp + 1) <= hi) GhLazyNoteInto(g_lazyRet, sp[0], bytes);
+    for (int i = 0; i < 512 && (uint8_t*)(sp + i + 1) <= hi; ++i){
+        const uint64_t v = sp[i];
+        if (v >= gb && v < ge){ GhLazyNoteInto(g_lazyOwn, v, bytes); return; }
+    }
+    GhLazyNoteInto(g_lazyOwn, 1, bytes);          // no guest frame in 4 KB of stack
+}
+
+// Called from the fault path and from the kernel-write rescue, which passes
+// rip=1 so the two channels stay distinguishable in the census.
+static inline void GhLazyNoteCommit(GhLazyAcct* a, uint64_t bytes, uint64_t rip, const CONTEXT* ctx = nullptr)
+{
+    if (!a) return;
+    InterlockedExchangeAdd64(&a->committed, (LONG64)bytes);
+    InterlockedIncrement(&a->faults);
+    const LONG64 ms = (LONG64)(GetTickCount64() - (ULONGLONG)g_lazyT0);
+    InterlockedCompareExchange64(&a->firstMs, ms, -1);
+    InterlockedExchange64(&a->lastMs, ms);
+    if (g_lazyWho >= 2) GhLazyNoteRip(rip, bytes);
+    if (g_lazyWho >= 3) GhLazyNoteOwner(ctx, bytes);
+}
 
 static void GhLazyLog(const std::string& m)
 {
@@ -25205,7 +25353,15 @@ static bool GhLazyOn()
             while (g < ((uint64_t)kb << 10)) g <<= 1;      // round up to a power of two
             g_lazyGran = g;
             g_lazyMin  = (uint64_t)GhCfgNum(L"gh_lazy_min_mb.txt", "GH_LAZY_MIN_MB", 16) << 20;
-            Diag("LAZY on gran=" + Hex(g_lazyGran) + " min=" + Hex(g_lazyMin));
+            // #213: attribute the commits. Read-only; see the block above.
+            g_lazyWho  = GhCfgNumZ(L"gh_lazy_who.txt", "GH_LAZY_WHO", 0);
+            // #213: stop lying to our own shim. See GhRaInShim above. 1 = the
+            // pre-#213 behaviour (lie to everyone), for A/B only.
+            g_lazyShimLie = GhCfgNumZ(L"gh_lazy_shim_lie.txt", "GH_LAZY_SHIM_LIE", 0);
+            g_lazyT0   = (LONG64)GetTickCount64();
+            Diag("LAZY on gran=" + Hex(g_lazyGran) + " min=" + Hex(g_lazyMin) +
+                 " who=" + std::to_string((unsigned long)g_lazyWho) +
+                 " shimlie=" + std::to_string((unsigned long)g_lazyShimLie));
         } else {
             Diag("LAZY off (no gh_lazy_mb.txt)");
         }
@@ -25215,10 +25371,18 @@ static bool GhLazyOn()
 
 // Records a range as promised-but-not-committed. Caller must have satisfied
 // itself that the whole span is reserved and uncommitted.
-static bool GhLazyAdd(uint8_t* base, uint64_t size, DWORD prot)
+static bool GhLazyAdd(uint8_t* base, uint64_t size, DWORD prot, uint64_t site)
 {
     uint64_t grans = (size + g_lazyGran - 1) / g_lazyGran;
     LONG*    bits  = new LONG[(grans + 31) / 32]();
+    // #213. Allocated before the lock so the fault path can read it through the
+    // range with no second lookup; -1 is "no granule has landed yet".
+    GhLazyAcct* acct = nullptr;
+    if (g_lazyWho){
+        acct = new GhLazyAcct();
+        acct->base = base; acct->size = size; acct->site = site;
+        acct->committed = 0; acct->firstMs = -1; acct->lastMs = -1; acct->faults = 0;
+    }
     bool     added = false;
     AcquireSRWLockExclusive(&g_lazyLock);
     // Ranges must not overlap. GhLazyLocate binary-searches for the last range
@@ -25230,12 +25394,13 @@ static bool GhLazyAdd(uint8_t* base, uint64_t size, DWORD prot)
     if (!clash){
         auto at = std::lower_bound(g_lazy.begin(), g_lazy.end(), base,
                                    [](const GhLazyRange& x, uint8_t* b){ return x.base < b; });
-        g_lazy.insert(at, GhLazyRange{ base, size, prot ? prot : PAGE_READWRITE, bits });
+        g_lazy.insert(at, GhLazyRange{ base, size, prot ? prot : PAGE_READWRITE, bits, acct });
         InterlockedExchange(&g_lazyCount, (LONG)g_lazy.size());
+        if (acct) g_lazyAcct.push_back(acct);
         added = true;
     }
     ReleaseSRWLockExclusive(&g_lazyLock);
-    if (!added){ delete[] bits; return false; }
+    if (!added){ delete[] bits; delete acct; return false; }
     InterlockedExchangeAdd64(&g_lazyPromised, (LONG64)size);
     return true;
 }
@@ -25253,10 +25418,12 @@ static GhLazyRange* GhLazyLocate(const void* p)
 }
 
 // The fault path. Must not allocate, must not log, must not recurse.
-static bool GhLazyFault(void* addr)
+static bool GhLazyFault(void* addr, const CONTEXT* ctx)
 {
+    const uint64_t rip = ctx ? (uint64_t)ctx->Rip : 0;
     if (InterlockedCompareExchange(&g_lazyCount, 0, 0) == 0) return false;
     uint8_t* base = nullptr; uint64_t gsize = 0; DWORD prot = 0; LONG bit = 0; LONG* bits = nullptr;
+    GhLazyAcct* acct = nullptr;
     AcquireSRWLockShared(&g_lazyLock);
     if (GhLazyRange* r = GhLazyLocate(addr)){
         uint64_t off = (uint64_t)((uint8_t*)addr - r->base) & ~(g_lazyGran - 1);
@@ -25265,6 +25432,7 @@ static bool GhLazyFault(void* addr)
         prot  = r->prot;
         bits  = r->bits;
         bit   = (LONG)(off / g_lazyGran);
+        acct  = r->acct;
     }
     ReleaseSRWLockShared(&g_lazyLock);
     if (!base) return false;
@@ -25275,7 +25443,10 @@ static bool GhLazyFault(void* addr)
         InterlockedIncrement(&g_lazyFailed);
         return false;                       // genuinely out of memory: report it honestly
     }
-    if (first) InterlockedExchangeAdd64(&g_lazyCommitted, (LONG64)gsize);
+    if (first){
+        InterlockedExchangeAdd64(&g_lazyCommitted, (LONG64)gsize);
+        GhLazyNoteCommit(acct, gsize, rip, ctx);    // #213
+    }
     InterlockedIncrement(&g_lazyFaults);
     return true;
 }
@@ -25308,6 +25479,7 @@ static bool GhLazyMaterialise(const void* addr, SIZE_T size)
             if (!_interlockedbittestandset(r.bits, (LONG)(o / g_lazyGran))){
                 uint64_t g = (r.size - o < g_lazyGran) ? (r.size - o) : g_lazyGran;
                 InterlockedExchangeAdd64(&g_lazyCommitted, (LONG64)g);
+                GhLazyNoteCommit(r.acct, g, 1);     // #213: rip=1 is "kernel rescue"
             }
         did = true;
     }
@@ -25355,7 +25527,98 @@ static std::string GhLazyStats()
            " lazysaved=" + Hex((uint64_t)(promised > committed ? promised - committed : 0)) +
            " lazyfaults=" + std::to_string((long)InterlockedCompareExchange(&g_lazyFaults, 0, 0)) +
            " lazyfailed=" + std::to_string((long)InterlockedCompareExchange(&g_lazyFailed, 0, 0)) +
-           " lazynoaccess=" + std::to_string((long)InterlockedCompareExchange(&g_lazyNoAccess, 0, 0));
+           " lazynoaccess=" + std::to_string((long)InterlockedCompareExchange(&g_lazyNoAccess, 0, 0)) +
+           " lazytruth=" + std::to_string((long)InterlockedCompareExchange(&g_lazyTruthHits, 0, 0));
+}
+
+// #213. One line per promised range, largest committed first, plus the top
+// touching RIPs. Capped: LocalState's quota is shared with the game's own log.
+static volatile LONG g_lazyWhoDumps = 0;
+static void GhLazyWhoDump(const char* where)
+{
+    if (!g_lazyWho) return;
+    if (InterlockedIncrement(&g_lazyWhoDumps) > 80) return;
+    std::vector<GhLazyAcct*> v;
+    AcquireSRWLockShared(&g_lazyLock);
+    v = g_lazyAcct;
+    ReleaseSRWLockShared(&g_lazyLock);
+    if (v.empty()) return;
+    std::sort(v.begin(), v.end(), [](GhLazyAcct* a, GhLazyAcct* b){
+        return InterlockedCompareExchange64(&a->committed, 0, 0) >
+               InterlockedCompareExchange64(&b->committed, 0, 0); });
+    uint64_t tot = 0, totp = 0;
+    for (auto* a : v){ tot += (uint64_t)InterlockedCompareExchange64(&a->committed, 0, 0); totp += a->size; }
+    Diag(std::string("LAZYWHO at=") + (where ? where : "?") +
+         " ranges=" + std::to_string((unsigned long)v.size()) +
+         " promised=" + Hex(totp) + " committed=" + Hex(tot));
+    const size_t n = v.size() < 14 ? v.size() : 14;
+    for (size_t i = 0; i < n; ++i){
+        GhLazyAcct* a = v[i];
+        const uint64_t c = (uint64_t)InterlockedCompareExchange64(&a->committed, 0, 0);
+        if (!c && i) break;                       // the rest are untouched
+        Diag("  LAZYWHO #" + std::to_string((unsigned long)i) +
+             " base=" + Hex((uint64_t)(uintptr_t)a->base) +
+             " size=" + Hex(a->size) + " comm=" + Hex(c) +
+             " pct=" + std::to_string((unsigned long)(a->size ? (c * 100) / a->size : 0)) +
+             " f=" + std::to_string((long)InterlockedCompareExchange(&a->faults, 0, 0)) +
+             " firstMs=" + std::to_string((long long)InterlockedCompareExchange64(&a->firstMs, 0, 0)) +
+             " lastMs=" + std::to_string((long long)InterlockedCompareExchange64(&a->lastMs, 0, 0)) +
+             " by=" + NameForCodeAddr((uintptr_t)a->site));
+    }
+    if (g_lazyWho < 2) return;
+    struct GhRipE { uint64_t rip; uint64_t bytes; long n; };
+    std::vector<GhRipE> e;
+    for (auto& s : g_lazyRip){
+        const LONG64 r = InterlockedCompareExchange64(&s.rip, 0, 0);
+        if (r) e.push_back(GhRipE{ (uint64_t)r,
+                                   (uint64_t)InterlockedCompareExchange64(&s.bytes, 0, 0),
+                                   (long)InterlockedCompareExchange(&s.n, 0, 0) });
+    }
+    std::sort(e.begin(), e.end(), [](const GhRipE& a, const GhRipE& b){ return a.bytes > b.bytes; });
+    const size_t m = e.size() < 14 ? e.size() : 14;
+    for (size_t i = 0; i < m; ++i)
+        Diag("  LAZYRIP #" + std::to_string((unsigned long)i) +
+             " MB=" + std::to_string((unsigned long)(e[i].bytes >> 20)) +
+             " n=" + std::to_string(e[i].n) +
+             " at=" + (e[i].rip == 1 ? std::string("kernel-rescue")
+                                     : NameForCodeAddr((uintptr_t)e[i].rip)));
+    if (g_lazyRipLost)
+        Diag("  LAZYRIP table full, lost=" + std::to_string((long)g_lazyRipLost));
+    if (g_lazyWho < 3) return;
+    std::vector<GhRipE> o;
+    for (auto& s : g_lazyOwn){
+        const LONG64 r = InterlockedCompareExchange64(&s.rip, 0, 0);
+        if (r) o.push_back(GhRipE{ (uint64_t)r,
+                                   (uint64_t)InterlockedCompareExchange64(&s.bytes, 0, 0),
+                                   (long)InterlockedCompareExchange(&s.n, 0, 0) });
+    }
+    std::sort(o.begin(), o.end(), [](const GhRipE& a, const GhRipE& b){ return a.bytes > b.bytes; });
+    const size_t k = o.size() < 14 ? o.size() : 14;
+    for (size_t i = 0; i < k; ++i)
+        Diag("  LAZYOWN #" + std::to_string((unsigned long)i) +
+             " MB=" + std::to_string((unsigned long)(o[i].bytes >> 20)) +
+             " n=" + std::to_string(o[i].n) +
+             " at=" + (o[i].rip == 1 ? std::string("no-guest-frame")
+                                     : NameForCodeAddr((uintptr_t)o[i].rip)));
+    auto dumpTbl = [](GhLazyRip* tbl, const char* label, bool asCode){
+        std::vector<GhRipE> v;
+        for (size_t i = 0; i < 256; ++i){
+            const LONG64 r = InterlockedCompareExchange64(&tbl[i].rip, 0, 0);
+            if (r) v.push_back(GhRipE{ (uint64_t)r,
+                                       (uint64_t)InterlockedCompareExchange64(&tbl[i].bytes, 0, 0),
+                                       (long)InterlockedCompareExchange(&tbl[i].n, 0, 0) });
+        }
+        std::sort(v.begin(), v.end(), [](const GhRipE& a, const GhRipE& b){ return a.bytes > b.bytes; });
+        const size_t m = v.size() < 10 ? v.size() : 10;
+        for (size_t i = 0; i < m; ++i)
+            Diag(std::string("  ") + label + " #" + std::to_string((unsigned long)i) +
+                 " MB=" + std::to_string((unsigned long)(v[i].bytes >> 20)) +
+                 " n=" + std::to_string(v[i].n) + " at=" +
+                 (asCode ? NameForCodeAddr((uintptr_t)v[i].rip)
+                         : std::to_string((unsigned long)v[i].rip)));
+    };
+    dumpTbl(g_lazyRet, "LAZYRET", true);
+    dumpTbl(g_lazyTid, "LAZYTID", false);
 }
 
 // The guest asked for private commit and must be told it has private commit.
@@ -25369,8 +25632,15 @@ static SIZE_T WINAPI Bed_VirtualQuery(LPCVOID addr, PMEMORY_BASIC_INFORMATION mb
     if (r && mbi && len >= sizeof(MEMORY_BASIC_INFORMATION) && mbi->State == MEM_RESERVE){
         DWORD prot = 0;
         if (GhLazyFind(addr, &prot)){
-            mbi->State   = MEM_COMMIT;
-            mbi->Protect = prot;
+            // #213. The promise is for the guest. When our own shim asks, tell it
+            // the truth so its CCM heap-scan skips the range instead of reading
+            // -- and thereby committing -- every granule of it.
+            if (!g_lazyShimLie && GhRaInShim(_ReturnAddress())){
+                InterlockedIncrement(&g_lazyTruthHits);
+            } else {
+                mbi->State   = MEM_COMMIT;
+                mbi->Protect = prot;
+            }
         }
     }
     if (r && mbi && len >= sizeof(MEMORY_BASIC_INFORMATION) && mbi->Type == MEM_MAPPED){
@@ -25471,7 +25741,7 @@ static LPVOID WINAPI Bed_VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWOR
         if (VirtualQuery(addr, &mbi, sizeof mbi) == sizeof mbi &&
             mbi.State == MEM_RESERVE &&
             (uint8_t*)addr + size <= (uint8_t*)mbi.BaseAddress + mbi.RegionSize){
-            if (GhLazyAdd((uint8_t*)addr, (uint64_t)size, prot)){
+            if (GhLazyAdd((uint8_t*)addr, (uint64_t)size, prot, (uint64_t)(uintptr_t)_ReturnAddress())){
             GhLazyLog("promise addr=" + Hex((uint64_t)(uintptr_t)addr) + " size=" + Hex((uint64_t)size) +
                       " prot=" + Hex((uint32_t)prot) +
                       " from=" + NameForCodeAddr((uintptr_t)_ReturnAddress()));
@@ -25483,7 +25753,7 @@ static LPVOID WINAPI Bed_VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWOR
     // commit. The guest gets an address it can use either way.
     if ((type & MEM_COMMIT) && (type & MEM_RESERVE) && GhLazyOn() && size >= g_lazyMin){
         if (LPVOID q = VirtualAlloc(addr, size, type & ~(DWORD)MEM_COMMIT, PAGE_READWRITE)){
-            if (!GhLazyAdd((uint8_t*)q, (uint64_t)size, prot))
+            if (!GhLazyAdd((uint8_t*)q, (uint64_t)size, prot, (uint64_t)(uintptr_t)_ReturnAddress()))
                 return VirtualAlloc(q, size, MEM_COMMIT, prot);   // overlap: do it for real
             GhLazyLog("promise+reserve addr=" + Hex((uint64_t)(uintptr_t)q) + " size=" + Hex((uint64_t)size) +
                       " prot=" + Hex((uint32_t)prot) +
@@ -27306,7 +27576,7 @@ static LONG GhCrashObserverVehBody(EXCEPTION_POINTERS* ep)
     // probes would be handed to the crash reporter as a genuine fault.
     if (ep->ExceptionRecord->ExceptionCode == (DWORD)EXCEPTION_ACCESS_VIOLATION &&
         ep->ExceptionRecord->NumberParameters >= 2 &&
-        GhLazyFault((void*)ep->ExceptionRecord->ExceptionInformation[1]))
+        GhLazyFault((void*)ep->ExceptionRecord->ExceptionInformation[1], ep->ContextRecord))
         return EXCEPTION_CONTINUE_EXECUTION;
     // #202 arena view recycling, for the same reason and in the same place: a
     // touch on a slice whose view we dropped is a memory repair, not a fault.
