@@ -8411,6 +8411,479 @@ static void GhPsoReplay(ID3D12Device* dev);   // #181, defined after the bindles
 static volatile LONG g_psoCallSeq = 0;
 static void GhPsoCanaryTick(ID3D12Device* dev);  // #181 cell J, defined beside the replay
 
+// ======================= #211: the heap billing probe =======================
+//
+// #209 left #202 stated cleanly for the first time. With the driver's shader
+// cache warm the game STILL dies out of memory -- in 244 s instead of 7,326,
+// at psoN 1,729 instead of 13,648, but with the same ~29,600 resources and the
+// same ~6.4 GiB behind it. So the compile was pacing the load, not causing the
+// wall, and what is left is the game's resident set against a 5.12 GiB
+// container. The largest single identified line item there is D3D12 heaps: at
+// SC6warm's death heapMB=1891 and viduse=0xA5E1B000 (2,783 MB) sat inside a
+// 5,117 MB appused.
+//
+// The standing suspicion -- written into GhVaCensus's cWC bucket and never
+// tested -- is that a D3D12 heap on this UMA console is charged TWICE against
+// one 5 GiB budget: once as PAGE_WRITECOMBINE private commit in our own
+// address space, and again as viduse. If that is true, and if some heap shape
+// avoids the private charge, it is worth more than every knob closed in #205
+// put together and it costs the game nothing visually -- it would advertise
+// and receive exactly what it does today.
+//
+// That is a claim about BILLING, so measure billing, with no game involved.
+// Allocate one heap of a known size in each shape D3D12 offers and watch five
+// counters:
+//
+//   appused  AppMemoryUsage         -- the ONLY number the 5 GiB cap enforces
+//   viduse   QueryVideoMemoryInfo   -- what DXGI reports as video use
+//   priv     MEM_COMMIT private VA  -- what this process has actually committed
+//   wc       ...of which PAGE_WRITECOMBINE
+//   ws       working set
+//
+// HOW TO READ THE RESULT. A shape whose appused delta is ~0 while viduse moves
+// by the full size is the prize. A shape where appused AND priv both move by
+// the full size is paying for the heap out of the container budget, and
+// "viduse moved too" is then just DXGI reporting the same physical pages --
+// not a second charge, and the double-billing story is WRONG. The reserved
+// resource at the end is the instrument's zero: it is pure VA with no tiles
+// mapped, so if it does not read ~0 the probe itself is not trustworthy.
+//
+// Runs on a throwaway compile-only device from the loader thread before any
+// guest exists. It therefore never goes through our own D3D12 vtable hooks --
+// GhFixUmaHeapProps included -- so a result here cannot be an artifact of our
+// own CreateHeap wrapper.
+//
+// Knob gh_heapbill.txt = the probe size in MB (0 = off). 256 is a good value:
+// large enough to dwarf the sampling noise, small enough that ten of them in
+// sequence cannot themselves exhaust the container.
+
+struct GhBillSnap { uint64_t appused, viduse, priv, wc, ws, resv; };
+
+static IDXGIAdapter3* GhBillAdapter()
+{
+    static com_ptr<IDXGIAdapter3> a3;
+    static LONG once = 0;
+    if (InterlockedCompareExchange(&once, 1, 0) == 0){
+        com_ptr<IDXGIFactory4> f;
+        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory4), f.put_void())) && f){
+            com_ptr<IDXGIAdapter1> a;
+            if (SUCCEEDED(f->EnumAdapters1(0, a.put())) && a) a3 = a.try_as<IDXGIAdapter3>();
+        }
+    }
+    return a3.get();
+}
+
+// Isolated so the __try holds nothing that needs unwinding.
+static uint64_t GhBillAppUsedRaw()
+{
+    uint64_t v = 0;
+    __try { v = (uint64_t)winrt::Windows::System::MemoryManager::AppMemoryUsage(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { v = 0; }
+    return v;
+}
+
+static uint64_t GhBillAppLimitRaw()
+{
+    uint64_t v = 0;
+    __try { v = (uint64_t)winrt::Windows::System::MemoryManager::AppMemoryUsageLimit(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { v = 0; }
+    return v;
+}
+
+static void GhBillTake(GhBillSnap* s)
+{
+    if (!s) return;
+    memset(s, 0, sizeof *s);
+    s->appused = GhBillAppUsedRaw();
+
+    if (IDXGIAdapter3* a3 = GhBillAdapter()){
+        DXGI_QUERY_VIDEO_MEMORY_INFO vm{};
+        if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vm)))
+            s->viduse = (uint64_t)vm.CurrentUsage;
+    }
+
+    SYSTEM_INFO si{}; GetSystemInfo(&si);
+    uint8_t* p   = (uint8_t*)si.lpMinimumApplicationAddress;
+    uint8_t* end = (uint8_t*)si.lpMaximumApplicationAddress;
+    MEMORY_BASIC_INFORMATION mbi{};
+    while (p < end && VirtualQuery(p, &mbi, sizeof mbi) == sizeof mbi){
+        const uint64_t rs = (uint64_t)mbi.RegionSize;
+        if (mbi.State == MEM_COMMIT && mbi.Type != MEM_IMAGE && mbi.Type != MEM_MAPPED){
+            s->priv += rs;
+            if (mbi.Protect & PAGE_WRITECOMBINE) s->wc += rs;
+        } else if (mbi.State == MEM_RESERVE){
+            s->resv += rs;
+        }
+        uint8_t* nx = (uint8_t*)mbi.BaseAddress + rs;
+        if (nx <= p) break;                       // never spin on a degenerate region
+        p = nx;
+    }
+
+    struct GhBillPMC {
+        DWORD cb, PageFaultCount;
+        SIZE_T PeakWorkingSetSize, WorkingSetSize;
+        SIZE_T QuotaPeakPagedPoolUsage, QuotaPagedPoolUsage;
+        SIZE_T QuotaPeakNonPagedPoolUsage, QuotaNonPagedPoolUsage;
+        SIZE_T PagefileUsage, PeakPagefileUsage;
+    };
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    auto pGPMI = k32 ? (BOOL (WINAPI*)(HANDLE, GhBillPMC*, DWORD))
+                           GetProcAddress(k32, "K32GetProcessMemoryInfo") : nullptr;
+    GhBillPMC pmc{}; pmc.cb = sizeof pmc;
+    if (pGPMI && pGPMI(GetCurrentProcess(), &pmc, sizeof pmc))
+        s->ws = (uint64_t)pmc.WorkingSetSize;
+}
+
+static std::string GhBillMB(uint64_t a, uint64_t b)      // (b - a) as signed MB
+{
+    const double mb = (double)((int64_t)b - (int64_t)a) / (1024.0 * 1024.0);
+    char buf[40];
+    std::snprintf(buf, sizeof buf, "%+.1f", mb);
+    return buf;
+}
+
+static void GhBillReport(const char* tag, const GhBillSnap& a, const GhBillSnap& b)
+{
+    Diag(std::string("HEAPBILL ") + tag +
+         " appused=" + GhBillMB(a.appused, b.appused) +
+         " viduse="  + GhBillMB(a.viduse,  b.viduse) +
+         " priv="    + GhBillMB(a.priv,    b.priv) +
+         " wc="      + GhBillMB(a.wc,      b.wc) +
+         " ws="      + GhBillMB(a.ws,      b.ws) +
+         " resv="    + GhBillMB(a.resv,    b.resv) + " MB");
+}
+
+// The second half of #211, and the half that matters if the first half says
+// every shape charges commit. #143 established that file-backed views escape
+// the commit cap on this console -- 1 GB dirtied cost 56 MB of budget -- and
+// [[arena-cap-is-our-own-number]] that the 1 GiB of live view is the
+// container's own ceiling. If D3D12 will open a HEAP over a file mapping, the
+// game's heaps move off the container budget without changing one thing the
+// game asks for or one thing it receives.
+//
+// The reason to doubt it, and the reason to measure rather than assume:
+// Tsushima calls OpenExistingHeapFromAddress 11.5 times EVERY FRAME -- ~2.4
+// million calls in cell A202 -- and every single one returns E_INVALIDARG, for
+// memory VirtualQuery reports as private, committed, PAGE_READWRITE and 64 KB
+// at its own allocation base, which is exactly what the API documents as
+// eligible. That refusal has never been reproduced outside the game, and the
+// capability bit behind it has never been read on its own. Both happen here,
+// with nothing else running.
+// If either existing-heap path is ACCEPTED, the HRESULT is only half the news.
+// The lever only exists if the resulting heap is CHEAPER than a CreateHeap heap,
+// and cell BILL1 proved a normal heap costs its full size at create. So place a
+// buffer in the opened heap and dirty every page: that is where a file-backed
+// view would have to materialise, and it is the number that decides #211.
+static void GhBillUseOpenedHeap(ID3D12Device* dev, ID3D12Heap* h,
+                                UINT64 sz, const char* tag)
+{
+    if (!dev || !h) return;
+
+    D3D12_HEAP_DESC hd = h->GetDesc();
+    Diag(std::string("HEAPBILL ") + tag + " heapdesc size=" +
+         std::to_string((unsigned long long)(hd.SizeInBytes >> 20)) + "MB" +
+         " type=" + std::to_string((int)hd.Properties.Type) +
+         " cpupage=" + std::to_string((int)hd.Properties.CPUPageProperty) +
+         " pool=" + std::to_string((int)hd.Properties.MemoryPoolPreference) +
+         " flags=" + Hex((uint32_t)hd.Flags) +
+         " align=" + std::to_string((unsigned long long)hd.Alignment));
+
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width            = sz;
+    rd.Height           = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels        = 1;
+    rd.Format           = DXGI_FORMAT_UNKNOWN;
+    rd.SampleDesc.Count = 1;
+    rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    GhBillSnap s0{}; GhBillTake(&s0);
+    com_ptr<ID3D12Resource> res;
+    HRESULT hr = dev->CreatePlacedResource(h, 0, &rd, D3D12_RESOURCE_STATE_COMMON,
+                                           nullptr, __uuidof(ID3D12Resource),
+                                           res.put_void());
+    Diag(std::string("HEAPBILL ") + tag + " CreatePlacedResource hr=" + Hex((uint32_t)hr));
+    if (FAILED(hr) || !res) return;
+
+    GhBillSnap s1{}; GhBillTake(&s1);
+    GhBillReport((std::string(tag) + " placed").c_str(), s0, s1);
+
+    void* mp = nullptr;
+    D3D12_RANGE none{ 0, 0 };
+    HRESULT mhr = res->Map(0, &none, &mp);
+    Diag(std::string("HEAPBILL ") + tag + " Map hr=" + Hex((uint32_t)mhr));
+    if (SUCCEEDED(mhr) && mp){
+        volatile uint8_t* b = (volatile uint8_t*)mp;
+        for (UINT64 off = 0; off < sz; off += 4096) b[off] = (uint8_t)(off >> 12);
+        GhBillSnap s2{}; GhBillTake(&s2);
+        GhBillReport((std::string(tag) + " TOUCHED-ALL").c_str(), s1, s2);
+        res->Unmap(0, nullptr);
+    }
+    res = nullptr;
+    GhBillSnap s3{}; GhBillTake(&s3);
+    GhBillReport((std::string(tag) + " released-placed").c_str(), s1, s3);
+}
+
+static void GhHeapBillExisting(ID3D12Device* dev, UINT64 sz)
+{
+    if (!dev) return;
+
+    D3D12_FEATURE_DATA_EXISTING_HEAPS eh{};
+    HRESULT ehr = dev->CheckFeatureSupport(D3D12_FEATURE_EXISTING_HEAPS, &eh, sizeof eh);
+    Diag("HEAPBILL EXISTING_HEAPS hr=" + Hex((uint32_t)ehr) +
+         " supported=" + std::to_string((int)eh.Supported) +
+         " (this is the bit the game asks for ONCE and then trusts forever)");
+
+    com_ptr<ID3D12Device3> d3;
+    dev->QueryInterface(__uuidof(ID3D12Device3), d3.put_void());
+    if (!d3){
+        Diag("HEAPBILL no ID3D12Device3 -- neither existing-heap path is reachable here");
+        return;
+    }
+
+    // (a) Private committed pages -- the exact shape the game hands over.
+    {
+        GhBillSnap s0{}; GhBillTake(&s0);
+        void* p = VirtualAlloc(nullptr, (SIZE_T)sz, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!p){
+            Diag("HEAPBILL VirtualAlloc(" + std::to_string((unsigned long long)(sz >> 20)) +
+                 "MB) failed err=" + Hex(GetLastError()));
+        } else {
+            GhBillSnap s1{}; GhBillTake(&s1);
+            GhBillReport("VirtualAlloc private+committed", s0, s1);
+            com_ptr<ID3D12Heap> h;
+            HRESULT hr = d3->OpenExistingHeapFromAddress(p, __uuidof(ID3D12Heap), h.put_void());
+            Diag("HEAPBILL OpenExistingHeapFromAddress hr=" + Hex((uint32_t)hr) +
+                 (SUCCEEDED(hr) ? " ACCEPTED" : " refused -- reproduces the game's E_INVALIDARG"
+                                                " with no game in the process"));
+            if (SUCCEEDED(hr) && h){
+                GhBillSnap s2{}; GhBillTake(&s2);
+                GhBillReport("OpenExistingHeapFromAddress", s1, s2);
+                GhBillUseOpenedHeap(dev, h.get(), sz, "FROM-ADDRESS");
+                h = nullptr;
+            }
+            VirtualFree(p, 0, MEM_RELEASE);
+        }
+    }
+
+    // (b) A file mapping on D:, which is where #143's cheap bytes came from.
+    // D: has ~12 GB free and no quota (#188), so if this is accepted the size
+    // of the win is bounded by that, not by the 5 GiB container.
+    {
+        HANDLE f = CreateFileW(L"D:\\DevelopmentFiles\\ghbill.bin",
+                               GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        if (f == INVALID_HANDLE_VALUE){
+            Diag("HEAPBILL CreateFile D:\\DevelopmentFiles\\ghbill.bin err=" + Hex(GetLastError()));
+        } else {
+            HANDLE m = CreateFileMappingW(f, nullptr, PAGE_READWRITE,
+                                          (DWORD)(sz >> 32), (DWORD)(sz & 0xFFFFFFFFull), nullptr);
+            if (!m){
+                Diag("HEAPBILL CreateFileMapping err=" + Hex(GetLastError()));
+            } else {
+                GhBillSnap s0{}; GhBillTake(&s0);
+                com_ptr<ID3D12Heap> h;
+                HRESULT hr = d3->OpenExistingHeapFromFileMapping(m, __uuidof(ID3D12Heap),
+                                                                 h.put_void());
+                Diag("HEAPBILL OpenExistingHeapFromFileMapping hr=" + Hex((uint32_t)hr) +
+                     (SUCCEEDED(hr) ? " ACCEPTED -- a D3D12 heap backed by a FILE, and #143"
+                                      " says those bytes are nearly free against the cap"
+                                    : " refused"));
+                if (SUCCEEDED(hr) && h){
+                    GhBillSnap s1{}; GhBillTake(&s1);
+                    GhBillReport("OpenExistingHeapFromFileMapping", s0, s1);
+                    GhBillUseOpenedHeap(dev, h.get(), sz, "FROM-FILEMAP");
+                    h = nullptr;
+                }
+                CloseHandle(m);
+            }
+            CloseHandle(f);
+        }
+    }
+}
+
+static void GhHeapBillProbe()
+{
+    static const unsigned mb = GhCfgNum(L"gh_heapbill.txt", "GH_HEAPBILL", 0);
+    if (!mb) return;
+    const UINT64 sz = (UINT64)mb << 20;
+
+    ID3D12Device* dev = GhCompileOnlyDevice();
+    if (!dev){ Diag("HEAPBILL no device -- VOID, not a negative"); return; }
+
+    D3D12_FEATURE_DATA_ARCHITECTURE arch{};
+    dev->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &arch, sizeof arch);
+
+    GhBillSnap base{}; GhBillTake(&base);
+    Diag("HEAPBILL begin size=" + std::to_string((unsigned long long)mb) + "MB" +
+         " uma=" + std::to_string((int)arch.UMA) +
+         " cacheuma=" + std::to_string((int)arch.CacheCoherentUMA) +
+         " appused0=" + Hex(base.appused) +
+         " applimit=" + Hex(GhBillAppLimitRaw()) +
+         " viduse0=" + Hex(base.viduse) +
+         " priv0=" + Hex(base.priv) + " wc0=" + Hex(base.wc));
+
+    struct GhBillVariant {
+        const char*             name;
+        D3D12_HEAP_TYPE         type;
+        D3D12_CPU_PAGE_PROPERTY cpu;
+        D3D12_MEMORY_POOL       pool;
+        D3D12_HEAP_FLAGS        flags;
+    };
+    static const GhBillVariant vars[] = {
+        { "DEFAULT/buffers",   D3D12_HEAP_TYPE_DEFAULT,  D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+          D3D12_MEMORY_POOL_UNKNOWN, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS },
+        { "DEFAULT/textures",  D3D12_HEAP_TYPE_DEFAULT,  D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+          D3D12_MEMORY_POOL_UNKNOWN, D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES },
+        { "DEFAULT/rt-ds",     D3D12_HEAP_TYPE_DEFAULT,  D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+          D3D12_MEMORY_POOL_UNKNOWN, D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES },
+        { "UPLOAD/buffers",    D3D12_HEAP_TYPE_UPLOAD,   D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+          D3D12_MEMORY_POOL_UNKNOWN, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS },
+        { "READBACK/buffers",  D3D12_HEAP_TYPE_READBACK, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+          D3D12_MEMORY_POOL_UNKNOWN, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS },
+        // The three CUSTOM shapes are the actual question. NOT_AVAILABLE is the
+        // one that says "the CPU will never see this heap" -- if D3D12 is
+        // charging our private commit because it has to keep a CPU mapping
+        // alive, this is the shape that should not pay for it.
+        { "CUSTOM/WC/L0/buf",  D3D12_HEAP_TYPE_CUSTOM,   D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE,
+          D3D12_MEMORY_POOL_L0, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS },
+        { "CUSTOM/WB/L0/buf",  D3D12_HEAP_TYPE_CUSTOM,   D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+          D3D12_MEMORY_POOL_L0, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS },
+        { "CUSTOM/NOCPU/buf",  D3D12_HEAP_TYPE_CUSTOM,   D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+          D3D12_MEMORY_POOL_L0, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS },
+        { "CUSTOM/NOCPU/tex",  D3D12_HEAP_TYPE_CUSTOM,   D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+          D3D12_MEMORY_POOL_L0, D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES },
+    };
+
+    for (const GhBillVariant& v : vars){
+        D3D12_HEAP_DESC hd{};
+        hd.SizeInBytes            = sz;
+        hd.Alignment              = 0;                 // 64 KB
+        hd.Flags                  = v.flags;
+        hd.Properties.Type        = v.type;
+        hd.Properties.CPUPageProperty      = v.cpu;
+        hd.Properties.MemoryPoolPreference = v.pool;
+
+        GhBillSnap s0{}; GhBillTake(&s0);
+        com_ptr<ID3D12Heap> h;
+        HRESULT hr = dev->CreateHeap(&hd, __uuidof(ID3D12Heap), h.put_void());
+        if (FAILED(hr) || !h){
+            Diag(std::string("HEAPBILL ") + v.name + " CreateHeap hr=" + Hex((uint32_t)hr) +
+                 " -- shape refused, no measurement");
+            continue;
+        }
+        GhBillSnap s1{}; GhBillTake(&s1);
+        GhBillReport((std::string(v.name) + " create").c_str(), s0, s1);
+
+        // Second phase: place a resource in it and, where the CPU can see the
+        // heap at all, write one byte per 4 KB page. This separates "charged at
+        // CreateHeap" from "charged when the pages are first touched", which is
+        // exactly the distinction the #145 demand-commit pager turns on.
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width            = sz;
+        rd.Height           = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels        = 1;
+        rd.Format           = DXGI_FORMAT_UNKNOWN;
+        rd.SampleDesc.Count = 1;
+        rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const bool bufferHeap = (v.flags == D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS);
+        if (bufferHeap){
+            D3D12_RESOURCE_STATES st =
+                (v.type == D3D12_HEAP_TYPE_UPLOAD)   ? D3D12_RESOURCE_STATE_GENERIC_READ :
+                (v.type == D3D12_HEAP_TYPE_READBACK) ? D3D12_RESOURCE_STATE_COPY_DEST :
+                                                       D3D12_RESOURCE_STATE_COMMON;
+            com_ptr<ID3D12Resource> r;
+            HRESULT rr = dev->CreatePlacedResource(h.get(), 0, &rd, st, nullptr,
+                                                   __uuidof(ID3D12Resource), r.put_void());
+            if (SUCCEEDED(rr) && r){
+                GhBillSnap s2{}; GhBillTake(&s2);
+                GhBillReport((std::string(v.name) + " placed").c_str(), s1, s2);
+
+                const bool mappable = (v.type == D3D12_HEAP_TYPE_UPLOAD) ||
+                                      (v.type == D3D12_HEAP_TYPE_READBACK) ||
+                                      (v.cpu  == D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE) ||
+                                      (v.cpu  == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK);
+                if (mappable){
+                    void* p = nullptr;
+                    D3D12_RANGE none{0, 0};
+                    if (SUCCEEDED(r->Map(0, &none, &p)) && p){
+                        volatile uint8_t* q = (volatile uint8_t*)p;
+                        for (UINT64 o = 0; o < sz; o += 4096) q[o] = (uint8_t)(o >> 12);
+                        GhBillSnap s3{}; GhBillTake(&s3);
+                        GhBillReport((std::string(v.name) + " touched").c_str(), s2, s3);
+                        r->Unmap(0, nullptr);
+                    }
+                }
+            } else {
+                Diag(std::string("HEAPBILL ") + v.name + " CreatePlacedResource hr=" +
+                     Hex((uint32_t)rr));
+            }
+        }
+
+        h = nullptr;
+        GhBillSnap s4{}; GhBillTake(&s4);
+        GhBillReport((std::string(v.name) + " RELEASED").c_str(), s1, s4);
+    }
+
+    // A committed DEFAULT buffer -- the path most of the game's allocations
+    // actually take, since it never calls CreateHeap for them.
+    {
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = sz; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        GhBillSnap s0{}; GhBillTake(&s0);
+        com_ptr<ID3D12Resource> r;
+        HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                        D3D12_RESOURCE_STATE_COMMON, nullptr,
+                        __uuidof(ID3D12Resource), r.put_void());
+        if (SUCCEEDED(hr) && r){
+            GhBillSnap s1{}; GhBillTake(&s1);
+            GhBillReport("COMMITTED-DEFAULT/buf create", s0, s1);
+            r = nullptr;
+            GhBillSnap s2{}; GhBillTake(&s2);
+            GhBillReport("COMMITTED-DEFAULT/buf RELEASED", s1, s2);
+        } else {
+            Diag("HEAPBILL COMMITTED-DEFAULT/buf hr=" + Hex((uint32_t)hr));
+        }
+    }
+
+    // The instrument's zero. A reserved resource is virtual address and nothing
+    // else until UpdateTileMappings backs it, so every counter here must stay
+    // flat. If this line shows the full size, the probe above is measuring VA
+    // rather than billing and every number in it is void.
+    {
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = sz; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        GhBillSnap s0{}; GhBillTake(&s0);
+        com_ptr<ID3D12Resource> r;
+        HRESULT hr = dev->CreateReservedResource(&rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                  __uuidof(ID3D12Resource), r.put_void());
+        if (SUCCEEDED(hr) && r){
+            GhBillSnap s1{}; GhBillTake(&s1);
+            GhBillReport("RESERVED/buf (expect ~0) create", s0, s1);
+            r = nullptr;
+        } else {
+            Diag("HEAPBILL RESERVED/buf hr=" + Hex((uint32_t)hr) +
+                 " -- no tiled-resource support, so the zero control is missing");
+        }
+    }
+
+    GhHeapBillExisting(dev, sz);
+
+    GhBillSnap fin{}; GhBillTake(&fin);
+    GhBillReport("NET over the whole probe", base, fin);
+    Diag("HEAPBILL done");
+}
+
 static void GhDxilControl()
 {
     static const unsigned mode = GhCfgNum(L"gh_dxil_ctl.txt", "GH_DXIL_CTL", 0);
@@ -19592,10 +20065,22 @@ static void GhVaCensus(const char* when, uint64_t appused, uint64_t applimit)
 
     GhVaReg top[12]{};
     uint64_t cImage = 0, cMapped = 0, cPrivate = 0, cPrivExec = 0, reserved = 0;
-    // On this UMA console a D3D12 heap the CPU can see is PAGE_WRITECOMBINE, and
-    // it is charged to the app's PRIVATE commit as well as to viduse -- the same
-    // bytes twice against one 5 GiB container. Bucket them so the split is a
-    // measurement rather than an inference from the top-N list.
+    // On this UMA console a D3D12 heap the CPU can see is PAGE_WRITECOMBINE, so
+    // bucketing by that protection separates GPU heaps from the rest of private
+    // commit without inferring anything from the top-N list.
+    //
+    // RETRACTED 2026-09-16 by cell BILL1 (#211): this comment used to claim the
+    // bytes were billed TWICE, to private commit and again to viduse. They are
+    // not. One 256 MB heap of every shape D3D12 offers moves appused +256.5 and
+    // priv +256.0 -- once, not twice -- with CreateReservedResource as a passing
+    // zero control. viduse is a second VIEW of the same physical pages.
+    //
+    // Two things BILL1 did establish about this counter: the charge lands
+    // entirely at CreateHeap (placed/touched move ~0, so no #145-style pager
+    // trick applies to heaps), and wc only covers the DEFAULT / CUSTOM-WC /
+    // CUSTOM-NOT_AVAILABLE shapes -- UPLOAD, READBACK and CUSTOM-WRITE_BACK are
+    // committed but not write-combine. So cWC UNDERCOUNTS total D3D12 heap
+    // bytes; it is a floor on them, not a total.
     uint64_t cWC = 0; unsigned long nWC = 0;
     unsigned long nreg = 0;
 
@@ -30850,6 +31335,11 @@ static void RunGuest()
         // #170. One signed DXIL <= 6.5 compute PSO, on a throwaway device,
         // before the guest exists. Off unless gh_dxil_ctl says otherwise.
         GhDxilControl();
+
+        // #211. One heap of each shape D3D12 offers, on a throwaway device,
+        // before the guest exists -- so the answer cannot be an artifact of
+        // our own CreateHeap hook. Off unless gh_heapbill says a size in MB.
+        GhHeapBillProbe();
 
         // ghwmm.dll: our WINMM replacement for the multimedia-timer functions the
         // container's slim WINMM lacks. Mono's import name is binary-patched
