@@ -1783,6 +1783,10 @@ static bool gh_stub_build_vtbl() {
 // identity, which is what gh_stub_dispatch uses to tell shape (c) from (a).
 // The shared thunks carry only the slot; the interface is recovered from the
 // object pointer in gh_stub_dispatch.
+// Defined after the flat exports, because it answers out of exactly the same
+// functions they do -- one source of truth for "what is true about this user".
+static void* gh_handwritten_iface(const char* prefix);
+
 static void* gh_stub_object(const char* name) {
     if (InterlockedCompareExchange(&g_stub_cs_init, 1, 0) == 0) {
         InitializeCriticalSection(&g_stub_cs);
@@ -1907,6 +1911,7 @@ static void* gh_iface_for_version(const char* ver) {
     // C exports still hand them back, and those wrappers ignore `self`.
     void* stub = nullptr;
     if (route && route->sentinel == (void*)&g_rp_fallback) stub = route->sentinel;
+    else if (route && (stub = gh_handwritten_iface(route->prefix)) != nullptr) { /* real answers */ }
     else stub = gh_stub_object(route ? route->prefix : "SteamUnknown");
     if (!stub) stub = route ? route->sentinel : (void*)&g_iface_client;
     void* out = real ? real : stub;
@@ -2320,6 +2325,186 @@ __declspec(dllexport) const char* SteamAPI_ISteamApps_GetAvailableGameLanguages(
 __declspec(dllexport) uint64_steamid SteamAPI_ISteamApps_GetAppOwner(void*) { return kFakeSteamID; }
 __declspec(dllexport) uint32_t SteamAPI_ISteamApps_GetAppBuildId(void*) { return 1; }
 __declspec(dllexport) int      SteamAPI_ISteamApps_GetAppInstallDir(void*, AppId_t, char* buf, uint32_t cch) { if (buf && cch) buf[0]=0; return 0; }
+
+// ============ #220: hand-written vtables for the two interfaces this game ============
+// ============       actually calls before it decides whether to run       ============
+//
+// Cell ENGOFF2 answered the question empirically and cheaply. With the generic
+// zero-returning objects in place the guest no longer AV'd -- it called exactly
+//     STUBCALL STEAMAPPS_INTERFACE_VERSION slot=0 shape=plain
+//     STUBCALL STEAMAPPS_INTERFACE_VERSION slot=6 shape=plain
+// and then exited cleanly with code 1. Slot 0 of ISteamApps is BIsSubscribed()
+// and slot 6 is BIsSubscribedApp(AppId_t) -- the game asked "do you own this?",
+// the generic stub said false twice, and it quit. That is not a crash and it is
+// not a stub bug; it is the right question getting the wrong answer.
+//
+// So these two interfaces get REAL vtables, in the g_rp_vtbl style, answering out
+// of the same flat exports above so there is one source of truth. Everything else
+// still falls through to the generic object.
+//
+// The slot ORDER is from Open Steamworks' ISteamApps007.h / ISteamUser017.h.
+// Those are older than the versions this game asks for (008 / 023), which is safe
+// for the slots below because Steamworks appends: the newer versions add methods
+// at the END, and anything past the table falls to gh_hw_zero.
+//
+// x64 ABI notes that matter here:
+//   * one zero-returning stub serves any arity (the callee never cleans the stack)
+//   * a const char* return must be "" and never nullptr -- a caller may strlen it
+//   * CSteamID is returned through a HIDDEN POINTER: buffer in rcx, `this` in rdx
+static uint64_t    gh_hw_zero(void*)                          { return 0; }
+static uint64_t    gh_hw_one(void*)                           { return 1; }
+static uint64_t    gh_hw_rate(void*)                          { return 11025; }
+static const char* gh_hw_english(void*)                       { return "english"; }
+static const char* gh_hw_empty(void*, const char*)            { return ""; }
+static void*       gh_hw_steamid(void* ret, void*)            { if (ret) *(uint64_steamid*)ret = kFakeSteamID; return ret; }
+static uint64_t    gh_hw_buf2(void*, char* b, int)            { if (b) b[0] = 0; return 0; }
+static uint64_t    gh_hw_buf3(void*, AppId_t, char* b, uint32_t) { if (b) b[0] = 0; return 0; }
+
+static void* const g_apps_vtbl[64] = {
+    (void*)&gh_hw_one,   // 0  BIsSubscribed            -> TRUE. Cell ENGOFF2 proved this is the one
+    (void*)&gh_hw_zero,   // 1  BIsLowViolence
+    (void*)&gh_hw_zero,   // 2  BIsCybercafe
+    (void*)&gh_hw_zero,   // 3  BIsVACBanned
+    (void*)&gh_hw_english,   // 4  GetCurrentGameLanguage   -> english, never nullptr
+    (void*)&gh_hw_english,   // 5  GetAvailableGameLanguages
+    (void*)&gh_hw_one,   // 6  BIsSubscribedApp         -> TRUE. the other one ENGOFF2 named
+    (void*)&gh_hw_zero,   // 7  BIsDlcInstalled          -> false, matching the flat export
+    (void*)&gh_hw_zero,   // 8  GetEarliestPurchaseUnixTime
+    (void*)&gh_hw_zero,   // 9  BIsSubscribedFromFreeWeekend
+    (void*)&gh_hw_zero,   // 10 GetDLCCount
+    (void*)&gh_hw_zero,   // 11 BGetDLCDataByIndex
+    (void*)&gh_hw_zero,   // 12 InstallDLC (void)
+    (void*)&gh_hw_zero,   // 13 UninstallDLC (void)
+    (void*)&gh_hw_zero,   // 14 RequestAppProofOfPurchaseKey (void)
+    (void*)&gh_hw_buf2,   // 15 GetCurrentBetaName(char*,int) -> false, empty
+    (void*)&gh_hw_zero,   // 16 MarkContentCorrupt
+    (void*)&gh_hw_zero,   // 17 GetInstalledDepots
+    (void*)&gh_hw_buf3,   // 18 GetAppInstallDir(id,char*,uint32) -> 0, empty
+    (void*)&gh_hw_one,   // 19 BIsAppInstalled          -> TRUE
+    (void*)&gh_hw_steamid,   // 20 GetAppOwner -> CSteamID through the HIDDEN POINTER in rcx
+    (void*)&gh_hw_empty,   // 21 GetLaunchQueryParam -> empty string, never nullptr
+    (void*)&gh_hw_zero,   // 22 GetDlcDownloadProgress
+    (void*)&gh_hw_one,   // 23 GetAppBuildId            -> 1, matching the flat export
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+};
+
+static void* const g_user_vtbl[64] = {
+    (void*)&gh_hw_one,   // 0  GetHSteamUser            -> 1, the same fake handle the flat API uses
+    (void*)&gh_hw_one,   // 1  BLoggedOn                -> TRUE
+    (void*)&gh_hw_steamid,   // 2  GetSteamID -> CSteamID through the HIDDEN POINTER in rcx
+    (void*)&gh_hw_zero,   // 3  InitiateGameConnection
+    (void*)&gh_hw_zero,   // 4  TerminateGameConnection (void)
+    (void*)&gh_hw_zero,   // 5  TrackAppUsageEvent (void)
+    (void*)&gh_hw_buf2,   // 6  GetUserDataFolder(char*,int) -> false, empty
+    (void*)&gh_hw_zero,   // 7  StartVoiceRecording (void)
+    (void*)&gh_hw_zero,   // 8  StopVoiceRecording (void)
+    (void*)&gh_hw_zero,   // 9  GetAvailableVoice
+    (void*)&gh_hw_zero,   // 10 GetVoice
+    (void*)&gh_hw_zero,   // 11 DecompressVoice
+    (void*)&gh_hw_rate,   // 12 GetVoiceOptimalSampleRate -> 11025, NOT 0: a zero sample rate is
+    (void*)&gh_hw_zero,   // 13 GetAuthSessionTicket
+    (void*)&gh_hw_zero,   // 14 BeginAuthSession
+    (void*)&gh_hw_zero,   // 15 EndAuthSession (void)
+    (void*)&gh_hw_zero,   // 16 CancelAuthTicket (void)
+    (void*)&gh_hw_zero,   // 17 UserHasLicenseForApp -> 0 == k_EUserHasLicenseResultHasLicense
+    (void*)&gh_hw_zero,   // 18 BIsBehindNAT
+    (void*)&gh_hw_zero,   // 19 AdvertiseGame (void)
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+};
+
+// The object IS its vtable pointer, exactly like g_rp_fallback.
+static void* const* g_apps_obj = g_apps_vtbl;
+static void* const* g_user_obj = g_user_vtbl;
+
+static void* gh_handwritten_iface(const char* prefix) {
+    if (!prefix) return nullptr;
+    if (strcmp(prefix, "STEAMAPPS_INTERFACE_VERSION") == 0) return (void*)&g_apps_obj;
+    if (strcmp(prefix, "SteamUser") == 0)                   return (void*)&g_user_obj;
+    return nullptr;
+}
+
 
 // ---- ISteamUserStats -----
 __declspec(dllexport) bool SteamAPI_ISteamUserStats_RequestCurrentStats(void*) { return true; }
