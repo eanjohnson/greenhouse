@@ -25638,6 +25638,27 @@ static uint64_t                 g_lazyMin       = 16ull << 20;
 static unsigned g_lazyWho = 0;
 static LONG64   g_lazyT0  = 0;
 
+// #217. gh_engine_off: skip bringing the real Steam client engine up.
+//
+// Tsushima does not want Steam multiplayer, yet every Tsushima run so far has
+// carried the full engine -- steamclient64 + tier0_s64 + vstdlib_s64, brought
+// up by the Launcher's QR-login path before the picker. Cell DEDUP1 ended when
+// Valve's own tier0 allocator failed a 16 KB request and called
+// _ExitOnFatalAssert, a run-ender with nothing to do with the game, and no cell
+// has ever priced what the engine costs because the bring-up was compile-time
+// only.
+//
+// 1 = skip. Sensed that way on purpose: run30N.py writes '0' for every slot a
+// runargs does not supply, so a knob meaning "bring it up" would silently
+// disable the engine for every older runargs in the tree (the gh_lazy_shim_lie
+// lesson). Titles that DO need Steam -- Cheese, Lethal Company, REPO -- must
+// never set it: the engine-before-Mono ordering is the whole #134/#139 fix.
+static unsigned GhEngineOff()
+{
+    static const unsigned v = GhCfgNumZ(L"gh_engine_off.txt", "GH_ENGINE_OFF", 0);
+    return v;
+}
+
 // #213. Our OWN shim runs an address-space sweep (gh_find_connected_ccm in
 // corpus/shims/gh_steam_engine.h) that reads every committed PAGE_READWRITE
 // region <= 512 MB in 64 KB chunks, looking for steamclient's CCMInterface.
@@ -27072,6 +27093,29 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
 // the load is the cheapest way to test whether it is on the critical path.
 // Delivered like ghguest.txt (WDP fsupload), so toggling costs an upload, not a
 // rebuild. Empty/missing file = deny nothing, i.e. no effect on any other title.
+// #217. gh_engine_off has to bite HERE, not only at the Launcher login screen.
+// The shim brings the engine up from three places -- gh_launcher_login_thread
+// (GhStartQrLoginAsync, the path Tsushima actually takes), GhBringUpEngineNow
+// (the compile-time GH_LOADER_ENGINE_FIRST site) and gh_engine_lazy_init (the
+// GUEST's own SteamAPI_Init) -- and all three funnel into ONE
+// LoadLibraryA("steamclient64.dll") in gh_steam_engine_init, which is bedded
+// through us. Gating the login screen alone would leave the guest free to pull
+// the engine in later and the cell would measure nothing.
+//
+// Refusing the load is a path the shim already handles cleanly: it logs
+// "GHENG LoadLibraryA(steamclient64.dll) -> 0000 err=126", sets
+// g_gh_engine_state = -1 and returns -1 from every one of the three. tier0_s64
+// and vstdlib_s64 are static imports of steamclient64 and nothing loads them by
+// name, so denying the one module keeps all three out of the process.
+static bool GhEngineDenied(const char* base)
+{
+    if (!GhEngineOff()) return false;
+    if (0 != _stricmp(base, "steamclient64.dll")) return false;
+    Diag("ENGINEOFF refusing steamclient64.dll (gh_engine_off=1) -- "
+         "the Steam client engine is not brought up in this run");
+    return true;
+}
+
 static bool GuestDllDenied(const char* dll)
 {
     static std::vector<std::string> deny;
@@ -27090,10 +27134,11 @@ static bool GuestDllDenied(const char* dll)
             for (auto& d : deny) Diag("DENYDLL entry " + d);
         }
     }
-    if (deny.empty()) return false;
     const char* b1 = strrchr(dll, '\\'); const char* b2 = strrchr(dll, '/');
     const char* base = (b1 && b2) ? (b1 > b2 ? b1 : b2) : (b1 ? b1 : b2);
     base = base ? base + 1 : dll;
+    if (GhEngineDenied(base)) return true;
+    if (deny.empty()) return false;
     std::string lb; for (const char* q = base; *q; ++q)
         lb += (char)((*q >= 'A' && *q <= 'Z') ? *q - 'A' + 'a' : *q);
     for (auto& d : deny)
@@ -32290,7 +32335,26 @@ static void RunGuest()
                 // CreateLocalUser write then happens before Mono exists (Mono allocates clean
                 // afterward). Fully in-process; steamclient64's LoadLibrary is bedded above.
                 // Blocks until bring-up completes.
-                if (auto up = (void(*)())GetProcAddress(stm, "GhBringUpEngineNow")) {
+                //
+                // #217: gh_engine_off makes this skippable at runtime for the first
+                // time. Until now the bring-up was compile-time only, so no cell had
+                // ever priced the engine and EVERY Tsushima run has carried it -- and
+                // cell DEDUP1 ended when steamclient64's own tier0 allocator failed a
+                // 16 KB request and called _ExitOnFatalAssert, a run-ender that has
+                // nothing to do with the game. Tsushima does not want Steam
+                // multiplayer.
+                //
+                // 1 = skip. Sensed that way on purpose: run30N.py writes '0' for every
+                // slot a runargs does not supply, so a knob meaning "bring it up"
+                // would silently disable the engine for every older runargs in the
+                // tree -- the gh_lazy_shim_lie lesson.
+                //
+                // Titles that DO need Steam (Cheese, Lethal Company, REPO) must never
+                // set this: the engine-before-Mono ordering is the whole #134/#139 fix.
+                if (const unsigned engOff = GhEngineOff()) {
+                    Diag("STAGE=engine_first_bringup SKIPPED (gh_engine_off=" +
+                         std::to_string((unsigned long)engOff) + ")");
+                } else if (auto up = (void(*)())GetProcAddress(stm, "GhBringUpEngineNow")) {
                     Diag("STAGE=engine_first_bringup begin");
                     up();
                     Diag("STAGE=engine_first_bringup done");
@@ -32744,7 +32808,17 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
                     // logs in — so our CM connection is the account's SOLE session (a second
                     // concurrent session for the same account is not serviced for Player.* calls).
                     LauncherFetchLibrary();
-                    if (startQr && g_ghLoginSteamID) {
+                    // #217: the engine comes up HERE for Tsushima, not at the
+                    // GH_LOADER_ENGINE_FIRST site -- the login path is what pulls
+                    // steamclient64 (and with it tier0_s64/vstdlib_s64) into the
+                    // process, before the picker and long before the guest. This is
+                    // the gate that matters; the other one is never reached by a
+                    // title the Launcher preloads the shim for.
+                    if (GhEngineOff()) {
+                        Diag("LAUNCHER steam login SKIPPED (gh_engine_off=1) -- "
+                             "the Steam engine is not brought up in this run");
+                        loginStatus = L"not signed in · engine off";
+                    } else if (startQr && g_ghLoginSteamID) {
                         LauncherClearQrUrl();
                         startQr();
                         uint64_t sid = LauncherSteamLogin(/*timeoutSec=*/600);   // up to 10 min to scan
