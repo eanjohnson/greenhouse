@@ -2359,6 +2359,11 @@ static const char* gh_hw_empty(void*, const char*)            { return ""; }
 static void*       gh_hw_steamid(void* ret, void*)            { if (ret) *(uint64_steamid*)ret = kFakeSteamID; return ret; }
 static uint64_t    gh_hw_buf2(void*, char* b, int)            { if (b) b[0] = 0; return 0; }
 static uint64_t    gh_hw_buf3(void*, AppId_t, char* b, uint32_t) { if (b) b[0] = 0; return 0; }
+static const char* gh_hw_emptystr(void*)                      { return ""; }
+// Engine-off persona name. Same answer the flat SteamAPI_ISteamFriends_GetPersonaName
+// gives when g_gh_engine_state != 2, so the two paths cannot disagree.
+static const char* gh_hw_player(void*)                        { return "Player"; }
+static uint64_t    gh_hw_online(void*)                        { return 1; }  // k_EPersonaStateOnline
 
 static void* const g_apps_vtbl[64] = {
     (void*)&gh_hw_one,   // 0  BIsSubscribed            -> TRUE. Cell ENGOFF2 proved this is the one
@@ -2495,13 +2500,86 @@ static void* const g_user_vtbl[64] = {
 };
 
 // The object IS its vtable pointer, exactly like g_rp_fallback.
+// ISteamFriends017. Slot order from Open Steamworks' ISteamFriends015.h, which is
+// also what the flat invite plumbing above already assumes and has had verified
+// against the real engine. Cell ENGOFF3 died at GUEST+0x4659C8 reading address 0
+// immediately after "STUBCALL SteamFriends slot=0", and slot 0 is GetPersonaName()
+// -- a const char* the generic stub answered with a null the game then walked.
+static void* const g_friends_vtbl[64] = {
+    (void*)&gh_hw_player,   // 0  GetPersonaName -> const char*. THE SLOT ENGOFF3 DIED ON: the
+    (void*)&gh_hw_zero,   // 1  SetPersonaName -> no API call
+    (void*)&gh_hw_online,   // 2  GetPersonaState -> Online, matching the flat export
+    (void*)&gh_hw_zero,   // 3  GetFriendCount -> 0
+    (void*)&gh_hw_steamid,   // 4  GetFriendByIndex -> CSteamID through the HIDDEN POINTER
+    (void*)&gh_hw_zero,   // 5  GetFriendRelationship
+    (void*)&gh_hw_zero,   // 6  GetFriendPersonaState
+    (void*)&gh_hw_emptystr,   // 7  GetFriendPersonaName -> "" , never nullptr
+    (void*)&gh_hw_zero,   // 8  GetFriendGamePlayed
+    (void*)&gh_hw_emptystr,   // 9  GetFriendPersonaNameHistory -> ""
+    (void*)&gh_hw_zero,   // 10 GetFriendSteamLevel
+    (void*)&gh_hw_emptystr,   // 11 GetPlayerNickname -> "" (the SDK may return NULL; we never do)
+    (void*)&gh_hw_zero,   // 12 GetFriendsGroupCount
+    (void*)&gh_hw_zero,   // 13 GetFriendsGroupIDByIndex
+    (void*)&gh_hw_emptystr,   // 14 GetFriendsGroupName -> ""
+    (void*)&gh_hw_zero,   // 15 GetFriendsGroupMembersCount
+    (void*)&gh_hw_zero,   // 16 GetFriendsGroupMembersList
+    (void*)&gh_hw_zero,   // 17 HasFriend
+    (void*)&gh_hw_zero,   // 18 GetClanCount
+    (void*)&gh_hw_steamid,   // 19 GetClanByIndex -> CSteamID through the HIDDEN POINTER
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+    (void*)&gh_hw_zero,
+};
 static void* const* g_apps_obj = g_apps_vtbl;
 static void* const* g_user_obj = g_user_vtbl;
+static void* const* g_friends_obj = g_friends_vtbl;
 
 static void* gh_handwritten_iface(const char* prefix) {
     if (!prefix) return nullptr;
     if (strcmp(prefix, "STEAMAPPS_INTERFACE_VERSION") == 0) return (void*)&g_apps_obj;
     if (strcmp(prefix, "SteamUser") == 0)                   return (void*)&g_user_obj;
+    if (strcmp(prefix, "SteamFriends") == 0)                return (void*)&g_friends_obj;
     return nullptr;
 }
 
