@@ -22340,7 +22340,22 @@ static bool GhWgiInjectOn()
 // PollGamepadOnUi's fallback branch reads the pad THROUGH this vtable slot. If
 // the merge ran there it would write our own override back into g_padState and
 // latch a press on forever, so the host poll marks itself and is never merged.
-static bool g_wgiHostPoll = false;
+//
+// thread_local, and reset by a destructor, for two reasons that both turn a
+// VOID cell into a convincing false negative if they are got wrong:
+//   * the question is "is THIS thread inside the host poll". A process-wide
+//     flag races the game's own polling thread and would skip a merge the game
+//     did ask for, on whatever tick the UI thread happened to be reading.
+//   * pad.GetCurrentReading() is a C++/WinRT call and CAN throw --
+//     PollGamepadOnUi wraps the whole body in catch(...) precisely because WGI
+//     does. A bare assignment pair leaves the flag stuck true on the first
+//     throw, silently disabling the merge for the rest of the run while every
+//     other proof-of-life line still prints.
+static thread_local bool g_wgiHostPoll = false;
+struct GhWgiHostPollGuard {
+    GhWgiHostPollGuard()  { g_wgiHostPoll = true;  }
+    ~GhWgiHostPollGuard() { g_wgiHostPoll = false; }
+};
 
 static void GhWgiMergeSynth(GhWgiPadReading* out)
 {
@@ -22452,19 +22467,20 @@ static void PollGamepadOnUi()
             auto pad = pads.GetAt(0);
             void* abi = g_wgiPadAbi ? g_wgiPadAbi : winrt::get_abi(pad);
             GhWgiPadReading raw{};
-            g_wgiHostPoll = true;                                          // #214
-            if (g_realWgiPadRead && abi && SUCCEEDED(g_realWgiPadRead(abi, &raw))) {
-                bb = raw.Buttons; lt = raw.LeftTrigger; rt = raw.RightTrigger;
-                lx = raw.LeftThumbstickX; ly = raw.LeftThumbstickY;
-                rx = raw.RightThumbstickX; ry = raw.RightThumbstickY;
-            } else {
-                auto r = pad.GetCurrentReading();
-                bb = (uint32_t)r.Buttons;
-                lt = r.LeftTrigger; rt = r.RightTrigger;
-                lx = r.LeftThumbstickX; ly = r.LeftThumbstickY;
-                rx = r.RightThumbstickX; ry = r.RightThumbstickY;
+            {
+                GhWgiHostPollGuard _hostPoll;                              // #214
+                if (g_realWgiPadRead && abi && SUCCEEDED(g_realWgiPadRead(abi, &raw))) {
+                    bb = raw.Buttons; lt = raw.LeftTrigger; rt = raw.RightTrigger;
+                    lx = raw.LeftThumbstickX; ly = raw.LeftThumbstickY;
+                    rx = raw.RightThumbstickX; ry = raw.RightThumbstickY;
+                } else {
+                    auto r = pad.GetCurrentReading();
+                    bb = (uint32_t)r.Buttons;
+                    lt = r.LeftTrigger; rt = r.RightTrigger;
+                    lx = r.LeftThumbstickX; ly = r.LeftThumbstickY;
+                    rx = r.RightThumbstickX; ry = r.RightThumbstickY;
+                }
             }
-            g_wgiHostPoll = false;                                         // #214
             auto has = [&](uint32_t f){ return (bb & f) != 0; };
             WORD w = 0;
             if (has(0x1))    w |= XINPUT_GAMEPAD_START;
