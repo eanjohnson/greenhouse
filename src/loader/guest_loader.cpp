@@ -22376,6 +22376,167 @@ static std::string GhHex32(uint32_t v)
     return o;
 }
 
+// #214 cell DEVREC -- read the GAME's own device record, not another guess.
+//
+// The guest exe is on this host (29.3 MB, ImageBase 0x140000000) and three
+// independently recorded patch sites confirm the RVA mapping byte for byte:
+// 0x54454B = 74 (je, the gh_pspc_init site), 0x43C635 = C7 04 25 00000000
+// 0E000000 (mov dword[0],14, the #188 "fatal trap"), 0xD30034 = 48 89 5C 24 20
+// 55 (the gh_pspc_trust site). Offline disassembly of the function WHOCALLS
+// named -- .pdata bounds GUEST+0x492490..0x4931B9, 3369 bytes -- gives the
+// whole poll:
+//
+//   InputDevice::PollWgi(this=rbx)
+//     0x4924A6  mov [rbp+0x128],rbx          <- rbx SPILLED, and rbp is fixed
+//     0x49251B  mov ecx,[rbx+0x110]          <- the device index
+//     0x492521  call GUEST+0x4919E0          -> IRawGameController*
+//     0x4925E0  call [rax+0x50]              -> get_HardwareVendorId  (r13d)
+//     0x4925F1  call [rax+0x48]              -> get_HardwareProductId (esi)
+//     0x49260B  cmp r13d,0x54C / 0x5C4,0x9CC,0xCE6,0xDF2 -> PS pads skip WGI
+//     0x492649  call [rax]                   -> QI(IID_IGameController)
+//     0x492661  call [rax+0x30]              -> GamepadStatics2::FromGameController
+//     0x4926C3  lea rdx,[rbp+0x60]           <- THE READING BUFFER IS rbp+0x60
+//     0x4926C7  call [rax+0x40]              <- IGamepad::GetCurrentReading (slot 8)
+//     0x4926CA  test eax,eax                 <- the return address WHOCALLS measured
+//     0x4926D4  mov edx,[rbp+0x68]           <- GamepadReading::Buttons IS read
+//     0x492A08  mov dword [rbx+0x100],8      <- "Gamepad for main player: 8" is a
+//                                               controller TYPE, not a device id
+//                                               (0xA=DS4, 0xB=DualSense, MS via
+//                                               a jump table). Corrects §32.48.
+//     0x492B1F  cmp [rbp+0x60],[rbx+0x108]
+//     0x492B23  je  0x493084                 <- SAME TIMESTAMP => the entire
+//                                               14-button decode is skipped
+//     0x492B2D..0x492E4x  decode edx bit by bit into [rbx+0x80 .. rbx+0xB4]
+//                         (0x80=DPadUp bit6, 0x84=DPadDown bit7, 0x88=DPadLeft
+//                          bit8, ...), each setting [rbx+0x78]=1 "changed"
+//     0x49307D  mov [rbx+0x108],[rbp+0x60]   <- the timestamp is stored LAST
+//     0x493110  call [rbx]->vtbl[3]          <- the dispatch into the engine
+//
+// So the device record is reachable from inside this hook with no tracepoint
+// and no second instrument: rbp = out - 0x60, dev = *(rbp + 0x128). Because our
+// hook runs DURING GetCurrentReading, [dev+0x108] is still the PREVIOUS frame's
+// timestamp -- exactly the value the gate at 0x492B1F is about to compare
+// against -- and [dev+0x80..0xB4] still holds the PREVIOUS frame's decode. One
+// line therefore says both "will this frame decode?" and "did last frame's
+// injection actually land in the game's own state?".
+//
+// PROOF OF LIFE THAT CAN FAIL. TS2's check was unsatisfiable by construction
+// and cost a cell; this one is two independent derivations of the same number.
+// rbp is computed from the lea at 0x4926C3 (out-0x60) AND from the prologue
+// (push rbp,r12,r13,r14,r15; sub rsp,0x130; lea rbp,[rsp+0x40] => rsp at the
+// call is rbp-0x40, and the call pushes 8, so rbp = &returnaddr + 0x48). If the
+// two disagree the frame model is wrong, the line says DEVBAD, and the cell is
+// VOID rather than a negative. Every read goes through GhReadableQword -- never
+// SEH -- because this process installs its own fault handlers (guest-live-peek).
+static thread_local void* g_wgiFrameARA = nullptr;
+static thread_local uintptr_t g_wgiGuestThis = 0;
+
+// #214 cell DEVREC, second form.  The FIRST form read [rbp+0x128] believing it
+// held `this`, and the run refuted that cleanly: it returned an object whose
+// +0xA0 was 0x409 == 1033, the keyboard language id the GAME logs one line
+// above "Gamepad for main player".  Re-reading the prologue says why --
+//
+//     00492490  push rbp/r12/r13/r14/r15 ; sub rsp,0x130 ; lea rbp,[rsp+0x40]
+//     004924A6  mov [rbp+0x128], rbx     <- spills the CALLER's rbx
+//     004924EA  mov rbx, rcx             <- `this` enters rbx only HERE
+//
+// -- so [rbp+0x128] is the caller's saved register, not the device.  The frame
+// model itself was right (rbpA == rbpB on all 40 reads); only the slot was
+// wrong.  That cell is an instrument bug, VOID, not a negative.
+//
+// `this` therefore exists only in the live rbx.  rbx is non-volatile in the
+// Win64 ABI, so it still holds the guest's value when this hook is entered,
+// and clang-cl accepts GNU extended asm (verified: it emits `movq %rbx,%rax`
+// and clobbers nothing).  GhGuestRbx is noinline and is called as the FIRST
+// statement of the hook, before anything can assign rbx.
+//
+// THE CHECK THAT CAN FAIL.  Offline RTTI gives the exact answer this must
+// produce: the vtable at GUEST+0x10FD528 carries the complete-object locator
+// GUEST+0x139F7F8, whose type descriptor reads
+// ".?AVGamepadWindowsInput@Input@nx@@", with PollWgi at slot 5 and the engine
+// dispatch at slot 3.  So *(void**)this MUST equal GUEST+0x10FD528.  If clang
+// moved rbx before our call, or the caller is not the site we mapped, the line
+// says vt=BAD and the cell is VOID rather than a negative.  X (the caller's
+// rbx) is logged once beside it, because 0x44D0F0/0x44BAE2 show the owner
+// holds the 20-entry device array at [owner+0x590] and the main-player SLOT at
+// [owner+0x694] -- the number the game prints as "Gamepad for main player: 8".
+extern "C" __declspec(noinline) uint64_t GhGuestRbx(void)
+{
+    uint64_t v;
+    __asm__ __volatile__("movq %%rbx, %0" : "=r"(v));
+    return v;
+}
+
+static bool GhWgiDevDw(uintptr_t dev, unsigned off, uint32_t* v)
+{
+    uintptr_t q = 0;
+    if (!GhReadableQword(dev + (off & ~7u), &q)) return false;
+    *v = (uint32_t)((off & 4u) ? (q >> 32) : (q & 0xFFFFFFFFu));
+    return true;
+}
+
+static void GhWgiPeekDevice(GhWgiPadReading* out, long bk)
+{
+    const std::string tag = "DEVREC #" + std::to_string(bk) + " ";
+    const uintptr_t site = (uintptr_t)g_guestImageBase + 0x4926CA;
+    if (!g_guestImageBase || g_wgiCallerRa != site) {
+        Diag(tag + "VOID caller=" + NameForCodeAddr(g_wgiCallerRa) +
+             " != GUEST+0x4926CA -- frame model does not apply");
+        return;
+    }
+    const uintptr_t rbpA = (uintptr_t)out - 0x60;
+    const uintptr_t rbpB = (uintptr_t)g_wgiFrameARA + 0x48;
+    if (!g_wgiFrameARA || rbpA != rbpB) {
+        Diag(tag + "DEVBAD rbpA=" + Hex((uint64_t)rbpA) +
+             " rbpB=" + Hex((uint64_t)rbpB) + " -- VOID, not a negative");
+        return;
+    }
+
+    // Once: name the owner, so the 20-slot device array and the main-player
+    // slot can be read next without another build.
+    if (bk == 1) {
+        uintptr_t x = 0, xvt = 0; uint32_t slot = 0xFFFFFFFFu;
+        GhReadableQword(rbpA + 0x128, &x);
+        if (x) { GhReadableQword(x, &xvt); GhWgiDevDw(x, 0x694, &slot); }
+        Diag(tag + "OWNER x=" + Hex((uint64_t)x) + " xvt=" + Hex((uint64_t)xvt) +
+             " mainslot=" + std::to_string((long)(int32_t)slot));
+    }
+
+    const uintptr_t dev = g_wgiGuestThis;
+    uintptr_t vt = 0;
+    if (!dev || !GhReadableQword(dev, &vt)) {
+        Diag(tag + "DEVBAD this=" + Hex((uint64_t)dev) + " unreadable -- VOID");
+        return;
+    }
+    const uintptr_t want = (uintptr_t)g_guestImageBase + 0x10FD528;
+    if (vt != want) {
+        Diag(tag + "DEVBAD this=" + Hex((uint64_t)dev) + " vt=" + Hex((uint64_t)vt) +
+             " want=" + Hex((uint64_t)want) +
+             " -- not GamepadWindowsInput: VOID, not a negative");
+        return;
+    }
+    uintptr_t lastTs = 0;
+    GhReadableQword(dev + 0x108, &lastTs);
+    uint32_t idx = 0, type = 0, chg = 0;
+    GhWgiDevDw(dev, 0x110, &idx);
+    GhWgiDevDw(dev, 0x100, &type);
+    GhWgiDevDw(dev, 0x78,  &chg);
+    std::string bs;
+    for (unsigned o = 0x80; o <= 0xB4; o += 4) {
+        uint32_t v = 0;
+        if (o != 0x80) bs += ",";
+        bs += GhWgiDevDw(dev, o, &v) ? GhHex32(v) : std::string("??");
+    }
+    Diag(tag + "this=" + Hex((uint64_t)dev) + " vt=OK" +
+         " idx=" + std::to_string((unsigned long)idx) +
+         " type=" + std::to_string((unsigned long)type) +
+         " chg=0x" + GhHex32(chg) +
+         " lastts=" + std::to_string((unsigned long long)lastTs) +
+         " tsout=" + std::to_string((unsigned long long)out->Timestamp) +
+         " gate=" + (((uint64_t)lastTs == out->Timestamp) ? "SKIP" : "DECODE") +
+         " btn=" + bs);
+}
+
 static void GhWgiMergeSynth(GhWgiPadReading* out)
 {
     const uint64_t tsIn = out->Timestamp;   // #214: what the REAL pad reported
@@ -22450,7 +22611,10 @@ static void GhWgiMergeSynth(GhWgiPadReading* out)
         static volatile LONG64 tsBias = 0;
         const LONG64 bias = InterlockedAdd64(&tsBias, 10000);
         out->Timestamp += (uint64_t)bias;
-    } else if (tsMode >= 3) {
+    } else if (tsMode == 3 || tsMode == 5) {
+        // #214: mode 4 must differ from mode 1 by the DEVREC instrument ALONE,
+        // so the timestamp rewrite is spelled out per mode rather than as a
+        // ladder. 3 = QPC only (TS3), 4 = instrument only, 5 = both.
         LARGE_INTEGER qpc{}, frq{};
         // #200: GhNowUs returns 0 when QPC fails, and a 0 timestamp would be a
         // far worse lie than a stale one. Leave the reading alone on failure.
@@ -22485,12 +22649,15 @@ static void GhWgiMergeSynth(GhWgiPadReading* out)
                  " ts=" + std::to_string((unsigned long long)tsIn) +
                  " tsout=" + std::to_string((unsigned long long)out->Timestamp) +
                  " from=" + NameForCodeAddr(g_wgiCallerRa));
+        if (bk <= 40 && GhWgiInjectMode() >= 4) GhWgiPeekDevice(out, bk);  // #214
     }
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_WgiPadRead(void* self, GhWgiPadReading* out)
 {
+    g_wgiGuestThis = (uintptr_t)GhGuestRbx();   // #214: FIRST -- the guest's `this`
     g_wgiCallerRa = (uintptr_t)_ReturnAddress();                          // #214
+    g_wgiFrameARA = _AddressOfReturnAddress();                            // #214
     HRESULT hr = g_realWgiPadRead ? g_realWgiPadRead(self, out) : E_FAIL;
     if (FAILED(hr) || !out) return hr;
 #ifdef GH_LAUNCHER
