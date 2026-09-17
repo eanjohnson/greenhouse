@@ -26289,10 +26289,65 @@ static HANDLE WINAPI Bed_HeapCreate(DWORD opts, SIZE_T initial, SIZE_T maxSize)
     return h;
 }
 
+// #217: the container's remaining budget, cached briefly. GlobalMemoryStatusEx
+// can be called hot, and each of these is a WinRT property read.
+static uint64_t g_memRemCacheMs   = 0;
+static uint64_t g_memRemCacheUsed = 0;
+static uint64_t g_memRemCacheLim  = 0;
+static void GhAppBudget(uint64_t* used, uint64_t* lim)
+{
+    const uint64_t now = (uint64_t)GetTickCount64();
+    if (!g_memRemCacheMs || now - g_memRemCacheMs > 100){
+        g_memRemCacheUsed = GhBillAppUsedRaw();
+        g_memRemCacheLim  = GhBillAppLimitRaw();
+        g_memRemCacheMs   = now ? now : 1;
+    }
+    *used = g_memRemCacheUsed; *lim = g_memRemCacheLim;
+}
+
+// gh_mem_truth (slot 218): report ullAvailPhys as the CONTAINER's remaining
+// budget instead of the box's free memory.
+//
+// #217 measured the level load as an ELASTIC consumer: across three arms the
+// burst it takes is within 43 MB of whatever headroom it is handed (978.0 into
+// 978.8, 1258.6 into 1260.5, 1053.5 into 1096.0). A streaming engine that does
+// that is sizing its pools from an "available memory" figure, and the three
+// guest sites that query this bed sit at GUEST+0x4EF249 / +0x46E9A0 / +0x454348
+// -- the first of those is 0x477 bytes from GUEST+0x4EEDD2, the site that
+// commits 1,355.9 MB during the load.
+//
+// This is accuracy, NOT a downgrade: the app's limit is unchanged, no setting,
+// resolution or advertised VRAM is touched. It reports what this process can
+// actually still obtain, which is what the game would see natively on a machine
+// with this much memory free.
+static unsigned GhMemTruth()
+{
+    static unsigned v = 0xFFFFFFFF;
+    if (v == 0xFFFFFFFF){
+        v = GhCfgNum(L"gh_mem_truth.txt", "GH_MEM_TRUTH", 0);
+        Diag("MEMORY truth (avail = container remaining) = " + std::to_string(v));
+    }
+    return v;
+}
+
 // The guest's own view of the machine. Report the APP's ceiling, not the box's:
 // AppMemoryUsageLimit is the only number here that is true for this process.
 static void GhFillMemStatus(MEMORYSTATUSEX* ms)
 {
+    if (GhMemTruth()){
+        uint64_t used = 0, lim = 0;
+        GhAppBudget(&used, &lim);
+        if (lim && used <= lim){
+            const ULONGLONG rem = (ULONGLONG)(lim - used);
+            if (ms->ullTotalPhys     > (ULONGLONG)lim) ms->ullTotalPhys     = (ULONGLONG)lim;
+            if (ms->ullTotalPageFile > (ULONGLONG)lim) ms->ullTotalPageFile = (ULONGLONG)lim;
+            if (ms->ullAvailPhys     > rem) ms->ullAvailPhys     = rem;
+            if (ms->ullAvailPageFile > rem) ms->ullAvailPageFile = rem;
+            if (ms->ullAvailVirtual  > rem) ms->ullAvailVirtual  = rem;
+            ms->dwMemoryLoad = (DWORD)(ms->ullTotalPhys ?
+                (100 - (ms->ullAvailPhys * 100 / ms->ullTotalPhys)) : 0);
+        }
+    }
     unsigned mb = GhSysMemMb();
     if (!mb) return;
     ULONGLONG cap = (ULONGLONG)mb << 20;
@@ -26314,12 +26369,24 @@ static BOOL WINAPI Bed_GlobalMemoryStatusEx(LPMEMORYSTATUSEX ms)
     if (ok){
         ULONGLONG realPhys = ms->ullTotalPhys, realAvail = ms->ullAvailPhys;
         GhFillMemStatus(ms);
-        if (InterlockedIncrement(&g_memStatusLogged) <= 8)
-            Diag("BED GlobalMemoryStatusEx totalphys=" + Hex((uint64_t)realPhys) +
+        // #217: 8 lines was too few to see the LOAD -- every logged sample was
+        // from the first seconds, when "4.9 GB free" was still roughly true.
+        // Log the first 400 and carry the container's own budget alongside, so
+        // the gap between what we report and what the app can really get is
+        // visible without a second run.
+        const LONG nlog = InterlockedIncrement(&g_memStatusLogged);
+        if (nlog <= 400){
+            uint64_t used = 0, lim = 0;
+            GhAppBudget(&used, &lim);
+            Diag("BED GlobalMemoryStatusEx n=" + std::to_string((long)nlog) +
+                 " totalphys=" + Hex((uint64_t)realPhys) +
                  " availphys=" + Hex((uint64_t)realAvail) +
                  " -> reported total=" + Hex((uint64_t)ms->ullTotalPhys) +
                  " avail=" + Hex((uint64_t)ms->ullAvailPhys) +
+                 " | appused=" + Hex(used) + " applimit=" + Hex(lim) +
+                 " remaining=" + Hex(lim > used ? lim - used : 0) +
                  " from=" + NameForCodeAddr((uintptr_t)_ReturnAddress()));
+        }
     }
     return ok;
 }
