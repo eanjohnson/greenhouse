@@ -21438,6 +21438,81 @@ static unsigned GhVaCensusEvery()
 static unsigned GhVaCensusHotPct()
 { static const unsigned v = (unsigned)GhCfgNumZ(L"gh_va_census_hot.txt", "GH_VA_CENSUS_HOT", 85); return v; }
 
+// ---------------------------------------------------------------------------
+// #202 cell HEAPTRIM.  What the VA census actually says about the pipeline phase.
+//
+// Over the 20 censuses in cell VACENSUS where the write-combined delta is ~0 --
+// i.e. after streaming is done and only pipelines are still being created -- the
+// process grew 215.9 MB and freed 95.6 MB, a NET 120.3 MB, and every listed
+// grower is `private`.  Zero image, zero mapped.  Of the top rows, 66.8 MB is
+// prot=0x4 (PAGE_READWRITE) against 17.4 MB of 0x404 (write-combined), and the
+// growth arrives as 1,602 fresh regions averaging 138 KB.
+//
+// Ordinary read-write private memory, appearing in a stream of ~138 KB regions,
+// is the shape of NT heap segments -- not of GPU memory, which
+// va-census-confirms-the-d3d12-split ties to the 0x404 bucket.  A Windows heap
+// keeps freed blocks committed and cached rather than returning them, which is
+// exactly how a process can free 95.6 MB and still owe all of it to the
+// container.  HeapOptimizeResources (HeapSetInformation class 3) is the
+// documented request to decommit those cached blocks.
+//
+// THE BRACKET IS THE POINT, not the trim.  This population's run-to-run spread
+// is 41% on psoN and 44% on throughput (cell RESKIND2), so no cross-run
+// comparison can resolve a 100 MB effect.  Reading AppMemoryUsage immediately
+// before and after the trim measures it INSIDE one run, against itself.  A cell
+// that trims and reports freedKB=0 has answered the question as cleanly as one
+// that reports 120,000, and neither needs a control.
+//
+// gh_heap_trim.txt = N : trim on every Nth MEMORY sample.  0 = off (default),
+// so every existing cell is bit-for-bit unchanged.
+static unsigned GhHeapTrimEvery()
+{ static const unsigned v = GhCfgNum(L"gh_heap_trim.txt", "GH_HEAP_TRIM", 0); return v; }
+
+static void GhHeapTrim(const char* when)
+{
+    const unsigned every = GhHeapTrimEvery();
+    if (!every) return;
+    static unsigned  seq = 0;
+    if ((seq++ % every) != 0) return;
+
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    auto pGPH = k32 ? (DWORD (WINAPI*)(DWORD, PHANDLE))
+                          GetProcAddress(k32, "GetProcessHeaps") : nullptr;
+    auto pHSI = k32 ? (BOOL (WINAPI*)(HANDLE, int, PVOID, SIZE_T))
+                          GetProcAddress(k32, "HeapSetInformation") : nullptr;
+    if (!pGPH || !pHSI) {                       // container-api-gaps: say so, do not guess
+        Diag(std::string("HEAPTRIM ") + when + " UNAVAILABLE GetProcessHeaps=" +
+             (pGPH ? "1" : "0") + " HeapSetInformation=" + (pHSI ? "1" : "0"));
+        return;
+    }
+
+    HANDLE heaps[256];
+    const DWORD n = pGPH(256, heaps);
+    const uint64_t before = GhBillAppUsedRaw();
+    const ULONGLONG t0 = GetTickCount64();
+    DWORD ok = 0, bad = 0;
+    // HeapOptimizeResources == 3; the argument is ULONG Version + ULONG Flags,
+    // both zero.  Documented since Windows 8.1 and a no-op on a heap with
+    // nothing cached, so a refusal is informative and a success may still be 0.
+    struct { ULONG Version, Flags; } hori { 0, 0 };
+    for (DWORD i = 0; i < n && i < 256; ++i) {
+        if (!heaps[i]) continue;
+        if (pHSI(heaps[i], 3, &hori, sizeof hori)) ++ok; else ++bad;
+    }
+    const uint64_t after = GhBillAppUsedRaw();
+    const ULONGLONG ms = GetTickCount64() - t0;
+    // Signed: the trim can lose the race against 53 guest threads allocating, and
+    // a negative reading is a real answer (the heaps had nothing to give).
+    const long long freedKB = ((long long)before - (long long)after) / 1024;
+    Diag(std::string("HEAPTRIM ") + when + " heaps=" + std::to_string((unsigned long)n) +
+         " ok=" + std::to_string((unsigned long)ok) +
+         " refused=" + std::to_string((unsigned long)bad) +
+         " beforeKB=" + std::to_string((unsigned long long)(before / 1024)) +
+         " afterKB=" + std::to_string((unsigned long long)(after / 1024)) +
+         " freedKB=" + std::to_string(freedKB) +
+         " ms=" + std::to_string((unsigned long long)ms));
+}
+
 struct GhVaReg { uint64_t base, size; DWORD type, prot; };
 static SRWLOCK              g_vaCensusLock = SRWLOCK_INIT;
 static std::vector<GhVaReg> g_vaPrev;        // previous walk, ascending by base
@@ -21648,6 +21723,7 @@ static void GhLogMemoryBudget(const char* where)
     GhLazyWhoDump(where);                         // #213
     GhResLiveDump(where);                         // #202: what is IN that viduse
     GhVaCensus(where, appUsed, appLimit);
+    GhHeapTrim(where);                            // #202: does the heap owe us the pipeline phase?
 }
 
 // #158. The repairs above say something specific and testable: every one of them
