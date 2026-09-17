@@ -11152,6 +11152,16 @@ static volatile LONG64 g_pgCapB     = 0;   // bytes in captured descriptors
 static volatile LONG64 g_pgBlobB    = 0;   // bytes in interned shader bytecode
 static volatile LONG   g_pgBlobN    = 0;   // distinct interned blobs
 static volatile LONG64 g_pgRematUs  = 0;   // driver time spent re-creating
+// PGCAP scored +15.8 MB against a +-37 MB floor: the cap held at 2048, 3014
+// pipelines were evicted, and the container did not move.  pgEv counts quarantine
+// PUSHES, so it cannot tell 'the driver does not return the 38 KiB on final
+// Release' from 'our Release is not the final one'.  These three do: every drain
+// Release is counted, and the refcount it RETURNS is bucketed.  rel==relZero and
+// a flat appused is a driver property; relLive>0 names a reference we still hold.
+static volatile LONG   g_pgRel      = 0;   // Release() calls made by the drain
+static volatile LONG   g_pgRelZero  = 0;   //   ... that returned 0 (we were last)
+static volatile LONG   g_pgRelLive  = 0;   //   ... that returned > 0 (someone else holds one)
+static volatile LONG   g_pgBracketN = 0;   // how many drains we have bracketed with appused
 
 // ------------------------------------------------------------ shader interning
 //
@@ -11519,12 +11529,46 @@ static void GhPagerQuarPush(ID3D12PipelineState* p, LONG64 now)   // g_pgLock he
 }
 static void GhPagerQuarDrain(LONG64 now)                          // g_pgLock held
 {
+    // Direct evidence beats arithmetic. When a drain is about to release a big
+    // batch, bracket it with the ONE number the 5 GiB cap enforces. 3,014 Releases
+    // that all return 0 while appused does not move is the driver not giving the
+    // 38.0 KiB back -- stated, not inferred.
+    size_t due = 0;
+    for (size_t i = 0; i < g_pgQuar.size(); ++i)
+        if (now - g_pgQuar[i].ms >= kPgQuarMs) ++due;
+    const bool bracket = (due >= 256) && (InterlockedIncrement(&g_pgBracketN) <= 6);
+    const uint64_t usedBefore = bracket ? GhBillAppUsedRaw() : 0;
+
     size_t keep = 0;
     for (size_t i = 0; i < g_pgQuar.size(); ++i){
-        if (now - g_pgQuar[i].ms >= kPgQuarMs) g_pgQuar[i].p->Release();
+        if (now - g_pgQuar[i].ms >= kPgQuarMs){
+            ID3D12PipelineState* p = g_pgQuar[i].p;
+            const ULONG rc = p->Release();
+            const LONG n = InterlockedIncrement(&g_pgRel);
+            if (rc == 0) InterlockedIncrement(&g_pgRelZero);
+            else {
+                const LONG bad = InterlockedIncrement(&g_pgRelLive);
+                // This is the one that would explain PGCAP as OUR bug rather than
+                // the driver's behaviour, so say which object and what it returned.
+                if (bad <= 8)
+                    Diag("PSOPAGER release NOT last n=" + std::to_string(n) +
+                         " real=" + Hex((uint64_t)(uintptr_t)p) +
+                         " refcount_after=" + std::to_string((uint64_t)rc));
+            }
+        }
         else g_pgQuar[keep++] = g_pgQuar[i];
     }
     g_pgQuar.resize(keep);
+
+    if (bracket){
+        const uint64_t usedAfter = GhBillAppUsedRaw();
+        const int64_t  deltaKB   = ((int64_t)usedAfter - (int64_t)usedBefore) / 1024;
+        Diag("PSOPAGER drain bracket released=" + std::to_string((uint64_t)due) +
+             " appusedKB " + std::to_string(usedBefore / 1024) +
+             " -> " + std::to_string(usedAfter / 1024) +
+             " delta=" + std::to_string(deltaKB) + "KB" +
+             " expectedKB=-" + std::to_string((uint64_t)due * 38u));
+    }
 }
 
 // Evict until the live count is back inside the cap. A clock sweep rather than an
@@ -11793,6 +11837,9 @@ static std::string GhPagerFrameLine()
            " pgBlobKB=" + std::to_string((long long)(
                InterlockedCompareExchange64(&g_pgBlobB, 0, 0) >> 10)) +
            " pgBlobN=" + std::to_string((long)InterlockedCompareExchange(&g_pgBlobN, 0, 0)) +
+        " pgRel=" + std::to_string((long)InterlockedCompareExchange(&g_pgRel, 0, 0)) +
+        "/"      + std::to_string((long)InterlockedCompareExchange(&g_pgRelZero, 0, 0)) +
+        "/"      + std::to_string((long)InterlockedCompareExchange(&g_pgRelLive, 0, 0)) +
            " pgEpoch=" + std::to_string((long)InterlockedCompareExchange(&g_caEpoch, 0, 0)) +
            "/" + std::to_string((long)InterlockedCompareExchange(&g_caMin, 0, 0));
 }
