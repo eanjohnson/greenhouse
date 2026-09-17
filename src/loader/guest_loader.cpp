@@ -17966,7 +17966,7 @@ static void GhFreedNote(void* p)
 // COST. The table is 3 MiB of commit, allocated lazily and only when the knob is
 // on, which is inside the +-37 MB scoring floor. RtlCaptureStackBackTrace per
 // create is the same price gh_lazy_who paid for 1,274 MB of answer.
-struct GhLiveRes { void* p; volatile LONG live; uint32_t site; uint64_t bytes; };
+struct GhLiveRes { void* p; volatile LONG live; uint32_t tag; uint64_t bytes; };
 static const LONG      GH_LIVE_SLOTS  = 1 << 17;      // 131,072; ~30k creates in a full run
 static GhLiveRes*      g_liveRes      = nullptr;
 static volatile LONG   g_liveFull     = 0;            // creates the table could not hold
@@ -17977,15 +17977,45 @@ static volatile LONG   g_liveN        = 0;            // LIVE count
 static volatile LONG   g_liveEverN    = 0;            // recorded creates
 static volatile LONG   g_liveDropN    = 0;            // recorded destroys
 
+// CORRECTION, loader 0.0.511.0. The first RESLIVE cell bucketed by
+// GhGuestCallerRva(), and every one of its 29,978 creates came back
+// <unattributed> -- as did the one HEAPSITE line #158 ever printed, site=0x0.
+// RtlCaptureStackBackTrace cannot walk out of the guest: we SELF-MAP the guest
+// image, so its .pdata is never registered with the OS and there is no unwind
+// information to follow. (gh_lazy_who attributes fine because it reads the RIP
+// out of an EXCEPTION_RECORD and never walks a stack.) So bucket by what we
+// actually hold in our hands at the create: the resource SHAPE. For memory work
+// that is the better key anyway -- "29,249 mipped BC textures" says more than a
+// return address would.
 struct GhLiveSite {
-    uint64_t       addr;                              // guest code address that created them
+    uint64_t        key;                              // GhRdKey(rd) ^ kind, or the heap key
+    char            brief[104];
     volatile LONG64 liveB, everB;
-    volatile LONG   liveN, everN, texN;
+    volatile LONG   liveN, everN;
 };
 static GhLiveSite    g_liveSite[64]{};
 static volatile LONG g_liveSiteN    = 0;
 static SRWLOCK       g_liveSiteLock = SRWLOCK_INIT;
-static uintptr_t     GhGuestCallerRva();              // defined with the create hooks
+
+// #202. Where a resource is billed depends entirely on how it was made. A
+// COMMITTED resource owns its memory. A PLACED one owns none: its bytes were
+// already billed to the heap at CreateHeap, once and eagerly (#211). A RESERVED
+// one owns address space and may have no tiles at all. Summing all three is how
+// "6.6-7.1 GiB resident" was arrived at, and it is why that number is larger
+// than the container it supposedly fits inside. Split them.
+enum { GH_LK_NONE = 0, GH_LK_COMMITTED = 1, GH_LK_PLACED = 2, GH_LK_RESERVED = 3, GH_LK_HEAP = 4 };
+static volatile LONG64 g_liveKindB[5]{};
+static volatile LONG   g_liveKindN[5]{};
+static const char* GhLiveKindName(unsigned k)
+{
+    switch (k){
+        case GH_LK_COMMITTED: return "committed";
+        case GH_LK_PLACED:    return "placed";
+        case GH_LK_RESERVED:  return "reserved";
+        case GH_LK_HEAP:      return "heap";
+        default:              return "unknown";
+    }
+}
 
 static inline LONG GhLiveHash(void* p)
 {
@@ -18018,17 +18048,21 @@ static GhLiveRes* GhLiveTable()
     return g_liveRes;
 }
 
-// -1 means the site table is full; the resource is still counted process-wide.
-static LONG GhLiveSiteIdx(uint64_t addr)
+// -1 means the bucket table is full; the resource is still counted process-wide.
+static LONG GhLiveSiteIdx(uint64_t key, const std::string& brief)
 {
     LONG n = InterlockedCompareExchange(&g_liveSiteN, 0, 0);
-    for (LONG i = 0; i < n && i < 64; ++i) if (g_liveSite[i].addr == addr) return i;
+    for (LONG i = 0; i < n && i < 64; ++i) if (g_liveSite[i].key == key) return i;
     AcquireSRWLockExclusive(&g_liveSiteLock);
     LONG r = -1;
     n = g_liveSiteN;
-    for (LONG i = 0; i < n && i < 64; ++i) if (g_liveSite[i].addr == addr){ r = i; break; }
+    for (LONG i = 0; i < n && i < 64; ++i) if (g_liveSite[i].key == key){ r = i; break; }
     if (r < 0 && n < 64){
-        g_liveSite[n].addr = addr;
+        g_liveSite[n].key = key;
+        const size_t cb = brief.size() < sizeof(g_liveSite[n].brief) - 1
+                        ? brief.size() : sizeof(g_liveSite[n].brief) - 1;
+        memcpy(g_liveSite[n].brief, brief.c_str(), cb);
+        g_liveSite[n].brief[cb] = 0;
         r = n;
         InterlockedExchange(&g_liveSiteN, n + 1);
     }
@@ -18045,15 +18079,16 @@ static void GhLivePeak(LONG64 now)
     }
 }
 
-static void GhResLiveNote(void* p, ID3D12Device* dev, const D3D12_RESOURCE_DESC* rd)
+// The one place that actually records a live object. kind decides where it is
+// billed; bytes is what it costs there.
+static void GhLiveNote(void* p, uint64_t bytes, unsigned kind, uint64_t key,
+                       const std::string& brief)
 {
-    if (!p || !rd || GhObjLife() < 2) return;
+    if (!p || GhObjLife() < 2) return;
     GhLiveRes* t = GhLiveTable();
     if (!t) return;
-    const uint64_t bytes = GhResBytesOf(dev, rd);
-    const LONG     si    = GhLiveSiteIdx((uint64_t)GhGuestCallerRva());
-    const bool     tex   = rd->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER;
-    const LONG     h     = GhLiveHash(p);
+    const LONG si = GhLiveSiteIdx(key, brief);
+    const LONG h  = GhLiveHash(p);
     for (LONG probe = 0; probe < 512; ++probe){
         const LONG i = (h + probe) & (GH_LIVE_SLOTS - 1);
         void* cur = t[i].p;
@@ -18068,22 +18103,48 @@ static void GhResLiveNote(void* p, ID3D12Device* dev, const D3D12_RESOURCE_DESC*
             continue;
         }
         t[i].bytes = bytes;
-        t[i].site  = (uint32_t)(si + 1);            // 0 = unattributed
+        // low 16 bits: bucket index + 1 (0 = unattributed). high 16: the kind.
+        t[i].tag   = (uint32_t)((si + 1) & 0xFFFF) | ((uint32_t)kind << 16);
         InterlockedExchange(&t[i].live, 1);
         const LONG64 now = InterlockedAdd64(&g_liveBytes, (LONG64)bytes);
         GhLivePeak(now);
         InterlockedIncrement(&g_liveN);
         InterlockedIncrement(&g_liveEverN);
+        if (kind < 5){
+            InterlockedAdd64(&g_liveKindB[kind], (LONG64)bytes);
+            InterlockedIncrement(&g_liveKindN[kind]);
+        }
         if (si >= 0){
             InterlockedAdd64(&g_liveSite[si].liveB, (LONG64)bytes);
             InterlockedAdd64(&g_liveSite[si].everB, (LONG64)bytes);
             InterlockedIncrement(&g_liveSite[si].liveN);
             InterlockedIncrement(&g_liveSite[si].everN);
-            if (tex) InterlockedIncrement(&g_liveSite[si].texN);
         }
         return;
     }
     InterlockedIncrement(&g_liveFull);
+}
+
+static void GhResLiveNote(void* p, ID3D12Device* dev, const D3D12_RESOURCE_DESC* rd,
+                          unsigned kind)
+{
+    if (!p || !rd || GhObjLife() < 2) return;
+    GhLiveNote(p, GhResBytesOf(dev, rd), kind,
+               GhRdKey(rd) ^ ((uint64_t)kind << 60),
+               std::string(GhLiveKindName(kind)) + " " + GhRdBrief(rd));
+}
+
+// Heaps are the other half of the bill, and the half the placed resources were
+// charged to. Without them the split cannot be read.
+static void GhHeapLiveNote(void* p, const D3D12_HEAP_DESC* hd)
+{
+    if (!p || !hd || GhObjLife() < 2) return;
+    const int ty = (int)hd->Properties.Type;
+    GhLiveNote(p, (uint64_t)hd->SizeInBytes, GH_LK_HEAP,
+               0x48454150ull ^ ((uint64_t)ty << 8) ^ (uint64_t)hd->Flags,
+               "heap type=" + std::to_string(ty) +
+               " cpupage=" + std::to_string((int)hd->Properties.CPUPageProperty) +
+               " flags=" + Hex((uint32_t)hd->Flags));
 }
 
 static void GhResLiveDrop(void* p)
@@ -18099,10 +18160,15 @@ static void GhResLiveDrop(void* p)
         if (cur != p) continue;
         if (InterlockedCompareExchange(&t[i].live, 0, 1) != 1) return;   // not ours to drop
         const uint64_t b = t[i].bytes;
-        const uint32_t s = t[i].site;
+        const uint32_t s = t[i].tag & 0xFFFF;
+        const uint32_t k = t[i].tag >> 16;
         InterlockedAdd64(&g_liveBytes, -(LONG64)b);
         InterlockedDecrement(&g_liveN);
         InterlockedIncrement(&g_liveDropN);
+        if (k < 5){
+            InterlockedAdd64(&g_liveKindB[k], -(LONG64)b);
+            InterlockedDecrement(&g_liveKindN[k]);
+        }
         if (s && s <= 64){
             InterlockedAdd64(&g_liveSite[s - 1].liveB, -(LONG64)b);
             InterlockedDecrement(&g_liveSite[s - 1].liveN);
@@ -18116,6 +18182,9 @@ static std::string GhResLiveFrameLine()
 {
     if (GhObjLife() < 2) return std::string();
     return " livresMB=" + std::to_string((long long)(InterlockedCompareExchange64(&g_liveBytes, 0, 0) >> 20)) +
+           " livchargeMB=" + std::to_string((long long)(
+               (InterlockedCompareExchange64(&g_liveKindB[GH_LK_COMMITTED], 0, 0) +
+                InterlockedCompareExchange64(&g_liveKindB[GH_LK_HEAP], 0, 0)) >> 20)) +
            " livresN="  + std::to_string((long)InterlockedCompareExchange(&g_liveN, 0, 0)) +
            " livdrop="  + std::to_string((long)InterlockedCompareExchange(&g_liveDropN, 0, 0));
 }
@@ -18135,6 +18204,27 @@ static void GhResLiveDump(const char* where)
          " sites="   + std::to_string((long)n) +
          " tableFull=" + std::to_string((long)InterlockedCompareExchange(&g_liveFull, 0, 0)) +
          " untracked=" + std::to_string((long)InterlockedCompareExchange(&g_liveMiss, 0, 0)));
+    // THE LINE THE CELL EXISTS FOR. A placed resource is not billed here -- its
+    // bytes were billed to its heap -- so the D3D12 charge is committed + heap,
+    // and THAT is the number to hold against viduse. Summing all four is the
+    // mistake that produced a "resident set" bigger than the container.
+    {
+        const LONG64 cm = InterlockedCompareExchange64(&g_liveKindB[GH_LK_COMMITTED], 0, 0);
+        const LONG64 pl = InterlockedCompareExchange64(&g_liveKindB[GH_LK_PLACED],    0, 0);
+        const LONG64 rv = InterlockedCompareExchange64(&g_liveKindB[GH_LK_RESERVED],  0, 0);
+        const LONG64 hp = InterlockedCompareExchange64(&g_liveKindB[GH_LK_HEAP],      0, 0);
+        Diag(std::string("RESLIVE kinds at ") + where +
+             " committedMB=" + std::to_string((long long)(cm >> 20)) +
+             "/" + std::to_string((long)InterlockedCompareExchange(&g_liveKindN[GH_LK_COMMITTED], 0, 0)) +
+             " placedMB="    + std::to_string((long long)(pl >> 20)) +
+             "/" + std::to_string((long)InterlockedCompareExchange(&g_liveKindN[GH_LK_PLACED], 0, 0)) +
+             " reservedMB="  + std::to_string((long long)(rv >> 20)) +
+             "/" + std::to_string((long)InterlockedCompareExchange(&g_liveKindN[GH_LK_RESERVED], 0, 0)) +
+             " heapMB="      + std::to_string((long long)(hp >> 20)) +
+             "/" + std::to_string((long)InterlockedCompareExchange(&g_liveKindN[GH_LK_HEAP], 0, 0)) +
+             " chargeMB="    + std::to_string((long long)((cm + hp) >> 20)) +
+             " (committed+heap; placed is already inside heap)");
+    }
     // Rank by LIVE bytes -- the whole point is which sites are still holding.
     LONG ord[64]; LONG m = n < 64 ? n : 64;
     for (LONG i = 0; i < m; ++i) ord[i] = i;
@@ -18146,13 +18236,12 @@ static void GhResLiveDump(const char* where)
     const LONG top = m < 12 ? m : 12;
     for (LONG i = 0; i < top; ++i){
         const GhLiveSite& e = g_liveSite[ord[i]];
-        Diag("  RESLIVE site[" + std::to_string((long)i) + "] " +
-             (e.addr ? NameForCodeAddr((uintptr_t)e.addr) : std::string("<unattributed>")) +
+        Diag("  RESLIVE shape[" + std::to_string((long)i) + "]" +
              " liveMB=" + std::to_string((long long)(e.liveB >> 20)) +
              " everMB=" + std::to_string((long long)(e.everB >> 20)) +
              " liveN="  + std::to_string((long)e.liveN) +
              " everN="  + std::to_string((long)e.everN) +
-             " tex="    + std::to_string((long)e.texN));
+             " | "      + std::string(e.brief));
     }
 }
 
@@ -20507,7 +20596,7 @@ static HRESULT __stdcall Hook_D12CreateCommitted(ID3D12Device* self,
     if (SUCCEEDED(hr) && pp && *pp) GhVaRegister((ID3D12Resource*)*pp, rd);
     if (SUCCEEDED(hr) && pp && *pp) GhRtDsRecord((ID3D12Resource*)*pp, rd, st);
     if (SUCCEEDED(hr) && pp && *pp) GhHookResourceVtable((ID3D12Resource*)*pp);
-    if (SUCCEEDED(hr) && pp && *pp) { GhHookObjRelease((IUnknown*)*pp); GhResLiveNote(*pp, self, rd); }
+    if (SUCCEEDED(hr) && pp && *pp) { GhHookObjRelease((IUnknown*)*pp); GhResLiveNote(*pp, self, rd, GH_LK_COMMITTED); }
     static LONG n = 0;
     if (InterlockedIncrement(&n) <= 24 || FAILED(hr))
         Diag("D3D12 CreateCommittedResource heap=" + std::to_string(hp ? (int)hp->Type : -1) +
@@ -20662,6 +20751,12 @@ static HRESULT __stdcall Hook_D12CreateHeap(ID3D12Device* self,
     if (SUCCEEDED(hr) && hd){
         InterlockedAdd64(&heapBytes, (LONG64)hd->SizeInBytes);
         InterlockedIncrement(&heapCount);
+    }
+    // #202. heapBytes above is CUMULATIVE like everything else; these two give the
+    // heap set a live number, and heaps are where every placed resource is billed.
+    if (SUCCEEDED(hr) && hd && pp && *pp){
+        GhHookObjRelease((IUnknown*)*pp);
+        GhHeapLiveNote(*pp, hd);
     }
     Diag("D3D12 CreateHeap size=" + (hd ? Hex((uint64_t)hd->SizeInBytes) : std::string("null")) +
          " type=" + std::to_string(hd ? (int)hd->Properties.Type : -1) +
@@ -20843,7 +20938,7 @@ static HRESULT __stdcall Hook_D12CreatePlaced(ID3D12Device* self, ID3D12Heap* he
                     if (pp && *pp) GhVaRegister((ID3D12Resource*)*pp, rd);
                     if (pp && *pp) GhRtDsRecord((ID3D12Resource*)*pp, rd, st);
                     if (pp && *pp) GhHookResourceVtable((ID3D12Resource*)*pp);
-                    if (pp && *pp) { GhHookObjRelease((IUnknown*)*pp); GhResLiveNote(*pp, self, rd); }
+                    if (pp && *pp) { GhHookObjRelease((IUnknown*)*pp); GhResLiveNote(*pp, self, rd, GH_LK_COMMITTED); }
                     return hc;
                 }
             }
@@ -20893,7 +20988,7 @@ static HRESULT __stdcall Hook_D12CreatePlaced(ID3D12Device* self, ID3D12Heap* he
                 if (pp && *pp) GhVaRegister((ID3D12Resource*)*pp, rd);
                 if (pp && *pp) GhRtDsRecord((ID3D12Resource*)*pp, rd, st);
                 if (pp && *pp) GhHookResourceVtable((ID3D12Resource*)*pp);
-                if (pp && *pp) { GhHookObjRelease((IUnknown*)*pp); GhResLiveNote(*pp, self, rd); }
+                if (pp && *pp) { GhHookObjRelease((IUnknown*)*pp); GhResLiveNote(*pp, self, rd, GH_LK_COMMITTED); }
                 return hc;
             }
         }
@@ -20919,7 +21014,7 @@ static HRESULT __stdcall Hook_D12CreatePlaced(ID3D12Device* self, ID3D12Heap* he
     if (SUCCEEDED(hr) && pp && *pp) GhVaRegister((ID3D12Resource*)*pp, rd);
     if (SUCCEEDED(hr) && pp && *pp) GhRtDsRecord((ID3D12Resource*)*pp, rd, st);
     if (SUCCEEDED(hr) && pp && *pp) GhHookResourceVtable((ID3D12Resource*)*pp);
-    if (SUCCEEDED(hr) && pp && *pp) { GhHookObjRelease((IUnknown*)*pp); GhResLiveNote(*pp, self, rd); }
+    if (SUCCEEDED(hr) && pp && *pp) { GhHookObjRelease((IUnknown*)*pp); GhResLiveNote(*pp, self, rd, GH_LK_PLACED); }
     if (loud || FAILED(hr)) Diag("  CreatePlacedResource -> hr=" + Hex((uint32_t)hr));
     // #187 log budget: every placement, once each, was 1.16 MB of a quota the game
     // needs. The placements matter as a population, not individually -- keep the
@@ -20976,7 +21071,7 @@ static HRESULT __stdcall Hook_D12CreateReserved(ID3D12Device* self,
     if (SUCCEEDED(hr) && pp && *pp) GhVaRegister((ID3D12Resource*)*pp, rd);
     if (SUCCEEDED(hr) && pp && *pp) GhRtDsRecord((ID3D12Resource*)*pp, rd, st);
     if (SUCCEEDED(hr) && pp && *pp) GhHookResourceVtable((ID3D12Resource*)*pp);
-    if (SUCCEEDED(hr) && pp && *pp) { GhHookObjRelease((IUnknown*)*pp); GhResLiveNote(*pp, self, rd); }
+    if (SUCCEEDED(hr) && pp && *pp) { GhHookObjRelease((IUnknown*)*pp); GhResLiveNote(*pp, self, rd, GH_LK_RESERVED); }
     static LONG n = 0;
     LONG i = InterlockedIncrement(&n);
     if (i <= 24 || (i % 64) == 0 || FAILED(hr))
