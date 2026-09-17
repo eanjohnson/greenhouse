@@ -1608,6 +1608,207 @@ static void* const g_rp_vtbl[12] = {
 };
 static void* const* g_rp_fallback = g_rp_vtbl;   // the object IS its vtable pointer
 
+// ===================== #220: a real object for every interface =====================
+// A one-byte `char` sentinel is a correct answer for the flat C API and a fatal
+// one for a native C++ consumer. The flat API hands the pointer straight back to
+// our own wrappers as an opaque `self` they ignore; a C++ consumer instead does
+//     mov rdx,[rcx]          ; load the vtable out of the object
+//     call [rdx]             ; call slot 0
+// and a `char` in .bss reads as eight zero bytes, so rdx is 0 and the call faults
+// reading address 0. That is EXACTLY the death cell ENGOFF recorded with
+// gh_engine_off=1 -- "VEH fault code=0xC0000005 at=0x140465842 read 0x0", insn
+// FF 12 (call qword ptr [rdx]), rdx=0, rcx pointing into this DLL's .bss. It is
+// also the death Remote Play already hit once, which is why g_rp_vtbl exists.
+// g_rp_vtbl is the RIGHT answer and stays; this is the same answer generalised to
+// every other interface, for the case where the real engine is not available.
+//
+// THE PROBLEM WITH A GENERIC VTABLE is the x64 return ABI, not the arity: the
+// callee never cleans the stack, so one stub serves every slot however many
+// arguments it really takes. Three return shapes have to be told apart:
+//   (a) integer / pointer / bool  -> rax. Zero is right.
+//   (b) float / double            -> xmm0. rax is ignored, so a C stub that
+//       "returns 0" leaves whatever was in xmm0 -- and #154 is the standing proof
+//       that a stray NaN out of a bed costs weeks. xmm0 is zeroed explicitly.
+//   (c) a struct too big (or too non-trivial) to return in rax -- CSteamID,
+//       SteamNetworkingIdentity, InputAnalogActionData_t -- is returned through a
+//       HIDDEN POINTER: the caller passes the buffer in rcx, `this` shifts to rdx,
+//       and the callee must return that same buffer in rax. Returning 0 here
+//       hands the caller a null it will dereference.
+//
+// (c) is decidable at runtime and needs no SDK header, which is the whole point:
+// the Steamworks headers for these versions (SteamUser023, SteamUtils010,
+// SteamFriends017, ...) are newer than the Open Steamworks copies in toolchain/,
+// so the vtable layouts are not knowable here -- but WE own the object address.
+// If rcx is one of our interface objects the call is shape (a)/(b); if rdx is one
+// and rcx is not, rcx is the hidden return buffer and the call is shape (c).
+//
+// How much of that buffer to zero is the one genuinely unknowable number, so it
+// is a knob (gh_stub_ret_bytes.txt, default 8 = sizeof(CSteamID)). Writing more
+// than the caller allocated would smash its stack silently, so the default is the
+// smallest plausible answer and deliberately does NOT cover
+// SteamNetworkingIdentity -- networking is not on the level-load path.
+//
+// Every distinct (interface, slot) that is actually CALLED is logged exactly once.
+// That list is the real answer to "what does this game need", and is far cheaper
+// to collect than guessing from headers.
+#ifndef GH_STUB_SLOTS
+#define GH_STUB_SLOTS 192
+#endif
+
+struct GhStubIface {
+    void* const*  vtbl;          // slot 0: the object IS its vtable pointer
+    const char*   name;
+    unsigned      idx;
+    unsigned char seen[GH_STUB_SLOTS];
+};
+static GhStubIface  g_stub_obj[40];
+static int          g_stub_obj_n = 0;
+static void**       g_stub_vtbl  = nullptr;   // one shared vtable of per-slot thunks
+static CRITICAL_SECTION g_stub_cs;
+static LONG             g_stub_cs_init = 0;
+
+// Knob file, read once, in the same LocalState folder as gh_shim.log so it can be
+// dropped in with one fsupload without touching the loader's slot table.
+static unsigned gh_stub_ret_bytes() {
+    static unsigned v = 0;
+    if (v) return v;
+    // 8, not 16: CSteamID is 8 bytes and is by far the likeliest struct return on
+    // the load path. Over-zeroing a caller's stack buffer corrupts whatever sits
+    // next to it SILENTLY; under-zeroing only leaves fields the caller may not
+    // read. Between two unknowns, take the one that cannot corrupt. The STUBCALL
+    // "shape=structret" lines say exactly which slots take this path, and the
+    // knob is here so the answer can be raised once they are known.
+    v = 8;
+    char path[MAX_PATH]; strcpy_s(path, MAX_PATH, gh_log_path());
+    char* slash = strrchr(path, '\\');
+    if (slash) strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "gh_stub_ret_bytes.txt");
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        char buf[16] = {0}; DWORD rd = 0;
+        if (ReadFile(h, buf, sizeof(buf) - 1, &rd, nullptr) && rd) {
+            unsigned n = 0; bool any = false;
+            for (DWORD i = 0; i < rd && buf[i] >= '0' && buf[i] <= '9'; ++i) {
+                n = n * 10 + (unsigned)(buf[i] - '0'); any = true;
+            }
+            if (any && n > 0 && n <= 256) v = n;
+        }
+        CloseHandle(h);
+    }
+    return v;
+}
+
+static bool gh_stub_is_obj(const void* p) {
+    for (int i = 0; i < g_stub_obj_n; ++i)
+        if ((const void*)&g_stub_obj[i] == p) return true;
+    return false;
+}
+
+// Called by the emitted common stub with the ORIGINAL rcx/rdx and the packed
+// (interface<<16 | slot) the per-slot thunk put in r10d.
+extern "C" void* gh_stub_dispatch(void* a, void* b, unsigned id) {
+    const unsigned slot = id & 0xFFFFu;   // the thunks carry the slot and nothing else
+
+    // WHICH interface is recovered from the object pointer, not from the thunk:
+    // the vtable is shared by every interface, so a per-interface thunk table
+    // would have cost GH_STUB_SLOTS thunks per interface for no new information.
+    GhStubIface* self = nullptr;
+    bool structret = false;
+    if (gh_stub_is_obj(a))      { self = (GhStubIface*)a; }                  // this in rcx
+    else if (gh_stub_is_obj(b)) { self = (GhStubIface*)b; structret = true; } // hidden buffer in rcx
+
+    if (self && slot < GH_STUB_SLOTS && !self->seen[slot]) {
+        self->seen[slot] = 1;
+        gh_logf("[gh-shim] STUBCALL %s slot=%u shape=%s", self->name, slot,
+                structret ? "structret" : "plain");
+    } else if (!self) {
+        // Neither register is one of ours. Nothing can be said about the shape,
+        // so take the safe branch (rax=0) and say so once.
+        static LONG once = 0;
+        if (InterlockedCompareExchange(&once, 1, 0) == 0)
+            gh_logf("[gh-shim] STUBCALL UNIDENTIFIED slot=%u rcx=%p rdx=%p", slot, a, b);
+    }
+
+    if (structret && a) {                        // shape (c): zero and return the buffer
+        memset(a, 0, gh_stub_ret_bytes());
+        return a;
+    }
+    return nullptr;                                // shape (a)/(b): rax = 0, xmm0 zeroed by the stub
+}
+
+// One RWX page holding the common stub plus GH_STUB_SLOTS per-slot thunks.
+// Hand-emitted rather than written in asm because MSVC x64 has no __declspec(naked)
+// and this shim is built by a single cl.exe line with no ml64 step.
+static bool gh_stub_build_vtbl() {
+    if (g_stub_vtbl) return true;
+    const size_t kCommon = 32, kThunk = 32;
+    unsigned char* page = (unsigned char*)VirtualAlloc(
+        nullptr, kCommon + kThunk * GH_STUB_SLOTS, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!page) return false;
+
+    // common:  sub rsp,0x28 ; mov r8d,r10d ; mov rax,gh_stub_dispatch ; call rax
+    //          xorps xmm0,xmm0 ; add rsp,0x28 ; ret
+    // rsp is 8 mod 16 on entry, so sub 0x28 realigns it AND leaves the 0x20 of
+    // shadow space the callee is entitled to write.
+    unsigned char* c = page;
+    *c++=0x48; *c++=0x83; *c++=0xEC; *c++=0x28;                 // sub rsp,0x28
+    *c++=0x45; *c++=0x89; *c++=0xD0;                            // mov r8d,r10d
+    *c++=0x48; *c++=0xB8;                                       // mov rax,imm64
+    { void* f = (void*)&gh_stub_dispatch; memcpy(c, &f, 8); c += 8; }
+    *c++=0xFF; *c++=0xD0;                                       // call rax
+    *c++=0x0F; *c++=0x57; *c++=0xC0;                            // xorps xmm0,xmm0
+    *c++=0x48; *c++=0x83; *c++=0xC4; *c++=0x28;                 // add rsp,0x28
+    *c++=0xC3;                                                  // ret
+
+    static void* vt[GH_STUB_SLOTS];
+    for (int i = 0; i < GH_STUB_SLOTS; ++i) {
+        unsigned char* t = page + kCommon + kThunk * i;
+        vt[i] = t;
+        // mov r10d, imm32 (the SLOT; the interface half is or-ed in per object
+        // below -- see gh_stub_thunk_for) ; mov rax,common ; jmp rax
+        t[0]=0x41; t[1]=0xBA; *(unsigned*)(t+2) = (unsigned)i;  // mov r10d,i
+        t[6]=0x48; t[7]=0xB8; { void* f = page; memcpy(t+8, &f, 8); }
+        t[16]=0xFF; t[17]=0xE0;                                 // jmp rax
+    }
+    DWORD old = 0;
+    if (!VirtualProtect(page, kCommon + kThunk * GH_STUB_SLOTS, PAGE_EXECUTE_READ, &old)) return false;
+    FlushInstructionCache(GetCurrentProcess(), page, kCommon + kThunk * GH_STUB_SLOTS);
+    g_stub_vtbl = vt;
+    gh_logf("[gh-shim] STUBVTBL built at %p slots=%d ret_bytes=%u",
+            (void*)page, GH_STUB_SLOTS, gh_stub_ret_bytes());
+    return true;
+}
+
+// One object per ROUTE, created on first use. The object's address is its
+// identity, which is what gh_stub_dispatch uses to tell shape (c) from (a).
+// The shared thunks carry only the slot; the interface is recovered from the
+// object pointer in gh_stub_dispatch.
+static void* gh_stub_object(const char* name) {
+    if (InterlockedCompareExchange(&g_stub_cs_init, 1, 0) == 0) {
+        InitializeCriticalSection(&g_stub_cs);
+        InterlockedExchange(&g_stub_cs_init, 2);
+    }
+    while (InterlockedCompareExchange(&g_stub_cs_init, 2, 2) != 2) Sleep(0);
+    EnterCriticalSection(&g_stub_cs);
+    void* out = nullptr;
+    if (gh_stub_build_vtbl()) {
+        for (int i = 0; i < g_stub_obj_n; ++i)
+            if (strcmp(g_stub_obj[i].name, name) == 0) { out = &g_stub_obj[i]; break; }
+        if (!out && g_stub_obj_n < (int)(sizeof(g_stub_obj)/sizeof(g_stub_obj[0]))) {
+            GhStubIface* o = &g_stub_obj[g_stub_obj_n];
+            memset(o, 0, sizeof(*o));
+            o->vtbl = g_stub_vtbl;
+            o->name = name;
+            o->idx  = (unsigned)g_stub_obj_n;
+            ++g_stub_obj_n;
+            out = o;
+            gh_logf("[gh-shim] STUBOBJ %s -> %p", name, out);
+        }
+    }
+    LeaveCriticalSection(&g_stub_cs);
+    return out;
+}
+
 struct GhIfaceRoute { const char* prefix; int slot; bool useUser; void* sentinel; };
 static const GhIfaceRoute kGhIfaceRoutes[] = {
     { "SteamUserStats",                       GH_SC_GetISteamGenericInterface, true,  &g_iface_stats },
@@ -1699,7 +1900,16 @@ static void* gh_iface_for_version(const char* ver) {
             real = gh_sc_get_iface(route->slot, ver, route->useUser);
     }
 
-    void* out = real ? real : (route ? route->sentinel : (void*)&g_iface_client);
+    // #220. The fallback for a NATIVE C++ consumer must be an object with a
+    // vtable, never a char. Remote Play already has a hand-written, semantically
+    // correct one (g_rp_vtbl) and keeps it; everything else gets the generic
+    // object above. The char sentinels stay exactly where they were -- the flat
+    // C exports still hand them back, and those wrappers ignore `self`.
+    void* stub = nullptr;
+    if (route && route->sentinel == (void*)&g_rp_fallback) stub = route->sentinel;
+    else stub = gh_stub_object(route ? route->prefix : "SteamUnknown");
+    if (!stub) stub = route ? route->sentinel : (void*)&g_iface_client;
+    void* out = real ? real : stub;
     gh_logf("[gh-shim] iface \"%s\" -> %s %p (slot=%d state=%d)", ver,
             real ? "ENGINE" : "sentinel", out, route ? route->slot : -1, g_gh_engine_state);
 
@@ -1757,7 +1967,14 @@ __declspec(dllexport) void* SteamInternal_ContextInit(void* p) {
 // is exactly the wild write into Mono's heap that took months to pin down. Every
 // other name goes through the shared resolver.
 __declspec(dllexport) void* SteamInternal_CreateInterface(const char* ver) {
-    if (!ver || strncmp(ver, "SteamClient", 11) == 0) return &g_iface_client;
+    if (!ver || strncmp(ver, "SteamClient", 11) == 0) {
+        // #220. Still never routed to the engine's ISteamClient (see above), but
+        // a char is the wrong shape for a C++ caller here too -- give it an
+        // object. Whether this game ever virtual-calls ISteamClient is exactly
+        // what the STUBCALL lines will say.
+        void* o = gh_stub_object("SteamClient");
+        return o ? o : (void*)&g_iface_client;
+    }
     return gh_iface_for_version(ver);
 }
 
