@@ -5125,6 +5125,11 @@ static bool GhCreateDeferredSwap()
 // is what capped cell D's diag at 16 MB before the probe window opened.
 static unsigned GhRawInput();
 
+// #202 the PSO pager. Defined with the pager, several thousand lines below;
+// declared here because the FRAME line is the instrument every #202 cell is
+// scored on and the pager has to be visible in it.
+static std::string GhPagerFrameLine();
+
 static HRESULT GfxPresent(UINT sync)
 {
     GhWatchTick("GfxPresent");
@@ -5424,6 +5429,7 @@ static HRESULT GfxPresent(UINT sync)
              " psoPreMs=" + std::to_string((long long)(InterlockedCompareExchange64(&g_psoPreUs, 0, 0) / 1000)) +
              " psoDup=" + std::to_string((long)InterlockedCompareExchange(&g_psoDup, 0, 0)) +
              " psoSavMs=" + std::to_string((long long)(InterlockedCompareExchange64(&g_psoDupSavUs, 0, 0) / 1000)) +
+             GhPagerFrameLine() +
              " dt=" + std::to_string((unsigned long long)(s_lastMs ? now - s_lastMs : 0)) + "ms" +
              // #158. The cross-queue waits are the only part of the per-frame path
              // not cleared, and they cannot be cleared by removal -- every psync
@@ -11073,6 +11079,724 @@ static inline LONG64 GhDeltaUs(LONG64 later, LONG64 earlier)
     return (later > 0 && earlier > 0 && later >= earlier) ? (later - earlier) : 0;
 }
 
+// ============================================================ #202: the PSO pager
+//
+// §32.69/§32.70/§32.71 between them leave exactly one shape of fix. Restating the
+// three findings this is built on, because every design decision below is forced
+// by one of them:
+//
+//   §32.69  The shader set does NOT converge. Across seven independent arms the
+//           rate of never-before-seen (vs,ps) pairs RISES with the run -- 0.297
+//           new pairs per create in the first thousand, 0.6-0.86 in the last full
+//           thousand. There is no warm-up to finish, so "create fewer pipelines"
+//           is not available without a visual compromise, and those are excluded.
+//
+//   §32.70  NOTHING ever frees a pipeline. Address reuse is ZERO across 11,794 /
+//           10,587 / 9,004 creates in three runs, and net `appused` growth per
+//           create is the FULL 38.0 KiB driver object. 11,783 pipelines = 437 MB,
+//           which is the container.
+//
+//   §32.71  Cell NODEDUP1 turning the dedup cache OFF was worth -25.4 MB against
+//           a +-37 MB noise floor, not the predicted -78 MB. Our AddRef is never
+//           the last reference: THE GAME HOLDS ITS OWN. So any design that hands
+//           the game the real ID3D12PipelineState and drops our reference later
+//           frees nothing. The proxy is MANDATORY, not an optimisation.
+//
+// So: hand the game an object of ours, keep the driver's object behind it, and
+// release the driver's object when the game is not using it. Every consumer of an
+// ID3D12PipelineState is already on our side of a hook (verified in source, not
+// assumed): SetPipelineState (slot 25), Reset (slot 10), ExecuteBundle (slot 27),
+// CreateCommandList's pInitialState, and creation itself. GhHookCommandList hooks
+// one vtable per list TYPE, so COPY and BUNDLE lists are covered identically
+// (#158's fix). There is no fifth path.
+//
+// Affordability is #209: the driver's own shader cache is a 100% warm hit here
+// and 139x less compile time, so re-creating an evicted pipeline costs a lookup,
+// not a compile.
+//
+//   gh_pso_live = 0  off. Not one byte of this runs; the guest gets the driver's
+//                      own pointer exactly as in every build before this one.
+//                 1  proxy every pipeline, capture nothing, evict nothing. The
+//                      INERT cell: it tests interception completeness alone. If
+//                      the game renders identically the interception is complete;
+//                      if it does not, no eviction policy would have saved it.
+//                 2  also capture the descriptor, still evict nothing. Prices the
+//                      pager's own bookkeeping against the 38 KiB it would save.
+//                 3  capture and evict.
+//
+// GhCfgNumZ, and sensed so that 0 = off: run30N.py writes '0' for every slot a
+// runargs does not supply, so a knob meaning "on" would silently enable the pager
+// for every older runargs in the tree (the gh_lazy_shim_lie lesson).
+static unsigned GhPsoLive()
+{
+    static const unsigned v = GhCfgNumZ(L"gh_pso_live.txt", "GH_PSO_LIVE", 0);
+    return v;
+}
+// The live cap, in pipelines. 2048 x 38.0 KiB = 78 MB, against 437 MB for the
+// 11,783 the run reached before the platform suspended it.
+static unsigned GhPsoLiveN()
+{
+    static const unsigned v = GhCfgNumZ(L"gh_pso_live_n.txt", "GH_PSO_LIVE_N", 0);
+    return v ? v : 2048;
+}
+
+static volatile LONG   g_pgN        = 0;   // proxies handed out
+static volatile LONG   g_pgLive     = 0;   // proxies currently holding a real pipeline
+static volatile LONG   g_pgEvict    = 0;   // evictions
+static volatile LONG   g_pgRemat    = 0;   // re-creates after an eviction
+static volatile LONG   g_pgRematBad = 0;   // re-creates that FAILED -- must read 0
+static volatile LONG   g_pgPinSkip  = 0;   // sweep passes blocked by a pin
+static volatile LONG   g_pgNoCap    = 0;   // proxies with no captured descriptor
+static volatile LONG   g_pgDead     = 0;   // proxies destroyed (game dropped the last ref)
+static volatile LONG64 g_pgCapB     = 0;   // bytes in captured descriptors
+static volatile LONG64 g_pgBlobB    = 0;   // bytes in interned shader bytecode
+static volatile LONG   g_pgBlobN    = 0;   // distinct interned blobs
+static volatile LONG64 g_pgRematUs  = 0;   // driver time spent re-creating
+
+// ------------------------------------------------------------ shader interning
+//
+// A captured descriptor has to own its shader bytecode: the pointers the guest
+// hands us are the guest's, and the SUBSTITUTED ones (#173) live in the blob
+// cache, which #201 deliberately bounded and which therefore evicts. Copying per
+// PSO would cost ~15 KiB each -- the same 15 KiB GhPsoKeep would have cost, which
+// §32.70 measured -- against the 38.0 KiB being saved.
+//
+// But shaders are shared: 8,052 graphics creates carry only 4,760 distinct
+// (vs,ps) PAIRS, and far fewer distinct blobs than that, because the pair count
+// is a cross product. So intern by content and refcount. weak_ptr keeps the table
+// self-cleaning: the last proxy to drop a blob frees it.
+typedef std::shared_ptr<const std::vector<uint8_t>> GhBlobRef;
+struct GhBlobKey {
+    uint64_t a, b; uint64_t n;
+    bool operator<(const GhBlobKey& o) const {
+        if (a != o.a) return a < o.a;
+        if (b != o.b) return b < o.b;
+        return n < o.n;
+    }
+};
+static GhBlobKey GhBlobHashOf(const void* p, SIZE_T n)
+{
+    // Two FNV-1a lanes over the same bytes with different offsets, which is what
+    // GhPsoKeyOfGfx already uses for the dedup key. 128 bits of content identity.
+    GhBlobKey k{ 1469598103934665603ULL, 1099511628211ULL, (uint64_t)n };
+    const uint8_t* b = (const uint8_t*)p;
+    for (SIZE_T i = 0; i < n; ++i){
+        k.a = (k.a ^ b[i]) * 1099511628211ULL;
+        k.b = (k.b + b[i]) * 1099511628211ULL;
+        k.b ^= (k.b >> 29);
+    }
+    return k;
+}
+static std::mutex& GhBlobMu(){ static std::mutex m; return m; }
+static std::map<GhBlobKey, std::weak_ptr<const std::vector<uint8_t>>>& GhBlobMap()
+{ static std::map<GhBlobKey, std::weak_ptr<const std::vector<uint8_t>>> m; return m; }
+
+static GhBlobRef GhInternBlob(const void* p, SIZE_T n)
+{
+    if (!p || !n) return GhBlobRef();
+    const GhBlobKey k = GhBlobHashOf(p, n);
+    std::lock_guard<std::mutex> lk(GhBlobMu());
+    auto& m = GhBlobMap();
+    auto it = m.find(k);
+    if (it != m.end()){
+        if (GhBlobRef hit = it->second.lock()) return hit;
+        m.erase(it);
+    }
+    auto v = std::make_shared<std::vector<uint8_t>>((const uint8_t*)p, (const uint8_t*)p + n);
+    m[k] = std::weak_ptr<const std::vector<uint8_t>>(v);
+    InterlockedIncrement(&g_pgBlobN);
+    InterlockedExchangeAdd64(&g_pgBlobB, (LONG64)n);
+    // The map itself outlives its values, so expired entries would accumulate.
+    // Sweeping every 256th intern keeps that bounded without an O(n) walk per
+    // create.
+    static LONG sinceSweep = 0;
+    if (++sinceSweep >= 256){
+        sinceSweep = 0;
+        for (auto i = m.begin(); i != m.end(); )
+            if (i->second.expired()) i = m.erase(i); else ++i;
+    }
+    return v;
+}
+
+// ---------------------------------------------------- the captured descriptor
+//
+// Everything needed to build this pipeline again, owning every byte of it. What
+// is captured is the EFFECTIVE descriptor -- `use` in the graphics hook, `d`
+// after substitution in the compute one -- because that is the one the driver
+// accepted. Re-creating from the guest's original would re-run the backporter,
+// and worse, could hand the driver a 6.6 shader the console refuses.
+struct GhPsoCap {
+    bool                 compute = false;
+    ID3D12RootSignature* rs      = nullptr;   // AddRef'd: the game may release its own
+    GhBlobRef            vs, ps, ds, hs, gs, cs;
+    std::vector<D3D12_SO_DECLARATION_ENTRY> so;
+    std::vector<std::string>                soName;
+    std::vector<UINT>                       soStride;
+    std::vector<D3D12_INPUT_ELEMENT_DESC>   il;
+    std::vector<std::string>                ilName;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC      g{};
+    D3D12_COMPUTE_PIPELINE_STATE_DESC       c{};
+    ~GhPsoCap(){ if (rs) rs->Release(); }
+
+    // Our own bookkeeping only -- the interned bytecode is shared and counted
+    // once, in g_pgBlobB.
+    size_t bytes() const
+    {
+        return sizeof(GhPsoCap)
+             + so.capacity() * sizeof(D3D12_SO_DECLARATION_ENTRY)
+             + soStride.capacity() * sizeof(UINT)
+             + il.capacity() * sizeof(D3D12_INPUT_ELEMENT_DESC)
+             + (soName.size() + ilName.size()) * sizeof(std::string) + 64;
+    }
+    // Re-point every pointer in the descriptor at storage this object owns.
+    // Called after every move of the vectors, and before every re-create.
+    void relink()
+    {
+        auto bind = [](D3D12_SHADER_BYTECODE& b, const GhBlobRef& r){
+            if (r){ b.pShaderBytecode = r->data(); b.BytecodeLength = r->size(); }
+            else  { b.pShaderBytecode = nullptr;   b.BytecodeLength = 0; }
+        };
+        if (compute){
+            bind(c.CS, cs);
+            c.pRootSignature = rs;
+            c.CachedPSO = D3D12_CACHED_PIPELINE_STATE{};
+            return;
+        }
+        bind(g.VS, vs); bind(g.PS, ps); bind(g.DS, ds);
+        bind(g.HS, hs); bind(g.GS, gs);
+        g.pRootSignature = rs;
+        // #177: GetCachedBlob and CreatePipelineLibrary are both device-fatal on
+        // this console, so a cached blob can never be ours. The graphics hook
+        // already strips the game's; strip it here too so a re-create cannot
+        // reintroduce one.
+        g.CachedPSO = D3D12_CACHED_PIPELINE_STATE{};
+        for (size_t i = 0; i < il.size(); ++i)
+            il[i].SemanticName = ilName[i].empty() ? nullptr : ilName[i].c_str();
+        for (size_t i = 0; i < so.size(); ++i)
+            so[i].SemanticName = soName[i].empty() ? nullptr : soName[i].c_str();
+        g.InputLayout.pInputElementDescs = il.empty() ? nullptr : il.data();
+        g.InputLayout.NumElements        = (UINT)il.size();
+        g.StreamOutput.pSODeclaration    = so.empty() ? nullptr : so.data();
+        g.StreamOutput.NumEntries        = (UINT)so.size();
+        g.StreamOutput.pBufferStrides    = soStride.empty() ? nullptr : soStride.data();
+        g.StreamOutput.NumStrides        = (UINT)soStride.size();
+    }
+};
+
+static GhPsoCap* GhPsoCapture(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d)
+{
+    if (!d) return nullptr;
+    GhPsoCap* k = new (std::nothrow) GhPsoCap();
+    if (!k) return nullptr;
+    k->compute = false;
+    k->g  = *d;
+    k->rs = d->pRootSignature;
+    if (k->rs) k->rs->AddRef();
+    k->vs = GhInternBlob(d->VS.pShaderBytecode, d->VS.BytecodeLength);
+    k->ps = GhInternBlob(d->PS.pShaderBytecode, d->PS.BytecodeLength);
+    k->ds = GhInternBlob(d->DS.pShaderBytecode, d->DS.BytecodeLength);
+    k->hs = GhInternBlob(d->HS.pShaderBytecode, d->HS.BytecodeLength);
+    k->gs = GhInternBlob(d->GS.pShaderBytecode, d->GS.BytecodeLength);
+    for (UINT i = 0; i < d->InputLayout.NumElements && d->InputLayout.pInputElementDescs; ++i){
+        k->il.push_back(d->InputLayout.pInputElementDescs[i]);
+        const char* s = d->InputLayout.pInputElementDescs[i].SemanticName;
+        k->ilName.push_back(s ? std::string(s) : std::string());
+    }
+    for (UINT i = 0; i < d->StreamOutput.NumEntries && d->StreamOutput.pSODeclaration; ++i){
+        k->so.push_back(d->StreamOutput.pSODeclaration[i]);
+        const char* s = d->StreamOutput.pSODeclaration[i].SemanticName;
+        k->soName.push_back(s ? std::string(s) : std::string());
+    }
+    for (UINT i = 0; i < d->StreamOutput.NumStrides && d->StreamOutput.pBufferStrides; ++i)
+        k->soStride.push_back(d->StreamOutput.pBufferStrides[i]);
+    k->relink();
+    InterlockedExchangeAdd64(&g_pgCapB, (LONG64)k->bytes());
+    return k;
+}
+static GhPsoCap* GhPsoCapture(const D3D12_COMPUTE_PIPELINE_STATE_DESC* d)
+{
+    if (!d) return nullptr;
+    GhPsoCap* k = new (std::nothrow) GhPsoCap();
+    if (!k) return nullptr;
+    k->compute = true;
+    k->c  = *d;
+    k->rs = d->pRootSignature;
+    if (k->rs) k->rs->AddRef();
+    k->cs = GhInternBlob(d->CS.pShaderBytecode, d->CS.BytecodeLength);
+    k->relink();
+    InterlockedExchangeAdd64(&g_pgCapB, (LONG64)k->bytes());
+    return k;
+}
+
+// ------------------------------------------------------------------ the proxy
+//
+// A SINGLE-VTABLE COM object, laid out by hand. NOT winrt::implements: #139 and
+// #156 are the same bug twice -- a multi-vtable implements hands out a DIFFERENT
+// pointer per interface, and a guest that mixes two of them walks a secondary
+// vtable and corrupts memory. ID3D12PipelineState is a linear chain (IUnknown ->
+// ID3D12Object -> ID3D12DeviceChild -> ID3D12PipelineState), so ONE vtable of
+// nine slots is the whole interface and every QueryInterface answers with `this`.
+struct GhPsoProxy {
+    void*                          vtbl;       // MUST be first: this IS the object
+    volatile LONG                  ref;
+    ID3D12PipelineState* volatile  real;       // null while evicted
+    ID3D12Device*                  dev;
+    GhPsoCap*                      cap;        // null at gh_pso_live=1
+    SRWLOCK                        lk;         // serialises re-creation only
+    volatile LONG                  noEvict;    // see the three reasons below
+    volatile LONG64                lastUseMs;
+    volatile LONG                  lastEpoch;  // allocator-reset epoch at last bind
+    LONG                           slot;       // index in g_pgAll, -1 = not registered
+};
+static SRWLOCK g_pgLock = SRWLOCK_INIT;
+static std::vector<GhPsoProxy*> g_pgAll;       // append-only; a dead proxy leaves a null
+static size_t  g_pgHand = 0;                   // the sweep's rotating hand
+
+// Quarantine. An evicted pipeline is NOT released at the moment of eviction:
+// another thread may have loaded `real` microseconds earlier and be about to call
+// through it, and the GPU may still be executing a submission that binds it.
+// Holding the driver's object for kPgQuarMs after the eviction closes both
+// windows for the cost of a few MB in flight. This is the belt to the pin's
+// braces -- the pin below is the argument, this is the margin.
+static const LONG64 kPgQuarMs = 2000;
+struct GhPgQuar { ID3D12PipelineState* p; LONG64 ms; };
+static std::vector<GhPgQuar> g_pgQuar;         // under g_pgLock
+
+// ---- the pin: which pipelines the GPU may still be reading
+//
+// D3D12's own contract is the signal. ID3D12CommandAllocator::Reset REQUIRES that
+// every command list recorded into that allocator has finished executing -- it is
+// the one API rule that names GPU completion without a fence. (ID3D12Graphics-
+// CommandList::Reset does NOT: a list may be Reset while still executing, so it
+// is not a drain point and must not be used as one.)
+//
+// So: stamp every bind with a global epoch that ticks on each allocator Reset,
+// and evict only pipelines last bound STRICTLY BEFORE the oldest allocator's last
+// reset. Any recording still in flight lives in some allocator A, which has not
+// been Reset since that recording began, so its binds are at an epoch >= A's last
+// reset >= the minimum. Until every allocator has cycled once the minimum is 0
+// and nothing is evictable, which is the correct conservative start.
+static volatile LONG g_caEpoch = 0;   // ticks on every allocator Reset
+static volatile LONG g_caMin   = 0;   // oldest live allocator's last-reset epoch
+static const int kPgAllocMax = 128;
+static struct { void* a; LONG epoch; LONG64 ms; } g_pgAlloc[kPgAllocMax];
+static volatile LONG g_pgAllocN = 0;
+static SRWLOCK g_pgAllocLock = SRWLOCK_INIT;
+
+static void GhPagerAllocReset(void* a)
+{
+    if (GhPsoLive() < 3) return;
+    const LONG  e  = InterlockedIncrement(&g_caEpoch);
+    const LONG64 now = (LONG64)GetTickCount64();
+    AcquireSRWLockExclusive(&g_pgAllocLock);
+    LONG n = g_pgAllocN, at = -1;
+    for (LONG i = 0; i < n; ++i) if (g_pgAlloc[i].a == a){ at = i; break; }
+    if (at < 0 && n < kPgAllocMax){ at = n; g_pgAlloc[n].a = a; g_pgAllocN = ++n; }
+    if (at >= 0){ g_pgAlloc[at].epoch = e; g_pgAlloc[at].ms = now; }
+    // An allocator the game has stopped cycling would hold the minimum down
+    // forever. One that has not been Reset for 60 s is not carrying work the GPU
+    // is still doing, so drop it from the minimum -- but keep the entry, so it
+    // rejoins the moment it is used again.
+    LONG mn = 0; bool first = true;
+    for (LONG i = 0; i < n; ++i){
+        if (now - g_pgAlloc[i].ms > 60000) continue;
+        if (first || g_pgAlloc[i].epoch < mn){ mn = g_pgAlloc[i].epoch; first = false; }
+    }
+    InterlockedExchange(&g_caMin, first ? 0 : mn);
+    ReleaseSRWLockExclusive(&g_pgAllocLock);
+}
+
+// A pipeline is off limits to the sweep for three reasons, all of them exact:
+//   1. it was bound into a BUNDLE. A bundle is recorded once and executed many
+//      times with no further SetPipelineState, so its pipelines must outlive any
+//      idle window.
+//   2. the game attached private data or a name to it. Re-creating would lose
+//      that silently, and a silent loss is worse than holding 38 KiB.
+//   3. there is no captured descriptor to rebuild it from.
+static void GhPagerPin(GhPsoProxy* x, const char* why)
+{
+    if (!x || InterlockedExchange(&x->noEvict, 1) != 0) return;
+    static volatile LONG n = 0;
+    const LONG k = InterlockedIncrement(&n);
+    if (k <= 8 || (k % 512) == 0)
+        Diag(std::string("  PSOPAGER pinned n=") + std::to_string((long)k) +
+             " why=" + why + " pso=" + Hex((uint64_t)(uintptr_t)x));
+}
+
+static ID3D12PipelineState* GhPagerMaterialise(GhPsoProxy* x);
+static void GhPagerDestroy(GhPsoProxy* x);
+static void* g_pgVtbl[9];          // filled once, in GhPagerWrap
+
+// ---- the nine slots
+static HRESULT __stdcall GhPP_QueryInterface(GhPsoProxy* self, REFIID riid, void** pp)
+{
+    if (!pp) return E_POINTER;
+    *pp = nullptr;
+    if (riid == __uuidof(ID3D12PipelineState) ||
+        riid == __uuidof(ID3D12DeviceChild)   ||
+        riid == __uuidof(ID3D12Object)        ||
+        riid == __uuidof(IUnknown)){
+        // The whole interface is one vtable, so every one of these is the SAME
+        // pointer. That is the #139/#156 rule, and it is the reason this object
+        // is hand-laid rather than a winrt::implements.
+        InterlockedIncrement(&self->ref);
+        *pp = self;
+        return S_OK;
+    }
+    // Deliberately NOT forwarded to the real pipeline: handing the game a pointer
+    // that bypasses us would put an un-paged pipeline back in its hands, and the
+    // pointer would dangle the moment we evicted. Log the IID instead -- if the
+    // game needs an interface we have not got, the log says which.
+    static volatile LONG n = 0;
+    const LONG k = InterlockedIncrement(&n);
+    if (k <= 16)
+        Diag("  PSOPAGER QI refused n=" + std::to_string((long)k) +
+             " iid=" + Hex((uint32_t)riid.Data1) + "-" + Hex((uint32_t)riid.Data2));
+    return E_NOINTERFACE;
+}
+static ULONG __stdcall GhPP_AddRef(GhPsoProxy* self)
+{ return (ULONG)InterlockedIncrement(&self->ref); }
+static ULONG __stdcall GhPP_Release(GhPsoProxy* self)
+{
+    const LONG r = InterlockedDecrement(&self->ref);
+    if (r == 0) GhPagerDestroy(self);
+    return (ULONG)r;
+}
+static HRESULT __stdcall GhPP_GetPrivateData(GhPsoProxy* self, REFGUID g, UINT* sz, void* p)
+{
+    GhPagerPin(self, "privatedata");
+    ID3D12PipelineState* r = GhPagerMaterialise(self);
+    return r ? r->GetPrivateData(g, sz, p) : E_FAIL;
+}
+static HRESULT __stdcall GhPP_SetPrivateData(GhPsoProxy* self, REFGUID g, UINT sz, const void* p)
+{
+    GhPagerPin(self, "privatedata");
+    ID3D12PipelineState* r = GhPagerMaterialise(self);
+    return r ? r->SetPrivateData(g, sz, p) : E_FAIL;
+}
+static HRESULT __stdcall GhPP_SetPrivateDataInterface(GhPsoProxy* self, REFGUID g, const IUnknown* p)
+{
+    GhPagerPin(self, "privatedata");
+    ID3D12PipelineState* r = GhPagerMaterialise(self);
+    return r ? r->SetPrivateDataInterface(g, p) : E_FAIL;
+}
+static HRESULT __stdcall GhPP_SetName(GhPsoProxy* self, LPCWSTR name)
+{
+    GhPagerPin(self, "setname");
+    ID3D12PipelineState* r = GhPagerMaterialise(self);
+    return r ? r->SetName(name) : E_FAIL;
+}
+static HRESULT __stdcall GhPP_GetDevice(GhPsoProxy* self, REFIID riid, void** pp)
+{
+    // Answered from the stored device rather than by materialising: this is what
+    // the real object would return, and it is the one method a paged-out pipeline
+    // can serve without the driver.
+    if (!pp) return E_POINTER;
+    if (!self->dev){ *pp = nullptr; return E_FAIL; }
+    return self->dev->QueryInterface(riid, pp);
+}
+static HRESULT __stdcall GhPP_GetCachedBlob(GhPsoProxy* self, ID3DBlob** pp)
+{
+    // #177 measured this as DEVICE-FATAL on this console -- GetCachedBlob removes
+    // the device. Forwarded rather than faked because a game that called it would
+    // already have died in every previous build, so refusing here would be a
+    // behaviour change with no evidence behind it. If this ever appears in a log,
+    // that is the finding.
+    static volatile LONG n = 0;
+    if (InterlockedIncrement(&n) <= 4)
+        Diag("  PSOPAGER GetCachedBlob CALLED -- #177 says this removes the device");
+    ID3D12PipelineState* r = GhPagerMaterialise(self);
+    return r ? r->GetCachedBlob(pp) : E_FAIL;
+}
+
+static inline bool GhPsoIsProxy(const void* p)
+{ return p && *(void* const*)p == (void*)g_pgVtbl; }
+
+// ------------------------------------------------------------------ the sweep
+static void GhPagerQuarPush(ID3D12PipelineState* p, LONG64 now)   // g_pgLock held
+{
+    if (p) g_pgQuar.push_back(GhPgQuar{ p, now });
+}
+static void GhPagerQuarDrain(LONG64 now)                          // g_pgLock held
+{
+    size_t keep = 0;
+    for (size_t i = 0; i < g_pgQuar.size(); ++i){
+        if (now - g_pgQuar[i].ms >= kPgQuarMs) g_pgQuar[i].p->Release();
+        else g_pgQuar[keep++] = g_pgQuar[i];
+    }
+    g_pgQuar.resize(keep);
+}
+
+// Evict until the live count is back inside the cap. A clock sweep rather than an
+// LRU list on purpose: a real LRU has to be re-linked on every bind, and binds
+// come from ~53 guest threads thousands of times a frame, so the list head would
+// be the single hottest lock in the process. The hot path here writes two plain
+// fields and takes no lock at all; the sweep runs at pipeline-CREATION rate,
+// which is 0.8/frame.
+static const LONG64 kPgIdleMs = 1000;   // a pipeline bound this recently is in use
+static void GhPagerTrim(const char* why)
+{
+    if (GhPsoLive() < 3) return;
+    const unsigned cap = GhPsoLiveN();
+    const LONG64 now = (LONG64)GetTickCount64();
+    AcquireSRWLockExclusive(&g_pgLock);
+    GhPagerQuarDrain(now);
+    const LONG epochFloor = InterlockedCompareExchange(&g_caMin, 0, 0);
+    LONG evicted = 0, pinned = 0;
+    // Bound the work per call: in steady state one create needs one eviction, and
+    // an unbounded walk of 12,000 entries on the create path would be its own
+    // regression.
+    size_t budget = g_pgAll.size();
+    if (budget > 4096) budget = 4096;
+    while ((LONG)InterlockedCompareExchange(&g_pgLive, 0, 0) > (LONG)cap && budget--){
+        if (g_pgAll.empty()) break;
+        if (g_pgHand >= g_pgAll.size()) g_pgHand = 0;
+        GhPsoProxy* x = g_pgAll[g_pgHand++];
+        if (!x || !x->real) continue;
+        if (x->noEvict || !x->cap){ ++pinned; continue; }
+        if (x->lastEpoch >= epochFloor){ ++pinned; continue; }
+        if (now - x->lastUseMs < kPgIdleMs){ ++pinned; continue; }
+        ID3D12PipelineState* r = (ID3D12PipelineState*)
+            InterlockedExchangePointer((void* volatile*)&x->real, nullptr);
+        if (!r) continue;
+        GhPagerQuarPush(r, now);
+        InterlockedDecrement(&g_pgLive);
+        ++evicted;
+    }
+    ReleaseSRWLockExclusive(&g_pgLock);
+    if (evicted) InterlockedExchangeAdd(&g_pgEvict, evicted);
+    if (pinned)  InterlockedExchangeAdd(&g_pgPinSkip, pinned);
+    static volatile LONG shown = 0;
+    if (evicted){
+        const LONG k = InterlockedIncrement(&shown);
+        if (k <= 8 || (k % 256) == 0)
+            Diag("  PSOPAGER evicted n=" + std::to_string((long)evicted) +
+                 " at " + why +
+                 " live=" + std::to_string((long)InterlockedCompareExchange(&g_pgLive, 0, 0)) +
+                 "/" + std::to_string((unsigned long)cap) +
+                 " total=" + std::to_string((long)InterlockedCompareExchange(&g_pgEvict, 0, 0)) +
+                 " epochFloor=" + std::to_string((long)epochFloor) +
+                 " pinSkip=" + std::to_string((long)pinned));
+    }
+}
+
+// ------------------------------------------------------------ rematerialisation
+//
+// #209 is what makes this affordable: the driver's own shader cache is a 100%
+// warm hit here and 139x less compile time, so this is a cache lookup, not a
+// compile. The driver is called through the ORIGINAL vtable entry, never through
+// our own hook -- re-entering the hook would re-run the screen, the substitution
+// and the dedup publish for a pipeline that has already been through all three.
+static ID3D12PipelineState* GhPagerMaterialise(GhPsoProxy* x)
+{
+    if (!x) return nullptr;
+    ID3D12PipelineState* r = (ID3D12PipelineState*)*(void* volatile*)&x->real;
+    if (r) return r;
+    AcquireSRWLockExclusive(&x->lk);
+    r = (ID3D12PipelineState*)*(void* volatile*)&x->real;
+    if (r){ ReleaseSRWLockExclusive(&x->lk); return r; }
+    if (!x->cap || !x->dev){
+        ReleaseSRWLockExclusive(&x->lk);
+        InterlockedIncrement(&g_pgRematBad);
+        return nullptr;
+    }
+    x->cap->relink();
+    void* out = nullptr;
+    DWORD fault = 0;
+    const LONG64 t0 = GhNowUs();
+    HRESULT hr = E_FAIL;
+    if (x->cap->compute){
+        auto fn = (GhCpsRawFn)g_d12vtOrig[11];
+        if (fn) hr = GhCallCpsGuarded(fn, x->dev, &x->cap->c,
+                                      __uuidof(ID3D12PipelineState), &out, &fault);
+    } else {
+        auto fn = (GhGpsFn)g_d12vtOrig[10];
+        if (fn) hr = GhTryCreateGPS(fn, x->dev, &x->cap->g,
+                                    __uuidof(ID3D12PipelineState), &out, &fault);
+    }
+    const LONG64 us = GhDeltaUs(GhNowUs(), t0);
+    InterlockedExchangeAdd64(&g_pgRematUs, us);
+    if (SUCCEEDED(hr) && out){
+        InterlockedExchangePointer((void* volatile*)&x->real, out);
+        InterlockedIncrement(&g_pgLive);
+        const LONG k = InterlockedIncrement(&g_pgRemat);
+        ReleaseSRWLockExclusive(&x->lk);
+        // Trim here as well as at create. Creation is the obvious growth path and
+        // it is not the only one: a run that stopped building new pipelines but
+        // kept re-binding evicted ones would climb back past the cap through this
+        // function alone and never come down. Safe against evicting the pipeline
+        // just handed back -- GhPsoRealOf stamped lastUseMs microseconds ago, and
+        // the sweep will not touch anything inside kPgIdleMs.
+        GhPagerTrim("remat");
+        if (k <= 8 || (k % 512) == 0)
+            Diag("  PSOPAGER remat n=" + std::to_string((long)k) +
+                 " pso=" + Hex((uint64_t)(uintptr_t)x) +
+                 " real=" + Hex((uint64_t)(uintptr_t)out) +
+                 " us=" + std::to_string((long long)us) +
+                 " totalMs=" + std::to_string((long long)(
+                     InterlockedCompareExchange64(&g_pgRematUs, 0, 0) / 1000)));
+        return (ID3D12PipelineState*)out;
+    }
+    ReleaseSRWLockExclusive(&x->lk);
+    const LONG nb = InterlockedIncrement(&g_pgRematBad);
+    if (nb <= 16)
+        Diag("  PSOPAGER remat FAILED n=" + std::to_string((long)nb) +
+             " hr=" + Hex((uint32_t)hr) + " fault=" + Hex((uint32_t)fault) +
+             " compute=" + std::to_string((int)x->cap->compute) +
+             " drr=" + Hex((uint32_t)(x->dev ? x->dev->GetDeviceRemovedReason() : 0)) +
+             "; the guest gets a null pipeline -- this MUST read 0 in a scored cell");
+    return nullptr;
+}
+
+// ------------------------------------------------------- the hot-path unwrap
+//
+// Called from every one of the five interception points. The identity test is one
+// load and one compare against our own vtable address: unambiguous (a real
+// pipeline's vtable is D3D12Core's) and cheaper than a magic field. The two
+// stores are plain and racy on purpose -- they are an idle hint for the sweep,
+// not a lock, and the quarantine is what makes a lost race harmless.
+static ID3D12PipelineState* GhPsoRealOf(ID3D12PipelineState* p)
+{
+    if (!GhPsoIsProxy(p)) return p;
+    GhPsoProxy* x = (GhPsoProxy*)p;
+    x->lastUseMs = (LONG64)GetTickCount64();
+    x->lastEpoch = InterlockedCompareExchange(&g_caEpoch, 0, 0);
+    ID3D12PipelineState* r = (ID3D12PipelineState*)*(void* volatile*)&x->real;
+    return r ? r : GhPagerMaterialise(x);
+}
+
+static void GhPagerDestroy(GhPsoProxy* x)
+{
+    const LONG64 now = (LONG64)GetTickCount64();
+    AcquireSRWLockExclusive(&g_pgLock);
+    if (x->slot >= 0 && (size_t)x->slot < g_pgAll.size() && g_pgAll[x->slot] == x)
+        g_pgAll[x->slot] = nullptr;
+    ID3D12PipelineState* r = (ID3D12PipelineState*)
+        InterlockedExchangePointer((void* volatile*)&x->real, nullptr);
+    if (r){ GhPagerQuarPush(r, now); InterlockedDecrement(&g_pgLive); }
+    GhPagerQuarDrain(now);
+    // Freed under the lock: the sweep walks g_pgAll with the same lock held, so
+    // there is no window in which it can hold a pointer to this object.
+    if (x->cap){ InterlockedExchangeAdd64(&g_pgCapB, -(LONG64)x->cap->bytes()); delete x->cap; }
+    ReleaseSRWLockExclusive(&g_pgLock);
+    free(x);
+    InterlockedIncrement(&g_pgDead);
+}
+
+// ----------------------------------------------------------------- the wrap
+//
+// Takes over the reference the driver returned -- the proxy is born with ref=1
+// for the guest and holds the driver's object outright. That is the whole of
+// §32.71: while the GAME holds a reference to the driver's pipeline, nothing we
+// do can free it, so the game must never see it.
+static ID3D12PipelineState* GhPagerWrap(ID3D12Device* dev, ID3D12PipelineState* real,
+                                        const D3D12_GRAPHICS_PIPELINE_STATE_DESC* g,
+                                        const D3D12_COMPUTE_PIPELINE_STATE_DESC* c)
+{
+    const unsigned mode = GhPsoLive();
+    if (!mode || !real) return nullptr;
+    // A function-local static, NOT an InterlockedCompareExchange latch. The latch
+    // is the obvious way to write this and it is wrong: the thread that LOSES the
+    // CAS does not wait, so it would fall straight through and hand the guest a
+    // proxy whose vtable slots were still null -- a null indirect call on the
+    // guest's first AddRef. PSOs are built from a job pool on ~53 threads, so two
+    // threads reaching the first create together is the normal case, not a corner.
+    // C++11 magic statics block every other thread until the initialiser returns.
+    static const bool vtReady = []{
+        g_pgVtbl[0] = (void*)&GhPP_QueryInterface;
+        g_pgVtbl[1] = (void*)&GhPP_AddRef;
+        g_pgVtbl[2] = (void*)&GhPP_Release;
+        g_pgVtbl[3] = (void*)&GhPP_GetPrivateData;
+        g_pgVtbl[4] = (void*)&GhPP_SetPrivateData;
+        g_pgVtbl[5] = (void*)&GhPP_SetPrivateDataInterface;
+        g_pgVtbl[6] = (void*)&GhPP_SetName;
+        g_pgVtbl[7] = (void*)&GhPP_GetDevice;
+        g_pgVtbl[8] = (void*)&GhPP_GetCachedBlob;
+        Diag("PSOPAGER on: gh_pso_live=" + std::to_string((unsigned long)GhPsoLive()) +
+             " cap=" + std::to_string((unsigned long)GhPsoLiveN()) +
+             " vtbl=" + Hex((uint64_t)(uintptr_t)g_pgVtbl) +
+             " (1=proxy only, 2=+capture, 3=+evict)");
+        return true;
+    }();
+    (void)vtReady;
+    GhPsoProxy* x = (GhPsoProxy*)calloc(1, sizeof(GhPsoProxy));
+    if (!x) return nullptr;
+    x->vtbl      = (void*)g_pgVtbl;
+    x->ref       = 1;                       // the guest's
+    x->real      = real;                    // the driver's reference, taken over
+    x->dev       = dev;
+    x->slot      = -1;
+    x->lastUseMs = (LONG64)GetTickCount64();
+    x->lastEpoch = InterlockedCompareExchange(&g_caEpoch, 0, 0);
+    InitializeSRWLock(&x->lk);
+    if (mode >= 2) x->cap = g ? GhPsoCapture(g) : (c ? GhPsoCapture(c) : nullptr);
+    if (!x->cap){
+        InterlockedIncrement(&g_pgNoCap);
+        // No descriptor, no rebuild, so this one can never be evicted. At mode 1
+        // that is every pipeline and is the point of the mode; at mode 3 it is a
+        // capture failure and the counter says how many.
+        x->noEvict = 1;
+    }
+    AcquireSRWLockExclusive(&g_pgLock);
+    x->slot = (LONG)g_pgAll.size();
+    g_pgAll.push_back(x);
+    ReleaseSRWLockExclusive(&g_pgLock);
+    InterlockedIncrement(&g_pgLive);
+    const LONG n = InterlockedIncrement(&g_pgN);
+    if (n <= 8 || (n % 1024) == 0)
+        Diag("  PSOPAGER wrap n=" + std::to_string((long)n) +
+             " proxy=" + Hex((uint64_t)(uintptr_t)x) +
+             " real=" + Hex((uint64_t)(uintptr_t)real) +
+             " live=" + std::to_string((long)InterlockedCompareExchange(&g_pgLive, 0, 0)) +
+             " capKB=" + std::to_string((long long)(
+                 InterlockedCompareExchange64(&g_pgCapB, 0, 0) >> 10)) +
+             " blobKB=" + std::to_string((long long)(
+                 InterlockedCompareExchange64(&g_pgBlobB, 0, 0) >> 10)) +
+             " blobN=" + std::to_string((long)InterlockedCompareExchange(&g_pgBlobN, 0, 0)));
+    GhPagerTrim("create");
+    return (ID3D12PipelineState*)x;
+}
+
+// The pager's share of the FRAME line. Empty when the knob is off, so every
+// pre-#202 log and every scorer that parses one is untouched.
+//
+// Reading it:
+//   pgN      proxies handed out. Equals psoN once the pager is on.
+//   pgLive   proxies currently holding a driver pipeline. THIS is the number the
+//            437 MB is proportional to; at mode 3 it should sit at the cap.
+//   pgEv     evictions, pgRe rematerialisations, pgReMs the driver time they
+//            cost. pgReBad MUST read 0 -- a failed rematerialise hands the guest
+//            a pipeline that is not there.
+//   pgPin    sweep passes refused by a pin. Large and rising means the idle
+//            window or the epoch floor, not the cap, is what is holding memory.
+//   pgCapKB  our own bookkeeping; pgBlobKB/pgBlobN the interned shader set. The
+//            sum of those two is what the pager COSTS, against 38.0 KiB x pgEv
+//            for what it returns -- that ratio is the whole cell.
+//   pgEpoch  allocator-reset epoch / the floor the sweep is allowed to evict
+//            below. A floor stuck at 0 means no allocator has cycled and nothing
+//            can be evicted, which is a VOID cell, not a negative.
+static std::string GhPagerFrameLine()
+{
+    if (!GhPsoLive()) return std::string();
+    return " pgN=" + std::to_string((long)InterlockedCompareExchange(&g_pgN, 0, 0)) +
+           " pgLive=" + std::to_string((long)InterlockedCompareExchange(&g_pgLive, 0, 0)) +
+           " pgEv=" + std::to_string((long)InterlockedCompareExchange(&g_pgEvict, 0, 0)) +
+           " pgRe=" + std::to_string((long)InterlockedCompareExchange(&g_pgRemat, 0, 0)) +
+           " pgReBad=" + std::to_string((long)InterlockedCompareExchange(&g_pgRematBad, 0, 0)) +
+           " pgReMs=" + std::to_string((long long)(
+               InterlockedCompareExchange64(&g_pgRematUs, 0, 0) / 1000)) +
+           " pgPin=" + std::to_string((long)InterlockedCompareExchange(&g_pgPinSkip, 0, 0)) +
+           " pgDead=" + std::to_string((long)InterlockedCompareExchange(&g_pgDead, 0, 0)) +
+           " pgNoCap=" + std::to_string((long)InterlockedCompareExchange(&g_pgNoCap, 0, 0)) +
+           " pgCapKB=" + std::to_string((long long)(
+               InterlockedCompareExchange64(&g_pgCapB, 0, 0) >> 10)) +
+           " pgBlobKB=" + std::to_string((long long)(
+               InterlockedCompareExchange64(&g_pgBlobB, 0, 0) >> 10)) +
+           " pgBlobN=" + std::to_string((long)InterlockedCompareExchange(&g_pgBlobN, 0, 0)) +
+           " pgEpoch=" + std::to_string((long)InterlockedCompareExchange(&g_caEpoch, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_caMin, 0, 0));
+}
+
 static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** pp)
 {
@@ -11520,13 +12244,28 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     if (pp && *pp){
         res += " CREATED pso=" + Hex((uint64_t)(uintptr_t)*pp) +
                " idx=" + std::to_string((long)InterlockedIncrement(&psoIdx));
+        // #202 the PSO pager. The substitution happens HERE, after every refusal
+        // and every stand-in has already returned: nothing wrapped can be a
+        // substitute for something else, which is the same rule the dedup publish
+        // below has always followed. `realPso` keeps the driver's pointer for the
+        // bookkeeping that follows, all of which is ours and none of which the
+        // guest ever sees.
+        ID3D12PipelineState* realPso = (ID3D12PipelineState*)*pp;
+        if (riid == __uuidof(ID3D12PipelineState))
+            if (ID3D12PipelineState* px = GhPagerWrap(self, realPso, use, nullptr)){
+                *pp = px;
+                res += " proxy=" + Hex((uint64_t)(uintptr_t)px);
+            }
         // #202. Only a pipeline the driver really built for this descriptor is
         // published -- every stand-in and every refusal has already returned
         // above, so nothing in the cache can be a substitute for something else.
+        // With the pager on this publishes the PROXY, deliberately: the cache has
+        // to hold the same object the guest holds, or its own reference would pin
+        // a driver pipeline the pager has just evicted.
         if (dedupable) GhPsoDedupPublish(dedupKey, (ID3D12PipelineState*)*pp, drvUs);
         // Keep the bytecode by PSO pointer so gh_dump_pso_at can name an op, not a length.
-        if (d && GhPsoKeepOn()) GhPsoKeep(*pp, d->VS.pShaderBytecode, d->VS.BytecodeLength,
-                                               d->PS.pShaderBytecode, d->PS.BytecodeLength);
+        if (d && GhPsoKeepOn()) GhPsoKeep(realPso, d->VS.pShaderBytecode, d->VS.BytecodeLength,
+                                                   d->PS.pShaderBytecode, d->PS.BytecodeLength);
         if (d) res += " vs=" + std::to_string((unsigned long long)d->VS.BytecodeLength) +
                       " ps=" + std::to_string((unsigned long long)d->PS.BytecodeLength);
         // #188 axis (b). Build the first stand-in now, off a desc the driver
@@ -11540,7 +12279,7 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
                 GhStandInFor(self, orig, use);
         }
         if (d && GhSkipPsShaderSizes(d->VS.BytecodeLength, d->PS.BytecodeLength)){
-            InterlockedExchangePointer((void**)&g_skipPso, *pp);
+            InterlockedExchangePointer((void**)&g_skipPso, realPso);
             res += " <<< gh_skip_vs/ps MATCHED -- every draw bound to this pipeline"
                    " will be dropped";
         }
@@ -11799,6 +12538,15 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
             res += " CREATED pso=" + Hex((uint64_t)(uintptr_t)*pp) +
                    " cidx=" + std::to_string((long)InterlockedIncrement(&cpsIdx));
             if (d) res += " cs=" + std::to_string((unsigned long long)d->CS.BytecodeLength);
+            // #202 the PSO pager, compute half. Gated on !cpsFault for the same
+            // reason the publish below is: a faulted create can still leave a
+            // pipeline behind, and the stand-in further down may replace it.
+            if (!cpsFault && riid == __uuidof(ID3D12PipelineState))
+                if (ID3D12PipelineState* px =
+                        GhPagerWrap(self, (ID3D12PipelineState*)*pp, nullptr, d)){
+                    *pp = px;
+                    res += " proxy=" + Hex((uint64_t)(uintptr_t)px);
+                }
             // #202. A faulted create can still leave a pipeline behind, and the
             // stand-in below may replace it, so only a clean build is published.
             if (dedupable && !cpsFault)
@@ -14331,6 +15079,10 @@ static void* g_caVtOrig8 = nullptr;
 static volatile LONG g_caHooked = 0;
 static HRESULT __stdcall Hook_CAReset(ID3D12CommandAllocator* self)
 {
+    // #202 the PSO pager. This is the one D3D12 call that names GPU completion
+    // without a fence: resetting an allocator REQUIRES that every command list
+    // recorded into it has finished executing. That makes it the pager's clock.
+    GhPagerAllocReset(self);
     GhCAShadowReset(self);
     return ((HRESULT (__stdcall*)(ID3D12CommandAllocator*))g_caVtOrig8)(self);
 }
@@ -14352,6 +15104,12 @@ static void GhHookCommandAllocator(ID3D12CommandAllocator* a)
 static HRESULT __stdcall Hook_CLReset(ID3D12GraphicsCommandList* self,
                                       ID3D12CommandAllocator* a, ID3D12PipelineState* pso)
 {
+    // #202 the PSO pager, interception point 2 of 4. Reset's pInitialState binds a
+    // pipeline exactly as SetPipelineState does, so it is unwrapped on the same
+    // rule. (Note what Reset is NOT: a drain point. D3D12 permits Reset while the
+    // list is still executing -- it is ALLOCATOR Reset that requires completion,
+    // and that is where the pager's epoch ticks.)
+    pso = GhPsoRealOf(pso);
     if (GhCLNote* n = GhCLFind(self)){
         n->draws = n->idraws = n->disp = n->barriers = n->psosets = n->work = 0;
         n->iDraws = n->iIdraws = n->iDisp = n->iBarr = n->iPsosets = 0;
@@ -14467,9 +15225,35 @@ static void __stdcall Hook_CLDispatch(ID3D12GraphicsCommandList* self, UINT x, U
 }
 static void __stdcall Hook_CLSetPso(ID3D12GraphicsCommandList* self, ID3D12PipelineState* pso)
 {
-    if (GhCLNote* n = GhCLFind(self)){ InterlockedIncrement(&n->psosets); n->lastPso = pso; }
+    // #202 the PSO pager, interception point 1 of 4. Unwrap FIRST: the proxy must
+    // never reach the runtime. The guard a few lines down says why in the game's
+    // own words -- D3D12Core reads [pso+0xCC], i.e. it reads the object's raw
+    // MEMORY and not just its vtable, so an object of ours would not survive the
+    // call. Everything below this line -- the trace, the shadow, gh_cl_rec, the
+    // forwarded call -- therefore sees the driver's pipeline, and a rematerialise
+    // (if this one has been paged out) happens right here, on the thread that
+    // needs it.
+    ID3D12PipelineState* rp = GhPsoRealOf(pso);
+    if (GhCLNote* n = GhCLFind(self)){
+        InterlockedIncrement(&n->psosets); n->lastPso = rp;
+        // A BUNDLE is recorded once and replayed many times with no further
+        // SetPipelineState, so its pipelines have no idle window the sweep could
+        // read. Pin them for the life of the process.
+        if (n->type == (LONG)D3D12_COMMAND_LIST_TYPE_BUNDLE && GhPsoIsProxy(pso))
+            GhPagerPin((GhPsoProxy*)pso, "bundle");
+    }
     if (GhCLTraceOn())
-        Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " SETPSO " + Hex((uint64_t)(uintptr_t)pso));
+        Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " SETPSO " + Hex((uint64_t)(uintptr_t)rp));
+    // A proxy whose rematerialise failed is a null, and a null here is the exact
+    // fault #196 fixed. Swallow it the same way rather than hand the runtime one.
+    if (pso && !rp){
+        static volatile LONG nr = 0;
+        const LONG k = InterlockedIncrement(&nr);
+        if (k <= 8 || (k % 256) == 0)
+            Diag("  CLSETPSO proxy with no pipeline swallowed n=" + std::to_string((long)k));
+        return;
+    }
+    pso = rp;
     // #196. Belt to the stand-in's braces. SetPipelineState(nullptr) is legal in
     // the API and D3D12Core here dereferences it anyway -- `mov edx,[rdx+0xCC]`
     // with rdx=0, which is how cells C/D/E ended. Every stand-in above exists so
@@ -16310,6 +17094,12 @@ static void __stdcall Hook_CLClearUavFloat(ID3D12GraphicsCommandList* self,
                         D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*, const FLOAT*, UINT,
                         const D3D12_RECT*))GhClOrig(self, 50))(self, g, c, res, v, nr, r);
 }
+// #202 the PSO pager, interception point 4 of 4. The argument here is a command
+// LIST, not a pipeline, so there is nothing to unwrap: the bundle's pipelines
+// were bound through Hook_CLSetPso on the bundle itself, which unwrapped them
+// then and -- because a bundle is replayed with no further SetPipelineState --
+// pinned them for the life of the process. This is the point where that pin is
+// spent, and naming it here is what makes the four-point claim checkable.
 static void __stdcall Hook_CLExecuteBundle(ID3D12GraphicsCommandList* self,
                                            ID3D12GraphicsCommandList* b)
 {
@@ -18941,7 +19731,10 @@ static HRESULT __stdcall Hook_D12CreateCA(ID3D12Device* self, D3D12_COMMAND_LIST
     HRESULT hr = orig(self, t, riid, pp);
     if (FAILED(hr)) GhD12Failed(self, "CreateCommandAllocator", hr);
     // #158 gh_cl_reloc needs to see the guest declare its allocator's contents dead.
-    else if (pp && *pp && GhClReloc()) GhHookCommandAllocator((ID3D12CommandAllocator*)*pp);
+    // #202: the pager needs this vtable too -- Hook_CAReset is where its epoch
+    // ticks, and without it g_caMin stays 0 and nothing is ever evictable.
+    else if (pp && *pp && (GhClReloc() || GhPsoLive() >= 3))
+        GhHookCommandAllocator((ID3D12CommandAllocator*)*pp);
     return hr;
 }
 static HRESULT __stdcall Hook_D12CreateCL(ID3D12Device* self, UINT node, D3D12_COMMAND_LIST_TYPE t,
@@ -18958,6 +19751,10 @@ static HRESULT __stdcall Hook_D12CreateCL(ID3D12Device* self, UINT node, D3D12_C
     ID3D12CommandAllocator* useA = alloc;
     if (GhClReloc() && alloc)
         if (ID3D12CommandAllocator* sa = GhClSubstitute(alloc, self, (LONG)t)) useA = sa;
+    // #202 the PSO pager, interception point 3 of 4. A list is born in the
+    // RECORDING state with pInitialState already bound, so this is a bind like
+    // any other and the proxy must not reach the runtime here either.
+    init = GhPsoRealOf(init);
     HRESULT hr = orig(self, node, t, useA, init, riid, pp);
     if (FAILED(hr)) GhD12Failed(self, "CreateCommandList", hr);
     else if (pp && *pp){
