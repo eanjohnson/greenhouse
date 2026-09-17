@@ -22492,16 +22492,6 @@ static void GhWgiPeekDevice(GhWgiPadReading* out, long bk)
         return;
     }
 
-    // Once: name the owner, so the 20-slot device array and the main-player
-    // slot can be read next without another build.
-    if (bk == 1) {
-        uintptr_t x = 0, xvt = 0; uint32_t slot = 0xFFFFFFFFu;
-        GhReadableQword(rbpA + 0x128, &x);
-        if (x) { GhReadableQword(x, &xvt); GhWgiDevDw(x, 0x694, &slot); }
-        Diag(tag + "OWNER x=" + Hex((uint64_t)x) + " xvt=" + Hex((uint64_t)xvt) +
-             " mainslot=" + std::to_string((long)(int32_t)slot));
-    }
-
     const uintptr_t dev = g_wgiGuestThis;
     uintptr_t vt = 0;
     if (!dev || !GhReadableQword(dev, &vt)) {
@@ -22535,6 +22525,80 @@ static void GhWgiPeekDevice(GhWgiPadReading* out, long bk)
          " tsout=" + std::to_string((unsigned long long)out->Timestamp) +
          " gate=" + (((uint64_t)lastTs == out->Timestamp) ? "SKIP" : "DECODE") +
          " btn=" + bs);
+
+    // ---- the owner, and the slot our device actually occupies ---------------
+    // DEVREC2/DEVREC5 established that Poll's caller keeps nx::NxInputImpl in
+    // rbx and that Poll spills it to [rbp+0x128], with xvt matching the
+    // NxInputImpl vtable exactly.  The offline read of GUEST+0x448D30
+    // (GetInputValue) says the front end reaches a device through
+    //     [mgr + player*20 + 0x694]   -- the device SLOT bound to that player
+    //     [mgr + player*20 + 0x69C]   -- 1 blocks the gamepad path outright
+    // and the gamepad button codes 0x190..0x19D read [dev + (code-400)*4 + 0x80],
+    // which is the same 14 dwords printed above.  So the one number that decides
+    // whether the front end is even looking at the device we drive is the slot
+    // holding `dev` in the 20-entry array at [mgr+0x590].  Read-only: no knob.
+    if (bk == 1 || bk == 20 || bk == 40) {
+        uintptr_t x = 0, xvt = 0;
+        GhReadableQword(rbpA + 0x128, &x);
+        if (x) GhReadableQword(x, &xvt);
+        const uintptr_t mgrVt = (uintptr_t)g_guestImageBase + 0x10FD5A8;
+        if (!x || xvt != mgrVt) {
+            Diag(tag + "MGRBAD x=" + Hex((uint64_t)x) + " xvt=" + Hex((uint64_t)xvt) +
+                 " want=" + Hex((uint64_t)mgrVt) +
+                 " -- not NxInputImpl: VOID, not a negative");
+            return;
+        }
+        // the 20-entry device array, and which entry is ours
+        std::string arr; long mine = -1;
+        for (unsigned i = 0; i < 20; ++i) {
+            uintptr_t d = 0;
+            if (!GhReadableQword(x + 0x590 + i * 8, &d)) { arr += " ??"; continue; }
+            if (!d) { arr += " ."; continue; }
+            if (d == dev) mine = (long)i;
+            uintptr_t dvt = 0; GhReadableQword(d, &dvt);
+            uint32_t conn = 0, ch = 0;
+            GhWgiDevDw(d, 0x79, &conn); GhWgiDevDw(d, 0x78, &ch);
+            arr += " " + std::to_string((unsigned long)i) + (d == dev ? "*" : "") +
+                   ":" + (dvt == want ? "W" : "?") +
+                   ((conn & 0xFFu) ? "c" : "-") + ((ch & 0xFFu) ? "h" : "-");
+        }
+        // the compact connected list the count-changed handler builds
+        std::string cl;
+        for (unsigned n = 0; n < 20; ++n) {
+            uint32_t v = 0;
+            cl += (n ? "," : "") + (GhWgiDevDw(x, 0x638 + n * 4, &v)
+                                      ? std::to_string((long)(int32_t)v) : std::string("??"));
+        }
+        // the per-player records: stride 20 from 0x694
+        std::string pr;
+        for (unsigned pl = 0; pl < 4; ++pl) {
+            uint32_t sl = 0, kind = 0, filt = 0, f0 = 0, f1 = 0;
+            const unsigned b = 0x694 + pl * 20;
+            GhWgiDevDw(x, b, &sl); GhWgiDevDw(x, b + 4, &kind);
+            GhWgiDevDw(x, b + 8, &filt); GhWgiDevDw(x, b + 12, &f0);
+            GhWgiDevDw(x, b + 13, &f1);
+            pr += " p" + std::to_string((unsigned long)pl) +
+                  "{slot=" + std::to_string((long)(int32_t)sl) +
+                  " kind=" + std::to_string((long)(int32_t)kind) +
+                  " filt=" + std::to_string((long)(int32_t)filt) +
+                  " f=0x" + GhHex32(f0) + "}";
+        }
+        Diag(tag + "MGR x=" + Hex((uint64_t)x) + " vt=OK myslot=" +
+             std::to_string(mine) + " arr:" + arr);
+        // NxInputImpl vtable slot 79 (GUEST+0x44AA70) is the gate GetInputValue
+        // consults before ANY code: it returns true -- meaning input is
+        // SUPPRESSED -- when [this+0x890] != 0 AND [this+0x848] != 0.  Read the
+        // two fields rather than calling the virtual: calling a guest method
+        // from inside our hook would be a side effect, and these are the whole
+        // predicate.
+        uintptr_t g890 = 0; uint32_t g848 = 0;
+        GhReadableQword(x + 0x890, &g890);
+        GhWgiDevDw(x, 0x848, &g848);
+        Diag(tag + "MGR conn=[" + cl + "]" + pr +
+             " gate890=" + Hex((uint64_t)g890) +
+             " gate848=0x" + GhHex32(g848 & 0xFFu) +
+             " suppressed=" + ((g890 && (g848 & 0xFFu)) ? "YES" : "no"));
+    }
 }
 
 static void GhWgiMergeSynth(GhWgiPadReading* out)
