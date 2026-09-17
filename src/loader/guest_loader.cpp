@@ -533,6 +533,11 @@ static const std::wstring& GhCorpusDir();
 static void GhCheckDeviceRemoved(const char* where,
                                  ID3D12Device* dev = nullptr); // #158 removal + DRED
 static std::string GhLazyStats();                             // #145 demand-commit counters
+// #202. The container budget, 100 ms-cached. Declared here because AdapterProxy
+// is defined thousands of lines before the pager that owns it, and
+// QueryVideoMemoryInfo now needs to know how full the CONTAINER is, not just
+// how full the adapter says it is.
+static void GhAppBudget(uint64_t* used, uint64_t* lim);
 static void        GhLazyWhoDump(const char* where);          // #213 who promised it, who touched it
 static void GhIssuedPairsDump(const char* when);              // #158 executed-barrier tally
 static void GhBarrFlushPending(ID3D12GraphicsCommandList* self); // #158 coalescing
@@ -5489,6 +5494,43 @@ static UINT g_winW = 1920, g_winH = 1080;
 // LocalState just before the guest starts (GhInitGuestDisplay), because
 // AdapterProxy::VramCap is defined long before GhCfgNum is.
 static unsigned g_vramCapMb = 0;               // 0 = keep the built-in 2048
+
+// #202. THE GUEST IS GIVEN A VRAM HEADROOM NUMBER FOR THE WRONG RESOURCE.
+//
+// §32.75 priced the container at the ceiling: appused 5,092.6 of 5,120 MB, so
+// 27.4 MB left. At that same moment the guest is being told, by the #157 scaling
+// in AdapterProxy::QueryVideoMemoryInfo, that it has used 1,574.6 MB of a
+// 2,048 MB budget -- 473.4 MB of headroom. (Real adapter: 3,011.4 MB used of
+// 3,916.8 MB; 3011.4 * 2048 / 3916.8 = 1574.6.) The signal is arithmetically
+// correct and describes a resource that is not the one running out.
+//
+// #217 measured that the level load "takes whatever headroom it is given"
+// (burst == headroom within 43 MB across four arms). This is where it is given
+// it. The game streams against a VRAM budget whose denominator is the adapter,
+// while it dies against a 5 GB container.
+//
+// gh_vram_press = N: also compute the pressure the CONTAINER is under, scale it
+// onto the advertised budget, and report whichever of the two is worse -- never
+// letting the guest see less than N MB of headroom. N is the reserve in MB, so
+// N=128 reproduces the existing cap/16 floor exactly and smaller N pushes
+// harder. 0 = off (the #157 behaviour untouched), and it is read with GhCfgNumZ
+// so no older runargs can switch it on by accident.
+//
+// This is NOT a visual compromise: it changes no setting and lowers no
+// advertised budget. It corrects a pressure signal we already synthesise, so
+// the game's own eviction logic sees the shortage it actually has.
+//
+// PREDICTION, recorded before the cell runs: if the engine acts on
+// QueryVideoMemoryInfo at all, a truthful pressure signal makes it evict, and
+// res/tex keep moving past the point where the container currently pins at
+// ~5,093 MB. If the trajectory is unchanged -- same psoN, same res/tex, same
+// ceiling -- the engine does not act on this signal and the lead is dead. The
+// #157 failure mode (Spider-Man's "using more video memory than your system can
+// currently support" box) means the reserve N is too small, not that the idea
+// is wrong.
+static unsigned      g_vramPressMb  = 0;       // 0 = off; else reserve in MB
+static volatile LONG g_vramPressN   = 0;       // QVMI calls with the knob on
+static volatile LONG g_vramPressWon = 0;       //   ... where CONTAINER pressure was worse
 static unsigned g_cpuCount   = 0;              // #150: 0 = report the container's real count
 static const HWND kFakeHwnd = (HWND)0x00477A01;
 
@@ -6354,19 +6396,52 @@ struct AdapterProxy : IDXGIAdapter4
             // computes headroom always has some. This preserves the pressure signal
             // -- if the machine really is filling up, the fraction still climbs --
             // without inventing a shortage that does not exist at our scale.
-            if (realBudget){
-                UINT64 scaled = (UINT64)((double)realUsage * (double)cap / (double)realBudget);
-                const UINT64 ceiling = cap - cap / 16;
-                if (scaled > ceiling) scaled = ceiling;
-                i->CurrentUsage = scaled;
-            } else if (i->CurrentUsage > cap - cap / 16){
-                i->CurrentUsage = cap - cap / 16;
+            //
+            // #202: the reserve. Without the knob this is cap/16, exactly as #157
+            // set it; with it, the knob's N megabytes, so a cell can push harder
+            // than 128 MB without touching the rest of the arithmetic.
+            const UINT64 reserve = g_vramPressMb ? ((UINT64)g_vramPressMb << 20)
+                                                 : (cap / 16);
+            const UINT64 ceiling = (reserve < cap) ? (cap - reserve) : (cap / 2);
+            UINT64 vramScaled = i->CurrentUsage;
+            if (realBudget)
+                vramScaled = (UINT64)((double)realUsage * (double)cap / (double)realBudget);
+
+            // #202: the same fraction, computed against the resource that actually
+            // runs out. `appused / applimit` is the container's own billing -- the
+            // number the 5 GiB cap is enforced on -- so scaling it onto the budget
+            // we advertise puts both pressures in the same units and lets the worse
+            // one speak. GhAppBudget is 100 ms-cached, so this is cheap enough for
+            // a call the engine makes every frame.
+            UINT64 chosen = vramScaled;
+            if (g_vramPressMb){
+                uint64_t used = 0, lim = 0;
+                GhAppBudget(&used, &lim);
+                InterlockedIncrement(&g_vramPressN);
+                if (lim && used <= lim){
+                    const UINT64 contScaled =
+                        (UINT64)((double)used * (double)cap / (double)lim);
+                    if (contScaled > chosen){
+                        chosen = contScaled;
+                        InterlockedIncrement(&g_vramPressWon);
+                    }
+                }
             }
+            if (chosen > ceiling) chosen = ceiling;
+            i->CurrentUsage = chosen;
+
             static LONG n = 0;
-            if (InterlockedIncrement(&n) <= 6)
+            const LONG nn = InterlockedIncrement(&n);
+            if (nn <= 6 || (g_vramPressMb && (nn % 512) == 0))
                 Diag("AdapterProxy QueryVideoMemoryInfo -> budget=" + Hex((uint64_t)i->Budget) +
                      " use=" + Hex((uint64_t)i->CurrentUsage) +
-                     " (real budget=" + Hex(realBudget) + " use=" + Hex(realUsage) + ")");
+                     " (real budget=" + Hex(realBudget) + " use=" + Hex(realUsage) + ")" +
+                     (g_vramPressMb
+                        ? (" VRAMPRESS vram=" + Hex(vramScaled) +
+                           " ceiling=" + Hex(ceiling) +
+                           " n=" + std::to_string((long)InterlockedCompareExchange(&g_vramPressN, 0, 0)) +
+                           " containerWon=" + std::to_string((long)InterlockedCompareExchange(&g_vramPressWon, 0, 0)))
+                        : std::string()));
         }
         return hr;
     }
@@ -25056,6 +25131,12 @@ static void GhInitGuestDisplay()
 
     g_cpuCount = GhCfgNum(L"gh_cpus.txt", "GH_CPUS", 0);
     if (g_cpuCount) Diag("DISPLAY processor count override " + std::to_string(g_cpuCount));
+
+    // #202. GhCfgNumZ so 0 is expressible and means off; run31N.py writes '0' for
+    // every slot a runargs does not supply, so this stays off for the whole tree.
+    g_vramPressMb = GhCfgNumZ(L"gh_vram_press.txt", "GH_VRAM_PRESS", 0);
+    Diag("DISPLAY vram pressure reserve = " + std::to_string(g_vramPressMb) +
+         " MB (0 = off, report adapter pressure only)");
 }
 
 static void GhProbeAwe()
