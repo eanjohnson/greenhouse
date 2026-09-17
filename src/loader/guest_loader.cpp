@@ -20622,6 +20622,7 @@ static void GhNoteVaSite(unsigned kind, uint64_t size, uint32_t type,
                          uint32_t prot, uintptr_t ret);
 static void GhNoteVaFree(unsigned kind, uint64_t size, uint32_t type);
 static void GhInstallNtVmHooks();            // #223
+static void GhInstallSecMapHooks();          // #224
 static void GhVaSitesDump(const char* when);
 static bool GhVaSitesOn();
 
@@ -22779,6 +22780,7 @@ static void GhHookD12Device(ID3D12Device* dev)
 {
     GhInstallUmdVaTrace();
     GhInstallNtVmHooks();                    // #223: the path no IAT exposes
+    GhInstallSecMapHooks();                  // #224: the paths that charge without it
     GhInstallCoreHeapTrace();   // #158 gh_va_trace>=3
     GhInstallSecTrace();        // #158 gh_va_trace>=4
     GhInstallScacheShim();      // #209 gh_scache>=1
@@ -23894,6 +23896,44 @@ static void GhNtVmNote(uintptr_t ret, uint64_t size, uint32_t type)
     InterlockedExchangeAdd64(&g_ntVmOtherBytes, (LONG64)size);
 }
 
+// ---- #224: SIZE THE RELEASES ------------------------------------------------
+// #222 and #223 both concluded "paired 1:1" from COUNTS.  Counts matching is not
+// bytes matching: a reserve-only region released costs nothing, and a committed
+// region never released is a ratchet, and those two together leave the counts
+// perfectly balanced while the bytes run away.  The release size is the one
+// number no instrument in this project has ever measured -- MEM_RELEASE passes
+// size 0, meaning "the whole reservation", so it has to be asked for.
+//
+// VirtualQuery is a syscall (NtQueryVirtualMemory).  It allocates nothing and
+// takes no loader lock, so it is safe in here where a stack walk is not.
+// A reservation can be several sub-regions; walk at most a few and bucket the
+// ones that run past the cap, so an undercount is visible rather than silent.
+static volatile LONG64 g_ntVmRelCommitKB = 0;   // committed bytes actually released
+static volatile LONG64 g_ntVmRelReserveKB = 0;  // total reservation bytes released
+static volatile LONG   g_ntVmRelWalkCap   = 0;  // releases that outran the walk
+static volatile LONG   g_ntVmRelQueryFail = 0;
+
+static void GhNtVmSizeRelease(void* base)
+{
+    if (!base) return;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(base, &mbi, sizeof mbi)){ InterlockedIncrement(&g_ntVmRelQueryFail); return; }
+    void* const allocBase = mbi.AllocationBase ? mbi.AllocationBase : base;
+    uint8_t* p = (uint8_t*)allocBase;
+    uint64_t commit = 0, reserve = 0;
+    for (int i = 0; i < 16; ++i){
+        MEMORY_BASIC_INFORMATION m{};
+        if (!VirtualQuery(p, &m, sizeof m)) break;
+        if (m.AllocationBase != allocBase) break;          // walked off the end
+        reserve += (uint64_t)m.RegionSize;
+        if (m.State == MEM_COMMIT) commit += (uint64_t)m.RegionSize;
+        p += m.RegionSize;
+        if (i == 15) InterlockedIncrement(&g_ntVmRelWalkCap);
+    }
+    InterlockedExchangeAdd64(&g_ntVmRelCommitKB,  (LONG64)(commit  >> 10));
+    InterlockedExchangeAdd64(&g_ntVmRelReserveKB, (LONG64)(reserve >> 10));
+}
+
 // The guard is the whole safety argument.  GhNoteVaSite takes a lock and walks
 // the stack, and the stack walk can touch the loader; if either allocates we
 // would re-enter this hook from inside RtlHeap.  A thread already inside passes
@@ -23927,12 +23967,24 @@ static LONG __stdcall Hook_GhNtAVM(HANDLE proc, PVOID* base, ULONG_PTR zb,
 static LONG __stdcall Hook_GhNtFVM(HANDLE proc, PVOID* base, SIZE_T* size, ULONG type)
 {
     const SIZE_T req = size ? *size : 0;                   // read BEFORE the call
+    // The region is gone once the call returns, so its size has to be taken on
+    // the way IN -- and only when we are actually going to use it, because this
+    // costs two syscalls on a path that runs 113,000 times a run.
+    void* relBase = nullptr;
+    if ((type & MEM_RELEASE) && GhNtVmOn() && proc == (HANDLE)(LONG_PTR)-1){
+        GhNtVmGuard pre;
+        // Size it INSIDE the guard so relComKB and relN count the same
+        // population: a thread already inside is skipped by both, not one.
+        if (pre.held && base){ relBase = *base; GhNtVmSizeRelease(relBase); }
+    }
     const LONG st = g_realNtFVM(proc, base, size, type);
     if (st >= 0 && proc == (HANDLE)(LONG_PTR)-1){
         GhNtVmGuard g;
         if (g.held){
             InterlockedIncrement(&g_ntVmFreeN);
-            if (type & MEM_RELEASE) InterlockedIncrement(&g_ntVmRelN);
+            if (type & MEM_RELEASE){
+                InterlockedIncrement(&g_ntVmRelN);
+            }
             else if (type & MEM_DECOMMIT){
                 InterlockedIncrement(&g_ntVmDecN);
                 InterlockedExchangeAdd64(&g_ntVmFreeBytes, (LONG64)req);
@@ -23973,6 +24025,220 @@ static void GhInstallNtVmHooks()
          " ntdll=" + Hex((uint64_t)nt));
 }
 
+
+// ---------------------------------------------------------------- #224 -----
+// #223 eliminated the entire user-mode virtual-memory API for the pipeline
+// phase: every commit goes through VirtualAlloc, we see all of them, they pair
+// 1:1 at the KERNEL boundary, and they net ~7 MB against a +59.8 MB climb of
+// appused.  appused is MemoryManager::AppMemoryUsage() -- the container's
+// COMMIT CHARGE -- and commit charge is taken by more mechanisms than one.
+//
+// This instrument covers the three that never call NtAllocateVirtualMemory:
+//   (a) PAGEFILE-BACKED SECTIONS.  NtCreateSection with FileHandle == NULL and
+//       SEC_COMMIT charges commit at CREATE time.  This is how D3D12 heaps
+//       allocate and how our own arena works, and `ws` grew MORE than `appused`
+//       in the window (+76.3 vs +59.8), which is what mapped views look like.
+//       So the create side is the decisive number and the map side is context.
+//   (b) NtAllocateVirtualMemoryEx -- a separate stub the #223 hook never saw.
+//   (c) thread stacks, committed kernel-side inside NtCreateThreadEx.
+//
+// !! KNOWN FATAL AS WRITTEN -- gh_secmap MUST STAY 0 UNTIL BISECTED !!
+// Cells SECMAP1 and SECMAP2 both died at crs-client.dll+0x226E reading
+// [0x10], with zero frames, where the control run has no VEH fault at all.
+// Two for two against a clean control is a confirmed perturbation, not a
+// memory result.  RELSIZE1 then cleared the release sizing by running the
+// full 377 s with gh_secmap=0, so the fault is in one of the five hooks
+// below and not in the shared machinery.  Bisect order if this is ever
+// resumed: drop NtCreateThreadEx and NtUnmapViewOfSection first (neither is
+// needed for the pagefile-section question), then keep only NtCreateSection.
+//
+// Same safety shape NTVM2 proved on this console and for the same reason:
+// NO STACK WALK AND NO LOCK.  NTVM1's deadlock was lock inversion, not
+// recursion, so the TLS guard alone is not the argument -- the absence of the
+// walk is.  Knob gh_secmap (slot 229) is switch and KB floor, OFF by default.
+#ifndef SEC_COMMIT
+#define SEC_COMMIT 0x08000000
+#endif
+
+typedef LONG (__stdcall *GhNtCS_t)(PHANDLE, ACCESS_MASK, PVOID, PLARGE_INTEGER, ULONG, ULONG, HANDLE);
+typedef LONG (__stdcall *GhNtMVS_t)(HANDLE, HANDLE, PVOID*, ULONG_PTR, SIZE_T, PLARGE_INTEGER, PSIZE_T, DWORD, ULONG, ULONG);
+typedef LONG (__stdcall *GhNtUVS_t)(HANDLE, PVOID);
+typedef LONG (__stdcall *GhNtAVMX_t)(HANDLE, PVOID*, PSIZE_T, ULONG, ULONG, PVOID, ULONG);
+typedef LONG (__stdcall *GhNtCTX_t)(PHANDLE, ACCESS_MASK, PVOID, HANDLE, PVOID, PVOID, ULONG, SIZE_T, SIZE_T, SIZE_T, PVOID);
+
+static GhNtCS_t   g_realNtCS   = nullptr;
+static GhNtMVS_t  g_realNtMVS  = nullptr;
+static GhNtUVS_t  g_realNtUVS  = nullptr;
+static GhNtAVMX_t g_realNtAVMX = nullptr;
+static GhNtCTX_t  g_realNtCTX  = nullptr;
+
+static unsigned GhSecMapMinKB()
+{ static const unsigned v = GhCfgNum(L"gh_secmap.txt", "GH_SECMAP", 0); return v; }
+static unsigned GhSecMapOn(){ return GhSecMapMinKB(); }
+
+static GhNtVmRec g_secPf[32]{};    // pagefile-backed NtCreateSection, by caller
+static GhNtVmRec g_secMap[32]{};   // NtMapViewOfSection, by caller
+static GhNtVmRec g_secAvx[32]{};   // NtAllocateVirtualMemoryEx commits, by caller
+
+static volatile LONG   g_secPfN = 0,  g_secFbN = 0,  g_secMapN = 0, g_secUnmapN = 0;
+static volatile LONG64 g_secPfKB = 0, g_secFbKB = 0, g_secMapKB = 0;
+static volatile LONG   g_secAvxN = 0; static volatile LONG64 g_secAvxKB = 0;
+static volatile LONG   g_secThrN = 0;
+static volatile LONG   g_secOtherN = 0;
+
+// One probe, three tables.  Identical to GhNtVmNote and deliberately duplicated
+// rather than generalised: this code runs under every thread in the process and
+// must stay readable enough to audit by eye.
+static void GhSecNote(GhNtVmRec* tab, uintptr_t ret, uint64_t size)
+{
+    const LONG64 key = (LONG64)ret;
+    for (int i = 0; i < 32; ++i){
+        LONG64 cur = tab[i].ret;
+        if (cur == 0){
+            if (InterlockedCompareExchange64((LONG64*)&tab[i].ret, key, 0) != 0){ --i; continue; }
+            cur = key;
+        }
+        if (cur == key){
+            InterlockedExchangeAdd64((LONG64*)&tab[i].bytes, (LONG64)size);
+            InterlockedIncrement(&tab[i].n);
+            return;
+        }
+    }
+    InterlockedIncrement(&g_secOtherN);
+}
+
+static LONG __stdcall Hook_GhNtCS(PHANDLE h, ACCESS_MASK acc, PVOID oa,
+                                  PLARGE_INTEGER maxSize, ULONG prot,
+                                  ULONG attrs, HANDLE file)
+{
+    // Read the requested size BEFORE the call: the kernel may round it.
+    const uint64_t req = maxSize ? (uint64_t)maxSize->QuadPart : 0;
+    const LONG st = g_realNtCS(h, acc, oa, maxSize, prot, attrs, file);
+    if (st >= 0){
+        GhNtVmGuard g;
+        if (g.held){
+            const uint64_t sz = maxSize ? (uint64_t)maxSize->QuadPart : req;
+            if (file == nullptr){          // pagefile-backed: THIS is commit charge
+                InterlockedIncrement(&g_secPfN);
+                InterlockedExchangeAdd64(&g_secPfKB, (LONG64)(sz >> 10));
+                if ((sz >> 10) >= (uint64_t)GhSecMapMinKB())
+                    GhSecNote(g_secPf, (uintptr_t)_ReturnAddress(), sz);
+            } else {                       // file-backed: mapped bytes are free
+                InterlockedIncrement(&g_secFbN);
+                InterlockedExchangeAdd64(&g_secFbKB, (LONG64)(sz >> 10));
+            }
+            (void)attrs;
+        }
+    }
+    return st;
+}
+
+static LONG __stdcall Hook_GhNtMVS(HANDLE sec, HANDLE proc, PVOID* base, ULONG_PTR zb,
+                                   SIZE_T commitSize, PLARGE_INTEGER off, PSIZE_T viewSize,
+                                   DWORD inh, ULONG allocType, ULONG prot)
+{
+    const LONG st = g_realNtMVS(sec, proc, base, zb, commitSize, off, viewSize, inh, allocType, prot);
+    if (st >= 0 && proc == (HANDLE)(LONG_PTR)-1){
+        GhNtVmGuard g;
+        if (g.held){
+            const uint64_t sz = viewSize ? (uint64_t)*viewSize : 0;   // OUT param: read AFTER
+            InterlockedIncrement(&g_secMapN);
+            InterlockedExchangeAdd64(&g_secMapKB, (LONG64)(sz >> 10));
+            if ((sz >> 10) >= (uint64_t)GhSecMapMinKB())
+                GhSecNote(g_secMap, (uintptr_t)_ReturnAddress(), sz);
+        }
+    }
+    return st;
+}
+
+static LONG __stdcall Hook_GhNtUVS(HANDLE proc, PVOID base)
+{
+    const LONG st = g_realNtUVS(proc, base);
+    if (st >= 0 && proc == (HANDLE)(LONG_PTR)-1){
+        GhNtVmGuard g;
+        if (g.held) InterlockedIncrement(&g_secUnmapN);
+    }
+    return st;
+}
+
+static LONG __stdcall Hook_GhNtAVMX(HANDLE proc, PVOID* base, PSIZE_T size,
+                                    ULONG type, ULONG prot, PVOID ext, ULONG extN)
+{
+    const LONG st = g_realNtAVMX(proc, base, size, type, prot, ext, extN);
+    if (st >= 0 && proc == (HANDLE)(LONG_PTR)-1 && (type & MEM_COMMIT)){
+        GhNtVmGuard g;
+        if (g.held){
+            const uint64_t sz = size ? (uint64_t)*size : 0;
+            InterlockedIncrement(&g_secAvxN);
+            InterlockedExchangeAdd64(&g_secAvxKB, (LONG64)(sz >> 10));
+            if ((sz >> 10) >= (uint64_t)GhSecMapMinKB())
+                GhSecNote(g_secAvx, (uintptr_t)_ReturnAddress(), sz);
+        }
+    }
+    return st;
+}
+
+static LONG __stdcall Hook_GhNtCTX(PHANDLE h, ACCESS_MASK acc, PVOID oa, HANDLE proc,
+                                   PVOID start, PVOID arg, ULONG flags, SIZE_T zb,
+                                   SIZE_T stackCommit, SIZE_T stackReserve, PVOID attrs)
+{
+    const LONG st = g_realNtCTX(h, acc, oa, proc, start, arg, flags, zb,
+                                stackCommit, stackReserve, attrs);
+    if (st >= 0 && proc == (HANDLE)(LONG_PTR)-1){
+        GhNtVmGuard g;
+        if (g.held) InterlockedIncrement(&g_secThrN);
+    }
+    return st;
+}
+
+static void GhInstallSecMapHooks()
+{
+    if (!GhSecMapOn()) return;
+    static LONG done = 0;
+    if (InterlockedCompareExchange(&done, 1, 0) != 0) return;
+    (void)GhSecMapMinKB();        // warm the knob BEFORE anything goes live
+    // #223 allocates the guard TLS slot.  If gh_ntvm is off we must allocate it
+    // ourselves, and refuse rather than run unguarded -- same rule as NTVM.
+    if (g_ntVmTls == TLS_OUT_OF_INDEXES){
+        g_ntVmTls = TlsAlloc();
+        if (g_ntVmTls == TLS_OUT_OF_INDEXES){
+            Diag("SECMAP: TlsAlloc failed -- refusing to install without a guard");
+            return;
+        }
+    }
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    if (!nt){ Diag("SECMAP: no ntdll"); return; }
+    struct { const char* name; void* hook; void** orig; bool ok; } h[] = {
+        { "NtCreateSection",           (void*)&Hook_GhNtCS,   (void**)&g_realNtCS,   false },
+        { "NtMapViewOfSection",        (void*)&Hook_GhNtMVS,  (void**)&g_realNtMVS,  false },
+        { "NtUnmapViewOfSection",      (void*)&Hook_GhNtUVS,  (void**)&g_realNtUVS,  false },
+        { "NtAllocateVirtualMemoryEx", (void*)&Hook_GhNtAVMX, (void**)&g_realNtAVMX, false },
+        { "NtCreateThreadEx",          (void*)&Hook_GhNtCTX,  (void**)&g_realNtCTX,  false },
+    };
+    std::string msg = "SECMAP install";
+    for (auto& e : h){
+        void* p = (void*)GetProcAddress(nt, e.name);
+        // Each hook stands alone: one missing export or one undecodable prologue
+        // costs that row, not the cell.
+        e.ok = p && InstallInlineHook(p, e.hook, e.orig);
+        msg += std::string(" ") + e.name + "=" + (e.ok ? "OK" : (p ? "FAILED" : "ABSENT"));
+    }
+    msg += " minKB=" + std::to_string((unsigned long)GhSecMapMinKB()) + " ntdll=" + Hex((uint64_t)nt);
+    Diag(msg);
+}
+
+static void GhSecMapDumpTable(const char* kind, GhNtVmRec* tab)
+{
+    for (int i = 0; i < 32; ++i){
+        const LONG64 r = tab[i].ret;
+        if (!r) continue;
+        Diag(std::string("  SECSITE k=") + kind +
+             " totKB=" + std::to_string((long long)(tab[i].bytes >> 10)) +
+             " n=" + std::to_string((long)tab[i].n) +
+             " ret=" + Hex((uint64_t)r) + " " + NameForCodeAddr((uintptr_t)r));
+    }
+}
+
 // Delta since the previous dump, biggest first. Collected under the lock and
 // PRINTED outside it -- Diag allocates, and this runs on guest threads.
 static void GhVaSitesDump(const char* when)
@@ -24008,6 +24274,26 @@ static void GhVaSitesDump(const char* when)
     const LONG   dfdN = fdN - g_vaFreeDecNDumped, dfrN = frN - g_vaFreeRelNDumped;
     const LONG64 dfdKB = fdKB - g_vaFreeDecKBDumped;
     g_vaFreeDecNDumped = fdN; g_vaFreeRelNDumped = frN; g_vaFreeDecKBDumped = fdKB;
+    if (GhSecMapOn()){
+        Diag(std::string("SECMAP ") + when +
+             " pfN="    + std::to_string((long)g_secPfN) +
+             " pfKB="   + std::to_string((long long)g_secPfKB) +
+             " fbN="    + std::to_string((long)g_secFbN) +
+             " fbKB="   + std::to_string((long long)g_secFbKB) +
+             " mapN="   + std::to_string((long)g_secMapN) +
+             " mapKB="  + std::to_string((long long)g_secMapKB) +
+             " unmapN=" + std::to_string((long)g_secUnmapN) +
+             " avxN="   + std::to_string((long)g_secAvxN) +
+             " avxKB="  + std::to_string((long long)g_secAvxKB) +
+             " thrN="   + std::to_string((long)g_secThrN) +
+             " otherN=" + std::to_string((long)g_secOtherN) +
+             " hooked=" + (g_realNtCS ? "1" : "0") + (g_realNtMVS ? "1" : "0") +
+                          (g_realNtUVS ? "1" : "0") + (g_realNtAVMX ? "1" : "0") +
+                          (g_realNtCTX ? "1" : "0"));
+        GhSecMapDumpTable("pf",  g_secPf);
+        GhSecMapDumpTable("map", g_secMap);
+        GhSecMapDumpTable("avx", g_secAvx);
+    }
     if (GhNtVmOn()){
         Diag(std::string("NTVM ") + when +
              " allocN=" + std::to_string((long)g_ntVmAllocN) +
@@ -24017,6 +24303,10 @@ static void GhVaSitesDump(const char* when)
              " decKB="  + std::to_string((long long)(g_ntVmFreeBytes >> 10)) +
              " otherN=" + std::to_string((long)g_ntVmOtherN) +
              " otherKB=" + std::to_string((long long)(g_ntVmOtherBytes >> 10)) +
+             " relComKB=" + std::to_string((long long)g_ntVmRelCommitKB) +
+             " relResKB=" + std::to_string((long long)g_ntVmRelReserveKB) +
+             " relCap="   + std::to_string((long)g_ntVmRelWalkCap) +
+             " relQF="    + std::to_string((long)g_ntVmRelQueryFail) +
              " hooked=" + (g_realNtAVM ? "1" : "0"));
         for (int i = 0; i < 64; ++i){
             const LONG64 r = g_ntVm[i].ret;
