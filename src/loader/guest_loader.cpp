@@ -20613,17 +20613,30 @@ static HRESULT __stdcall Hook_D12CreateCommitted(ID3D12Device* self,
 // #158. Returns the first return address on the stack that lies inside the mapped
 // guest image, i.e. the guest code that called us. Image-relative offsets drop
 // straight into an objdump of the same exe on the dev box.
-static bool PtrInLastGame(uintptr_t p);   // defined far below
+// #219. These are the guest-site attribution set, defined just after
+// g_guestImageBase/g_guestImageSize (which they need) and far above the
+// overlay-quit g_lastGameRanges (which they deliberately do NOT share).
+static void GhArmGuestSiteRanges();
+static bool GhPtrInGuestSite(uintptr_t p);
+static void GhNoteVaSite(unsigned kind, uint64_t size, uint32_t type,
+                         uint32_t prot, uintptr_t ret);
+static void GhVaSitesDump(const char* when);
+static bool GhVaSitesOn();
+
 static uintptr_t GhGuestCallerRva()
 {
     using Fn = USHORT (NTAPI*)(ULONG, ULONG, PVOID*, PULONG);
     static Fn cap = (Fn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"),
                                        "RtlCaptureStackBackTrace");
     if (!cap) return 0;
+    // #219. This used to consult g_lastGameRanges, which is filled only on the
+    // overlay-quit path -- so in a game run the table was empty and this
+    // returned 0 for every call, for the whole x64 track.
+    GhArmGuestSiteRanges();
     void* fr[32]{};
     USHORT n = cap(0, 32, fr, nullptr);
     for (USHORT i = 0; i < n; ++i)
-        if (PtrInLastGame((uintptr_t)fr[i])) return (uintptr_t)fr[i];
+        if (GhPtrInGuestSite((uintptr_t)fr[i])) return (uintptr_t)fr[i];
     return 0;
 }
 static HRESULT __stdcall Hook_D12CreateHeap(ID3D12Device* self,
@@ -21729,6 +21742,7 @@ static void GhLogMemoryBudget(const char* where)
     GhResLiveDump(where);                         // #202: what is IN that viduse
     GhVaCensus(where, appUsed, appLimit);
     GhHeapTrim(where);                            // #202: does the heap owe us the pipeline phase?
+    GhVaSitesDump(where);                         // #219: and WHO asked for it?
 }
 
 // #158. The repairs above say something specific and testable: every one of them
@@ -21915,6 +21929,7 @@ static LPVOID WINAPI Hook_UmdVirtualAlloc(LPVOID a, SIZE_T s, DWORD t, DWORD p)
 {
     LPVOID r = g_umdVaOrig ? g_umdVaOrig(a, s, t, p) : VirtualAlloc(a, s, t, p);
     GhUmdVaNote(1, a, s, t, p, r, r ? 0u : GetLastError(), 0);
+    if (r) GhNoteVaSite(3, (uint64_t)s, t, p, (uintptr_t)_ReturnAddress());
     return r;
 }
 static BOOL WINAPI Hook_UmdVirtualFree(LPVOID a, SIZE_T s, DWORD t)
@@ -21930,6 +21945,9 @@ static NTSTATUS NTAPI Hook_UmdNtAlloc(HANDLE proc, PVOID* base, ULONG_PTR zb, PS
     SIZE_T inSize = size ? *size : 0;
     NTSTATUS st = g_umdNtOrig ? g_umdNtOrig(proc, base, zb, size, type, prot) : (NTSTATUS)0xC0000002;
     GhUmdVaNote(3, inBase, inSize, type, prot, (st >= 0 && base) ? *base : nullptr, 0, st);
+    if (st >= 0)
+        GhNoteVaSite(4, (uint64_t)(size ? *size : inSize), type, prot,
+                     (uintptr_t)_ReturnAddress());
     return st;
 }
 
@@ -22334,7 +22352,9 @@ static void GhInstallSecTrace()
 
 static void GhInstallUmdVaTrace()
 {
-    if (!GhVaTraceOn()) return;
+    // #219: gh_va_sites needs the driver's allocator hooked as well, and the
+    // ring costs nothing when nobody dumps it.
+    if (!GhVaTraceOn() && !GhVaSitesOn()) return;
     static LONG done = 0;
     if (InterlockedCompareExchange(&done, 1, 0) != 0) return;
     struct { const wchar_t* w; const char* a; } mods[] = {
@@ -23630,6 +23650,217 @@ extern std::wstring g_guestExePath;   // defined near the PE mapper, below
 // IS its main module, and that is a fact several beds have to agree on.
 static uint8_t*          g_guestImageBase = nullptr;
 static DWORD             g_guestImageSize = 0;
+
+// ---------------------------------------------------------------------------
+// #219: guest call-site attribution.
+//
+// GhGuestCallerRva() walks the stack for the first frame inside guest code, and
+// for the whole x64 track it returned 0 for every call in a game run. The table
+// below is the repair. Two things it does that the old one could not:
+//
+//   * it arms ITSELF, from whatever thread first asks, instead of waiting for
+//     the overlay-quit path that a game run never reaches; and
+//   * it pushes the SELF-MAPPED guest EXE unconditionally. The guest image is
+//     ours (VirtualAlloc + our own relocs, see the PE mapper below), so it is
+//     not on the PEB loader list at all -- and it is where essentially every
+//     GUEST+0x... address lives.
+//
+// Storage is a fixed static array, never resized and never freed, because it is
+// read from ~53 guest threads with no lock: a torn read can misattribute one
+// sample, but nothing can dangle. The overlay-quit path keeps its own
+// g_lastGameRanges untouched -- widening THAT set would start suspending
+// threads running inside the guest EXE, a behaviour change on a path that works
+// today (Cheese/LC/REPO quit-to-launcher).
+// ---------------------------------------------------------------------------
+struct GhSiteRange { uintptr_t lo, hi; };
+static GhSiteRange     g_siteRanges[256];
+static volatile LONG   g_siteRangeN   = 0;   // published AFTER the entries are written
+static volatile LONG   g_siteArmStamp = 0;   // GetTickCount64() >> 10 of the last collect
+static volatile LONG   g_siteCollects = 0;
+
+// Minimal copy of the in-memory LDR entry. The shared GhLdrEntry is declared
+// ~8k lines below, next to the overlay-quit code; duplicating six fields is
+// cheaper than moving a struct the rest of that file depends on.
+struct GhSiteLdrEntry {
+    LIST_ENTRY InLoadOrder, InMemoryOrder, InInitOrder;
+    void*  DllBase;
+    void*  EntryPoint;
+    DWORD  SizeOfImage;
+    DWORD  pad;
+    UNICODE_STRING FullDllName, BaseDllName;
+};
+
+static void GhCollectGuestSiteRanges()
+{
+    const LONG kMax = (LONG)(sizeof g_siteRanges / sizeof g_siteRanges[0]);
+    LONG n = 0;
+    // The self-mapped guest EXE FIRST: it is the point of the fix, and it has to
+    // be present even if the loader walk below finds nothing.
+    if (g_guestImageBase && g_guestImageSize)
+        g_siteRanges[n++] = { (uintptr_t)g_guestImageBase,
+                              (uintptr_t)g_guestImageBase + (uintptr_t)g_guestImageSize };
+
+    // ...then the guest's own shipped DLLs, which DO go through ntdll. Compared
+    // on the raw buffer rather than a std::wstring: this runs inside a
+    // VirtualAlloc hook, so it must not allocate.
+    const wchar_t* dir = !g_lastGameDir.empty() ? g_lastGameDir.c_str()
+                       : (!g_guestDir.empty()   ? g_guestDir.c_str() : nullptr);
+    const size_t dlen = dir ? wcslen(dir) : 0;
+    BYTE* teb = (BYTE*)NtCurrentTeb();
+    BYTE* peb = teb ? *(BYTE**)(teb + 0x60) : nullptr;
+    BYTE* ldr = peb ? *(BYTE**)(peb + 0x18) : nullptr;
+    if (dir && ldr){
+        auto* head = (LIST_ENTRY*)(ldr + 0x10);   // InLoadOrderModuleList
+        int walked = 0;
+        for (LIST_ENTRY* e = head->Flink;
+             e && e != head && walked < 512 && n < kMax; e = e->Flink, ++walked){
+            auto* ent = CONTAINING_RECORD(e, GhSiteLdrEntry, InLoadOrder);
+            if (!ent->DllBase || !ent->SizeOfImage) continue;
+            if (!ent->FullDllName.Buffer) continue;
+            if (ent->FullDllName.Length / sizeof(wchar_t) < dlen) continue;
+            if (_wcsnicmp(ent->FullDllName.Buffer, dir, dlen) != 0) continue;
+            g_siteRanges[n++] = { (uintptr_t)ent->DllBase,
+                                  (uintptr_t)ent->DllBase + (uintptr_t)ent->SizeOfImage };
+        }
+    }
+    InterlockedExchange(&g_siteRangeN, n);        // publish LAST
+    const LONG c = InterlockedIncrement(&g_siteCollects);
+    if (c <= 3 || (c % 64) == 0)
+        Diag("STAGE=guest_site_ranges n=" + std::to_string((long)n) +
+             " collect=" + std::to_string((long)c) +
+             " img=" + Hex((uint64_t)(uintptr_t)g_guestImageBase) +
+             " size=" + Hex((uint32_t)g_guestImageSize));
+}
+
+// Arm on first use, then refresh every few seconds so guest DLLs loaded after
+// the EXE mapped are picked up. One collector at a time; everyone else skips.
+static void GhArmGuestSiteRanges()
+{
+    if (!g_guestImageBase) return;                  // no guest mapped yet
+    const LONG now = (LONG)(GetTickCount64() >> 10);
+    const LONG was = g_siteArmStamp;
+    if (g_siteRangeN != 0 && (now - was) < 4) return;
+    if (InterlockedCompareExchange(&g_siteArmStamp, now, was) != was) return;
+    GhCollectGuestSiteRanges();
+}
+
+static bool GhPtrInGuestSite(uintptr_t p)
+{
+    const LONG n = g_siteRangeN;
+    for (LONG i = 0; i < n; ++i)
+        if (p >= g_siteRanges[i].lo && p < g_siteRanges[i].hi) return true;
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// #219 / #202: who allocates the pipeline phase?
+//
+// #221 closed the last CPU-side candidate: 526 successful HeapOptimizeResources
+// calls across a whole run returned 0.1 MB, so the pipeline phase's net 120.3 MB
+// (VACENSUS: 1,602 fresh private regions, mean 138 KB, almost all
+// PAGE_READWRITE, zero image and zero mapped) is LIVE direct VirtualAlloc by
+// someone we have never named.
+//
+// gh_va_sites is that name, in KB: allocations at or above it are attributed to
+// the first GUEST frame on the stack, aggregated, and dumped as a delta beside
+// each MEMORY sample. 64 is the value that matches the census (138 KB mean)
+// without paying for a stack walk on every small commit.
+// ---------------------------------------------------------------------------
+static unsigned GhVaSitesMinKB()
+{ static const unsigned v = GhCfgNum(L"gh_va_sites.txt", "GH_VA_SITES", 0); return v; }
+static bool GhVaSitesOn(){ return GhVaSitesMinKB() != 0; }
+
+struct GhVaSiteRec {
+    uintptr_t site;     // first guest frame, 0 = no guest frame on this stack
+    uintptr_t ret;      // immediate caller: the only name the site==0 rows have
+    LONG64    bytes;    // cumulative committed bytes
+    LONG64    dumped;   // bytes at the previous dump, so a sample prints a delta
+    LONG      n, ndumped;
+    unsigned  kind;     // 1 guest bed, 3 driver VirtualAlloc, 4 driver NtAllocVM
+};
+static GhVaSiteRec     g_vaSite[192]{};
+static volatile LONG   g_vaSiteN     = 0;
+static SRWLOCK         g_vaSiteLk    = SRWLOCK_INIT;
+static volatile LONG64 g_vaSiteOther = 0;   // bytes that did not fit the table
+static volatile LONG   g_vaSiteOverN = 0;
+
+static void GhNoteVaSite(unsigned kind, uint64_t size, uint32_t type,
+                         uint32_t prot, uintptr_t ret)
+{
+    const unsigned minKB = GhVaSitesMinKB();
+    if (!minKB) return;
+    if (!(type & MEM_COMMIT)) return;             // a reservation spends no commit
+    if ((size >> 10) < (uint64_t)minKB) return;   // filter BEFORE the stack walk
+    const uintptr_t site = GhGuestCallerRva();
+    AcquireSRWLockExclusive(&g_vaSiteLk);
+    const LONG n = g_vaSiteN;
+    LONG i = 0;
+    for (; i < n; ++i)
+        if (g_vaSite[i].site == site && g_vaSite[i].kind == kind &&
+            (site != 0 || g_vaSite[i].ret == ret)) break;
+    if (i == n){
+        if (n >= (LONG)(sizeof g_vaSite / sizeof g_vaSite[0])){
+            g_vaSiteOther += (LONG64)size;
+            ++g_vaSiteOverN;
+            ReleaseSRWLockExclusive(&g_vaSiteLk);
+            return;
+        }
+        g_vaSite[n].site = site; g_vaSite[n].ret = ret; g_vaSite[n].kind = kind;
+        g_vaSiteN = n + 1;
+    }
+    g_vaSite[i].bytes += (LONG64)size;
+    g_vaSite[i].n     += 1;
+    (void)prot;
+    ReleaseSRWLockExclusive(&g_vaSiteLk);
+}
+
+// Delta since the previous dump, biggest first. Collected under the lock and
+// PRINTED outside it -- Diag allocates, and this runs on guest threads.
+static void GhVaSitesDump(const char* when)
+{
+    if (!GhVaSitesOn()) return;
+    struct Row { uintptr_t site, ret; LONG64 d, tot; LONG dn, tn; unsigned kind; };
+    Row top[12]{};
+    int ntop = 0;
+    LONG64 dTot = 0, other = 0;
+    LONG nsite = 0, overn = 0;
+
+    AcquireSRWLockExclusive(&g_vaSiteLk);
+    nsite = g_vaSiteN; other = g_vaSiteOther; overn = g_vaSiteOverN;
+    for (LONG i = 0; i < nsite; ++i){
+        const LONG64 d = g_vaSite[i].bytes - g_vaSite[i].dumped;
+        if (d <= 0) continue;
+        dTot += d;
+        Row r{ g_vaSite[i].site, g_vaSite[i].ret, d, g_vaSite[i].bytes,
+               g_vaSite[i].n - g_vaSite[i].ndumped, g_vaSite[i].n, g_vaSite[i].kind };
+        int at = ntop;
+        while (at > 0 && top[at - 1].d < r.d){ if (at < 12) top[at] = top[at - 1]; --at; }
+        if (at < 12){ top[at] = r; if (ntop < 12) ++ntop; }
+    }
+    for (LONG i = 0; i < nsite; ++i){
+        g_vaSite[i].dumped  = g_vaSite[i].bytes;
+        g_vaSite[i].ndumped = g_vaSite[i].n;
+    }
+    ReleaseSRWLockExclusive(&g_vaSiteLk);
+
+    if (!dTot && !ntop) return;
+    Diag(std::string("VASITES ") + when +
+         " sites=" + std::to_string((long)nsite) +
+         " deltaKB=" + std::to_string((long long)(dTot >> 10)) +
+         " overflowKB=" + std::to_string((long long)(other >> 10)) +
+         " overflowN=" + std::to_string((long)overn) +
+         " ranges=" + std::to_string((long)g_siteRangeN));
+    for (int i = 0; i < ntop; ++i){
+        const Row& r = top[i];
+        Diag("  VASITE k=" + std::to_string((unsigned long)r.kind) +
+             " dKB=" + std::to_string((long long)(r.d >> 10)) +
+             " dn=" + std::to_string((long)r.dn) +
+             " totKB=" + std::to_string((long long)(r.tot >> 10)) +
+             " n=" + std::to_string((long)r.tn) +
+             " at=" + (r.site ? NameForCodeAddr(r.site)
+                              : ("NOGUEST via " + NameForCodeAddr(r.ret))));
+    }
+}
 
 // True when `h` refers to the process's main executable. Games ask for the main
 // module's path two ways: GetModuleFileNameW(NULL, ...) OR
@@ -27807,6 +28038,8 @@ static LPVOID WINAPI Bed_VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWOR
     }
 
     LPVOID p = VirtualAlloc(addr, size, type, prot);
+    // #219: name the guest site behind every private commit big enough to matter.
+    if (p) GhNoteVaSite(1, (uint64_t)size, type, prot, (uintptr_t)_ReturnAddress());
     // Only MEM_COMMIT spends the app budget; a reservation is address space.
     if (p && size >= kBigAlloc && (type & MEM_COMMIT)){
         {
