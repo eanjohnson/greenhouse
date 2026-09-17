@@ -20620,6 +20620,7 @@ static void GhArmGuestSiteRanges();
 static bool GhPtrInGuestSite(uintptr_t p);
 static void GhNoteVaSite(unsigned kind, uint64_t size, uint32_t type,
                          uint32_t prot, uintptr_t ret);
+static void GhNoteVaFree(unsigned kind, uint64_t size, uint32_t type);
 static void GhVaSitesDump(const char* when);
 static bool GhVaSitesOn();
 
@@ -21936,6 +21937,7 @@ static BOOL WINAPI Hook_UmdVirtualFree(LPVOID a, SIZE_T s, DWORD t)
 {
     BOOL ok = g_umdVfOrig ? g_umdVfOrig(a, s, t) : VirtualFree(a, s, t);
     GhUmdVaNote(2, a, s, t, 0, ok ? a : nullptr, ok ? 0u : GetLastError(), 0);
+    if (ok) GhNoteVaFree(3, (uint64_t)s, t);
     return ok;
 }
 static NTSTATUS NTAPI Hook_UmdNtAlloc(HANDLE proc, PVOID* base, ULONG_PTR zb, PSIZE_T size,
@@ -23784,6 +23786,27 @@ static SRWLOCK         g_vaSiteLk    = SRWLOCK_INIT;
 static volatile LONG64 g_vaSiteOther = 0;   // bytes that did not fit the table
 static volatile LONG   g_vaSiteOverN = 0;
 
+// The free side, counted globally rather than per site: a block is rarely freed
+// from the frame that allocated it, so per-site netting would be fiction.
+// MEM_DECOMMIT carries an explicit size and is the one that returns commit;
+// MEM_RELEASE passes size 0 (the whole reservation) and can only be counted.
+static volatile LONG   g_vaFreeDecN  = 0;
+static volatile LONG   g_vaFreeRelN  = 0;
+static volatile LONG64 g_vaFreeDecKB = 0;
+static volatile LONG   g_vaFreeDecNDumped = 0, g_vaFreeRelNDumped = 0;
+static volatile LONG64 g_vaFreeDecKBDumped = 0;
+
+static void GhNoteVaFree(unsigned kind, uint64_t size, uint32_t type)
+{
+    if (!GhVaSitesOn()) return;
+    (void)kind;
+    if (type & MEM_RELEASE){ InterlockedIncrement(&g_vaFreeRelN); return; }
+    if (type & MEM_DECOMMIT){
+        InterlockedIncrement(&g_vaFreeDecN);
+        InterlockedExchangeAdd64(&g_vaFreeDecKB, (LONG64)(size >> 10));
+    }
+}
+
 static void GhNoteVaSite(unsigned kind, uint64_t size, uint32_t type,
                          uint32_t prot, uintptr_t ret)
 {
@@ -23844,6 +23867,18 @@ static void GhVaSitesDump(const char* when)
     ReleaseSRWLockExclusive(&g_vaSiteLk);
 
     if (!dTot && !ntop) return;
+    const LONG   fdN = g_vaFreeDecN, frN = g_vaFreeRelN;
+    const LONG64 fdKB = g_vaFreeDecKB;
+    const LONG   dfdN = fdN - g_vaFreeDecNDumped, dfrN = frN - g_vaFreeRelNDumped;
+    const LONG64 dfdKB = fdKB - g_vaFreeDecKBDumped;
+    g_vaFreeDecNDumped = fdN; g_vaFreeRelNDumped = frN; g_vaFreeDecKBDumped = fdKB;
+    Diag(std::string("VAFREE ") + when +
+         " decN=" + std::to_string((long)dfdN) +
+         " decKB=" + std::to_string((long long)dfdKB) +
+         " relN=" + std::to_string((long)dfrN) +
+         " totDecN=" + std::to_string((long)fdN) +
+         " totDecKB=" + std::to_string((long long)fdKB) +
+         " totRelN=" + std::to_string((long)frN));
     Diag(std::string("VASITES ") + when +
          " sites=" + std::to_string((long)nsite) +
          " deltaKB=" + std::to_string((long long)(dTot >> 10)) +
