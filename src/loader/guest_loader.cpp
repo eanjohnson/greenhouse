@@ -22315,6 +22315,72 @@ static bool GhPatchVtblSlot(void* obj, int slot, void* hook, void** origOut)
     return *origOut != nullptr;
 }
 
+// #214/#202. The synthetic pad has only ever existed inside the XInput bed.
+// Tsushima's own persisted HKCU key has EnableWindowsGamingInput=1, and a REAL
+// controller IS enumerated in this container: "OVERLAY WGI
+// Gamepad.GetCurrentReading hooked" appears in every menu run, and that line is
+// reachable only from inside `if (pads.Size() > 0)`. So a front end that reads
+// Windows.Gaming.Input gets a perfectly truthful reading of a pad nobody is
+// physically touching, and every press we inject is invisible to it. That is
+// the exact shape of the menu wall in 32.43 -- mouse motion lands, because it
+// is a different path, and no button from any channel does.
+//
+// g_padState is already the merged pad: PollGamepadOnUi writes the real
+// controller into it and PollSyntheticPad ORs our override on top. Folding it
+// back into the WGI reading therefore costs nothing when no override is active,
+// and makes both paths carry the same pad when one is. Buttons OR; triggers and
+// sticks keep whichever magnitude is larger, so a real stick is never damped by
+// a neutral synthetic one.
+//
+// gh_wgi_inject (slot 217) defaults to 0. This changes what the GAME sees, so
+// it gets an A/B like any other knob instead of arriving switched on.
+static bool GhWgiInjectOn()
+{ static const unsigned v = GhCfgNumZ(L"gh_wgi_inject.txt", "GH_WGI_INJECT", 0); return v != 0; }
+
+// PollGamepadOnUi's fallback branch reads the pad THROUGH this vtable slot. If
+// the merge ran there it would write our own override back into g_padState and
+// latch a press on forever, so the host poll marks itself and is never merged.
+static bool g_wgiHostPoll = false;
+
+static void GhWgiMergeSynth(GhWgiPadReading* out)
+{
+    XINPUT_GAMEPAD g{};
+    bool connected = false;
+    { std::lock_guard<std::mutex> lk(g_padMutex); g = g_padState; connected = g_padConnected; }
+    if (!connected) return;
+    const WORD w = g.wButtons;
+    uint32_t b = 0;
+    if (w & XINPUT_GAMEPAD_START)          b |= 0x1;
+    if (w & XINPUT_GAMEPAD_BACK)           b |= 0x2;
+    if (w & XINPUT_GAMEPAD_A)              b |= 0x4;
+    if (w & XINPUT_GAMEPAD_B)              b |= 0x8;
+    if (w & XINPUT_GAMEPAD_X)              b |= 0x10;
+    if (w & XINPUT_GAMEPAD_Y)              b |= 0x20;
+    if (w & XINPUT_GAMEPAD_DPAD_UP)        b |= 0x40;
+    if (w & XINPUT_GAMEPAD_DPAD_DOWN)      b |= 0x80;
+    if (w & XINPUT_GAMEPAD_DPAD_LEFT)      b |= 0x100;
+    if (w & XINPUT_GAMEPAD_DPAD_RIGHT)     b |= 0x200;
+    if (w & XINPUT_GAMEPAD_LEFT_SHOULDER)  b |= 0x400;
+    if (w & XINPUT_GAMEPAD_RIGHT_SHOULDER) b |= 0x800;
+    if (w & XINPUT_GAMEPAD_LEFT_THUMB)     b |= 0x1000;
+    if (w & XINPUT_GAMEPAD_RIGHT_THUMB)    b |= 0x2000;
+    out->Buttons |= b;
+    auto big = [](double a, double c){ return (std::fabs(c) > std::fabs(a)) ? c : a; };
+    out->LeftTrigger      = big(out->LeftTrigger,      g.bLeftTrigger  / 255.0);
+    out->RightTrigger     = big(out->RightTrigger,     g.bRightTrigger / 255.0);
+    out->LeftThumbstickX  = big(out->LeftThumbstickX,  g.sThumbLX / 32767.0);
+    out->LeftThumbstickY  = big(out->LeftThumbstickY,  g.sThumbLY / 32767.0);
+    out->RightThumbstickX = big(out->RightThumbstickX, g.sThumbRX / 32767.0);
+    out->RightThumbstickY = big(out->RightThumbstickY, g.sThumbRY / 32767.0);
+    // Proof of life, and the count that says the GAME is the caller: this hook
+    // only runs when something other than PollGamepadOnUi reads the pad.
+    static volatile LONG n = 0;
+    const LONG k = InterlockedIncrement(&n);
+    if (k == 1 || k == 10 || k == 100 || k == 1000 || k == 10000)
+        Diag("WGI inject n=" + std::to_string((long)k) +
+             " wgibtn=" + std::to_string((unsigned long)b));
+}
+
 static HRESULT STDMETHODCALLTYPE Hook_WgiPadRead(void* self, GhWgiPadReading* out)
 {
     HRESULT hr = g_realWgiPadRead ? g_realWgiPadRead(self, out) : E_FAIL;
@@ -22324,10 +22390,12 @@ static HRESULT STDMETHODCALLTYPE Hook_WgiPadRead(void* self, GhWgiPadReading* ou
         uint64_t ts = out->Timestamp;
         memset(out, 0, sizeof(*out));
         out->Timestamp = ts;
+        return hr;                                                        // #214
     } else if (g_kmRemapOn) {
         GhInputMaskWgi(out);
     }
 #endif
+    if (GhWgiInjectOn() && !g_wgiHostPoll) GhWgiMergeSynth(out);          // #214
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE Hook_WgiNavRead(void* self, GhWgiNavReading* out)
@@ -22384,6 +22452,7 @@ static void PollGamepadOnUi()
             auto pad = pads.GetAt(0);
             void* abi = g_wgiPadAbi ? g_wgiPadAbi : winrt::get_abi(pad);
             GhWgiPadReading raw{};
+            g_wgiHostPoll = true;                                          // #214
             if (g_realWgiPadRead && abi && SUCCEEDED(g_realWgiPadRead(abi, &raw))) {
                 bb = raw.Buttons; lt = raw.LeftTrigger; rt = raw.RightTrigger;
                 lx = raw.LeftThumbstickX; ly = raw.LeftThumbstickY;
@@ -22395,6 +22464,7 @@ static void PollGamepadOnUi()
                 lx = r.LeftThumbstickX; ly = r.LeftThumbstickY;
                 rx = r.RightThumbstickX; ry = r.RightThumbstickY;
             }
+            g_wgiHostPoll = false;                                         // #214
             auto has = [&](uint32_t f){ return (bb & f) != 0; };
             WORD w = 0;
             if (has(0x1))    w |= XINPUT_GAMEPAD_START;
