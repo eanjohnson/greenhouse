@@ -539,6 +539,8 @@ static std::string GhLazyStats();                             // #145 demand-com
 // how full the adapter says it is.
 static void GhAppBudget(uint64_t* used, uint64_t* lim);
 static void        GhLazyWhoDump(const char* where);          // #213 who promised it, who touched it
+static void        GhResLiveDump(const char* where);           // #202 the LIVE resource set, by site
+static std::string GhResLiveFrameLine();                       // #202 livresMB on every FRAME line
 static void GhIssuedPairsDump(const char* when);              // #158 executed-barrier tally
 static void GhBarrFlushPending(ID3D12GraphicsCommandList* self); // #158 coalescing
 // #158 one entry of the game's captured frame program; replayed by GhRtTest.
@@ -4744,24 +4746,34 @@ static volatile LONG   g_resBufN  = 0;
 static volatile LONG   g_resTexN  = 0;
 static bool GhResCensus()
 { static const bool on = GhCfgNumZ(L"gh_res_census.txt", "GH_RES_CENSUS", 1) != 0; return on; }
+// #202. What one resource costs, as the driver would allocate it. Factored out
+// of GhResCount because the live-footprint census (gh_obj_life=2) needs exactly
+// the same number and must not pay for a second answer.
+static uint64_t GhResBytesOf(ID3D12Device* dev, const D3D12_RESOURCE_DESC* rd)
+{
+    if (!rd) return 0;
+    // A buffer's Width IS its byte size, so this costs nothing.
+    if (rd->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return (uint64_t)rd->Width;
+    if (!dev) return 0;
+    // Only the driver knows what a texture actually costs. Device slot 25 is not
+    // one we hook, so this cannot re-enter, and it is one query against a create
+    // that has already done far more work than this.
+    const D3D12_RESOURCE_ALLOCATION_INFO ai = dev->GetResourceAllocationInfo(0, 1, rd);
+    return ai.SizeInBytes == UINT64_MAX ? 0 : (uint64_t)ai.SizeInBytes;
+}
 static void GhResCount(ID3D12Device* dev, const D3D12_RESOURCE_DESC* rd)
 {
     if (!rd || !GhResCensus()) return;
     InterlockedIncrement(&g_resN);
     if (rd->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER){
-        // A buffer's Width IS its byte size, so this costs nothing.
         InterlockedIncrement(&g_resBufN);
         InterlockedAdd64(&g_resBufB,  (LONG64)rd->Width);
         InterlockedAdd64(&g_resBytes, (LONG64)rd->Width);
         return;
     }
     InterlockedIncrement(&g_resTexN);
-    if (!dev) return;
-    // Only the driver knows what a texture actually costs. Device slot 25 is not
-    // one we hook, so this cannot re-enter, and it is one query against a create
-    // that has already done far more work than this.
-    D3D12_RESOURCE_ALLOCATION_INFO ai = dev->GetResourceAllocationInfo(0, 1, rd);
-    if (ai.SizeInBytes != UINT64_MAX) InterlockedAdd64(&g_resBytes, (LONG64)ai.SizeInBytes);
+    const uint64_t b = GhResBytesOf(dev, rd);
+    if (b) InterlockedAdd64(&g_resBytes, (LONG64)b);
 }
 static volatile LONG   g_heapCount = 0;
 static LONG GhEclNow();                   // #158, defined with g_eclCount below
@@ -5436,6 +5448,7 @@ static HRESULT GfxPresent(UINT sync)
              " psoDup=" + std::to_string((long)InterlockedCompareExchange(&g_psoDup, 0, 0)) +
              " psoSavMs=" + std::to_string((long long)(InterlockedCompareExchange64(&g_psoDupSavUs, 0, 0) / 1000)) +
              GhPagerFrameLine() +
+             GhResLiveFrameLine() +
              " dt=" + std::to_string((unsigned long long)(s_lastMs ? now - s_lastMs : 0)) + "ms" +
              // #158. The cross-queue waits are the only part of the per-frame path
              // not cleared, and they cannot be cleared by removal -- every psync
@@ -17925,6 +17938,224 @@ static void GhFreedNote(void* p)
              " n=" + std::to_string((long)i + 1));
 }
 
+// ---------------------------------------------------------------- #202 LIVE RESOURCES
+// Every resource number we have ever quoted -- res, resMB, buf, bufMB, tex -- is
+// CUMULATIVE. g_resBytes is only ever InterlockedAdd64-ed and nothing subtracts
+// on Release, so "29,900 resources totalling 6.6 GiB" was never a footprint: it
+// is allocation TRAFFIC since launch. Meanwhile the largest live term in the
+// container budget -- viduse = 3,011 MB, straight from QueryVideoMemoryInfo --
+// has never once been decomposed. Six scored negatives on #202 all aimed at
+// terms we could already see; this aims at the one we cannot.
+//
+// gh_obj_life=2 makes the Release hook that already exists do the accounting the
+// counters cannot: record each resource's size and its guest call site at
+// create, and subtract both when its refcount reaches zero. What comes out is a
+// LIVE resource set with owners.
+//
+// THE PREDICTION, recorded before the run.
+//   * If livresMB lands near viduse (3,011 MB), the video memory IS the guest's
+//     resource set, and the site table names who is holding it.
+//   * If livresMB is far below viduse, most of that 3 GB is the driver's own --
+//     pipelines, descriptor heaps, its scratch -- and no resource-side lever can
+//     reach it.
+//   * If livresMB tracks resMB (2,000+ MB and climbing, drops ~= 0), the game
+//     frees nothing during the load and the set is a pure accumulation.
+// Those are three different fixes, and nothing we have measured distinguishes
+// them.
+//
+// COST. The table is 3 MiB of commit, allocated lazily and only when the knob is
+// on, which is inside the +-37 MB scoring floor. RtlCaptureStackBackTrace per
+// create is the same price gh_lazy_who paid for 1,274 MB of answer.
+struct GhLiveRes { void* p; volatile LONG live; uint32_t site; uint64_t bytes; };
+static const LONG      GH_LIVE_SLOTS  = 1 << 17;      // 131,072; ~30k creates in a full run
+static GhLiveRes*      g_liveRes      = nullptr;
+static volatile LONG   g_liveFull     = 0;            // creates the table could not hold
+static volatile LONG   g_liveMiss     = 0;            // frees of a resource we never recorded
+static volatile LONG64 g_liveBytes    = 0;            // LIVE bytes, create minus destroy
+static volatile LONG64 g_livePeakB    = 0;
+static volatile LONG   g_liveN        = 0;            // LIVE count
+static volatile LONG   g_liveEverN    = 0;            // recorded creates
+static volatile LONG   g_liveDropN    = 0;            // recorded destroys
+
+struct GhLiveSite {
+    uint64_t       addr;                              // guest code address that created them
+    volatile LONG64 liveB, everB;
+    volatile LONG   liveN, everN, texN;
+};
+static GhLiveSite    g_liveSite[64]{};
+static volatile LONG g_liveSiteN    = 0;
+static SRWLOCK       g_liveSiteLock = SRWLOCK_INIT;
+static uintptr_t     GhGuestCallerRva();              // defined with the create hooks
+
+static inline LONG GhLiveHash(void* p)
+{
+    uint64_t h = (uint64_t)(uintptr_t)p >> 4;
+    h *= 0x9E3779B97F4A7C15ull;
+    return (LONG)((h >> 33) & (GH_LIVE_SLOTS - 1));
+}
+
+static GhLiveRes* GhLiveTable()
+{
+    GhLiveRes* t = (GhLiveRes*)InterlockedCompareExchangePointer((void**)&g_liveRes, nullptr, nullptr);
+    if (t) return t;
+    static SRWLOCK lk = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&lk);
+    if (!g_liveRes){
+        const SIZE_T cb = sizeof(GhLiveRes) * (SIZE_T)GH_LIVE_SLOTS;
+        void* m = VirtualAlloc(nullptr, cb, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (m){
+            memset(m, 0, cb);
+            InterlockedExchangePointer((void**)&g_liveRes, m);
+            Diag("RESLIVE table slots=" + std::to_string((long)GH_LIVE_SLOTS) +
+                 " bytes=" + std::to_string((unsigned long long)cb) +
+                 " at=" + Hex((uint64_t)(uintptr_t)m));
+        } else {
+            Diag("RESLIVE table alloc FAILED err=" + Hex(GetLastError()) +
+                 " -- the cell is VOID, not a negative");
+        }
+    }
+    ReleaseSRWLockExclusive(&lk);
+    return g_liveRes;
+}
+
+// -1 means the site table is full; the resource is still counted process-wide.
+static LONG GhLiveSiteIdx(uint64_t addr)
+{
+    LONG n = InterlockedCompareExchange(&g_liveSiteN, 0, 0);
+    for (LONG i = 0; i < n && i < 64; ++i) if (g_liveSite[i].addr == addr) return i;
+    AcquireSRWLockExclusive(&g_liveSiteLock);
+    LONG r = -1;
+    n = g_liveSiteN;
+    for (LONG i = 0; i < n && i < 64; ++i) if (g_liveSite[i].addr == addr){ r = i; break; }
+    if (r < 0 && n < 64){
+        g_liveSite[n].addr = addr;
+        r = n;
+        InterlockedExchange(&g_liveSiteN, n + 1);
+    }
+    ReleaseSRWLockExclusive(&g_liveSiteLock);
+    return r;
+}
+
+static void GhLivePeak(LONG64 now)
+{
+    for (;;){
+        const LONG64 pk = InterlockedCompareExchange64(&g_livePeakB, 0, 0);
+        if (now <= pk) return;
+        if (InterlockedCompareExchange64(&g_livePeakB, now, pk) == pk) return;
+    }
+}
+
+static void GhResLiveNote(void* p, ID3D12Device* dev, const D3D12_RESOURCE_DESC* rd)
+{
+    if (!p || !rd || GhObjLife() < 2) return;
+    GhLiveRes* t = GhLiveTable();
+    if (!t) return;
+    const uint64_t bytes = GhResBytesOf(dev, rd);
+    const LONG     si    = GhLiveSiteIdx((uint64_t)GhGuestCallerRva());
+    const bool     tex   = rd->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER;
+    const LONG     h     = GhLiveHash(p);
+    for (LONG probe = 0; probe < 512; ++probe){
+        const LONG i = (h + probe) & (GH_LIVE_SLOTS - 1);
+        void* cur = t[i].p;
+        // The driver recycles addresses, so a dead entry under this exact pointer
+        // is ours to revive. live: 0 = dead, 2 = being filled, 1 = live.
+        if (cur == p){
+            if (InterlockedCompareExchange(&t[i].live, 2, 0) != 0) continue;
+        } else if (!cur){
+            if (InterlockedCompareExchangePointer(&t[i].p, p, nullptr) != nullptr) continue;
+            InterlockedExchange(&t[i].live, 2);
+        } else {
+            continue;
+        }
+        t[i].bytes = bytes;
+        t[i].site  = (uint32_t)(si + 1);            // 0 = unattributed
+        InterlockedExchange(&t[i].live, 1);
+        const LONG64 now = InterlockedAdd64(&g_liveBytes, (LONG64)bytes);
+        GhLivePeak(now);
+        InterlockedIncrement(&g_liveN);
+        InterlockedIncrement(&g_liveEverN);
+        if (si >= 0){
+            InterlockedAdd64(&g_liveSite[si].liveB, (LONG64)bytes);
+            InterlockedAdd64(&g_liveSite[si].everB, (LONG64)bytes);
+            InterlockedIncrement(&g_liveSite[si].liveN);
+            InterlockedIncrement(&g_liveSite[si].everN);
+            if (tex) InterlockedIncrement(&g_liveSite[si].texN);
+        }
+        return;
+    }
+    InterlockedIncrement(&g_liveFull);
+}
+
+static void GhResLiveDrop(void* p)
+{
+    if (!p) return;
+    GhLiveRes* t = (GhLiveRes*)InterlockedCompareExchangePointer((void**)&g_liveRes, nullptr, nullptr);
+    if (!t) return;
+    const LONG h = GhLiveHash(p);
+    for (LONG probe = 0; probe < 512; ++probe){
+        const LONG i = (h + probe) & (GH_LIVE_SLOTS - 1);
+        void* cur = t[i].p;
+        if (!cur) break;                             // p was never recorded
+        if (cur != p) continue;
+        if (InterlockedCompareExchange(&t[i].live, 0, 1) != 1) return;   // not ours to drop
+        const uint64_t b = t[i].bytes;
+        const uint32_t s = t[i].site;
+        InterlockedAdd64(&g_liveBytes, -(LONG64)b);
+        InterlockedDecrement(&g_liveN);
+        InterlockedIncrement(&g_liveDropN);
+        if (s && s <= 64){
+            InterlockedAdd64(&g_liveSite[s - 1].liveB, -(LONG64)b);
+            InterlockedDecrement(&g_liveSite[s - 1].liveN);
+        }
+        return;
+    }
+    InterlockedIncrement(&g_liveMiss);
+}
+
+static std::string GhResLiveFrameLine()
+{
+    if (GhObjLife() < 2) return std::string();
+    return " livresMB=" + std::to_string((long long)(InterlockedCompareExchange64(&g_liveBytes, 0, 0) >> 20)) +
+           " livresN="  + std::to_string((long)InterlockedCompareExchange(&g_liveN, 0, 0)) +
+           " livdrop="  + std::to_string((long)InterlockedCompareExchange(&g_liveDropN, 0, 0));
+}
+
+static void GhResLiveDump(const char* where)
+{
+    if (GhObjLife() < 2) return;
+    const LONG n = InterlockedCompareExchange(&g_liveSiteN, 0, 0);
+    // The positive control. everN=0 means no create was ever recorded, which is a
+    // VOID cell, not "the game holds nothing".
+    Diag(std::string("RESLIVE at ") + where +
+         " liveMB="  + std::to_string((long long)(InterlockedCompareExchange64(&g_liveBytes, 0, 0) >> 20)) +
+         " peakMB="  + std::to_string((long long)(InterlockedCompareExchange64(&g_livePeakB, 0, 0) >> 20)) +
+         " liveN="   + std::to_string((long)InterlockedCompareExchange(&g_liveN, 0, 0)) +
+         " everN="   + std::to_string((long)InterlockedCompareExchange(&g_liveEverN, 0, 0)) +
+         " dropN="   + std::to_string((long)InterlockedCompareExchange(&g_liveDropN, 0, 0)) +
+         " sites="   + std::to_string((long)n) +
+         " tableFull=" + std::to_string((long)InterlockedCompareExchange(&g_liveFull, 0, 0)) +
+         " untracked=" + std::to_string((long)InterlockedCompareExchange(&g_liveMiss, 0, 0)));
+    // Rank by LIVE bytes -- the whole point is which sites are still holding.
+    LONG ord[64]; LONG m = n < 64 ? n : 64;
+    for (LONG i = 0; i < m; ++i) ord[i] = i;
+    for (LONG i = 1; i < m; ++i){
+        const LONG k = ord[i]; LONG j = i - 1;
+        while (j >= 0 && g_liveSite[ord[j]].liveB < g_liveSite[k].liveB){ ord[j + 1] = ord[j]; --j; }
+        ord[j + 1] = k;
+    }
+    const LONG top = m < 12 ? m : 12;
+    for (LONG i = 0; i < top; ++i){
+        const GhLiveSite& e = g_liveSite[ord[i]];
+        Diag("  RESLIVE site[" + std::to_string((long)i) + "] " +
+             (e.addr ? NameForCodeAddr((uintptr_t)e.addr) : std::string("<unattributed>")) +
+             " liveMB=" + std::to_string((long long)(e.liveB >> 20)) +
+             " everMB=" + std::to_string((long long)(e.everB >> 20)) +
+             " liveN="  + std::to_string((long)e.liveN) +
+             " everN="  + std::to_string((long)e.everN) +
+             " tex="    + std::to_string((long)e.texN));
+    }
+}
+
 // Placed, committed and reserved resources do not necessarily share one vtable,
 // and the existing Map hook takes only the first it sees. Getting that wrong
 // here would look exactly like "nothing was ever freed", which is the answer we
@@ -17947,7 +18178,13 @@ static ULONG __stdcall Hook_ObjRelease(IUnknown* self)
     if (!orig) return 1;
     InterlockedIncrement(&g_relCalls);
     const ULONG rc = ((ULONG (__stdcall*)(IUnknown*))orig)(self);
-    if (rc == 0) GhFreedNote(self);
+    if (rc == 0){
+        GhResLiveDrop(self);
+        // Mode 1's freed[] ring is 8,192 entries and one Diag line in every 256.
+        // Tsushima's load would overrun both and drown the quota, so mode 2 keeps
+        // the accounting and drops the roll call.
+        if (GhObjLife() < 2) GhFreedNote(self);
+    }
     return rc;
 }
 
@@ -20270,7 +20507,7 @@ static HRESULT __stdcall Hook_D12CreateCommitted(ID3D12Device* self,
     if (SUCCEEDED(hr) && pp && *pp) GhVaRegister((ID3D12Resource*)*pp, rd);
     if (SUCCEEDED(hr) && pp && *pp) GhRtDsRecord((ID3D12Resource*)*pp, rd, st);
     if (SUCCEEDED(hr) && pp && *pp) GhHookResourceVtable((ID3D12Resource*)*pp);
-    if (SUCCEEDED(hr) && pp && *pp) GhHookObjRelease((IUnknown*)*pp);
+    if (SUCCEEDED(hr) && pp && *pp) { GhHookObjRelease((IUnknown*)*pp); GhResLiveNote(*pp, self, rd); }
     static LONG n = 0;
     if (InterlockedIncrement(&n) <= 24 || FAILED(hr))
         Diag("D3D12 CreateCommittedResource heap=" + std::to_string(hp ? (int)hp->Type : -1) +
@@ -20606,7 +20843,7 @@ static HRESULT __stdcall Hook_D12CreatePlaced(ID3D12Device* self, ID3D12Heap* he
                     if (pp && *pp) GhVaRegister((ID3D12Resource*)*pp, rd);
                     if (pp && *pp) GhRtDsRecord((ID3D12Resource*)*pp, rd, st);
                     if (pp && *pp) GhHookResourceVtable((ID3D12Resource*)*pp);
-                    if (pp && *pp) GhHookObjRelease((IUnknown*)*pp);
+                    if (pp && *pp) { GhHookObjRelease((IUnknown*)*pp); GhResLiveNote(*pp, self, rd); }
                     return hc;
                 }
             }
@@ -20656,7 +20893,7 @@ static HRESULT __stdcall Hook_D12CreatePlaced(ID3D12Device* self, ID3D12Heap* he
                 if (pp && *pp) GhVaRegister((ID3D12Resource*)*pp, rd);
                 if (pp && *pp) GhRtDsRecord((ID3D12Resource*)*pp, rd, st);
                 if (pp && *pp) GhHookResourceVtable((ID3D12Resource*)*pp);
-                if (pp && *pp) GhHookObjRelease((IUnknown*)*pp);
+                if (pp && *pp) { GhHookObjRelease((IUnknown*)*pp); GhResLiveNote(*pp, self, rd); }
                 return hc;
             }
         }
@@ -20682,7 +20919,7 @@ static HRESULT __stdcall Hook_D12CreatePlaced(ID3D12Device* self, ID3D12Heap* he
     if (SUCCEEDED(hr) && pp && *pp) GhVaRegister((ID3D12Resource*)*pp, rd);
     if (SUCCEEDED(hr) && pp && *pp) GhRtDsRecord((ID3D12Resource*)*pp, rd, st);
     if (SUCCEEDED(hr) && pp && *pp) GhHookResourceVtable((ID3D12Resource*)*pp);
-    if (SUCCEEDED(hr) && pp && *pp) GhHookObjRelease((IUnknown*)*pp);
+    if (SUCCEEDED(hr) && pp && *pp) { GhHookObjRelease((IUnknown*)*pp); GhResLiveNote(*pp, self, rd); }
     if (loud || FAILED(hr)) Diag("  CreatePlacedResource -> hr=" + Hex((uint32_t)hr));
     // #187 log budget: every placement, once each, was 1.16 MB of a quota the game
     // needs. The placements matter as a population, not individually -- keep the
@@ -20739,7 +20976,7 @@ static HRESULT __stdcall Hook_D12CreateReserved(ID3D12Device* self,
     if (SUCCEEDED(hr) && pp && *pp) GhVaRegister((ID3D12Resource*)*pp, rd);
     if (SUCCEEDED(hr) && pp && *pp) GhRtDsRecord((ID3D12Resource*)*pp, rd, st);
     if (SUCCEEDED(hr) && pp && *pp) GhHookResourceVtable((ID3D12Resource*)*pp);
-    if (SUCCEEDED(hr) && pp && *pp) GhHookObjRelease((IUnknown*)*pp);
+    if (SUCCEEDED(hr) && pp && *pp) { GhHookObjRelease((IUnknown*)*pp); GhResLiveNote(*pp, self, rd); }
     static LONG n = 0;
     LONG i = InterlockedIncrement(&n);
     if (i <= 24 || (i % 64) == 0 || FAILED(hr))
@@ -21314,6 +21551,7 @@ static void GhLogMemoryBudget(const char* where)
     ln += GhLazyStats();
     Diag(ln);
     GhLazyWhoDump(where);                         // #213
+    GhResLiveDump(where);                         // #202: what is IN that viduse
     GhVaCensus(where, appUsed, appLimit);
 }
 
