@@ -24445,7 +24445,7 @@ struct GhArenaLock {
 // the one allocation that could have been free is spent on whoever asked first.
 //
 // gh_arena_site names the guest RVA (DECIMAL -- the config reader strips
-// non-digits, so 0x4EEDD2 is written as 5173458) that may draw on the arena.
+// non-digits, so 0x4EEDD2 is written as 5172690) that may draw on the arena.
 // Every other caller is declined before GhArenaTake, so the budget is still
 // unspent when the named site asks. 0 = the old first-come behaviour.
 static volatile LONG                    g_arenaSiteDecl = 0;
