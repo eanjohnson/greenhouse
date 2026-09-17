@@ -533,6 +533,7 @@ static const std::wstring& GhCorpusDir();
 static void GhCheckDeviceRemoved(const char* where,
                                  ID3D12Device* dev = nullptr); // #158 removal + DRED
 static std::string GhLazyStats();                             // #145 demand-commit counters
+static void        GhLazyCashIn();                            // #230 cash promises before the container is gone
 // #202. The container budget, 100 ms-cached. Declared here because AdapterProxy
 // is defined thousands of lines before the pager that owns it, and
 // QueryVideoMemoryInfo now needs to know how full the CONTAINER is, not just
@@ -21739,6 +21740,7 @@ static void GhLogMemoryBudget(const char* where)
                       " nonlocaluse=" + Hex((uint64_t)vm.CurrentUsage);
         }
     }
+    GhLazyCashIn();                               // #230: before the counters are read
     ln += GhLazyStats();
     Diag(ln);
     GhLazyWhoDump(where);                         // #213
@@ -27907,6 +27909,19 @@ static unsigned      g_lazyShimLie   = 0;
 // default-on knob would be silently disabled by every older runargs in the tree.
 static uint64_t      g_lazyFloor     = 0;   // bytes of container we refuse to promise into
 static volatile LONG g_lazyFloorHits = 0;   // promises refused by the floor
+// #230. The floor above only guards promises made NEAR the ceiling; the granule
+// that killed HIDE2 (§32.99) was promised at startup by GUEST+0x4EEDD2's pool
+// plan and first touched with the container full. So: cash the cheques while
+// the bank still has money. From the memory sampler, once
+// remaining < outstanding + margin, commit every promised-uncommitted granule.
+// After that the container fills on the game's OWN allocations, which return
+// NULL / E_OUTOFMEMORY -- the failure the engine already survives (WHOL2 took
+// seven bad_allocs; HIDE2 survived a CreateGraphicsPipelineState OOM and died
+// on our promise one line later). Saves nothing: appused + lazysaved is a
+// constant (§pager-mode). Converts a fault into a pin. 0 = off.
+static uint64_t      g_lazyCash      = 0;   // margin in bytes; 0 = off
+static volatile LONG g_lazyCashRuns  = 0;
+static volatile LONG64 g_lazyCashed  = 0;   // bytes committed by the cash-in
 
 // Defined with GhMemTruth further down; both want the same 100 ms-cached read
 // of the container's own billing, and the pager is compiled before it.
@@ -28059,11 +28074,16 @@ static bool GhLazyOn()
             // #217: refuse to promise into the last N MB of the container.
             g_lazyFloor = (uint64_t)GhCfgNumZ(L"gh_lazy_floor_mb.txt",
                                               "GH_LAZY_FLOOR_MB", 0) << 20;
+            // #230: cash every outstanding promise once the container's
+            // remaining budget is within this margin of what we still owe.
+            g_lazyCash  = (uint64_t)GhCfgNumZ(L"gh_lazy_cash_mb.txt",
+                                              "GH_LAZY_CASH_MB", 0) << 20;
             g_lazyT0   = (LONG64)GetTickCount64();
             Diag("LAZY on gran=" + Hex(g_lazyGran) + " min=" + Hex(g_lazyMin) +
                  " who=" + std::to_string((unsigned long)g_lazyWho) +
                  " shimlie=" + std::to_string((unsigned long)g_lazyShimLie) +
-                 " floorMB=" + std::to_string((unsigned long long)(g_lazyFloor >> 20)));
+                 " floorMB=" + std::to_string((unsigned long long)(g_lazyFloor >> 20)) +
+                 " cashMB=" + std::to_string((unsigned long long)(g_lazyCash >> 20)));
         } else {
             Diag("LAZY off (no gh_lazy_mb.txt)");
         }
@@ -28280,7 +28300,57 @@ static std::string GhLazyStats()
            "/" + std::to_string((long)InterlockedCompareExchange(&g_lazyMissRsv, 0, 0)) +
            " lazynoaccess=" + std::to_string((long)InterlockedCompareExchange(&g_lazyNoAccess, 0, 0)) +
            " lazytruth=" + std::to_string((long)InterlockedCompareExchange(&g_lazyTruthHits, 0, 0)) +
-           " lazyfloor=" + std::to_string((long)InterlockedCompareExchange(&g_lazyFloorHits, 0, 0));
+           " lazyfloor=" + std::to_string((long)InterlockedCompareExchange(&g_lazyFloorHits, 0, 0)) +
+           " lazycash=" + std::to_string((long)InterlockedCompareExchange(&g_lazyCashRuns, 0, 0)) +
+           "/" + Hex((uint64_t)InterlockedCompareExchange64(&g_lazyCashed, 0, 0));
+}
+
+// #230. See g_lazyCash. Called from the memory sampler (a few seconds apart),
+// so the margin must cover the load's growth between two samples: HIDE2 grew
+// ~250 MB per sample through the level. Shared lock: the fault path can keep
+// answering; GhLazyAdd waits. Idempotent -- committing a committed granule is
+// a no-op to the kernel and the bit test keeps the counters honest.
+static void GhLazyCashIn()
+{
+    if (!g_lazyCash || !g_lazyOn) return;
+    if (InterlockedCompareExchange(&g_lazyCount, 0, 0) == 0) return;
+    const LONG64 promised  = InterlockedCompareExchange64(&g_lazyPromised, 0, 0);
+    const LONG64 committed = InterlockedCompareExchange64(&g_lazyCommitted, 0, 0);
+    if (promised <= committed) return;
+    const uint64_t owed = (uint64_t)(promised - committed);
+    uint64_t used = 0, lim = 0;
+    GhAppBudget(&used, &lim);
+    if (!lim || used > lim) return;
+    const uint64_t rem = lim - used;
+    if (rem >= owed + g_lazyCash) return;
+    const LONG run = InterlockedIncrement(&g_lazyCashRuns);
+    const uint64_t t0 = (uint64_t)GetTickCount64();
+    uint64_t done = 0, failed = 0; LONG grans = 0;
+    bool stop = false;
+    AcquireSRWLockShared(&g_lazyLock);
+    for (auto& r : g_lazy){
+        if (stop) break;
+        for (uint64_t o = 0; o < r.size; o += g_lazyGran){
+            const LONG bit = (LONG)(o / g_lazyGran);
+            if (r.bits[bit / 32] & (1L << (bit % 32))) continue;      // already landed
+            const uint64_t g = (r.size - o < g_lazyGran) ? (r.size - o) : g_lazyGran;
+            if (!VirtualAlloc(r.base + o, (SIZE_T)g, MEM_COMMIT, r.prot)){
+                failed = GetLastError(); stop = true; break;          // the bank is empty
+            }
+            if (!_interlockedbittestandset(r.bits, bit)){
+                InterlockedExchangeAdd64(&g_lazyCommitted, (LONG64)g);
+                InterlockedExchangeAdd64(&g_lazyCashed, (LONG64)g);
+                GhLazyNoteCommit(r.acct, g, 2);                       // rip=2 is "cashed"
+                done += g; ++grans;
+            }
+        }
+    }
+    ReleaseSRWLockShared(&g_lazyLock);
+    if (run <= 64)
+        Diag("LAZYCASH #" + std::to_string((long)run) + " remaining=" + Hex(rem) +
+             " owed=" + Hex(owed) + " margin=" + Hex(g_lazyCash) +
+             " committed=" + Hex(done) + " granules=" + std::to_string((long)grans) +
+             " failed=" + Hex(failed) + " ms=" + std::to_string((unsigned long long)((uint64_t)GetTickCount64() - t0)));
 }
 
 // #213. One line per promised range, largest committed first, plus the top
@@ -33568,9 +33638,16 @@ static std::wstring GuestExtraArgs(const std::wstring& exePath)
     for (const auto& e : kExtra){
         if (base != e.exe) continue;
         std::wstring args(e.args);
+        // #231 (plan Phase 2b): the Nixxes EXE parses "-job-threads N"
+        // ("Overriding number of worker threads to %d"). Knob-gated, 0 = absent,
+        // so no existing runargs can change the command line by accident.
+        if (base == L"ghostoftsushima.exe"){
+            static const unsigned jt = GhCfgNumZ(L"gh_job_threads.txt", "GH_JOB_THREADS", 0);
+            if (jt) args += L" -job-threads " + std::to_wstring(jt);
+        }
         Diag("CMDLINE extra args for " + std::string(base.begin(), base.end()) + ":" +
              std::string(args.begin(), args.end()));
-        return e.args;
+        return args;
     }
     return L"";
 }
