@@ -118,6 +118,7 @@ static const wchar_t* kDevGames = L"D:\\DevelopmentFiles\\gh_games\\";
 static const wchar_t* kDevRoot   = L"D:\\DevelopmentFiles\\";
 static const wchar_t* kDevCorpus = L"D:\\DevelopmentFiles\\ghlo\\";
 static const wchar_t* kDevDumps  = L"D:\\DevelopmentFiles\\ghmiss\\";
+static const wchar_t* kDevBlobs  = L"D:\\DevelopmentFiles\\ghblob\\";  // #202: spilled PSO shader bytes
 
 #ifdef GH_LAUNCHER
 // Launcher's on-screen picker writes the chosen guest here; RunGuest reads it as
@@ -11134,6 +11135,20 @@ static unsigned GhPsoLive()
 }
 // The live cap, in pipelines. 2048 x 38.0 KiB = 78 MB, against 437 MB for the
 // 11,783 the run reached before the platform suspended it.
+// gh_pso_spill = 1: keep the interned shader bytes on D: instead of in the
+// container. PGREL2 measured why this is the whole game: the blobs grew ~15.3 KiB
+// per new pipeline against the ~21 KiB each eviction returns, so the pager handed
+// back 21 and took 15 and scored +4.2 MB. Remat is RARE -- 64 against 6,086
+// evictions -- and #209's warm driver cache makes each one ~1 ms, so paying a
+// disk read on the rare remat to keep ~92 MB out of appused is the cheap side of
+// the trade. GhCfgNumZ so 0 = off: no older runargs can turn it on by accident.
+static unsigned GhPsoSpill()
+{ static const unsigned v = GhCfgNumZ(L"gh_pso_spill.txt", "GH_PSO_SPILL", 0); return v; }
+static volatile LONG g_pgSpillN   = 0;   // blobs written to D:
+static volatile LONG g_pgSpillBad = 0;   // spill writes that FAILED (bytes kept resident)
+static volatile LONG g_pgLoadN    = 0;   // blobs read back for a rematerialise
+static volatile LONG g_pgLoadBad  = 0;   // read-backs that FAILED -- MUST be 0 in a scored cell
+
 static unsigned GhPsoLiveN()
 {
     static const unsigned v = GhCfgNumZ(L"gh_pso_live_n.txt", "GH_PSO_LIVE_N", 0);
@@ -11175,7 +11190,18 @@ static volatile LONG   g_pgBracketN = 0;   // how many drains we have bracketed 
 // (vs,ps) PAIRS, and far fewer distinct blobs than that, because the pair count
 // is a cross product. So intern by content and refcount. weak_ptr keeps the table
 // self-cleaning: the last proxy to drop a blob frees it.
-typedef std::shared_ptr<const std::vector<uint8_t>> GhBlobRef;
+// A blob body is the shader bytes, or -- once spilled -- their length plus the
+// path they went to, with `mem` empty. `n != 0 && mem.empty()` means "on disk".
+// The bytes are immutable and content-addressed, so a spilled file is valid for
+// the life of the process and needs no invalidation.
+struct GhBlobBody {
+    uint64_t             n      = 0;
+    bool                 onDisk = false;
+    std::wstring         path;
+    std::vector<uint8_t> mem;      // empty once spilled
+    size_t size() const { return (size_t)n; }
+};
+typedef std::shared_ptr<GhBlobBody> GhBlobRef;
 struct GhBlobKey {
     uint64_t a, b; uint64_t n;
     bool operator<(const GhBlobKey& o) const {
@@ -11198,8 +11224,59 @@ static GhBlobKey GhBlobHashOf(const void* p, SIZE_T n)
     return k;
 }
 static std::mutex& GhBlobMu(){ static std::mutex m; return m; }
-static std::map<GhBlobKey, std::weak_ptr<const std::vector<uint8_t>>>& GhBlobMap()
-{ static std::map<GhBlobKey, std::weak_ptr<const std::vector<uint8_t>>> m; return m; }
+static std::map<GhBlobKey, std::weak_ptr<GhBlobBody>>& GhBlobMap()
+{ static std::map<GhBlobKey, std::weak_ptr<GhBlobBody>> m; return m; }
+
+// Made once, on the first spill. WDP uploads into an existing DevelopmentFiles
+// subdirectory but will not create one (#188), so the loader creates it; on
+// failure we fall back to the DevelopmentFiles root, which always exists.
+static const wchar_t* GhBlobDir()
+{
+    static const wchar_t* dir = []() -> const wchar_t* {
+        std::wstring d(kDevBlobs);
+        while (!d.empty() && d.back() == L'\\') d.pop_back();
+        const BOOL ok = CreateDirectoryW(d.c_str(), nullptr);
+        const DWORD e = ok ? 0 : GetLastError();
+        const bool have = ok || e == ERROR_ALREADY_EXISTS;
+        Diag(std::string("PSOPAGER blobdir D:\\DevelopmentFiles\\ghblob ") +
+             (have ? "ok" : "err " + Hex(e) + " -- falling back to the DevelopmentFiles root"));
+        return have ? kDevBlobs : kDevRoot;
+    }();
+    return dir;
+}
+// Content-addressed, so the name IS the identity and a collision would have to
+// be a 128-bit hash collision on identical-length bytes.
+static std::wstring GhBlobPathOf(const GhBlobKey& k)
+{
+    wchar_t b[128];
+    swprintf(b, 128, L"%s%016llx%016llx_%llu.bin", GhBlobDir(),
+             (unsigned long long)k.a, (unsigned long long)k.b, (unsigned long long)k.n);
+    return std::wstring(b);
+}
+// Best effort by design: if the write fails we keep the bytes resident, so a
+// full or absent D: costs memory rather than correctness.
+static bool GhBlobSpillWrite(const std::wstring& path, const void* p, SIZE_T n)
+{
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD wrote = 0;
+    const BOOL ok = WriteFile(h, p, (DWORD)n, &wrote, nullptr);
+    CloseHandle(h);
+    return ok && wrote == (DWORD)n;
+}
+static bool GhBlobSpillRead(const std::wstring& path, std::vector<uint8_t>& out, uint64_t n)
+{
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    out.resize((size_t)n);
+    DWORD got = 0;
+    const BOOL ok = ReadFile(h, out.data(), (DWORD)n, &got, nullptr);
+    CloseHandle(h);
+    if (!ok || got != (DWORD)n){ out.clear(); return false; }
+    return true;
+}
 
 static GhBlobRef GhInternBlob(const void* p, SIZE_T n)
 {
@@ -11212,10 +11289,21 @@ static GhBlobRef GhInternBlob(const void* p, SIZE_T n)
         if (GhBlobRef hit = it->second.lock()) return hit;
         m.erase(it);
     }
-    auto v = std::make_shared<std::vector<uint8_t>>((const uint8_t*)p, (const uint8_t*)p + n);
-    m[k] = std::weak_ptr<const std::vector<uint8_t>>(v);
+    auto v = std::make_shared<GhBlobBody>();
+    v->n = (uint64_t)n;
+    if (GhPsoSpill()){
+        v->path = GhBlobPathOf(k);
+        if (GhBlobSpillWrite(v->path, p, n)){
+            v->onDisk = true;                 // and `mem` stays empty: this is the point
+            InterlockedIncrement(&g_pgSpillN);
+        } else {
+            InterlockedIncrement(&g_pgSpillBad);
+        }
+    }
+    if (!v->onDisk) v->mem.assign((const uint8_t*)p, (const uint8_t*)p + n);
+    m[k] = std::weak_ptr<GhBlobBody>(v);
     InterlockedIncrement(&g_pgBlobN);
-    InterlockedExchangeAdd64(&g_pgBlobB, (LONG64)n);
+    if (!v->onDisk) InterlockedExchangeAdd64(&g_pgBlobB, (LONG64)n);
     // The map itself outlives its values, so expired entries would accumulate.
     // Sweeping every 256th intern keeps that bounded without an O(n) walk per
     // create.
@@ -11239,6 +11327,11 @@ struct GhPsoCap {
     bool                 compute = false;
     ID3D12RootSignature* rs      = nullptr;   // AddRef'd: the game may release its own
     GhBlobRef            vs, ps, ds, hs, gs, cs;
+    // Staging for spilled bytes. Empty except for the moment a rematerialise is
+    // in flight -- filled by loadBlobs(), pointed at by relink(), freed by
+    // dropBlobs() as soon as the driver has copied the descriptor. Keeping them
+    // would put the 92 MB straight back into appused, which is the whole point.
+    std::vector<uint8_t> stVs, stPs, stDs, stHs, stGs, stCs;
     std::vector<D3D12_SO_DECLARATION_ENTRY> so;
     std::vector<std::string>                soName;
     std::vector<UINT>                       soStride;
@@ -11258,22 +11351,51 @@ struct GhPsoCap {
              + il.capacity() * sizeof(D3D12_INPUT_ELEMENT_DESC)
              + (soName.size() + ilName.size()) * sizeof(std::string) + 64;
     }
+    // Pull any spilled shader bytes back into the staging vectors. Returns false
+    // if a blob that claims to be on disk cannot be read -- the caller MUST NOT
+    // then attempt the re-create, because relink would bind a null bytecode and
+    // the guest would be handed a pipeline that is not there.
+    bool loadBlobs()
+    {
+        struct P { const GhBlobRef& r; std::vector<uint8_t>& st; };
+        P all[6] = { {vs,stVs},{ps,stPs},{ds,stDs},{hs,stHs},{gs,stGs},{cs,stCs} };
+        for (int i = 0; i < 6; ++i){
+            const GhBlobRef& r = all[i].r;
+            if (!r || !r->onDisk || !r->n) continue;
+            if (!all[i].st.empty()) continue;
+            if (!GhBlobSpillRead(r->path, all[i].st, r->n)){
+                InterlockedIncrement(&g_pgLoadBad);
+                return false;
+            }
+            InterlockedIncrement(&g_pgLoadN);
+        }
+        return true;
+    }
+    void dropBlobs()
+    {
+        std::vector<uint8_t>().swap(stVs); std::vector<uint8_t>().swap(stPs);
+        std::vector<uint8_t>().swap(stDs); std::vector<uint8_t>().swap(stHs);
+        std::vector<uint8_t>().swap(stGs); std::vector<uint8_t>().swap(stCs);
+    }
     // Re-point every pointer in the descriptor at storage this object owns.
     // Called after every move of the vectors, and before every re-create.
     void relink()
     {
-        auto bind = [](D3D12_SHADER_BYTECODE& b, const GhBlobRef& r){
-            if (r){ b.pShaderBytecode = r->data(); b.BytecodeLength = r->size(); }
-            else  { b.pShaderBytecode = nullptr;   b.BytecodeLength = 0; }
+        auto bind = [](D3D12_SHADER_BYTECODE& b, const GhBlobRef& r,
+                       const std::vector<uint8_t>& st){
+            if (!r || !r->n){ b.pShaderBytecode = nullptr; b.BytecodeLength = 0; return; }
+            if (!r->mem.empty()){ b.pShaderBytecode = r->mem.data(); b.BytecodeLength = (SIZE_T)r->n; }
+            else if (!st.empty()){ b.pShaderBytecode = st.data();    b.BytecodeLength = st.size(); }
+            else { b.pShaderBytecode = nullptr; b.BytecodeLength = 0; }
         };
         if (compute){
-            bind(c.CS, cs);
+            bind(c.CS, cs, stCs);
             c.pRootSignature = rs;
             c.CachedPSO = D3D12_CACHED_PIPELINE_STATE{};
             return;
         }
-        bind(g.VS, vs); bind(g.PS, ps); bind(g.DS, ds);
-        bind(g.HS, hs); bind(g.GS, gs);
+        bind(g.VS, vs, stVs); bind(g.PS, ps, stPs); bind(g.DS, ds, stDs);
+        bind(g.HS, hs, stHs); bind(g.GS, gs, stGs);
         g.pRootSignature = rs;
         // #177: GetCachedBlob and CreatePipelineLibrary are both device-fatal on
         // this console, so a cached blob can never be ours. The graphics hook
@@ -11644,6 +11766,19 @@ static ID3D12PipelineState* GhPagerMaterialise(GhPsoProxy* x)
         InterlockedIncrement(&g_pgRematBad);
         return nullptr;
     }
+    // Pull spilled bytes back before relink can bind them. A failed read must
+    // REFUSE the re-create: binding a null bytecode would create a pipeline that
+    // draws nothing, or hand the guest a null, which is the one outcome the cell
+    // criteria call non-negotiable. Refusing here leaves `real` null, and
+    // GhPsoRealOf's caller already swallows that path with a Diag.
+    if (!x->cap->loadBlobs()){
+        x->cap->dropBlobs();
+        ReleaseSRWLockExclusive(&x->lk);
+        InterlockedIncrement(&g_pgRematBad);
+        Diag("  PSOPAGER remat REFUSED: a spilled shader blob could not be read back"
+             " -- this MUST read 0 in a scored cell");
+        return nullptr;
+    }
     x->cap->relink();
     void* out = nullptr;
     DWORD fault = 0;
@@ -11660,6 +11795,9 @@ static ID3D12PipelineState* GhPagerMaterialise(GhPsoProxy* x)
     }
     const LONG64 us = GhDeltaUs(GhNowUs(), t0);
     InterlockedExchangeAdd64(&g_pgRematUs, us);
+    // The driver has copied everything it needs out of the descriptor by now, so
+    // the staged bytes go back immediately -- on the failure path too.
+    x->cap->dropBlobs();
     if (SUCCEEDED(hr) && out){
         InterlockedExchangePointer((void* volatile*)&x->real, out);
         InterlockedIncrement(&g_pgLive);
@@ -11759,7 +11897,8 @@ static ID3D12PipelineState* GhPagerWrap(ID3D12Device* dev, ID3D12PipelineState* 
         Diag("PSOPAGER on: gh_pso_live=" + std::to_string((unsigned long)GhPsoLive()) +
              " cap=" + std::to_string((unsigned long)GhPsoLiveN()) +
              " vtbl=" + Hex((uint64_t)(uintptr_t)g_pgVtbl) +
-             " (1=proxy only, 2=+capture, 3=+evict)");
+             " gh_pso_spill=" + std::to_string((unsigned long)GhPsoSpill()) +
+             " (1=proxy only, 2=+capture, 3=+evict; spill=1 keeps shader bytes on D:)");
         return true;
     }();
     (void)vtReady;
@@ -11837,6 +11976,10 @@ static std::string GhPagerFrameLine()
            " pgBlobKB=" + std::to_string((long long)(
                InterlockedCompareExchange64(&g_pgBlobB, 0, 0) >> 10)) +
            " pgBlobN=" + std::to_string((long)InterlockedCompareExchange(&g_pgBlobN, 0, 0)) +
+        " pgSpill=" + std::to_string((long)InterlockedCompareExchange(&g_pgSpillN, 0, 0)) +
+        "/"        + std::to_string((long)InterlockedCompareExchange(&g_pgSpillBad, 0, 0)) +
+        " pgLoad="  + std::to_string((long)InterlockedCompareExchange(&g_pgLoadN, 0, 0)) +
+        "/"        + std::to_string((long)InterlockedCompareExchange(&g_pgLoadBad, 0, 0)) +
         " pgRel=" + std::to_string((long)InterlockedCompareExchange(&g_pgRel, 0, 0)) +
         "/"      + std::to_string((long)InterlockedCompareExchange(&g_pgRelZero, 0, 0)) +
         "/"      + std::to_string((long)InterlockedCompareExchange(&g_pgRelLive, 0, 0)) +
