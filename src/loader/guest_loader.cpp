@@ -22353,6 +22353,13 @@ static bool GhWgiInjectOn() { return GhWgiInjectMode() != 0; }
 //     throw, silently disabling the merge for the rest of the run while every
 //     other proof-of-life line still prints.
 static thread_local bool g_wgiHostPoll = false;
+// #214 cell WHO. Everything since WGI1 rests on "the ~3,600 per-frame reads are
+// the GAME's", and the only evidence is that g_wgiHostPoll excludes
+// PollGamepadOnUi -- which means "not that one host path", NOT "the guest made
+// them". Capture the hook's own caller so the delivery line can say which image
+// it came from, instead of us inferring it. Same discipline that
+// Bed_VirtualQuery needed in #213.
+static thread_local uintptr_t g_wgiCallerRa = 0;
 struct GhWgiHostPollGuard {
     GhWgiHostPollGuard()  { g_wgiHostPoll = true;  }
     ~GhWgiHostPollGuard() { g_wgiHostPoll = false; }
@@ -22406,7 +22413,8 @@ static void GhWgiMergeSynth(GhWgiPadReading* out)
     const LONG k = InterlockedIncrement(&n);
     if (k == 1 || k == 10 || k == 100 || k == 1000 || k == 10000)
         Diag("WGI inject n=" + std::to_string((long)k) +
-             " wgibtn=" + std::to_string((unsigned long)b));
+             " wgibtn=" + std::to_string((unsigned long)b) +
+             " from=" + NameForCodeAddr(g_wgiCallerRa));
 
     // #214 cell TS. Cells WGI3 and SCEPAD0 both delivered DPadDown into forty
     // consecutive readings the GAME read, on a menu confirmed by eye, and the
@@ -22475,12 +22483,14 @@ static void GhWgiMergeSynth(GhWgiPadReading* out)
                  " xinbtn=0x" + GhHex32(w) +
                  " read=" + std::to_string((long)k) +
                  " ts=" + std::to_string((unsigned long long)tsIn) +
-                 " tsout=" + std::to_string((unsigned long long)out->Timestamp));
+                 " tsout=" + std::to_string((unsigned long long)out->Timestamp) +
+                 " from=" + NameForCodeAddr(g_wgiCallerRa));
     }
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_WgiPadRead(void* self, GhWgiPadReading* out)
 {
+    g_wgiCallerRa = (uintptr_t)_ReturnAddress();                          // #214
     HRESULT hr = g_realWgiPadRead ? g_realWgiPadRead(self, out) : E_FAIL;
     if (FAILED(hr) || !out) return hr;
 #ifdef GH_LAUNCHER
