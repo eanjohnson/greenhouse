@@ -1717,7 +1717,12 @@ static LSTATUS RegQueryImpl(HKEY hk, const std::wstring& name, LPDWORD ptype, LP
     if(*pcb < outb.size()){ *pcb=(DWORD)outb.size(); return ERROR_MORE_DATA; }
     if(!outb.empty()) memcpy(data,outb.data(),outb.size());
     *pcb=(DWORD)outb.size();
-    Diag("REG query " + RegNarrow(name) + " [hit]");
+    // #214. "[hit]" throws away the one thing worth knowing. Tsushima reads
+    // EnableLibScePad and EnableWindowsGamingInput out of its own HKCU Input key
+    // and then loads xinput1_4.dll AND libScePad.dll, so the VALUE we hand back
+    // is what selects the button path -- and nothing in the tree seeds either,
+    // meaning we have never known what we were telling it.
+    Diag("REG query " + RegNarrow(name) + " [hit] = " + RegShow(v));
     return ERROR_SUCCESS;
 }
 static LSTATUS APIENTRY Bed_RegOpenKeyExW(HKEY r, LPCWSTR sub, DWORD, REGSAM, PHKEY out){ return RegOpenImpl(r, sub?sub:L"", out); }
@@ -22425,10 +22430,26 @@ static void PollGamepadOnUi()
     }
 }
 
+// #214. The one measurement that splits Tsushima's input wall. The main menu
+// consumes mouse MOTION and acts on no button from any channel, and the loader
+// feeds exactly one of the three paths the game resolves (XInput; the other two
+// are Windows.Gaming.Input and Sony's libScePad). If these counters stay at zero
+// through a whole run, the menu never asks us for the pad and serving it harder
+// is wasted work. Counted at powers of ten: the poll is per-frame and LocalState
+// is shared with the game's own log.
+static void GhXiCount(const char* tag, volatile LONG* n)
+{
+    const LONG k = InterlockedIncrement(n);
+    if (k == 1 || k == 10 || k == 100 || k == 1000 || k == 10000 || k == 100000)
+        Diag(std::string("XI ") + tag + " n=" + std::to_string((long)k));
+}
+#define GH_XI_COUNT(tag) do{ static volatile LONG _xn = 0; GhXiCount(tag, &_xn); }while(0)
+
 static DWORD WINAPI Bed_XInputGetState(DWORD idx, XINPUT_STATE* state)
 {
+    GH_XI_COUNT("XInputGetState");
     if (!state) return ERROR_BAD_ARGUMENTS;
-    if (idx != 0) return ERROR_DEVICE_NOT_CONNECTED;
+    if (idx != 0) { GH_XI_COUNT("XInputGetState.idx!=0"); return ERROR_DEVICE_NOT_CONNECTED; }
     std::lock_guard<std::mutex> lk(g_padMutex);
     if (!g_padConnected) return ERROR_DEVICE_NOT_CONNECTED;
     state->dwPacketNumber = g_padPacket;
@@ -22451,6 +22472,7 @@ static DWORD WINAPI Bed_XInputGetState(DWORD idx, XINPUT_STATE* state)
 }
 static DWORD WINAPI Bed_XInputGetCapabilities(DWORD idx, DWORD, XINPUT_CAPABILITIES* caps)
 {
+    GH_XI_COUNT("XInputGetCapabilities");                                  // #214
     if (idx != 0) return ERROR_DEVICE_NOT_CONNECTED;
     std::lock_guard<std::mutex> lk(g_padMutex);
     if (!g_padConnected) return ERROR_DEVICE_NOT_CONNECTED;
