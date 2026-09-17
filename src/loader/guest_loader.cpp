@@ -21490,14 +21490,18 @@ static void GhHeapTrim(const char* when)
     const DWORD n = pGPH(256, heaps);
     const uint64_t before = GhBillAppUsedRaw();
     const ULONGLONG t0 = GetTickCount64();
-    DWORD ok = 0, bad = 0;
-    // HeapOptimizeResources == 3; the argument is ULONG Version + ULONG Flags,
-    // both zero.  Documented since Windows 8.1 and a no-op on a heap with
-    // nothing cached, so a refusal is informative and a success may still be 0.
-    struct { ULONG Version, Flags; } hori { 0, 0 };
+    DWORD ok = 0, bad = 0, lastErr = 0;
+    // HeapOptimizeResources == 3.  Version MUST be
+    // HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION == 1 (winnt.h:24426); the class
+    // validates it and rejects anything else with ERROR_INVALID_PARAMETER.
+    // Cell HEAPTRIM1 passed 0 here and got ok=0 refused=5 on all 100 brackets --
+    // a version rejection that looked exactly like a container refusal.  Log
+    // GetLastError so the next refusal is diagnosable instead of ambiguous.
+    struct { ULONG Version, Flags; } hori { 1, 0 };
     for (DWORD i = 0; i < n && i < 256; ++i) {
         if (!heaps[i]) continue;
-        if (pHSI(heaps[i], 3, &hori, sizeof hori)) ++ok; else ++bad;
+        if (pHSI(heaps[i], 3, &hori, sizeof hori)) ++ok;
+        else { ++bad; lastErr = GetLastError(); }
     }
     const uint64_t after = GhBillAppUsedRaw();
     const ULONGLONG ms = GetTickCount64() - t0;
@@ -21507,6 +21511,7 @@ static void GhHeapTrim(const char* when)
     Diag(std::string("HEAPTRIM ") + when + " heaps=" + std::to_string((unsigned long)n) +
          " ok=" + std::to_string((unsigned long)ok) +
          " refused=" + std::to_string((unsigned long)bad) +
+         " err=" + Hex((uint64_t)lastErr) +
          " beforeKB=" + std::to_string((unsigned long long)(before / 1024)) +
          " afterKB=" + std::to_string((unsigned long long)(after / 1024)) +
          " freedKB=" + std::to_string(freedKB) +
