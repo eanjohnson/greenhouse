@@ -26686,6 +26686,16 @@ static volatile LONG64          g_lazyCommitted = 0;
 static volatile LONG            g_lazyFaults    = 0;
 static volatile LONG            g_lazyFailed    = 0;
 static volatile LONG            g_lazyNoAccess  = 0; // kernel writes we had to rescue
+// #218. A fault inside no tracked range used to return false here leaving NO
+// TRACE AT ALL. That is how cell VPON ended: an AV on 0x40C7E290010, a page the
+// same archive says we promised (`LAZY promise addr=0x40C7E000000
+// size=0x2000000 ... from=GUEST+0xE8792A`), while `lazyfailed` read 0 -- so the
+// pager never even ATTEMPTED that commit, and nothing in the log could say
+// whether the range had been dropped, the lookup had missed, or the recorded
+// base did not cover the offset. Count every miss; characterise the first few.
+static volatile LONG            g_lazyMiss      = 0; // AV faults inside no tracked range
+static volatile LONG            g_lazyMissRsv   = 0; //   ... on a PRIVATE RESERVED page
+static volatile LONG            g_lazyMissLog   = 0; // how many we have characterised
 static volatile LONG            g_lazyLogs      = 0;
 static bool                     g_lazyOn        = false;
 static uint64_t                 g_lazyGran      = 64u << 10;
@@ -27003,7 +27013,54 @@ static bool GhLazyFault(void* addr, const CONTEXT* ctx)
         acct  = r->acct;
     }
     ReleaseSRWLockShared(&g_lazyLock);
-    if (!base) return false;
+    if (!base){
+        // #218. The miss. Counting it is free; describing it is not, so the
+        // VirtualQuery and the neighbour scan are capped at 64 and every miss
+        // past that is still counted. The signature worth catching is a PRIVATE
+        // RESERVED page: somebody promised it and nobody committed it, which is
+        // exactly the VPON fault and is not what a wild pointer looks like (that
+        // is MEM_FREE) or an evicted arena slice (that is MEM_MAPPED, and
+        // GhArenaFault owns it one handler down).
+        InterlockedIncrement(&g_lazyMiss);
+        if (InterlockedIncrement(&g_lazyMissLog) <= 64){
+            MEMORY_BASIC_INFORMATION mbi{};
+            const bool q  = VirtualQuery(addr, &mbi, sizeof mbi) == sizeof mbi;
+            const bool rsv = q && mbi.State == MEM_RESERVE && mbi.Type == MEM_PRIVATE;
+            if (rsv) InterlockedIncrement(&g_lazyMissRsv);
+            // Name the tracked ranges on either side. If the address sits just
+            // past the end of one of ours, the recorded size is wrong; if it
+            // sits inside the gap between two, the range was dropped or never
+            // recorded. Either way the next occurrence is diagnosable on sight.
+            const uint8_t *loB = nullptr, *hiB = nullptr;
+            uint64_t loS = 0, hiS = 0;
+            AcquireSRWLockShared(&g_lazyLock);
+            for (auto& r : g_lazy){
+                if (r.base <= (const uint8_t*)addr){ loB = r.base; loS = r.size; }
+                else { hiB = r.base; hiS = r.size; break; }
+            }
+            ReleaseSRWLockShared(&g_lazyLock);
+            Diag(std::string("LAZYMISS n=") +
+                 std::to_string((long)InterlockedCompareExchange(&g_lazyMiss, 0, 0)) +
+                 " addr=" + Hex((uint64_t)(uintptr_t)addr) +
+                 " rip=" + NameForCodeAddr((uintptr_t)rip) +
+                 (q ? (" allocbase=" + Hex((uint64_t)(uintptr_t)mbi.AllocationBase) +
+                       " base=" + Hex((uint64_t)(uintptr_t)mbi.BaseAddress) +
+                       " size=" + Hex((uint64_t)mbi.RegionSize) +
+                       " state=" + Hex((uint64_t)mbi.State) +
+                       " prot=" + Hex((uint64_t)mbi.Protect) +
+                       " allocprot=" + Hex((uint64_t)mbi.AllocationProtect) +
+                       " type=" + Hex((uint64_t)mbi.Type))
+                    : std::string(" (VirtualQuery failed)")) +
+                 " RESERVEDPRIVATE=" + std::to_string(rsv ? 1 : 0) +
+                 " prevRange=" + (loB ? (Hex((uint64_t)(uintptr_t)loB) + "+" + Hex(loS) +
+                                         " endsAt=" + Hex((uint64_t)(uintptr_t)loB + loS))
+                                      : std::string("none")) +
+                 " nextRange=" + (hiB ? (Hex((uint64_t)(uintptr_t)hiB) + "+" + Hex(hiS))
+                                      : std::string("none")) +
+                 " ranges=" + std::to_string((long)InterlockedCompareExchange(&g_lazyCount, 0, 0)));
+        }
+        return false;
+    }
     // Claim the granule first. Losing the race is harmless -- committing an
     // already-committed page succeeds -- it only means we must not count it.
     bool first = !_interlockedbittestandset(bits, bit);
@@ -27095,6 +27152,8 @@ static std::string GhLazyStats()
            " lazysaved=" + Hex((uint64_t)(promised > committed ? promised - committed : 0)) +
            " lazyfaults=" + std::to_string((long)InterlockedCompareExchange(&g_lazyFaults, 0, 0)) +
            " lazyfailed=" + std::to_string((long)InterlockedCompareExchange(&g_lazyFailed, 0, 0)) +
+           " lazymiss=" + std::to_string((long)InterlockedCompareExchange(&g_lazyMiss, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_lazyMissRsv, 0, 0)) +
            " lazynoaccess=" + std::to_string((long)InterlockedCompareExchange(&g_lazyNoAccess, 0, 0)) +
            " lazytruth=" + std::to_string((long)InterlockedCompareExchange(&g_lazyTruthHits, 0, 0)) +
            " lazyfloor=" + std::to_string((long)InterlockedCompareExchange(&g_lazyFloorHits, 0, 0));
