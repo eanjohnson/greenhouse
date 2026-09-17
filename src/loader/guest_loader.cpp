@@ -22357,6 +22357,17 @@ struct GhWgiHostPollGuard {
     ~GhWgiHostPollGuard() { g_wgiHostPoll = false; }
 };
 
+static std::string GhHex32(uint32_t v)
+{
+    static const char* d = "0123456789ABCDEF";
+    std::string o; bool lead = true;
+    for (int i = 28; i >= 0; i -= 4) {
+        const int nib = (v >> i) & 0xF;
+        if (nib || !lead || i == 0) { o += d[nib]; lead = false; }
+    }
+    return o;
+}
+
 static void GhWgiMergeSynth(GhWgiPadReading* out)
 {
     XINPUT_GAMEPAD g{};
@@ -22394,6 +22405,25 @@ static void GhWgiMergeSynth(GhWgiPadReading* out)
     if (k == 1 || k == 10 || k == 100 || k == 1000 || k == 10000)
         Diag("WGI inject n=" + std::to_string((long)k) +
              " wgibtn=" + std::to_string((unsigned long)b));
+
+    // Cell WGI1 came back ambiguous and this is why. The powers-of-ten sample
+    // points are uncorrelated with a 400 ms press: the game polls this hook
+    // every frame, so five samples out of >10,000 reads all showed wgibtn=0
+    // while the two presses sat thousands of lines away in the log. That says
+    // nothing about whether a button was ever delivered -- which is the entire
+    // question. Log the reads that actually CARRY one instead.
+    //
+    // Capped, because a held button is delivered every frame and LocalState is
+    // shared with the game's own log (#187: filling it silently truncates both).
+    if (b) {
+        static volatile LONG bn = 0;
+        const LONG bk = InterlockedIncrement(&bn);
+        if (bk <= 40 || (bk % 250) == 0)
+            Diag("WGI DELIVERED #" + std::to_string((long)bk) +
+                 " wgibtn=0x" + GhHex32(b) +
+                 " xinbtn=0x" + GhHex32(w) +
+                 " read=" + std::to_string((long)k));
+    }
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_WgiPadRead(void* self, GhWgiPadReading* out)
