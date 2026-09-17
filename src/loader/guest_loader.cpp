@@ -22334,8 +22334,9 @@ static bool GhPatchVtblSlot(void* obj, int slot, void* hook, void** origOut)
 //
 // gh_wgi_inject (slot 217) defaults to 0. This changes what the GAME sees, so
 // it gets an A/B like any other knob instead of arriving switched on.
-static bool GhWgiInjectOn()
-{ static const unsigned v = GhCfgNumZ(L"gh_wgi_inject.txt", "GH_WGI_INJECT", 0); return v != 0; }
+static unsigned GhWgiInjectMode()
+{ static const unsigned v = GhCfgNumZ(L"gh_wgi_inject.txt", "GH_WGI_INJECT", 0); return v; }
+static bool GhWgiInjectOn() { return GhWgiInjectMode() != 0; }
 
 // PollGamepadOnUi's fallback branch reads the pad THROUGH this vtable slot. If
 // the merge ran there it would write our own override back into g_padState and
@@ -22370,6 +22371,7 @@ static std::string GhHex32(uint32_t v)
 
 static void GhWgiMergeSynth(GhWgiPadReading* out)
 {
+    const uint64_t tsIn = out->Timestamp;   // #214: what the REAL pad reported
     XINPUT_GAMEPAD g{};
     bool connected = false;
     { std::lock_guard<std::mutex> lk(g_padMutex); g = g_padState; connected = g_padConnected; }
@@ -22406,6 +22408,53 @@ static void GhWgiMergeSynth(GhWgiPadReading* out)
         Diag("WGI inject n=" + std::to_string((long)k) +
              " wgibtn=" + std::to_string((unsigned long)b));
 
+    // #214 cell TS. Cells WGI3 and SCEPAD0 both delivered DPadDown into forty
+    // consecutive readings the GAME read, on a menu confirmed by eye, and the
+    // highlight did not move -- with libScePad in (WGI3) and out (SCEPAD0).
+    // The reading is right and the device is right, which leaves the one field
+    // we pass through untouched: Timestamp.
+    //
+    // Windows.Gaming.Input's GamepadReading.Timestamp is the analogue of
+    // XInput's dwPacketNumber -- it advances only when the device reports new
+    // state. We merge our buttons into an IDLE pad's reading, so its Timestamp
+    // is whatever the real, untouched controller last reported. An engine that
+    // dedupes on "is this reading newer than the one I processed?" therefore
+    // never looks at the bytes we wrote.
+    //
+    // Mode 2 makes the reading announce itself as new. The advance is
+    // UNCONDITIONAL on b: a pad that reports only while a button is held would
+    // hide the RELEASE behind a stale timestamp and stick the button down.
+    // This function has already returned if the synthetic pad is not connected,
+    // so "advance every merge" is exactly "this pad reports on every poll".
+    // CELL TS2 MEASURED THE UNIT AND IT IS MICROSECONDS, not 100ns ticks.
+    // (ts 306789023721 -> 3.55 days of uptime, and the gap between the TS1 and
+    // TS2 runs came out at 808.9 s against a real 13.5 min.)  Mode 2's +10,000
+    // per read is therefore +10 ms per read, which by read 3711 had put the
+    // reading 37 SECONDS IN THE FUTURE.  A front end that sanity-checks a
+    // reading's age would reject that, so TS2 is not a clean negative -- it is
+    // a badly chosen step.  Mode 2 is kept only so that arm stays reproducible.
+    //
+    // Mode 3 is the truthful version: hand back the CURRENT time on the same
+    // clock WGI uses (QPC, microseconds since boot), so the reading says
+    // exactly what it is -- fresh, now, and never ahead of the caller's clock.
+    const unsigned tsMode = GhWgiInjectMode();
+    if (tsMode == 2) {
+        static volatile LONG64 tsBias = 0;
+        const LONG64 bias = InterlockedAdd64(&tsBias, 10000);
+        out->Timestamp += (uint64_t)bias;
+    } else if (tsMode >= 3) {
+        LARGE_INTEGER qpc{}, frq{};
+        // #200: GhNowUs returns 0 when QPC fails, and a 0 timestamp would be a
+        // far worse lie than a stale one. Leave the reading alone on failure.
+        if (QueryPerformanceCounter(&qpc) && QueryPerformanceFrequency(&frq) &&
+            frq.QuadPart > 0) {
+            const uint64_t nowUs =
+                (uint64_t)((qpc.QuadPart / frq.QuadPart) * 1000000ull +
+                           ((qpc.QuadPart % frq.QuadPart) * 1000000ull) / (uint64_t)frq.QuadPart);
+            if (nowUs) out->Timestamp = nowUs;
+        }
+    }
+
     // Cell WGI1 came back ambiguous and this is why. The powers-of-ten sample
     // points are uncorrelated with a 400 ms press: the game polls this hook
     // every frame, so five samples out of >10,000 reads all showed wgibtn=0
@@ -22415,6 +22464,8 @@ static void GhWgiMergeSynth(GhWgiPadReading* out)
     //
     // Capped, because a held button is delivered every frame and LocalState is
     // shared with the game's own log (#187: filling it silently truncates both).
+
+
     if (b) {
         static volatile LONG bn = 0;
         const LONG bk = InterlockedIncrement(&bn);
@@ -22422,7 +22473,9 @@ static void GhWgiMergeSynth(GhWgiPadReading* out)
             Diag("WGI DELIVERED #" + std::to_string((long)bk) +
                  " wgibtn=0x" + GhHex32(b) +
                  " xinbtn=0x" + GhHex32(w) +
-                 " read=" + std::to_string((long)k));
+                 " read=" + std::to_string((long)k) +
+                 " ts=" + std::to_string((unsigned long long)tsIn) +
+                 " tsout=" + std::to_string((unsigned long long)out->Timestamp));
     }
 }
 
