@@ -25662,6 +25662,49 @@ static LONG64   g_lazyT0  = 0;
 // because run30N.py writes '0' for every slot a runargs does not supply -- a
 // default-ON knob here would be silently disabled by every pre-#213 runargs.
 static unsigned      g_lazyShimLie   = 0;
+
+// #217. THE PAGER MUST NOT PROMISE WHAT THE CONTAINER WILL NOT GIVE.
+//
+// Cell LEAN2 is the only arm of six that ever aborted, and it is the only one
+// that ever needed a COMMIT REPAIR. The shape is always the same: the arena
+// declines a slice because commit is exhausted (and per 32.61 evicting every
+// live view buys nothing), the request falls through to the two promise paths
+// in Bed_VirtualAlloc below, we take the reservation and promise the commit --
+// and when the guest writes there the deferred VirtualAlloc comes back
+// ERROR_COMMITMENT_LIMIT. Nothing can repair that, so it escapes as an access
+// violation on memory the game believes it owns.
+//
+// That is the worst of the available failures. The game's own allocator knows
+// how to handle a NULL: WHOL2 caught seven std::bad_allocs out of D3D12 and
+// kept presenting at 60 fps. So when the container is nearly gone, refuse the
+// promise and let the real VirtualAlloc fail honestly.
+//
+// 0 = off (the pre-#217 behaviour, promise regardless). Sensed that way because
+// run30N.py writes '0' for every slot a runargs does not supply, so a
+// default-on knob would be silently disabled by every older runargs in the tree.
+static uint64_t      g_lazyFloor     = 0;   // bytes of container we refuse to promise into
+static volatile LONG g_lazyFloorHits = 0;   // promises refused by the floor
+
+// Defined with GhMemTruth further down; both want the same 100 ms-cached read
+// of the container's own billing, and the pager is compiled before it.
+static void GhAppBudget(uint64_t* used, uint64_t* lim);
+
+// True when a promise of `size` should be refused. Cheap: GhAppBudget caches.
+static bool GhLazyFloorBlocks(uint64_t size)
+{
+    if (!g_lazyFloor) return false;
+    uint64_t used = 0, lim = 0;
+    GhAppBudget(&used, &lim);
+    if (!lim || used > lim) return false;          // unreadable budget: behave as before
+    const uint64_t rem = lim - used;
+    if (rem >= g_lazyFloor + size) return false;
+    const LONG n = InterlockedIncrement(&g_lazyFloorHits);
+    if (n <= 32)
+        Diag("LAZYFLOOR refused promise #" + std::to_string((long)n) +
+             " size=" + Hex(size) + " remaining=" + Hex(rem) +
+             " floor=" + Hex(g_lazyFloor));
+    return true;
+}
 static volatile LONG g_lazyTruthHits = 0;
 static uint8_t*      g_shimBase      = nullptr;
 static volatile LONG64 g_shimSize    = 0;      // nonzero == resolved
@@ -25790,10 +25833,14 @@ static bool GhLazyOn()
             // #213: stop lying to our own shim. See GhRaInShim above. 1 = the
             // pre-#213 behaviour (lie to everyone), for A/B only.
             g_lazyShimLie = GhCfgNumZ(L"gh_lazy_shim_lie.txt", "GH_LAZY_SHIM_LIE", 0);
+            // #217: refuse to promise into the last N MB of the container.
+            g_lazyFloor = (uint64_t)GhCfgNumZ(L"gh_lazy_floor_mb.txt",
+                                              "GH_LAZY_FLOOR_MB", 0) << 20;
             g_lazyT0   = (LONG64)GetTickCount64();
             Diag("LAZY on gran=" + Hex(g_lazyGran) + " min=" + Hex(g_lazyMin) +
                  " who=" + std::to_string((unsigned long)g_lazyWho) +
-                 " shimlie=" + std::to_string((unsigned long)g_lazyShimLie));
+                 " shimlie=" + std::to_string((unsigned long)g_lazyShimLie) +
+                 " floorMB=" + std::to_string((unsigned long long)(g_lazyFloor >> 20)));
         } else {
             Diag("LAZY off (no gh_lazy_mb.txt)");
         }
@@ -25960,7 +26007,8 @@ static std::string GhLazyStats()
            " lazyfaults=" + std::to_string((long)InterlockedCompareExchange(&g_lazyFaults, 0, 0)) +
            " lazyfailed=" + std::to_string((long)InterlockedCompareExchange(&g_lazyFailed, 0, 0)) +
            " lazynoaccess=" + std::to_string((long)InterlockedCompareExchange(&g_lazyNoAccess, 0, 0)) +
-           " lazytruth=" + std::to_string((long)InterlockedCompareExchange(&g_lazyTruthHits, 0, 0));
+           " lazytruth=" + std::to_string((long)InterlockedCompareExchange(&g_lazyTruthHits, 0, 0)) +
+           " lazyfloor=" + std::to_string((long)InterlockedCompareExchange(&g_lazyFloorHits, 0, 0));
 }
 
 // #213. One line per promised range, largest committed first, plus the top
@@ -26168,7 +26216,8 @@ static LPVOID WINAPI Bed_VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWOR
     // memory. Only when the whole span is one reserved, uncommitted region --
     // shadowing memory that is already live would be a silent corruption, and
     // the VirtualQuery costs nothing next to the allocation being skipped.
-    if (addr && (type & MEM_COMMIT) && !(type & MEM_RESERVE) && GhLazyOn() && size >= g_lazyMin){
+    if (addr && (type & MEM_COMMIT) && !(type & MEM_RESERVE) && GhLazyOn() && size >= g_lazyMin &&
+        !GhLazyFloorBlocks((uint64_t)size)){
         MEMORY_BASIC_INFORMATION mbi{};
         if (VirtualQuery(addr, &mbi, sizeof mbi) == sizeof mbi &&
             mbi.State == MEM_RESERVE &&
@@ -26183,7 +26232,8 @@ static LPVOID WINAPI Bed_VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWOR
     }
     // Reserve-and-commit in one call: take the reservation for real, promise the
     // commit. The guest gets an address it can use either way.
-    if ((type & MEM_COMMIT) && (type & MEM_RESERVE) && GhLazyOn() && size >= g_lazyMin){
+    if ((type & MEM_COMMIT) && (type & MEM_RESERVE) && GhLazyOn() && size >= g_lazyMin &&
+        !GhLazyFloorBlocks((uint64_t)size)){
         if (LPVOID q = VirtualAlloc(addr, size, type & ~(DWORD)MEM_COMMIT, PAGE_READWRITE)){
             if (!GhLazyAdd((uint8_t*)q, (uint64_t)size, prot, (uint64_t)(uintptr_t)_ReturnAddress()))
                 return VirtualAlloc(q, size, MEM_COMMIT, prot);   // overlap: do it for real
