@@ -20621,6 +20621,7 @@ static bool GhPtrInGuestSite(uintptr_t p);
 static void GhNoteVaSite(unsigned kind, uint64_t size, uint32_t type,
                          uint32_t prot, uintptr_t ret);
 static void GhNoteVaFree(unsigned kind, uint64_t size, uint32_t type);
+static void GhInstallNtVmHooks();            // #223
 static void GhVaSitesDump(const char* when);
 static bool GhVaSitesOn();
 
@@ -22777,6 +22778,7 @@ static void GhInstallScacheShim()
 static void GhHookD12Device(ID3D12Device* dev)
 {
     GhInstallUmdVaTrace();
+    GhInstallNtVmHooks();                    // #223: the path no IAT exposes
     GhInstallCoreHeapTrace();   // #158 gh_va_trace>=3
     GhInstallSecTrace();        // #158 gh_va_trace>=4
     GhInstallScacheShim();      // #209 gh_scache>=1
@@ -23837,6 +23839,140 @@ static void GhNoteVaSite(unsigned kind, uint64_t size, uint32_t type,
     ReleaseSRWLockExclusive(&g_vaSiteLk);
 }
 
+// ---------------------------------------------------------------- #223 -----
+// The last unmeasured commit path.  Every VirtualAlloc* eventually lands here,
+// but so does RtlHeap -- which calls it INTERNALLY, through no import table, so
+// neither Bed_VirtualAlloc nor Hook_UmdVirtualAlloc can see it.  That is also
+// why k=4 has produced zero rows in every run to date: the hook was on the
+// driver's IAT, so its silence was never evidence the path is unused.
+//
+// This is the most invasive hook in the project -- it sits under every thread,
+// including ntdll's own loader and heap paths -- so it is knob-gated (gh_ntvm,
+// slot 228) and OFF by default.
+typedef LONG (__stdcall *GhNtAVM_t)(HANDLE, PVOID*, ULONG_PTR, SIZE_T*, ULONG, ULONG);
+typedef LONG (__stdcall *GhNtFVM_t)(HANDLE, PVOID*, SIZE_T*, ULONG);
+static GhNtAVM_t g_realNtAVM = nullptr;
+static GhNtFVM_t g_realNtFVM = nullptr;
+static DWORD     g_ntVmTls   = TLS_OUT_OF_INDEXES;
+static volatile LONG g_ntVmAllocN = 0, g_ntVmFreeN = 0;
+
+// gh_ntvm is both the switch and the floor: 0 = off, N = count commits >= N KB.
+static unsigned GhNtVmMinKB()
+{ static const unsigned v = GhCfgNum(L"gh_ntvm.txt", "GH_NTVM", 0); return v; }
+static unsigned GhNtVmOn(){ return GhNtVmMinKB(); }
+
+// NO LOCK AND NO STACK WALK IN HERE.  NTVM1 hung the process because the walk
+// wanted the loader lock underneath RtlHeap.  Fixed table, interlocked linear
+// probe, keyed on the immediate return address -- which is the one thing that
+// still answers the open question: which ntdll subsystem is committing.
+struct GhNtVmRec { volatile LONG64 ret; volatile LONG64 bytes; volatile LONG n; volatile LONG pad; };
+static GhNtVmRec       g_ntVm[64]{};
+static volatile LONG   g_ntVmOtherN     = 0;
+static volatile LONG64 g_ntVmOtherBytes = 0;
+static volatile LONG64 g_ntVmFreeBytes  = 0;
+static volatile LONG   g_ntVmDecN = 0, g_ntVmRelN = 0;
+
+static void GhNtVmNote(uintptr_t ret, uint64_t size, uint32_t type)
+{
+    if (!(type & MEM_COMMIT)) return;                 // a reservation spends nothing
+    const unsigned minKB = GhNtVmMinKB();
+    if ((size >> 10) < (uint64_t)minKB) return;
+    const LONG64 key = (LONG64)ret;
+    for (int i = 0; i < 64; ++i){
+        LONG64 cur = g_ntVm[i].ret;
+        if (cur == 0){
+            if (InterlockedCompareExchange64((LONG64*)&g_ntVm[i].ret, key, 0) != 0){ --i; continue; }
+            cur = key;
+        }
+        if (cur == key){
+            InterlockedExchangeAdd64((LONG64*)&g_ntVm[i].bytes, (LONG64)size);
+            InterlockedIncrement(&g_ntVm[i].n);
+            return;
+        }
+    }
+    InterlockedIncrement(&g_ntVmOtherN);
+    InterlockedExchangeAdd64(&g_ntVmOtherBytes, (LONG64)size);
+}
+
+// The guard is the whole safety argument.  GhNoteVaSite takes a lock and walks
+// the stack, and the stack walk can touch the loader; if either allocates we
+// would re-enter this hook from inside RtlHeap.  A thread already inside passes
+// straight through and is not counted -- an undercount is a correct answer, a
+// deadlock is not.
+struct GhNtVmGuard {
+    bool held;
+    GhNtVmGuard() : held(false) {
+        if (g_ntVmTls == TLS_OUT_OF_INDEXES) return;
+        if (TlsGetValue(g_ntVmTls)) return;
+        TlsSetValue(g_ntVmTls, (LPVOID)1); held = true;
+    }
+    ~GhNtVmGuard(){ if (held) TlsSetValue(g_ntVmTls, nullptr); }
+};
+
+static LONG __stdcall Hook_GhNtAVM(HANDLE proc, PVOID* base, ULONG_PTR zb,
+                                   SIZE_T* size, ULONG type, ULONG prot)
+{
+    const LONG st = g_realNtAVM(proc, base, zb, size, type, prot);
+    if (st >= 0 && proc == (HANDLE)(LONG_PTR)-1){          // our own process only
+        GhNtVmGuard g;
+        if (g.held){
+            InterlockedIncrement(&g_ntVmAllocN);
+            GhNtVmNote((uintptr_t)_ReturnAddress(),
+                       (uint64_t)(size ? *size : 0), (uint32_t)type);
+        }
+    }
+    return st;
+}
+
+static LONG __stdcall Hook_GhNtFVM(HANDLE proc, PVOID* base, SIZE_T* size, ULONG type)
+{
+    const SIZE_T req = size ? *size : 0;                   // read BEFORE the call
+    const LONG st = g_realNtFVM(proc, base, size, type);
+    if (st >= 0 && proc == (HANDLE)(LONG_PTR)-1){
+        GhNtVmGuard g;
+        if (g.held){
+            InterlockedIncrement(&g_ntVmFreeN);
+            if (type & MEM_RELEASE) InterlockedIncrement(&g_ntVmRelN);
+            else if (type & MEM_DECOMMIT){
+                InterlockedIncrement(&g_ntVmDecN);
+                InterlockedExchangeAdd64(&g_ntVmFreeBytes, (LONG64)req);
+            }
+        }
+    }
+    return st;
+}
+
+static void GhInstallNtVmHooks()
+{
+    if (!GhNtVmOn()) return;
+    static LONG done = 0;
+    if (InterlockedCompareExchange(&done, 1, 0) != 0) return;
+    // Warm every lazy static the hook body touches BEFORE it goes live, so the
+    // first hooked allocation cannot land inside a magic-static initializer.
+    (void)GhNtVmMinKB();          // warm the knob BEFORE the hook goes live
+    g_ntVmTls = TlsAlloc();
+    if (g_ntVmTls == TLS_OUT_OF_INDEXES){
+        Diag("NTVM: TlsAlloc failed -- refusing to install without a guard");
+        return;
+    }
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    void* pa = nt ? (void*)GetProcAddress(nt, "NtAllocateVirtualMemory") : nullptr;
+    void* pf = nt ? (void*)GetProcAddress(nt, "NtFreeVirtualMemory") : nullptr;
+    if (!pa || !pf){
+        Diag(std::string("NTVM: no export alloc=") + (pa?"1":"0") + " free=" + (pf?"1":"0"));
+        return;
+    }
+    const bool a = InstallInlineHook(pa, (void*)&Hook_GhNtAVM, (void**)&g_realNtAVM);
+    const bool f = a && InstallInlineHook(pf, (void*)&Hook_GhNtFVM, (void**)&g_realNtFVM);
+    // If the free side refuses, keep the alloc side rather than lose the cell --
+    // but say so, because the net is then unreadable.
+    Diag(std::string("NTVM install alloc=") + (a?"OK":"FAILED") +
+         " free=" + (f?"OK":"FAILED") +
+         " at=" + Hex((uint64_t)pa) + "/" + Hex((uint64_t)pf) +
+         " minKB=" + std::to_string((unsigned long)GhNtVmMinKB()) +
+         " ntdll=" + Hex((uint64_t)nt));
+}
+
 // Delta since the previous dump, biggest first. Collected under the lock and
 // PRINTED outside it -- Diag allocates, and this runs on guest threads.
 static void GhVaSitesDump(const char* when)
@@ -23872,6 +24008,24 @@ static void GhVaSitesDump(const char* when)
     const LONG   dfdN = fdN - g_vaFreeDecNDumped, dfrN = frN - g_vaFreeRelNDumped;
     const LONG64 dfdKB = fdKB - g_vaFreeDecKBDumped;
     g_vaFreeDecNDumped = fdN; g_vaFreeRelNDumped = frN; g_vaFreeDecKBDumped = fdKB;
+    if (GhNtVmOn()){
+        Diag(std::string("NTVM ") + when +
+             " allocN=" + std::to_string((long)g_ntVmAllocN) +
+             " freeN="  + std::to_string((long)g_ntVmFreeN) +
+             " decN="   + std::to_string((long)g_ntVmDecN) +
+             " relN="   + std::to_string((long)g_ntVmRelN) +
+             " decKB="  + std::to_string((long long)(g_ntVmFreeBytes >> 10)) +
+             " otherN=" + std::to_string((long)g_ntVmOtherN) +
+             " otherKB=" + std::to_string((long long)(g_ntVmOtherBytes >> 10)) +
+             " hooked=" + (g_realNtAVM ? "1" : "0"));
+        for (int i = 0; i < 64; ++i){
+            const LONG64 r = g_ntVm[i].ret;
+            if (!r) continue;
+            Diag("  NTVMSITE totKB=" + std::to_string((long long)(g_ntVm[i].bytes >> 10)) +
+                 " n=" + std::to_string((long)g_ntVm[i].n) +
+                 " ret=" + Hex((uint64_t)r) + " " + NameForCodeAddr((uintptr_t)r));
+        }
+    }
     Diag(std::string("VAFREE ") + when +
          " decN=" + std::to_string((long)dfdN) +
          " decKB=" + std::to_string((long long)dfdKB) +
