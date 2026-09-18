@@ -459,3 +459,181 @@ if __name__ == '__main__':
     out = lower(src, rep)
     open(sys.argv[2], 'w').write(out)
     print('\n'.join(rep))
+
+
+# ---------------------------------------------------------------------------
+# `switch` -> compare/branch chain.
+#
+# GREENHOUSE §32.125 (2026-09-18): an op census over the 5,485 blobs the console
+# created in one Tsushima run finds ZERO carrying an LLVM `switch` instruction,
+# while three of the four blobs the driver refuses outright (fa29971e:
+# sc::dxil::DxilError -> device removed; 4acdac3e / 86d22de2: access violation
+# inside the compiler) each carry one or two. dxc emits `switch` for HLSL
+# switch statements it cannot fold; the console's SC front end appears to have
+# no lowering for it. Every `switch` is exactly a chain of equality tests, so
+# the rewrite is semantics-preserving: one block per distinct target, cases
+# sharing a target OR'ed together, the default at the end of the chain. PHI
+# nodes in the targets are re-pointed at their new predecessor blocks (and
+# duplicated when one target is reached by two chain blocks).
+_SWITCH_HEAD = re.compile(r'^(\s*)switch\s+(i\d+)\s+(%[\w.]+|\d+),\s*label\s+%([\w.]+)\s*\[\s*$')
+_SWITCH_CASE = re.compile(r'^\s*(i\d+)\s+(-?\d+),\s*label\s+%([\w.]+)\s*$')
+_LABEL_LINE  = re.compile(r'^([A-Za-z_][\w.]*):')
+
+def lower_switch(text, report=None):
+    lines = text.split('\n')
+    n_sw = 0
+    i = 0
+    while i < len(lines):
+        m = _SWITCH_HEAD.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        ind, ty, val, default = m.groups()
+        # the block this switch lives in
+        blk = None
+        for j in range(i - 1, -1, -1):
+            lm = _LABEL_LINE.match(lines[j])
+            if lm:
+                blk = lm.group(1); break
+            if lines[j].startswith('define '):
+                break
+        if blk is None:
+            raise SystemExit('lower_switch: switch in an unnamed (entry) block')
+        # collect cases up to the closing bracket
+        cases = []
+        k = i + 1
+        while k < len(lines) and lines[k].strip() != ']':
+            cm = _SWITCH_CASE.match(lines[k])
+            if not cm:
+                raise SystemExit('lower_switch: unparsed case line %r' % lines[k])
+            cases.append((cm.group(2), cm.group(3)))
+            k += 1
+        end = k                                  # index of the ']' line
+        n_sw += 1
+        targets = []                             # distinct, first-appearance order
+        for _, lab in cases:
+            if lab not in targets: targets.append(lab)
+        pfx = '%s_sw%d' % (blk, n_sw)
+        new = []
+        preds = {}                               # successor label -> new pred labels
+        cur_blk = blk
+        for t_i, lab in enumerate(targets):
+            consts = [c for c, l in cases if l == lab]
+            cmps = []
+            for c_i, c in enumerate(consts):
+                nm = '%%%s_t%d_c%d' % (pfx, t_i, c_i)
+                new.append('%s%s = icmp eq %s %s, %s' % (ind, nm, ty, val, c))
+                cmps.append(nm)
+            cond = cmps[0]
+            for c_i, nm in enumerate(cmps[1:], 1):
+                acc = '%%%s_t%d_o%d' % (pfx, t_i, c_i)
+                new.append('%s%s = or i1 %s, %s' % (ind, acc, cond, nm))
+                cond = acc
+            last = (t_i == len(targets) - 1)
+            nxt = default if last else '%s_b%d' % (pfx, t_i + 1)
+            new.append('%sbr i1 %s, label %%%s, label %%%s' % (ind, cond, lab, nxt))
+            preds.setdefault(lab, []).append(cur_blk)
+            if last:
+                preds.setdefault(default, []).append(cur_blk)
+            else:
+                new.append('')
+                new.append('%s:' % nxt)
+                cur_blk = nxt
+        if not targets:                          # degenerate: no cases
+            new = ['%sbr label %%%s' % (ind, default)]
+            preds = {default: [blk]}
+        lines[i:end + 1] = new
+        # re-point PHIs in every successor whose predecessor changed
+        for lab, plist in preds.items():
+            if plist == [blk]:
+                continue
+            # find block `lab`
+            start = None
+            for j, ln in enumerate(lines):
+                lm = _LABEL_LINE.match(ln)
+                if lm and lm.group(1) == lab:
+                    start = j; break
+            if start is None:
+                raise SystemExit('lower_switch: target block %s not found' % lab)
+            j = start + 1
+            while j < len(lines) and not _LABEL_LINE.match(lines[j]) and not lines[j].startswith('}'):
+                if re.match(r'^\s*%[\w.]+ = phi ', lines[j]):
+                    def _rep(mm, plist=plist):
+                        v = mm.group(1)
+                        return ', '.join('[ %s, %%%s ]' % (v, p) for p in plist)
+                    lines[j] = re.sub(r'\[\s*([^,\]]+),\s*%' + re.escape(blk) + r'\s*\]', _rep, lines[j])
+                j += 1
+        i += len(new)
+    if report is not None:
+        report.append('switch: %d lowered' % n_sw)
+    return '\n'.join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 64-bit raw buffer loads -> two 32-bit lanes.
+#
+# GREENHOUSE §32.125 (2026-09-18): the two Int64 soak blobs (4acdac3e / 86d22de2)
+# fault the console's compiler (AV, device survives) and, once their `switch`
+# is lowered, the only constructs they use that no created blob uses are
+# `dx.op.rawBufferLoad.i64` and the i64 lshr/trunc that split its result.
+# Every such load here reads one i64 (mask 1) and takes element 0. Rewrite it
+# as a 2-dword i32 load and rebuild the i64 with zext/shl/or — all of which
+# created blobs already use.
+_I64LOAD = re.compile(r'^(\s*)(%[\w.]+) = call %dx\.types\.ResRet\.i64 @dx\.op\.rawBufferLoad\.i64\(i32 139, (%dx\.types\.Handle %[\w.]+), (i32 [^,]+), (i32 [^,]+), i8 (\d+), i32 (\d+)\)(.*)$')
+
+def lower_i64load(text, report=None):
+    lines = text.split('\n')
+    out = []
+    alias = {}                                    # (%r, k) -> %value
+    n = 0
+    for ln in lines:
+        m = _I64LOAD.match(ln)
+        if not m:
+            out.append(ln); continue
+        ind, dst, h, idx, off, mask, align = m.groups()[:7]
+        mask = int(mask)
+        if mask not in (1, 3):
+            raise SystemExit('lower_i64load: mask %d on %s not handled' % (mask, dst))
+        n += 1
+        nel = 2 if mask == 3 else 1
+        i32mask = (1 << (2 * nel)) - 1
+        out.append('%s%s_lo = call %%dx.types.ResRet.i32 @dx.op.rawBufferLoad.i32(i32 139, %s, %s, %s, i8 %d, i32 4)  ; lower_i64load' % (ind, dst, h, idx, off, i32mask))
+        for k in range(nel):
+            out.append('%s%s_e%d = extractvalue %%dx.types.ResRet.i32 %s_lo, %d' % (ind, dst, 2*k, dst, 2*k))
+            out.append('%s%s_e%d = extractvalue %%dx.types.ResRet.i32 %s_lo, %d' % (ind, dst, 2*k+1, dst, 2*k+1))
+            out.append('%s%s_z%d = zext i32 %s_e%d to i64' % (ind, dst, 2*k, dst, 2*k))
+            out.append('%s%s_z%d = zext i32 %s_e%d to i64' % (ind, dst, 2*k+1, dst, 2*k+1))
+            out.append('%s%s_s%d = shl nuw i64 %s_z%d, 32' % (ind, dst, k, dst, 2*k+1))
+            out.append('%s%s_v%d = or i64 %s_s%d, %s_z%d' % (ind, dst, k, dst, k, dst, 2*k))
+            alias[(dst, k)] = '%s_v%d' % (dst, k)
+    if not n:
+        if report is not None: report.append('i64load: 0')
+        return text
+    # extractvalue rewrites
+    res = []
+    for ln in out:
+        m = re.match(r'^(\s*)(%[\w.]+) = extractvalue %dx\.types\.ResRet\.i64 (%[\w.]+), (\d+)\s*$', ln)
+        if m:
+            ind, d, r, k = m.groups()
+            key = (r, int(k))
+            if key not in alias:
+                if int(k) == 4:
+                    raise SystemExit('lower_i64load: status element of %s used' % r)
+                raise SystemExit('lower_i64load: element %s of %s not loaded' % (k, r))
+            # alias via a no-op or (dxv folds nothing, but the driver's LLVM will)
+            res.append('%s%s = or i64 %s, 0' % (ind, d, alias[key]))
+            continue
+        res.append(ln)
+    text = '\n'.join(res)
+    # declarations: make sure the i32 form exists
+    if '@dx.op.rawBufferLoad.i32(' not in text.split('declare', 1)[-1] or not re.search(r'declare %dx\.types\.ResRet\.i32 @dx\.op\.rawBufferLoad\.i32\(', text):
+        text = text.replace('declare %dx.types.ResRet.i64 @dx.op.rawBufferLoad.i64(i32, %dx.types.Handle, i32, i32, i8, i32)',
+                            'declare %dx.types.ResRet.i64 @dx.op.rawBufferLoad.i64(i32, %dx.types.Handle, i32, i32, i8, i32)\ndeclare %dx.types.ResRet.i32 @dx.op.rawBufferLoad.i32(i32, %dx.types.Handle, i32, i32, i8, i32)', 1)
+    if '%dx.types.ResRet.i32 = type' not in text:
+        text = text.replace('%dx.types.ResRet.i64 = type', '%dx.types.ResRet.i32 = type { i32, i32, i32, i32, i32 }\n%dx.types.ResRet.i64 = type', 1)
+    # the i64 declaration is now unused and dxv refuses an unused external
+    if '@dx.op.rawBufferLoad.i64(i32 139' not in text:
+        text = re.sub(r'^declare %dx\.types\.ResRet\.i64 @dx\.op\.rawBufferLoad\.i64\([^\n]*\n', '', text, flags=re.M)
+    if report is not None:
+        report.append('i64load: %d lowered' % n)
+    return text

@@ -34,7 +34,11 @@ JOBS = int(sys.argv[3]) if len(sys.argv) > 3 else 14
 # deny list is 42ab5eed (VS, no wave ops at all) and 6c9bda76 (PS, 116 x6): the
 # PS was the killer and the VS was denied only for being the first stage the
 # guard checks. #192, #194 and #202's psoN=682 removal are one defect.
-KILL = {'112', '119', '121', '123', '116'}
+# 135 waveAllOp(AllBitCount) / 136 wavePrefixOp(PrefixBitCount): DENY3 (2026-09-18,
+# GREENHOUSE §32.125) -- 451b08b2's phase-1 blob (real 110/135/136) is refused by
+# scdxil with sc::dxil::DxilError -> 0x887A0020, exactly #175's reduction/scan
+# class; the deny list had hidden it. lower_wave1 already rewrites both.
+KILL = {'112', '119', '121', '123', '116', '135', '136'}
 
 def key_of(path):
     with open(path, 'rb') as f:

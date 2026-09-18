@@ -55,6 +55,13 @@ def lower_text(text, templates, report=None):
     # knob: it costs mip selection in the shaders it touches.
     if os.environ.get('GH_CS_LOD0') == '1':
         text = lower66.lower_cs_implicit_lod(text, report)
+    # GH_SWITCH=1: `switch` -> compare/branch chain (§32.125: no created blob
+    # carries a switch, three of the four the driver refuses do). Off by default.
+    if os.environ.get('GH_SWITCH') == '1':
+        text = lower66.lower_switch(text, report)
+    # GH_I64LOAD=1: rawBufferLoad.i64 -> 2-dword i32 load + zext/shl/or (§32.125).
+    if os.environ.get('GH_I64LOAD') == '1':
+        text = lower66.lower_i64load(text, report)
     return text
 
 
