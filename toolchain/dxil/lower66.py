@@ -271,18 +271,18 @@ def lower_wave1(text, report=None):
                 continue
             counts[op] = counts.get(op, 0) + 1
             if op == 110:
-                # WaveIsFirstLane -> WaveGetLaneIndex() == 0, NOT the constant
-                # `true`. Constant-folding it makes every lane take the
-                # first-lane branch, and that branch is usually the one that
-                # writes the wave's result to LDS at index tid/waveWidth -- so
-                # with the width folded to its real value the index is right and
-                # exactly one thread stores, while `true` had all of them store
-                # OUT OF BOUNDS (measured: `[8 x i32]` indexed 0..63). Op 111 is
-                # measured CREATED, so this costs nothing.
-                lines.append('%s%s_li = call i32 @dx.op.waveGetLaneIndex(i32 111)'
-                             % (ind, dst))
-                lines.append('%s%s = icmp eq i32 %s_li, 0' % (ind, dst, dst))
-                need111.add(True)
+                # WaveIsFirstLane -> `true`: under this model every lane IS the
+                # first (and only) lane of its wave. The earlier `laneIndex == 0`
+                # form broke the idiom this pass exists for -- the wave-aggregated
+                # allocation `if (IsFirstLane) base = atomicAdd(counter, count);
+                # base = ReadLaneFirst(base)` -- because 63 of 64 lanes then skipped
+                # the atomic and used an UNDEFINED base (TEXQ1/TEXQ2: the world's
+                # compaction shaders wrote garbage indirect-argument buffers and the
+                # first ExecuteIndirect hung the GPU). The OUT-OF-BOUNDS LDS store
+                # that motivated `laneIndex == 0` only existed while the width was
+                # folded to 1 (index tid/1); with the real width (fold_lane_count,
+                # GH_WAVE_SIZE) the index is tid/64 and in bounds for every lane.
+                alias[dst] = 'true'
             elif op in _W1_CONST:
                 alias[dst] = _W1_CONST[op]
             elif op in _W1_PASS or op in _W1_COPY:
@@ -307,12 +307,24 @@ def lower_wave1(text, report=None):
             ind, dst, src, idx = m.groups()
             kind, cond = structs[src]
             counts[-1] = counts.get(-1, 0) + 1
-            if idx != '0':
-                alias[dst] = '0'                    # no other lane is ever set
-            elif kind == 'match':
-                alias[dst] = '1'                    # a lane always matches itself
+            if idx in ('2', '3'):
+                alias[dst] = '0'                    # a 64-wide wave never sets these
             else:
-                lines.append('%s%s = select i1 %s, i32 1, i32 0' % (ind, dst, cond))
+                # The lane's OWN bit, at its REAL index. 111 waveGetLaneIndex is
+                # kept real, and these shaders test `mask & (1 << laneIndex)` and
+                # clear `mask &= ~ballot(v == first)`; a ballot that always set
+                # bit 0 left lanes 1..63 without their bit (they skipped the
+                # scalarized light loop) and, in a loop that also polls a real
+                # 113 waveAnyTrue, with a mask they could never clear.
+                c = 'true' if kind == 'match' else cond   # a lane matches itself
+                lines.append('%s%s_li = call i32 @dx.op.waveGetLaneIndex(i32 111)' % (ind, dst))
+                lines.append('%s%s_lo = and i32 %s_li, 31' % (ind, dst, dst))
+                lines.append('%s%s_bit = shl i32 1, %s_lo' % (ind, dst, dst))
+                lines.append('%s%s_hi = lshr i32 %s_li, 5' % (ind, dst, dst))
+                lines.append('%s%s_in = icmp eq i32 %s_hi, %s' % (ind, dst, dst, idx))
+                lines.append('%s%s_c = and i1 %s, %s_in' % (ind, dst, c, dst))
+                lines.append('%s%s = select i1 %s_c, i32 %s_bit, i32 0' % (ind, dst, dst, dst))
+                need111.add(True)
             continue
         lines.append(line)
 
