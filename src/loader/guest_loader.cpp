@@ -12387,8 +12387,21 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     // Outlives every use of the substituted bytecode below: the screen reads it,
     // then the driver compiles from it, and both finish before this returns.
     GhBlobHold subHold;
+    // #234: name the pipeline by its shaders' corpus keys (the hash of the ORIGINAL
+    // bytecode, the same key gh_lo_<key>.bin is staged under), so a CLOP pso=
+    // pointer in the trace turns back into shader keys with no log adjacency.
+    std::string psoKeys;
     if (use && GhShaderSubOn()){
         if (use != &local){ local = *use; }
+        {
+            char k[33];
+            const D3D12_SHADER_BYTECODE* st[5] = { &local.VS, &local.PS, &local.GS, &local.HS, &local.DS };
+            const char* nm[5] = { "vs", "ps", "gs", "hs", "ds" };
+            for (int i = 0; i < 5; ++i)
+                if (st[i]->pShaderBytecode && st[i]->BytecodeLength >= 20 &&
+                    GhShaderKey(st[i]->pShaderBytecode, st[i]->BytecodeLength, k))
+                    psoKeys += std::string(" ") + nm[i] + "=" + std::string(k, 8);
+        }
         bool any = false;
         any |= GhSubstShader(&local.VS, subHold);
         any |= GhSubstShader(&local.PS, subHold);
@@ -12560,6 +12573,7 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     if (pp && *pp){
         res += " CREATED pso=" + Hex((uint64_t)(uintptr_t)*pp) +
                " idx=" + std::to_string((long)InterlockedIncrement(&psoIdx));
+        res += psoKeys;   // #234
         // #202 the PSO pager. The substitution happens HERE, after every refusal
         // and every stand-in has already returned: nothing wrapped can be a
         // substitute for something else, which is the same rule the dedup publish
@@ -12744,8 +12758,15 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
     // substitution exists to let through.
     D3D12_COMPUTE_PIPELINE_STATE_DESC subd;
     GhBlobHold subHold;          // same lifetime rule as the graphics path
+    std::string psoKeys;         // #234: see the graphics hook
     if (d && GhShaderSubOn()){
         subd = *d;
+        {
+            char k[33];
+            if (subd.CS.pShaderBytecode && subd.CS.BytecodeLength >= 20 &&
+                GhShaderKey(subd.CS.pShaderBytecode, subd.CS.BytecodeLength, k))
+                psoKeys = std::string(" cs=") + std::string(k, 8);
+        }
         if (GhSubstShader(&subd.CS, subHold)){
             static volatile LONG nsub = 0;
             const LONG k = InterlockedIncrement(&nsub);
@@ -12853,6 +12874,7 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
         if (pp && *pp){
             res += " CREATED pso=" + Hex((uint64_t)(uintptr_t)*pp) +
                    " cidx=" + std::to_string((long)InterlockedIncrement(&cpsIdx));
+            res += psoKeys;   // #234
             if (d) res += " cs=" + std::to_string((unsigned long long)d->CS.BytecodeLength);
             // #202 the PSO pager, compute half. Gated on !cpsFault for the same
             // reason the publish below is: a faulted create can still leave a
@@ -19759,7 +19781,7 @@ static void __stdcall Hook_CQExecute(ID3D12CommandQueue* self_, UINT n, ID3D12Co
     InterlockedExchange64(&g_eclTick, (LONG64)GetTickCount64());
     // Log the shape of every submission until the run settles. The hang happens
     // inside the first hundred, and past that a running game would drown the log.
-    if (seq <= 256){
+    if (seq <= 256 || GhCLTraceOn()){   // #234: also inside the armed CL trace window
         std::string m = "GPUSUBMIT #" + std::to_string((long)seq) +
                         " t=" + std::to_string((unsigned long long)GhMsSinceFirstSubmit()) + "ms" +
                         " q=" + Hex((uint64_t)(uintptr_t)self) + " lists=" + std::to_string((unsigned)n);
