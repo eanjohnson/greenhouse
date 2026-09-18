@@ -8928,6 +8928,25 @@ static void GhHeapBillProbe()
             }
         }
 
+        // Third phase (SPILL12, §32.120): does Evict() hand the heap's charge
+        // back to the container, and does MakeResident() take it again? The
+        // level's one-per-texture heaps are never destroyed by the game; if a
+        // share of them is dead, this is the only reclaim that is not a
+        // visual compromise. The game itself calls MakeResident 0x / Evict 1x,
+        // so the residency axis is ours alone.
+        {
+            ID3D12Pageable* pg = h.get();
+            GhBillSnap e0{}; GhBillTake(&e0);
+            HRESULT eh = dev->Evict(1, &pg);
+            GhBillSnap e1{}; GhBillTake(&e1);
+            Diag(std::string("HEAPBILL ") + v.name + " Evict hr=" + Hex((uint32_t)eh));
+            GhBillReport((std::string(v.name) + " EVICTED").c_str(), e0, e1);
+            HRESULT mh = dev->MakeResident(1, &pg);
+            GhBillSnap e2{}; GhBillTake(&e2);
+            Diag(std::string("HEAPBILL ") + v.name + " MakeResident hr=" + Hex((uint32_t)mh));
+            GhBillReport((std::string(v.name) + " RESIDENT-AGAIN").c_str(), e1, e2);
+        }
+
         h = nullptr;
         GhBillSnap s4{}; GhBillTake(&s4);
         GhBillReport((std::string(v.name) + " RELEASED").c_str(), s1, s4);
