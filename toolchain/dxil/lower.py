@@ -65,6 +65,10 @@ def lower_text(text, templates, report=None):
     # GH_I64=1: every remaining i64 value -> (lo, hi) i32 pair (§32.125); needs GH_I64LOAD.
     if os.environ.get('GH_I64') == '1':
         text = lower66.lower_i64(text, report)
+    # GH_RETILE=1: a >64-thread group with barriers AVs the console's back end; retile
+    # the strided-loop shape to 64 threads exactly (§32.125, cells NT1/RT1).
+    if os.environ.get('GH_RETILE') == '1':
+        text = lower66.lower_group512(text, report)
     return text
 
 

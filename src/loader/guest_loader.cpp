@@ -14013,11 +14013,25 @@ static bool GhFirstSeen(const char* kind, uint64_t key)
     return isNew;
 }
 
+// #234: the world-frame hang sits ~1,500 ExecuteCommandLists apart from run to
+// run, so a fixed gh_cl_trace_lo/_hi window cannot be aimed at it. The first-use
+// counter is stable instead (the first world-frame SRV is FIRST #297 in every
+// run), so gh_cl_trace_first=N arms the per-op trace at FIRST #N for the next
+// gh_cl_trace_span submissions (default 400). Off (0) unless asked.
+static volatile LONG g_clTraceArmEcl = -1;
+static LONG GhEclNowEarly();
 static void GhFirstSay(const char* kind, const std::string& what)
 {
-    Diag("FIRST #" + std::to_string((long)InterlockedIncrement(&g_firstN)) +
+    const long n = (long)InterlockedIncrement(&g_firstN);
+    Diag("FIRST #" + std::to_string(n) +
          " frame=" + std::to_string((long long)InterlockedCompareExchange64(&g_frameNo, 0, 0)) +
          " " + kind + " " + what);
+    static const unsigned armAt = GhCfgNumZ(L"gh_cl_trace_first.txt", "GH_CL_TRACE_FIRST", 0);
+    if (armAt && n == (long)armAt){
+        const LONG e = GhEclNowEarly();
+        InterlockedExchange(&g_clTraceArmEcl, e);
+        Diag("CLTRACE armed at FIRST #" + std::to_string(n) + " ecl=" + std::to_string((long)e));
+    }
 }
 
 #define GH_FIRST(kind, key, what) \
@@ -14394,11 +14408,15 @@ static bool GhCLTraceOn()
 {
     static const unsigned lo = GhCfgNum(L"gh_cl_trace_lo.txt", "GH_CL_TRACE_LO", 0);
     static const unsigned hi = GhCfgNum(L"gh_cl_trace_hi.txt", "GH_CL_TRACE_HI", 0);
+    static const unsigned span = GhCfgNumZ(L"gh_cl_trace_span.txt", "GH_CL_TRACE_SPAN", 400);
     const LONG e = InterlockedCompareExchange(&g_eclCount, 0, 0);
+    const LONG arm = InterlockedCompareExchange(&g_clTraceArmEcl, 0, 0);
+    if (arm >= 0) return e >= arm && e <= arm + (LONG)span;   // #234: armed by gh_cl_trace_first
     if (!lo && !hi) return e <= 64;
     return e >= (LONG)lo && (!hi || e <= (LONG)hi);
 }
 static LONG GhEclNow(){ return InterlockedCompareExchange(&g_eclCount, 0, 0); }
+static LONG GhEclNowEarly(){ return GhEclNow(); }
 static std::string GhPixName(const void* p, UINT size)
 {
     // PIX packs its header bit-wise and the layout has changed between versions,

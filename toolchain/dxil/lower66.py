@@ -761,3 +761,59 @@ def lower_i64(text, report=None):
     if report is not None:
         report.append('i64: %d legalised' % n)
     return '\n'.join(out)
+
+
+# ---------------------------------------------------------------------------
+# #234: the console's DXIL back end AVs (0xC0000005 inside CreateComputePipelineState,
+# device survives) on a 512-thread group that carries dx.op.barrier: the same
+# shader with 64 or 256 threads compiles, and without the barriers it compiles
+# at 512 (cells LDS1/NT1/RT1, 2026-09-18). Every created Tsushima compute shader
+# uses a 64-thread group. The two skinning kernels that fault use the group size
+# in exactly one shape -- `for (i = tid; i < n; i += N)` with tid the global
+# dispatch id -- so retiling them to 64 threads is EXACT: tid becomes
+# groupId.x*N + flattenedThreadIdInGroup and every stride N becomes 64, which
+# walks the same index set per group into the same groupshared slots. The pass
+# refuses (raises) any shader whose id or group size is used in another shape.
+_NUMTHREADS = re.compile(r'!\{i32 (\d+), i32 1, i32 1\}')
+_THREADID = re.compile(r'^  (%\S+) = call i32 @dx\.op\.threadId\.i32\(i32 93, i32 0\).*$', re.M)
+
+
+def lower_group512(text, report=None, target=64):
+    m = _NUMTHREADS.search(text)
+    if not m:
+        return text
+    n = int(m.group(1))
+    if n <= target:
+        return text
+    if len(_NUMTHREADS.findall(text)) != 1:
+        raise SystemExit('lower_group512: more than one numthreads tuple')
+    ids = _THREADID.findall(text)
+    if len(ids) != 1 or text.count('@dx.op.threadId.i32(') != 2:
+        raise SystemExit('lower_group512: expected exactly one dx.op.threadId use (found %d)' % len(ids))
+    v = ids[0]
+    uses = [l for l in text.split('\n')
+            if re.search(r'(?<![\w.])' + re.escape(v) + r'\b', l) and not _THREADID.match(l)]
+    bad = [l for l in uses if not (re.match(r'\s*%\S+ = phi i32', l)
+                                   or re.match(r'\s*%\S+ = icmp ult i32 ' + re.escape(v) + ',', l))]
+    if bad:
+        raise SystemExit('lower_group512: the thread id is not only a loop start/guard:\n' + '\n'.join(bad[:5]))
+    other = [l for l in text.split('\n')
+             if re.search(r'\b%d\b' % n, l) and not re.search(r'= add i32 %%\S+, %d$' % n, l)
+             and not _NUMTHREADS.search(l) and 'NumThreads=' not in l and not l.startswith(';')]
+    if other:
+        raise SystemExit('lower_group512: %d used outside a stride:\n%s' % (n, '\n'.join(other[:5])))
+    text = _NUMTHREADS.sub('!{i32 %d, i32 1, i32 1}' % target, text)
+    text = text.replace('NumThreads=(%d,1,1)' % n, 'NumThreads=(%d,1,1)' % target)
+    m = _THREADID.search(text)
+    new = ('  %s_g = call i32 @dx.op.groupId.i32(i32 94, i32 0)  ; GroupId(component)\n'
+           '  %s_t = call i32 @dx.op.flattenedThreadIdInGroup.i32(i32 96)  ; FlattenedThreadIdInGroup()\n'
+           '  %s_m = mul i32 %s_g, %d\n'
+           '  %s = add i32 %s_m, %s_t') % (v, v, v, v, n, v, v, v)
+    text = text[:m.start()] + new + text[m.end():]
+    text = text.replace('declare i32 @dx.op.threadId.i32(i32, i32) #0',
+                        'declare i32 @dx.op.groupId.i32(i32, i32) #0\n'
+                        'declare i32 @dx.op.flattenedThreadIdInGroup.i32(i32) #0')
+    text, k = re.subn(r'(= add i32 %%\S+), %d$' % n, r'\1, %d' % target, text, flags=re.M)
+    if report is not None:
+        report.append('  group %d -> %d: tid := groupId*%d + flatTid, %d strides, %d id uses' % (n, target, n, k, len(uses)))
+    return text
