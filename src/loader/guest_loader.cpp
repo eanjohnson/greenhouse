@@ -534,6 +534,9 @@ static void GhCheckDeviceRemoved(const char* where,
                                  ID3D12Device* dev = nullptr); // #158 removal + DRED
 static std::string GhLazyStats();                             // #145 demand-commit counters
 static void        GhLazyCashIn();                            // #230 cash promises before the container is gone
+static void        GhLazySpillReserve();                       // #233 age granules + keep a commit reserve (sampler thread)
+static bool        GhLazySpillRoom(uint64_t need, const char* why); // #233 evict cold pager granules to the spill file
+static bool        GhLazySpillOn();                            // #233 true when the spill file is open
 // #202. The container budget, 100 ms-cached. Declared here because AdapterProxy
 // is defined thousands of lines before the pager that owns it, and
 // QueryVideoMemoryInfo now needs to know how full the CONTAINER is, not just
@@ -9615,6 +9618,21 @@ static void GhScdxilBringUp()
         }
     }
     if (!g_scdxil) return;
+    // #233 SPILL3: SC_DLL loads scdxil.dll through Bed_SC_LoadLibraryW, which hands
+    // back OUR module without taking a loader reference, and frees it with the real
+    // FreeLibrary -- which drops the ONE reference this function holds. The second
+    // load/free pair (two compiler instances) unmapped the image under newbe.DLL,
+    // which then executed MEM_FREE memory at scdxil+0xB997, removed the device and
+    // the game killed itself. Pin it: a pinned module survives any FreeLibrary.
+    // A self-mapped image is not a loader module; ntdll cannot unmap it either.
+    if (!g_scdxilSelf){
+        HMODULE keep = nullptr;
+        const BOOL ok = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN |
+                                           GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                                           (LPCWSTR)g_scdxil, &keep);
+        Diag(std::string("SCDXIL pinned ") + (ok ? "OK" : "FAILED err=" + Hex(GetLastError())) +
+             " h=" + Hex((uintptr_t)g_scdxil));
+    }
     // The one export the whole wall turns on. If this is NULL the bring-up is
     // useless even though the module is mapped, and the log should say so before
     // anybody reads a PSO result.
@@ -20765,6 +20783,15 @@ static HRESULT __stdcall Hook_D12CreateHeap(ID3D12Device* self,
         }
     }
     HRESULT hr = orig(self, hd, riid, pp);
+    // #233. A refused heap is fatal to this game (HEAPCAP1: MessageBox, trap).
+    // With a spill file open, return cold pager granules to the container and
+    // ask the driver once more before the refusal reaches the guest.
+    if (hr == E_OUTOFMEMORY && hd && GhLazySpillOn() &&
+        GhLazySpillRoom((uint64_t)hd->SizeInBytes + (64ull << 20), "createheap")){
+        hr = orig(self, hd, riid, pp);
+        Diag("D3D12 CreateHeap RETRY after spill size=" + Hex((uint64_t)hd->SizeInBytes) +
+             " hr=" + Hex((uint32_t)hr));
+    }
     if (SUCCEEDED(hr) && hd){
         InterlockedAdd64(&heapBytes, (LONG64)hd->SizeInBytes);
         InterlockedIncrement(&heapCount);
@@ -21741,6 +21768,7 @@ static void GhLogMemoryBudget(const char* where)
         }
     }
     GhLazyCashIn();                               // #230: before the counters are read
+    GhLazySpillReserve();                         // #233: age a slice, keep the reserve
     ln += GhLazyStats();
     Diag(ln);
     GhLazyWhoDump(where);                         // #213
@@ -27803,6 +27831,15 @@ struct GhLazyRange {
     DWORD        prot;
     LONG*        bits;        // one bit per granule, 1 = committed
     GhLazyAcct*  acct;        // #213, null unless gh_lazy_who
+    // #233 spill state, null unless gh_lazy_spill_mb and the range is PAGE_READWRITE.
+    // One bit per granule, like `bits`.
+    LONG*        spilled;     // 1 = contents live in the spill file; the pages are decommitted
+    LONG*        guard;       // 1 = AGED: dropped from the working set since the aging hand last passed
+    LONG*        ref;         // (kept for the record; the working-set bit is read live instead)
+    LONG*        busy;        // 1 = an evict, restore or commit is in flight on the granule
+    uint32_t*    slot;        // spill-file slot the granule's contents occupy while spilled
+    LONG*        ever;        // patch h: 1 = the granule has been evicted at least once
+    LONG*        back;        // patch h: 1 = the granule has been restored at least once
 };
 static SRWLOCK                  g_lazyLock = SRWLOCK_INIT;
 static std::vector<GhLazyRange> g_lazy;              // sorted by base
@@ -27826,6 +27863,103 @@ static volatile LONG            g_lazyLogs      = 0;
 static bool                     g_lazyOn        = false;
 static uint64_t                 g_lazyGran      = 64u << 10;
 static uint64_t                 g_lazyMin       = 16ull << 20;
+// #233. A user-mode page file for the promised ranges. The container has no
+// page file: when commit runs out an allocation fails and this engine answers
+// every failure with death (HEAPCAP1, §32.103). The pager already owns the
+// game's pool promises (~1.7 GB) and answers their faults, so it can also take
+// their cold granules OUT: copy to a file on D:, decommit (the charge comes
+// back), and restore on the next touch. Reference bits: NOT PAGE_GUARD -- cell
+// SPILL1 (§32.111) showed a guard on a page DirectStorage writes into fails the
+// game's own I/O and it exits on the spot, with no fault for anyone to see.
+// Instead the sampler AGES a slice each tick by dropping its granules from the
+// working set (VirtualUnlock on unlocked pages is documented to do that and
+// nothing else); a later touch brings the page back by a kernel soft fault that
+// no API and no exception can observe, and the working-set bit read through
+// NtQueryVirtualMemory(MemoryWorkingSetExInformation) is then the reference
+// bit. Eviction is a clock over the ranges: lap 1 takes aged granules that are
+// out of the working set, lap 2 any aged granule, lap 3 anything committed.
+static uint64_t                 g_lazySpill      = 0;       // reserve to keep free, bytes; 0 = off
+static HANDLE                   g_spillFile      = INVALID_HANDLE_VALUE;
+static SRWLOCK                  g_spillLock      = SRWLOCK_INIT;  // free slots + the two hands
+static std::vector<uint32_t>    g_spillFree;                       // capacity fixed up front: no growth in the VEH
+static uint32_t                 g_spillNext      = 0;
+static uint8_t*                 g_spillHandBase  = nullptr;        // eviction clock: range base + offset
+static uint64_t                 g_spillHandOff   = 0;
+static uint8_t*                 g_spillAgeBase   = nullptr;        // aging hand
+static uint64_t                 g_spillAgeOff    = 0;
+static volatile LONG64          g_spillBytes     = 0;       // bytes in the file right now (= commit returned)
+static volatile LONG            g_spillEvicts    = 0;
+static volatile LONG            g_spillRestores  = 0;
+static volatile LONG            g_spillEvictFail = 0;       // VirtualProtect/VirtualFree refused
+static volatile LONG            g_spillIoFail    = 0;       // WriteFile/ReadFile short or failed
+static volatile LONG            g_spillGuardHits = 0;
+static volatile LONG            g_spillGuardFail = 0;
+static volatile LONG            g_spillArmed     = 0;
+static volatile LONG            g_spillRooms     = 0;       // GhLazySpillRoom calls
+static volatile LONG            g_spillRoomFault = 0;       //   ... of which from the fault/materialise paths
+static volatile LONG            g_spillRoomShort = 0;       //   ... that could not free what was asked
+static volatile LONG            g_spillRetryOk   = 0;       // commits that succeeded only after making room
+static volatile LONG64          g_spillMs        = 0;
+static volatile LONG            g_spillLogs      = 0;
+static volatile LONG            g_spillRecommit  = 0;       // spilled granules restored under a guest MEM_COMMIT
+static volatile LONG            g_spillNtRead    = 0;       // NtReadFile buffers Materialise had to repair
+static volatile LONG            g_spillNtReadN   = 0;       // NtReadFile calls seen by the hook
+// #233 patch f. Staging buffers for fill-then-expose restores, and the in-flight
+// kernel-read table the evictor consults before it takes a granule.
+static uint8_t*                 g_spillStage     = nullptr; // GH_SPILL_STAGE_N x g_lazyGran
+static volatile LONG            g_spillStageMap  = 0;       // bit set = staging buffer in use
+static volatile LONG            g_spillStaged    = 0;       // restores that went through staging
+static volatile LONG            g_spillStageWait = 0;       // times a restore waited for a buffer
+enum { GH_SPILL_STAGE_N = 32, GH_SPILL_IO_N = 512 };
+struct GhSpillIo { volatile LONG used; const uint8_t* buf; SIZE_T len; PIO_STATUS_BLOCK io; ULONG64 t0; };
+static GhSpillIo                g_spillIo[GH_SPILL_IO_N];
+static volatile LONG            g_spillIoRec     = 0;       // reads recorded in the table
+static volatile LONG            g_spillIoFull    = 0;       // reads that found the table full
+static volatile LONG            g_spillIoSkip    = 0;       // granules the evictor left for a pending read
+// #233 patch h: diagnostics for the null-object-read class (SPILL2/4/7).
+static volatile LONG            g_spillLap[3]    = {0, 0, 0}; // evictions by clock lap
+static volatile LONG            g_spillSpin      = 0;       // faults that found the granule busy
+static volatile LONG            g_spillCrcBad    = 0;       // staged restores whose slot CRC did not match
+static volatile LONG            g_spillCrcN      = 0;       // staged restores CRC-checked
+enum { GH_SPILL_CRC_N = 1 << 17 };                          // 8 GB of 64 KB slots
+static uint32_t                 g_spillCrc[GH_SPILL_CRC_N];
+typedef DWORD (NTAPI* PFN_GhRtlCrc32)(DWORD, const void*, ULONG);
+static PFN_GhRtlCrc32           g_rtlCrc32 = nullptr;
+static DWORD GhSpillCrc(const void* p, ULONG n)
+{
+    if (!g_rtlCrc32){
+        if (HMODULE nt = GetModuleHandleW(L"ntdll.dll"))
+            g_rtlCrc32 = (PFN_GhRtlCrc32)GetProcAddress(nt, "RtlComputeCrc32");
+    }
+    return g_rtlCrc32 ? g_rtlCrc32(0, p, n) : 0;
+}
+static bool GhSpillIoPending(const uint8_t* p, uint64_t g);
+typedef struct _GH_WS_EX { PVOID VirtualAddress; ULONG_PTR Flags; } GH_WS_EX;   // Flags bit 0 = Valid
+typedef NTSTATUS (NTAPI* PFN_GhNtQueryVirtualMemory)(HANDLE, PVOID, int, PVOID, SIZE_T, PSIZE_T);
+static PFN_GhNtQueryVirtualMemory g_ntQvm = nullptr;
+// True when any page of the granule is in the working set (or when we cannot
+// tell: an unanswerable question must never evict a hot page).
+static bool GhLazyTouched(uint8_t* p, uint64_t g)
+{
+    if (!g_ntQvm){
+        g_ntQvm = (PFN_GhNtQueryVirtualMemory)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryVirtualMemory");
+        if (!g_ntQvm){ InterlockedIncrement(&g_spillGuardFail); return true; }
+    }
+    GH_WS_EX ws[64];
+    const size_t n = (size_t)((g + 4095) / 4096);
+    if (n == 0 || n > 64) return true;
+    for (size_t i = 0; i < n; ++i){ ws[i].VirtualAddress = p + i * 4096; ws[i].Flags = 0; }
+    SIZE_T got = 0;
+    const NTSTATUS st = g_ntQvm(GetCurrentProcess(), p, 4 /* MemoryWorkingSetExInformation */,
+                                ws, sizeof(GH_WS_EX) * n, &got);
+    if (st < 0){ InterlockedIncrement(&g_spillGuardFail); return true; }
+    for (size_t i = 0; i < n; ++i) if (ws[i].Flags & 1) return true;
+    return false;
+}
+static uint64_t GhLazyEvictOne(GhLazyRange& r, LONG bit);
+static bool     GhLazyRestoreLocked(uint8_t* p, uint64_t g, DWORD prot, LONG* bits, LONG* spilled,
+                                    uint32_t* slot, LONG* back, LONG bit, bool lockHeld);
+static bool     GhLazySpillRoomLocked(uint64_t need, const char* why, bool count);
 
 // #213. `lazysaved` is the container's only free variable -- appused + lazysaved
 // is a constant ~5,089 MB (GREENHOUSE.md 32.41) -- and two runs of the SAME
@@ -28078,6 +28212,26 @@ static bool GhLazyOn()
             // remaining budget is within this margin of what we still owe.
             g_lazyCash  = (uint64_t)GhCfgNumZ(L"gh_lazy_cash_mb.txt",
                                               "GH_LAZY_CASH_MB", 0) << 20;
+            // #233: user-mode page file; reserve in MB to keep free, 0 = off.
+            g_lazySpill = (uint64_t)GhCfgNumZ(L"gh_lazy_spill_mb.txt", "GH_LAZY_SPILL_MB", 0) << 20;
+            if (g_lazySpill){
+                const std::wstring path = std::wstring(kDevRoot) + L"gh_spill_" +
+                                          std::to_wstring((unsigned long)GetCurrentProcessId()) + L".bin";
+                g_spillFile = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                          CREATE_ALWAYS,
+                                          FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+                if (g_spillFile == INVALID_HANDLE_VALUE){
+                    Diag("LAZYSPILL OFF: spill file refused err=" + std::to_string((unsigned long)GetLastError()));
+                    g_lazySpill = 0;
+                } else {
+                    g_spillFree.reserve(1u << 16);          // 4 GB of 64 KB slots; never grown later
+                    g_spillStage = (uint8_t*)VirtualAlloc(nullptr, (SIZE_T)g_lazyGran * GH_SPILL_STAGE_N,
+                                                          MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                    if (!g_spillStage) Diag("LAZYSPILL staging refused err=" + std::to_string((unsigned long)GetLastError()));
+                    Diag("LAZYSPILL on reserve=" + Hex(g_lazySpill) + " gran=" + Hex(g_lazyGran) +
+                         " file=D:\\DevelopmentFiles\\gh_spill_<pid>.bin");
+                }
+            }
             g_lazyT0   = (LONG64)GetTickCount64();
             Diag("LAZY on gran=" + Hex(g_lazyGran) + " min=" + Hex(g_lazyMin) +
                  " who=" + std::to_string((unsigned long)g_lazyWho) +
@@ -28105,6 +28259,19 @@ static bool GhLazyAdd(uint8_t* base, uint64_t size, DWORD prot, uint64_t site)
         acct->base = base; acct->size = size; acct->site = site;
         acct->committed = 0; acct->firstMs = -1; acct->lastMs = -1; acct->faults = 0;
     }
+    // #233: spill state, only for ordinary read-write ranges (a restore is a
+    // kernel write into the page, and only ordinary pages are aged and restored).
+    LONG *spilled = nullptr, *guard = nullptr, *ref = nullptr, *busy = nullptr; uint32_t* slot = nullptr;
+    LONG *ever = nullptr, *back = nullptr;   // patch h
+    if (g_lazySpill && (prot ? prot : PAGE_READWRITE) == PAGE_READWRITE){
+        spilled = new LONG[(grans + 31) / 32]();
+        guard   = new LONG[(grans + 31) / 32]();
+        ref     = new LONG[(grans + 31) / 32]();
+        busy    = new LONG[(grans + 31) / 32]();
+        slot    = new uint32_t[grans]();
+        ever    = new LONG[(grans + 31) / 32]();
+        back    = new LONG[(grans + 31) / 32]();
+    }
     bool     added = false;
     AcquireSRWLockExclusive(&g_lazyLock);
     // Ranges must not overlap. GhLazyLocate binary-searches for the last range
@@ -28116,13 +28283,14 @@ static bool GhLazyAdd(uint8_t* base, uint64_t size, DWORD prot, uint64_t site)
     if (!clash){
         auto at = std::lower_bound(g_lazy.begin(), g_lazy.end(), base,
                                    [](const GhLazyRange& x, uint8_t* b){ return x.base < b; });
-        g_lazy.insert(at, GhLazyRange{ base, size, prot ? prot : PAGE_READWRITE, bits, acct });
+        g_lazy.insert(at, GhLazyRange{ base, size, prot ? prot : PAGE_READWRITE, bits, acct,
+                                       spilled, guard, ref, busy, slot, ever, back });
         InterlockedExchange(&g_lazyCount, (LONG)g_lazy.size());
         if (acct) g_lazyAcct.push_back(acct);
         added = true;
     }
     ReleaseSRWLockExclusive(&g_lazyLock);
-    if (!added){ delete[] bits; delete acct; return false; }
+    if (!added){ delete[] bits; delete acct; delete[] spilled; delete[] guard; delete[] ref; delete[] busy; delete[] slot; delete[] ever; delete[] back; return false; }
     InterlockedExchangeAdd64(&g_lazyPromised, (LONG64)size);
     return true;
 }
@@ -28146,6 +28314,8 @@ static bool GhLazyFault(void* addr, const CONTEXT* ctx)
     if (InterlockedCompareExchange(&g_lazyCount, 0, 0) == 0) return false;
     uint8_t* base = nullptr; uint64_t gsize = 0; DWORD prot = 0; LONG bit = 0; LONG* bits = nullptr;
     GhLazyAcct* acct = nullptr;
+    LONG* spilled = nullptr; LONG* busy = nullptr; uint32_t* slot = nullptr;   // #233
+    LONG* back = nullptr;   // patch h
     AcquireSRWLockShared(&g_lazyLock);
     if (GhLazyRange* r = GhLazyLocate(addr)){
         uint64_t off = (uint64_t)((uint8_t*)addr - r->base) & ~(g_lazyGran - 1);
@@ -28155,8 +28325,11 @@ static bool GhLazyFault(void* addr, const CONTEXT* ctx)
         bits  = r->bits;
         bit   = (LONG)(off / g_lazyGran);
         acct  = r->acct;
+        spilled = r->spilled; busy = r->busy; slot = r->slot; back = r->back;
     }
-    ReleaseSRWLockShared(&g_lazyLock);
+    // #233: a spill-capable range keeps the shared lock for the whole fault, so
+    // the restore / room-making below never takes it a second time.
+    if (!spilled) ReleaseSRWLockShared(&g_lazyLock);
     if (!base){
         // #218. The miss. Counting it is free; describing it is not, so the
         // VirtualQuery and the neighbour scan are capped at 64 and every miss
@@ -28205,17 +28378,47 @@ static bool GhLazyFault(void* addr, const CONTEXT* ctx)
         }
         return false;
     }
+    // #233. The granule may be spilled, or mid-evict / mid-restore on another
+    // thread. Own it first: wait out a busy flag (the holder never waits on us),
+    // then either bring it back from the file or commit it as before.
+    if (spilled){
+        if (_interlockedbittestandset(busy, bit)){
+            InterlockedIncrement(&g_spillSpin);   // patch h: somebody else is mid-evict / mid-restore here
+            while (_interlockedbittestandset(busy, bit)){ YieldProcessor(); SwitchToThread(); }
+        }
+        if (spilled[bit / 32] & (1L << (bit % 32))){
+            const bool ok = GhLazyRestoreLocked(base, gsize, prot, bits, spilled, slot, back, bit, true);
+            _interlockedbittestandreset(busy, bit);
+            ReleaseSRWLockShared(&g_lazyLock);
+            if (!ok){ InterlockedIncrement(&g_lazyFailed); return false; }
+            InterlockedIncrement(&g_lazyFaults);
+            return true;
+        }
+    }
     // Claim the granule first. Losing the race is harmless -- committing an
     // already-committed page succeeds -- it only means we must not count it.
     bool first = !_interlockedbittestandset(bits, bit);
     if (!VirtualAlloc(base, (SIZE_T)gsize, MEM_COMMIT, prot)){
-        InterlockedIncrement(&g_lazyFailed);
-        return false;                       // genuinely out of memory: report it honestly
+        // #233: the bounce. With a spill file, make room and ask once more.
+        bool again = false;
+        if (g_lazySpill){
+            InterlockedIncrement(&g_spillRoomFault);
+            const bool room = spilled ? GhLazySpillRoomLocked(gsize + (64ull << 20), "fault", true)
+                                      : GhLazySpillRoom(gsize + (64ull << 20), "fault");
+            if (room) again = VirtualAlloc(base, (SIZE_T)gsize, MEM_COMMIT, prot) != nullptr;
+        }
+        if (!again){
+            if (spilled){ _interlockedbittestandreset(busy, bit); ReleaseSRWLockShared(&g_lazyLock); }
+            InterlockedIncrement(&g_lazyFailed);
+            return false;                   // genuinely out of memory: report it honestly
+        }
+        InterlockedIncrement(&g_spillRetryOk);
     }
     if (first){
         InterlockedExchangeAdd64(&g_lazyCommitted, (LONG64)gsize);
         GhLazyNoteCommit(acct, gsize, rip, ctx);    // #213
     }
+    if (spilled){ _interlockedbittestandreset(busy, bit); ReleaseSRWLockShared(&g_lazyLock); }
     InterlockedIncrement(&g_lazyFaults);
     return true;
 }
@@ -28243,6 +28446,38 @@ static bool GhLazyMaterialise(const void* addr, SIZE_T size)
         uint64_t from = (uint64_t)(a - r.base) & ~(g_lazyGran - 1);
         uint64_t to   = ((uint64_t)(b - r.base) + g_lazyGran - 1) & ~(g_lazyGran - 1);
         if (to > r.size) to = r.size;
+        if (r.spilled){
+            // #233. Granule by granule: a spilled one must come back from the
+            // file (a blanket commit would hand the kernel a blank page); a
+            // missing one is committed as before.
+            for (uint64_t o = from; o < to; o += g_lazyGran){
+                const LONG bit = (LONG)(o / g_lazyGran);
+                const LONG m   = 1L << (bit % 32);
+                const uint64_t g = (r.size - o < g_lazyGran) ? (r.size - o) : g_lazyGran;
+                while (_interlockedbittestandset(r.busy, bit)){ YieldProcessor(); SwitchToThread(); }
+                if (r.spilled[bit / 32] & m){
+                    if (GhLazyRestoreLocked(r.base + o, g, r.prot, r.bits, r.spilled, r.slot, r.back, bit, true)) did = true;
+                    else InterlockedIncrement(&g_lazyFailed);
+                } else if (!(r.bits[bit / 32] & m)){
+                    bool ok = VirtualAlloc(r.base + o, (SIZE_T)g, MEM_COMMIT, r.prot) != nullptr;
+                    if (!ok && g_lazySpill){
+                        InterlockedIncrement(&g_spillRoomFault);
+                        if (GhLazySpillRoomLocked(g + (64ull << 20), "materialise", true))
+                            ok = VirtualAlloc(r.base + o, (SIZE_T)g, MEM_COMMIT, r.prot) != nullptr;
+                        if (ok) InterlockedIncrement(&g_spillRetryOk);
+                    }
+                    if (ok){
+                        if (!_interlockedbittestandset(r.bits, bit)){
+                            InterlockedExchangeAdd64(&g_lazyCommitted, (LONG64)g);
+                            GhLazyNoteCommit(r.acct, g, 1);     // #213: rip=1 is "kernel rescue"
+                        }
+                        did = true;
+                    }
+                }
+                _interlockedbittestandreset(r.busy, bit);
+            }
+            continue;
+        }
         if (!VirtualAlloc(r.base + from, (SIZE_T)(to - from), MEM_COMMIT, r.prot)) continue;
         for (uint64_t o = from; o < to; o += g_lazyGran)
             if (!_interlockedbittestandset(r.bits, (LONG)(o / g_lazyGran))){
@@ -28269,19 +28504,59 @@ static bool GhLazyFind(const void* p, DWORD* prot)
 
 // The guest is giving the range back. Forget it; the real VirtualFree that
 // follows releases whatever granules were actually committed.
-static void GhLazyDrop(const void* base, bool release)
+// #233: a spilled granule the guest decommits or releases is discarded -- its
+// slot goes back to the free list and its contents are gone, exactly as the
+// page's would be. Slots are recycled under g_spillLock; the list's capacity
+// was fixed when the file opened, so no push here can allocate.
+static void GhLazySpillDiscard(GhLazyRange& r, uint64_t from, uint64_t to, bool alsoCommitted)
+{
+    if (!r.spilled) return;
+    for (uint64_t o = from; o < to; o += g_lazyGran){
+        const LONG bit = (LONG)(o / g_lazyGran);
+        const LONG m   = 1L << (bit % 32);
+        const uint64_t g = (r.size - o < g_lazyGran) ? (r.size - o) : g_lazyGran;
+        if (r.busy[bit / 32] & m) continue;            // mid-flight elsewhere: leave it to its owner
+        if (r.spilled[bit / 32] & m){
+            AcquireSRWLockExclusive(&g_spillLock);
+            if (g_spillFree.size() < g_spillFree.capacity()) g_spillFree.push_back(r.slot[bit]);
+            ReleaseSRWLockExclusive(&g_spillLock);
+            _interlockedbittestandreset(r.spilled, bit);
+            InterlockedExchangeAdd64(&g_spillBytes, -(LONG64)g);
+        } else if (alsoCommitted && (r.bits[bit / 32] & m)){
+            _interlockedbittestandreset(r.bits, bit);
+            InterlockedExchangeAdd64(&g_lazyCommitted, -(LONG64)g);
+        }
+        _interlockedbittestandreset(r.guard, bit);
+        _interlockedbittestandreset(r.ref, bit);
+    }
+}
+
+static void GhLazyDrop(const void* base, SIZE_T size, bool release)
 {
     if (InterlockedCompareExchange(&g_lazyCount, 0, 0) == 0) return;
     AcquireSRWLockExclusive(&g_lazyLock);
-    for (size_t i = 0; i < g_lazy.size(); ++i){
-        if (g_lazy[i].base != (const uint8_t*)base) continue;
-        if (release){
+    if (release){
+        for (size_t i = 0; i < g_lazy.size(); ++i){
+            if (g_lazy[i].base != (const uint8_t*)base) continue;
+            GhLazySpillDiscard(g_lazy[i], 0, g_lazy[i].size, false);
             delete[] g_lazy[i].bits;
+            delete[] g_lazy[i].spilled; delete[] g_lazy[i].guard; delete[] g_lazy[i].ref;
+            delete[] g_lazy[i].busy;    delete[] g_lazy[i].slot;
+            delete[] g_lazy[i].ever;    delete[] g_lazy[i].back;
             InterlockedExchangeAdd64(&g_lazyPromised, -(LONG64)g_lazy[i].size);
             g_lazy.erase(g_lazy.begin() + i);
             InterlockedExchange(&g_lazyCount, (LONG)g_lazy.size());
+            break;
         }
-        break;
+    } else if (GhLazyRange* r = GhLazyLocate(base)){
+        // #233: MEM_DECOMMIT of part (or, with size 0, all) of a promised range.
+        // Whole granules inside the span lose their spilled contents and their
+        // committed bit; the OS decommit that follows this call does the rest.
+        const uint64_t off  = (uint64_t)((const uint8_t*)base - r->base);
+        const uint64_t from = size ? ((off + g_lazyGran - 1) & ~(g_lazyGran - 1)) : 0;
+        uint64_t       to   = size ? ((off + size) & ~(g_lazyGran - 1)) : r->size;
+        if (to > r->size) to = r->size;
+        if (from < to) GhLazySpillDiscard(*r, from, to, true);
     }
     ReleaseSRWLockExclusive(&g_lazyLock);
 }
@@ -28291,7 +28566,36 @@ static std::string GhLazyStats()
     if (InterlockedCompareExchange(&g_lazyCount, 0, 0) == 0 && !g_lazyOn) return std::string();
     LONG64 promised  = InterlockedCompareExchange64(&g_lazyPromised, 0, 0);
     LONG64 committed = InterlockedCompareExchange64(&g_lazyCommitted, 0, 0);
-    return " lazypromised=" + Hex((uint64_t)promised) +
+    std::string sp;
+    if (g_lazySpill)
+        sp = " lazyspilled=" + Hex((uint64_t)InterlockedCompareExchange64(&g_spillBytes, 0, 0)) +
+             " spillev=" + std::to_string((long)InterlockedCompareExchange(&g_spillEvicts, 0, 0)) +
+             " spillrs=" + std::to_string((long)InterlockedCompareExchange(&g_spillRestores, 0, 0)) +
+             " spillaged=" + std::to_string((long)InterlockedCompareExchange(&g_spillGuardHits, 0, 0)) +
+             "/" + std::to_string((long)InterlockedCompareExchange(&g_spillArmed, 0, 0)) +
+             " spillrooms=" + std::to_string((long)InterlockedCompareExchange(&g_spillRooms, 0, 0)) +
+             "/" + std::to_string((long)InterlockedCompareExchange(&g_spillRoomFault, 0, 0)) +
+             "/" + std::to_string((long)InterlockedCompareExchange(&g_spillRoomShort, 0, 0)) +
+             " spillretry=" + std::to_string((long)InterlockedCompareExchange(&g_spillRetryOk, 0, 0)) +
+             " spillfail=" + std::to_string((long)InterlockedCompareExchange(&g_spillEvictFail, 0, 0)) +
+             "/" + std::to_string((long)InterlockedCompareExchange(&g_spillIoFail, 0, 0)) +
+             "/" + std::to_string((long)InterlockedCompareExchange(&g_spillGuardFail, 0, 0)) +
+             " spillms=" + std::to_string((long long)InterlockedCompareExchange64(&g_spillMs, 0, 0)) +
+             " spillrecommit=" + std::to_string((long)InterlockedCompareExchange(&g_spillRecommit, 0, 0)) +
+             " spillntread=" + std::to_string((long)InterlockedCompareExchange(&g_spillNtRead, 0, 0)) +
+             "/" + std::to_string((long)InterlockedCompareExchange(&g_spillNtReadN, 0, 0)) +
+             " spillstage=" + std::to_string((long)InterlockedCompareExchange(&g_spillStaged, 0, 0)) +
+             "/" + std::to_string((long)InterlockedCompareExchange(&g_spillStageWait, 0, 0)) +
+             " spillio=" + std::to_string((long)InterlockedCompareExchange(&g_spillIoSkip, 0, 0)) +
+             "/" + std::to_string((long)InterlockedCompareExchange(&g_spillIoRec, 0, 0)) +
+             "/" + std::to_string((long)InterlockedCompareExchange(&g_spillIoFull, 0, 0)) +
+             " spilllap=" + std::to_string((long)InterlockedCompareExchange(&g_spillLap[0], 0, 0)) +
+             "/" + std::to_string((long)InterlockedCompareExchange(&g_spillLap[1], 0, 0)) +
+             "/" + std::to_string((long)InterlockedCompareExchange(&g_spillLap[2], 0, 0)) +
+             " spillspin=" + std::to_string((long)InterlockedCompareExchange(&g_spillSpin, 0, 0)) +
+             " spillcrc=" + std::to_string((long)InterlockedCompareExchange(&g_spillCrcBad, 0, 0)) +
+             "/" + std::to_string((long)InterlockedCompareExchange(&g_spillCrcN, 0, 0));
+    return sp + " lazypromised=" + Hex((uint64_t)promised) +
            " lazycommitted=" + Hex((uint64_t)committed) +
            " lazysaved=" + Hex((uint64_t)(promised > committed ? promised - committed : 0)) +
            " lazyfaults=" + std::to_string((long)InterlockedCompareExchange(&g_lazyFaults, 0, 0)) +
@@ -28333,6 +28637,7 @@ static void GhLazyCashIn()
         for (uint64_t o = 0; o < r.size; o += g_lazyGran){
             const LONG bit = (LONG)(o / g_lazyGran);
             if (r.bits[bit / 32] & (1L << (bit % 32))) continue;      // already landed
+            if (r.spilled && (r.spilled[bit / 32] & (1L << (bit % 32)))) continue;   // #233: in the file
             const uint64_t g = (r.size - o < g_lazyGran) ? (r.size - o) : g_lazyGran;
             if (!VirtualAlloc(r.base + o, (SIZE_T)g, MEM_COMMIT, r.prot)){
                 failed = GetLastError(); stop = true; break;          // the bank is empty
@@ -28351,6 +28656,499 @@ static void GhLazyCashIn()
              " owed=" + Hex(owed) + " margin=" + Hex(g_lazyCash) +
              " committed=" + Hex(done) + " granules=" + std::to_string((long)grans) +
              " failed=" + Hex(failed) + " ms=" + std::to_string((unsigned long long)((uint64_t)GetTickCount64() - t0)));
+}
+
+// ---- #233 spill: evict / restore / clock / aging ---------------------------
+static bool GhLazySpillOn() { return g_lazySpill != 0 && g_spillFile != INVALID_HANDLE_VALUE; }
+
+// Evict one committed granule to the spill file. Caller holds g_lazyLock
+// (shared) and the range has spill state. Returns the bytes returned to the
+// container, 0 if the granule was not ours to take. Readers keep reading while
+// the copy is taken (PAGE_READONLY); a writer faults into GhLazyFault, sees the
+// busy bit and waits for the granule to settle -- as spilled, which it then
+// restores. Nothing can land in the page between the copy and the decommit.
+static uint64_t GhLazyEvictOne(GhLazyRange& r, LONG bit)
+{
+    if (!r.spilled) return 0;
+    const LONG m = 1L << (bit % 32);
+    if (_interlockedbittestandset(r.busy, bit)) return 0;
+    if (!(r.bits[bit / 32] & m) || (r.spilled[bit / 32] & m)){
+        _interlockedbittestandreset(r.busy, bit); return 0;
+    }
+    const uint64_t o = (uint64_t)bit * g_lazyGran;
+    const uint64_t g = (r.size - o < g_lazyGran) ? (r.size - o) : g_lazyGran;
+    uint8_t* p = r.base + o;
+    DWORD old = 0;
+    if (!VirtualProtect(p, (SIZE_T)g, PAGE_READONLY, &old)){
+        InterlockedIncrement(&g_spillEvictFail);
+        _interlockedbittestandreset(r.guard, bit);
+        _interlockedbittestandreset(r.busy, bit); return 0;
+    }
+    uint32_t s = 0;
+    AcquireSRWLockExclusive(&g_spillLock);
+    if (!g_spillFree.empty()){ s = g_spillFree.back(); g_spillFree.pop_back(); } else s = g_spillNext++;
+    ReleaseSRWLockExclusive(&g_spillLock);
+    OVERLAPPED ov{}; const uint64_t fo = (uint64_t)s * g_lazyGran;
+    ov.Offset = (DWORD)fo; ov.OffsetHigh = (DWORD)(fo >> 32);
+    DWORD wrote = 0;
+    const DWORD crc = GhSpillCrc(p, (ULONG)g);   // patch h: the page is READONLY here, nobody writes it
+    const bool ok = WriteFile(g_spillFile, p, (DWORD)g, &wrote, &ov) && wrote == (DWORD)g;
+    if (!ok || !VirtualFree(p, (SIZE_T)g, MEM_DECOMMIT)){
+        InterlockedIncrement(ok ? &g_spillEvictFail : &g_spillIoFail);
+        DWORD o2 = 0; VirtualProtect(p, (SIZE_T)g, r.prot, &o2);
+        AcquireSRWLockExclusive(&g_spillLock);
+        if (g_spillFree.size() < g_spillFree.capacity()) g_spillFree.push_back(s);
+        ReleaseSRWLockExclusive(&g_spillLock);
+        _interlockedbittestandreset(r.guard, bit);
+        _interlockedbittestandreset(r.busy, bit); return 0;
+    }
+    r.slot[bit] = s;
+    if (s < GH_SPILL_CRC_N) g_spillCrc[s] = crc;
+    if (r.ever) _interlockedbittestandset(r.ever, bit);
+    _interlockedbittestandset(r.spilled, bit);
+    _interlockedbittestandreset(r.bits, bit);
+    _interlockedbittestandreset(r.guard, bit);
+    _interlockedbittestandreset(r.ref, bit);
+    InterlockedExchangeAdd64(&g_lazyCommitted, -(LONG64)g);
+    InterlockedExchangeAdd64(&g_spillBytes, (LONG64)g);
+    InterlockedIncrement(&g_spillEvicts);
+    _interlockedbittestandreset(r.busy, bit);
+    return g;
+}
+
+// Bring a spilled granule back. Caller owns the granule's busy bit. lockHeld
+// says whether g_lazyLock is already held (shared) by this thread -- SRW locks
+// do not recurse, so the room-maker must not take it twice.
+static bool GhLazyRestoreLocked(uint8_t* p, uint64_t g, DWORD prot, LONG* bits, LONG* spilled,
+                                uint32_t* slot, LONG* back, LONG bit, bool lockHeld)
+{
+    // Patch f. SPILL2 and SPILL4 both died reading a NULL object pointer out of
+    // pool memory with every counter clean: a second thread that touches a
+    // granule while its restorer is between VirtualAlloc(MEM_COMMIT) and the end
+    // of the ReadFile does NOT fault -- the page is committed and readable -- and
+    // gets the zero page. Fill-then-expose: commit PAGE_NOACCESS (any other
+    // thread faults into the busy spin), read the slot into a staging buffer,
+    // then expose and copy. The remaining window is one 64 KB memcpy.
+    const bool stage = g_spillStage != nullptr;
+    const DWORD cprot = stage ? PAGE_NOACCESS : prot;
+    if (!VirtualAlloc(p, (SIZE_T)g, MEM_COMMIT, cprot)){
+        InterlockedIncrement(&g_spillRoomFault);
+        const bool room = lockHeld ? GhLazySpillRoomLocked(g + (64ull << 20), "restore", true)
+                                   : GhLazySpillRoom(g + (64ull << 20), "restore");
+        if (!room || !VirtualAlloc(p, (SIZE_T)g, MEM_COMMIT, cprot)) return false;
+        InterlockedIncrement(&g_spillRetryOk);
+    }
+    const uint32_t s = slot[bit];
+    OVERLAPPED ov{}; const uint64_t fo = (uint64_t)s * g_lazyGran;
+    ov.Offset = (DWORD)fo; ov.OffsetHigh = (DWORD)(fo >> 32);
+    DWORD got = 0;
+    if (stage){
+        int sb = -1;
+        for (;;){
+            for (int i = 0; i < GH_SPILL_STAGE_N; ++i)
+                if (!_interlockedbittestandset(&g_spillStageMap, i)){ sb = i; break; }
+            if (sb >= 0) break;
+            InterlockedIncrement(&g_spillStageWait);
+            SwitchToThread();
+        }
+        uint8_t* st = g_spillStage + (size_t)sb * g_lazyGran;
+        const bool rd = ReadFile(g_spillFile, st, (DWORD)g, &got, &ov) && got == (DWORD)g;
+        if (rd && s < GH_SPILL_CRC_N && g_rtlCrc32){                 // patch h: the file round trip, checked
+            InterlockedIncrement(&g_spillCrcN);
+            if (GhSpillCrc(st, (ULONG)g) != g_spillCrc[s]){
+                if (InterlockedIncrement(&g_spillCrcBad) <= 8)
+                    Diag("LAZYSPILL CRC MISMATCH p=" + Hex((uint64_t)(uintptr_t)p) + " slot=" + std::to_string(s));
+            }
+        }
+        DWORD o2 = 0;
+        const bool ex = rd && VirtualProtect(p, (SIZE_T)g, prot, &o2);
+        if (ex) memcpy(p, st, (size_t)g);
+        _interlockedbittestandreset(&g_spillStageMap, sb);
+        if (!ex){
+            InterlockedIncrement(rd ? &g_spillEvictFail : &g_spillIoFail);
+            return false;
+        }
+        InterlockedIncrement(&g_spillStaged);
+    } else if (!ReadFile(g_spillFile, p, (DWORD)g, &got, &ov) || got != (DWORD)g){
+        // The page is committed but blank. Report the fault rather than hand the
+        // guest silent zeroes; the counter names the cause.
+        InterlockedIncrement(&g_spillIoFail);
+        return false;
+    }
+    AcquireSRWLockExclusive(&g_spillLock);
+    if (g_spillFree.size() < g_spillFree.capacity()) g_spillFree.push_back(s);
+    ReleaseSRWLockExclusive(&g_spillLock);
+    _interlockedbittestandreset(spilled, bit);
+    _interlockedbittestandset(bits, bit);
+    InterlockedExchangeAdd64(&g_lazyCommitted, (LONG64)g);
+    InterlockedExchangeAdd64(&g_spillBytes, -(LONG64)g);
+    InterlockedIncrement(&g_spillRestores);
+    if (back) _interlockedbittestandset(back, bit);   // patch h
+    return true;
+}
+
+// The eviction clock. Caller holds g_lazyLock shared. Walks the granules from
+// the hand, three laps at most: lap 0 takes only granules whose guard is still
+// armed (aged and untouched since), lap 1 also the touched-since-armed ones,
+// lap 2 anything committed. One thread at a time; a second caller waits for the
+// first and reports its outcome. No Diag here: this runs inside the VEH.
+static bool GhLazySpillRoomLocked(uint64_t need, const char* why, bool count)
+{
+    (void)why;
+    if (!GhLazySpillOn() || g_lazy.empty()) return false;
+    if (need > (1ull << 30)) need = 1ull << 30;
+    static volatile LONG inRoom = 0;
+    if (InterlockedCompareExchange(&inRoom, 1, 0) != 0){
+        while (InterlockedCompareExchange(&inRoom, 0, 0)){ YieldProcessor(); SwitchToThread(); }
+        return true;
+    }
+    const uint64_t t0 = GetTickCount64();
+    if (count) InterlockedIncrement(&g_spillRooms);
+    uint64_t freed = 0; LONG grans = 0; int lap = 0;
+    size_t ri = 0; uint64_t off = 0;
+    {
+        AcquireSRWLockExclusive(&g_spillLock);
+        auto it = std::lower_bound(g_lazy.begin(), g_lazy.end(), g_spillHandBase,
+                                   [](const GhLazyRange& x, uint8_t* b){ return x.base < b; });
+        if (it == g_lazy.end()){ it = g_lazy.begin(); off = 0; }
+        else off = (it->base == g_spillHandBase) ? g_spillHandOff : 0;
+        ri = (size_t)(it - g_lazy.begin());
+        ReleaseSRWLockExclusive(&g_spillLock);
+    }
+    uint64_t total = 0;
+    for (auto& r : g_lazy) total += (r.size + g_lazyGran - 1) / g_lazyGran;
+    uint64_t visited = 0;
+    while (freed < need && total){
+        lap = (int)(visited / total);
+        if (lap >= 3) break;
+        GhLazyRange& r = g_lazy[ri];
+        if (off >= r.size){ off = 0; ri = (ri + 1) % g_lazy.size(); continue; }
+        ++visited;
+        const LONG bit = (LONG)(off / g_lazyGran);
+        const LONG m   = 1L << (bit % 32);
+        if (r.spilled && (r.bits[bit / 32] & m) && !(r.spilled[bit / 32] & m)){
+            const bool aged = (r.guard[bit / 32] & m) != 0;
+            bool take = lap >= 2 || (lap == 1 && aged);
+            if (!take && lap == 0 && aged){
+                const uint64_t g = (r.size - off < g_lazyGran) ? (r.size - off) : g_lazyGran;
+                take = !GhLazyTouched(r.base + off, g);
+                if (!take) InterlockedIncrement(&g_spillGuardHits);     // aged but back in the working set
+            }
+            if (take){
+                const uint64_t g0 = (r.size - off < g_lazyGran) ? (r.size - off) : g_lazyGran;
+                if (GhSpillIoPending(r.base + off, g0)){ InterlockedIncrement(&g_spillIoSkip); take = false; }
+            }
+            if (take){
+                const uint64_t g = GhLazyEvictOne(r, bit);
+                if (g){ freed += g; ++grans; InterlockedIncrement(&g_spillLap[lap < 2 ? lap : 2]); }
+            }
+        }
+        off += g_lazyGran;
+    }
+    AcquireSRWLockExclusive(&g_spillLock);
+    g_spillHandBase = g_lazy[ri].base; g_spillHandOff = off;
+    ReleaseSRWLockExclusive(&g_spillLock);
+    if (count && freed < need) InterlockedIncrement(&g_spillRoomShort);
+    InterlockedExchangeAdd64(&g_spillMs, (LONG64)(GetTickCount64() - t0));
+    InterlockedExchange(&inRoom, 0);
+    (void)grans; (void)lap;
+    return freed > 0;
+}
+
+// Patch g (SPILL5). A room is disk-bound -- ~80 MB/s to D: -- and used to hold
+// the shared pager lock for its whole length. One exclusive waiter (the guest
+// promising a new pool) then queues EVERY later shared acquirer behind it: every
+// pager fault on every thread, for seconds. SPILL5's first room took 3.8 s, the
+// frame took 3.8 s, the GPU queues sat on CPU-signalled fences, and the driver
+// declared 0x887A0006. So the lock is now taken per 8 MB chunk, with a yield
+// between chunks; the hand persists in g_spillHandBase/Off, so the clock
+// continues where it left off. The fault-path room (lock already held) is
+// unchanged: it is rare and bounded by its own need.
+static bool GhLazySpillRoom(uint64_t need, const char* why)
+{
+    if (!GhLazySpillOn() || InterlockedCompareExchange(&g_lazyCount, 0, 0) == 0) return false;
+    if (need > (1ull << 30)) need = 1ull << 30;
+    InterlockedIncrement(&g_spillRooms);
+    const uint64_t before = (uint64_t)InterlockedCompareExchange64(&g_spillBytes, 0, 0);
+    uint64_t done = 0; bool any = false;
+    while (done < need){
+        const uint64_t chunk = (need - done < (8ull << 20)) ? need - done : (8ull << 20);
+        const uint64_t b0 = (uint64_t)InterlockedCompareExchange64(&g_spillBytes, 0, 0);
+        AcquireSRWLockShared(&g_lazyLock);
+        const bool r = GhLazySpillRoomLocked(chunk, why, false);
+        ReleaseSRWLockShared(&g_lazyLock);
+        const uint64_t b1 = (uint64_t)InterlockedCompareExchange64(&g_spillBytes, 0, 0);
+        if (!r || b1 <= b0) break;                       // the clock found nothing more to take
+        any = true; done += b1 - b0;
+        SwitchToThread();
+    }
+    const uint64_t after = (uint64_t)InterlockedCompareExchange64(&g_spillBytes, 0, 0);
+    if (after < before + need) InterlockedIncrement(&g_spillRoomShort);
+    return any;
+}
+
+// #233 (SPILL2's crash). The guest re-commits sub-ranges of its own pools all
+// the time (the arena's commit-in-slice path sees it thousands of times). A
+// real MEM_COMMIT over a SPILLED granule zero-fills it while our state still
+// says "in the file", and the guest then reads zeroes where its data was --
+// SPILL2 died on a null table pointer read from an object in pool memory, on
+// two threads at once. So a commit landing on a spill-capable range restores
+// its spilled granules first; untouched promises are left alone (the real
+// commit that follows gives them zeroes, which is what a promise means).
+static LONG GhLazyRestoreSpan(const void* addr, SIZE_T size)
+{
+    if (!GhLazySpillOn() || !addr || !size) return 0;
+    if (InterlockedCompareExchange(&g_lazyCount, 0, 0) == 0) return 0;
+    uint8_t* lo = (uint8_t*)addr;
+    uint8_t* hi = lo + size;
+    LONG n = 0;
+    AcquireSRWLockShared(&g_lazyLock);
+    for (auto& r : g_lazy){
+        if (!r.spilled) continue;
+        uint8_t* a = r.base > lo ? r.base : lo;
+        uint8_t* b = (r.base + r.size) < hi ? (r.base + r.size) : hi;
+        if (a >= b) continue;
+        uint64_t from = (uint64_t)(a - r.base) & ~(g_lazyGran - 1);
+        uint64_t to   = ((uint64_t)(b - r.base) + g_lazyGran - 1) & ~(g_lazyGran - 1);
+        if (to > r.size) to = r.size;
+        for (uint64_t o = from; o < to; o += g_lazyGran){
+            const LONG bit = (LONG)(o / g_lazyGran);
+            const LONG m   = 1L << (bit % 32);
+            if (!(r.spilled[bit / 32] & m)) continue;          // cheap pre-check without busy
+            const uint64_t g = (r.size - o < g_lazyGran) ? (r.size - o) : g_lazyGran;
+            while (_interlockedbittestandset(r.busy, bit)){ YieldProcessor(); SwitchToThread(); }
+            if (r.spilled[bit / 32] & m){
+                if (GhLazyRestoreLocked(r.base + o, g, r.prot, r.bits, r.spilled, r.slot, r.back, bit, true)) ++n;
+                else InterlockedIncrement(&g_lazyFailed);
+            }
+            _interlockedbittestandreset(r.busy, bit);
+        }
+    }
+    ReleaseSRWLockShared(&g_lazyLock);
+    if (n) InterlockedExchangeAdd(&g_spillRecommit, n);
+    return n;
+}
+
+
+// #233 patch h. At a fatal guest fault, say what the pager knows about every
+// register that points into a promised range -- was the granule ever evicted,
+// ever restored, is it spilled or busy right now -- and show the first 192
+// bytes it points at. SPILL2/4/7 died reading a null table pointer out of an
+// object that looked zero-filled; this says whether the pager ever had it.
+static void GhLazyDescribeReg(const char* name, uint64_t v)
+{
+    if (InterlockedCompareExchange(&g_lazyCount, 0, 0) == 0) return;
+    if (!TryAcquireSRWLockShared(&g_lazyLock)) return;      // never wait inside the VEH
+    std::string out;
+    if (GhLazyRange* r = GhLazyLocate((void*)(uintptr_t)v)){
+        const uint64_t off = (uint64_t)((uint8_t*)(uintptr_t)v - r->base);
+        const LONG bit = (LONG)(off / g_lazyGran);
+        const LONG m   = 1L << (bit % 32);
+        out = std::string("  LAZYREG ") + name + "=" + Hex(v) +
+              " range=" + Hex((uint64_t)(uintptr_t)r->base) + "+" + Hex(r->size) +
+              " gran=" + std::to_string((long)bit) +
+              " committed=" + ((r->bits[bit / 32] & m) ? "1" : "0");
+        if (r->spilled)
+            out += std::string(" spilled=") + ((r->spilled[bit / 32] & m) ? "1" : "0") +
+                   " busy=" + ((r->busy[bit / 32] & m) ? "1" : "0") +
+                   " aged=" + ((r->guard[bit / 32] & m) ? "1" : "0") +
+                   " ever=" + ((r->ever && (r->ever[bit / 32] & m)) ? "1" : "0") +
+                   " back=" + ((r->back && (r->back[bit / 32] & m)) ? "1" : "0") +
+                   " slot=" + std::to_string((unsigned long)r->slot[bit]);
+        else out += " spill=n/a";
+    }
+    ReleaseSRWLockShared(&g_lazyLock);
+    if (out.empty()) return;
+    Diag(out);
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery((LPCVOID)(uintptr_t)v, &mbi, sizeof mbi) == sizeof mbi && mbi.State == MEM_COMMIT &&
+        (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))){
+        const uint64_t* q = (const uint64_t*)(uintptr_t)(v & ~7ull);
+        const uint64_t end = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        for (int row = 0; row < 3; ++row){
+            std::string l = "    +" + Hex((uint64_t)(row * 64)) + ":";
+            for (int k = 0; k < 8; ++k){
+                const uint64_t* e = q + row * 8 + k;
+                if ((uint64_t)(uintptr_t)(e + 1) > end) break;
+                l += " " + Hex(*e);
+            }
+            Diag(l);
+        }
+    }
+}
+
+// #233. The kernel writing into a spilled (decommitted) page fails the I/O
+// with no fault anyone can catch. The Win32 ReadFile beds already materialise
+// their buffers; this catches the callers that go to ntdll directly -- the
+// game's DirectStorage runtime (dstoragecore.dll) among them -- by patching
+// NtReadFile in the import tables of the modules that import it. Our own reads
+// of the spill file pass straight through: they happen with the granule's busy
+// bit held, and a Materialise on that buffer would wait for itself.
+typedef NTSTATUS (NTAPI* PFN_GhNtReadFile)(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK,
+                                           PVOID, ULONG, PLARGE_INTEGER, PULONG);
+static PFN_GhNtReadFile g_ntReadOrig = nullptr;
+// Patch f: the in-flight table. A kernel read locks its destination pages at
+// issue time and writes them at completion -- for DirectStorage that is an
+// overlapped ReadFile completing on an I/O completion port seconds later. A
+// granule evicted in between keeps the file copy (pre-read bytes) and the read's
+// data lands in physical pages nobody maps any more. Record the buffer before
+// the call; release it on synchronous completion; for STATUS_PENDING leave it
+// and let the evictor read the IOSB (through ReadProcessMemory, so a caller that
+// freed its OVERLAPPED after completion cannot fault the sampler).
+static int GhSpillIoRecord(const void* buf, SIZE_T len, PIO_STATUS_BLOCK io)
+{
+    for (int i = 0; i < GH_SPILL_IO_N; ++i){
+        if (InterlockedCompareExchange(&g_spillIo[i].used, 1, 0) == 0){
+            g_spillIo[i].buf = (const uint8_t*)buf; g_spillIo[i].len = len;
+            g_spillIo[i].io = io; g_spillIo[i].t0 = GetTickCount64();
+            MemoryBarrier();
+            InterlockedExchange(&g_spillIo[i].used, 2);       // 2 = visible to the evictor
+            InterlockedIncrement(&g_spillIoRec);
+            return i;
+        }
+    }
+    InterlockedIncrement(&g_spillIoFull);
+    return -1;
+}
+static void GhSpillIoRelease(int i)
+{
+    if (i >= 0) InterlockedExchange(&g_spillIo[i].used, 0);
+}
+// Evictor side. True if a recorded read still pending overlaps [p, p+g).
+static bool GhSpillIoPending(const uint8_t* p, uint64_t g)
+{
+    const ULONG64 now = GetTickCount64();
+    for (int i = 0; i < GH_SPILL_IO_N; ++i){
+        if (InterlockedCompareExchange(&g_spillIo[i].used, 0, 0) != 2) continue;
+        const uint8_t* b = g_spillIo[i].buf; const SIZE_T l = g_spillIo[i].len;
+        if (b >= p + g || b + l <= p) continue;
+        // Overlaps. Still pending?
+        NTSTATUS st = 0; SIZE_T got = 0;
+        const bool readable = g_spillIo[i].io &&
+            ReadProcessMemory(GetCurrentProcess(), (const void*)&g_spillIo[i].io->Status, &st, sizeof st, &got) &&
+            got == sizeof st;
+        if (readable && st == (NTSTATUS)0x103 /*STATUS_PENDING*/ && now - g_spillIo[i].t0 < 60000) return true;
+        InterlockedExchange(&g_spillIo[i].used, 0);           // completed, unreadable or stale: drop it
+    }
+    return false;
+}
+static NTSTATUS NTAPI Hook_GhNtReadFile(HANDLE h, HANDLE ev, PVOID apc, PVOID ctx, PIO_STATUS_BLOCK io,
+                                        PVOID buf, ULONG len, PLARGE_INTEGER off, PULONG key)
+{
+    int rec = -1;
+    if (buf && len && h != g_spillFile && GhLazySpillOn()){
+        InterlockedIncrement(&g_spillNtReadN);
+        rec = GhSpillIoRecord(buf, (SIZE_T)len, io);
+        if (GhLazyMaterialise(buf, (SIZE_T)len)) InterlockedIncrement(&g_spillNtRead);
+    }
+    if (!g_ntReadOrig){
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        g_ntReadOrig = nt ? (PFN_GhNtReadFile)GetProcAddress(nt, "NtReadFile") : nullptr;
+        if (!g_ntReadOrig){ GhSpillIoRelease(rec); return (NTSTATUS)0xC0000001L; }    // STATUS_UNSUCCESSFUL, never expected
+    }
+    const NTSTATUS st = g_ntReadOrig(h, ev, apc, ctx, io, buf, len, off, key);
+    if (st != (NTSTATUS)0x103 /*STATUS_PENDING*/) GhSpillIoRelease(rec);
+    return st;
+}
+static void GhLazySpillHookNtRead()
+{
+    static unsigned patched = 0;
+    static const wchar_t* mods[] = { L"kernelbase.dll", L"dstoragecore.dll", L"dstorage.dll", L"kernel32.dll" };
+    for (unsigned i = 0; i < 4; ++i){
+        if (patched & (1u << i)) continue;
+        HMODULE h = GetModuleHandleW(mods[i]);
+        if (!h) continue;
+        PFN_GhNtReadFile orig = nullptr;
+        if (GhPatchHostImport(h, "NtReadFile", (void*)&Hook_GhNtReadFile, (void**)&orig)){
+            if (orig && !g_ntReadOrig) g_ntReadOrig = orig;
+            patched |= 1u << i;
+            Diag(std::string("LAZYSPILL NtReadFile hooked in ") + (i == 0 ? "kernelbase.dll" : i == 1 ? "dstoragecore.dll" : i == 2 ? "dstorage.dll" : "kernel32.dll"));
+        } else {
+            patched |= 1u << i;          // module present but no such import: do not ask again
+            Diag(std::string("LAZYSPILL NtReadFile not imported by ") + (i == 0 ? "kernelbase.dll" : i == 1 ? "dstoragecore.dll" : i == 2 ? "dstorage.dll" : "kernel32.dll"));
+        }
+    }
+    if (!g_ntReadOrig){
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        if (nt) g_ntReadOrig = (PFN_GhNtReadFile)GetProcAddress(nt, "NtReadFile");
+    }
+}
+
+// Sampler thread, once per MEMORY sample. Two jobs: age a slice (drop up to
+// 4,096 committed granules from the working set, from the aging hand -- 256 MB
+// at 64 KB, so the whole set is re-aged every ~7 samples) and keep the reserve
+// (if the container's remaining budget is under gh_lazy_spill_mb, evict cold
+// granules until it is not).
+static void GhLazySpillReserve()
+{
+    if (!GhLazySpillOn()) return;
+    GhLazySpillHookNtRead();
+    if (InterlockedCompareExchange(&g_lazyCount, 0, 0) == 0) return;
+    const uint64_t t0 = GetTickCount64();
+    LONG armed = 0;
+    AcquireSRWLockShared(&g_lazyLock);
+    if (!g_lazy.empty()){
+        size_t ri = 0; uint64_t off = 0;
+        {
+            AcquireSRWLockExclusive(&g_spillLock);
+            auto it = std::lower_bound(g_lazy.begin(), g_lazy.end(), g_spillAgeBase,
+                                       [](const GhLazyRange& x, uint8_t* b){ return x.base < b; });
+            if (it == g_lazy.end()){ it = g_lazy.begin(); off = 0; }
+            else off = (it->base == g_spillAgeBase) ? g_spillAgeOff : 0;
+            ri = (size_t)(it - g_lazy.begin());
+            ReleaseSRWLockExclusive(&g_spillLock);
+        }
+        uint64_t total = 0;
+        for (auto& r : g_lazy) total += (r.size + g_lazyGran - 1) / g_lazyGran;
+        uint64_t visited = 0;
+        while (visited < total && armed < 4096){
+            GhLazyRange& r = g_lazy[ri];
+            if (off >= r.size){ off = 0; ri = (ri + 1) % g_lazy.size(); continue; }
+            ++visited;
+            const LONG bit = (LONG)(off / g_lazyGran);
+            const LONG m   = 1L << (bit % 32);
+            if (r.spilled && (r.bits[bit / 32] & m) && !(r.spilled[bit / 32] & m) &&
+                !_interlockedbittestandset(r.busy, bit)){
+                if ((r.bits[bit / 32] & m) && !(r.spilled[bit / 32] & m)){
+                    const uint64_t g = (r.size - off < g_lazyGran) ? (r.size - off) : g_lazyGran;
+                    // ERROR_NOT_LOCKED is the documented answer; the pages are
+                    // out of the working set either way.
+                    VirtualUnlock(r.base + off, (SIZE_T)g);
+                    _interlockedbittestandset(r.guard, bit);
+                    _interlockedbittestandreset(r.ref, bit);
+                    ++armed;
+                }
+                _interlockedbittestandreset(r.busy, bit);
+            }
+            off += g_lazyGran;
+        }
+        AcquireSRWLockExclusive(&g_spillLock);
+        g_spillAgeBase = g_lazy[ri].base; g_spillAgeOff = off;
+        ReleaseSRWLockExclusive(&g_spillLock);
+    }
+    InterlockedExchangeAdd(&g_spillArmed, armed);
+    // The reserve.
+    uint64_t used = 0, lim = 0;
+    GhAppBudget(&used, &lim);
+    uint64_t rem = (lim && used < lim) ? lim - used : 0;
+    uint64_t freedBefore = (uint64_t)InterlockedCompareExchange64(&g_spillBytes, 0, 0);
+    bool room = false; uint64_t need = 0;
+    ReleaseSRWLockShared(&g_lazyLock);
+    if (lim && rem < g_lazySpill){
+        need = g_lazySpill - rem + (32ull << 20);
+        room = GhLazySpillRoom(need, "reserve");         // patch g: chunked, lock per 8 MB
+    }
+    if (need){
+        const LONG nl = InterlockedIncrement(&g_spillLogs);
+        const uint64_t after = (uint64_t)InterlockedCompareExchange64(&g_spillBytes, 0, 0);
+        if (nl <= 96 || (nl % 32) == 0)
+            Diag("LAZYSPILL reserve remaining=" + Hex(rem) + " need=" + Hex(need) +
+                 " freed=" + Hex(after > freedBefore ? after - freedBefore : 0) +
+                 " room=" + std::to_string(room ? 1 : 0) +
+                 " spilled=" + Hex(after) + " armed=" + std::to_string((long)armed) +
+                 " short=" + std::to_string((long)InterlockedCompareExchange(&g_spillRoomShort, 0, 0)) +
+                 " ms=" + std::to_string((unsigned long long)(GetTickCount64() - t0)));
+    }
 }
 
 // #213. One line per promised range, largest committed first, plus the top
@@ -28554,6 +29352,8 @@ static LPVOID WINAPI Bed_VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWOR
             }
         }
     }
+    // #233: a commit over a spilled granule must bring the data back first.
+    if (addr && (type & MEM_COMMIT) && GhLazySpillOn()) GhLazyRestoreSpan(addr, size);
     // #145 demand-commit. Answer a big MEM_COMMIT with a promise instead of
     // memory. Only when the whole span is one reserved, uncommitted region --
     // shadowing memory that is already live would be a silent corruption, and
@@ -28622,7 +29422,7 @@ static BOOL WINAPI Bed_VirtualFree(LPVOID addr, SIZE_T size, DWORD type)
     }
     // #145. Drop the promise before the real free; what was actually committed
     // is ordinary private commit and VirtualFree handles it normally.
-    if (type & (MEM_RELEASE | MEM_DECOMMIT)) GhLazyDrop(addr, (type & MEM_RELEASE) != 0);
+    if (type & (MEM_RELEASE | MEM_DECOMMIT)) GhLazyDrop(addr, size, (type & MEM_RELEASE) != 0);
     size_t known = 0;
     {
         std::lock_guard<std::mutex> lk(g_bigAllocMx);
@@ -31181,6 +31981,14 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
     Diag("  r8=" + Hex(c->R8) + " r9=" + Hex(c->R9) + " r12=" + Hex(c->R12) +
          " r14=" + Hex(c->R14) + " r15=" + Hex(c->R15));
     Diag("  tid=" + std::to_string(GetCurrentThreadId()) + " rip=" + Hex(c->Rip));
+    {   // patch h: the pager's view of every register
+        struct { const char* n; uint64_t v; } regs[] = {
+            {"rax", c->Rax}, {"rbx", c->Rbx}, {"rcx", c->Rcx}, {"rdx", c->Rdx},
+            {"rsi", c->Rsi}, {"rdi", c->Rdi}, {"rbp", c->Rbp}, {"r8", c->R8},
+            {"r9", c->R9}, {"r10", c->R10}, {"r11", c->R11}, {"r12", c->R12},
+            {"r13", c->R13}, {"r14", c->R14}, {"r15", c->R15} };
+        for (auto& rg : regs) GhLazyDescribeReg(rg.n, rg.v);
+    }
     // The faulting instruction, verbatim. A register dump alone cannot say which
     // operand computed the bad address; sixteen bytes at RIP decode to exactly
     // that, and they cost nothing -- RIP is executable by definition.
