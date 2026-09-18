@@ -14262,6 +14262,7 @@ struct GhCLNote {
     LONG                    recIsOurs;   // 1 = a loader replay list, never record it
     volatile LONG work;      // shader-running ops since Reset, 1-based; see GhWorkIndex
     void*   lastPso;
+    void*   psos[8];  LONG psoN;   // #234: every distinct PSO set since Reset (first 8)
     LONG    type;
     // #184. GhPromoteCopy runs before GhCLAdd, so .type above is the type the
     // list was actually CREATED with -- which, with gh_copy_as_direct on, is
@@ -14390,6 +14391,11 @@ static std::string GhCLSummary(ID3D12CommandList* cl)
          "/" + std::to_string((long)n->iBarr) +
          "/" + std::to_string((long)n->iPsosets);
     if (n->lastPso) s += " lastpso=" + Hex((uint64_t)(uintptr_t)n->lastPso);
+    if (n->psoN){
+        s += " psos=";
+        for (LONG i = 0; i < n->psoN && i < 8; ++i) s += (i ? "," : "") + Hex((uint64_t)(uintptr_t)n->psos[i]);
+        if (n->psoN > 8) s += ",+" + std::to_string((long)(n->psoN - 8));
+    }
     return s;
 }
 
@@ -15468,6 +15474,7 @@ static HRESULT __stdcall Hook_CLReset(ID3D12GraphicsCommandList* self,
     pso = GhPsoRealOf(pso);
     if (GhCLNote* n = GhCLFind(self)){
         n->draws = n->idraws = n->disp = n->barriers = n->psosets = n->work = 0;
+        n->psoN = 0;
         n->iDraws = n->iIdraws = n->iDisp = n->iBarr = n->iPsosets = 0;
         n->progIdx = 0;
         n->npend = 0;
@@ -15592,6 +15599,12 @@ static void __stdcall Hook_CLSetPso(ID3D12GraphicsCommandList* self, ID3D12Pipel
     ID3D12PipelineState* rp = GhPsoRealOf(pso);
     if (GhCLNote* n = GhCLFind(self)){
         InterlockedIncrement(&n->psosets); n->lastPso = rp;
+        {   // #234: remember the distinct pipelines of this list for GPUSUBMIT
+            LONG k = n->psoN; bool seen = false;
+            for (LONG i = 0; i < k && i < 8; ++i) if (n->psos[i] == (void*)rp){ seen = true; break; }
+            if (!seen && k < 8){ n->psos[k] = (void*)rp; n->psoN = k + 1; }
+            else if (!seen) n->psoN = k + 1;   // counts past 8, not stored
+        }
         // A BUNDLE is recorded once and replayed many times with no further
         // SetPipelineState, so its pipelines have no idle window the sweep could
         // read. Pin them for the life of the process.
@@ -17712,18 +17725,21 @@ static void GhNoteWait(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v)
 // signalled with the submission number right behind every ExecuteCommandLists
 // (bypassing our own Signal hook so it is not counted among the game's), turns
 // "fence2 60470/60473" into "the GPU finished #143745 and never finished #143746".
-// gh_prog_fence: 1 = inside the armed CL-trace window only, 2 = always.
+// gh_prog_fence: bit 0 = on (armed CL-trace window only), bit 1 = always, bit 2 = per-list split in the window.
 struct GhProgQ { ID3D12CommandQueue* q; ID3D12Fence* f; LONG64 last; };
 static GhProgQ g_prog[8]{};
 static int     g_progN = 0;
 static SRWLOCK g_progLock = SRWLOCK_INIT;
 static void GhCQSignalRaw(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v);
 static unsigned GhProgMode(){ static const unsigned m = GhCfgNum(L"gh_prog_fence.txt", "GH_PROG_FENCE", 0); return m; }
-static void GhProgSignal(ID3D12CommandQueue* q, LONG seq)
+// Values are seq*64 + k: k = 63 for the whole submission, k = 1..n for list k of a
+// submission split per list (bit 4 of gh_prog_fence, armed window only). Monotonic
+// per queue either way, so GetCompletedValue reads as "submission.list".
+static void GhProgSignalV(ID3D12CommandQueue* q, LONG seq, unsigned k)
 {
     const unsigned m = GhProgMode();
     if (!m || !q) return;
-    if (m == 1 && !GhCLTraceOn()) return;
+    if (!(m & 2) && !GhCLTraceOn()) return;
     GhProgQ* e = nullptr;
     AcquireSRWLockExclusive(&g_progLock);
     for (int i = 0; i < g_progN; ++i) if (g_prog[i].q == q){ e = &g_prog[i]; break; }
@@ -17737,9 +17753,12 @@ static void GhProgSignal(ID3D12CommandQueue* q, LONG seq)
     }
     ReleaseSRWLockExclusive(&g_progLock);
     if (!e) return;
-    InterlockedExchange64(&e->last, (LONG64)seq);
-    GhCQSignalRaw(q, e->f, (UINT64)seq);
+    const LONG64 v = (LONG64)seq * 64 + (LONG64)k;
+    InterlockedExchange64(&e->last, v);
+    GhCQSignalRaw(q, e->f, (UINT64)v);
 }
+static void GhProgSignal(ID3D12CommandQueue* q, LONG seq){ GhProgSignalV(q, seq, 63); }
+static bool GhProgSplit(){ return (GhProgMode() & 4) && GhCLTraceOn(); }
 static std::string GhProgState()
 {
     std::string s;
@@ -17747,8 +17766,10 @@ static std::string GhProgState()
     for (int i = 0; i < g_progN; ++i){
         UINT64 got = g_prog[i].f ? g_prog[i].f->GetCompletedValue() : 0;
         LONG64 last = InterlockedCompareExchange64(&g_prog[i].last, 0, 0);
-        s += " | prog q@" + Hex((uint64_t)(uintptr_t)g_prog[i].q) + " done=#" + std::to_string((unsigned long long)got) +
-             " last=#" + std::to_string((long long)last) + (got < (UINT64)last ? " STUCK" : "");
+        s += " | prog q@" + Hex((uint64_t)(uintptr_t)g_prog[i].q) +
+             " done=#" + std::to_string((unsigned long long)(got / 64)) + "." + std::to_string((unsigned long long)(got % 64)) +
+             " last=#" + std::to_string((long long)(last / 64)) + "." + std::to_string((long long)(last % 64)) +
+             (got < (UINT64)last ? " STUCK" : "");
     }
     ReleaseSRWLockShared(&g_progLock);
     return s;
@@ -19840,7 +19861,8 @@ static void __stdcall Hook_CQExecute(ID3D12CommandQueue* self_, UINT n, ID3D12Co
         std::string m = "GPUSUBMIT #" + std::to_string((long)seq) +
                         " t=" + std::to_string((unsigned long long)GhMsSinceFirstSubmit()) + "ms" +
                         " q=" + Hex((uint64_t)(uintptr_t)self) + " lists=" + std::to_string((unsigned)n);
-        for (UINT i = 0; i < n && i < 8; ++i) m += "\n    [" + std::to_string(i) + "] " + GhCLSummary(l[i]);
+        const UINT cap = GhCLTraceOn() ? 32u : 8u;   // #234: the whole submission inside the armed window
+        for (UINT i = 0; i < n && i < cap; ++i) m += "\n    [" + std::to_string(i) + "] " + GhCLSummary(l[i]);
         Diag(m);
     }
     // #158 gh_sub_census. Emitted BEFORE the submission goes down, so the fatal one --
@@ -19963,6 +19985,14 @@ static void __stdcall Hook_CQExecute(ID3D12CommandQueue* self_, UINT n, ID3D12Co
                      " type=" + std::to_string(relTy) +
                      " batches=" + std::to_string((long)InterlockedCompareExchange(&g_relBatch, 0, 0)) +
                      " barriers=" + std::to_string((long)InterlockedCompareExchange(&g_relBarr, 0, 0)));
+        } else if (n > 1 && GhProgSplit()){
+            // #234 PROGFENCE bit 4: one ExecuteCommandLists per list, a progress value
+            // after each. Same queue, same order -- D3D12 executes the lists of one
+            // call in order, so this is the same stream with finer fence marks.
+            for (UINT i = 0; i < n; ++i){
+                ((void (__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*))g_cqVtOrig[10])(self, 1, &l[i]);
+                GhProgSignalV(self, seq, i + 1);
+            }
         } else {
             ((void (__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*))g_cqVtOrig[10])(self, n, l);
         }
