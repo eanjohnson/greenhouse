@@ -62,6 +62,9 @@ def lower_text(text, templates, report=None):
     # GH_I64LOAD=1: rawBufferLoad.i64 -> 2-dword i32 load + zext/shl/or (§32.125).
     if os.environ.get('GH_I64LOAD') == '1':
         text = lower66.lower_i64load(text, report)
+    # GH_I64=1: every remaining i64 value -> (lo, hi) i32 pair (§32.125); needs GH_I64LOAD.
+    if os.environ.get('GH_I64') == '1':
+        text = lower66.lower_i64(text, report)
     return text
 
 

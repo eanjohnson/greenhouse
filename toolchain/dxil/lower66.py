@@ -637,3 +637,127 @@ def lower_i64load(text, report=None):
     if report is not None:
         report.append('i64load: %d lowered' % n)
     return text
+
+
+# ---------------------------------------------------------------------------
+# i64 -> (lo, hi) i32 pairs.
+#
+# GREENHOUSE §32.125: with switch and the 64-bit loads lowered, the Int64 pair
+# still faults the driver and the only i64 forms left that no created blob uses
+# are `lshr i64` / `trunc i64` — the lo/hi split of a 64-bit lane mask. This
+# legalises every i64 SSA value in the function into two i32 values, for the
+# closed instruction set those shaders use; anything else raises.
+_I64_BIN = re.compile(r'^(\s*)(%[\w.]+) = (and|or|xor) i64 (\S+), (\S+)\s*$')
+_I64_SHL = re.compile(r'^(\s*)(%[\w.]+) = shl(?: nuw| nsw)* i64 (\S+), (\S+)\s*$')
+_I64_LSHR = re.compile(r'^(\s*)(%[\w.]+) = lshr(?: exact)? i64 (\S+), (\d+)\s*$')
+_I64_ZEXT = re.compile(r'^(\s*)(%[\w.]+) = zext i32 (\S+) to i64\s*$')
+_I64_TRUNC = re.compile(r'^(\s*)(%[\w.]+) = trunc i64 (\S+) to i32\s*$')
+_I64_ICMP = re.compile(r'^(\s*)(%[\w.]+) = icmp (eq|ne) i64 (\S+), (\S+)\s*$')
+_I64_PHI = re.compile(r'^(\s*)(%[\w.]+) = phi i64 (.*)$')
+_I64_SEL = re.compile(r'^(\s*)(%[\w.]+) = select i1 (\S+), i64 (\S+), i64 (\S+)\s*$')
+
+def _pair(v):
+    """(lo, hi) operand strings for an i64 SSA value or constant."""
+    if v.startswith('%'):
+        return v + '_lo', v + '_hi'
+    n = int(v) & 0xFFFFFFFFFFFFFFFF
+    lo, hi = n & 0xFFFFFFFF, n >> 32
+    def s(x): return str(x - (1 << 32) if x >= (1 << 31) else x)
+    return s(lo), s(hi)
+
+def lower_i64(text, report=None):
+    lines = text.split('\n')
+    out = []
+    n = 0
+    for ln in lines:
+        m = _I64_BIN.match(ln)
+        if m:
+            ind, d, op, a, b = m.groups(); al, ah = _pair(a); bl, bh = _pair(b); n += 1
+            out.append('%s%s_lo = %s i32 %s, %s' % (ind, d, op, al, bl))
+            out.append('%s%s_hi = %s i32 %s, %s' % (ind, d, op, ah, bh)); continue
+        m = _I64_ZEXT.match(ln)
+        if m:
+            ind, d, a = m.groups(); n += 1
+            out.append('%s%s_lo = or i32 %s, 0' % (ind, d, a))
+            out.append('%s%s_hi = or i32 0, 0' % (ind, d)); continue
+        m = _I64_TRUNC.match(ln)
+        if m:
+            ind, d, a = m.groups(); al, ah = _pair(a); n += 1
+            out.append('%s%s = or i32 %s, 0' % (ind, d, al)); continue
+        m = _I64_LSHR.match(ln)
+        if m:
+            ind, d, a, c = m.groups(); al, ah = _pair(a); c = int(c); n += 1
+            if c == 32:
+                out.append('%s%s_lo = or i32 %s, 0' % (ind, d, ah))
+                out.append('%s%s_hi = or i32 0, 0' % (ind, d))
+            elif 0 < c < 32:
+                out.append('%s%s_l0 = lshr i32 %s, %d' % (ind, d, al, c))
+                out.append('%s%s_l1 = shl i32 %s, %d' % (ind, d, ah, 32 - c))
+                out.append('%s%s_lo = or i32 %s_l0, %s_l1' % (ind, d, d, d))
+                out.append('%s%s_hi = lshr i32 %s, %d' % (ind, d, ah, c))
+            elif 32 < c < 64:
+                out.append('%s%s_lo = lshr i32 %s, %d' % (ind, d, ah, c - 32))
+                out.append('%s%s_hi = or i32 0, 0' % (ind, d))
+            else:
+                raise SystemExit('lower_i64: lshr by %d' % c)
+            continue
+        m = _I64_SHL.match(ln)
+        if m:
+            ind, d, a, b = m.groups(); al, ah = _pair(a); n += 1
+            if not b.startswith('%'):
+                c = int(b)
+                if c == 32:
+                    out.append('%s%s_lo = or i32 0, 0' % (ind, d))
+                    out.append('%s%s_hi = or i32 %s, 0' % (ind, d, al))
+                elif 0 < c < 32:
+                    out.append('%s%s_h0 = shl i32 %s, %d' % (ind, d, ah, c))
+                    out.append('%s%s_h1 = lshr i32 %s, %d' % (ind, d, al, 32 - c))
+                    out.append('%s%s_hi = or i32 %s_h0, %s_h1' % (ind, d, d, d))
+                    out.append('%s%s_lo = shl i32 %s, %d' % (ind, d, al, c))
+                elif 32 < c < 64:
+                    out.append('%s%s_hi = shl i32 %s, %d' % (ind, d, al, c - 32))
+                    out.append('%s%s_lo = or i32 0, 0' % (ind, d))
+                else:
+                    raise SystemExit('lower_i64: shl by %d' % c)
+                continue
+            # variable shift: amount is an i64 value whose lo word carries it (0..63)
+            bl, bh = _pair(b)
+            out.append('%s%s_n = and i32 %s, 63' % (ind, d, bl))
+            out.append('%s%s_n31 = and i32 %s_n, 31' % (ind, d, d))
+            out.append('%s%s_lt = icmp ult i32 %s_n, 32' % (ind, d, d))
+            out.append('%s%s_nz = icmp ne i32 %s_n31, 0' % (ind, d, d))
+            out.append('%s%s_a = shl i32 %s, %s_n31' % (ind, d, al, d))            # lo << n      (n<32)
+            out.append('%s%s_b = shl i32 %s, %s_n31' % (ind, d, ah, d))            # hi << n      (n<32)
+            out.append('%s%s_r = sub i32 32, %s_n31' % (ind, d, d))
+            out.append('%s%s_c0 = lshr i32 %s, %s_r' % (ind, d, al, d))           # lo >> (32-n)  (n31 != 0)
+            out.append('%s%s_c = select i1 %s_nz, i32 %s_c0, i32 0' % (ind, d, d, d))
+            out.append('%s%s_hn = or i32 %s_b, %s_c' % (ind, d, d, d))             # hi word for n<32
+            out.append('%s%s_lo = select i1 %s_lt, i32 %s_a, i32 0' % (ind, d, d, d))
+            out.append('%s%s_hi = select i1 %s_lt, i32 %s_hn, i32 %s_a' % (ind, d, d, d, d))   # n>=32: hi = lo << (n-32)
+            continue
+        m = _I64_ICMP.match(ln)
+        if m:
+            ind, d, op, a, b = m.groups(); al, ah = _pair(a); bl, bh = _pair(b); n += 1
+            out.append('%s%s_x0 = xor i32 %s, %s' % (ind, d, al, bl))
+            out.append('%s%s_x1 = xor i32 %s, %s' % (ind, d, ah, bh))
+            out.append('%s%s_x = or i32 %s_x0, %s_x1' % (ind, d, d, d))
+            out.append('%s%s = icmp %s i32 %s_x, 0' % (ind, d, op, d)); continue
+        m = _I64_SEL.match(ln)
+        if m:
+            ind, d, c, a, b = m.groups(); al, ah = _pair(a); bl, bh = _pair(b); n += 1
+            out.append('%s%s_lo = select i1 %s, i32 %s, i32 %s' % (ind, d, c, al, bl))
+            out.append('%s%s_hi = select i1 %s, i32 %s, i32 %s' % (ind, d, c, ah, bh)); continue
+        m = _I64_PHI.match(ln)
+        if m:
+            ind, d, rest = m.groups(); n += 1
+            inc = re.findall(r'\[\s*([^,\]]+),\s*(%[\w.]+)\s*\]', rest)
+            los = ', '.join('[ %s, %s ]' % (_pair(v.strip())[0], b) for v, b in inc)
+            his = ', '.join('[ %s, %s ]' % (_pair(v.strip())[1], b) for v, b in inc)
+            out.append('%s%s_lo = phi i32 %s' % (ind, d, los))
+            out.append('%s%s_hi = phi i32 %s' % (ind, d, his)); continue
+        if re.search(r'\bi64\b', ln) and not ln.lstrip().startswith(('!', 'declare', 'target', ';')) and 'llvm.lifetime' not in ln and '= type' not in ln:
+            raise SystemExit('lower_i64: unhandled i64 line: %s' % ln.strip()[:120])
+        out.append(ln)
+    if report is not None:
+        report.append('i64: %d legalised' % n)
+    return '\n'.join(out)
