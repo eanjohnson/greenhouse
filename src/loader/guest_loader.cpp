@@ -27953,6 +27953,12 @@ static volatile LONG            g_phViews       = 0;        // section views liv
 static volatile LONG            g_phRestores    = 0;        // restores published as views
 static volatile LONG            g_phSplitFail   = 0;
 static volatile LONG            g_phReplaceFail = 0;
+// patch j: stall watchdog inputs
+static volatile LONG            g_lazyInFault      = 0;   // GhLazyFault calls in flight
+static volatile LONG64          g_lazyLastFaultAt  = 0;
+static volatile LONG            g_lazyLastFaultTid = 0;
+static volatile LONG            g_stallDumps       = 0;
+static volatile LONG            g_phAlready        = 0;   // replace refused because the granule was already committed
 static volatile LONG            g_phViewFail    = 0;
 static volatile LONG            g_phUncommitFail= 0;
 static volatile LONG            g_phGuestCommit = 0;        // guest MEM_COMMIT calls answered inside a reservation
@@ -27978,19 +27984,52 @@ static bool GhPhFind(const void* p, uint8_t** base, uint64_t* size, DWORD* prot 
 }
 static void GhPhLog(const std::string& m){ if (InterlockedIncrement(&g_phLogs) <= 200) Diag("LAZYPH " + m); }
 // Split the placeholder to this granule and replace it with private commit.
-static bool GhPhCommitGranule(uint8_t* p, DWORD prot)
+// patch j: what the kernel thinks the granule is, for the failure lines below.
+static std::string GhPhDescribe(const void* p)
+{
+    MEMORY_BASIC_INFORMATION m{};
+    if (VirtualQuery(p, &m, sizeof m) != sizeof m) return " (VirtualQuery failed)";
+    return " state=" + Hex((uint64_t)m.State) + " type=" + Hex((uint64_t)m.Type) +
+           " prot=" + Hex((uint64_t)m.Protect) + " size=" + Hex((uint64_t)m.RegionSize) +
+           " allocbase=" + Hex((uint64_t)(uintptr_t)m.AllocationBase) +
+           " regbase=" + Hex((uint64_t)(uintptr_t)m.BaseAddress);
+}
+static bool GhPhCommitGranule(uint8_t* p, DWORD prot, const char* who = "fault")
 {
     if (!VirtualFree(p, (SIZE_T)g_lazyGran, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)){
         const DWORD e = GetLastError();
-        if (InterlockedIncrement(&g_phSplitFail) <= 8)
-            GhPhLog("split failed p=" + Hex((uint64_t)(uintptr_t)p) + " err=" + Hex(e));
+        // An exactly-64K placeholder (both neighbours already replaced) refuses
+        // the split with ERROR_INVALID_ADDRESS and that is benign; anything else
+        // is not, so describe the region for the first few of each.
+        if (InterlockedIncrement(&g_phSplitFail) <= 16)
+            GhPhLog("split failed p=" + Hex((uint64_t)(uintptr_t)p) + " err=" + Hex(e) +
+                    " who=" + who + GhPhDescribe(p));
     }
     void* q = g_va2(GetCurrentProcess(), p, (SIZE_T)g_lazyGran,
                     MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, prot, nullptr, 0);
     if (!q){
         const DWORD e = GetLastError();
-        if (InterlockedIncrement(&g_phReplaceFail) <= 8)
-            GhPhLog("replace failed p=" + Hex((uint64_t)(uintptr_t)p) + " err=" + Hex(e));
+        MEMORY_BASIC_INFORMATION m{};
+        const bool qok = VirtualQuery(p, &m, sizeof m) == sizeof m;
+        if (InterlockedIncrement(&g_phReplaceFail) <= 16)
+            GhPhLog("replace failed p=" + Hex((uint64_t)(uintptr_t)p) + " err=" + Hex(e) +
+                    " who=" + who + GhPhDescribe(p) +
+                    " tid=" + std::to_string((unsigned long)GetCurrentThreadId()));
+        // patch j. ERROR_INVALID_ADDRESS means "not exactly one placeholder here".
+        // Two shapes are recoverable and must not cost a 64 MB room: the granule
+        // is already committed private memory (somebody else's replace landed),
+        // and the placeholder is still bigger than a granule (re-split, replace).
+        if (e == ERROR_INVALID_ADDRESS && qok && m.State == MEM_COMMIT && m.Type == MEM_PRIVATE &&
+            (m.Protect & 0xFF) == (prot & 0xFF)){
+            InterlockedIncrement(&g_phAlready);
+            return true;
+        }
+        if (e == ERROR_INVALID_ADDRESS && qok && m.State == MEM_RESERVE && m.RegionSize > (SIZE_T)g_lazyGran &&
+            VirtualFree(p, (SIZE_T)g_lazyGran, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)){
+            q = g_va2(GetCurrentProcess(), p, (SIZE_T)g_lazyGran,
+                      MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, prot, nullptr, 0);
+            if (q){ InterlockedIncrement(&g_phCommits); return true; }
+        }
         SetLastError(e);
         return false;
     }
@@ -28401,6 +28440,10 @@ static bool GhLazyFault(void* addr, const CONTEXT* ctx)
 {
     const uint64_t rip = ctx ? (uint64_t)ctx->Rip : 0;
     if (InterlockedCompareExchange(&g_lazyCount, 0, 0) == 0) return false;
+    struct InFlight { InFlight(){ InterlockedIncrement(&g_lazyInFault); }
+                      ~InFlight(){ InterlockedDecrement(&g_lazyInFault); } } inflight;
+    InterlockedExchange64(&g_lazyLastFaultAt, (LONG64)(uintptr_t)addr);
+    InterlockedExchange(&g_lazyLastFaultTid, (LONG)GetCurrentThreadId());
     uint8_t* base = nullptr; uint64_t gsize = 0; DWORD prot = 0; LONG bit = 0; LONG* bits = nullptr;
     GhLazyAcct* acct = nullptr;
     LONG* spilled = nullptr; LONG* busy = nullptr; uint32_t* slot = nullptr;   // #233
@@ -28556,12 +28599,16 @@ static bool GhLazyMaterialise(const void* addr, SIZE_T size)
                     if (GhLazyRestoreLocked(r.base + o, g, r.prot, r.bits, r.spilled, r.slot, r.back, bit, true, &r)) did = true;
                     else InterlockedIncrement(&g_lazyFailed);
                 } else if (!(r.bits[bit / 32] & m)){
-                    bool ok = r.ph ? GhPhCommitGranule(r.base + o, r.prot)
+                    bool ok = r.ph ? GhPhCommitGranule(r.base + o, r.prot, "materialise")
                                    : VirtualAlloc(r.base + o, (SIZE_T)g, MEM_COMMIT, r.prot) != nullptr;
                     if (!ok && g_lazySpill){
                         InterlockedIncrement(&g_spillRoomFault);
+                        // patch j: the retry went through plain VirtualAlloc, which a
+                        // placeholder refuses -- so a placeholder range could never be
+                        // rescued under commit pressure.
                         if (GhLazySpillRoomLocked(g + (64ull << 20), "materialise", true))
-                            ok = VirtualAlloc(r.base + o, (SIZE_T)g, MEM_COMMIT, r.prot) != nullptr;
+                            ok = r.ph ? GhPhCommitGranule(r.base + o, r.prot, "materialise-retry")
+                                      : VirtualAlloc(r.base + o, (SIZE_T)g, MEM_COMMIT, r.prot) != nullptr;
                         if (ok) InterlockedIncrement(&g_spillRetryOk);
                     }
                     if (ok){
@@ -28573,6 +28620,24 @@ static bool GhLazyMaterialise(const void* addr, SIZE_T size)
                     }
                 }
                 _interlockedbittestandreset(r.busy, bit);
+            }
+            continue;
+        }
+        if (r.ph){
+            // patch j: a blanket VirtualAlloc(MEM_COMMIT) is refused inside a
+            // placeholder; claim and replace one granule at a time instead.
+            for (uint64_t o = from; o < to; o += g_lazyGran){
+                const LONG bit = (LONG)(o / g_lazyGran);
+                if (_interlockedbittestandset(r.bits, bit)) continue;     // already owned
+                if (!GhPhCommitGranule(r.base + o, r.prot, "span")){
+                    _interlockedbittestandreset(r.bits, bit);
+                    InterlockedIncrement(&g_lazyFailed);
+                    continue;
+                }
+                const uint64_t g = (r.size - o < g_lazyGran) ? (r.size - o) : g_lazyGran;
+                InterlockedExchangeAdd64(&g_lazyCommitted, (LONG64)g);
+                GhLazyNoteCommit(r.acct, g, 1);
+                did = true;
             }
             continue;
         }
@@ -28701,6 +28766,7 @@ static std::string GhLazyStats()
              "/" + std::to_string((long)InterlockedCompareExchange(&g_phReplaceFail, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_phViewFail, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_phUncommitFail, 0, 0)) +
+             "/" + std::to_string((long)InterlockedCompareExchange(&g_phAlready, 0, 0)) +
              " lazyphguest=" + std::to_string((long)InterlockedCompareExchange(&g_phGuestCommit, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_phGuestDecommit, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_phGuestRelease, 0, 0));
@@ -29188,7 +29254,11 @@ static bool GhPhCommit(uint8_t* addr, SIZE_T size, DWORD prot, uint64_t site)
     if (hi > rb + rs) hi = rb + rs;
     if (lo >= hi) return true;
     InterlockedIncrement(&g_phGuestCommit);
-    GhLazyRestoreSpan(lo, (SIZE_T)(hi - lo));
+    // patch j: no GhLazyRestoreSpan here. It materialised every promised-but-
+    // untouched granule under the guest's commit -- a real commit the pager had
+    // deliberately deferred -- and a kernel-mode consumer is the NtReadFile
+    // hook's business, not this one's. Covered granules keep their state; the
+    // fault path serves them on first touch exactly as before.
     // Runs of unpromised granules, collected under the shared lock, promised after it.
     std::vector<std::pair<uint8_t*, uint64_t>> runs;
     AcquireSRWLockShared(&g_lazyLock);
@@ -29741,7 +29811,7 @@ static LPVOID WINAPI Bed_VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWOR
 
     // #233 patch i: a big plain reservation becomes a placeholder, so that the
     // commits the guest makes into it later can be promised and restored atomically.
-    if ((type & MEM_RESERVE) && !(type & MEM_COMMIT) && GhPhOn() && size >= g_lazyMin &&
+    if ((type & MEM_RESERVE) && !(type & MEM_COMMIT) && GhLazyOn() && GhPhOn() && size >= g_lazyMin &&
         !(prot & kExecProt) && !(type & ~(DWORD)(MEM_RESERVE | MEM_TOP_DOWN)) && !GhLazyFloorBlocks((uint64_t)size)){
         if (LPVOID q = GhPhReserve(addr, size, prot)){
             GhLazyLog("reserve(ph) addr=" + Hex((uint64_t)(uintptr_t)q) + " size=" + Hex((uint64_t)size) +
@@ -32952,7 +33022,7 @@ static bool GhInAnyMod(const std::vector<GhModRange>& m, uintptr_t a)
     return false;
 }
 
-static void GhRipCensus(const char* why)
+static void GhRipCensus(const char* why, unsigned forceWords = 0)
 {
     // Stamped BEFORE the first suspend. The header used to be built after the
     // loop, so its timestamp was the PUBLISH time -- and on run 57 that made a
@@ -32978,7 +33048,7 @@ static void GhRipCensus(const char* why)
 
     // Phase 2: size every buffer up front. After this line and until the
     // sampling loop is done, not one byte is allocated.
-    const unsigned words = GhCfgNum(L"gh_rip_stack.txt", "GH_RIP_STACK", 0);
+    const unsigned words = forceWords ? forceWords : GhCfgNum(L"gh_rip_stack.txt", "GH_RIP_STACK", 0);
     const size_t   nW    = words > 4096 ? 4096 : words;   // qwords per thread
     std::vector<GhRipRow>  rows(tids.size());
     std::vector<DWORD64>   stk(tids.size() * nW);
@@ -33321,6 +33391,39 @@ static void SnapshotHostThreads()
                 if (!ms) return;
                 Diag("RIPCENSUS on, every " + std::to_string(ms) + " ms");
                 while (!g_guestDone){ GhRipCensus("tick"); Sleep(ms); }
+            }).detach();
+            // patch j (#233 SPILL10): the app stalled at frame ~545 and was gone
+            // within a minute with no exception and no exit -- nothing sampled
+            // the stall. This thread does: once frames stop advancing for
+            // gh_stall_ms it prints the pager's lock/in-flight state and a full
+            // census WITH stack words, three times at most.
+            std::thread([]{
+                const unsigned ms = (unsigned)GhCfgNumZ(L"gh_stall_ms.txt", "GH_STALL_MS", 8000);
+                if (!ms) return;
+                LONG64 last = -1; unsigned long long lastT = GhUpMs();
+                while (!g_guestDone){
+                    Sleep(1000);
+                    const LONG64 n = InterlockedCompareExchange64(&g_frameNo, 0, 0);
+                    const unsigned long long now = GhUpMs();
+                    if (n != last){ last = n; lastT = now; continue; }
+                    if (n < 60 || now - lastT < ms) continue;
+                    if (InterlockedIncrement(&g_stallDumps) > 3) return;
+                    lastT = now;
+                    bool lockFree = false;
+                    if (TryAcquireSRWLockExclusive(&g_lazyLock)){ ReleaseSRWLockExclusive(&g_lazyLock); lockFree = true; }
+                    Diag("STALL frames=" + std::to_string((long long)n) + " t=" + std::to_string(now) +
+                         "ms lazylock=" + (lockFree ? "free" : "HELD") +
+                         " inflight=" + std::to_string((long)InterlockedCompareExchange(&g_lazyInFault, 0, 0)) +
+                         " lastfault=" + Hex((uint64_t)InterlockedCompareExchange64(&g_lazyLastFaultAt, 0, 0)) +
+                         " tid=" + std::to_string((long)InterlockedCompareExchange(&g_lazyLastFaultTid, 0, 0)) +
+                         " rooms=" + std::to_string((long)InterlockedCompareExchange(&g_spillRooms, 0, 0)) +
+                         " roomfault=" + std::to_string((long)InterlockedCompareExchange(&g_spillRoomFault, 0, 0)) +
+                         " retryok=" + std::to_string((long)InterlockedCompareExchange(&g_spillRetryOk, 0, 0)) +
+                         " lazyfailed=" + std::to_string((long)InterlockedCompareExchange(&g_lazyFailed, 0, 0)) +
+                         " phfail=" + std::to_string((long)InterlockedCompareExchange(&g_phSplitFail, 0, 0)) +
+                         "/" + std::to_string((long)InterlockedCompareExchange(&g_phReplaceFail, 0, 0)));
+                    GhRipCensus("stall", 192);
+                }
             }).detach();
         }
     }
