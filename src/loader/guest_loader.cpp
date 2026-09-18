@@ -27959,6 +27959,7 @@ static volatile LONG64          g_lazyLastFaultAt  = 0;
 static volatile LONG            g_lazyLastFaultTid = 0;
 static volatile LONG            g_stallDumps       = 0;
 static volatile LONG            g_phAlready        = 0;   // replace refused because the granule was already committed
+static volatile LONG            g_phResplit        = 0;   // replace succeeded only after a re-split (patch k)
 static volatile LONG            g_phViewFail    = 0;
 static volatile LONG            g_phUncommitFail= 0;
 static volatile LONG            g_phGuestCommit = 0;        // guest MEM_COMMIT calls answered inside a reservation
@@ -28008,7 +28009,7 @@ static bool GhPhCommitGranule(uint8_t* p, DWORD prot, const char* who = "fault")
     void* q = g_va2(GetCurrentProcess(), p, (SIZE_T)g_lazyGran,
                     MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, prot, nullptr, 0);
     if (!q){
-        const DWORD e = GetLastError();
+        DWORD e = GetLastError();
         MEMORY_BASIC_INFORMATION m{};
         const bool qok = VirtualQuery(p, &m, sizeof m) == sizeof m;
         if (InterlockedIncrement(&g_phReplaceFail) <= 16)
@@ -28024,11 +28025,23 @@ static bool GhPhCommitGranule(uint8_t* p, DWORD prot, const char* who = "fault")
             InterlockedIncrement(&g_phAlready);
             return true;
         }
-        if (e == ERROR_INVALID_ADDRESS && qok && m.State == MEM_RESERVE && m.RegionSize > (SIZE_T)g_lazyGran &&
-            VirtualFree(p, (SIZE_T)g_lazyGran, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)){
+        // patch k (SPILL11): every refusal showed the placeholder at p already
+        // bigger than a granule again at replace time -- an evicted neighbour
+        // released back to a placeholder (MEM_PRESERVE_PLACEHOLDER) is
+        // coalesced with ours by the kernel between our split and our replace.
+        // Split and replace again, a few times; the room fallback stays behind it.
+        for (int tries = 0; tries < 6 && e == ERROR_INVALID_ADDRESS; ++tries){
+            if (VirtualQuery(p, &m, sizeof m) != sizeof m) break;
+            if (m.State == MEM_COMMIT && m.Type == MEM_PRIVATE && (m.Protect & 0xFF) == (prot & 0xFF)){
+                InterlockedIncrement(&g_phAlready);
+                return true;
+            }
+            if (!(m.State == MEM_RESERVE && m.RegionSize > (SIZE_T)g_lazyGran)) break;
+            if (!VirtualFree(p, (SIZE_T)g_lazyGran, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) continue;
             q = g_va2(GetCurrentProcess(), p, (SIZE_T)g_lazyGran,
                       MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, prot, nullptr, 0);
-            if (q){ InterlockedIncrement(&g_phCommits); return true; }
+            if (q){ InterlockedIncrement(&g_phCommits); InterlockedIncrement(&g_phResplit); return true; }
+            e = GetLastError();
         }
         SetLastError(e);
         return false;
@@ -28767,6 +28780,7 @@ static std::string GhLazyStats()
              "/" + std::to_string((long)InterlockedCompareExchange(&g_phViewFail, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_phUncommitFail, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_phAlready, 0, 0)) +
+             "/" + std::to_string((long)InterlockedCompareExchange(&g_phResplit, 0, 0)) +
              " lazyphguest=" + std::to_string((long)InterlockedCompareExchange(&g_phGuestCommit, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_phGuestDecommit, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_phGuestRelease, 0, 0));
