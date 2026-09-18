@@ -17707,6 +17707,52 @@ static void GhNoteWait(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v)
         g_waits[g_waitCount++] = GhWaitNote{ q, f, v };
     ReleaseSRWLockExclusive(&g_waitLock);
 }
+// #234 PROGFENCE. The heartbeat's fences are the GAME's: they say a queue is
+// behind, not which submission it is inside. A private fence per queue,
+// signalled with the submission number right behind every ExecuteCommandLists
+// (bypassing our own Signal hook so it is not counted among the game's), turns
+// "fence2 60470/60473" into "the GPU finished #143745 and never finished #143746".
+// gh_prog_fence: 1 = inside the armed CL-trace window only, 2 = always.
+struct GhProgQ { ID3D12CommandQueue* q; ID3D12Fence* f; LONG64 last; };
+static GhProgQ g_prog[8]{};
+static int     g_progN = 0;
+static SRWLOCK g_progLock = SRWLOCK_INIT;
+static void GhCQSignalRaw(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v);
+static unsigned GhProgMode(){ static const unsigned m = GhCfgNum(L"gh_prog_fence.txt", "GH_PROG_FENCE", 0); return m; }
+static void GhProgSignal(ID3D12CommandQueue* q, LONG seq)
+{
+    const unsigned m = GhProgMode();
+    if (!m || !q) return;
+    if (m == 1 && !GhCLTraceOn()) return;
+    GhProgQ* e = nullptr;
+    AcquireSRWLockExclusive(&g_progLock);
+    for (int i = 0; i < g_progN; ++i) if (g_prog[i].q == q){ e = &g_prog[i]; break; }
+    if (!e && g_progN < 8){
+        com_ptr<ID3D12Device> d;
+        ID3D12Fence* f = nullptr;
+        if (SUCCEEDED(q->GetDevice(__uuidof(ID3D12Device), d.put_void())) && d)
+            d->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), (void**)&f);
+        if (f){ g_prog[g_progN] = GhProgQ{ q, f, 0 }; e = &g_prog[g_progN++];
+            Diag("PROGFENCE q=" + Hex((uint64_t)(uintptr_t)q) + " fence=" + Hex((uint64_t)(uintptr_t)f) + " from #" + std::to_string((long)seq)); }
+    }
+    ReleaseSRWLockExclusive(&g_progLock);
+    if (!e) return;
+    InterlockedExchange64(&e->last, (LONG64)seq);
+    GhCQSignalRaw(q, e->f, (UINT64)seq);
+}
+static std::string GhProgState()
+{
+    std::string s;
+    AcquireSRWLockShared(&g_progLock);
+    for (int i = 0; i < g_progN; ++i){
+        UINT64 got = g_prog[i].f ? g_prog[i].f->GetCompletedValue() : 0;
+        LONG64 last = InterlockedCompareExchange64(&g_prog[i].last, 0, 0);
+        s += " | prog q@" + Hex((uint64_t)(uintptr_t)g_prog[i].q) + " done=#" + std::to_string((unsigned long long)got) +
+             " last=#" + std::to_string((long long)last) + (got < (UINT64)last ? " STUCK" : "");
+    }
+    ReleaseSRWLockShared(&g_progLock);
+    return s;
+}
 static std::string GhGpuProgress()
 {
     std::string s = " ecl=" + std::to_string((long)InterlockedCompareExchange(&g_eclCount, 0, 0)) +
@@ -17735,6 +17781,7 @@ static std::string GhGpuProgress()
              (got < g_waits[i].want ? " BLOCKED" : "");
     }
     ReleaseSRWLockShared(&g_waitLock);
+    s += GhProgState();
     return s;
 }
 
@@ -17808,6 +17855,14 @@ static void GhHookFence(ID3D12Fence* f)
 }
 
 static void* g_cqVtOrig[20]{};
+// #234 PROGFENCE: signal through the original slot so our own Signal hook does not
+// count the progress fence among the game's.
+static void GhCQSignalRaw(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v)
+{
+    if (g_cqVtOrig[14])
+        ((HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64))g_cqVtOrig[14])(q, f, v);
+    else q->Signal(f, v);
+}
 static volatile LONG g_cqHooked = 0;
 // #158 gh_rttest_rawsub: let GhRtTest submit through the ORIGINAL vtable entry. The
 // probe runs from inside Hook_CQExecute, so submitting on the game's queue re-enters
@@ -19912,6 +19967,7 @@ static void __stdcall Hook_CQExecute(ID3D12CommandQueue* self_, UINT n, ID3D12Co
             ((void (__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*))g_cqVtOrig[10])(self, n, l);
         }
     }
+    GhProgSignal(self, seq);   // #234 PROGFENCE: which submission the GPU last finished, per queue
     // #158 gh_dup_submit / gh_dup_nth: one extra, LEGAL execution of THIS submission.
     //
     // v0.0.325.0 submitted the duplicate back-to-back, and D3D12 rejected it outright:
@@ -20089,7 +20145,7 @@ static HRESULT __stdcall Hook_CQSignal(ID3D12CommandQueue* self_, ID3D12Fence* f
     // which submission each value comes after turns "completed 90 of 103" into a
     // pointer to one GPUSUBMIT line.
     LONG seq = InterlockedCompareExchange(&g_eclCount, 0, 0);
-    if (seq <= 256)
+    if (seq <= 256 || GhCLTraceOn())   // #234 CLTRACE3: signals inside the armed window
         Diag("GPUSIGNAL fence=" + Hex((uint64_t)(uintptr_t)f) + " val=" + std::to_string((unsigned long long)v) +
              " afterSubmit=#" + std::to_string((long)seq) + " q=" + Hex((uint64_t)(uintptr_t)self) +
              " from=" + NameForCodeAddr((uintptr_t)_ReturnAddress()));
@@ -20104,7 +20160,7 @@ static HRESULT __stdcall Hook_CQWait(ID3D12CommandQueue* self_, ID3D12Fence* f, 
     // Name the caller. The fence that blocks our queue in every run was never
     // created through the device, so the only way to find its owner is to ask
     // who is asking to wait on it.
-    if (InterlockedCompareExchange(&g_eclCount, 0, 0) <= 256)
+    if (InterlockedCompareExchange(&g_eclCount, 0, 0) <= 256 || GhCLTraceOn())   // #234 CLTRACE3
         Diag("GPUWAIT q=" + Hex((uint64_t)(uintptr_t)self) + " fence=" + Hex((uint64_t)(uintptr_t)f) +
              " want=" + std::to_string((unsigned long long)v) +
              " got=" + std::to_string((unsigned long long)(f ? f->GetCompletedValue() : 0)) +
