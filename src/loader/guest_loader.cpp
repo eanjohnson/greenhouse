@@ -13714,7 +13714,10 @@ static bool GhDescTrackOn()
 // time; if the game rewrites a slot in between, nothing else in the loader would see
 // it. A monotonic write number on the slot plus a ring of the recent writes turns
 // that into a diff anyone can do from the log.
-struct GhDescNote { volatile LONG64 cpu; ID3D12Resource* res; UINT32 kind; UINT32 fmt; UINT64 va; UINT32 seq; };
+// #234 BREAD8: a buffer view's geometry. SRV/UAV: voff = FirstElement, vlen = NumElements,
+// vstride = StructureByteStride (0 = typed/raw), vraw = the RAW flag. CBV: vlen = SizeInBytes.
+struct GhDescNote { volatile LONG64 cpu; ID3D12Resource* res; UINT32 kind; UINT32 fmt; UINT64 va; UINT32 seq;
+                    UINT64 voff; UINT32 vlen; UINT32 vstride; UINT32 vraw; };
 static GhDescNote g_desc[131072]{};
 // #234 BREAD6: the game's shader-visible CBV/SRV/UAV heaps total 1.17M slots (one of
 // 999,000) used as a per-frame ring, and the hash above dropped 4.79M notes on them.
@@ -13741,11 +13744,12 @@ static inline size_t GhDescSlot(UINT64 h)
     return (size_t)(((h >> 5) * 0x9E3779B97F4A7C15ull) >> 47) & 131071;
 }
 static void GhDescPut(UINT64 cpu, ID3D12Resource* res, unsigned kind, unsigned fmt,
-                      UINT64 va = 0)
+                      UINT64 va = 0, UINT64 voff = 0, UINT32 vlen = 0, UINT32 vstride = 0, UINT32 vraw = 0)
 {
     if (!cpu) return;
     if (GhDescNote* sh = GhDescShadowSlot(cpu)){
         sh->res = res; sh->kind = kind; sh->fmt = fmt; sh->va = va;
+        sh->voff = voff; sh->vlen = vlen; sh->vstride = vstride; sh->vraw = vraw;
         const LONG sq = InterlockedIncrement(&g_descSeq);
         sh->seq = (UINT32)sq; sh->cpu = (LONG64)cpu;
         GhDescWrite* w = &g_dwr[(size_t)(sq - 1) & 1023];
@@ -13759,6 +13763,7 @@ static void GhDescPut(UINT64 cpu, ID3D12Resource* res, unsigned kind, unsigned f
              InterlockedCompareExchange64(&g_desc[i].cpu, (LONG64)cpu, 0) == 0)){
             g_desc[i].res = res; g_desc[i].kind = kind; g_desc[i].fmt = fmt;
             g_desc[i].va = va;
+            g_desc[i].voff = voff; g_desc[i].vlen = vlen; g_desc[i].vstride = vstride; g_desc[i].vraw = vraw;
             const LONG sq = InterlockedIncrement(&g_descSeq);
             g_desc[i].seq = (UINT32)sq;
             GhDescWrite* w = &g_dwr[(size_t)(sq - 1) & 1023];
@@ -14011,12 +14016,34 @@ static const char* GhDescKindName(unsigned k)
 // Describe whatever a descriptor handle names. Diagnostic-only, called from the
 // bind dump; GetDesc on a resource the guest has already released would be a read
 // of freed memory, so it is guarded by the same one-shot budget as the dump.
+static int GhResLiveState(void* p);   // #234 BREAD8: 1 live, 2 released, 0 untracked (gh_obj_life>=2)
+static unsigned GhObjLife();
+static ID3D12Resource* GhVaFindBuf(UINT64 va, UINT64* offOut, UINT64* leftOut);
+static unsigned GhFmtBytes(unsigned f)
+{
+    switch (f){
+        case 2: case 3: case 4: return 16;          // R32G32B32A32
+        case 6: case 7: case 8: return 12;          // R32G32B32
+        case 10: case 11: case 12: case 13: case 14: return 8;   // R16G16B16A16
+        case 16: case 17: case 18: return 8;        // R32G32
+        case 27: case 28: case 29: case 30: case 31: case 32: return 4;   // R8G8B8A8
+        case 33: case 34: case 35: case 36: case 37: case 38: return 4;   // R16G16
+        case 39: case 40: case 41: case 42: case 43: return 4;   // R32
+        case 48: case 49: case 50: case 51: case 52: return 2;   // R8G8
+        case 53: case 54: case 55: case 56: case 57: case 58: case 59: return 2;   // R16
+        case 60: case 61: case 62: case 63: case 64: case 65: return 1;   // R8
+        default: return 4;
+    }
+}
 static std::string GhDescribeHandle(UINT64 cpu)
 {
     const GhDescNote* n = GhDescGet(cpu);
     if (!n) return "?";
     std::string out = std::string(GhDescKindName(n->kind)) + " res=" +
                       Hex((uint64_t)(uintptr_t)n->res);
+    const int live = n->res ? GhResLiveState(n->res) : 0;
+    if (live == 2) return out + " <<< RELEASED (resource dropped from RESLIVE; desc not read)";
+    if (n->res && live == 0 && GhObjLife() >= 2) out += " (untracked)";
     if (n->res){
         D3D12_RESOURCE_DESC rd = n->res->GetDesc();
         out += " dim=" + std::to_string((int)rd.Dimension) +
@@ -14040,6 +14067,28 @@ static std::string GhDescribeHandle(UINT64 cpu)
     }
     if (n->fmt) out += " viewfmt=" + std::to_string((int)n->fmt);
     if (n->va) out += " va=" + Hex(n->va) + (GhVaInBuffer(n->va) ? "" : " <<< NOT IN ANY BUFFER");
+    // buffer view geometry against the resource it was made on
+    if ((n->kind == 2 || n->kind == 3) && n->res && n->vlen){
+        D3D12_RESOURCE_DESC rd = n->res->GetDesc();
+        const UINT64 elem = n->vstride ? n->vstride : ((n->vraw & 1) ? 4 : GhFmtBytes(n->fmt));
+        const UINT64 b0 = n->voff * elem, b1 = (n->voff + n->vlen) * elem;
+        out += " view=first" + std::to_string((unsigned long long)n->voff) + "+n" + std::to_string((unsigned long)n->vlen) +
+               (n->vstride ? "x" + std::to_string((unsigned long)n->vstride) : (n->vraw & 1) ? "raw" : "typed") +
+               " bytes=[" + std::to_string((unsigned long long)b0) + "," + std::to_string((unsigned long long)b1) + ")";
+        if (rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && b1 > rd.Width)
+            out += " <<< VIEW-PAST-END by " + std::to_string((unsigned long long)(b1 - rd.Width));
+    }
+    if (n->kind == 1 && n->va && n->vlen){
+        UINT64 off = 0, left = 0;
+        ID3D12Resource* r = GhVaFindBuf(n->va, &off, &left);
+        out += " size=" + std::to_string((unsigned long)n->vlen);
+        if (r){
+            const int l = GhResLiveState(r);
+            out += " in=" + Hex((uint64_t)(uintptr_t)r) + "+" + std::to_string((unsigned long long)off) +
+                   (l == 2 ? " <<< RELEASED" : "");
+            if (n->vlen > left) out += " <<< CBV-PAST-END by " + std::to_string((unsigned long long)(n->vlen - left));
+        }
+    }
     return out;
 }
 static void __stdcall Hook_D12CreateCBV(ID3D12Device* self,
@@ -14048,7 +14097,7 @@ static void __stdcall Hook_D12CreateCBV(ID3D12Device* self,
     // A CBV carries a raw address, not a resource. Recording nullptr here is what
     // made every constant buffer in the run invisible; keep the address.
     const UINT64 va = d ? (UINT64)d->BufferLocation : 0;
-    if (GhDescTrackOn() || GhVaCheckOn()) GhDescPut((UINT64)dest.ptr, nullptr, 1, 0, va);
+    if (GhDescTrackOn() || GhVaCheckOn()) GhDescPut((UINT64)dest.ptr, nullptr, 1, 0, va, 0, d ? (UINT32)d->SizeInBytes : 0u);
     if (GhVaCheckOn() && va){
         InterlockedIncrement(&g_vaChkCbv); GhVaTick();
         if (!GhVaInBuffer(va)) GhVaBad("CBV", va, 0, self, d ? (UINT64)d->SizeInBytes : 0);
@@ -14134,7 +14183,12 @@ static std::string GhRdBrief(const D3D12_RESOURCE_DESC* rd)
 static void __stdcall Hook_D12CreateSRV(ID3D12Device* self, ID3D12Resource* res,
     const D3D12_SHADER_RESOURCE_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE dest)
 {
-    if (GhDescTrackOn() || GhVaCheckOn()) GhDescPut((UINT64)dest.ptr, res, 2, d ? (unsigned)d->Format : 0u);
+    if (GhDescTrackOn() || GhVaCheckOn()){
+        if (d && d->ViewDimension == D3D12_SRV_DIMENSION_BUFFER)
+            GhDescPut((UINT64)dest.ptr, res, 2, (unsigned)d->Format, 0, d->Buffer.FirstElement,
+                      d->Buffer.NumElements, d->Buffer.StructureByteStride, (UINT32)d->Buffer.Flags);
+        else GhDescPut((UINT64)dest.ptr, res, 2, d ? (unsigned)d->Format : 0u);
+    }
     GH_FIRST("srv", ((uint64_t)(d ? (unsigned)d->Format : 0u) << 8) ^ (uint64_t)(d ? (unsigned)d->ViewDimension : 0u),
              "fmt=" + std::to_string((int)(d ? (unsigned)d->Format : 0u)) +
              " viewdim=" + std::to_string((int)(d ? (unsigned)d->ViewDimension : 0u)));
@@ -14146,7 +14200,12 @@ static void __stdcall Hook_D12CreateUAV(ID3D12Device* self, ID3D12Resource* res,
     ID3D12Resource* counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC* d,
     D3D12_CPU_DESCRIPTOR_HANDLE dest)
 {
-    if (GhDescTrackOn() || GhVaCheckOn()) GhDescPut((UINT64)dest.ptr, res, 3, d ? (unsigned)d->Format : 0u);
+    if (GhDescTrackOn() || GhVaCheckOn()){
+        if (d && d->ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
+            GhDescPut((UINT64)dest.ptr, res, 3, (unsigned)d->Format, 0, d->Buffer.FirstElement,
+                      d->Buffer.NumElements, d->Buffer.StructureByteStride, (UINT32)d->Buffer.Flags);
+        else GhDescPut((UINT64)dest.ptr, res, 3, d ? (unsigned)d->Format : 0u);
+    }
     GH_FIRST("uav", ((uint64_t)(d ? (unsigned)d->Format : 0u) << 8) ^ (uint64_t)(d ? (unsigned)d->ViewDimension : 0u),
              "fmt=" + std::to_string((int)(d ? (unsigned)d->Format : 0u)) +
              " viewdim=" + std::to_string((int)(d ? (unsigned)d->ViewDimension : 0u)));
@@ -14206,7 +14265,7 @@ static void __stdcall Hook_D12CopyDescSimple(ID3D12Device* self, UINT num,
         UINT inc = self->GetDescriptorHandleIncrementSize(type);
         for (UINT k = 0; k < num && k < 4096; ++k){
             const GhDescNote* n = GhDescGet((UINT64)src.ptr + (UINT64)k * inc);
-            if (n) GhDescPut((UINT64)dst.ptr + (UINT64)k * inc, n->res, n->kind, n->fmt, n->va);
+            if (n) GhDescPut((UINT64)dst.ptr + (UINT64)k * inc, n->res, n->kind, n->fmt, n->va, n->voff, n->vlen, n->vstride, n->vraw);
         }
     }
     ((void (__stdcall*)(ID3D12Device*, UINT, D3D12_CPU_DESCRIPTOR_HANDLE,
@@ -14227,7 +14286,7 @@ static void __stdcall Hook_D12CopyDesc(ID3D12Device* self,
             if (dk >= dn){ ++di; dk = 0; continue; }
             if (sk >= sn){ ++si; sk = 0; continue; }
             const GhDescNote* n = GhDescGet((UINT64)src[si].ptr + (UINT64)sk * inc);
-            if (n) GhDescPut((UINT64)dst[di].ptr + (UINT64)dk * inc, n->res, n->kind, n->fmt, n->va);
+            if (n) GhDescPut((UINT64)dst[di].ptr + (UINT64)dk * inc, n->res, n->kind, n->fmt, n->va, n->voff, n->vlen, n->vstride, n->vraw);
             ++dk; ++sk;
         }
     }
@@ -15183,7 +15242,7 @@ static std::string GhBcSnapLine(const GhBcSnap& e, const char* tag)
             UINT64 cpu = GhGpuHandleToCpu(e.tbl[i], &inc);
             if (!cpu){ m += "{NOT-IN-A-REGISTERED-HEAP}"; continue; }
             if (!GhHandleInBoundHeap(e.heaps, e.tbl[i])) m += "{UNBOUND-HEAP}";
-            for (int k = 0; k < 8; ++k){
+            for (int k = 0; k < 16; ++k){
                 const GhDescNote* dn = GhDescGet(cpu + (UINT64)k * inc);
                 if (!dn){ m += " [" + std::to_string(k) + "]UNWRITTEN"; break; }
                 m += " [" + std::to_string(k) + "]" + GhDescribeHandle(cpu + (UINT64)k * inc) +
@@ -15222,6 +15281,7 @@ static void GhBcSnapDump(const char* where, UINT32 started, UINT32 finished)
             const GhBcSnap& e = g_bcRing[i];
             if (!e.g || (UINT32)e.g == started || e.op.kind != 13) continue;
             if (e.op.a[0] != h.op.a[0] || e.op.a[2] != h.op.a[2]) continue;
+            if (same < 4) Diag(GhBcSnapLine(e, (UINT32)e.g <= finished ? "sameobj-retired" : "sameobj-inflight"));
             Diag("BCSAME g=" + std::to_string((long)e.g) + " cl=" + Hex((uint64_t)(uintptr_t)e.cl) +
                  " pso=" + Hex((uint64_t)(uintptr_t)e.pso) +
                  " idx=" + std::to_string((unsigned long)e.op.a[0]) + " inst=" + std::to_string((unsigned long)e.op.a[1]) +
@@ -18621,6 +18681,21 @@ static void GhResLiveDrop(void* p)
     InterlockedIncrement(&g_liveMiss);
 }
 
+static int GhResLiveState(void* p)
+{
+    if (!p || GhObjLife() < 2) return 0;
+    GhLiveRes* t = (GhLiveRes*)InterlockedCompareExchangePointer((void**)&g_liveRes, nullptr, nullptr);
+    if (!t) return 0;
+    const LONG h = GhLiveHash(p);
+    for (LONG probe = 0; probe < 512; ++probe){
+        const LONG i = (h + probe) & (GH_LIVE_SLOTS - 1);
+        void* cur = t[i].p;
+        if (!cur) return 0;
+        if (cur != p) continue;
+        return InterlockedCompareExchange(&t[i].live, 0, 0) ? 1 : 2;
+    }
+    return 0;
+}
 static std::string GhResLiveFrameLine()
 {
     if (GhObjLife() < 2) return std::string();
