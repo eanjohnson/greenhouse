@@ -13883,6 +13883,7 @@ static volatile LONG g_vaChkRoot = 0, g_vaChkTbl = 0, g_vaChkCbv = 0;
 // #158. The validator covered the GRAPHICS setters only. Counted separately so a
 // clean run says which pipeline was actually exercised rather than implying both.
 static volatile LONG g_vaChkCmpTbl = 0, g_vaChkCmpRoot = 0;
+static volatile LONG g_vaChkIa = 0;   // #234: IB/VB views (slots 43/44)
 static void GhVaStats(const char* when)
 {
     AcquireSRWLockShared(&g_bufVaLk);
@@ -13895,6 +13896,7 @@ static void GhVaStats(const char* when)
          " checked_table=" + std::to_string((long)g_vaChkTbl) +
          " checked_cbv=" + std::to_string((long)g_vaChkCbv) +
          " checked_cmptbl=" + std::to_string((long)g_vaChkCmpTbl) +
+         " checked_ia=" + std::to_string((long)g_vaChkIa) +
          " checked_cmproot=" + std::to_string((long)g_vaChkCmpRoot));
 }
 // #158. Three VACHK cells in a row died before the stall dump ran, so VASTATS -- the
@@ -14292,6 +14294,11 @@ struct GhCLNote {
     float   vp[4][6];        // x, y, w, h, zn, zf
     LONG    sc[4][4];        // l, t, r, b
     UINT32  nvp, nsc;
+    // #234 BREAD3/4: the hung draw is a plain pipeline whose previous draw retired,
+    // so the draw's fixed-function inputs are what the record was missing.
+    D3D12_INDEX_BUFFER_VIEW  ib;
+    D3D12_VERTEX_BUFFER_VIEW vb[4];
+    UINT32  nvb, hasIb;
     // #173. The last root signature bound for each pipeline type, so the two
     // appended bindless tables can be pointed at the descriptor heap base every
     // time either the signature or the heaps change.
@@ -14511,6 +14518,30 @@ static unsigned GhOpMask()
 // exactly the one long pass. Binary-search N for the smallest value that still
 // hangs; the CLOP line carrying w=N is then the op that does it.
 static void GhBindDump(ID3D12GraphicsCommandList* self, LONG g);
+// #234 BREAD3/BREAD4. The breadcrumb names the exact op, and twice now that op was a
+// 27-index, 4-instance draw on a plain pipeline whose previous draw retired: what
+// differs is the draw's own state, none of which the CL trace recorded. So every
+// stamped op snapshots its arguments and the list's IB/VB views, root tables, root
+// addresses and targets into a ring, and the device-removed path prints the entries
+// in (finished, started] -- plus `finished` itself as the control that retired.
+struct GhOpArgs { UINT kind; UINT a[5]; };          // kind: 12 draw, 13 drawindexed, 14 dispatch
+static thread_local GhOpArgs t_bcOpArgs{};
+struct GhBcSnap {
+    LONG   g;
+    void*  cl;
+    void*  pso;
+    GhOpArgs op;
+    UINT64 tbl[16], rootva[16];
+    UINT32 tblSet, vaSet;
+    void*  heaps[2];
+    UINT64 rtv[8]; UINT32 nrt; UINT64 dsv; UINT32 hasDsv;
+    D3D12_INDEX_BUFFER_VIEW ib; UINT32 hasIb;
+    D3D12_VERTEX_BUFFER_VIEW vb[4]; UINT32 nvb;
+};
+static const unsigned kBcRingN = 4096;
+static GhBcSnap g_bcRing[kBcRingN];
+static void GhBcSnapTake(ID3D12GraphicsCommandList* self, LONG g);
+static void GhBcSnapDump(const char* where, UINT32 started, UINT32 finished);
 
 // #158. DRED is a dead end on this console -- it arms, and its breadcrumb list is
 // always empty with a page-fault VA of zero. So keep our own. A READBACK buffer
@@ -14619,6 +14650,7 @@ static LONG GhBreadcrumbBefore(ID3D12GraphicsCommandList* cl)
     if (g <= 8192 || GhBcMode() >= 2) Diag("BCOP g=" + std::to_string((long)g) +
                         " cl=" + Hex((uint64_t)(uintptr_t)cl));
     GhBindDump(cl, g);
+    if (GhBcMode() >= 2) GhBcSnapTake(cl, g);
     if (GhDumpPsoAt() && g == (LONG)GhDumpPsoAt()){
         const GhCLNote* n = GhCLFind(cl);
         GhPsoDumpAt(n ? n->lastPso : nullptr, g);
@@ -14730,6 +14762,7 @@ static void GhBreadcrumbDump(const char* where)
          " started=" + std::to_string((unsigned long)g_bcCpu[0]) +
          " finished=" + std::to_string((unsigned long)g_bcCpu[1]) +
          " issued=" + std::to_string((long)InterlockedCompareExchange(&g_bcSeq, 0, 0)));
+    GhBcSnapDump(where, g_bcCpu[0], g_bcCpu[1]);   // #234: the hung op's own state
     // #158: kept on its own line so a run with both draws and barriers stamped is
     // still readable, and so the two numbering schemes are never confused.
     if (GhBcBarriers())
@@ -15042,6 +15075,90 @@ static void GhBindDump(ID3D12GraphicsCommandList* self, LONG g)
     for (UINT i = 0; i < 16; ++i)
         if (n->vaSet & (1u << i)) m += " v" + std::to_string(i) + "=" + Hex(n->rootva[i]);
     Diag(m);
+}
+
+static void GhBcSnapTake(ID3D12GraphicsCommandList* self, LONG g)
+{
+    if (g <= 0) return;
+    const GhCLNote* n = GhCLFind(self);
+    GhBcSnap& e = g_bcRing[(unsigned)g % kBcRingN];
+    GhBcSnap t{};
+    t.g = g; t.cl = self; t.op = t_bcOpArgs;
+    if (n){
+        t.pso = n->lastPso;
+        memcpy(t.tbl, n->tbl, sizeof(t.tbl)); memcpy(t.rootva, n->rootva, sizeof(t.rootva));
+        t.tblSet = n->tblSet; t.vaSet = n->vaSet;
+        t.heaps[0] = n->heaps[0]; t.heaps[1] = n->heaps[1];
+        memcpy(t.rtv, n->rtv, sizeof(t.rtv)); t.nrt = n->nrt; t.dsv = n->dsv; t.hasDsv = n->hasDsv;
+        t.ib = n->ib; t.hasIb = n->hasIb;
+        memcpy(t.vb, n->vb, sizeof(t.vb)); t.nvb = n->nvb;
+    }
+    e = t;
+}
+static std::string GhBcSnapLine(const GhBcSnap& e, const char* tag)
+{
+    std::string m = std::string("BCSNAP ") + tag + " g=" + std::to_string((long)e.g) +
+                    " cl=" + Hex((uint64_t)(uintptr_t)e.cl) + " pso=" + Hex((uint64_t)(uintptr_t)e.pso);
+    if (e.op.kind == 13)
+        m += " DRAWINDEXED idx=" + std::to_string((unsigned long)e.op.a[0]) + " inst=" + std::to_string((unsigned long)e.op.a[1]) +
+             " startidx=" + std::to_string((unsigned long)e.op.a[2]) + " basevtx=" + std::to_string((long)(INT)e.op.a[3]) +
+             " startinst=" + std::to_string((unsigned long)e.op.a[4]);
+    else if (e.op.kind == 12)
+        m += " DRAW verts=" + std::to_string((unsigned long)e.op.a[0]) + " inst=" + std::to_string((unsigned long)e.op.a[1]) +
+             " startvtx=" + std::to_string((unsigned long)e.op.a[2]) + " startinst=" + std::to_string((unsigned long)e.op.a[3]);
+    else if (e.op.kind == 14)
+        m += " DISPATCH " + std::to_string((unsigned long)e.op.a[0]) + "," + std::to_string((unsigned long)e.op.a[1]) + "," +
+             std::to_string((unsigned long)e.op.a[2]);
+    else m += " kind=" + std::to_string((unsigned)e.op.kind);
+    if (e.hasIb){
+        m += " ib=" + Hex((uint64_t)e.ib.BufferLocation) + "+" + std::to_string((unsigned long)e.ib.SizeInBytes) +
+             " fmt=" + std::to_string((int)e.ib.Format);
+        if (GhVaCheckOn()) m += GhVaInBuffer((UINT64)e.ib.BufferLocation) ? "" : " IB-NOT-IN-ANY-BUFFER";
+    }
+    for (UINT i = 0; i < e.nvb && i < 4; ++i){
+        m += " vb" + std::to_string(i) + "=" + Hex((uint64_t)e.vb[i].BufferLocation) + "+" +
+             std::to_string((unsigned long)e.vb[i].SizeInBytes) + "/" + std::to_string((unsigned)e.vb[i].StrideInBytes);
+        if (GhVaCheckOn() && e.vb[i].SizeInBytes)
+            m += GhVaInBuffer((UINT64)e.vb[i].BufferLocation) ? "" : " VB-NOT-IN-ANY-BUFFER";
+    }
+    m += " heaps=" + Hex((uint64_t)(uintptr_t)e.heaps[0]) + "," + Hex((uint64_t)(uintptr_t)e.heaps[1]) +
+         " nrt=" + std::to_string((unsigned long)e.nrt);
+    for (UINT i = 0; i < e.nrt && i < 8; ++i) m += " rtv" + std::to_string(i) + "=" + Hex(e.rtv[i]) + "{" + GhDescribeHandle(e.rtv[i]) + "}";
+    if (e.hasDsv) m += " dsv=" + Hex(e.dsv) + "{" + GhDescribeHandle(e.dsv) + "}";
+    for (UINT i = 0; i < 16; ++i)
+        if (e.tblSet & (1u << i)){
+            m += " t" + std::to_string(i) + "=" + Hex(e.tbl[i]);
+            UINT inc = 32;
+            UINT64 cpu = GhGpuHandleToCpu(e.tbl[i], &inc);
+            if (!cpu){ m += "{NOT-IN-A-REGISTERED-HEAP}"; continue; }
+            if (!GhHandleInBoundHeap(e.heaps, e.tbl[i])) m += "{UNBOUND-HEAP}";
+            for (int k = 0; k < 8; ++k){
+                const GhDescNote* dn = GhDescGet(cpu + (UINT64)k * inc);
+                if (!dn){ m += " [" + std::to_string(k) + "]UNWRITTEN"; break; }
+                m += " [" + std::to_string(k) + "]" + GhDescribeHandle(cpu + (UINT64)k * inc) +
+                     "#" + std::to_string((unsigned long)dn->seq);
+            }
+        }
+    for (UINT i = 0; i < 16; ++i)
+        if (e.vaSet & (1u << i)){
+            m += " v" + std::to_string(i) + "=" + Hex(e.rootva[i]);
+            if (GhVaCheckOn() && e.rootva[i]) m += GhVaInBuffer(e.rootva[i]) ? "" : "{NOT-IN-ANY-BUFFER}";
+        }
+    return m;
+}
+static void GhBcSnapDump(const char* where, UINT32 started, UINT32 finished)
+{
+    if (GhBcMode() < 2 || !started) return;
+    if (started == 0xFFFFFFFFu || finished == 0xFFFFFFFFu){ Diag(std::string("BCSNAP ") + where + " markers unreadable"); return; }
+    // the last op that retired is the control; then everything the GPU had started
+    unsigned printed = 0;
+    for (UINT32 g = finished; g <= started && printed < 12; ++g){
+        if (!g) continue;
+        const GhBcSnap& e = g_bcRing[g % kBcRingN];
+        if ((UINT32)e.g != g){ Diag("BCSNAP " + std::string(where) + " g=" + std::to_string((unsigned long)g) + " evicted from the ring"); continue; }
+        Diag(GhBcSnapLine(e, g == finished ? "retired" : (g == started ? "HUNG" : "inflight")));
+        ++printed;
+    }
 }
 
 static unsigned GhOpStop()
@@ -15587,6 +15704,7 @@ static void __stdcall Hook_CLDraw(ID3D12GraphicsCommandList* self, UINT a, UINT 
                                     " DRAW verts=" + std::to_string((unsigned long)a) +
                                     " inst=" + std::to_string((unsigned long)b));
     if ((GhOpMask() & 1) || GhWorkOpDropped(self, wi)) return;
+    t_bcOpArgs = GhOpArgs{ 12, { a, b, c, d, 0 } };
     const LONG bcg = GhBreadcrumbBefore(self);
     if (!GhRecCap12(self, a, b, c, d)){
         GhPsoRebindBefore(self);
@@ -15606,6 +15724,7 @@ static void __stdcall Hook_CLDrawIndexed(ID3D12GraphicsCommandList* self, UINT a
                                     " DRAWINDEXED idx=" + std::to_string((unsigned long)a) +
                                     " inst=" + std::to_string((unsigned long)b));
     if ((GhOpMask() & 1) || GhWorkOpDropped(self, wi)) return;
+    t_bcOpArgs = GhOpArgs{ 13, { a, b, c, (UINT)d, e } };
     const LONG bcg = GhBreadcrumbBefore(self);
     if (!GhRecCap13(self, a, b, c, d, e)){
         GhPsoRebindBefore(self);
@@ -15625,6 +15744,7 @@ static void __stdcall Hook_CLDispatch(ID3D12GraphicsCommandList* self, UINT x, U
                                     " DISPATCH " + std::to_string((unsigned long)x) + "," +
                                     std::to_string((unsigned long)y) + "," + std::to_string((unsigned long)z));
     if ((GhOpMask() & 2) || GhWorkOpDropped(self, wi)) return;
+    t_bcOpArgs = GhOpArgs{ 14, { x, y, z, 0, 0 } };
     const LONG bcg = GhBreadcrumbBefore(self);
     if (!GhRecCap14(self, x, y, z))
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT))GhClOrig(self, 14))(self, x, y, z);
@@ -17633,6 +17753,27 @@ static void __stdcall Hook_CLSetCmpUav(ID3D12GraphicsCommandList* self, UINT idx
 static void __stdcall Hook_CLIASetIB(ID3D12GraphicsCommandList* self,
                                      const D3D12_INDEX_BUFFER_VIEW* v)
 {
+    // #234 BREAD3: the exact hung draw is a plain pipeline whose previous draw
+    // retired, so what differs is the draw's state. The VA check covered root
+    // CBV/SRV/UAV addresses and descriptor tables but never the two fixed-function
+    // views a draw fetches from; and the CL trace never recorded them either.
+    if (GhCLNote* nt = GhCLFind(self)){
+        if (v){ nt->ib = *v; nt->hasIb = 1; } else { nt->ib = D3D12_INDEX_BUFFER_VIEW{}; nt->hasIb = 0; }
+    }
+    if (v && v->SizeInBytes){
+        if (GhVaCheckOn()){
+            InterlockedIncrement(&g_vaChkIa); GhVaTick();
+            if (!GhVaInBuffer((UINT64)v->BufferLocation))
+                GhVaBad("IB", (UINT64)v->BufferLocation, 0, self, (UINT64)v->SizeInBytes);
+            else if (!GhVaInBuffer((UINT64)v->BufferLocation + v->SizeInBytes - 1))
+                GhVaBad("IB-END", (UINT64)v->BufferLocation + v->SizeInBytes - 1, 0, self,
+                        (UINT64)v->SizeInBytes);
+        }
+        if (GhCLTraceOn())
+            Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " IB va=" + Hex((uint64_t)v->BufferLocation) +
+                 " size=" + std::to_string((unsigned long)v->SizeInBytes) +
+                 " fmt=" + std::to_string((unsigned)v->Format));
+    }
     if (!GhRecCap43(self, v))
         ((void (__stdcall*)(ID3D12GraphicsCommandList*,
             const D3D12_INDEX_BUFFER_VIEW*))GhClOrig(self, 43))(self, v);
@@ -17640,6 +17781,30 @@ static void __stdcall Hook_CLIASetIB(ID3D12GraphicsCommandList* self,
 static void __stdcall Hook_CLIASetVB(ID3D12GraphicsCommandList* self, UINT start, UINT n,
                                      const D3D12_VERTEX_BUFFER_VIEW* v)
 {
+    if (GhCLNote* nt = GhCLFind(self)){
+        for (UINT i = 0; i < n && start + i < 4; ++i){
+            nt->vb[start + i] = v ? v[i] : D3D12_VERTEX_BUFFER_VIEW{};
+            if (start + i + 1 > nt->nvb) nt->nvb = start + i + 1;
+        }
+    }
+    if (v && n && n <= 32){
+        for (UINT i = 0; i < n; ++i){
+            if (!v[i].SizeInBytes) continue;
+            if (GhVaCheckOn()){
+                InterlockedIncrement(&g_vaChkIa); GhVaTick();
+                if (!GhVaInBuffer((UINT64)v[i].BufferLocation))
+                    GhVaBad("VB", (UINT64)v[i].BufferLocation, start + i, self, (UINT64)v[i].SizeInBytes);
+                else if (!GhVaInBuffer((UINT64)v[i].BufferLocation + v[i].SizeInBytes - 1))
+                    GhVaBad("VB-END", (UINT64)v[i].BufferLocation + v[i].SizeInBytes - 1, start + i,
+                            self, (UINT64)v[i].SizeInBytes);
+            }
+            if (GhCLTraceOn())
+                Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " VB slot=" + std::to_string((unsigned)(start + i)) +
+                     " va=" + Hex((uint64_t)v[i].BufferLocation) +
+                     " size=" + std::to_string((unsigned long)v[i].SizeInBytes) +
+                     " stride=" + std::to_string((unsigned)v[i].StrideInBytes));
+        }
+    }
     if (!GhRecCap44(self, start, n, v))
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, UINT,
             const D3D12_VERTEX_BUFFER_VIEW*))GhClOrig(self, 44))(self, start, n, v);
