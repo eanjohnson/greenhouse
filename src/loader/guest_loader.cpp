@@ -14520,6 +14520,15 @@ static void GhBindDump(ID3D12GraphicsCommandList* self, LONG g);
 // When the device hangs, started != finished names the exact draw or dispatch the
 // GPU stopped inside -- and every CLOP line carries the same g= number, so the
 // PSO and the op are one grep away.
+// #234. gh_breadcrumb=2 stamps only inside the gh_cl_trace window (GhCLTraceOn),
+// so the ~10^6 ops of the menu and the load carry no WriteBufferImmediate pair, and
+// the BCOP line prints for EVERY stamped op (the 8192 cap below was sized for
+// whole-run stamping). The hung list is CL-traced already, so each BCOP g= resolves
+// to the CLOP line immediately above it, and at device removal started=/finished=
+// name the exact draw or dispatch the GPU stopped inside.
+static unsigned GhBcMode()
+{ static const unsigned v = (unsigned)GhCfgNum(L"gh_breadcrumb.txt", "GH_BREADCRUMB", 0); return v; }
+static UINT g_bcWbiFlags = 0;   // OPTIONS3 WriteBufferImmediateSupportFlags, 0 = unknown
 static com_ptr<ID3D12Resource> g_bcRes;
 static volatile UINT32* g_bcCpu = nullptr;
 static D3D12_GPU_VIRTUAL_ADDRESS g_bcVa = 0;
@@ -14528,7 +14537,7 @@ static volatile LONG g_bcOn = 0;
 
 static void GhBreadcrumbInit(ID3D12Device* dev)
 {
-    if (!dev || !GhCfgNum(L"gh_breadcrumb.txt", "GH_BREADCRUMB", 0)) return;
+    if (!dev || !GhBcMode()) return;
     if (InterlockedCompareExchange(&g_bcOn, 1, 0) != 0) return;
     D3D12_HEAP_PROPERTIES hp{};
     hp.Type = D3D12_HEAP_TYPE_READBACK;
@@ -14557,8 +14566,13 @@ static void GhBreadcrumbInit(ID3D12Device* dev)
     g_bcCpu[0] = 0; g_bcCpu[1] = 0;
     g_bcCpu[2] = 0; g_bcCpu[3] = 0;   // #158 barrier-batch breadcrumb
     g_bcVa = g_bcRes->GetGPUVirtualAddress();
+    D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3{};
+    if (SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3))))
+        g_bcWbiFlags = (UINT)o3.WriteBufferImmediateSupportFlags;
     Diag("BREADCRUMB armed va=" + Hex((uint64_t)g_bcVa) +
-         " cpu=" + Hex((uint64_t)(uintptr_t)p));
+         " cpu=" + Hex((uint64_t)(uintptr_t)p) +
+         " mode=" + std::to_string(GhBcMode()) +
+         " wbi=" + Hex((uint32_t)g_bcWbiFlags));
 }
 
 // Returns the global op number stamped, or 0 when breadcrumbs are off.
@@ -14571,6 +14585,20 @@ static LONG GhBreadcrumbBefore(ID3D12GraphicsCommandList* cl)
     // gh_cl_dup is the opposite case: the command is captured AND still executed from
     // this list, so the stamp belongs here and the duplicate carries none.
     if (GhClRec() && GhRecOn(cl)) return 0;
+    if (GhBcMode() >= 2){
+        if (!GhCLTraceOn()) return 0;              // #234: window-only stamping
+        // Only stamp list types the driver says take the marker modes; a
+        // WriteBufferImmediate on an unsupported queue would be a failure mode of
+        // the instrument, not of the game. Flags unknown (0) = stamp as before.
+        if (g_bcWbiFlags){
+            const GhCLNote* nt = GhCLFind(cl);
+            const int ty = nt ? (int)nt->type : (int)D3D12_COMMAND_LIST_TYPE_DIRECT;
+            const UINT need = ty == (int)D3D12_COMMAND_LIST_TYPE_COMPUTE ? (UINT)D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE
+                            : ty == (int)D3D12_COMMAND_LIST_TYPE_COPY    ? (UINT)D3D12_COMMAND_LIST_SUPPORT_FLAG_COPY
+                            :                                              (UINT)D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT;
+            if (!(g_bcWbiFlags & need)) return 0;
+        }
+    }
     LONG g = InterlockedIncrement(&g_bcSeq);
     com_ptr<ID3D12GraphicsCommandList2> cl2;
     if (FAILED(cl->QueryInterface(__uuidof(ID3D12GraphicsCommandList2), cl2.put_void())) || !cl2){
@@ -14588,7 +14616,7 @@ static LONG GhBreadcrumbBefore(ID3D12GraphicsCommandList* cl)
     // The number the GPU stamps has to be resolvable back to an op. Diag is
     // serialised, so this line sits immediately after that op's CLOP line for the
     // same list, which is all the correlation needed.
-    if (g <= 8192) Diag("BCOP g=" + std::to_string((long)g) +
+    if (g <= 8192 || GhBcMode() >= 2) Diag("BCOP g=" + std::to_string((long)g) +
                         " cl=" + Hex((uint64_t)(uintptr_t)cl));
     GhBindDump(cl, g);
     if (GhDumpPsoAt() && g == (LONG)GhDumpPsoAt()){
@@ -14607,6 +14635,23 @@ static void GhBreadcrumbAfter(ID3D12GraphicsCommandList* cl, LONG g)
     pr.Value = (UINT32)g;
     D3D12_WRITEBUFFERIMMEDIATE_MODE md = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
     cl2->WriteBufferImmediate(1, &pr, &md);
+    // #234 mode 3: serialise. BREAD1b showed the GPU with 31 draws in flight at the
+    // freeze (started=#32, finished=#1 of the hung list), so MARKER_OUT alone names
+    // a range, not a draw. A null-UAV plus null-aliasing barrier after every stamped
+    // op asks the driver to drain the pipeline before the next op starts; if it
+    // honours that, started == finished + 1 at the freeze and the draw is exact.
+    // Through the ORIGINAL vtable slot 26 so our own barrier hooks and rings see none
+    // of it. Window-only, like the stamps.
+    if (GhBcMode() >= 3){
+        D3D12_RESOURCE_BARRIER b[2]{};
+        b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;      b[0].UAV.pResource = nullptr;
+        b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING; b[1].Aliasing.pResourceBefore = nullptr;
+                                                          b[1].Aliasing.pResourceAfter  = nullptr;
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*))
+            GhClOrig(cl, 26))(cl, 2, b);
+        static volatile LONG nser = 0;
+        if (InterlockedIncrement(&nser) == 1) Diag("BREADCRUMB serialising (mode 3): drain barrier pair after every stamped op");
+    }
 }
 // #158. The draw breadcrumb is stamped at exactly four sites -- draws, dispatch
 // and indirect. Barriers were never stamped, so in the ONE configuration that
