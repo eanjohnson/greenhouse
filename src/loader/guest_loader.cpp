@@ -13715,21 +13715,21 @@ static bool GhDescTrackOn()
 // it. A monotonic write number on the slot plus a ring of the recent writes turns
 // that into a diff anyone can do from the log.
 struct GhDescNote { volatile LONG64 cpu; ID3D12Resource* res; UINT32 kind; UINT32 fmt; UINT64 va; UINT32 seq; };
-static GhDescNote g_desc[16384]{};
+static GhDescNote g_desc[131072]{};
 struct GhDescWrite { UINT32 seq; UINT32 kind; UINT64 cpu; void* res; };
 static GhDescWrite g_dwr[1024]{};
 static volatile LONG g_descSeq = 0;
 static volatile LONG g_descDrop = 0;   // notes lost to a full 32-probe run
 static inline size_t GhDescSlot(UINT64 h)
 {
-    return (size_t)(((h >> 5) * 0x9E3779B97F4A7C15ull) >> 50) & 16383;
+    return (size_t)(((h >> 5) * 0x9E3779B97F4A7C15ull) >> 47) & 131071;
 }
 static void GhDescPut(UINT64 cpu, ID3D12Resource* res, unsigned kind, unsigned fmt,
                       UINT64 va = 0)
 {
     if (!cpu) return;
     size_t i = GhDescSlot(cpu);
-    for (int p = 0; p < 32; ++p, i = (i + 1) & 16383){
+    for (int p = 0; p < 32; ++p, i = (i + 1) & 131071){
         LONG64 cur = g_desc[i].cpu;
         if ((UINT64)cur == cpu || (cur == 0 &&
              InterlockedCompareExchange64(&g_desc[i].cpu, (LONG64)cpu, 0) == 0)){
@@ -13749,7 +13749,7 @@ static const GhDescNote* GhDescGet(UINT64 cpu)
 {
     if (!cpu) return nullptr;
     size_t i = GhDescSlot(cpu);
-    for (int p = 0; p < 32; ++p, i = (i + 1) & 16383){
+    for (int p = 0; p < 32; ++p, i = (i + 1) & 131071){
         LONG64 cur = g_desc[i].cpu;
         if ((UINT64)cur == cpu) return &g_desc[i];
         if (!cur) return nullptr;
@@ -14096,7 +14096,7 @@ static std::string GhRdBrief(const D3D12_RESOURCE_DESC* rd)
 static void __stdcall Hook_D12CreateSRV(ID3D12Device* self, ID3D12Resource* res,
     const D3D12_SHADER_RESOURCE_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE dest)
 {
-    if (GhDescTrackOn()) GhDescPut((UINT64)dest.ptr, res, 2, d ? (unsigned)d->Format : 0u);
+    if (GhDescTrackOn() || GhVaCheckOn()) GhDescPut((UINT64)dest.ptr, res, 2, d ? (unsigned)d->Format : 0u);
     GH_FIRST("srv", ((uint64_t)(d ? (unsigned)d->Format : 0u) << 8) ^ (uint64_t)(d ? (unsigned)d->ViewDimension : 0u),
              "fmt=" + std::to_string((int)(d ? (unsigned)d->Format : 0u)) +
              " viewdim=" + std::to_string((int)(d ? (unsigned)d->ViewDimension : 0u)));
@@ -14108,7 +14108,7 @@ static void __stdcall Hook_D12CreateUAV(ID3D12Device* self, ID3D12Resource* res,
     ID3D12Resource* counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC* d,
     D3D12_CPU_DESCRIPTOR_HANDLE dest)
 {
-    if (GhDescTrackOn()) GhDescPut((UINT64)dest.ptr, res, 3, d ? (unsigned)d->Format : 0u);
+    if (GhDescTrackOn() || GhVaCheckOn()) GhDescPut((UINT64)dest.ptr, res, 3, d ? (unsigned)d->Format : 0u);
     GH_FIRST("uav", ((uint64_t)(d ? (unsigned)d->Format : 0u) << 8) ^ (uint64_t)(d ? (unsigned)d->ViewDimension : 0u),
              "fmt=" + std::to_string((int)(d ? (unsigned)d->Format : 0u)) +
              " viewdim=" + std::to_string((int)(d ? (unsigned)d->ViewDimension : 0u)));
@@ -14119,7 +14119,7 @@ static void __stdcall Hook_D12CreateUAV(ID3D12Device* self, ID3D12Resource* res,
 static void __stdcall Hook_D12CreateDSV(ID3D12Device* self, ID3D12Resource* res,
     const D3D12_DEPTH_STENCIL_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE dest)
 {
-    if (GhDescTrackOn()) GhDescPut((UINT64)dest.ptr, res, 5, d ? (unsigned)d->Format : 0u);
+    if (GhDescTrackOn() || GhVaCheckOn()) GhDescPut((UINT64)dest.ptr, res, 5, d ? (unsigned)d->Format : 0u);
     GH_FIRST("dsv", ((uint64_t)(d ? (unsigned)d->Format : 0u) << 8) ^ (uint64_t)(d ? (unsigned)d->ViewDimension : 0u),
              "fmt=" + std::to_string((int)(d ? (unsigned)d->Format : 0u)) +
              " viewdim=" + std::to_string((int)(d ? (unsigned)d->ViewDimension : 0u)));
@@ -14164,7 +14164,7 @@ static void __stdcall Hook_D12CopyDescSimple(ID3D12Device* self, UINT num,
     D3D12_CPU_DESCRIPTOR_HANDLE dst, D3D12_CPU_DESCRIPTOR_HANDLE src,
     D3D12_DESCRIPTOR_HEAP_TYPE type)
 {
-    if (GhDescTrackOn()){
+    if (GhDescTrackOn() || GhVaCheckOn()){
         UINT inc = self->GetDescriptorHandleIncrementSize(type);
         for (UINT k = 0; k < num && k < 4096; ++k){
             const GhDescNote* n = GhDescGet((UINT64)src.ptr + (UINT64)k * inc);
@@ -14180,7 +14180,7 @@ static void __stdcall Hook_D12CopyDesc(ID3D12Device* self,
     UINT nSrc, const D3D12_CPU_DESCRIPTOR_HANDLE* src, const UINT* srcSizes,
     D3D12_DESCRIPTOR_HEAP_TYPE type)
 {
-    if (GhDescTrackOn() && dst && src){
+    if ((GhDescTrackOn() || GhVaCheckOn()) && dst && src){
         UINT inc = self->GetDescriptorHandleIncrementSize(type);
         UINT di = 0, dk = 0, si = 0, sk = 0;
         for (UINT guard = 0; guard < 8192 && di < nDst && si < nSrc; ++guard){
@@ -14209,7 +14209,7 @@ static void __stdcall Hook_D12CreateRTV(ID3D12Device* self, ID3D12Resource* res,
         Diag(std::string("D3D12 CreateRenderTargetView res=") +
              (res == g_gfx.guestRT12.get() ? "guestRT12" : "other") +
              " fmt=" + (d ? std::to_string((int)d->Format) : "null"));
-    if (GhDescTrackOn()) GhDescPut((UINT64)dest.ptr, res, 4, d ? (unsigned)d->Format : 0u);
+    if (GhDescTrackOn() || GhVaCheckOn()) GhDescPut((UINT64)dest.ptr, res, 4, d ? (unsigned)d->Format : 0u);
     GhRtAuditRtv(res);
     orig(self, res, d, dest);
 }
