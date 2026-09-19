@@ -13716,6 +13716,22 @@ static bool GhDescTrackOn()
 // that into a diff anyone can do from the log.
 struct GhDescNote { volatile LONG64 cpu; ID3D12Resource* res; UINT32 kind; UINT32 fmt; UINT64 va; UINT32 seq; };
 static GhDescNote g_desc[131072]{};
+// #234 BREAD6: the game's shader-visible CBV/SRV/UAV heaps total 1.17M slots (one of
+// 999,000) used as a per-frame ring, and the hash above dropped 4.79M notes on them.
+// Every shader-visible CBV/SRV/UAV heap gets a direct-indexed shadow instead; the hash
+// keeps serving the staging heaps, RTV/DSV heaps and the sampler heaps (~33k slots).
+struct GhDescShadow { UINT64 cpu0, end; UINT32 inc; GhDescNote* notes; };
+static GhDescShadow g_dsh[8]{};
+static volatile LONG g_dshN = 0;
+static GhDescNote* GhDescShadowSlot(UINT64 cpu)
+{
+    LONG n = g_dshN; if (n > 8) n = 8;
+    for (LONG i = 0; i < n; ++i){
+        const GhDescShadow& d = g_dsh[i];
+        if (d.notes && cpu >= d.cpu0 && cpu < d.end) return &d.notes[(cpu - d.cpu0) / d.inc];
+    }
+    return nullptr;
+}
 struct GhDescWrite { UINT32 seq; UINT32 kind; UINT64 cpu; void* res; };
 static GhDescWrite g_dwr[1024]{};
 static volatile LONG g_descSeq = 0;
@@ -13728,6 +13744,14 @@ static void GhDescPut(UINT64 cpu, ID3D12Resource* res, unsigned kind, unsigned f
                       UINT64 va = 0)
 {
     if (!cpu) return;
+    if (GhDescNote* sh = GhDescShadowSlot(cpu)){
+        sh->res = res; sh->kind = kind; sh->fmt = fmt; sh->va = va;
+        const LONG sq = InterlockedIncrement(&g_descSeq);
+        sh->seq = (UINT32)sq; sh->cpu = (LONG64)cpu;
+        GhDescWrite* w = &g_dwr[(size_t)(sq - 1) & 1023];
+        w->seq = (UINT32)sq; w->kind = (UINT32)kind; w->cpu = cpu; w->res = res;
+        return;
+    }
     size_t i = GhDescSlot(cpu);
     for (int p = 0; p < 32; ++p, i = (i + 1) & 131071){
         LONG64 cur = g_desc[i].cpu;
@@ -13748,6 +13772,7 @@ static void GhDescPut(UINT64 cpu, ID3D12Resource* res, unsigned kind, unsigned f
 static const GhDescNote* GhDescGet(UINT64 cpu)
 {
     if (!cpu) return nullptr;
+    if (const GhDescNote* sh = GhDescShadowSlot(cpu)) return sh->cpu ? sh : nullptr;
     size_t i = GhDescSlot(cpu);
     for (int p = 0; p < 32; ++p, i = (i + 1) & 131071){
         LONG64 cur = g_desc[i].cpu;
@@ -13807,6 +13832,19 @@ static void GhDHAdd(ID3D12Device* dev, ID3D12DescriptorHeap* h,
     g_dh[i].num  = d->NumDescriptors;
     g_dh[i].type = (UINT32)d->Type;
     g_dh[i].obj  = (void*)h;
+    if ((d->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
+        d->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && d->NumDescriptors && g_dh[i].inc){
+        LONG k = InterlockedIncrement(&g_dshN) - 1;
+        if (k >= 0 && k < 8){
+            SIZE_T bytes = (SIZE_T)d->NumDescriptors * sizeof(GhDescNote);
+            GhDescNote* notes = (GhDescNote*)VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            g_dsh[k].cpu0 = g_dh[i].cpu0; g_dsh[k].inc = g_dh[i].inc;
+            g_dsh[k].end  = g_dh[i].cpu0 + (UINT64)g_dh[i].inc * d->NumDescriptors;
+            g_dsh[k].notes = notes;
+            Diag("DESCSHADOW #" + std::to_string((long)k) + " slots=" + std::to_string((unsigned)d->NumDescriptors) +
+                 " bytes=" + std::to_string((unsigned long long)bytes) + (notes ? " ok" : " ALLOC FAILED " + Hex(GetLastError())));
+        }
+    }
 }
 // D3D12 requires that a table handle live in a heap that is currently BOUND on
 // the list. A handle inside some other, unbound heap is undefined behaviour and
@@ -14548,6 +14586,7 @@ struct GhBcSnap {
     UINT64 rtv[8]; UINT32 nrt; UINT64 dsv; UINT32 hasDsv;
     D3D12_INDEX_BUFFER_VIEW ib; UINT32 hasIb;
     D3D12_VERTEX_BUFFER_VIEW vb[4]; UINT32 nvb;
+    UINT32 descSeqAtTake;
 };
 static const unsigned kBcRingN = 4096;
 static GhBcSnap g_bcRing[kBcRingN];
@@ -15104,6 +15143,7 @@ static void GhBcSnapTake(ID3D12GraphicsCommandList* self, LONG g)
         t.ib = n->ib; t.hasIb = n->hasIb;
         memcpy(t.vb, n->vb, sizeof(t.vb)); t.nvb = n->nvb;
     }
+    t.descSeqAtTake = (UINT32)InterlockedCompareExchange(&g_descSeq, 0, 0);
     e = t;
 }
 static std::string GhBcSnapLine(const GhBcSnap& e, const char* tag)
@@ -15147,7 +15187,8 @@ static std::string GhBcSnapLine(const GhBcSnap& e, const char* tag)
                 const GhDescNote* dn = GhDescGet(cpu + (UINT64)k * inc);
                 if (!dn){ m += " [" + std::to_string(k) + "]UNWRITTEN"; break; }
                 m += " [" + std::to_string(k) + "]" + GhDescribeHandle(cpu + (UINT64)k * inc) +
-                     "#" + std::to_string((unsigned long)dn->seq);
+                     "#" + std::to_string((unsigned long)dn->seq) +
+                     (dn->seq > e.descSeqAtTake ? "(REWRITTEN-AFTER-RECORD)" : "");
             }
         }
     for (UINT i = 0; i < 16; ++i)
@@ -15169,6 +15210,30 @@ static void GhBcSnapDump(const char* where, UINT32 started, UINT32 finished)
         if ((UINT32)e.g != g){ Diag("BCSNAP " + std::string(where) + " g=" + std::to_string((unsigned long)g) + " evicted from the ring"); continue; }
         Diag(GhBcSnapLine(e, g == finished ? "retired" : (g == started ? "HUNG" : "inflight")));
         ++printed;
+    }
+    // #234 BREAD7: the hung draw is the same object every run (idx=27, startidx=1,001,140,
+    // the same VB offsets inside its 16 MB block). List every other draw of that object the
+    // ring still holds, with whether it retired -- an object that retired at inst=1 or 2
+    // and hangs at 4-5 says the instance records, not the mesh.
+    const GhBcSnap& h = g_bcRing[started % kBcRingN];
+    if ((UINT32)h.g == started && h.op.kind == 13){
+        unsigned same = 0;
+        for (unsigned i = 0; i < kBcRingN && same < 24; ++i){
+            const GhBcSnap& e = g_bcRing[i];
+            if (!e.g || (UINT32)e.g == started || e.op.kind != 13) continue;
+            if (e.op.a[0] != h.op.a[0] || e.op.a[2] != h.op.a[2]) continue;
+            Diag("BCSAME g=" + std::to_string((long)e.g) + " cl=" + Hex((uint64_t)(uintptr_t)e.cl) +
+                 " pso=" + Hex((uint64_t)(uintptr_t)e.pso) +
+                 " idx=" + std::to_string((unsigned long)e.op.a[0]) + " inst=" + std::to_string((unsigned long)e.op.a[1]) +
+                 " startidx=" + std::to_string((unsigned long)e.op.a[2]) + " startinst=" + std::to_string((unsigned long)e.op.a[4]) +
+                 " ib=" + Hex((uint64_t)e.ib.BufferLocation) +
+                 " vb0=" + Hex((uint64_t)e.vb[0].BufferLocation) + "+" + std::to_string((unsigned long)e.vb[0].SizeInBytes) +
+                 " vb3=" + Hex((uint64_t)e.vb[3].BufferLocation) + "+" + std::to_string((unsigned long)e.vb[3].SizeInBytes) +
+                 " t2=" + Hex(e.tbl[2]) + " t3=" + Hex(e.tbl[3]) + " t4=" + Hex(e.tbl[4]) +
+                 ((UINT32)e.g <= finished ? " retired" : " inflight"));
+            ++same;
+        }
+        Diag("BCSAME total=" + std::to_string(same) + " (ring holds the last " + std::to_string(kBcRingN) + " stamped ops)");
     }
 }
 
