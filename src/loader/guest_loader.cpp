@@ -15242,7 +15242,7 @@ static std::string GhBcSnapLine(const GhBcSnap& e, const char* tag)
             UINT64 cpu = GhGpuHandleToCpu(e.tbl[i], &inc);
             if (!cpu){ m += "{NOT-IN-A-REGISTERED-HEAP}"; continue; }
             if (!GhHandleInBoundHeap(e.heaps, e.tbl[i])) m += "{UNBOUND-HEAP}";
-            for (int k = 0; k < 16; ++k){
+            for (int k = 0; k < 56; ++k){
                 const GhDescNote* dn = GhDescGet(cpu + (UINT64)k * inc);
                 if (!dn){ m += " [" + std::to_string(k) + "]UNWRITTEN"; break; }
                 m += " [" + std::to_string(k) + "]" + GhDescribeHandle(cpu + (UINT64)k * inc) +
