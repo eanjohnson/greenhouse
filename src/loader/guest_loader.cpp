@@ -14407,7 +14407,7 @@ struct GhCLNote {
     // #234 BREAD3/4: the hung draw is a plain pipeline whose previous draw retired,
     // so the draw's fixed-function inputs are what the record was missing.
     D3D12_INDEX_BUFFER_VIEW  ib;
-    D3D12_VERTEX_BUFFER_VIEW vb[4];
+    D3D12_VERTEX_BUFFER_VIEW vb[16];   // #234 BREAD11: was 4 -- the hung layout reads slots 0-9
     UINT32  nvb, hasIb;
     UINT32  topo;            // #234 BREAD10: IASetPrimitiveTopology, last set on this list
     // #173. The last root signature bound for each pipeline type, so the two
@@ -14646,6 +14646,7 @@ static thread_local GhOpArgs t_bcOpArgs{};
 static bool GhPsoDescOn(){ static const bool on = GhCfgNumZ(L"gh_pso_desc.txt", "GH_PSO_DESC", 0) != 0; return on; }
 static SRWLOCK g_psoDescLock = SRWLOCK_INIT;
 static std::unordered_map<void*, std::string> g_psoDescMap;
+static std::unordered_map<void*, UINT64> g_psoSlotMask;   // low 32: per-vertex slots, high 32: per-instance
 static void GhPsoDescKeepAdd(void* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d)
 {
     if (!GhPsoDescOn() || !pso || !d) return;
@@ -14694,9 +14695,23 @@ static void GhPsoDescKeepAdd(void* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC
              ":c" + std::to_string((int)e.InputSlotClass) + ":r" + std::to_string((unsigned)e.InstanceDataStepRate);
     }
     m += "}";
+    UINT64 mask = 0;
+    for (UINT i = 0; i < d->InputLayout.NumElements && i < 32 && d->InputLayout.pInputElementDescs; ++i){
+        const D3D12_INPUT_ELEMENT_DESC& e = d->InputLayout.pInputElementDescs[i];
+        if (e.InputSlot < 32) mask |= (UINT64)1 << (e.InputSlot + (e.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA ? 32 : 0));
+    }
     AcquireSRWLockExclusive(&g_psoDescLock);
-    if (g_psoDescMap.size() < 40000) g_psoDescMap[pso] = m;
+    if (g_psoDescMap.size() < 40000){ g_psoDescMap[pso] = m; g_psoSlotMask[pso] = mask; }
     ReleaseSRWLockExclusive(&g_psoDescLock);
+}
+static UINT64 GhPsoSlotMask(void* pso)
+{
+    UINT64 r = 0;
+    AcquireSRWLockShared(&g_psoDescLock);
+    auto it = g_psoSlotMask.find(pso);
+    if (it != g_psoSlotMask.end()) r = it->second;
+    ReleaseSRWLockShared(&g_psoDescLock);
+    return r;
 }
 static std::string GhPsoDescLine(void* pso)
 {
@@ -14717,7 +14732,7 @@ struct GhBcSnap {
     void*  heaps[2];
     UINT64 rtv[8]; UINT32 nrt; UINT64 dsv; UINT32 hasDsv;
     D3D12_INDEX_BUFFER_VIEW ib; UINT32 hasIb;
-    D3D12_VERTEX_BUFFER_VIEW vb[4]; UINT32 nvb;
+    D3D12_VERTEX_BUFFER_VIEW vb[16]; UINT32 nvb;
     UINT32 descSeqAtTake;
     UINT32 topo;
 };
@@ -15300,11 +15315,31 @@ static std::string GhBcSnapLine(const GhBcSnap& e, const char* tag)
              " fmt=" + std::to_string((int)e.ib.Format);
         if (GhVaCheckOn()) m += GhVaInBuffer((UINT64)e.ib.BufferLocation) ? "" : " IB-NOT-IN-ANY-BUFFER";
     }
-    for (UINT i = 0; i < e.nvb && i < 4; ++i){
+    for (UINT i = 0; i < e.nvb && i < 16; ++i){
         m += " vb" + std::to_string(i) + "=" + Hex((uint64_t)e.vb[i].BufferLocation) + "+" +
              std::to_string((unsigned long)e.vb[i].SizeInBytes) + "/" + std::to_string((unsigned)e.vb[i].StrideInBytes);
         if (GhVaCheckOn() && e.vb[i].SizeInBytes)
             m += GhVaInBuffer((UINT64)e.vb[i].BufferLocation) ? "" : " VB-NOT-IN-ANY-BUFFER";
+    }
+    // #234 BREAD11: every slot the pipeline's input layout declares, against what the draw
+    // bound. A declared slot with no view, a zero stride, or too few records for the
+    // instance range is the fetch the prepass (which reads fewer slots) never makes.
+    if (const UINT64 mask = GhPsoSlotMask(e.pso)){
+        const UINT inst = (e.op.kind == 13) ? e.op.a[1] : (e.op.kind == 12) ? e.op.a[1] : 0;
+        const UINT sinst = (e.op.kind == 13) ? e.op.a[4] : (e.op.kind == 12) ? e.op.a[3] : 0;
+        m += " slots{";
+        for (UINT k = 0; k < 32; ++k){
+            const bool pv = (mask >> k) & 1, pi = (mask >> (k + 32)) & 1;
+            if (!pv && !pi) continue;
+            m += " s" + std::to_string(k) + (pi ? "i" : "v") + ":";
+            if (k >= e.nvb || k >= 16 || !e.vb[k].SizeInBytes){ m += "<<< DECLARED-UNBOUND"; continue; }
+            const UINT st = e.vb[k].StrideInBytes;
+            const UINT64 recs = st ? e.vb[k].SizeInBytes / st : 0;
+            m += std::to_string((unsigned long long)recs) + "rec";
+            if (!st) m += "<<< ZERO-STRIDE";
+            else if (pi && inst && (UINT64)sinst + inst > recs) m += "<<< INST-PAST-END need=" + std::to_string((unsigned)(sinst + inst));
+        }
+        m += " }";
     }
     m += " topo=" + std::to_string((unsigned)e.topo);
     m += " heaps=" + Hex((uint64_t)(uintptr_t)e.heaps[0]) + "," + Hex((uint64_t)(uintptr_t)e.heaps[1]) +
@@ -18002,7 +18037,7 @@ static void __stdcall Hook_CLIASetVB(ID3D12GraphicsCommandList* self, UINT start
                                      const D3D12_VERTEX_BUFFER_VIEW* v)
 {
     if (GhCLNote* nt = GhCLFind(self)){
-        for (UINT i = 0; i < n && start + i < 4; ++i){
+        for (UINT i = 0; i < n && start + i < 16; ++i){
             nt->vb[start + i] = v ? v[i] : D3D12_VERTEX_BUFFER_VIEW{};
             if (start + i + 1 > nt->nvb) nt->nvb = start + i + 1;
         }
