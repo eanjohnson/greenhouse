@@ -520,6 +520,9 @@ static unsigned GhDsNoGpu();              // #169: keep DirectStorage's DXIL out
 // each with its own control cell.
 static unsigned GhCfgNumZ(const wchar_t* file, const char* envName, unsigned dflt);
 static void GhPsoDescKeepAdd(void* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d);   // #234 BREAD10
+static void GhRhCreate(void* p, unsigned kind, void* heap, UINT64 off, ID3D12Device* dev, const D3D12_RESOURCE_DESC* rd);   // #234 T33
+static void GhRhWrite(void* p);
+static std::string GhRhLine(void* p);
 
 // #209. Defined with the D3D hook machinery, but called from GhDdiInstall too, so that a
 // Launcher-only session still emits the knob's CFG line and one "deferred" proof of life.
@@ -14053,7 +14056,7 @@ static std::string GhDescribeHandle(UINT64 cpu)
                " h=" + std::to_string((unsigned)rd.Height) +
                " mips=" + std::to_string((unsigned)rd.MipLevels) +
                " fmt=" + std::to_string((int)rd.Format) +
-               " flags=" + Hex((uint32_t)rd.Flags);
+               " flags=" + Hex((uint32_t)rd.Flags) + GhRhLine(n->res);
     }
     // #158: a SMP note has no resource and no address -- `fmt` is the D3D12_FILTER and
     // `va` is the packed address/comparison/anisotropy state.  Running it through the
@@ -14087,7 +14090,7 @@ static std::string GhDescribeHandle(UINT64 cpu)
         if (r){
             const int l = GhResLiveState(r);
             out += " in=" + Hex((uint64_t)(uintptr_t)r) + "+" + std::to_string((unsigned long long)off) +
-                   (l == 2 ? " <<< RELEASED" : "");
+                   (l == 2 ? " <<< RELEASED" : "") + GhRhLine(r);
             if (n->vlen > left) out += " <<< CBV-PAST-END by " + std::to_string((unsigned long long)(n->vlen - left));
         }
     }
@@ -17401,6 +17404,7 @@ static void __stdcall Hook_CLCopyBufferRegion(ID3D12GraphicsCommandList* self,
 {
     GhBarrFlushPending(self);
     if (GhOpMask() & 16) return;
+    GhRhWrite(d);   // #234 T33HIST
     if (!GhRecCap15(self, d, dOff, sr, sOff, n))
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT64,
                         ID3D12Resource*, UINT64, UINT64))GhClOrig(self, 15))(self, d, dOff, sr, sOff, n);
@@ -17736,6 +17740,7 @@ static void __stdcall Hook_CLCopyTextureRegion(ID3D12GraphicsCommandList* self,
     GhBarrFlushPending(self);
     if (GhOpMask() & 16) return;
     GhCtrNote(self, d, x, y, z, sr, box);
+    GhRhWrite(d ? ((const D3D12_TEXTURE_COPY_LOCATION*)d)->pResource : nullptr);   // #234 T33HIST
     // #194: the shape of every texture copy. #184's killer lived in exactly this
     // call, so the record GhCtrNote just filled in is the one worth keying on.
     {
@@ -17785,6 +17790,7 @@ static void __stdcall Hook_CLCopyResource(ID3D12GraphicsCommandList* self,
 {
     GhBarrFlushPending(self);
     if (GhOpMask() & 16) return;
+    GhRhWrite(d);   // #234 T33HIST
     if (!GhRecCap17(self, d, sr))
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*,
                         ID3D12Resource*))GhClOrig(self, 17))(self, d, sr);
@@ -17795,6 +17801,7 @@ static void __stdcall Hook_CLResolveSubresource(ID3D12GraphicsCommandList* self,
     GH_FIRST("resolve", (uint64_t)f, "fmt=" + std::to_string((int)f));
     GhBarrFlushPending(self);
     if (GhOpMask() & 16) return;
+    GhRhWrite(d);   // #234 T33HIST
     if (!GhRecCap19(self, d, ds, sr, ss, f))
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT,
                         ID3D12Resource*, UINT, DXGI_FORMAT))GhClOrig(self, 19))(self, d, ds, sr, ss, f);
@@ -18764,6 +18771,87 @@ static void GhHeapLiveNote(void* p, const D3D12_HEAP_DESC* hd)
                "heap type=" + std::to_string(ty) +
                " cpupage=" + std::to_string((int)hd->Properties.CPUPageProperty) +
                " flags=" + Hex((uint32_t)hd->Flags));
+}
+
+// #234 T33HIST. The hung draw's one distinguishing binding is a texture the diag
+// names nowhere else, because every per-resource log is capped. This is the
+// uncapped answer for the resources a dump names: how the resource was made
+// (kind, heap, offset, bytes, ecl at creation) and how many recorded copies
+// targeted it (CopyTextureRegion / CopyResource / CopyBufferRegion / Resolve)
+// with the ecl of the last one. UAV writes are not copies and are not counted.
+// gh_res_hist.txt = 1 (GhCfgNumZ; no runargs slot -- delete the file by hand).
+static bool GhResHistOn()
+{ static const bool on = GhCfgNumZ(L"gh_res_hist.txt", "GH_RES_HIST", 0) != 0; return on; }
+struct GhResHist {
+    void* p; UINT8 kind, dim, mips, pad; UINT32 fmt; void* heap; UINT64 off, bytes;
+    UINT32 ecl0, lastW; volatile LONG writes; UINT32 w, h;
+};
+static const LONG     GH_RH_SLOTS = 1 << 18;
+static GhResHist*     g_rh     = nullptr;
+static volatile LONG  g_rhN    = 0, g_rhFull = 0;
+static GhResHist* GhRhFind(void* p, bool insert)
+{
+    if (!p) return nullptr;
+    GhResHist* t = (GhResHist*)InterlockedCompareExchangePointer((void**)&g_rh, nullptr, nullptr);
+    if (!t){
+        if (!insert) return nullptr;
+        GhResHist* nt = (GhResHist*)VirtualAlloc(nullptr, sizeof(GhResHist) * GH_RH_SLOTS,
+                                                 MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!nt) return nullptr;
+        if (InterlockedCompareExchangePointer((void**)&g_rh, nt, nullptr) != nullptr)
+            VirtualFree(nt, 0, MEM_RELEASE);
+        t = (GhResHist*)InterlockedCompareExchangePointer((void**)&g_rh, nullptr, nullptr);
+        if (!t) return nullptr;
+    }
+    const LONG h = (LONG)(((((uintptr_t)p) >> 4) * 2654435761u) & (GH_RH_SLOTS - 1));
+    for (LONG probe = 0; probe < 1024; ++probe){
+        const LONG i = (h + probe) & (GH_RH_SLOTS - 1);
+        void* cur = InterlockedCompareExchangePointer(&t[i].p, nullptr, nullptr);
+        if (cur == p) return &t[i];
+        if (!cur){
+            if (!insert) return nullptr;
+            if (InterlockedCompareExchangePointer(&t[i].p, p, nullptr) == nullptr){
+                InterlockedIncrement(&g_rhN); return &t[i];
+            }
+            if (t[i].p == p) return &t[i];
+        }
+    }
+    if (insert) InterlockedIncrement(&g_rhFull);
+    return nullptr;
+}
+static void GhRhCreate(void* p, unsigned kind, void* heap, UINT64 off, ID3D12Device* dev,
+                       const D3D12_RESOURCE_DESC* rd)
+{
+    if (!GhResHistOn() || !p || !rd) return;
+    GhResHist* e = GhRhFind(p, true);
+    if (!e) return;
+    e->kind = (UINT8)kind; e->dim = (UINT8)rd->Dimension; e->mips = (UINT8)rd->MipLevels;
+    e->fmt = (UINT32)rd->Format; e->heap = heap; e->off = off;
+    e->bytes = GhResBytesOf(dev, rd);
+    e->ecl0 = (UINT32)InterlockedCompareExchange(&g_eclCount, 0, 0);
+    e->w = (UINT32)rd->Width; e->h = rd->Height;
+    e->lastW = 0; InterlockedExchange(&e->writes, 0);
+}
+static void GhRhWrite(void* p)
+{
+    if (!GhResHistOn() || !p) return;
+    GhResHist* e = GhRhFind(p, false);
+    if (!e) return;
+    InterlockedIncrement(&e->writes);
+    e->lastW = (UINT32)InterlockedCompareExchange(&g_eclCount, 0, 0);
+}
+static std::string GhRhLine(void* p)
+{
+    if (!GhResHistOn() || !p) return "";
+    GhResHist* e = GhRhFind(p, false);
+    if (!e) return " hist{NONE}";
+    return " hist{" + std::string(e->kind == GH_LK_PLACED ? "placed" : e->kind == GH_LK_COMMITTED ? "committed" :
+                                  e->kind == GH_LK_RESERVED ? "reserved" : "?") +
+           " heap=" + Hex((uint64_t)(uintptr_t)e->heap) + " off=" + Hex(e->off) +
+           " bytes=" + std::to_string((unsigned long long)e->bytes) +
+           " ecl0=" + std::to_string((unsigned long)e->ecl0) +
+           " writes=" + std::to_string((long)InterlockedCompareExchange(&e->writes, 0, 0)) +
+           " lastw=" + std::to_string((unsigned long)e->lastW) + "}";
 }
 
 static void GhResLiveDrop(void* p)
@@ -21241,6 +21329,7 @@ static HRESULT __stdcall Hook_D12CreateCommitted(ID3D12Device* self,
     if (SUCCEEDED(hr) && pp && *pp) GhRtDsRecord((ID3D12Resource*)*pp, rd, st);
     if (SUCCEEDED(hr) && pp && *pp) GhHookResourceVtable((ID3D12Resource*)*pp);
     if (SUCCEEDED(hr) && pp && *pp) { GhHookObjRelease((IUnknown*)*pp); GhResLiveNote(*pp, self, rd, GH_LK_COMMITTED); }
+    if (SUCCEEDED(hr) && pp && *pp) GhRhCreate(*pp, GH_LK_COMMITTED, nullptr, 0, self, rd);   // #234 T33HIST
     static LONG n = 0;
     if (InterlockedIncrement(&n) <= 24 || FAILED(hr))
         Diag("D3D12 CreateCommittedResource heap=" + std::to_string(hp ? (int)hp->Type : -1) +
@@ -21608,6 +21697,7 @@ static HRESULT __stdcall Hook_D12CreatePlaced(ID3D12Device* self, ID3D12Heap* he
                     if (pp && *pp) GhRtDsRecord((ID3D12Resource*)*pp, rd, st);
                     if (pp && *pp) GhHookResourceVtable((ID3D12Resource*)*pp);
                     if (pp && *pp) { GhHookObjRelease((IUnknown*)*pp); GhResLiveNote(*pp, self, rd, GH_LK_COMMITTED); }
+                    if (pp && *pp) GhRhCreate(*pp, GH_LK_COMMITTED, heap, off, self, rd);   // #234 T33HIST (converted placement)
                     return hc;
                 }
             }
@@ -21658,6 +21748,7 @@ static HRESULT __stdcall Hook_D12CreatePlaced(ID3D12Device* self, ID3D12Heap* he
                 if (pp && *pp) GhRtDsRecord((ID3D12Resource*)*pp, rd, st);
                 if (pp && *pp) GhHookResourceVtable((ID3D12Resource*)*pp);
                 if (pp && *pp) { GhHookObjRelease((IUnknown*)*pp); GhResLiveNote(*pp, self, rd, GH_LK_COMMITTED); }
+                if (pp && *pp) GhRhCreate(*pp, GH_LK_COMMITTED, heap, off, self, rd);   // #234 T33HIST (converted placement)
                 return hc;
             }
         }
@@ -21684,6 +21775,7 @@ static HRESULT __stdcall Hook_D12CreatePlaced(ID3D12Device* self, ID3D12Heap* he
     if (SUCCEEDED(hr) && pp && *pp) GhRtDsRecord((ID3D12Resource*)*pp, rd, st);
     if (SUCCEEDED(hr) && pp && *pp) GhHookResourceVtable((ID3D12Resource*)*pp);
     if (SUCCEEDED(hr) && pp && *pp) { GhHookObjRelease((IUnknown*)*pp); GhResLiveNote(*pp, self, rd, GH_LK_PLACED); }
+    if (SUCCEEDED(hr) && pp && *pp) GhRhCreate(*pp, GH_LK_PLACED, heap, off, self, rd);   // #234 T33HIST
     if (loud || FAILED(hr)) Diag("  CreatePlacedResource -> hr=" + Hex((uint32_t)hr));
     // #187 log budget: every placement, once each, was 1.16 MB of a quota the game
     // needs. The placements matter as a population, not individually -- keep the
@@ -21741,6 +21833,7 @@ static HRESULT __stdcall Hook_D12CreateReserved(ID3D12Device* self,
     if (SUCCEEDED(hr) && pp && *pp) GhRtDsRecord((ID3D12Resource*)*pp, rd, st);
     if (SUCCEEDED(hr) && pp && *pp) GhHookResourceVtable((ID3D12Resource*)*pp);
     if (SUCCEEDED(hr) && pp && *pp) { GhHookObjRelease((IUnknown*)*pp); GhResLiveNote(*pp, self, rd, GH_LK_RESERVED); }
+    if (SUCCEEDED(hr) && pp && *pp) GhRhCreate(*pp, GH_LK_RESERVED, nullptr, 0, self, rd);   // #234 T33HIST
     static LONG n = 0;
     LONG i = InterlockedIncrement(&n);
     if (i <= 24 || (i % 64) == 0 || FAILED(hr))
