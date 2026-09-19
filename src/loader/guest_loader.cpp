@@ -519,6 +519,7 @@ static unsigned GhDsNoGpu();              // #169: keep DirectStorage's DXIL out
 // rest in every run ever launched by the harness. Convert one knob at a time,
 // each with its own control cell.
 static unsigned GhCfgNumZ(const wchar_t* file, const char* envName, unsigned dflt);
+static void GhPsoDescKeepAdd(void* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d);   // #234 BREAD10
 
 // #209. Defined with the D3D hook machinery, but called from GhDdiInstall too, so that a
 // Launcher-only session still emits the knob's CFG line and one "deferred" proof of life.
@@ -12598,6 +12599,7 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
                                                    d->PS.pShaderBytecode, d->PS.BytecodeLength);
         if (d) res += " vs=" + std::to_string((unsigned long long)d->VS.BytecodeLength) +
                       " ps=" + std::to_string((unsigned long long)d->PS.BytecodeLength);
+        GhPsoDescKeepAdd(*pp, d);   // #234 BREAD10
         // #188 axis (b). Build the first stand-in now, off a desc the driver
         // has just accepted, rather than at the first refusal: by then the
         // device may already be removed, and after a removal nothing can be
@@ -14407,6 +14409,7 @@ struct GhCLNote {
     D3D12_INDEX_BUFFER_VIEW  ib;
     D3D12_VERTEX_BUFFER_VIEW vb[4];
     UINT32  nvb, hasIb;
+    UINT32  topo;            // #234 BREAD10: IASetPrimitiveTopology, last set on this list
     // #173. The last root signature bound for each pipeline type, so the two
     // appended bindless tables can be pointed at the descriptor heap base every
     // time either the signature or the heaps change.
@@ -14634,6 +14637,76 @@ static void GhBindDump(ID3D12GraphicsCommandList* self, LONG g);
 // in (finished, started] -- plus `finished` itself as the control that retired.
 struct GhOpArgs { UINT kind; UINT a[5]; };          // kind: 12 draw, 13 drawindexed, 14 dispatch
 static thread_local GhOpArgs t_bcOpArgs{};
+// #234 BREAD10. Seven dumps agree on the hung draw and every binding it holds is
+// ordinary, so what is left of "the draw's state" is the pipeline's fixed-function
+// half: raster, depth/stencil, blend, RT/DS formats, sample state, topology, input
+// layout. Keep one compact line per graphics pipeline at creation (gh_pso_desc=1)
+// and print it under each ring entry at device removal -- hung against retired
+// against the same object's prepass.
+static bool GhPsoDescOn(){ static const bool on = GhCfgNumZ(L"gh_pso_desc.txt", "GH_PSO_DESC", 0) != 0; return on; }
+static SRWLOCK g_psoDescLock = SRWLOCK_INIT;
+static std::unordered_map<void*, std::string> g_psoDescMap;
+static void GhPsoDescKeepAdd(void* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d)
+{
+    if (!GhPsoDescOn() || !pso || !d) return;
+    std::string m = " topo=" + std::to_string((int)d->PrimitiveTopologyType) +
+                    " strip=" + std::to_string((int)d->IBStripCutValue) +
+                    " flags=" + Hex((uint32_t)d->Flags) + " node=" + Hex((uint32_t)d->NodeMask) +
+                    " nrt=" + std::to_string((unsigned)d->NumRenderTargets) + " rt=[";
+    for (UINT i = 0; i < d->NumRenderTargets && i < 8; ++i) m += (i ? "," : "") + std::to_string((int)d->RTVFormats[i]);
+    m += "] dsv=" + std::to_string((int)d->DSVFormat) +
+         " smp=" + std::to_string((unsigned)d->SampleDesc.Count) + "/" + std::to_string((unsigned)d->SampleDesc.Quality) +
+         " mask=" + Hex((uint32_t)d->SampleMask) +
+         " stages=" + std::to_string((unsigned long long)d->VS.BytecodeLength) + "/" + std::to_string((unsigned long long)d->PS.BytecodeLength) +
+         "/" + std::to_string((unsigned long long)d->GS.BytecodeLength) + "/" + std::to_string((unsigned long long)d->HS.BytecodeLength) +
+         "/" + std::to_string((unsigned long long)d->DS.BytecodeLength) + " so=" + std::to_string((unsigned)d->StreamOutput.NumEntries);
+    const D3D12_RASTERIZER_DESC& r = d->RasterizerState;
+    m += " rs{fill=" + std::to_string((int)r.FillMode) + " cull=" + std::to_string((int)r.CullMode) +
+         " ccw=" + std::to_string((int)r.FrontCounterClockwise) + " db=" + std::to_string((int)r.DepthBias) +
+         " dbc=" + std::to_string(r.DepthBiasClamp) + " ssdb=" + std::to_string(r.SlopeScaledDepthBias) +
+         " dclip=" + std::to_string((int)r.DepthClipEnable) + " ms=" + std::to_string((int)r.MultisampleEnable) +
+         " aal=" + std::to_string((int)r.AntialiasedLineEnable) + " fsc=" + std::to_string((unsigned)r.ForcedSampleCount) +
+         " cons=" + std::to_string((int)r.ConservativeRaster) + "}";
+    const D3D12_DEPTH_STENCIL_DESC& z = d->DepthStencilState;
+    m += " ds{de=" + std::to_string((int)z.DepthEnable) + " dwm=" + std::to_string((int)z.DepthWriteMask) +
+         " df=" + std::to_string((int)z.DepthFunc) + " se=" + std::to_string((int)z.StencilEnable) +
+         " srm=" + Hex((uint32_t)z.StencilReadMask) + " swm=" + Hex((uint32_t)z.StencilWriteMask) +
+         " f=" + std::to_string((int)z.FrontFace.StencilFailOp) + "/" + std::to_string((int)z.FrontFace.StencilDepthFailOp) +
+         "/" + std::to_string((int)z.FrontFace.StencilPassOp) + "/" + std::to_string((int)z.FrontFace.StencilFunc) +
+         " b=" + std::to_string((int)z.BackFace.StencilFailOp) + "/" + std::to_string((int)z.BackFace.StencilDepthFailOp) +
+         "/" + std::to_string((int)z.BackFace.StencilPassOp) + "/" + std::to_string((int)z.BackFace.StencilFunc) + "}";
+    const D3D12_BLEND_DESC& b = d->BlendState;
+    m += " bs{a2c=" + std::to_string((int)b.AlphaToCoverageEnable) + " ind=" + std::to_string((int)b.IndependentBlendEnable);
+    const UINT nb = b.IndependentBlendEnable ? (d->NumRenderTargets < 8 ? d->NumRenderTargets : 8) : 1;
+    for (UINT i = 0; i < nb; ++i){
+        const D3D12_RENDER_TARGET_BLEND_DESC& t = b.RenderTarget[i];
+        m += " rt" + std::to_string(i) + ":" + std::to_string((int)t.BlendEnable) + "/" + std::to_string((int)t.LogicOpEnable) +
+             " " + std::to_string((int)t.SrcBlend) + "," + std::to_string((int)t.DestBlend) + "," + std::to_string((int)t.BlendOp) +
+             " " + std::to_string((int)t.SrcBlendAlpha) + "," + std::to_string((int)t.DestBlendAlpha) + "," + std::to_string((int)t.BlendOpAlpha) +
+             " lo=" + std::to_string((int)t.LogicOp) + " wm=" + Hex((uint32_t)t.RenderTargetWriteMask);
+    }
+    m += "} il{n=" + std::to_string((unsigned)d->InputLayout.NumElements);
+    for (UINT i = 0; i < d->InputLayout.NumElements && i < 16 && d->InputLayout.pInputElementDescs; ++i){
+        const D3D12_INPUT_ELEMENT_DESC& e = d->InputLayout.pInputElementDescs[i];
+        m += " " + std::string(e.SemanticName ? e.SemanticName : "?") + std::to_string((unsigned)e.SemanticIndex) +
+             ":f" + std::to_string((int)e.Format) + ":s" + std::to_string((unsigned)e.InputSlot) +
+             ":o" + (e.AlignedByteOffset == 0xFFFFFFFFu ? std::string("app") : std::to_string((unsigned)e.AlignedByteOffset)) +
+             ":c" + std::to_string((int)e.InputSlotClass) + ":r" + std::to_string((unsigned)e.InstanceDataStepRate);
+    }
+    m += "}";
+    AcquireSRWLockExclusive(&g_psoDescLock);
+    if (g_psoDescMap.size() < 40000) g_psoDescMap[pso] = m;
+    ReleaseSRWLockExclusive(&g_psoDescLock);
+}
+static std::string GhPsoDescLine(void* pso)
+{
+    std::string out = "BCPSO pso=" + Hex((uint64_t)(uintptr_t)pso);
+    AcquireSRWLockShared(&g_psoDescLock);
+    auto it = g_psoDescMap.find(pso);
+    out += it == g_psoDescMap.end() ? std::string(" (not kept)") : it->second;
+    ReleaseSRWLockShared(&g_psoDescLock);
+    return out;
+}
 struct GhBcSnap {
     LONG   g;
     void*  cl;
@@ -14646,6 +14719,7 @@ struct GhBcSnap {
     D3D12_INDEX_BUFFER_VIEW ib; UINT32 hasIb;
     D3D12_VERTEX_BUFFER_VIEW vb[4]; UINT32 nvb;
     UINT32 descSeqAtTake;
+    UINT32 topo;
 };
 static const unsigned kBcRingN = 4096;
 static GhBcSnap g_bcRing[kBcRingN];
@@ -15201,6 +15275,7 @@ static void GhBcSnapTake(ID3D12GraphicsCommandList* self, LONG g)
         memcpy(t.rtv, n->rtv, sizeof(t.rtv)); t.nrt = n->nrt; t.dsv = n->dsv; t.hasDsv = n->hasDsv;
         t.ib = n->ib; t.hasIb = n->hasIb;
         memcpy(t.vb, n->vb, sizeof(t.vb)); t.nvb = n->nvb;
+        t.topo = n->topo;
     }
     t.descSeqAtTake = (UINT32)InterlockedCompareExchange(&g_descSeq, 0, 0);
     e = t;
@@ -15231,6 +15306,7 @@ static std::string GhBcSnapLine(const GhBcSnap& e, const char* tag)
         if (GhVaCheckOn() && e.vb[i].SizeInBytes)
             m += GhVaInBuffer((UINT64)e.vb[i].BufferLocation) ? "" : " VB-NOT-IN-ANY-BUFFER";
     }
+    m += " topo=" + std::to_string((unsigned)e.topo);
     m += " heaps=" + Hex((uint64_t)(uintptr_t)e.heaps[0]) + "," + Hex((uint64_t)(uintptr_t)e.heaps[1]) +
          " nrt=" + std::to_string((unsigned long)e.nrt);
     for (UINT i = 0; i < e.nrt && i < 8; ++i) m += " rtv" + std::to_string(i) + "=" + Hex(e.rtv[i]) + "{" + GhDescribeHandle(e.rtv[i]) + "}";
@@ -15268,6 +15344,7 @@ static void GhBcSnapDump(const char* where, UINT32 started, UINT32 finished)
         const GhBcSnap& e = g_bcRing[g % kBcRingN];
         if ((UINT32)e.g != g){ Diag("BCSNAP " + std::string(where) + " g=" + std::to_string((unsigned long)g) + " evicted from the ring"); continue; }
         Diag(GhBcSnapLine(e, g == finished ? "retired" : (g == started ? "HUNG" : "inflight")));
+        if (GhPsoDescOn()) Diag(GhPsoDescLine(e.pso));
         ++printed;
     }
     // #234 BREAD7: the hung draw is the same object every run (idx=27, startidx=1,001,140,
@@ -15281,7 +15358,10 @@ static void GhBcSnapDump(const char* where, UINT32 started, UINT32 finished)
             const GhBcSnap& e = g_bcRing[i];
             if (!e.g || (UINT32)e.g == started || e.op.kind != 13) continue;
             if (e.op.a[0] != h.op.a[0] || e.op.a[2] != h.op.a[2]) continue;
-            if (same < 4) Diag(GhBcSnapLine(e, (UINT32)e.g <= finished ? "sameobj-retired" : "sameobj-inflight"));
+            if (same < 4){
+                Diag(GhBcSnapLine(e, (UINT32)e.g <= finished ? "sameobj-retired" : "sameobj-inflight"));
+                if (GhPsoDescOn()) Diag(GhPsoDescLine(e.pso));
+            }
             Diag("BCSAME g=" + std::to_string((long)e.g) + " cl=" + Hex((uint64_t)(uintptr_t)e.cl) +
                  " pso=" + Hex((uint64_t)(uintptr_t)e.pso) +
                  " idx=" + std::to_string((unsigned long)e.op.a[0]) + " inst=" + std::to_string((unsigned long)e.op.a[1]) +
@@ -17818,6 +17898,7 @@ static void __stdcall Hook_CLResolveQuery(ID3D12GraphicsCommandList* self,
 static void __stdcall Hook_CLIASetTopology(ID3D12GraphicsCommandList* self,
                                            D3D12_PRIMITIVE_TOPOLOGY t)
 {
+    if (GhCLNote* nt = GhCLFind(self)) nt->topo = (UINT32)t;   // #234 BREAD10
     if (!GhRecCap20(self, t))
         ((void (__stdcall*)(ID3D12GraphicsCommandList*,
             D3D12_PRIMITIVE_TOPOLOGY))GhClOrig(self, 20))(self, t);
