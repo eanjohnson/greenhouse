@@ -13935,7 +13935,18 @@ static void GhVaBad(const char* site, UINT64 v, UINT idx, const void* cl, UINT64
 {
     static LONG n = 0;
     LONG k = InterlockedIncrement(&n);
-    if (k > 64) return;                     // the first one is the answer
+    if (k > 256) return;
+    // BREAD5: one startup compute list's CMPTABLE handles spent the whole cap before
+    // the press, so the checks that matter printed nothing. Cap per site instead.
+    {
+        static const char* sites[16]{}; static volatile LONG cnt[16]{};
+        int si = -1;
+        for (int i = 0; i < 16; ++i){
+            if (sites[i] == site || (sites[i] && strcmp(sites[i], site) == 0)){ si = i; break; }
+            if (!sites[i]){ sites[i] = site; si = i; break; }
+        }
+        if (si >= 0 && InterlockedIncrement(&cnt[si]) > 16) return;
+    }
     UINT64 bestLo = 0, bestHi = 0, bestD = ~0ull;
     AcquireSRWLockShared(&g_bufVaLk);
     LONG m = g_bufVaN; if (m > 16384) m = 16384;
@@ -17769,7 +17780,10 @@ static void __stdcall Hook_CLIASetIB(ID3D12GraphicsCommandList* self,
                 GhVaBad("IB-END", (UINT64)v->BufferLocation + v->SizeInBytes - 1, 0, self,
                         (UINT64)v->SizeInBytes);
         }
-        if (GhCLTraceOn())
+        // BREAD5: 240k of these lines in one window drowned the diag before the
+        // device-removed dump; the ring carries the views now, so trace them only
+        // when it is not armed.
+        if (GhCLTraceOn() && GhBcMode() < 2)
             Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " IB va=" + Hex((uint64_t)v->BufferLocation) +
                  " size=" + std::to_string((unsigned long)v->SizeInBytes) +
                  " fmt=" + std::to_string((unsigned)v->Format));
@@ -17798,7 +17812,7 @@ static void __stdcall Hook_CLIASetVB(ID3D12GraphicsCommandList* self, UINT start
                     GhVaBad("VB-END", (UINT64)v[i].BufferLocation + v[i].SizeInBytes - 1, start + i,
                             self, (UINT64)v[i].SizeInBytes);
             }
-            if (GhCLTraceOn())
+            if (GhCLTraceOn() && GhBcMode() < 2)
                 Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " VB slot=" + std::to_string((unsigned)(start + i)) +
                      " va=" + Hex((uint64_t)v[i].BufferLocation) +
                      " size=" + std::to_string((unsigned long)v[i].SizeInBytes) +
