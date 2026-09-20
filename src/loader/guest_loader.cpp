@@ -20962,7 +20962,8 @@ static volatile LONG64 g_gpAskB = 0, g_gpAskLiveB = 0, g_gpMatB = 0;
 static volatile LONG64 g_gpMatLiveB = 0;
 // #235 Phase 2 pager counters.
 static volatile LONG64 g_gpEvictB = 0, g_gpEvictedB = 0, g_gpRestoreB = 0, g_gpPageUs = 0;
-static volatile LONG   g_gpEvictN = 0, g_gpRestoreN = 0, g_gpNoVictim = 0;   // #235 TILE1c: g_gpMatB is EVER-materialised and never decremented; this one is live
+static volatile LONG   g_gpEvictN = 0, g_gpRestoreN = 0, g_gpNoVictim = 0;
+static volatile LONG   g_gpCutOverride = 0;   // #235 TILE2c: reclaims that had to ignore gh_gpu_evict_ms   // #235 TILE1c: g_gpMatB is EVER-materialised and never decremented; this one is live
 static void**          g_gpHeapVt = nullptr;   // the proxy class's vtable, for the is-a test
 
 struct GhGpRes;
@@ -21233,7 +21234,26 @@ static bool GhGpReclaim(UINT n, int* ci, UINT* base)
         GhGpRes* e = kv.second;
         if (e && e->chunk >= 0 && (now - e->lastUse) >= cut) v.push_back(e);
     }
-    if (v.empty()){ InterlockedIncrement(&g_gpNoVictim); return false; }
+    // #235 TILE2c: the age cut is a PREFERENCE, not a VETO. When a small pool FIRST
+    // fills, everything resident in it is seconds old, the aged list comes back empty,
+    // and the placement falls through to a real per-texture heap -- which is never
+    // un-materialised. TILE2c lost 47 placements and 61 MB that way at a 256 MB cap
+    // (gpconv mat 67 -> 114) and gave back only 66 of the 128 MB the cap had saved.
+    // So when nothing is old enough, evict the coldest resident thing anyway. Tier 2
+    // reads an unmapped tile as ZERO rather than faulting, so the worst case here is a
+    // visible pop, never a device loss; and TILE2a measured 0 restores against 213 MB
+    // evicted, so the coldest thing is very unlikely to be wanted.
+    bool overrode = false;
+    if (v.empty()){
+        overrode = true;
+        InterlockedIncrement(&g_gpCutOverride);
+        for (auto& kv : *g_gpMap){
+            GhGpRes* e = kv.second;
+            if (e && e->chunk >= 0) v.push_back(e);
+        }
+        // Genuinely nothing resident to take: now it really is no victim.
+        if (v.empty()){ InterlockedIncrement(&g_gpNoVictim); return false; }
+    }
     std::sort(v.begin(), v.end(), [](GhGpRes* a, GhGpRes* b){ return a->lastUse < b->lastUse; });
     bool got = false;
     size_t k = 0;
@@ -21245,7 +21265,7 @@ static bool GhGpReclaim(UINT n, int* ci, UINT* base)
     static LONG said = 0;
     if (InterlockedIncrement(&said) <= 16 || (said % 256) == 0)
         Diag("GPUPAGE reclaim need=" + std::to_string(n) + " victims=" + std::to_string((unsigned long long)k) +
-             "/" + std::to_string((unsigned long long)v.size()) + " got=" + std::to_string(got ? 1 : 0) +
+             "/" + std::to_string((unsigned long long)v.size()) + " got=" + std::to_string(got ? 1 : 0) + (overrode ? " CUTOVERRIDE" : "") +
              " evictedMB=" + std::to_string((long long)(g_gpEvictedB >> 20)) +
              " liveMB=" + std::to_string((long long)(g_gpLiveB >> 20)));
     return got;
@@ -21638,14 +21658,15 @@ static std::string GhGpHotLine()
            "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpAskLiveB, 0, 0) >> 20)) +
            "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpMatB, 0, 0) >> 20)) +
            "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpMatLiveB, 0, 0) >> 20)) +
-           // gpevict=evictions/MB-ever/MB-evicted-now  gprest=restores/MB/ms/novictim
+           // gpevict=evictions/MB-ever/MB-evicted-now  gprest=restores/MB/ms/novictim/cutoverride
            " gpevict=" + std::to_string((long)InterlockedCompareExchange(&g_gpEvictN, 0, 0)) +
            "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpEvictB, 0, 0) >> 20)) +
            "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpEvictedB, 0, 0) >> 20)) +
            " gprest=" + std::to_string((long)InterlockedCompareExchange(&g_gpRestoreN, 0, 0)) +
            "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpRestoreB, 0, 0) >> 20)) +
            "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpPageUs, 0, 0) / 1000)) +
-           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpNoVictim, 0, 0));
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpNoVictim, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpCutOverride, 0, 0));
 }
 static std::string GhGpFrameLine()
 {
