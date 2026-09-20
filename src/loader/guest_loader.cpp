@@ -551,7 +551,14 @@ static void        GhResLiveDump(const char* where);           // #202 the LIVE 
 static std::string GhResLiveFrameLine();                       // #202 livresMB on every FRAME line
 static std::string GhGpFrameLine();                            // #235 gpupage= on every FRAME line
 static void        GhGpTouch(ID3D12Resource* r);               // #235 last-use signal (copy hooks)
-static void        GhGpSrvNote(ID3D12Resource* r);             // #235 last-use signal (CreateSRV)
+static void GhGpSrvNote(ID3D12Resource* r);
+// #235 the per-use read signal: the game feeds a per-frame ring of shader-visible
+// descriptors by CopyDescriptors from staging slots (BREAD6). A staging slot that
+// names a converted texture is noted at CreateSRV; every copy FROM such a slot is a
+// use of that texture this frame.
+static std::unordered_map<UINT64, ID3D12Resource*>* g_gpDescMap = nullptr;
+static void GhGpDescNote(UINT64 cpu, ID3D12Resource* r);
+static void GhGpDescCopy(UINT64 src, UINT64 dst);
 static void GhIssuedPairsDump(const char* when);              // #158 executed-barrier tally
 static void GhBarrFlushPending(ID3D12GraphicsCommandList* self); // #158 coalescing
 // #158 one entry of the game's captured frame program; replayed by GhRtTest.
@@ -14651,6 +14658,7 @@ static void __stdcall Hook_D12CreateSRV(ID3D12Device* self, ID3D12Resource* res,
     const D3D12_SHADER_RESOURCE_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE dest)
 {
     GhGpSrvNote(res);   // #235
+    GhGpDescNote((UINT64)dest.ptr, res);
     if (GhDescTrackOn() || GhVaCheckOn()){
         if (d && d->ViewDimension == D3D12_SRV_DIMENSION_BUFFER)
             GhDescPut((UINT64)dest.ptr, res, 2, (unsigned)d->Format, 0, d->Buffer.FirstElement,
@@ -14736,6 +14744,11 @@ static void __stdcall Hook_D12CopyDescSimple(ID3D12Device* self, UINT num,
             if (n) GhDescPut((UINT64)dst.ptr + (UINT64)k * inc, n->res, n->kind, n->fmt, n->va, n->voff, n->vlen, n->vstride, n->vraw);
         }
     }
+    if (g_gpDescMap){   // #235
+        const UINT inc = self->GetDescriptorHandleIncrementSize(type);
+        for (UINT k = 0; k < num && k < 4096; ++k)
+            GhGpDescCopy((UINT64)src.ptr + (UINT64)k * inc, (UINT64)dst.ptr + (UINT64)k * inc);
+    }
     ((void (__stdcall*)(ID3D12Device*, UINT, D3D12_CPU_DESCRIPTOR_HANDLE,
         D3D12_CPU_DESCRIPTOR_HANDLE,
         D3D12_DESCRIPTOR_HEAP_TYPE))g_d12vtOrig[24])(self, num, dst, src, type);
@@ -14755,6 +14768,18 @@ static void __stdcall Hook_D12CopyDesc(ID3D12Device* self,
             if (sk >= sn){ ++si; sk = 0; continue; }
             const GhDescNote* n = GhDescGet((UINT64)src[si].ptr + (UINT64)sk * inc);
             if (n) GhDescPut((UINT64)dst[di].ptr + (UINT64)dk * inc, n->res, n->kind, n->fmt, n->va, n->voff, n->vlen, n->vstride, n->vraw);
+            ++dk; ++sk;
+        }
+    }
+    if (g_gpDescMap && dst && src){   // #235
+        const UINT inc = self->GetDescriptorHandleIncrementSize(type);
+        UINT di = 0, dk = 0, si = 0, sk = 0;
+        for (UINT guard = 0; guard < 8192 && di < nDst && si < nSrc; ++guard){
+            const UINT dn = dstSizes ? dstSizes[di] : 1u;
+            const UINT sn = srcSizes ? srcSizes[si] : 1u;
+            if (dk >= dn){ ++di; dk = 0; continue; }
+            if (sk >= sn){ ++si; sk = 0; continue; }
+            GhGpDescCopy((UINT64)src[si].ptr + (UINT64)sk * inc, (UINT64)dst[di].ptr + (UINT64)dk * inc);
             ++dk; ++sk;
         }
     }
@@ -20902,7 +20927,7 @@ static void GhD12CallWatchdog()
 //   gh_gpu_page_mb.txt  pool cap in MB (GhCfgNumZ; no runargs slot -- hand-
 //                       managed in LocalState, delete it by hand). 0 = off.
 //
-// FRAME line: gphot=MB<=1s/<=10s/<=60s/older/never gpround=allocMB gpupage=poolMB/liveMB/liveN gpconv=conv/skip/mat/full/fail
+// FRAME line: gphot=MB<=1s/<=10s/<=60s/older/never gpround=allocMB gpdesc=notes/hits gpclass=askEver/askLive/matMB gpupage=poolMB/liveMB/liveN gpconv=conv/skip/mat/full/fail
 //             gpalias=N gpmaps=maps/waits gpms=ms gpheaps=live/ever gptouch=copies/srvs
 //   pool  real pool bytes (chunks), live  mapped tile bytes, liveN  converted textures alive
 //   conv  placements converted, skip  not convertible (materialised), mat  proxies
@@ -20922,6 +20947,12 @@ static volatile LONG   g_gpProxyN = 0, g_gpProxyLive = 0, g_gpConv = 0, g_gpSkip
                        g_gpFull = 0, g_gpFail = 0, g_gpAlias = 0, g_gpMaps = 0, g_gpWaits = 0,
                        g_gpLiveN = 0, g_gpFreed = 0, g_gpTouch = 0, g_gpSrv = 0, g_gpChunkN = 0;
 static volatile LONG64 g_gpPoolB = 0, g_gpLiveB = 0, g_gpUs = 0, g_gpMapV = 0, g_gpAllocB = 0;
+// #235 the class ledger: what the game ASKED the per-texture 0x44 class for (every
+// proxy heap's SizeInBytes, i.e. exactly what baseline CreateHeap would have billed)
+// against what we actually spend on it (materialised real heaps + pool chunks).
+// TILE1/TILE1b were ~200 MB dearer on this class and cross-run heapMB arithmetic
+// cannot say why; these three numbers say it inside one run.
+static volatile LONG64 g_gpAskB = 0, g_gpAskLiveB = 0, g_gpMatB = 0;
 static void**          g_gpHeapVt = nullptr;   // the proxy class's vtable, for the is-a test
 
 struct GhGpRes;
@@ -20955,6 +20986,7 @@ struct GhGpHeap : ID3D12Heap
         if (n == 0){
             if (real) real->Release();
             delete occ;
+            InterlockedAdd64(&g_gpAskLiveB, -(LONG64)desc.SizeInBytes);   // #235 class ledger
             InterlockedDecrement(&g_gpProxyLive);
             delete this;
         }
@@ -20996,6 +21028,8 @@ static bool GhGpMakeProxy(ID3D12Device* dev, const D3D12_HEAP_DESC* hd, REFIID r
 {
     GhGpHeap* p = new GhGpHeap();
     p->desc = *hd; p->dev = dev;
+    InterlockedAdd64(&g_gpAskB, (LONG64)hd->SizeInBytes);
+    InterlockedAdd64(&g_gpAskLiveB, (LONG64)hd->SizeInBytes);
     if (!g_gpHeapVt) g_gpHeapVt = *(void***)p;
     void* out = nullptr;
     if (FAILED(p->QueryInterface(riid, &out)) || !out){ p->Release(); return false; }
@@ -21262,6 +21296,7 @@ static ID3D12Heap* GhGpMaterialise(ID3D12Device* dev, GhGpHeap* ph, const char* 
             ph->real = h;
             if (ph->name[0]) h->SetName(ph->name);
             InterlockedAdd64(&g_heapBytes, (LONG64)ph->desc.SizeInBytes);
+            InterlockedAdd64(&g_gpMatB, (LONG64)ph->desc.SizeInBytes);   // #235 class ledger
             InterlockedIncrement(&g_heapCount);
         }
         const LONG k = InterlockedIncrement(&g_gpMat);
@@ -21424,6 +21459,34 @@ static void GhGpSrvNote(ID3D12Resource* r)
 // age of the last CreateSRV or copy naming the texture (never = untouched since
 // creation). The residency policy's raw material: if the recent buckets are a
 // small fraction of the live set, CreateSRV is a read signal worth keying on.
+static SRWLOCK        g_gpDescLk = SRWLOCK_INIT;
+static volatile LONG  g_gpDescNotes = 0, g_gpDescHits = 0;
+static void GhGpDescNote(UINT64 cpu, ID3D12Resource* r)
+{
+    if (!GhGpOn() || !cpu) return;
+    const bool ours = r && g_gpMap && GhGpFind(r) != nullptr;
+    AcquireSRWLockExclusive(&g_gpDescLk);
+    if (!g_gpDescMap) g_gpDescMap = new std::unordered_map<UINT64, ID3D12Resource*>();
+    if (ours){ (*g_gpDescMap)[cpu] = r; InterlockedIncrement(&g_gpDescNotes); }
+    else if (!g_gpDescMap->empty()) g_gpDescMap->erase(cpu);   // the slot now names something else
+    ReleaseSRWLockExclusive(&g_gpDescLk);
+}
+// A copy from a noted staging slot is a use. Only the source side is looked up: a
+// copied-to ring slot is rewritten next frame, so tracking it would only grow the
+// map to the ring's 1.17M slots. A freed texture's stale note simply misses in
+// g_gpMap (or, if the address was reused, touches the new occupant -- census noise).
+static void GhGpDescCopy(UINT64 src, UINT64 dst)
+{
+    (void)dst;
+    if (!g_gpDescMap) return;
+    ID3D12Resource* r = nullptr;
+    AcquireSRWLockShared(&g_gpDescLk);
+    auto it = g_gpDescMap->find(src);
+    if (it != g_gpDescMap->end()) r = it->second;
+    ReleaseSRWLockShared(&g_gpDescLk);
+    if (!r) return;
+    if (GhGpRes* e = GhGpFind(r)){ e->lastUse = GhNowUs(); InterlockedIncrement(&g_gpDescHits); }
+}
 static std::string GhGpHotLine()
 {
     if (!g_gpMap) return std::string();
@@ -21441,7 +21504,15 @@ static std::string GhGpHotLine()
     ReleaseSRWLockShared(&g_gpLk);
     std::string o = " gphot=";
     for (int i = 0; i < 5; ++i) o += (i ? "/" : "") + std::to_string((unsigned long long)(b[i] >> 20));
-    return o + " gpround=" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpAllocB, 0, 0) >> 20));
+    return o + " gpround=" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpAllocB, 0, 0) >> 20)) +
+           " gpdesc=" + std::to_string((long)InterlockedCompareExchange(&g_gpDescNotes, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpDescHits, 0, 0)) +
+           // gpclass=askEver/askLive/mat: what the game asked the per-texture 0x44 class
+           // for (baseline CreateHeap bytes) vs the real heaps we still create for it.
+           // Our spend on the class = mat + poolMB; baseline would have been askLive.
+           " gpclass=" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpAskB, 0, 0) >> 20)) +
+           "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpAskLiveB, 0, 0) >> 20)) +
+           "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpMatB, 0, 0) >> 20));
 }
 static std::string GhGpFrameLine()
 {
