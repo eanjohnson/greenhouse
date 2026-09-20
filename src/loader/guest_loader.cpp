@@ -20940,6 +20940,12 @@ static bool GhGpOn(){ return GhGpuPageMb() != 0; }
 // gh_gpu_chunk_mb (LocalState, hand-managed, default 256): the pool grows in real
 // 0x44 heaps of this size. TILE1 pre-billed up to a whole 256 MB chunk of idle
 // pool at the ceiling and its fifth chunk was refused with 132 MB free.
+// #235 Phase 2: a converted texture is evictable once this many ms have passed
+// since anything named it (CreateSRV, a descriptor copy, or a copy into it).
+// 0 = eviction OFF, which is exactly Phase 1 / TILE1c behaviour.
+static unsigned GhGpEvictMs()
+{ static const unsigned v = GhCfgNumZ(L"gh_gpu_evict_ms.txt", "GH_GPU_EVICT_MS", 0); return v; }
+
 static unsigned GhGpChunkMb()
 { static const unsigned v = GhCfgNumZ(L"gh_gpu_chunk_mb.txt", "GH_GPU_CHUNK_MB", 256); return v ? v : 256; }
 
@@ -20953,7 +20959,10 @@ static volatile LONG64 g_gpPoolB = 0, g_gpLiveB = 0, g_gpUs = 0, g_gpMapV = 0, g
 // TILE1/TILE1b were ~200 MB dearer on this class and cross-run heapMB arithmetic
 // cannot say why; these three numbers say it inside one run.
 static volatile LONG64 g_gpAskB = 0, g_gpAskLiveB = 0, g_gpMatB = 0;
-static volatile LONG64 g_gpMatLiveB = 0;   // #235 TILE1c: g_gpMatB is EVER-materialised and never decremented; this one is live
+static volatile LONG64 g_gpMatLiveB = 0;
+// #235 Phase 2 pager counters.
+static volatile LONG64 g_gpEvictB = 0, g_gpEvictedB = 0, g_gpRestoreB = 0, g_gpPageUs = 0;
+static volatile LONG   g_gpEvictN = 0, g_gpRestoreN = 0, g_gpNoVictim = 0;   // #235 TILE1c: g_gpMatB is EVER-materialised and never decremented; this one is live
 static void**          g_gpHeapVt = nullptr;   // the proxy class's vtable, for the is-a test
 
 struct GhGpRes;
@@ -21096,7 +21105,7 @@ static bool GhGpRig(ID3D12Device* dev)
 
 // g_gpLk held. First fit over the chunks, growing the pool by one chunk (256 MB,
 // or what is left under the cap) when nothing fits.
-static bool GhGpAlloc(UINT n, int* ci, UINT* base)
+static bool GhGpAllocNoEvict(UINT n, int* ci, UINT* base)
 {
     for (size_t c = 0; c < g_gpChunks->size(); ++c){
         auto& fr = (*g_gpChunks)[c].fr;
@@ -21145,7 +21154,7 @@ static bool GhGpAlloc(UINT n, int* ci, UINT* base)
     return true;
 }
 // g_gpLk held. Insert sorted and coalesce with both neighbours.
-static void GhGpFree(int ci, UINT base, UINT n)
+static void GhGpFreeRun(int ci, UINT base, UINT n)
 {
     if (ci < 0 || (size_t)ci >= g_gpChunks->size()) return;
     auto& fr = (*g_gpChunks)[ci].fr;
@@ -21160,9 +21169,17 @@ static void GhGpFree(int ci, UINT base, UINT n)
     }
 }
 
+// g_gpLk held. Signal our mapping fence once; the guest's queues wait on it in
+// GhGpBeforeSubmit. Batched so a reclaim sweep pays one signal, not one per map.
+static void GhGpMapSignal()
+{
+    const UINT64 v = (UINT64)InterlockedIncrement64(&g_gpMapV);
+    GhGpCq<HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64)>(g_gpQ, 14)(g_gpQ, g_gpMapFence, v);
+}
+
 // g_gpLk held. One region covering the whole resource, one range, on OUR direct
 // queue, then a signal the guest's queues wait on (GhGpBeforeSubmit).
-static void GhGpMapWhole(GhGpRes* e, ID3D12Heap* heap, UINT base)
+static void GhGpMapWhole(GhGpRes* e, ID3D12Heap* heap, UINT base, bool signalNow = true)
 {
     D3D12_TILED_RESOURCE_COORDINATE c{};
     D3D12_TILE_REGION_SIZE sz{}; sz.NumTiles = e->nTiles; sz.UseBox = FALSE;
@@ -21171,9 +21188,102 @@ static void GhGpMapWhole(GhGpRes* e, ID3D12Heap* heap, UINT base)
     GhGpCq<void (__stdcall*)(ID3D12CommandQueue*, ID3D12Resource*, UINT, const D3D12_TILED_RESOURCE_COORDINATE*,
         const D3D12_TILE_REGION_SIZE*, ID3D12Heap*, UINT, const D3D12_TILE_RANGE_FLAGS*, const UINT*, const UINT*,
         D3D12_TILE_MAPPING_FLAGS)>(g_gpQ, 8)(g_gpQ, e->res, 1, &c, &sz, heap, 1, &rf, &off, &cnt, D3D12_TILE_MAPPING_FLAG_NONE);
-    const UINT64 v = (UINT64)InterlockedIncrement64(&g_gpMapV);
-    GhGpCq<HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64)>(g_gpQ, 14)(g_gpQ, g_gpMapFence, v);
     InterlockedIncrement(&g_gpMaps);
+    if (signalNow) GhGpMapSignal();
+}
+
+// #235 Phase 2. Eviction: a converted texture whose last use is older than
+// gh_gpu_evict_ms gives its run back to the pool. The resource object stays --
+// only its backing goes. On Tier 2 a whole-resource NULL unmap reads ZERO
+// (TILE0e), so a wrong guess is a visible pop, never a device removal, and a
+// restore can put a run back under it at any time.
+//
+// TILE2a DELIBERATELY DOES NOT SAVE THE BYTES. It is a diagnostic probe for the
+// three numbers the disk ring cannot be sized without: does the bounded pool
+// hold, how much does it give the container back, and how often does the read
+// signal actually demand an evicted texture back. TILE2b adds the CopyTiles +
+// D:\DevelopmentFiles ring so a restore returns real content.
+
+// g_gpLk held exclusive. Unmap whole, give the run back. No signal: the caller
+// batches one GhGpMapSignal for the whole sweep.
+static void GhGpEvictOne(GhGpRes* e)
+{
+    if (!e || e->chunk < 0) return;
+    GhGpMapWhole(e, nullptr, 0, false);          // whole-resource NULL: reads zero
+    GhGpFreeRun(e->chunk, e->base, e->nTiles);
+    const LONG64 bytes = (LONG64)e->nTiles << 16;
+    e->chunk = -1; e->base = 0;
+    InterlockedAdd64(&g_gpLiveB, -bytes);
+    InterlockedAdd64(&g_gpEvictedB, bytes);
+    InterlockedAdd64(&g_gpEvictB, bytes);
+    InterlockedIncrement(&g_gpEvictN);
+}
+
+// g_gpLk held exclusive. Evict cold textures, coldest first, retrying the
+// first-fit after each one (GhGpFreeRun coalesces, so neighbours merge into a
+// usable hole). Bounded so a pathological sweep cannot stall a frame.
+static bool GhGpReclaim(UINT n, int* ci, UINT* base)
+{
+    const unsigned ms = GhGpEvictMs();
+    if (!ms || !g_gpMap) return false;
+    const LONG64 now = GhNowUs(), cut = (LONG64)ms * 1000;
+    std::vector<GhGpRes*> v;
+    v.reserve(256);
+    for (auto& kv : *g_gpMap){
+        GhGpRes* e = kv.second;
+        if (e && e->chunk >= 0 && (now - e->lastUse) >= cut) v.push_back(e);
+    }
+    if (v.empty()){ InterlockedIncrement(&g_gpNoVictim); return false; }
+    std::sort(v.begin(), v.end(), [](GhGpRes* a, GhGpRes* b){ return a->lastUse < b->lastUse; });
+    bool got = false;
+    size_t k = 0;
+    for (; k < v.size() && k < 256; ++k){
+        GhGpEvictOne(v[k]);
+        if (GhGpAllocNoEvict(n, ci, base)){ got = true; ++k; break; }
+    }
+    GhGpMapSignal();                              // one signal for the whole sweep
+    static LONG said = 0;
+    if (InterlockedIncrement(&said) <= 16 || (said % 256) == 0)
+        Diag("GPUPAGE reclaim need=" + std::to_string(n) + " victims=" + std::to_string((unsigned long long)k) +
+             "/" + std::to_string((unsigned long long)v.size()) + " got=" + std::to_string(got ? 1 : 0) +
+             " evictedMB=" + std::to_string((long long)(g_gpEvictedB >> 20)) +
+             " liveMB=" + std::to_string((long long)(g_gpLiveB >> 20)));
+    return got;
+}
+
+// g_gpLk held exclusive. The allocator the conversion and restore paths use:
+// grow/first-fit as before, and only when that is exhausted, page something out.
+static bool GhGpAlloc(UINT n, int* ci, UINT* base)
+{
+    if (GhGpAllocNoEvict(n, ci, base)) return true;
+    return GhGpReclaim(n, ci, base);
+}
+
+// A use signal named a texture whose backing we took away: put a run back under
+// it. Called from the CreateSRV / descriptor-copy / copy-into hooks on game
+// threads, so it re-finds the entry under the lock rather than trusting the
+// pointer the caller raced on. Contents are NOT restored in TILE2a (zeros).
+static void GhGpRestoreByRes(void* res)
+{
+    if (!g_gpMap || !res) return;
+    const LONG64 t0 = GhNowUs();
+    AcquireSRWLockExclusive(&g_gpLk);
+    auto it = g_gpMap->find(res);
+    GhGpRes* e = it != g_gpMap->end() ? it->second : nullptr;
+    if (e && e->chunk < 0){
+        int ci = -1; UINT base = 0;
+        if (GhGpAlloc(e->nTiles, &ci, &base)){
+            e->chunk = ci; e->base = base;
+            GhGpMapWhole(e, (*g_gpChunks)[ci].heap, base);
+            const LONG64 bytes = (LONG64)e->nTiles << 16;
+            InterlockedAdd64(&g_gpLiveB, bytes);
+            InterlockedAdd64(&g_gpEvictedB, -bytes);
+            InterlockedAdd64(&g_gpRestoreB, bytes);
+            InterlockedIncrement(&g_gpRestoreN);
+        }
+    }
+    ReleaseSRWLockExclusive(&g_gpLk);
+    InterlockedAdd64(&g_gpPageUs, GhNowUs() - t0);
 }
 
 static GhGpRes* GhGpFind(void* res)
@@ -21210,7 +21320,8 @@ static void GhGpOnFree(void* res)
     if (e) g_gpMap->erase(it);
     GhGpHeap* ph = nullptr;
     if (e){
-        if (e->chunk >= 0){ GhGpFree(e->chunk, e->base, e->nTiles); InterlockedAdd64(&g_gpLiveB, -(LONG64)e->nTiles << 16); }
+        if (e->chunk >= 0){ GhGpFreeRun(e->chunk, e->base, e->nTiles); InterlockedAdd64(&g_gpLiveB, -(LONG64)e->nTiles << 16); }
+        else InterlockedAdd64(&g_gpEvictedB, -(LONG64)e->nTiles << 16);   // #235: released while evicted -- stop counting it as out
         InterlockedAdd64(&g_gpAllocB, -(LONG64)e->size);
         InterlockedDecrement(&g_gpLiveN); InterlockedIncrement(&g_gpFreed);
         ph = e->heap;
@@ -21450,12 +21561,18 @@ static bool GhGpFilterPageables(UINT num, ID3D12Pageable* const* in, std::vector
 static void GhGpTouch(ID3D12Resource* r)
 {
     if (!g_gpMap || !r) return;
-    if (GhGpRes* e = GhGpFind(r)){ e->lastUse = GhNowUs(); InterlockedIncrement(&g_gpTouch); }
+    if (GhGpRes* e = GhGpFind(r)){
+        e->lastUse = GhNowUs(); InterlockedIncrement(&g_gpTouch);
+        if (e->chunk < 0) GhGpRestoreByRes(r);   // a copy INTO an evicted texture would be dropped
+    }
 }
 static void GhGpSrvNote(ID3D12Resource* r)
 {
     if (!g_gpMap || !r) return;
-    if (GhGpRes* e = GhGpFind(r)){ e->lastUse = GhNowUs(); InterlockedIncrement(&g_gpSrv); }
+    if (GhGpRes* e = GhGpFind(r)){
+        e->lastUse = GhNowUs(); InterlockedIncrement(&g_gpSrv);
+        if (e->chunk < 0) GhGpRestoreByRes(r);
+    }
 }
 // gphot=MB<=1s/MB<=10s/MB<=60s/MBolder/MBnever: live mapped bytes bucketed by the
 // age of the last CreateSRV or copy naming the texture (never = untouched since
@@ -21487,7 +21604,12 @@ static void GhGpDescCopy(UINT64 src, UINT64 dst)
     if (it != g_gpDescMap->end()) r = it->second;
     ReleaseSRWLockShared(&g_gpDescLk);
     if (!r) return;
-    if (GhGpRes* e = GhGpFind(r)){ e->lastUse = GhNowUs(); InterlockedIncrement(&g_gpDescHits); }
+    if (GhGpRes* e = GhGpFind(r)){
+        e->lastUse = GhNowUs(); InterlockedIncrement(&g_gpDescHits);
+        // the page-fault signal: the engine has just published this texture into a
+        // shader-visible heap, so the list that samples it has not been submitted yet
+        if (e->chunk < 0) GhGpRestoreByRes(r);
+    }
 }
 static std::string GhGpHotLine()
 {
@@ -21515,7 +21637,15 @@ static std::string GhGpHotLine()
            " gpclass=" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpAskB, 0, 0) >> 20)) +
            "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpAskLiveB, 0, 0) >> 20)) +
            "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpMatB, 0, 0) >> 20)) +
-           "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpMatLiveB, 0, 0) >> 20));
+           "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpMatLiveB, 0, 0) >> 20)) +
+           // gpevict=evictions/MB-ever/MB-evicted-now  gprest=restores/MB/ms/novictim
+           " gpevict=" + std::to_string((long)InterlockedCompareExchange(&g_gpEvictN, 0, 0)) +
+           "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpEvictB, 0, 0) >> 20)) +
+           "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpEvictedB, 0, 0) >> 20)) +
+           " gprest=" + std::to_string((long)InterlockedCompareExchange(&g_gpRestoreN, 0, 0)) +
+           "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpRestoreB, 0, 0) >> 20)) +
+           "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpPageUs, 0, 0) / 1000)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpNoVictim, 0, 0));
 }
 static std::string GhGpFrameLine()
 {
@@ -22675,7 +22805,7 @@ static HRESULT __stdcall Hook_D12CreateHeap(ID3D12Device* self,
     if (hd && pp && GhGpWantsHeap(hd)){
         static LONG said = 0;
         if (InterlockedIncrement(&said) == 1)
-            Diag("GPUPAGE on cap=" + std::to_string((unsigned long)GhGpuPageMb()) + "MB (gh_gpu_page_mb) chunk=" + std::to_string((unsigned long)GhGpChunkMb()) + "MB (gh_gpu_chunk_mb) -- per-texture 0x44 heaps are proxies");
+            Diag("GPUPAGE on cap=" + std::to_string((unsigned long)GhGpuPageMb()) + "MB (gh_gpu_page_mb) chunk=" + std::to_string((unsigned long)GhGpChunkMb()) + "MB (gh_gpu_chunk_mb) evictms=" + std::to_string((unsigned long)GhGpEvictMs()) + " (gh_gpu_evict_ms) -- per-texture 0x44 heaps are proxies");
         if (GhGpMakeProxy(self, hd, riid, pp)){
             const LONG k = InterlockedIncrement(&g_gpProxyN);
             InterlockedIncrement(&g_gpProxyLive);
