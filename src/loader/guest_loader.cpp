@@ -9012,6 +9012,464 @@ static void GhHeapBillProbe()
     Diag("HEAPBILL done");
 }
 
+// ---------------------------------------------------------------------------
+// #235 TILE0. Can this driver page GPU memory the D3D12 way?
+//
+// The 5,120 MB cap is commit on a console with no OS page file. #233 pages the
+// guest's own pool to a file on D:; what is left un-pageable is the driver's
+// D3D12 heaps (1,690 MB of texture-only heaps + 1,187 MB RT/DS at SPILL12's
+// death), billed eagerly at CreateHeap, immune to Evict (EVICT1) and refused by
+// OpenExistingHeapFrom* (#211). The one paging primitive D3D12 has is tiled
+// (reserved) resources: GPU VA with no commit until UpdateTileMappings backs
+// 64 KB tiles from a pool heap, and TiledResourcesTier=2 promises an unmapped
+// tile reads ZERO instead of faulting. CreateReservedResource was #211's zero
+// control (+0.0). This console advertised EXISTING_HEAPS and then refused it, so
+// nothing is built on the tier until it is measured here, on a throwaway device
+// before the guest exists, in the shape the pager will use: a BC7 2048^2 12-mip
+// texture, a 256 MB 0x44 pool, CopyTiles in both directions, half the tiles
+// unmapped and read back (must be zero, device must live), then remapped to
+// DIFFERENT pool tiles and refilled (must match). Packed mips are deliberately
+// left out of the CopyTiles steps -- the pager keeps them resident (one tile per
+// texture) so their copy semantics never matter.
+//
+// gh_tiled_probe.txt: 1 = run and continue; 2 = run and ExitProcess (no game).
+static LONG64 GhNowUs();
+static void GhTiledProbe()
+{
+    static const unsigned mode = GhCfgNum(L"gh_tiled_probe.txt", "GH_TILED_PROBE", 0);
+    if (!mode) return;
+    ID3D12Device* dev = GhCompileOnlyDevice();
+    if (!dev){ Diag("TILEDPROBE no device -- VOID, not a negative"); return; }
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS o{};
+    dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof o);
+    GhBillSnap base{}; GhBillTake(&base);
+    Diag("TILEDPROBE begin tiledtier=" + std::to_string((int)o.TiledResourcesTier) +
+         " heaptier=" + std::to_string((int)o.ResourceHeapTier) +
+         " appused0=" + Hex(base.appused) + " applimit=" + Hex(GhBillAppLimitRaw()));
+
+    const LONG64 t0 = GhNowUs();
+    auto Ms = [&](){ return std::to_string((GhNowUs() - t0) / 1000); };
+
+    // The rig: one DIRECT queue, one allocator/list, one fence.
+    com_ptr<ID3D12CommandQueue> q; com_ptr<ID3D12CommandAllocator> ca;
+    com_ptr<ID3D12GraphicsCommandList> cl; com_ptr<ID3D12Fence> fence;
+    D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    HRESULT hr = dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), q.put_void());
+    if (SUCCEEDED(hr)) hr = dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                __uuidof(ID3D12CommandAllocator), ca.put_void());
+    if (SUCCEEDED(hr)) hr = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, ca.get(), nullptr,
+                                __uuidof(ID3D12GraphicsCommandList), cl.put_void());
+    if (SUCCEEDED(hr)) hr = dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), fence.put_void());
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (FAILED(hr) || !ev){ Diag("TILEDPROBE rig hr=" + Hex((uint32_t)hr) + " -- VOID"); return; }
+    UINT64 fv = 0;
+    // Every step ends with a fence wait AND a removed-reason read: a tier that
+    // lies fails here, not in a later cell's game.
+    auto Sync = [&](const char* tag) -> bool {
+        ++fv; q->Signal(fence.get(), fv);
+        bool ok = true;
+        if (fence->GetCompletedValue() < fv){
+            fence->SetEventOnCompletion(fv, ev);
+            ok = WaitForSingleObject(ev, 20000) == WAIT_OBJECT_0;
+        }
+        const HRESULT rr = dev->GetDeviceRemovedReason();
+        Diag(std::string("TILEDPROBE ") + tag + " fence=" + (ok ? "ok" : "TIMEOUT") +
+             " removed=" + Hex((uint32_t)rr) + " t=" + Ms() + "ms");
+        return ok && rr == S_OK;
+    };
+    auto Run = [&](const char* tag) -> bool {
+        cl->Close();
+        ID3D12CommandList* ls[1] = { cl.get() };
+        q->ExecuteCommandLists(1, ls);
+        const bool ok = Sync(tag);
+        ca->Reset(); cl->Reset(ca.get(), nullptr);
+        return ok;
+    };
+
+    // 1. The reserved texture: the pager's real shape.
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = 2048; rd.Height = 2048; rd.DepthOrArraySize = 1; rd.MipLevels = 12;
+    rd.Format = DXGI_FORMAT_BC7_UNORM; rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE; rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+    GhBillSnap s0{}; GhBillTake(&s0);
+    com_ptr<ID3D12Resource> tex;
+    hr = dev->CreateReservedResource(&rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                     __uuidof(ID3D12Resource), tex.put_void());
+    GhBillSnap s1{}; GhBillTake(&s1);
+    Diag("TILEDPROBE 1 CreateReservedResource BC7 2048x2048 mips=12 hr=" + Hex((uint32_t)hr));
+    if (FAILED(hr) || !tex){ Diag("TILEDPROBE VERDICT: reserved textures REFUSED -- the tier is a lie (like EXISTING_HEAPS)"); goto done; }
+    GhBillReport("TILE reserved/tex create (expect ~0)", s0, s1);
+
+    {
+        // 2. The tiling: how many 64 KB tiles, which mips are packed.
+        UINT nTiles = 0, nSub = 16;
+        D3D12_PACKED_MIP_INFO pm{}; D3D12_TILE_SHAPE ts{}; D3D12_SUBRESOURCE_TILING st[16]{};
+        dev->GetResourceTiling(tex.get(), &nTiles, &pm, &ts, &nSub, 0, st);
+        Diag("TILEDPROBE 2 tiling tiles=" + std::to_string(nTiles) +
+             " shape=" + std::to_string(ts.WidthInTexels) + "x" + std::to_string(ts.HeightInTexels) +
+             " stdmips=" + std::to_string((int)pm.NumStandardMips) +
+             " packedmips=" + std::to_string((int)pm.NumPackedMips) +
+             " packedtiles=" + std::to_string(pm.NumTilesForPackedMips) +
+             " packedstart=" + std::to_string(pm.StartTileIndexInOverallResource));
+        for (UINT s = 0; s < nSub && s < pm.NumStandardMips; ++s)
+            Diag("  sub " + std::to_string(s) + " " + std::to_string(st[s].WidthInTiles) + "x" +
+                 std::to_string(st[s].HeightInTiles) + " start=" + std::to_string(st[s].StartTileIndexInOverallResource));
+        if (!nTiles || nTiles > 4096 || !pm.NumStandardMips){ Diag("TILEDPROBE tiling unusable -- VOID"); goto done; }
+        const UINT nStd = pm.StartTileIndexInOverallResource;   // standard tiles precede the packed region
+        const UINT64 tileB = 65536;
+
+        // 3. The pool: 256 MB of the same heap class the game's texture heaps use.
+        D3D12_HEAP_DESC hd{};
+        hd.SizeInBytes = 256ull << 20; hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+        GhBillTake(&s0);
+        com_ptr<ID3D12Heap> pool;
+        hr = dev->CreateHeap(&hd, __uuidof(ID3D12Heap), pool.put_void());
+        GhBillTake(&s1);
+        Diag("TILEDPROBE 3 pool CreateHeap 256MB flags=0x44 hr=" + Hex((uint32_t)hr));
+        if (FAILED(hr) || !pool) goto done;
+        GhBillReport("TILE pool heap (expect +256)", s0, s1);
+
+        // 4. Map every tile, one region, one range, pool offset 0.
+        D3D12_TILED_RESOURCE_COORDINATE c0{}; D3D12_TILE_REGION_SIZE rs{};
+        rs.NumTiles = nTiles; rs.UseBox = FALSE;
+        D3D12_TILE_RANGE_FLAGS rf = D3D12_TILE_RANGE_FLAG_NONE; UINT off0 = 0, cnt = nTiles;
+        GhBillTake(&s0);
+        q->UpdateTileMappings(tex.get(), 1, &c0, &rs, pool.get(), 1, &rf, &off0, &cnt, D3D12_TILE_MAPPING_FLAG_NONE);
+        if (!Sync("4 map-all")) goto done;
+        GhBillTake(&s1);
+        GhBillReport("TILE map all (expect 0)", s0, s1);
+
+        // Staging: UPLOAD buffers holding pattern A, pattern B and a sentinel (one
+        // 64 KB tile each per tile index), a READBACK buffer for the tile path and a
+        // second one for the mip-0 texture path. Every readback is first overwritten
+        // ON THE GPU with the sentinel, so a copy the driver skips reads as sentinel,
+        // a zero read as zero, and a tile that is still backed as the old pattern.
+        auto MkBuf = [&](D3D12_HEAP_TYPE t, D3D12_RESOURCE_STATES stt, UINT64 bytes, com_ptr<ID3D12Resource>& out) -> HRESULT {
+            D3D12_HEAP_PROPERTIES hp{}; hp.Type = t;
+            D3D12_RESOURCE_DESC bd{}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = bytes;
+            bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1;
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            return dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, stt, nullptr,
+                                                __uuidof(ID3D12Resource), out.put_void());
+        };
+        const UINT64 stageB = tileB * nTiles;
+        const UINT64 mip0B  = 512ull * 8192;       // 2048x2048 BC7 mip 0: 512 block rows of 8 KB
+        const uint32_t kSent = 0xCDCDCDCDu;
+        auto PatA = [](UINT i, UINT j) -> uint32_t { return (i << 20) ^ (j * 2654435761u); };
+        auto PatB = [](UINT i, UINT j) -> uint32_t { return ~((i << 20) ^ (j * 2654435761u)) ^ 0x5A5A5A5Au; };
+        com_ptr<ID3D12Resource> upA, upB, sent, rb, rb2;
+        hr = MkBuf(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, stageB, upA);
+        if (SUCCEEDED(hr)) hr = MkBuf(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, stageB, upB);
+        if (SUCCEEDED(hr)) hr = MkBuf(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, stageB, sent);
+        if (SUCCEEDED(hr)) hr = MkBuf(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, stageB, rb);
+        if (SUCCEEDED(hr)) hr = MkBuf(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, mip0B, rb2);
+        if (FAILED(hr)){ Diag("TILEDPROBE staging hr=" + Hex((uint32_t)hr) + " -- VOID"); goto done; }
+        {
+            auto FillUp = [&](ID3D12Resource* b, int which){
+                uint32_t* p = nullptr; D3D12_RANGE none{0, 0};
+                if (SUCCEEDED(b->Map(0, &none, (void**)&p)) && p){
+                    for (UINT i = 0; i < nTiles; ++i)
+                        for (UINT j = 0; j < tileB / 4; ++j)
+                            p[i * (tileB / 4) + j] = which == 0 ? PatA(i, j) : which == 1 ? PatB(i, j) : kSent;
+                    b->Unmap(0, nullptr);
+                }
+            };
+            FillUp(upA.get(), 0); FillUp(upB.get(), 1); FillUp(sent.get(), 2);
+        }
+        // Tile i (standard region) -> its subresource + box coordinate.
+        auto Coord = [&](UINT i, D3D12_TILED_RESOURCE_COORDINATE* c) -> bool {
+            for (UINT s = 0; s < pm.NumStandardMips; ++s){
+                const UINT n = st[s].WidthInTiles * st[s].HeightInTiles;
+                if (i >= st[s].StartTileIndexInOverallResource && i < st[s].StartTileIndexInOverallResource + n){
+                    const UINT k = i - st[s].StartTileIndexInOverallResource;
+                    c->X = k % st[s].WidthInTiles; c->Y = k / st[s].WidthInTiles; c->Z = 0; c->Subresource = s;
+                    return true;
+                }
+            }
+            return false;
+        };
+        // One CopyTiles per standard tile of `res`, to/from `buf` at tile-index offsets
+        // (packed mips excluded by design: they stay resident in the pager too).
+        auto CopyStd = [&](ID3D12Resource* res, bool toTex, bool oddOnly, ID3D12Resource* buf){
+            for (UINT i = 0; i < nStd; ++i){
+                if (oddOnly && !(i & 1)) continue;
+                D3D12_TILED_RESOURCE_COORDINATE c{}; if (!Coord(i, &c)) continue;
+                D3D12_TILE_REGION_SIZE one{}; one.NumTiles = 1; one.UseBox = FALSE;
+                cl->CopyTiles(res, &c, &one, buf, tileB * i,
+                              toTex ? D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE
+                                    : D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+            }
+        };
+        auto Barrier = [&](ID3D12Resource* res, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b){
+            D3D12_RESOURCE_BARRIER br{}; br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            br.Transition.pResource = res; br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            br.Transition.StateBefore = a; br.Transition.StateAfter = b; cl->ResourceBarrier(1, &br);
+        };
+        auto Sentinel = [&](ID3D12Resource* dst, UINT64 bytes){ cl->CopyBufferRegion(dst, 0, sent.get(), 0, bytes); };
+        // Mip 0 of `res` through the TEXTURE copy path (not the tile copier) into rb2.
+        auto CopyMip0 = [&](ID3D12Resource* res){
+            D3D12_TEXTURE_COPY_LOCATION dl{}, sl{};
+            dl.pResource = rb2.get(); dl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dl.PlacedFootprint.Offset = 0; dl.PlacedFootprint.Footprint.Format = DXGI_FORMAT_BC7_UNORM;
+            dl.PlacedFootprint.Footprint.Width = 2048; dl.PlacedFootprint.Footprint.Height = 2048;
+            dl.PlacedFootprint.Footprint.Depth = 1; dl.PlacedFootprint.Footprint.RowPitch = 8192;
+            sl.pResource = res; sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = 0;
+            cl->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+        };
+        // Classify a tile from sampled dwords: all-zero / all-sentinel / pattern A /
+        // pattern B / other. The step's EXPECTATION lives in the prediction file.
+        struct Cls { UINT z = 0, s = 0, a = 0, b = 0, o = 0; };
+        auto ClsLine = [](const Cls& c){
+            return " zero=" + std::to_string(c.z) + " sent=" + std::to_string(c.s) + " patA=" + std::to_string(c.a) +
+                   " patB=" + std::to_string(c.b) + " other=" + std::to_string(c.o);
+        };
+        auto Scan = [&](const char* tag){
+            uint32_t* p = nullptr; D3D12_RANGE all{0, (SIZE_T)stageB};
+            if (FAILED(rb->Map(0, &all, (void**)&p)) || !p){ Diag(std::string("TILEDPROBE ") + tag + " readback Map failed"); return; }
+            Cls c[2];
+            for (UINT i = 0; i < nStd; ++i){
+                bool isZ = true, isS = true, isA = true, isB = true;
+                for (UINT j = 0; j < tileB / 4; j += 61){       // 268 samples per tile
+                    const uint32_t v = p[i * (tileB / 4) + j];
+                    if (v) isZ = false; if (v != kSent) isS = false;
+                    if (v != PatA(i, j)) isA = false; if (v != PatB(i, j)) isB = false;
+                }
+                Cls& k = c[i & 1];
+                if (isZ) ++k.z; else if (isS) ++k.s; else if (isA) ++k.a; else if (isB) ++k.b; else ++k.o;
+            }
+            D3D12_RANGE none{0, 0}; rb->Unmap(0, &none);
+            Diag(std::string("TILEDPROBE ") + tag + " stdtiles=" + std::to_string(nStd) +
+                 " odd:" + ClsLine(c[1]) + " | even:" + ClsLine(c[0]));
+        };
+        // Same over rb2: mip-0 tile (tx,ty) = 64 block rows x 1 KB of the 8 KB-pitch
+        // row-major image, tile index ty*8+tx, row-major inside the tile (j = r*256+c).
+        auto ScanMip0 = [&](const char* tag){
+            uint32_t* p = nullptr; D3D12_RANGE all{0, (SIZE_T)mip0B};
+            if (FAILED(rb2->Map(0, &all, (void**)&p)) || !p){ Diag(std::string("TILEDPROBE ") + tag + " rb2 Map failed"); return; }
+            Cls c[2];
+            const UINT wT = st[0].WidthInTiles ? st[0].WidthInTiles : 8;
+            for (UINT ty = 0; ty < 8; ++ty) for (UINT tx = 0; tx < 8; ++tx){
+                const UINT i = st[0].StartTileIndexInOverallResource + ty * wT + tx;
+                bool isZ = true, isS = true, isA = true, isB = true;
+                for (UINT r = 0; r < 64; r += 7) for (UINT cc = 0; cc < 256; cc += 13){
+                    const uint32_t v = p[(ty * 64 + r) * 2048 + tx * 256 + cc];
+                    const UINT j = r * 256 + cc;
+                    if (v) isZ = false; if (v != kSent) isS = false;
+                    if (v != PatA(i, j)) isA = false; if (v != PatB(i, j)) isB = false;
+                }
+                Cls& k = c[i & 1];
+                if (isZ) ++k.z; else if (isS) ++k.s; else if (isA) ++k.a; else if (isB) ++k.b; else ++k.o;
+            }
+            D3D12_RANGE none{0, 0}; rb2->Unmap(0, &none);
+            Diag(std::string("TILEDPROBE ") + tag + " mip0tiles=64 odd:" + ClsLine(c[1]) + " | even:" + ClsLine(c[0]));
+        };
+
+        // Scan helpers now also return a per-tile state string.
+        auto TileCh = [](bool z, bool s, bool a, bool b, bool any) -> char {
+            return z ? 'Z' : s ? 'S' : a ? 'A' : b ? 'B' : any ? 'M' : '?';
+        };
+        // Classify each standard tile of rb (A=patA B=patB Z=zero S=sentinel M=mixed).
+        auto ScanR = [&](const char* tag) -> std::string {
+            uint32_t* p = nullptr; D3D12_RANGE all{0, (SIZE_T)stageB};
+            std::string map(nStd, '?');
+            if (FAILED(rb->Map(0, &all, (void**)&p)) || !p){ Diag(std::string("TILEDPROBE ") + tag + " readback Map failed"); return map; }
+            Cls c[2];
+            for (UINT i = 0; i < nStd; ++i){
+                bool isZ = true, isS = true, isA = true, isB = true, anyKnown = false;
+                for (UINT j = 0; j < tileB / 4; j += 61){
+                    const uint32_t v = p[i * (tileB / 4) + j];
+                    if (v) isZ = false; if (v != kSent) isS = false;
+                    if (v != PatA(i, j)) isA = false; if (v != PatB(i, j)) isB = false;
+                    if (!v || v == kSent || v == PatA(i, j) || v == PatB(i, j)) anyKnown = true;
+                }
+                map[i] = TileCh(isZ, isS, isA, isB, anyKnown);
+                Cls& k = c[i & 1];
+                if (isZ) ++k.z; else if (isS) ++k.s; else if (isA) ++k.a; else if (isB) ++k.b; else ++k.o;
+            }
+            D3D12_RANGE none{0, 0}; rb->Unmap(0, &none);
+            Diag(std::string("TILEDPROBE ") + tag + " odd:" + ClsLine(c[1]) + " | even:" + ClsLine(c[0]) + " | " + map);
+            return map;
+        };
+        auto ScanMip0R = [&](const char* tag){
+            uint32_t* p = nullptr; D3D12_RANGE all{0, (SIZE_T)mip0B};
+            if (FAILED(rb2->Map(0, &all, (void**)&p)) || !p){ Diag(std::string("TILEDPROBE ") + tag + " rb2 Map failed"); return; }
+            const UINT wT = st[0].WidthInTiles ? st[0].WidthInTiles : 8;
+            std::string grid;
+            for (UINT ty = 0; ty < 8; ++ty){ for (UINT tx = 0; tx < 8; ++tx){
+                const UINT i = st[0].StartTileIndexInOverallResource + ty * wT + tx;
+                bool isZ = true, isS = true, isA = true, isB = true, anyKnown = false;
+                for (UINT r = 0; r < 64; r += 7) for (UINT cc = 0; cc < 256; cc += 13){
+                    const uint32_t v = p[(ty * 64 + r) * 2048 + tx * 256 + cc];
+                    const UINT j = r * 256 + cc;
+                    if (v) isZ = false; if (v != kSent) isS = false;
+                    if (v != PatA(i, j)) isA = false; if (v != PatB(i, j)) isB = false;
+                    if (!v || v == kSent || v == PatA(i, j) || v == PatB(i, j)) anyKnown = true;
+                }
+                grid += TileCh(isZ, isS, isA, isB, anyKnown);
+            } grid += '/'; }
+            D3D12_RANGE none{0, 0}; rb2->Unmap(0, &none);
+            Diag(std::string("TILEDPROBE ") + tag + " mip0 " + grid);
+        };
+        // Per-texture helpers: map every tile at pool tile `base`, fill patA (+ optional
+        // verifying read), read back both paths with the sentinel underneath.
+        auto MapAll = [&](ID3D12Resource* r, UINT base, const char* tag) -> bool {
+            D3D12_TILED_RESOURCE_COORDINATE c0{}; D3D12_TILE_REGION_SIZE rs{}; rs.NumTiles = nTiles;
+            D3D12_TILE_RANGE_FLAGS rf = D3D12_TILE_RANGE_FLAG_NONE; UINT cnt = nTiles;
+            q->UpdateTileMappings(r, 1, &c0, &rs, pool.get(), 1, &rf, &base, &cnt, D3D12_TILE_MAPPING_FLAG_NONE);
+            return Sync(tag);
+        };
+        auto ReadBoth = [&](ID3D12Resource* r, bool oddOnly){
+            Sentinel(rb.get(), stageB); CopyStd(r, false, oddOnly, rb.get());
+            Sentinel(rb2.get(), mip0B); CopyMip0(r);
+        };
+        auto FillA = [&](ID3D12Resource* r, bool verify, const char* tag) -> bool {
+            CopyStd(r, true, false, upA.get());
+            Barrier(r, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            if (verify) ReadBoth(r, false);
+            if (!Run(tag)) return false;
+            if (verify){ ScanR((std::string(tag) + " scan").c_str()); ScanMip0R((std::string(tag) + " scan").c_str()); }
+            return true;
+        };
+        auto MkTex = [&](com_ptr<ID3D12Resource>& out, const char* tag) -> bool {
+            HRESULT h = dev->CreateReservedResource(&rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                    __uuidof(ID3D12Resource), out.put_void());
+            if (FAILED(h) || !out){ Diag(std::string("TILEDPROBE ") + tag + " CreateReservedResource hr=" + Hex((uint32_t)h)); return false; }
+            return true;
+        };
+        // Odd-tile region lists (same tiling for every texture of this desc).
+        std::vector<D3D12_TILED_RESOURCE_COORDINATE> cs; std::vector<D3D12_TILE_REGION_SIZE> ss; std::vector<UINT> oddIdx;
+        for (UINT i = 1; i < nStd; i += 2){ D3D12_TILED_RESOURCE_COORDINATE c{}; if (!Coord(i, &c)) continue;
+            cs.push_back(c); D3D12_TILE_REGION_SIZE one{}; one.NumTiles = 1; ss.push_back(one); oddIdx.push_back(i); }
+        const UINT k = (UINT)cs.size();
+        D3D12_TILE_RANGE_FLAGS nul = D3D12_TILE_RANGE_FLAG_NULL;
+        auto UnmapOdd = [&](ID3D12Resource* r, const char* tag) -> bool {
+            UINT kk = k;
+            q->UpdateTileMappings(r, k, cs.data(), ss.data(), nullptr, 1, &nul, nullptr, &kk, D3D12_TILE_MAPPING_FLAG_NONE);
+            return Sync(tag);
+        };
+        auto ReadScan = [&](ID3D12Resource* r, bool oddOnly, const char* tag) -> bool {
+            ReadBoth(r, oddOnly);
+            if (!Run(tag)){ Diag(std::string("TILEDPROBE VERDICT: reading removed the device at ") + tag); return false; }
+            ScanR((std::string(tag) + " scan").c_str()); ScanMip0R((std::string(tag) + " scan").c_str());
+            return true;
+        };
+
+        // 5/e1. A at pool base 0 (mapped in step 4): fill, verify both paths.
+        if (!FillA(tex.get(), true, "e1 fillA")) goto done;
+
+        {
+            auto FillB = [&](ID3D12Resource* r, const char* tag) -> bool {
+                CopyStd(r, true, false, upB.get());
+                Barrier(r, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                return Run(tag);
+            };
+            auto UnmapWhole = [&](ID3D12Resource* r, const char* tag) -> bool {
+                D3D12_TILED_RESOURCE_COORDINATE c0{}; D3D12_TILE_REGION_SIZE rs{}; rs.NumTiles = nTiles;
+                UINT cnt = nTiles;
+                q->UpdateTileMappings(r, 1, &c0, &rs, nullptr, 1, &nul, nullptr, &cnt, D3D12_TILE_MAPPING_FLAG_NONE);
+                return Sync(tag);
+            };
+            // Refill = page-in: the resource is in COPY_SOURCE between reads; go to COPY_DEST, copy, back.
+            auto Refill = [&](ID3D12Resource* r, ID3D12Resource* up, const char* tag) -> bool {
+                Barrier(r, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                CopyStd(r, true, false, up);
+                Barrier(r, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                return Run(tag);
+            };
+
+            // e1. Whole NULL-unmap of A, then read it.
+            GhBillTake(&s0);
+            if (!UnmapWhole(tex.get(), "e1 unmapA-whole")) goto done;
+            GhBillTake(&s1);
+            GhBillReport("TILE whole unmap (expect 0)", s0, s1);
+            if (!ReadScan(tex.get(), false, "e1 readA-unmapped")) goto done;
+
+            // e2. B takes A's old range (base 0), filled patB; read B, read A.
+            com_ptr<ID3D12Resource> texB;
+            if (!MkTex(texB, "e2 B") || !MapAll(texB.get(), 0, "e2 mapB-base0") || !FillB(texB.get(), "e2 fillB")) goto done;
+            if (!ReadScan(texB.get(), false, "e2 readB")) goto done;
+            if (!ReadScan(tex.get(), false, "e2 readA-while-B-owns")) goto done;
+
+            // e3. Page A back in at base 2n.
+            GhBillTake(&s0);
+            if (!MapAll(tex.get(), 2 * nTiles, "e3 remapA-base2n")) goto done;
+            GhBillTake(&s1);
+            GhBillReport("TILE whole remap (expect 0)", s0, s1);
+            if (!Refill(tex.get(), upA.get(), "e3 refillA")) goto done;
+            if (!ReadScan(tex.get(), false, "e3 readA")) goto done;
+            if (!ReadScan(texB.get(), false, "e3 readB")) goto done;
+
+            // e4. Two more cycles: unmap A, C takes the range, A moves on and refills.
+            com_ptr<ID3D12Resource> texC;
+            if (!MkTex(texC, "e4 C")) goto done;
+            if (!UnmapWhole(tex.get(), "e4 unmapA-whole-2")) goto done;
+            if (!MapAll(texC.get(), 2 * nTiles, "e4 mapC-base2n") || !FillB(texC.get(), "e4 fillC")) goto done;
+            if (!MapAll(tex.get(), 4 * nTiles, "e4 remapA-base4n") || !Refill(tex.get(), upA.get(), "e4 refillA-2")) goto done;
+            if (!ReadScan(tex.get(), false, "e4 readA-cycle2")) goto done;
+            if (!ReadScan(texC.get(), false, "e4 readC")) goto done;
+            if (!UnmapWhole(tex.get(), "e4 unmapA-whole-3")) goto done;
+            if (!MapAll(tex.get(), 6 * nTiles, "e4 remapA-base6n") || !Refill(tex.get(), upA.get(), "e4 refillA-3")) goto done;
+            if (!ReadScan(tex.get(), false, "e4 readA-cycle3")) goto done;
+            if (!ReadScan(texB.get(), false, "e4 readB-final")) goto done;
+
+            // e5. Texture-path write after a remap: CopyTextureRegion UPLOAD footprint -> A mip 0.
+            if (!UnmapWhole(tex.get(), "e5 unmapA-whole-4")) goto done;
+            if (!MapAll(tex.get(), 8 * nTiles, "e5 remapA-base8n")) goto done;
+            {
+                // Build the mip-0 image in the sentinel-free part of upB? Use a dedicated UPLOAD image of patA
+                // in row-major-within-tile order so ScanMip0 can check it: dword (r*256+c) of tile (tx,ty).
+                com_ptr<ID3D12Resource> upImg;
+                hr = MkBuf(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, mip0B, upImg);
+                if (FAILED(hr)){ Diag("TILEDPROBE e5 upImg hr=" + Hex((uint32_t)hr)); goto done; }
+                uint32_t* p = nullptr; D3D12_RANGE none{0, 0};
+                if (SUCCEEDED(upImg->Map(0, &none, (void**)&p)) && p){
+                    const UINT wT = st[0].WidthInTiles ? st[0].WidthInTiles : 8;
+                    for (UINT ty = 0; ty < 8; ++ty) for (UINT tx = 0; tx < 8; ++tx){
+                        const UINT i = st[0].StartTileIndexInOverallResource + ty * wT + tx;
+                        for (UINT r = 0; r < 64; ++r) for (UINT cc = 0; cc < 256; ++cc)
+                            p[(ty * 64 + r) * 2048 + tx * 256 + cc] = PatA(i, r * 256 + cc);
+                    }
+                    upImg->Unmap(0, nullptr);
+                }
+                Barrier(tex.get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                D3D12_TEXTURE_COPY_LOCATION dl{}, sl{};
+                dl.pResource = tex.get(); dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dl.SubresourceIndex = 0;
+                sl.pResource = upImg.get(); sl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                sl.PlacedFootprint.Footprint.Format = DXGI_FORMAT_BC7_UNORM; sl.PlacedFootprint.Footprint.Width = 2048;
+                sl.PlacedFootprint.Footprint.Height = 2048; sl.PlacedFootprint.Footprint.Depth = 1; sl.PlacedFootprint.Footprint.RowPitch = 8192;
+                cl->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+                Barrier(tex.get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                if (!Run("e5 copytex-mip0-into-A")) goto done;
+                if (!ReadScan(tex.get(), false, "e5 readA-mip0-via-copytex")) goto done;   // mip0 tiles should be A; other mips unfilled
+            }
+
+            // e6. Release A; D takes A's last range; fill + verify D.
+            GhBillTake(&s0);
+            tex = nullptr;
+            GhBillTake(&s1);
+            GhBillReport("TILE release A while B/C live (expect 0)", s0, s1);
+            com_ptr<ID3D12Resource> texD;
+            if (!MkTex(texD, "e6 D") || !MapAll(texD.get(), 8 * nTiles, "e6 mapD-base8n") || !FillA(texD.get(), true, "e6 fillD")) goto done;
+
+            GhBillTake(&s0);
+            texB = nullptr; texC = nullptr; texD = nullptr;
+            GhBillTake(&s1);
+            GhBillReport("TILE release B/C/D (expect 0)", s0, s1);
+        }
+        pool = nullptr;
+        GhBillTake(&s0);
+        GhBillReport("TILE release pool (expect -256)", s1, s0);
+        Diag("TILEDPROBE VERDICT: see _pred_TILE0e.txt S1-S3 -- the whole-resource cycle is the pager primitive if e3/e4/e5 read 85/85");
+    }
+done:
+    if (mode >= 2){ Diag("TILEDPROBE done t=" + Ms() + "ms -- exiting (gh_tiled_probe=2)"); Sleep(500); ExitProcess(0); }
+    Diag("TILEDPROBE done t=" + Ms() + "ms");
+}
+
 static void GhDxilControl()
 {
     static const unsigned mode = GhCfgNum(L"gh_dxil_ctl.txt", "GH_DXIL_CTL", 0);
@@ -36609,6 +37067,10 @@ static void RunGuest()
         // before the guest exists -- so the answer cannot be an artifact of
         // our own CreateHeap hook. Off unless gh_heapbill says a size in MB.
         GhHeapBillProbe();
+
+        // #235. Tier 2 tiled resources as a GPU page file -- proved here on the
+        // throwaway device before anything is built on them. Off unless gh_tiled_probe.
+        GhTiledProbe();
 
         // ghwmm.dll: our WINMM replacement for the multimedia-timer functions the
         // container's slim WINMM lacks. Mono's import name is binary-patched
