@@ -20953,6 +20953,7 @@ static volatile LONG64 g_gpPoolB = 0, g_gpLiveB = 0, g_gpUs = 0, g_gpMapV = 0, g
 // TILE1/TILE1b were ~200 MB dearer on this class and cross-run heapMB arithmetic
 // cannot say why; these three numbers say it inside one run.
 static volatile LONG64 g_gpAskB = 0, g_gpAskLiveB = 0, g_gpMatB = 0;
+static volatile LONG64 g_gpMatLiveB = 0;   // #235 TILE1c: g_gpMatB is EVER-materialised and never decremented; this one is live
 static void**          g_gpHeapVt = nullptr;   // the proxy class's vtable, for the is-a test
 
 struct GhGpRes;
@@ -20984,7 +20985,7 @@ struct GhGpHeap : ID3D12Heap
     {
         const LONG n = InterlockedDecrement(&rc);
         if (n == 0){
-            if (real) real->Release();
+            if (real){ real->Release(); InterlockedAdd64(&g_gpMatLiveB, -(LONG64)desc.SizeInBytes); }   // #235 live matMB
             delete occ;
             InterlockedAdd64(&g_gpAskLiveB, -(LONG64)desc.SizeInBytes);   // #235 class ledger
             InterlockedDecrement(&g_gpProxyLive);
@@ -21297,6 +21298,7 @@ static ID3D12Heap* GhGpMaterialise(ID3D12Device* dev, GhGpHeap* ph, const char* 
             if (ph->name[0]) h->SetName(ph->name);
             InterlockedAdd64(&g_heapBytes, (LONG64)ph->desc.SizeInBytes);
             InterlockedAdd64(&g_gpMatB, (LONG64)ph->desc.SizeInBytes);   // #235 class ledger
+            InterlockedAdd64(&g_gpMatLiveB, (LONG64)ph->desc.SizeInBytes);   // #235 live matMB
             InterlockedIncrement(&g_heapCount);
         }
         const LONG k = InterlockedIncrement(&g_gpMat);
@@ -21512,7 +21514,8 @@ static std::string GhGpHotLine()
            // Our spend on the class = mat + poolMB; baseline would have been askLive.
            " gpclass=" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpAskB, 0, 0) >> 20)) +
            "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpAskLiveB, 0, 0) >> 20)) +
-           "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpMatB, 0, 0) >> 20));
+           "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpMatB, 0, 0) >> 20)) +
+           "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpMatLiveB, 0, 0) >> 20));
 }
 static std::string GhGpFrameLine()
 {
