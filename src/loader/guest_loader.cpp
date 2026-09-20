@@ -549,6 +549,9 @@ static void GhAppBudget(uint64_t* used, uint64_t* lim);
 static void        GhLazyWhoDump(const char* where);          // #213 who promised it, who touched it
 static void        GhResLiveDump(const char* where);           // #202 the LIVE resource set, by site
 static std::string GhResLiveFrameLine();                       // #202 livresMB on every FRAME line
+static std::string GhGpFrameLine();                            // #235 gpupage= on every FRAME line
+static void        GhGpTouch(ID3D12Resource* r);               // #235 last-use signal (copy hooks)
+static void        GhGpSrvNote(ID3D12Resource* r);             // #235 last-use signal (CreateSRV)
 static void GhIssuedPairsDump(const char* when);              // #158 executed-barrier tally
 static void GhBarrFlushPending(ID3D12GraphicsCommandList* self); // #158 coalescing
 // #158 one entry of the game's captured frame program; replayed by GhRtTest.
@@ -5457,6 +5460,7 @@ static HRESULT GfxPresent(UINT sync)
              " psoSavMs=" + std::to_string((long long)(InterlockedCompareExchange64(&g_psoDupSavUs, 0, 0) / 1000)) +
              GhPagerFrameLine() +
              GhResLiveFrameLine() +
+             GhGpFrameLine() +   // #235
              " dt=" + std::to_string((unsigned long long)(s_lastMs ? now - s_lastMs : 0)) + "ms" +
              // #158. The cross-queue waits are the only part of the per-frame path
              // not cleared, and they cannot be cleared by removal -- every psync
@@ -7102,7 +7106,7 @@ static HRESULT MakeFactoryProxy(REFIID riid, void** out)
 // hooks tell us whether that was CreateGraphicsPipelineState, a compute PSO, a
 // root signature, or a feature query. Vtable-patched on OUR device object after
 // 11on12 has already been created, so the guest is the only new caller.
-static void* g_d12vtOrig[50];
+static void* g_d12vtOrig[64];
 static LONG  g_d12vtHooked = 0;
 
 static const char* GhFourCC(const void* p, SIZE_T n)
@@ -14646,6 +14650,7 @@ static std::string GhRdBrief(const D3D12_RESOURCE_DESC* rd)
 static void __stdcall Hook_D12CreateSRV(ID3D12Device* self, ID3D12Resource* res,
     const D3D12_SHADER_RESOURCE_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE dest)
 {
+    GhGpSrvNote(res);   // #235
     if (GhDescTrackOn() || GhVaCheckOn()){
         if (d && d->ViewDimension == D3D12_SRV_DIMENSION_BUFFER)
             GhDescPut((UINT64)dest.ptr, res, 2, (unsigned)d->Format, 0, d->Buffer.FirstElement,
@@ -18199,6 +18204,7 @@ static void __stdcall Hook_CLCopyTextureRegion(ID3D12GraphicsCommandList* self,
     if (GhOpMask() & 16) return;
     GhCtrNote(self, d, x, y, z, sr, box);
     GhRhWrite(d ? ((const D3D12_TEXTURE_COPY_LOCATION*)d)->pResource : nullptr);   // #234 T33HIST
+    GhGpTouch(d ? ((const D3D12_TEXTURE_COPY_LOCATION*)d)->pResource : nullptr);   // #235 last-use
     // #194: the shape of every texture copy. #184's killer lived in exactly this
     // call, so the record GhCtrNote just filled in is the one worth keying on.
     {
@@ -18249,6 +18255,7 @@ static void __stdcall Hook_CLCopyResource(ID3D12GraphicsCommandList* self,
     GhBarrFlushPending(self);
     if (GhOpMask() & 16) return;
     GhRhWrite(d);   // #234 T33HIST
+    GhGpTouch(d);   // #235 last-use
     if (!GhRecCap17(self, d, sr))
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*,
                         ID3D12Resource*))GhClOrig(self, 17))(self, d, sr);
@@ -20865,6 +20872,646 @@ static void GhD12CallWatchdog()
         Sleep(500);
     }
 }
+// ---------------------------------------------------------------- #235 GPU heap pagefile
+// The container caps COMMIT and the console has no OS pagefile; #233 pages the
+// guest pool, and what is left pinned is the driver's heap memory -- Tsushima's
+// texture-only heaps (type=1 flags=0x44 align=64K, one per texture, recycled by
+// size class and never destroyed: 1,690 MB at SPILL12's death). Tier 2 tiled
+// resources are the one D3D12 primitive that separates a texture's ADDRESS from
+// its BACKING, and TILE0..TILE0e (GREENHOUSE.md 32.126) proved on this driver:
+// a reserved texture bills +0.0, a 0x44 tile-pool heap bills its size once,
+// UpdateTileMappings bills 0, and a WHOLE-resource single-range map / unmap /
+// remap is honoured by reads and writes (per-tile changes are NOT, and a mapping
+// issued on a COMPUTE queue removes the device -- DIRECT queue only, ever).
+//
+// Phase 1 (this build): every heap of the per-texture class becomes a PROXY --
+// an ID3D12Heap of ours with no driver heap behind it -- and every convertible
+// placement into a proxy (TEXTURE2D, no RT/DS/UAV flags, single-sampled, layout
+// UNKNOWN) becomes a reserved resource whole-mapped onto ONE contiguous run of
+// 64 KB tiles in a pool of real 0x44 heaps allocated in 256 MB chunks up to
+// gh_gpu_page_mb. What the pool then holds is the LIVE texture set; what the
+// game's heap set held was its high-water mark per size class. Nothing is ever
+// refused (a refused MB-class heap is fatal to this game, HEAPCAP1): a placement
+// the rule cannot convert, or one that arrives with the pool at its cap,
+// materialises the proxy's real heap (once) and is placed there exactly as
+// before. Mappings go down our own DIRECT queue behind a fence the guest's queues
+// wait on at their next submission, so a texture's backing exists before any
+// list that could touch it runs. Page-out / page-in (the pool as a pagefile on
+// D:) is Phase 2 and is not in this build.
+//
+//   gh_gpu_page_mb.txt  pool cap in MB (GhCfgNumZ; no runargs slot -- hand-
+//                       managed in LocalState, delete it by hand). 0 = off.
+//
+// FRAME line: gphot=MB<=1s/<=10s/<=60s/older/never gpround=allocMB gpupage=poolMB/liveMB/liveN gpconv=conv/skip/mat/full/fail
+//             gpalias=N gpmaps=maps/waits gpms=ms gpheaps=live/ever gptouch=copies/srvs
+//   pool  real pool bytes (chunks), live  mapped tile bytes, liveN  converted textures alive
+//   conv  placements converted, skip  not convertible (materialised), mat  proxies
+//   materialised, full  pool at cap (materialised), fail  driver refused the
+//   reserved create; maps  UpdateTileMappings issued, waits  guest-queue fence waits.
+static bool GhLazySpillOn();
+static unsigned GhGpuPageMb()
+{ static const unsigned v = GhCfgNumZ(L"gh_gpu_page_mb.txt", "GH_GPU_PAGE_MB", 0); return v; }
+static bool GhGpOn(){ return GhGpuPageMb() != 0; }
+// gh_gpu_chunk_mb (LocalState, hand-managed, default 256): the pool grows in real
+// 0x44 heaps of this size. TILE1 pre-billed up to a whole 256 MB chunk of idle
+// pool at the ceiling and its fifth chunk was refused with 132 MB free.
+static unsigned GhGpChunkMb()
+{ static const unsigned v = GhCfgNumZ(L"gh_gpu_chunk_mb.txt", "GH_GPU_CHUNK_MB", 256); return v ? v : 256; }
+
+static volatile LONG   g_gpProxyN = 0, g_gpProxyLive = 0, g_gpConv = 0, g_gpSkip = 0, g_gpMat = 0,
+                       g_gpFull = 0, g_gpFail = 0, g_gpAlias = 0, g_gpMaps = 0, g_gpWaits = 0,
+                       g_gpLiveN = 0, g_gpFreed = 0, g_gpTouch = 0, g_gpSrv = 0, g_gpChunkN = 0;
+static volatile LONG64 g_gpPoolB = 0, g_gpLiveB = 0, g_gpUs = 0, g_gpMapV = 0, g_gpAllocB = 0;
+static void**          g_gpHeapVt = nullptr;   // the proxy class's vtable, for the is-a test
+
+struct GhGpRes;
+// The proxy. Single-vtable COM (com-proxy-single-vtable): plain inheritance from
+// ID3D12Heap, no winrt::implements. The desc is the game's own words, returned
+// verbatim; the real heap exists only once something un-convertible lands here.
+struct GhGpHeap : ID3D12Heap
+{
+    LONG            rc = 1;
+    D3D12_HEAP_DESC desc{};
+    ID3D12Device*   dev = nullptr;     // not AddRef'd: the device outlives every heap
+    ID3D12Heap*     real = nullptr;    // materialised lazily, once, never un-materialised
+    LONG            occN = 0;          // live converted occupants (each holds one ref on us)
+    std::vector<GhGpRes*>* occ = nullptr;
+    wchar_t         name[48]{};
+
+    HRESULT __stdcall QueryInterface(REFIID riid, void** o) noexcept override
+    {
+        if (!o) return E_POINTER;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) ||
+            riid == __uuidof(ID3D12DeviceChild) || riid == __uuidof(ID3D12Pageable) ||
+            riid == __uuidof(ID3D12Heap)){
+            *o = static_cast<ID3D12Heap*>(this); AddRef(); return S_OK;
+        }
+        *o = nullptr; return E_NOINTERFACE;
+    }
+    ULONG __stdcall AddRef() noexcept override { return (ULONG)InterlockedIncrement(&rc); }
+    ULONG __stdcall Release() noexcept override
+    {
+        const LONG n = InterlockedDecrement(&rc);
+        if (n == 0){
+            if (real) real->Release();
+            delete occ;
+            InterlockedDecrement(&g_gpProxyLive);
+            delete this;
+        }
+        return (ULONG)n;
+    }
+    HRESULT __stdcall GetPrivateData(REFGUID g, UINT* n, void* d) noexcept override
+    { return real ? real->GetPrivateData(g, n, d) : DXGI_ERROR_NOT_FOUND; }
+    HRESULT __stdcall SetPrivateData(REFGUID g, UINT n, const void* d) noexcept override
+    { return real ? real->SetPrivateData(g, n, d) : S_OK; }
+    HRESULT __stdcall SetPrivateDataInterface(REFGUID g, const IUnknown* d) noexcept override
+    { return real ? real->SetPrivateDataInterface(g, d) : S_OK; }
+    HRESULT __stdcall SetName(LPCWSTR n) noexcept override
+    {
+        if (n){ size_t i = 0; for (; i + 1 < 48 && n[i]; ++i) name[i] = n[i]; name[i] = 0; }
+        if (real) real->SetName(n);
+        return S_OK;
+    }
+    HRESULT __stdcall GetDevice(REFIID riid, void** o) noexcept override
+    { return dev ? dev->QueryInterface(riid, o) : E_FAIL; }
+    D3D12_HEAP_DESC __stdcall GetDesc() noexcept override { return desc; }
+};
+static bool GhGpIsProxy(void* h)
+{ return h && g_gpHeapVt && *(void***)h == g_gpHeapVt; }
+
+// The per-texture class, as SPILL12's census shows it: DEFAULT, flags 0x44
+// (DENY_BUFFERS | DENY_RT_DS_TEXTURES), Alignment 64 KB, 64 KB..~10 MB, one
+// texture each. The ten 32 MB pools (Alignment 0) and every 0x84 RT/DS heap stay
+// real in this phase.
+static bool GhGpWantsHeap(const D3D12_HEAP_DESC* hd)
+{
+    if (!GhGpOn() || !hd) return false;
+    if (hd->Properties.Type != D3D12_HEAP_TYPE_DEFAULT) return false;
+    if (hd->Flags != D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES) return false;
+    if (hd->Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) return false;
+    if (hd->SizeInBytes < 0x10000 || hd->SizeInBytes > (64ull << 20)) return false;
+    return true;
+}
+static bool GhGpMakeProxy(ID3D12Device* dev, const D3D12_HEAP_DESC* hd, REFIID riid, void** pp)
+{
+    GhGpHeap* p = new GhGpHeap();
+    p->desc = *hd; p->dev = dev;
+    if (!g_gpHeapVt) g_gpHeapVt = *(void***)p;
+    void* out = nullptr;
+    if (FAILED(p->QueryInterface(riid, &out)) || !out){ p->Release(); return false; }
+    p->Release();            // QueryInterface's reference is the caller's; ours goes
+    *pp = out;
+    return true;
+}
+
+// One converted texture: the reserved resource the game holds, the placement it
+// asked for (proxy heap + offset, for the alias count and the release path), the
+// desc in the game's own words (GetDesc answers with it), and its run in the pool.
+struct GhGpRes {
+    ID3D12Resource*       res;
+    GhGpHeap*             heap;
+    UINT64                off, size;
+    D3D12_RESOURCE_DESC   desc0;         // Layout UNKNOWN, Alignment as given
+    D3D12_RESOURCE_STATES st0;
+    UINT                  nTiles, nSub, nStdMips, nPackedTiles;
+    int                   chunk;          // -1 = not mapped (Phase 2: evicted)
+    UINT                  base;
+    LONG64                created, lastUse;
+    UINT32                ecl0;
+};
+struct GhGpChunk { ID3D12Heap* heap; UINT tiles; std::vector<std::pair<UINT, UINT>> fr; };   // fr: sorted free runs (base,len)
+
+static SRWLOCK                                 g_gpLk = SRWLOCK_INIT;
+static std::vector<GhGpChunk>*                 g_gpChunks = nullptr;
+static std::unordered_map<void*, GhGpRes*>*    g_gpMap = nullptr;
+static ID3D12Device*                           g_gpDev = nullptr;
+static ID3D12CommandQueue*                     g_gpQ = nullptr;       // DIRECT, ours, mappings only
+static ID3D12Fence*                            g_gpMapFence = nullptr;
+static volatile LONG                           g_gpRigFailed = 0;
+
+template <class F> static F GhGpCq(ID3D12CommandQueue* q, int slot)
+{ return (F)(g_cqVtOrig[slot] ? g_cqVtOrig[slot] : (*(void***)q)[slot]); }
+
+// g_gpLk held.
+static bool GhGpRig(ID3D12Device* dev)
+{
+    if (g_gpQ) return true;
+    if (InterlockedCompareExchange(&g_gpRigFailed, 0, 0)) return false;
+    auto mkq = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_COMMAND_QUEUE_DESC*, REFIID, void**))g_d12vtOrig[8];
+    auto mkf = (HRESULT (__stdcall*)(ID3D12Device*, UINT64, D3D12_FENCE_FLAGS, REFIID, void**))g_d12vtOrig[36];
+    D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;   // never COMPUTE (TILE0d), never COPY
+    ID3D12CommandQueue* q = nullptr; ID3D12Fence* f = nullptr;
+    HRESULT hr = mkq ? mkq(dev, &qd, __uuidof(ID3D12CommandQueue), (void**)&q) : dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), (void**)&q);
+    if (SUCCEEDED(hr) && q)
+        hr = mkf ? mkf(dev, 0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), (void**)&f) : dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), (void**)&f);
+    if (FAILED(hr) || !q || !f){
+        Diag("GPUPAGE rig FAILED hr=" + Hex((uint32_t)hr) + " -- every placement stays real (materialise)");
+        if (q) q->Release();
+        InterlockedExchange(&g_gpRigFailed, 1);
+        return false;
+    }
+    g_gpDev = dev; g_gpQ = q; g_gpMapFence = f;
+    g_gpChunks = new std::vector<GhGpChunk>();
+    g_gpMap = new std::unordered_map<void*, GhGpRes*>();
+    g_gpMap->reserve(8192);
+    Diag("GPUPAGE rig q=" + Hex((uint64_t)(uintptr_t)q) + " fence=" + Hex((uint64_t)(uintptr_t)f) +
+         " cap=" + std::to_string((unsigned long)GhGpuPageMb()) + "MB");
+    return true;
+}
+
+// g_gpLk held. First fit over the chunks, growing the pool by one chunk (256 MB,
+// or what is left under the cap) when nothing fits.
+static bool GhGpAlloc(UINT n, int* ci, UINT* base)
+{
+    for (size_t c = 0; c < g_gpChunks->size(); ++c){
+        auto& fr = (*g_gpChunks)[c].fr;
+        for (size_t i = 0; i < fr.size(); ++i) if (fr[i].second >= n){
+            *ci = (int)c; *base = fr[i].first;
+            fr[i].first += n; fr[i].second -= n;
+            if (!fr[i].second) fr.erase(fr.begin() + i);
+            return true;
+        }
+    }
+    const UINT64 cap = (UINT64)GhGpuPageMb() << 20;
+    UINT64 chunkB = (UINT64)GhGpChunkMb() << 20;
+    if (chunkB < ((UINT64)n << 16)) chunkB = (((UINT64)n << 16) + 0xFFFFFFull) & ~0xFFFFFFull;   // one texture always fits a chunk
+    if ((UINT64)g_gpPoolB + chunkB > cap) chunkB = cap > (UINT64)g_gpPoolB ? (cap - (UINT64)g_gpPoolB) & ~0xFFFFull : 0;
+    if (chunkB < (UINT64)n << 16) return false;
+    auto mk = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_HEAP_DESC*, REFIID, void**))g_d12vtOrig[28];
+    D3D12_HEAP_DESC hd{};
+    hd.SizeInBytes = chunkB; hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+    ID3D12Heap* h = nullptr;
+    HRESULT hr = mk(g_gpDev, &hd, __uuidof(ID3D12Heap), (void**)&h);
+    if (FAILED(hr) && GhLazySpillOn() && GhLazySpillRoom(chunkB + (64ull << 20), "gpupage")){
+        hr = mk(g_gpDev, &hd, __uuidof(ID3D12Heap), (void**)&h);
+        Diag("GPUPAGE chunk RETRY after spill hr=" + Hex((uint32_t)hr));
+    }
+    if (FAILED(hr) || !h){
+        static LONG said = 0;
+        if (InterlockedIncrement(&said) <= 8)
+            Diag("GPUPAGE chunk REFUSED hr=" + Hex((uint32_t)hr) + " poolMB=" + std::to_string((long long)(g_gpPoolB >> 20)));
+        return false;
+    }
+    GhGpChunk c{}; c.heap = h; c.tiles = (UINT)(chunkB >> 16); c.fr.push_back({0u, c.tiles});
+    g_gpChunks->push_back(c);
+    InterlockedAdd64(&g_gpPoolB, (LONG64)chunkB);
+    InterlockedAdd64(&g_heapBytes, (LONG64)chunkB);   // heapMB keeps its meaning: real heaps, pool included
+    InterlockedIncrement(&g_heapCount);
+    const LONG k = InterlockedIncrement(&g_gpChunkN);
+    Diag("GPUPAGE chunk #" + std::to_string((long)k) + " heap=" + Hex((uint64_t)(uintptr_t)h) +
+         " bytes=" + Hex(chunkB) + " poolMB=" + std::to_string((long long)(g_gpPoolB >> 20)) +
+         " liveMB=" + std::to_string((long long)(g_gpLiveB >> 20)));
+    auto& fr = g_gpChunks->back().fr;
+    *ci = (int)g_gpChunks->size() - 1; *base = fr[0].first;
+    fr[0].first += n; fr[0].second -= n;
+    if (!fr[0].second) fr.erase(fr.begin());
+    return true;
+}
+// g_gpLk held. Insert sorted and coalesce with both neighbours.
+static void GhGpFree(int ci, UINT base, UINT n)
+{
+    if (ci < 0 || (size_t)ci >= g_gpChunks->size()) return;
+    auto& fr = (*g_gpChunks)[ci].fr;
+    size_t i = 0;
+    while (i < fr.size() && fr[i].first < base) ++i;
+    fr.insert(fr.begin() + i, {base, n});
+    if (i + 1 < fr.size() && fr[i].first + fr[i].second == fr[i + 1].first){
+        fr[i].second += fr[i + 1].second; fr.erase(fr.begin() + i + 1);
+    }
+    if (i > 0 && fr[i - 1].first + fr[i - 1].second == fr[i].first){
+        fr[i - 1].second += fr[i].second; fr.erase(fr.begin() + i);
+    }
+}
+
+// g_gpLk held. One region covering the whole resource, one range, on OUR direct
+// queue, then a signal the guest's queues wait on (GhGpBeforeSubmit).
+static void GhGpMapWhole(GhGpRes* e, ID3D12Heap* heap, UINT base)
+{
+    D3D12_TILED_RESOURCE_COORDINATE c{};
+    D3D12_TILE_REGION_SIZE sz{}; sz.NumTiles = e->nTiles; sz.UseBox = FALSE;
+    const D3D12_TILE_RANGE_FLAGS rf = heap ? D3D12_TILE_RANGE_FLAG_NONE : D3D12_TILE_RANGE_FLAG_NULL;
+    const UINT off = base, cnt = e->nTiles;
+    GhGpCq<void (__stdcall*)(ID3D12CommandQueue*, ID3D12Resource*, UINT, const D3D12_TILED_RESOURCE_COORDINATE*,
+        const D3D12_TILE_REGION_SIZE*, ID3D12Heap*, UINT, const D3D12_TILE_RANGE_FLAGS*, const UINT*, const UINT*,
+        D3D12_TILE_MAPPING_FLAGS)>(g_gpQ, 8)(g_gpQ, e->res, 1, &c, &sz, heap, 1, &rf, &off, &cnt, D3D12_TILE_MAPPING_FLAG_NONE);
+    const UINT64 v = (UINT64)InterlockedIncrement64(&g_gpMapV);
+    GhGpCq<HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64)>(g_gpQ, 14)(g_gpQ, g_gpMapFence, v);
+    InterlockedIncrement(&g_gpMaps);
+}
+
+static GhGpRes* GhGpFind(void* res)
+{
+    if (!g_gpMap || !res) return nullptr;
+    AcquireSRWLockShared(&g_gpLk);
+    GhGpRes* e = nullptr;
+    auto it = g_gpMap->find(res);
+    if (it != g_gpMap->end()) e = it->second;
+    ReleaseSRWLockShared(&g_gpLk);
+    return e;
+}
+
+// The reserved resource's vtable, hooked at three slots for the objects we made
+// and passed through for anything else on the same vtable: Release (2) frees
+// the run, GetDesc (10) answers in the game's words, GetHeapProperties (14)
+// answers as the placed resource the game thinks it has (a reserved resource
+// returns a failure there, and the engine's own bookkeeping could assert on it).
+static void*         g_gpResVt[4]{}, *g_gpResRel[4]{}, *g_gpResDesc[4]{}, *g_gpResGhp[4]{};
+static volatile LONG g_gpResVtN = 0;
+static int GhGpVtIdx(void* self)
+{
+    void** vt = self ? *(void***)self : nullptr;
+    const LONG n = InterlockedCompareExchange(&g_gpResVtN, 0, 0);
+    for (LONG i = 0; i < n && i < 4; ++i) if (g_gpResVt[i] == (void*)vt) return (int)i;
+    return -1;
+}
+static void GhGpOnFree(void* res)
+{
+    if (!g_gpMap) return;
+    AcquireSRWLockExclusive(&g_gpLk);
+    auto it = g_gpMap->find(res);
+    GhGpRes* e = it != g_gpMap->end() ? it->second : nullptr;
+    if (e) g_gpMap->erase(it);
+    GhGpHeap* ph = nullptr;
+    if (e){
+        if (e->chunk >= 0){ GhGpFree(e->chunk, e->base, e->nTiles); InterlockedAdd64(&g_gpLiveB, -(LONG64)e->nTiles << 16); }
+        InterlockedAdd64(&g_gpAllocB, -(LONG64)e->size);
+        InterlockedDecrement(&g_gpLiveN); InterlockedIncrement(&g_gpFreed);
+        ph = e->heap;
+        if (ph && ph->occ){
+            for (size_t i = 0; i < ph->occ->size(); ++i) if ((*ph->occ)[i] == e){ ph->occ->erase(ph->occ->begin() + i); break; }
+            --ph->occN;
+        }
+        delete e;
+    }
+    ReleaseSRWLockExclusive(&g_gpLk);
+    if (ph) ph->Release();   // the occupant's reference on its proxy
+}
+static ULONG __stdcall Hook_GpResRelease(IUnknown* self)
+{
+    const int i = GhGpVtIdx(self);
+    if (i < 0) return 1;   // never guess at a Release (Hook_ObjRelease's rule)
+    auto orig = (ULONG (__stdcall*)(IUnknown*))g_gpResRel[i];
+    // Peek: if this Release is the last, do the bookkeeping while the pointer is
+    // still a live object, so a new object at the same address cannot be confused
+    // with the dead one. The peek is AddRef + the driver's own Release.
+    const ULONG peek = self->AddRef();
+    orig(self);
+    if (peek == 2) GhGpOnFree(self);
+    const ULONG rc = orig(self);
+    if (rc == 0) GhGpOnFree(self);   // idempotent: covers a peek that raced
+    return rc;
+}
+static D3D12_RESOURCE_DESC* __stdcall Hook_GpResGetDesc(ID3D12Resource* self, D3D12_RESOURCE_DESC* out)
+{
+    const int i = GhGpVtIdx(self);
+    if (i < 0){ if (out) *out = D3D12_RESOURCE_DESC{}; return out; }
+    D3D12_RESOURCE_DESC* r = ((D3D12_RESOURCE_DESC* (__stdcall*)(ID3D12Resource*, D3D12_RESOURCE_DESC*))g_gpResDesc[i])(self, out);
+    if (out) if (GhGpRes* e = GhGpFind(self)){ out->Layout = e->desc0.Layout; out->Alignment = e->desc0.Alignment; }
+    return r;
+}
+static HRESULT __stdcall Hook_GpResGhp(ID3D12Resource* self, D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS* hf)
+{
+    const int i = GhGpVtIdx(self);
+    if (i < 0) return E_FAIL;
+    if (GhGpRes* e = GhGpFind(self)){
+        if (hp) *hp = e->heap ? e->heap->desc.Properties : D3D12_HEAP_PROPERTIES{ D3D12_HEAP_TYPE_DEFAULT };
+        if (hf) *hf = e->heap ? e->heap->desc.Flags : D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+        return S_OK;
+    }
+    return ((HRESULT (__stdcall*)(ID3D12Resource*, D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS*))g_gpResGhp[i])(self, hp, hf);
+}
+// g_gpLk held.
+static void GhGpHookResVt(ID3D12Resource* r)
+{
+    void** vt = *(void***)r;
+    const LONG n = InterlockedCompareExchange(&g_gpResVtN, 0, 0);
+    for (LONG i = 0; i < n && i < 4; ++i) if (g_gpResVt[i] == (void*)vt) return;
+    if (n >= 4){
+        static LONG warned = 0;
+        if (InterlockedIncrement(&warned) == 1) Diag("GPUPAGE more than 4 reserved vtables -- Release coverage is partial, run is suspect");
+        return;
+    }
+    DWORD old = 0;
+    if (!VirtualProtect(vt, sizeof(void*) * 16, PAGE_READWRITE, &old)){
+        Diag("GPUPAGE reserved vtable protect failed err=" + Hex(GetLastError()));
+        return;
+    }
+    g_gpResVt[n] = (void*)vt; g_gpResRel[n] = vt[2]; g_gpResDesc[n] = vt[10]; g_gpResGhp[n] = vt[14];
+    InterlockedExchange(&g_gpResVtN, n + 1);
+    vt[2] = (void*)&Hook_GpResRelease; vt[10] = (void*)&Hook_GpResGetDesc; vt[14] = (void*)&Hook_GpResGhp;
+    VirtualProtect(vt, sizeof(void*) * 16, old, &old);
+    Diag("GPUPAGE reserved vtable " + Hex((uint64_t)(uintptr_t)vt) + " hooked (Release, GetDesc, GetHeapProperties) " +
+         std::to_string((long)n + 1) + " of 4");
+}
+
+// The materialise path: the proxy grows its real heap, once, and from then on
+// every placement into it is a plain placement. Never refuses without first
+// asking the spill pager for room, exactly as Hook_D12CreateHeap does.
+static ID3D12Heap* GhGpMaterialise(ID3D12Device* dev, GhGpHeap* ph, const char* why)
+{
+    AcquireSRWLockExclusive(&g_gpLk);
+    if (!ph->real){
+        auto mk = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_HEAP_DESC*, REFIID, void**))g_d12vtOrig[28];
+        ID3D12Heap* h = nullptr;
+        HRESULT hr = mk(dev, &ph->desc, __uuidof(ID3D12Heap), (void**)&h);
+        if (FAILED(hr) && GhLazySpillOn() && GhLazySpillRoom((uint64_t)ph->desc.SizeInBytes + (64ull << 20), "gpupage-mat"))
+            hr = mk(dev, &ph->desc, __uuidof(ID3D12Heap), (void**)&h);
+        if (SUCCEEDED(hr) && h){
+            ph->real = h;
+            if (ph->name[0]) h->SetName(ph->name);
+            InterlockedAdd64(&g_heapBytes, (LONG64)ph->desc.SizeInBytes);
+            InterlockedIncrement(&g_heapCount);
+        }
+        const LONG k = InterlockedIncrement(&g_gpMat);
+        if (k <= 16 || (k % 256) == 0 || FAILED(hr))
+            Diag("GPUPAGE materialise n=" + std::to_string((long)k) + " why=" + why +
+                 " size=" + Hex((uint64_t)ph->desc.SizeInBytes) + " proxy=" + Hex((uint64_t)(uintptr_t)ph) +
+                 " real=" + Hex((uint64_t)(uintptr_t)h) + " hr=" + Hex((uint32_t)hr) +
+                 " occupants=" + std::to_string((long)ph->occN));
+    }
+    ID3D12Heap* r = ph->real;
+    ReleaseSRWLockExclusive(&g_gpLk);
+    return r;
+}
+
+// The conversion. Returns true with *hrOut set when the placement became a
+// reserved resource; false when the caller must place it for real (after
+// GhGpMaterialise). The convertibility rule is deliberately narrow: TEXTURE2D
+// (arrays and cubes included), no RT/DS/UAV/simultaneous-access flag (nothing a
+// shader could write behind our back), single-sampled, layout UNKNOWN.
+static bool GhGpConvert(ID3D12Device* dev, GhGpHeap* ph, UINT64 off, const D3D12_RESOURCE_DESC* rd,
+                        D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID riid, void** pp, HRESULT* hrOut)
+{
+    if (!rd || !pp || ph->real) return false;
+    if (rd->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || rd->Flags != D3D12_RESOURCE_FLAG_NONE ||
+        rd->SampleDesc.Count != 1 || rd->Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN ||
+        rd->DepthOrArraySize != 1){   // arrays: the driver refuses them as reserved (TILE1, E_INVALIDARG)
+        const LONG k = InterlockedIncrement(&g_gpSkip);
+        if (k <= 16 || (k % 256) == 0)
+            Diag("GPUPAGE skip n=" + std::to_string((long)k) + " dim=" + std::to_string((int)rd->Dimension) +
+                 " flags=" + Hex((uint32_t)rd->Flags) + " samples=" + std::to_string((unsigned)rd->SampleDesc.Count) +
+                 " layout=" + std::to_string((int)rd->Layout) + " " + std::to_string((unsigned long long)rd->Width) + "x" +
+                 std::to_string((unsigned)rd->Height) + " fmt=" + std::to_string((int)rd->Format));
+        return false;
+    }
+    const LONG64 t0 = GhNowUs();
+    auto mk = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
+                                    const D3D12_CLEAR_VALUE*, REFIID, void**))g_d12vtOrig[30];
+    D3D12_RESOURCE_DESC rr = *rd;
+    rr.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+    rr.Alignment = 0;
+    ID3D12Resource* res = nullptr;
+    HRESULT hr = mk(dev, &rr, st, cv, riid, (void**)&res);
+    UINT nTiles = 0, nSub = 0; D3D12_PACKED_MIP_INFO pm{}; D3D12_TILE_SHAPE ts{};
+    if (SUCCEEDED(hr) && res) dev->GetResourceTiling(res, &nTiles, &pm, &ts, &nSub, 0, nullptr);
+    if (FAILED(hr) || !res || !nTiles){
+        const LONG k = InterlockedIncrement(&g_gpFail);
+        if (k <= 16 || (k % 256) == 0)
+            Diag("GPUPAGE reserved create FAILED n=" + std::to_string((long)k) + " hr=" + Hex((uint32_t)hr) +
+                 " tiles=" + std::to_string(nTiles) + " " + std::to_string((unsigned long long)rd->Width) + "x" +
+                 std::to_string((unsigned)rd->Height) + " mips=" + std::to_string((unsigned)rd->MipLevels) +
+                 " arr=" + std::to_string((unsigned)rd->DepthOrArraySize) + " fmt=" + std::to_string((int)rd->Format));
+        if (res) res->Release();
+        return false;
+    }
+    const D3D12_RESOURCE_ALLOCATION_INFO ai = dev->GetResourceAllocationInfo(0, 1, rd);
+
+    AcquireSRWLockExclusive(&g_gpLk);
+    if (!GhGpRig(dev)){ ReleaseSRWLockExclusive(&g_gpLk); res->Release(); return false; }
+    int ci = -1; UINT base = 0;
+    if (!GhGpAlloc(nTiles, &ci, &base)){
+        ReleaseSRWLockExclusive(&g_gpLk);
+        res->Release();
+        const LONG k = InterlockedIncrement(&g_gpFull);
+        if (k <= 16 || (k % 256) == 0)
+            Diag("GPUPAGE pool FULL n=" + std::to_string((long)k) + " need=" + std::to_string(nTiles) + " tiles poolMB=" +
+                 std::to_string((long long)(g_gpPoolB >> 20)) + " liveMB=" + std::to_string((long long)(g_gpLiveB >> 20)) +
+                 " -> materialise");
+        return false;
+    }
+    GhGpRes* e = new GhGpRes{};
+    e->res = res; e->heap = ph; e->off = off; e->size = ai.SizeInBytes;
+    e->desc0 = *rd; e->st0 = st;
+    e->nTiles = nTiles; e->nSub = nSub; e->nStdMips = pm.NumStandardMips; e->nPackedTiles = pm.NumTilesForPackedMips;
+    e->chunk = ci; e->base = base;
+    e->created = e->lastUse = t0;
+    e->ecl0 = (UINT32)InterlockedCompareExchange(&g_eclCount, 0, 0);
+    GhGpMapWhole(e, (*g_gpChunks)[ci].heap, base);
+    // The alias count: a placement overlapping a live occupant of the same proxy.
+    // D3D12 makes the older occupant's contents undefined; nothing to do, but it
+    // is the number Phase 2 will want.
+    LONG aliased = 0;
+    if (!ph->occ) ph->occ = new std::vector<GhGpRes*>();
+    for (GhGpRes* o : *ph->occ)
+        if (o->off < off + e->size && off < o->off + o->size) ++aliased;
+    ph->occ->push_back(e); ++ph->occN;
+    ph->AddRef();   // the occupant's reference (a placed resource keeps its heap alive)
+    (*g_gpMap)[res] = e;
+    GhGpHookResVt(res);
+    InterlockedAdd64(&g_gpLiveB, (LONG64)nTiles << 16);
+    InterlockedAdd64(&g_gpAllocB, (LONG64)e->size);   // the game's own allocation size: gpround= is tile rounding
+    InterlockedIncrement(&g_gpLiveN);
+    ReleaseSRWLockExclusive(&g_gpLk);
+    if (aliased) InterlockedAdd(&g_gpAlias, aliased);
+
+    const LONG k = InterlockedIncrement(&g_gpConv);
+    InterlockedAdd64(&g_gpUs, GhNowUs() - t0);
+    if (k <= 16 || (k % 256) == 0)
+        Diag("GPUPAGE conv n=" + std::to_string((long)k) + " res=" + Hex((uint64_t)(uintptr_t)res) +
+             " proxy=" + Hex((uint64_t)(uintptr_t)ph) + " off=" + Hex(off) +
+             " " + std::to_string((unsigned long long)rd->Width) + "x" + std::to_string((unsigned)rd->Height) +
+             " mips=" + std::to_string((unsigned)rd->MipLevels) + " arr=" + std::to_string((unsigned)rd->DepthOrArraySize) +
+             " fmt=" + std::to_string((int)rd->Format) + " state=" + Hex((uint32_t)st) +
+             " tiles=" + std::to_string(nTiles) + " (std mips " + std::to_string((unsigned)pm.NumStandardMips) +
+             ", packed " + std::to_string((unsigned)pm.NumTilesForPackedMips) + ") alloc=" + Hex((uint64_t)ai.SizeInBytes) +
+             " chunk=" + std::to_string(ci) + " base=" + std::to_string(base) +
+             " aliased=" + std::to_string((long)aliased) +
+             " us=" + std::to_string((long long)(GhNowUs() - t0)) +
+             " poolMB=" + std::to_string((long long)(g_gpPoolB >> 20)) + " liveMB=" + std::to_string((long long)(g_gpLiveB >> 20)));
+    *pp = res; *hrOut = S_OK;
+    return true;
+}
+
+// Called from Hook_CQExecute on the queue the work goes to, before the
+// submission: a GPU-side wait for the last mapping we signalled, once per queue
+// per mapping generation. Our own queue never waits on anything, so no cycle.
+static void GhGpBeforeSubmit(ID3D12CommandQueue* q)
+{
+    if (!g_gpQ || !q || q == g_gpQ) return;
+    const UINT64 v = (UINT64)InterlockedCompareExchange64(&g_gpMapV, 0, 0);
+    if (!v) return;
+    static struct { void* q; volatile LONG64 v; } w[16]{};
+    static volatile LONG wn = 0;
+    int i = -1;
+    const LONG n = InterlockedCompareExchange(&wn, 0, 0);
+    for (LONG k = 0; k < n && k < 16; ++k) if (w[k].q == (void*)q){ i = (int)k; break; }
+    if (i < 0){
+        const LONG k = InterlockedIncrement(&wn) - 1;
+        if (k >= 16) return;   // more queues than the table: this one waits every time below
+        w[k].q = (void*)q; w[k].v = 0; i = (int)k;
+    }
+    if ((UINT64)InterlockedCompareExchange64(&w[i].v, 0, 0) >= v) return;
+    InterlockedExchange64(&w[i].v, (LONG64)v);
+    GhGpCq<HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64)>(q, 15)(q, g_gpMapFence, v);
+    InterlockedIncrement(&g_gpWaits);
+}
+
+// Residency calls that could name a proxy: strip them, since there is no driver
+// object behind a proxy. The reserved resources themselves are pageable and go
+// through untouched.
+static bool GhGpFilterPageables(UINT num, ID3D12Pageable* const* in, std::vector<ID3D12Pageable*>& out)
+{
+    bool any = false;
+    for (UINT i = 0; i < num && in; ++i) if (GhGpIsProxy(in[i])){ any = true; break; }
+    if (!any) return false;
+    out.reserve(num);
+    for (UINT i = 0; i < num; ++i) if (!GhGpIsProxy(in[i])) out.push_back(in[i]);
+    return true;
+}
+static void GhGpTouch(ID3D12Resource* r)
+{
+    if (!g_gpMap || !r) return;
+    if (GhGpRes* e = GhGpFind(r)){ e->lastUse = GhNowUs(); InterlockedIncrement(&g_gpTouch); }
+}
+static void GhGpSrvNote(ID3D12Resource* r)
+{
+    if (!g_gpMap || !r) return;
+    if (GhGpRes* e = GhGpFind(r)){ e->lastUse = GhNowUs(); InterlockedIncrement(&g_gpSrv); }
+}
+// gphot=MB<=1s/MB<=10s/MB<=60s/MBolder/MBnever: live mapped bytes bucketed by the
+// age of the last CreateSRV or copy naming the texture (never = untouched since
+// creation). The residency policy's raw material: if the recent buckets are a
+// small fraction of the live set, CreateSRV is a read signal worth keying on.
+static std::string GhGpHotLine()
+{
+    if (!g_gpMap) return std::string();
+    const LONG64 now = GhNowUs();
+    UINT64 b[5] = {0, 0, 0, 0, 0};
+    AcquireSRWLockShared(&g_gpLk);
+    for (auto& kv : *g_gpMap){
+        GhGpRes* e = kv.second;
+        if (!e || e->chunk < 0) continue;
+        const UINT64 bytes = (UINT64)e->nTiles << 16;
+        if (e->lastUse == e->created){ b[4] += bytes; continue; }
+        const LONG64 age = now - e->lastUse;
+        b[age <= 1000000 ? 0 : age <= 10000000 ? 1 : age <= 60000000 ? 2 : 3] += bytes;
+    }
+    ReleaseSRWLockShared(&g_gpLk);
+    std::string o = " gphot=";
+    for (int i = 0; i < 5; ++i) o += (i ? "/" : "") + std::to_string((unsigned long long)(b[i] >> 20));
+    return o + " gpround=" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpAllocB, 0, 0) >> 20));
+}
+static std::string GhGpFrameLine()
+{
+    if (!GhGpOn()) return std::string();
+    return GhGpHotLine() + " gpupage=" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpPoolB, 0, 0) >> 20)) +
+           "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpLiveB, 0, 0) >> 20)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpLiveN, 0, 0)) +
+           " gpconv=" + std::to_string((long)InterlockedCompareExchange(&g_gpConv, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpSkip, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpMat, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpFull, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpFail, 0, 0)) +
+           " gpalias=" + std::to_string((long)InterlockedCompareExchange(&g_gpAlias, 0, 0)) +
+           " gpmaps=" + std::to_string((long)InterlockedCompareExchange(&g_gpMaps, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpWaits, 0, 0)) +
+           " gpms=" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpUs, 0, 0) / 1000)) +
+           " gpheaps=" + std::to_string((long)InterlockedCompareExchange(&g_gpProxyLive, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpProxyN, 0, 0)) +
+           " gptouch=" + std::to_string((long)InterlockedCompareExchange(&g_gpTouch, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpSrv, 0, 0));
+}
+// The three device entry points the game has never been seen to call but that
+// could name a proxy: log-only for CreateSharedHandle (a proxy is refused, the
+// driver would dereference it), filtered for the two residency calls.
+static HRESULT __stdcall Hook_D12CreateSharedHandle(ID3D12Device* self, ID3D12DeviceChild* obj,
+    const SECURITY_ATTRIBUTES* sa, DWORD access, LPCWSTR name, HANDLE* h)
+{
+    static LONG n = 0;
+    const LONG i = InterlockedIncrement(&n);
+    const bool proxy = GhGpIsProxy(obj);
+    if (i <= 16 || proxy)
+        Diag("D3D12 CreateSharedHandle n=" + std::to_string((long)i) + " obj=" + Hex((uint64_t)(uintptr_t)obj) +
+             (proxy ? " PROXY HEAP -> E_INVALIDARG" : ""));
+    if (proxy){ if (h) *h = nullptr; return E_INVALIDARG; }
+    return ((HRESULT (__stdcall*)(ID3D12Device*, ID3D12DeviceChild*, const SECURITY_ATTRIBUTES*, DWORD, LPCWSTR,
+                                  HANDLE*))g_d12vtOrig[31])(self, obj, sa, access, name, h);
+}
+static HRESULT __stdcall Hook_D12SetResidencyPriority(ID3D12Device* self, UINT num,
+    ID3D12Pageable* const* objs, const D3D12_RESIDENCY_PRIORITY* prio)
+{
+    static LONG n = 0;
+    const LONG i = InterlockedIncrement(&n);
+    if (i <= 16 || (i % 256) == 0)
+        Diag("D3D12 SetResidencyPriority n=" + std::to_string((long)i) + " objs=" + std::to_string((unsigned)num));
+    auto orig = (HRESULT (__stdcall*)(ID3D12Device*, UINT, ID3D12Pageable* const*, const D3D12_RESIDENCY_PRIORITY*))g_d12vtOrig[46];
+    std::vector<ID3D12Pageable*> keep; std::vector<D3D12_RESIDENCY_PRIORITY> kp;
+    if (objs && prio && GhGpFilterPageables(num, objs, keep)){
+        kp.reserve(num);
+        for (UINT k = 0; k < num; ++k) if (!GhGpIsProxy(objs[k])) kp.push_back(prio[k]);
+        if (keep.empty()) return S_OK;
+        return orig(self, (UINT)keep.size(), keep.data(), kp.data());
+    }
+    return orig(self, num, objs, prio);
+}
+static HRESULT __stdcall Hook_D12EnqueueMakeResident(ID3D12Device* self, D3D12_RESIDENCY_FLAGS fl, UINT num,
+    ID3D12Pageable* const* objs, ID3D12Fence* f, UINT64 v)
+{
+    static LONG n = 0;
+    const LONG i = InterlockedIncrement(&n);
+    if (i <= 16 || (i % 256) == 0)
+        Diag("D3D12 EnqueueMakeResident n=" + std::to_string((long)i) + " objs=" + std::to_string((unsigned)num));
+    auto orig = (HRESULT (__stdcall*)(ID3D12Device*, D3D12_RESIDENCY_FLAGS, UINT, ID3D12Pageable* const*, ID3D12Fence*, UINT64))g_d12vtOrig[50];
+    std::vector<ID3D12Pageable*> keep;
+    if (objs && GhGpFilterPageables(num, objs, keep)){
+        if (keep.empty()){ if (f) f->Signal(v); return S_OK; }
+        return orig(self, fl, (UINT)keep.size(), keep.data(), f, v);
+    }
+    return orig(self, fl, num, objs, f, v);
+}
+// ---------------------------------------------------------------- end #235
 static void __stdcall Hook_CQExecute(ID3D12CommandQueue* self_, UINT n, ID3D12CommandList* const* l)
 {
     GhD12CallScope _s("ExecuteCommandLists");
@@ -20874,6 +21521,7 @@ static void __stdcall Hook_CQExecute(ID3D12CommandQueue* self_, UINT n, ID3D12Co
     ID3D12CommandQueue* self = self_;
     GhQSubTick(self_);
     if (ID3D12CommandQueue* sq = GhQSubFor(self_)) self = sq;
+    GhGpBeforeSubmit(self);   // #235: the tile mappings this submission may depend on
     // #158: initialize any render-target/depth-stencil resource created since the
     // last submission BEFORE the guest's work can read it. Waits on the GPU, so
     // the ordering is guaranteed rather than hoped for.
@@ -21947,6 +22595,22 @@ static HRESULT __stdcall Hook_D12CreateHeap(ID3D12Device* self,
              " flags=" + Hex((uint32_t)hd->Flags) +
              " tid=" + std::to_string(GetCurrentThreadId()));
 
+    // #235: the per-texture class becomes a proxy with no driver heap behind it;
+    // its textures are reserved resources on the tile pool (GhGpConvert), and
+    // anything else placed in it materialises the real heap then.
+    if (hd && pp && GhGpWantsHeap(hd)){
+        static LONG said = 0;
+        if (InterlockedIncrement(&said) == 1)
+            Diag("GPUPAGE on cap=" + std::to_string((unsigned long)GhGpuPageMb()) + "MB (gh_gpu_page_mb) chunk=" + std::to_string((unsigned long)GhGpChunkMb()) + "MB (gh_gpu_chunk_mb) -- per-texture 0x44 heaps are proxies");
+        if (GhGpMakeProxy(self, hd, riid, pp)){
+            const LONG k = InterlockedIncrement(&g_gpProxyN);
+            InterlockedIncrement(&g_gpProxyLive);
+            if (k <= 16 || (k % 256) == 0)
+                Diag("GPUPAGE proxy heap n=" + std::to_string((long)k) + " size=" + Hex((uint64_t)hd->SizeInBytes) +
+                     " heap=" + Hex((uint64_t)(uintptr_t)*pp) + " live=" + std::to_string((long)InterlockedCompareExchange(&g_gpProxyLive, 0, 0)));
+            return S_OK;
+        }
+    }
     D3D12_HEAP_DESC fixedHd{};
     if (hd){
         D3D12_HEAP_PROPERTIES fp{};
@@ -22225,7 +22889,20 @@ static HRESULT __stdcall Hook_D12CreatePlaced(ID3D12Device* self, ID3D12Heap* he
              " h=" + std::to_string(rd ? (unsigned)rd->Height : 0u) +
              " fmt=" + std::to_string(rd ? (int)rd->Format : -1) +
              " flags=" + Hex((uint32_t)(rd ? rd->Flags : 0)));
-    HRESULT hr = orig(self, heap, off, rd, st, cv, riid, pp);
+    HRESULT hr = E_FAIL;
+    // #235: a placement into a proxy heap becomes a reserved resource on the tile
+    // pool when the rule allows, and a plain placement into the proxy's (now
+    // materialised) real heap when it does not. The post-create bookkeeping below
+    // is shared: the reserved resource IS the game's placed resource from here on.
+    if (GhGpIsProxy(heap)){
+        if (!GhGpConvert(self, (GhGpHeap*)heap, off, rd, st, cv, riid, pp, &hr)){
+            ID3D12Heap* real = GhGpMaterialise(self, (GhGpHeap*)heap, "placed");
+            if (real) hr = orig(self, real, off, rd, st, cv, riid, pp);
+            else { hr = E_OUTOFMEMORY; if (pp) *pp = nullptr; }
+        }
+    } else {
+        hr = orig(self, heap, off, rd, st, cv, riid, pp);
+    }
     if (SUCCEEDED(hr) && pp && *pp) GhHeapUseSetRes(useSlot, *pp);
     if (SUCCEEDED(hr) && pp && *pp && aliasedPlacement) GhAliasNote(*pp);
     if (SUCCEEDED(hr) && pp && *pp) GhRtAuditCreate(*pp, auditRd, didStrip);
@@ -22312,6 +22989,11 @@ static HRESULT __stdcall Hook_D12MakeResident(ID3D12Device* self, UINT num,
 {
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, UINT,
                                       ID3D12Pageable* const*))g_d12vtOrig[34];
+    std::vector<ID3D12Pageable*> keep;   // #235: a proxy heap has no driver object behind it
+    if (GhGpFilterPageables(num, objs, keep)){
+        if (keep.empty()) return S_OK;
+        num = (UINT)keep.size(); objs = keep.data();
+    }
     HRESULT hr = orig(self, num, objs);
     static LONG n = 0;
     LONG i = InterlockedIncrement(&n);
@@ -22336,6 +23018,11 @@ static HRESULT __stdcall Hook_D12Evict(ID3D12Device* self, UINT num,
     }
     auto orig = (HRESULT (__stdcall*)(ID3D12Device*, UINT,
                                       ID3D12Pageable* const*))g_d12vtOrig[35];
+    std::vector<ID3D12Pageable*> keep;   // #235
+    if (GhGpFilterPageables(num, objs, keep)){
+        if (keep.empty()) return S_OK;
+        num = (UINT)keep.size(); objs = keep.data();
+    }
     HRESULT hr = orig(self, num, objs);
     if (i <= 24 || (i % 256) == 0 || FAILED(hr))
         Diag("D3D12 Evict n=" + std::to_string((long)i) +
@@ -23995,7 +24682,7 @@ static void GhHookD12Device(ID3D12Device* dev)
     if (!dev || InterlockedCompareExchange(&g_d12vtHooked, 1, 0) != 0) return;
     void** vt = *(void***)dev;
     DWORD old = 0;
-    if (!VirtualProtect(vt, sizeof(void*) * 50, PAGE_READWRITE, &old)){
+    if (!VirtualProtect(vt, sizeof(void*) * 56, PAGE_READWRITE, &old)){
         Diag("D3D12 vtable hook protect failed err=" + Hex(GetLastError()));
         return;
     }
@@ -24023,7 +24710,12 @@ static void GhHookD12Device(ID3D12Device* dev)
     g_d12vtOrig[30] = vt[30]; vt[30] = (void*)&Hook_D12CreateReserved;
     g_d12vtOrig[34] = vt[34]; vt[34] = (void*)&Hook_D12MakeResident;
     g_d12vtOrig[35] = vt[35]; vt[35] = (void*)&Hook_D12Evict;
-    VirtualProtect(vt, sizeof(void*) * 50, old, &old);
+    // #235: the three entry points that could name a proxy heap (Device3 is
+    // present here: slot 48 above is OpenExistingHeapFromAddress).
+    g_d12vtOrig[31] = vt[31]; vt[31] = (void*)&Hook_D12CreateSharedHandle;
+    g_d12vtOrig[46] = vt[46]; vt[46] = (void*)&Hook_D12SetResidencyPriority;
+    g_d12vtOrig[50] = vt[50]; vt[50] = (void*)&Hook_D12EnqueueMakeResident;
+    VirtualProtect(vt, sizeof(void*) * 56, old, &old);
     Diag("D3D12 vtable hooked GPS/CPS/CFS/RS/RTV/CCR/CH/CPR/OEHFA");
     // #158: layer the profiler over the finished vtable, so a counted call chains
     // into our hook where there is one and into the driver where there is not.
