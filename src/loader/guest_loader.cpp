@@ -9466,6 +9466,71 @@ static void GhTiledProbe()
             com_ptr<ID3D12Resource> texD;
             if (!MkTex(texD, "e6 D") || !MapAll(texD.get(), 8 * nTiles, "e6 mapD-base8n") || !FillA(texD.get(), true, "e6 fillD")) goto done;
 
+            // f. THE PACKED TAIL -- a question TILE0e left open and TILE2b needs answered.
+            // CopyStd stops at nStd, so every step above round-tripped STANDARD tiles only.
+            // But a whole-resource unmap takes the packed tiles with it (GhGpEvictOne
+            // NULL-maps all nTiles, and TILE0d says a partial remap is not honoured by the
+            // read side), so a pager that cannot save and restore the packed mips brings a
+            // texture back with its small mips reading zero. Ask the driver directly:
+            // does CopyTiles accept the packed region at all, and does it round-trip?
+            if (pm.NumTilesForPackedMips == 0){
+                Diag("TILEDPROBE f SKIP -- this desc has no packed mips");
+            } else {
+                const UINT nPack = pm.NumTilesForPackedMips;
+                const UINT sPack = pm.NumStandardMips;      // the first packed subresource
+                auto CopyPacked = [&](ID3D12Resource* r, bool toTex, ID3D12Resource* buf){
+                    D3D12_TILED_RESOURCE_COORDINATE c{}; c.Subresource = sPack;
+                    D3D12_TILE_REGION_SIZE rs{}; rs.NumTiles = nPack; rs.UseBox = FALSE;
+                    cl->CopyTiles(r, &c, &rs, buf, 0,
+                                  toTex ? D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE
+                                        : D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+                };
+                // We always copy from upA at offset 0, so packed tile t holds PatA(t, j) --
+                // the same words ScanR checks for a standard tile, at the same offsets.
+                auto ScanPacked = [&](const char* tag){
+                    uint32_t* p = nullptr; D3D12_RANGE all{0, (SIZE_T)(tileB * nPack)};
+                    if (FAILED(rb->Map(0, &all, (void**)&p)) || !p){ Diag(std::string("TILEDPROBE ") + tag + " packed Map failed"); return; }
+                    UINT good = 0, zero = 0, other = 0;
+                    for (UINT t = 0; t < nPack; ++t)
+                        for (UINT j = 0; j < (UINT)(tileB / 4); ++j){
+                            const uint32_t got = p[t * (UINT)(tileB / 4) + j], want = PatA(t, j);
+                            if (got == want) ++good; else if (!got) ++zero; else ++other;
+                        }
+                    rb->Unmap(0, nullptr);
+                    const UINT tot = (UINT)(nPack * (tileB / 4));
+                    Diag(std::string("TILEDPROBE ") + tag + " packedtiles=" + std::to_string(nPack) +
+                         " dwords good=" + std::to_string(good) + "/" + std::to_string(tot) +
+                         " zero=" + std::to_string(zero) + " other=" + std::to_string(other));
+                };
+                com_ptr<ID3D12Resource> texP;
+                if (!MkTex(texP, "f P") || !MapAll(texP.get(), 10 * nTiles, "f mapP-base10n")) goto done;
+                // f1. Does the driver take the packed region at all?
+                CopyPacked(texP.get(), true, upA.get());
+                Barrier(texP.get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                Sentinel(rb.get(), tileB * nPack);
+                CopyPacked(texP.get(), false, rb.get());
+                if (!Run("f1 packed fill+read")){
+                    Diag("TILEDPROBE VERDICT: the packed CopyTiles removed the device -- the pager must never move packed tiles");
+                    goto done;
+                }
+                ScanPacked("f1 filled (expect all good)");
+                // f2. The whole cycle: unmap, read (zero), move, refill the packed run, read.
+                if (!UnmapWhole(texP.get(), "f2 unmapP-whole")) goto done;
+                Sentinel(rb.get(), tileB * nPack);
+                CopyPacked(texP.get(), false, rb.get());
+                if (!Run("f2 read-unmapped")) goto done;
+                ScanPacked("f2 unmapped (expect all zero)");
+                if (!MapAll(texP.get(), 12 * nTiles, "f2 remapP-base12n")) goto done;
+                Barrier(texP.get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                CopyPacked(texP.get(), true, upA.get());
+                Barrier(texP.get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                Sentinel(rb.get(), tileB * nPack);
+                CopyPacked(texP.get(), false, rb.get());
+                if (!Run("f2 refill+read")) goto done;
+                ScanPacked("f2 refilled (expect all good)");
+                texP = nullptr;
+            }
+
             GhBillTake(&s0);
             texB = nullptr; texC = nullptr; texD = nullptr;
             GhBillTake(&s1);
@@ -9474,7 +9539,7 @@ static void GhTiledProbe()
         pool = nullptr;
         GhBillTake(&s0);
         GhBillReport("TILE release pool (expect -256)", s1, s0);
-        Diag("TILEDPROBE VERDICT: see _pred_TILE0e.txt S1-S3 -- the whole-resource cycle is the pager primitive if e3/e4/e5 read 85/85");
+        Diag("TILEDPROBE VERDICT: see _pred_TILE0e.txt S1-S3 -- the whole-resource cycle is the pager primitive if e3/e4/e5 read 85/85; f1/f2 say whether the PACKED tail can be saved and restored with it");
     }
 done:
     if (mode >= 2){ Diag("TILEDPROBE done t=" + Ms() + "ms -- exiting (gh_tiled_probe=2)"); Sleep(500); ExitProcess(0); }
@@ -20959,11 +21024,11 @@ static volatile LONG64 g_gpPoolB = 0, g_gpLiveB = 0, g_gpUs = 0, g_gpMapV = 0, g
 // TILE1/TILE1b were ~200 MB dearer on this class and cross-run heapMB arithmetic
 // cannot say why; these three numbers say it inside one run.
 static volatile LONG64 g_gpAskB = 0, g_gpAskLiveB = 0, g_gpMatB = 0;
-static volatile LONG64 g_gpMatLiveB = 0;
+static volatile LONG64 g_gpMatLiveB = 0;   // #235 TILE1c: g_gpMatB is EVER-materialised and never decremented; this one is live
 // #235 Phase 2 pager counters.
 static volatile LONG64 g_gpEvictB = 0, g_gpEvictedB = 0, g_gpRestoreB = 0, g_gpPageUs = 0;
 static volatile LONG   g_gpEvictN = 0, g_gpRestoreN = 0, g_gpNoVictim = 0;
-static volatile LONG   g_gpCutOverride = 0;   // #235 TILE2c: reclaims that had to ignore gh_gpu_evict_ms   // #235 TILE1c: g_gpMatB is EVER-materialised and never decremented; this one is live
+static volatile LONG   g_gpCutOverride = 0;   // #235 TILE2c: reclaims that had to ignore gh_gpu_evict_ms
 static void**          g_gpHeapVt = nullptr;   // the proxy class's vtable, for the is-a test
 
 struct GhGpRes;
