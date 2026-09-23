@@ -22221,7 +22221,10 @@ static bool GhGpConvert(ID3D12Device* dev, GhGpHeap* ph, UINT64 off, const D3D12
     GhGpRes* e = new GhGpRes{};
     e->res = res; e->heap = ph; e->off = off; e->size = ai.SizeInBytes;
     e->desc0 = *rd; e->st0 = st;
-    e->nTiles = nTiles; e->nSub = nSub; e->nStdMips = pm.NumStandardMips; e->nPackedTiles = pm.NumTilesForPackedMips;
+    // nSub from GetResourceTiling is in/out and was asked for 0 tilings, so it comes back 0;
+    // arrays are never converted, so the subresource count is the mip count. (TILE2b0 ran
+    // with nSub=0: no packed tail carried and no state barriers -- see _pred_TILE2b.txt.)
+    e->nTiles = nTiles; e->nSub = pm.NumStandardMips + pm.NumPackedMips; e->nStdMips = pm.NumStandardMips; e->nPackedTiles = pm.NumTilesForPackedMips;
     e->chunk = ci; e->base = base;
     e->created = e->lastUse = t0;
     e->ecl0 = (UINT32)InterlockedCompareExchange(&g_eclCount, 0, 0);
