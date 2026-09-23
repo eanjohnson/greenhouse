@@ -551,6 +551,7 @@ static void        GhResLiveDump(const char* where);           // #202 the LIVE 
 static std::string GhResLiveFrameLine();                       // #202 livresMB on every FRAME line
 static std::string GhGpFrameLine();                            // #235 gpupage= on every FRAME line
 static void        GhGpTouch(ID3D12Resource* r);               // #235 last-use signal (copy hooks)
+static void        GhGpNoteBarriers(UINT num, const D3D12_RESOURCE_BARRIER* b);   // #235 TILE2b state tracking
 static void GhGpSrvNote(ID3D12Resource* r);
 // #235 the per-use read signal: the game feeds a per-frame ring of shader-visible
 // descriptors by CopyDescriptors from staging slots (BREAD6). A staging slot that
@@ -9531,6 +9532,313 @@ static void GhTiledProbe()
                 texP = nullptr;
             }
 
+            // g. THE PAGER'S OWN ORDER -- capture, evict, restore, capture, and
+            // compare the two CAPTURES with each other rather than with a linear
+            // layout we assumed.  f1/f2 show the L->S->L composition is NOT an
+            // identity over the whole 64 KB packed tile (only the largest packed
+            // mip survives it byte for byte).  But the pager never does L->S->L:
+            // it does S->L (page out, tile -> our buffer -> the file) and later
+            // L->S (page in).  What it needs is that the texture READS THE SAME
+            // after a cycle as before, through the texture copy path -- which is
+            // what the game sees.  That is what g measures.
+            if (pm.NumTilesForPackedMips == 0){
+                Diag("TILEDPROBE g SKIP -- this desc has no packed mips");
+            } else {
+                const UINT nPack = pm.NumTilesForPackedMips;
+                const UINT sPack = pm.NumStandardMips;        // first packed subresource
+                const UINT pw = 2048u >> sPack, ph = 2048u >> sPack;
+                const UINT rowB = (pw / 4) * 16;              // BC7: 16 B per 4x4 block
+                const UINT mipB = rowB * (ph / 4);
+                auto CopyPack2 = [&](ID3D12Resource* r, bool toTex, ID3D12Resource* buf){
+                    D3D12_TILED_RESOURCE_COORDINATE c{}; c.Subresource = sPack;
+                    D3D12_TILE_REGION_SIZE rs2{}; rs2.NumTiles = nPack; rs2.UseBox = FALSE;
+                    cl->CopyTiles(r, &c, &rs2, buf, 0,
+                                  toTex ? D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE
+                                        : D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+                };
+                auto Foot = [&](D3D12_TEXTURE_COPY_LOCATION* l, ID3D12Resource* buf){
+                    l->pResource = buf; l->Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    l->PlacedFootprint.Offset = 0;
+                    l->PlacedFootprint.Footprint.Format = DXGI_FORMAT_BC7_UNORM;
+                    l->PlacedFootprint.Footprint.Width = pw; l->PlacedFootprint.Footprint.Height = ph;
+                    l->PlacedFootprint.Footprint.Depth = 1; l->PlacedFootprint.Footprint.RowPitch = rowB;
+                };
+                auto Sub = [&](D3D12_TEXTURE_COPY_LOCATION* l, ID3D12Resource* r){
+                    l->pResource = r; l->Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; l->SubresourceIndex = sPack;
+                };
+                auto MipToBuf = [&](ID3D12Resource* r, ID3D12Resource* buf){
+                    D3D12_TEXTURE_COPY_LOCATION dl{}, sl{}; Foot(&dl, buf); Sub(&sl, r);
+                    cl->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+                };
+                auto BufToMip = [&](ID3D12Resource* r, ID3D12Resource* buf){
+                    D3D12_TEXTURE_COPY_LOCATION dl{}, sl{}; Sub(&dl, r); Foot(&sl, buf);
+                    cl->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+                };
+                auto Cmp = [&](const char* tag, const uint8_t* a, const uint8_t* b, size_t n){
+                    size_t eq = 0, zb = 0;
+                    for (size_t i = 0; i < n; ++i){ if (a[i] == b[i]) ++eq; if (!b[i]) ++zb; }
+                    Diag(std::string("TILEDPROBE ") + tag + " bytes equal=" + std::to_string((unsigned long long)eq) +
+                         "/" + std::to_string((unsigned long long)n) + " zeroInB=" + std::to_string((unsigned long long)zb));
+                };
+                com_ptr<ID3D12Resource> texG, upG, rbG;
+                std::vector<uint8_t> save((size_t)(tileB * nPack)), capA((size_t)mipB), capB((size_t)mipB);
+                HRESULT gh2 = MkBuf(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, tileB * nPack, upG);
+                if (SUCCEEDED(gh2)) gh2 = MkBuf(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, tileB * nPack, rbG);
+                if (FAILED(gh2)){ Diag("TILEDPROBE g staging hr=" + Hex((uint32_t)gh2)); goto done; }
+                if (!MkTex(texG, "g G") || !MapAll(texG.get(), 14 * nTiles, "g mapG-base14n")) goto done;
+                Diag("TILEDPROBE g shape sPack=" + std::to_string(sPack) + " " + std::to_string(pw) + "x" +
+                     std::to_string(ph) + " rowB=" + std::to_string(rowB) + " mipB=" + std::to_string(mipB) +
+                     " packedtiles=" + std::to_string(nPack));
+                {
+                    uint8_t* p = nullptr; D3D12_RANGE none{0, 0};
+                    if (SUCCEEDED(upG->Map(0, &none, (void**)&p)) && p){
+                        for (UINT b = 0; b < mipB; ++b) p[b] = (uint8_t)(PatA(7, b >> 2) >> ((b & 3) * 8));
+                        upG->Unmap(0, nullptr);
+                    }
+                }
+                // g1. Fill the packed mip through the TEXTURE path and read it back
+                //     the same way.  capA is what the game sees before any paging.
+                BufToMip(texG.get(), upG.get());                      // texG is COPY_DEST
+                Barrier(texG.get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                Sentinel(rbG.get(), tileB * nPack);
+                MipToBuf(texG.get(), rbG.get());
+                if (!Run("g1 fill+read packed mip")) goto done;
+                {
+                    uint8_t* p = nullptr; D3D12_RANGE all{0, (SIZE_T)mipB};
+                    if (SUCCEEDED(rbG->Map(0, &all, (void**)&p)) && p){ memcpy(capA.data(), p, mipB); rbG->Unmap(0, nullptr); }
+                }
+                // g2. PAGE OUT: the exact copy the pager would write to the file.
+                Sentinel(rbG.get(), tileB * nPack);
+                CopyPack2(texG.get(), false, rbG.get());
+                if (!Run("g2 pageout S->L")) goto done;
+                {
+                    uint8_t* p = nullptr; D3D12_RANGE all{0, (SIZE_T)(tileB * nPack)};
+                    if (SUCCEEDED(rbG->Map(0, &all, (void**)&p)) && p){ memcpy(save.data(), p, (size_t)(tileB * nPack)); rbG->Unmap(0, nullptr); }
+                }
+                // g3. EVICT: whole-resource NULL unmap, then remap somewhere else.
+                if (!UnmapWhole(texG.get(), "g3 unmapG-whole")) goto done;
+                if (!MapAll(texG.get(), 16 * nTiles, "g3 remapG-base16n")) goto done;
+                // g4. PAGE IN: put the saved bytes back, then read the mip the way
+                //     the game does and compare with capA.
+                {
+                    uint8_t* p = nullptr; D3D12_RANGE none{0, 0};
+                    if (SUCCEEDED(upG->Map(0, &none, (void**)&p)) && p){ memcpy(p, save.data(), (size_t)(tileB * nPack)); upG->Unmap(0, nullptr); }
+                }
+                Barrier(texG.get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                CopyPack2(texG.get(), true, upG.get());
+                Barrier(texG.get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                Sentinel(rbG.get(), tileB * nPack);
+                MipToBuf(texG.get(), rbG.get());
+                if (!Run("g4 restore+read packed mip")) goto done;
+                {
+                    uint8_t* p = nullptr; D3D12_RANGE all{0, (SIZE_T)mipB};
+                    if (SUCCEEDED(rbG->Map(0, &all, (void**)&p)) && p){ memcpy(capB.data(), p, mipB); rbG->Unmap(0, nullptr); }
+                }
+                Cmp("g4 THE ANSWER texture-path mip after a full evict/restore cycle",
+                    capA.data(), capB.data(), (size_t)mipB);
+                // g5. And the tile capture itself: page out again and compare with
+                //     the bytes we saved.  Equal means the file content is stable
+                //     across a cycle, which is what a second eviction depends on.
+                Sentinel(rbG.get(), tileB * nPack);
+                CopyPack2(texG.get(), false, rbG.get());
+                if (!Run("g5 pageout again S->L")) goto done;
+                {
+                    uint8_t* p = nullptr; D3D12_RANGE all{0, (SIZE_T)(tileB * nPack)};
+                    if (SUCCEEDED(rbG->Map(0, &all, (void**)&p)) && p){
+                        Cmp("g5 tile capture vs the saved bytes", save.data(), p, (size_t)(tileB * nPack));
+                        rbG->Unmap(0, nullptr);
+                    }
+                }
+                texG = nullptr;
+            }
+
+            // h. THE PACKED TAIL THROUGH THE TEXTURE PATH.  TILE0g says CopyTiles
+            // cannot round-trip the packed region on this driver (g4: 11,860 of
+            // 16,384 bytes of mip 4 survived; g5: the capture itself is not
+            // reproducible).  But e5 and g1 both show the ORDINARY texture path --
+            // CopyTextureRegion between a PLACED_FOOTPRINT buffer and a
+            // subresource -- works on a reserved resource and survives a whole
+            // remap.  So ask whether the pager can save and restore the packed
+            // mips THAT way instead, one CopyTextureRegion per packed subresource,
+            // and leave CopyTiles to the standard tiles it already round-trips.
+            if (pm.NumTilesForPackedMips == 0){
+                Diag("TILEDPROBE h SKIP -- this desc has no packed mips");
+            } else {
+                const UINT sPack = pm.NumStandardMips;
+                // Per packed subresource: footprint, 512-aligned buffer offset.
+                struct PS { UINT sub, w, h, rowB, rows, bytes; UINT64 off; };
+                std::vector<PS> ps;
+                UINT64 cur = 0;
+                for (UINT sb = sPack; sb < rd.MipLevels; ++sb){
+                    const UINT w = 2048u >> sb, hh = 2048u >> sb;
+                    if (w < 4 || hh < 4) break;              // BC7 blocks are 4x4
+                    PS e{}; e.sub = sb; e.w = w; e.h = hh;
+                    e.rowB = ((w / 4) * 16 + 255u) & ~255u;  // 256-aligned row pitch
+                    e.rows = hh / 4; e.bytes = e.rowB * e.rows;
+                    e.off = cur; cur = (cur + e.bytes + 511u) & ~511ull;   // 512-aligned offsets
+                    ps.push_back(e);
+                }
+                Diag("TILEDPROBE h subresources=" + std::to_string((unsigned)ps.size()) +
+                     " first=" + std::to_string(sPack) + " bytes=" + std::to_string((unsigned long long)cur) +
+                     " (mips below 4x4 are NOT covered: " +
+                     std::to_string((unsigned)(rd.MipLevels - sPack - (UINT)ps.size())) + " of them)");
+                if (ps.empty()){ Diag("TILEDPROBE h VOID -- no packed subresource is 4x4 or larger"); }
+                else {
+                    auto Foot2 = [&](D3D12_TEXTURE_COPY_LOCATION* l, ID3D12Resource* buf, const PS& e){
+                        l->pResource = buf; l->Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                        l->PlacedFootprint.Offset = e.off;
+                        l->PlacedFootprint.Footprint.Format = DXGI_FORMAT_BC7_UNORM;
+                        l->PlacedFootprint.Footprint.Width = e.w; l->PlacedFootprint.Footprint.Height = e.h;
+                        l->PlacedFootprint.Footprint.Depth = 1; l->PlacedFootprint.Footprint.RowPitch = e.rowB;
+                    };
+                    auto Sub2 = [&](D3D12_TEXTURE_COPY_LOCATION* l, ID3D12Resource* r, const PS& e){
+                        l->pResource = r; l->Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; l->SubresourceIndex = e.sub;
+                    };
+                    auto ToTex = [&](ID3D12Resource* r, ID3D12Resource* buf){
+                        for (const PS& e : ps){ D3D12_TEXTURE_COPY_LOCATION dl{}, sl{};
+                            Sub2(&dl, r, e); Foot2(&sl, buf, e); cl->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr); }
+                    };
+                    auto ToBuf = [&](ID3D12Resource* r, ID3D12Resource* buf){
+                        for (const PS& e : ps){ D3D12_TEXTURE_COPY_LOCATION dl{}, sl{};
+                            Foot2(&dl, buf, e); Sub2(&sl, r, e); cl->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr); }
+                    };
+                    com_ptr<ID3D12Resource> texH, upH, rbH;
+                    const UINT64 hB = (cur + 65535u) & ~65535ull;
+                    std::vector<uint8_t> capA((size_t)cur), capB((size_t)cur);
+                    HRESULT hh2 = MkBuf(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, hB, upH);
+                    if (SUCCEEDED(hh2)) hh2 = MkBuf(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, hB, rbH);
+                    if (FAILED(hh2)){ Diag("TILEDPROBE h staging hr=" + Hex((uint32_t)hh2)); goto done; }
+                    if (!MkTex(texH, "h H") || !MapAll(texH.get(), 18 * nTiles, "h mapH-base18n")) goto done;
+                    {
+                        uint8_t* p = nullptr; D3D12_RANGE none{0, 0};
+                        if (SUCCEEDED(upH->Map(0, &none, (void**)&p)) && p){
+                            for (UINT64 b = 0; b < cur; ++b) p[b] = (uint8_t)(PatA(11, (UINT)(b >> 2)) >> ((b & 3) * 8));
+                            upH->Unmap(0, nullptr);
+                        }
+                    }
+                    // h1. Fill every covered packed subresource, read them all back.
+                    ToTex(texH.get(), upH.get());                       // texH is COPY_DEST
+                    Barrier(texH.get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    Sentinel(rbH.get(), hB);
+                    ToBuf(texH.get(), rbH.get());
+                    if (!Run("h1 fill+read packed subresources")) goto done;
+                    {
+                        uint8_t* p = nullptr; D3D12_RANGE all{0, (SIZE_T)cur};
+                        if (SUCCEEDED(rbH->Map(0, &all, (void**)&p)) && p){ memcpy(capA.data(), p, (size_t)cur); rbH->Unmap(0, nullptr); }
+                    }
+                    // h2. PAGE OUT through the texture path (capA IS the page-out).
+                    // h3. Evict and remap somewhere else.
+                    if (!UnmapWhole(texH.get(), "h3 unmapH-whole")) goto done;
+                    if (!MapAll(texH.get(), 20 * nTiles, "h3 remapH-base20n")) goto done;
+                    // h4. PAGE IN through the texture path, then read back and compare.
+                    {
+                        uint8_t* p = nullptr; D3D12_RANGE none{0, 0};
+                        if (SUCCEEDED(upH->Map(0, &none, (void**)&p)) && p){ memcpy(p, capA.data(), (size_t)cur); upH->Unmap(0, nullptr); }
+                    }
+                    Barrier(texH.get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                    ToTex(texH.get(), upH.get());
+                    Barrier(texH.get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    Sentinel(rbH.get(), hB);
+                    ToBuf(texH.get(), rbH.get());
+                    if (!Run("h4 restore+read packed subresources")) goto done;
+                    {
+                        uint8_t* p = nullptr; D3D12_RANGE all{0, (SIZE_T)cur};
+                        if (SUCCEEDED(rbH->Map(0, &all, (void**)&p)) && p){ memcpy(capB.data(), p, (size_t)cur); rbH->Unmap(0, nullptr); }
+                    }
+                    {
+                        // Whole-buffer verdict, then one line per subresource so a
+                        // partial answer names WHICH mip it is partial in.
+                        size_t eq = 0;
+                        for (size_t i = 0; i < (size_t)cur; ++i) if (capA[i] == capB[i]) ++eq;
+                        Diag("TILEDPROBE h4 THE ANSWER texture-path packed tail after a full evict/restore cycle bytes equal=" +
+                             std::to_string((unsigned long long)eq) + "/" + std::to_string((unsigned long long)cur));
+                        std::string per;
+                        for (const PS& e : ps){
+                            size_t k = 0;
+                            for (UINT i = 0; i < e.bytes; ++i) if (capA[(size_t)e.off + i] == capB[(size_t)e.off + i]) ++k;
+                            per += " mip" + std::to_string(e.sub) + "=" + std::to_string((unsigned long long)k) +
+                                   "/" + std::to_string((unsigned)e.bytes);
+                        }
+                        Diag("TILEDPROBE h4 per-subresource" + per);
+                    }
+                    // i. WHOSE DEFECT IS MIP sPack?  TILE0H: mips 5..9 come back
+                    // byte-exact through the texture path, mip 4 (the largest packed
+                    // mip) comes back 93%.  That is either paging losing content, or
+                    // the driver's copy path into that mip not being its own inverse
+                    // -- which would be there with no eviction at all.  Four readings
+                    // at the CURRENT mapping (no unmap, no remap) tell them apart.
+                    {
+                        auto PerSub = [&](const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) -> std::string {
+                            std::string o; size_t tot = 0;
+                            for (const PS& e : ps){
+                                size_t k = 0;
+                                for (UINT j = 0; j < e.bytes; ++j) if (a[(size_t)e.off + j] == b[(size_t)e.off + j]) ++k;
+                                tot += k;
+                                o += " mip" + std::to_string(e.sub) + "=" + std::to_string((unsigned long long)k) + "/" + std::to_string((unsigned)e.bytes);
+                            }
+                            return " equal=" + std::to_string((unsigned long long)tot) + "/" + std::to_string((unsigned long long)cur) + o;
+                        };
+                        // i0. Where in mip sPack the h4 mismatches sit: one char per block
+                        // row ('.' = row whole, else the count of differing 16-byte blocks,
+                        // '#' for ten or more), and the first mismatching byte offsets.
+                        {
+                            const PS& e = ps[0];
+                            std::string map, first; int nf = 0;
+                            for (UINT r = 0; r < e.rows; ++r){
+                                UINT blk = 0;
+                                for (UINT c = 0; c < (e.w / 4); ++c){
+                                    bool d = false;
+                                    for (UINT j = 0; j < 16; ++j){
+                                        const size_t o = (size_t)e.off + (size_t)r * e.rowB + c * 16 + j;
+                                        if (capA[o] != capB[o]){ d = true; if (nf < 8){ first += " " + std::to_string((unsigned long long)(o - e.off)); ++nf; } }
+                                    }
+                                    if (d) ++blk;
+                                }
+                                map += blk == 0 ? '.' : blk >= 10 ? '#' : (char)('0' + blk);
+                            }
+                            Diag("TILEDPROBE i0 mip" + std::to_string(e.sub) + " h4 mismatch rows [" + map + "] first offsets" + first);
+                        }
+                        // i1. Is write-then-read the identity at all?  capA against the
+                        // pattern that was uploaded in h1.
+                        std::vector<uint8_t> pat((size_t)cur);
+                        for (UINT64 b = 0; b < cur; ++b) pat[(size_t)b] = (uint8_t)(PatA(11, (UINT)(b >> 2)) >> ((b & 3) * 8));
+                        Diag("TILEDPROBE i1 h1 read-back vs uploaded pattern" + PerSub(pat, capA));
+                        // i3. Two reads with no write between them: is the READ deterministic?
+                        std::vector<uint8_t> capE((size_t)cur), capF((size_t)cur);
+                        auto ReadInto = [&](std::vector<uint8_t>& dst, const char* tag) -> bool {
+                            Sentinel(rbH.get(), hB);
+                            ToBuf(texH.get(), rbH.get());
+                            if (!Run(tag)) return false;
+                            uint8_t* p = nullptr; D3D12_RANGE all{0, (SIZE_T)cur};
+                            if (SUCCEEDED(rbH->Map(0, &all, (void**)&p)) && p){ memcpy(dst.data(), p, (size_t)cur); rbH->Unmap(0, nullptr); }
+                            return true;
+                        };
+                        auto WriteFrom = [&](const std::vector<uint8_t>& src){
+                            uint8_t* p = nullptr; D3D12_RANGE none{0, 0};
+                            if (SUCCEEDED(upH->Map(0, &none, (void**)&p)) && p){ memcpy(p, src.data(), (size_t)cur); upH->Unmap(0, nullptr); }
+                            Barrier(texH.get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                            ToTex(texH.get(), upH.get());
+                            Barrier(texH.get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        };
+                        if (ReadInto(capE, "i3 read#1 no write") && ReadInto(capF, "i3 read#2 no write")){
+                            Diag("TILEDPROBE i3 read vs read, nothing between" + PerSub(capE, capF));
+                            Diag("TILEDPROBE i3 read vs h4 capB (same content, later)" + PerSub(capB, capE));
+                            // i2. Write what we read, read it again -- at the SAME mapping,
+                            // twice.  A mismatch here needs no paging to happen.
+                            std::vector<uint8_t> capC((size_t)cur), capD((size_t)cur);
+                            WriteFrom(capE);
+                            if (ReadInto(capC, "i2 write capE, read, same mapping")){
+                                Diag("TILEDPROBE i2a write+read at the same mapping" + PerSub(capE, capC));
+                                WriteFrom(capC);
+                                if (ReadInto(capD, "i2 write capC, read, same mapping"))
+                                    Diag("TILEDPROBE i2b write+read at the same mapping again" + PerSub(capC, capD));
+                            }
+                        }
+                    }
+                    texH = nullptr;
+                }
+            }
+
             GhBillTake(&s0);
             texB = nullptr; texC = nullptr; texD = nullptr;
             GhBillTake(&s1);
@@ -9539,7 +9847,7 @@ static void GhTiledProbe()
         pool = nullptr;
         GhBillTake(&s0);
         GhBillReport("TILE release pool (expect -256)", s1, s0);
-        Diag("TILEDPROBE VERDICT: see _pred_TILE0e.txt S1-S3 -- the whole-resource cycle is the pager primitive if e3/e4/e5 read 85/85; f1/f2 say whether the PACKED tail can be saved and restored with it");
+        Diag("TILEDPROBE VERDICT: see _pred_TILE0e.txt S1-S3 -- the whole-resource cycle is the pager primitive if e3/e4/e5 read 85/85; f1/f2 say whether the driver takes a PACKED CopyTiles at all, and g4 is the answer TILE2b needs: the texture-path mip after a full evict/restore cycle");
     }
 done:
     if (mode >= 2){ Diag("TILEDPROBE done t=" + Ms() + "ms -- exiting (gh_tiled_probe=2)"); Sleep(500); ExitProcess(0); }
@@ -17398,6 +17706,7 @@ static void GhReinitStats(const char* when)
 static void __stdcall Hook_CLBarrier(ID3D12GraphicsCommandList* self, UINT num,
                                      const D3D12_RESOURCE_BARRIER* b)
 {
+    GhGpNoteBarriers(num, b);                    // #235 TILE2b: per-subresource state for the pager's copies
     GhAliasEmit(self, num, b);
     GhReinitScope reinit(self, num, b);          // #158: discards fire on every exit path
     if (GhCLNote* n = GhCLFind(self)) InterlockedAdd(&n->barriers, (LONG)num);
@@ -21128,6 +21437,14 @@ struct GhGpRes {
     UINT                  base;
     LONG64                created, lastUse;
     UINT32                ecl0;
+    // #235 TILE2b. The state each subresource was last barriered to, in the order
+    // the game RECORDED the barriers (Hook_CLBarrier), so a page-out/page-in can
+    // bracket its copies with StateNow -> COPY_x -> StateNow. Arrays are never
+    // converted, so subresource == mip and 16 covers every 2D texture.
+    UINT                  sst[16];
+    int                   slot;           // first 64 KB unit in gh_gpuspill_<pid>.bin, -1 = none yet
+    UINT                  slotN;          // its length in 64 KB units (kept across cycles)
+    bool                  saved;          // the slot holds this texture's current content
 };
 struct GhGpChunk { ID3D12Heap* heap; UINT tiles; std::vector<std::pair<UINT, UINT>> fr; };   // fr: sorted free runs (base,len)
 
@@ -21141,6 +21458,336 @@ static volatile LONG                           g_gpRigFailed = 0;
 
 template <class F> static F GhGpCq(ID3D12CommandQueue* q, int slot)
 { return (F)(g_cqVtOrig[slot] ? g_cqVtOrig[slot] : (*(void***)q)[slot]); }
+
+// #235 TILE2b -- LOSSLESS EVICTION. Until now GhGpEvictOne unmapped whole and a
+// restore mapped a FRESH run with no content, so a restored texture read zero.
+// Now a victim's bytes go to D:\DevelopmentFiles\gh_gpuspill_<pid>.bin first and
+// come back on restore:
+//   standard tiles  CopyTiles SWIZZLED<->LINEAR, which round-trips them exactly
+//                   across evict/remap cycles (TILE0c/d/e);
+//   packed tail     one CopyTextureRegion per packed subresource (TILE0H: mips
+//                   5..9 byte-exact, the largest packed mip 93%; CopyTiles on the
+//                   packed tile gets 72% and is not even reproducible, TILE0g);
+//   mips < 4x4      not carried (TILE0H never tested a sub-block footprint).
+// The copies run on OUR direct queue g_gpQ (never COMPUTE, never COPY), bracketed
+// by barriers to and from the state the game last recorded for each subresource.
+// Everything runs under g_gpLk exclusive, synchronously, on the thread that needed
+// the room -- the first TILE2b cell measures what that costs (gpio=) before a
+// background evictor is worth building. The file is buffered + TEMPORARY, exactly
+// #233's gh_spill file, so a write is a copy into the file cache.
+//
+//   gh_gpu_lossless.txt  1 (default) = save/restore content, 0 = TILE2a/2d zeroing
+//   gh_gpu_stage_mb.txt  READBACK + UPLOAD staging, MB each (default 16; billed)
+//   gh_gpu_packed.txt    1 (default) = carry the packed tail, 0 = standard tiles only
+//
+// FRAME: gpio=saves/loads/writeMB/readMB/writeMs/readMs/fail/toobig/nocontent/fileMB/stateTr
+static unsigned GhGpLossless()
+{ static const unsigned v = GhCfgNumZ(L"gh_gpu_lossless.txt", "GH_GPU_LOSSLESS", 1); return v; }
+static unsigned GhGpStageMb()
+{ static const unsigned v = GhCfgNumZ(L"gh_gpu_stage_mb.txt", "GH_GPU_STAGE_MB", 16); return v ? v : 16; }
+static unsigned GhGpPacked()
+{ static const unsigned v = GhCfgNumZ(L"gh_gpu_packed.txt", "GH_GPU_PACKED", 1); return v; }
+
+static ID3D12CommandAllocator*    g_gpCa = nullptr;
+static ID3D12GraphicsCommandList* g_gpCl = nullptr;
+static ID3D12Fence*               g_gpCopyF = nullptr;
+static HANDLE                     g_gpCopyEv = nullptr;
+static UINT64                     g_gpCopyV = 0;                 // g_gpLk held
+static ID3D12Resource*            g_gpRb = nullptr;
+static ID3D12Resource*            g_gpUp = nullptr;
+static uint8_t*                   g_gpRbP = nullptr;
+static uint8_t*                   g_gpUpP = nullptr;
+static UINT64                     g_gpStageB = 0;
+static HANDLE                     g_gpFile = INVALID_HANDLE_VALUE;
+static std::vector<std::pair<UINT, UINT>>* g_gpFileFr = nullptr; // free runs (base,len), 64 KB units, sorted
+static UINT                       g_gpFileEnd = 0;
+static bool                       g_gpIoOn = false;
+static volatile LONG64 g_gpWriteB = 0, g_gpReadB = 0, g_gpWriteUs = 0, g_gpReadUs = 0;
+static volatile LONG   g_gpSaveN = 0, g_gpLoadN = 0, g_gpIoFail = 0, g_gpTooBig = 0,
+                       g_gpNoContent = 0, g_gpStateTr = 0;
+
+// Our list's functions, never the hooks: the driver shares one list vtable, so
+// once the guest's lists are hooked ours is too.
+template <class F> static F GhGpClFn(int slot)
+{
+    void** vt = *(void***)g_gpCl;
+    for (LONG i = 0; i < g_clVtsN; ++i) if (g_clVts[i].vt == vt && g_clVts[i].orig[slot]) return (F)g_clVts[i].orig[slot];
+    return (F)vt[slot];
+}
+
+// g_gpLk held. Called once, from GhGpRig. A failure turns lossless paging off
+// (eviction zeroes, as before) -- it never refuses a placement.
+static void GhGpCopyRig(ID3D12Device* dev)
+{
+    if (!GhGpLossless()){ Diag("GPUPAGE io OFF (gh_gpu_lossless=0) -- eviction zeroes, as TILE2a/2d"); return; }
+    auto mka = (HRESULT (__stdcall*)(ID3D12Device*, D3D12_COMMAND_LIST_TYPE, REFIID, void**))g_d12vtOrig[9];
+    auto mkl = (HRESULT (__stdcall*)(ID3D12Device*, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator*,
+                                     ID3D12PipelineState*, REFIID, void**))g_d12vtOrig[12];
+    auto mkc = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
+                                     const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*,
+                                     REFIID, void**))g_d12vtOrig[27];
+    auto mkf = (HRESULT (__stdcall*)(ID3D12Device*, UINT64, D3D12_FENCE_FLAGS, REFIID, void**))g_d12vtOrig[36];
+    const D3D12_COMMAND_LIST_TYPE T = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    const char* step = "allocator";
+    HRESULT hr = mka ? mka(dev, T, __uuidof(ID3D12CommandAllocator), (void**)&g_gpCa)
+                     : dev->CreateCommandAllocator(T, __uuidof(ID3D12CommandAllocator), (void**)&g_gpCa);
+    if (SUCCEEDED(hr)){
+        step = "list";
+        hr = mkl ? mkl(dev, 0, T, g_gpCa, nullptr, __uuidof(ID3D12GraphicsCommandList), (void**)&g_gpCl)
+                 : dev->CreateCommandList(0, T, g_gpCa, nullptr, __uuidof(ID3D12GraphicsCommandList), (void**)&g_gpCl);
+    }
+    if (SUCCEEDED(hr) && g_gpCl){ step = "close"; hr = GhGpClFn<HRESULT (__stdcall*)(ID3D12GraphicsCommandList*)>(9)(g_gpCl); }
+    if (SUCCEEDED(hr)){
+        step = "fence";
+        hr = mkf ? mkf(dev, 0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), (void**)&g_gpCopyF)
+                 : dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), (void**)&g_gpCopyF);
+    }
+    if (SUCCEEDED(hr)){ step = "event"; g_gpCopyEv = CreateEventW(nullptr, FALSE, FALSE, nullptr); if (!g_gpCopyEv) hr = E_FAIL; }
+    g_gpStageB = (UINT64)GhGpStageMb() << 20;
+    for (int k = 0; k < 2 && SUCCEEDED(hr); ++k){
+        step = k ? "upload" : "readback";
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type = k ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bd{}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = g_gpStageB;
+        bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const D3D12_RESOURCE_STATES bs = k ? D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_COPY_DEST;
+        ID3D12Resource** pr = k ? &g_gpUp : &g_gpRb;
+        hr = mkc ? mkc(dev, &hp, D3D12_HEAP_FLAG_NONE, &bd, bs, nullptr, __uuidof(ID3D12Resource), (void**)pr)
+                 : dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, bs, nullptr, __uuidof(ID3D12Resource), (void**)pr);
+        if (SUCCEEDED(hr) && *pr){
+            void* mp = nullptr;
+            hr = (*pr)->Map(0, nullptr, &mp);           // persistently mapped (UMA)
+            (k ? g_gpUpP : g_gpRbP) = (uint8_t*)mp;
+            if (SUCCEEDED(hr) && !mp) hr = E_FAIL;
+        }
+    }
+    if (SUCCEEDED(hr)){
+        step = "file";
+        const std::wstring path = std::wstring(kDevRoot) + L"gh_gpuspill_" +
+                                  std::to_wstring((unsigned long)GetCurrentProcessId()) + L".bin";
+        g_gpFile = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        if (g_gpFile == INVALID_HANDLE_VALUE) hr = HRESULT_FROM_WIN32(GetLastError());
+    }
+    if (FAILED(hr)){
+        Diag("GPUPAGE io rig FAILED at " + std::string(step) + " hr=" + Hex((uint32_t)hr) +
+             " -- lossless paging OFF, eviction zeroes");
+        return;   // what was made stays made; it is a few MB and never used
+    }
+    g_gpFileFr = new std::vector<std::pair<UINT, UINT>>();
+    g_gpIoOn = true;
+    Diag("GPUPAGE io on stage=" + std::to_string((unsigned long)GhGpStageMb()) + "MBx2 packed=" +
+         std::to_string((unsigned long)GhGpPacked()) + " file=D:\\DevelopmentFiles\\gh_gpuspill_<pid>.bin");
+}
+
+// g_gpLk held. First fit in 64 KB units, else grow the file.
+static int GhGpFileAlloc(UINT n)
+{
+    auto& fr = *g_gpFileFr;
+    for (size_t i = 0; i < fr.size(); ++i) if (fr[i].second >= n){
+        const UINT b = fr[i].first;
+        fr[i].first += n; fr[i].second -= n;
+        if (!fr[i].second) fr.erase(fr.begin() + i);
+        return (int)b;
+    }
+    const UINT b = g_gpFileEnd; g_gpFileEnd += n;
+    return (int)b;
+}
+// g_gpLk held. Insert sorted, coalesce, and give a tail run back to the end mark.
+static void GhGpFileFree(UINT base, UINT n)
+{
+    if (!g_gpFileFr || !n) return;
+    auto& fr = *g_gpFileFr;
+    size_t i = 0;
+    while (i < fr.size() && fr[i].first < base) ++i;
+    fr.insert(fr.begin() + i, {base, n});
+    if (i + 1 < fr.size() && fr[i].first + fr[i].second == fr[i + 1].first){ fr[i].second += fr[i + 1].second; fr.erase(fr.begin() + i + 1); }
+    if (i > 0 && fr[i - 1].first + fr[i - 1].second == fr[i].first){ fr[i - 1].second += fr[i].second; fr.erase(fr.begin() + i); --i; }
+    if (i + 1 == fr.size() && fr[i].first + fr[i].second == g_gpFileEnd){ g_gpFileEnd = fr[i].first; fr.pop_back(); }
+}
+static bool GhGpFileIo(bool write, UINT64 off, void* p, DWORD n)
+{
+    OVERLAPPED ov{}; ov.Offset = (DWORD)off; ov.OffsetHigh = (DWORD)(off >> 32);
+    DWORD got = 0;
+    const BOOL ok = write ? WriteFile(g_gpFile, p, n, &got, &ov) : ReadFile(g_gpFile, p, n, &got, &ov);
+    return ok && got == n;
+}
+
+// g_gpLk held exclusive. Moves one texture's content between its tiles and its
+// file slot: in=false pages OUT (tiles -> readback -> file), in=true pages IN
+// (file -> upload -> tiles). The texture must be mapped. Work is cut into
+// batches no bigger than the stage; each batch is one submission and one wait.
+static bool GhGpXfer(GhGpRes* e, bool in)
+{
+    if (!g_gpIoOn || !e || e->chunk < 0) return false;
+    UINT nT = 0, nSub = 16; D3D12_PACKED_MIP_INFO pm{}; D3D12_TILE_SHAPE ts{}; D3D12_SUBRESOURCE_TILING st[16]{};
+    g_gpDev->GetResourceTiling(e->res, &nT, &pm, &ts, &nSub, 0, st);
+    if (!nT || nT != e->nTiles){ InterlockedIncrement(&g_gpIoFail); return false; }
+    const UINT nStd = nT - pm.NumTilesForPackedMips;
+    const UINT stageT = (UINT)(g_gpStageB >> 16);
+    struct Pc { UINT sub, y, n; UINT64 fo; UINT64 so; };   // n tiles of mip `sub` from tile row y; file + stage offsets
+    std::vector<Pc> pcs; pcs.reserve(32);
+    for (UINT sb = 0; sb < pm.NumStandardMips && sb < nSub && sb < 16; ++sb){
+        const UINT w = st[sb].WidthInTiles, h = st[sb].HeightInTiles;
+        if (!w || !h) continue;
+        if (w > stageT){ InterlockedIncrement(&g_gpTooBig); return false; }
+        const UINT rows = stageT / w;
+        for (UINT y = 0; y < h; y += rows){
+            const UINT r = (h - y) < rows ? (h - y) : rows;
+            pcs.push_back({ sb, y, r * w, (UINT64)(st[sb].StartTileIndexInOverallResource + y * w) << 16, 0 });
+        }
+    }
+    // The packed tail: every packed subresource of at least one 4x4 block.
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[16]{}; UINT pkN = 0; UINT64 pkB = 0;
+    const UINT pk0 = pm.NumStandardMips;
+    if (GhGpPacked() && pm.NumTilesForPackedMips){
+        for (UINT sb = pk0; sb < e->nSub && sb < 16; ++sb){
+            if ((e->desc0.Width >> sb) < 4 || (e->desc0.Height >> sb) < 4) break;
+            ++pkN;
+        }
+        if (pkN){
+            D3D12_RESOURCE_DESC d = e->desc0; d.MipLevels = (UINT16)e->nSub;
+            UINT rowsN[16]{}; UINT64 rowB[16]{};
+            g_gpDev->GetCopyableFootprints(&d, pk0, pkN, 0, fp, rowsN, rowB, &pkB);
+            if (!pkB || pkB > g_gpStageB){ pkN = 0; pkB = 0; }
+        }
+    }
+    const UINT need = nStd + (UINT)((pkB + 0xFFFFull) >> 16);
+    if (!in){
+        if (e->slot >= 0 && e->slotN < need){ GhGpFileFree((UINT)e->slot, e->slotN); e->slot = -1; }
+        if (e->slot < 0){ e->slot = GhGpFileAlloc(need); e->slotN = need; }
+    } else if (e->slot < 0 || !e->saved){
+        InterlockedIncrement(&g_gpNoContent); return false;
+    }
+    const UINT64 slotOff = (UINT64)(UINT)e->slot << 16;
+    const LONG64 t0 = GhNowUs();
+
+    auto clBarrier = GhGpClFn<void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*)>(26);
+    auto clTiles   = GhGpClFn<void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*, const D3D12_TILED_RESOURCE_COORDINATE*,
+                                                const D3D12_TILE_REGION_SIZE*, ID3D12Resource*, UINT64, D3D12_TILE_COPY_FLAGS)>(18);
+    auto clCopyTex = GhGpClFn<void (__stdcall*)(ID3D12GraphicsCommandList*, const D3D12_TEXTURE_COPY_LOCATION*, UINT, UINT, UINT,
+                                                const D3D12_TEXTURE_COPY_LOCATION*, const D3D12_BOX*)>(16);
+    auto clClose   = GhGpClFn<HRESULT (__stdcall*)(ID3D12GraphicsCommandList*)>(9);
+    auto clReset   = GhGpClFn<HRESULT (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*, ID3D12PipelineState*)>(10);
+    ID3D12Resource* buf = in ? g_gpUp : g_gpRb;
+    uint8_t*        bp  = in ? g_gpUpP : g_gpRbP;
+
+    // Bracket: every subresource from its recorded state to the copy state and back.
+    auto Bracket = [&](bool back){
+        D3D12_RESOURCE_BARRIER br[16]{}; UINT nb = 0;
+        for (UINT sb = 0; sb < e->nSub && sb < 16; ++sb){
+            const UINT cur = e->sst[sb];
+            UINT want = in ? (UINT)D3D12_RESOURCE_STATE_COPY_DEST : (UINT)D3D12_RESOURCE_STATE_COPY_SOURCE;
+            if (!in && (cur & D3D12_RESOURCE_STATE_COPY_SOURCE) && cur != (UINT)D3D12_RESOURCE_STATE_COPY_DEST) want = cur;   // a read state that already allows it
+            if (want == cur) continue;
+            br[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            br[nb].Transition.pResource = e->res; br[nb].Transition.Subresource = sb;
+            br[nb].Transition.StateBefore = (D3D12_RESOURCE_STATES)(back ? want : cur);
+            br[nb].Transition.StateAfter  = (D3D12_RESOURCE_STATES)(back ? cur : want);
+            ++nb;
+        }
+        if (nb) clBarrier(g_gpCl, nb, br);
+    };
+    auto Run = [&]() -> bool {
+        if (FAILED(clClose(g_gpCl))){ InterlockedIncrement(&g_gpIoFail); return false; }
+        ID3D12CommandList* l = g_gpCl;
+        GhGpCq<void (__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*)>(g_gpQ, 10)(g_gpQ, 1, &l);
+        const UINT64 v = ++g_gpCopyV;
+        GhGpCq<HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64)>(g_gpQ, 14)(g_gpQ, g_gpCopyF, v);
+        if (g_gpCopyF->GetCompletedValue() < v){
+            g_gpCopyF->SetEventOnCompletion(v, g_gpCopyEv);
+            if (WaitForSingleObject(g_gpCopyEv, 5000) != WAIT_OBJECT_0){
+                // The allocator is still in flight and cannot be reset: stop paging for good.
+                g_gpIoOn = false;
+                InterlockedIncrement(&g_gpIoFail);
+                Diag("GPUPAGE io copy wait TIMED OUT fence=" + std::to_string((unsigned long long)g_gpCopyF->GetCompletedValue()) +
+                     "/" + std::to_string((unsigned long long)v) + " removed=" + Hex((uint32_t)g_gpDev->GetDeviceRemovedReason()) +
+                     " -- lossless paging OFF");
+                return false;
+            }
+        }
+        return true;
+    };
+    auto Begin = [&]() -> bool {
+        if (FAILED(g_gpCa->Reset()) || FAILED(clReset(g_gpCl, g_gpCa, nullptr))){ InterlockedIncrement(&g_gpIoFail); return false; }
+        return true;
+    };
+    // One batch: pieces [a, b) plus, when last, the packed tail at stage offset pkSo.
+    auto Batch = [&](size_t a, size_t b, bool withPk, UINT64 pkSo) -> bool {
+        if (in){
+            for (size_t i = a; i < b; ++i)
+                if (!GhGpFileIo(false, slotOff + pcs[i].fo, bp + pcs[i].so, pcs[i].n << 16)){ InterlockedIncrement(&g_gpIoFail); return false; }
+            if (withPk && !GhGpFileIo(false, slotOff + ((UINT64)nStd << 16), bp + pkSo, (DWORD)pkB)){ InterlockedIncrement(&g_gpIoFail); return false; }
+        }
+        if (!Begin()) return false;
+        Bracket(false);
+        for (size_t i = a; i < b; ++i){
+            D3D12_TILED_RESOURCE_COORDINATE c{}; c.Subresource = pcs[i].sub; c.Y = pcs[i].y;
+            D3D12_TILE_REGION_SIZE rs{}; rs.NumTiles = pcs[i].n; rs.UseBox = FALSE;
+            clTiles(g_gpCl, e->res, &c, &rs, buf, pcs[i].so,
+                    in ? D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE
+                       : D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+        }
+        if (withPk) for (UINT k = 0; k < pkN; ++k){
+            D3D12_TEXTURE_COPY_LOCATION t{}, f{};
+            t.pResource = e->res; t.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; t.SubresourceIndex = pk0 + k;
+            f.pResource = buf; f.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; f.PlacedFootprint = fp[k];
+            f.PlacedFootprint.Offset += pkSo;
+            if (in) clCopyTex(g_gpCl, &t, 0, 0, 0, &f, nullptr); else clCopyTex(g_gpCl, &f, 0, 0, 0, &t, nullptr);
+        }
+        Bracket(true);
+        if (!Run()) return false;
+        if (!in){
+            for (size_t i = a; i < b; ++i)
+                if (!GhGpFileIo(true, slotOff + pcs[i].fo, bp + pcs[i].so, pcs[i].n << 16)){ InterlockedIncrement(&g_gpIoFail); return false; }
+            if (withPk && !GhGpFileIo(true, slotOff + ((UINT64)nStd << 16), bp + pkSo, (DWORD)pkB)){ InterlockedIncrement(&g_gpIoFail); return false; }
+        }
+        return true;
+    };
+    size_t a = 0; UINT64 so = 0;
+    for (size_t i = 0; i < pcs.size(); ++i){
+        const UINT64 nb = (UINT64)pcs[i].n << 16;
+        if (so + nb > g_gpStageB){ if (!Batch(a, i, false, 0)) return false; a = i; so = 0; }
+        pcs[i].so = so; so += nb;
+    }
+    UINT64 pkSo = (so + 511ull) & ~511ull;
+    if (pkN && pkSo + pkB > g_gpStageB){ if (!Batch(a, pcs.size(), false, 0)) return false; a = pcs.size(); pkSo = 0; }
+    if ((a < pcs.size() || pkN) && !Batch(a, pcs.size(), pkN != 0, pkSo)) return false;
+
+    const UINT64 moved = ((UINT64)nStd << 16) + pkB;
+    const LONG64 us = GhNowUs() - t0;
+    if (in){ InterlockedAdd64(&g_gpReadB, (LONG64)moved); InterlockedAdd64(&g_gpReadUs, us); }
+    else   { InterlockedAdd64(&g_gpWriteB, (LONG64)moved); InterlockedAdd64(&g_gpWriteUs, us); e->saved = true; }
+    const LONG k = InterlockedIncrement(in ? &g_gpLoadN : &g_gpSaveN);
+    if (k <= 8 || (k % 256) == 0)
+        Diag(std::string("GPUPAGE io ") + (in ? "load" : "save") + " n=" + std::to_string((long)k) +
+             " res=" + Hex((uint64_t)(uintptr_t)e->res) + " tiles=" + std::to_string(nT) + " std=" + std::to_string(nStd) +
+             " pieces=" + std::to_string((unsigned long long)pcs.size()) + " packedSubs=" + std::to_string(pkN) +
+             " packedB=" + std::to_string((unsigned long long)pkB) + " slot=" + std::to_string(e->slot) +
+             " us=" + std::to_string((long long)us) + " fileMB=" + std::to_string((unsigned long)(g_gpFileEnd >> 4)));
+    return true;
+}
+
+// Hook_CLBarrier: stamp the state the game just recorded for a converted texture.
+static void GhGpNoteBarriers(UINT num, const D3D12_RESOURCE_BARRIER* b)
+{
+    if (!g_gpMap || !b) return;
+    for (UINT i = 0; i < num; ++i){
+        const D3D12_RESOURCE_BARRIER& r = b[i];
+        if (r.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || !r.Transition.pResource) continue;
+        GhGpRes* e = nullptr;
+        AcquireSRWLockShared(&g_gpLk);
+        auto it = g_gpMap->find(r.Transition.pResource);
+        if (it != g_gpMap->end()) e = it->second;
+        if (e){
+            const UINT a = (UINT)r.Transition.StateAfter, sb = r.Transition.Subresource;
+            if (sb == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES){ for (UINT k = 0; k < 16; ++k) e->sst[k] = a; }
+            else if (sb < 16) e->sst[sb] = a;
+        }
+        ReleaseSRWLockShared(&g_gpLk);
+        if (e) InterlockedIncrement(&g_gpStateTr);
+    }
+}
 
 // g_gpLk held.
 static bool GhGpRig(ID3D12Device* dev)
@@ -21166,6 +21813,7 @@ static bool GhGpRig(ID3D12Device* dev)
     g_gpMap->reserve(8192);
     Diag("GPUPAGE rig q=" + Hex((uint64_t)(uintptr_t)q) + " fence=" + Hex((uint64_t)(uintptr_t)f) +
          " cap=" + std::to_string((unsigned long)GhGpuPageMb()) + "MB");
+    GhGpCopyRig(dev);   // #235 TILE2b
     return true;
 }
 
@@ -21270,11 +21918,13 @@ static void GhGpMapWhole(GhGpRes* e, ID3D12Heap* heap, UINT base, bool signalNow
 // signal actually demand an evicted texture back. TILE2b adds the CopyTiles +
 // D:\DevelopmentFiles ring so a restore returns real content.
 
-// g_gpLk held exclusive. Unmap whole, give the run back. No signal: the caller
-// batches one GhGpMapSignal for the whole sweep.
-static void GhGpEvictOne(GhGpRes* e)
+// g_gpLk held exclusive. Save the content (TILE2b), unmap whole, give the run
+// back. No signal: the caller batches one GhGpMapSignal for the whole sweep. With
+// lossless paging on, a texture whose content could not be saved is NOT evicted.
+static bool GhGpEvictOne(GhGpRes* e)
 {
-    if (!e || e->chunk < 0) return;
+    if (!e || e->chunk < 0) return false;
+    if (g_gpIoOn && !GhGpXfer(e, false)) return false;
     GhGpMapWhole(e, nullptr, 0, false);          // whole-resource NULL: reads zero
     GhGpFreeRun(e->chunk, e->base, e->nTiles);
     const LONG64 bytes = (LONG64)e->nTiles << 16;
@@ -21283,6 +21933,7 @@ static void GhGpEvictOne(GhGpRes* e)
     InterlockedAdd64(&g_gpEvictedB, bytes);
     InterlockedAdd64(&g_gpEvictB, bytes);
     InterlockedIncrement(&g_gpEvictN);
+    return true;
 }
 
 // g_gpLk held exclusive. Evict cold textures, coldest first, retrying the
@@ -21323,7 +21974,7 @@ static bool GhGpReclaim(UINT n, int* ci, UINT* base)
     bool got = false;
     size_t k = 0;
     for (; k < v.size() && k < 256; ++k){
-        GhGpEvictOne(v[k]);
+        if (!GhGpEvictOne(v[k])) continue;
         if (GhGpAllocNoEvict(n, ci, base)){ got = true; ++k; break; }
     }
     GhGpMapSignal();                              // one signal for the whole sweep
@@ -21359,7 +22010,9 @@ static void GhGpRestoreByRes(void* res)
         int ci = -1; UINT base = 0;
         if (GhGpAlloc(e->nTiles, &ci, &base)){
             e->chunk = ci; e->base = base;
-            GhGpMapWhole(e, (*g_gpChunks)[ci].heap, base);
+            GhGpMapWhole(e, (*g_gpChunks)[ci].heap, base, false);
+            if (g_gpIoOn) GhGpXfer(e, true);   // #235 TILE2b: queue-ordered after the map, on g_gpQ
+            GhGpMapSignal();                    // guest queues wait for the map AND the content
             const LONG64 bytes = (LONG64)e->nTiles << 16;
             InterlockedAdd64(&g_gpLiveB, bytes);
             InterlockedAdd64(&g_gpEvictedB, -bytes);
@@ -21407,6 +22060,7 @@ static void GhGpOnFree(void* res)
     if (e){
         if (e->chunk >= 0){ GhGpFreeRun(e->chunk, e->base, e->nTiles); InterlockedAdd64(&g_gpLiveB, -(LONG64)e->nTiles << 16); }
         else InterlockedAdd64(&g_gpEvictedB, -(LONG64)e->nTiles << 16);   // #235: released while evicted -- stop counting it as out
+        if (e->slot >= 0) GhGpFileFree((UINT)e->slot, e->slotN);          // #235 TILE2b
         InterlockedAdd64(&g_gpAllocB, -(LONG64)e->size);
         InterlockedDecrement(&g_gpLiveN); InterlockedIncrement(&g_gpFreed);
         ph = e->heap;
@@ -21571,6 +22225,8 @@ static bool GhGpConvert(ID3D12Device* dev, GhGpHeap* ph, UINT64 off, const D3D12
     e->chunk = ci; e->base = base;
     e->created = e->lastUse = t0;
     e->ecl0 = (UINT32)InterlockedCompareExchange(&g_eclCount, 0, 0);
+    for (UINT k = 0; k < 16; ++k) e->sst[k] = (UINT)st;
+    e->slot = -1; e->slotN = 0; e->saved = false;
     GhGpMapWhole(e, (*g_gpChunks)[ci].heap, base);
     // The alias count: a placement overlapping a live occupant of the same proxy.
     // D3D12 makes the older occupant's contents undefined; nothing to do, but it
@@ -21751,7 +22407,19 @@ static std::string GhGpFrameLine()
            " gpheaps=" + std::to_string((long)InterlockedCompareExchange(&g_gpProxyLive, 0, 0)) +
            "/" + std::to_string((long)InterlockedCompareExchange(&g_gpProxyN, 0, 0)) +
            " gptouch=" + std::to_string((long)InterlockedCompareExchange(&g_gpTouch, 0, 0)) +
-           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpSrv, 0, 0));
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpSrv, 0, 0)) +
+           // #235 TILE2b gpio=saves/loads/writeMB/readMB/writeMs/readMs/fail/toobig/nocontent/fileMB/stateTr
+           " gpio=" + std::to_string((long)InterlockedCompareExchange(&g_gpSaveN, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpLoadN, 0, 0)) +
+           "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpWriteB, 0, 0) >> 20)) +
+           "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpReadB, 0, 0) >> 20)) +
+           "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpWriteUs, 0, 0) / 1000)) +
+           "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpReadUs, 0, 0) / 1000)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpIoFail, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpTooBig, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpNoContent, 0, 0)) +
+           "/" + std::to_string((unsigned long)(g_gpFileEnd >> 4)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpStateTr, 0, 0));
 }
 // The three device entry points the game has never been seen to call but that
 // could name a proxy: log-only for CreateSharedHandle (a proxy is refused, the
