@@ -15426,6 +15426,13 @@ static bool GhCLTraceOn()
     if (!lo && !hi) return e <= 64;
     return e >= (LONG)lo && (!hi || e <= (LONG)hi);
 }
+// #234 LOOPFOLD4. A run that survives the world frame outlives the trace's diag
+// budget: 127 lists of per-op CLOP/BCOP lines filled the 24 MB cap (LOOPFOLD3), so
+// the later hang went unrecorded. gh_cl_trace_quiet=1 keeps everything the window
+// DOES (stamping, the BCSNAP ring, SETPSO/RESET, GPUSUBMIT) and drops only the
+// per-op lines and PIX events, which BCSNAP at removal names without.
+static bool GhCLQuiet()
+{ static const unsigned v = GhCfgNumZ(L"gh_cl_trace_quiet.txt", "GH_CL_TRACE_QUIET", 0); return v != 0; }
 static LONG GhEclNow(){ return InterlockedCompareExchange(&g_eclCount, 0, 0); }
 static LONG GhEclNowEarly(){ return GhEclNow(); }
 static std::string GhPixName(const void* p, UINT size)
@@ -15710,7 +15717,7 @@ static LONG GhBreadcrumbBefore(ID3D12GraphicsCommandList* cl)
     // The number the GPU stamps has to be resolvable back to an op. Diag is
     // serialised, so this line sits immediately after that op's CLOP line for the
     // same list, which is all the correlation needed.
-    if (g <= 8192 || GhBcMode() >= 2) Diag("BCOP g=" + std::to_string((long)g) +
+    if ((g <= 8192 || GhBcMode() >= 2) && !GhCLQuiet()) Diag("BCOP g=" + std::to_string((long)g) +
                         " cl=" + Hex((uint64_t)(uintptr_t)cl));
     GhBindDump(cl, g);
     if (GhBcMode() >= 2) GhBcSnapTake(cl, g);
@@ -16239,7 +16246,10 @@ static void GhBcSnapDump(const char* where, UINT32 started, UINT32 finished)
     if (started == 0xFFFFFFFFu || finished == 0xFFFFFFFFu){ Diag(std::string("BCSNAP ") + where + " markers unreadable"); return; }
     // the last op that retired is the control; then everything the GPU had started
     unsigned printed = 0;
-    for (UINT32 g = finished; g <= started && printed < 12; ++g){
+    // mode 2 does not drain, so started-finished spans every op in flight (61 in
+    // BREAD1b); a quiet trace has the diag budget to print them all.
+    const unsigned cap = GhCLQuiet() ? 96u : 12u;
+    for (UINT32 g = finished; g <= started && printed < cap; ++g){
         if (!g) continue;
         const GhBcSnap& e = g_bcRing[g % kBcRingN];
         if ((UINT32)e.g != g){ Diag("BCSNAP " + std::string(where) + " g=" + std::to_string((unsigned long)g) + " evicted from the ring"); continue; }
@@ -16533,6 +16543,7 @@ static bool GhWorkOpDropped(ID3D12CommandList* self, LONG idx)
 }
 static void GhCLOp(ID3D12CommandList* self, const std::string& what)
 {
+    if (GhCLQuiet()) return;
     GhCLNote* n = GhCLFind(self);
     Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " " + what +
          (n && n->lastPso ? " pso=" + Hex((uint64_t)(uintptr_t)n->lastPso) : ""));
@@ -18087,7 +18098,7 @@ static HRESULT __stdcall Hook_CLClose(ID3D12GraphicsCommandList* self)
 static void __stdcall Hook_CLBeginEvent(ID3D12GraphicsCommandList* self, UINT meta,
                                         const void* data, UINT size)
 {
-    if (GhCLTraceOn()){
+    if (GhCLTraceOn() && !GhCLQuiet()){
         std::string nm = GhPixName(data, size);
         Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " BEGINEVENT " +
              (nm.empty() ? ("meta=" + Hex((uint32_t)meta) + " size=" + std::to_string((unsigned long)size)) : nm));
@@ -18097,7 +18108,7 @@ static void __stdcall Hook_CLBeginEvent(ID3D12GraphicsCommandList* self, UINT me
 }
 static void __stdcall Hook_CLEndEvent(ID3D12GraphicsCommandList* self)
 {
-    if (GhCLTraceOn()) Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " ENDEVENT");
+    if (GhCLTraceOn() && !GhCLQuiet()) Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " ENDEVENT");
     if (!GhRecCap58(self))
         ((void (__stdcall*)(ID3D12GraphicsCommandList*))GhClOrig(self, 58))(self);
 }
