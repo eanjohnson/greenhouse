@@ -553,6 +553,7 @@ static std::string GhGpFrameLine();                            // #235 gpupage= 
 static void        GhGpTouch(ID3D12Resource* r);               // #235 last-use signal (copy hooks)
 static void        GhGpNoteBarriers(UINT num, const D3D12_RESOURCE_BARRIER* b);   // #235 TILE2b state tracking
 static void GhGpSrvNote(ID3D12Resource* r);
+static void GhGpRequest(ID3D12Resource* r);                 // #235 TILE2e
 // #235 the per-use read signal: the game feeds a per-frame ring of shader-visible
 // descriptors by CopyDescriptors from staging slots (BREAD6). A staging slot that
 // names a converted texture is noted at CreateSRV; every copy FROM such a slot is a
@@ -21445,6 +21446,10 @@ struct GhGpRes {
     int                   slot;           // first 64 KB unit in gh_gpuspill_<pid>.bin, -1 = none yet
     UINT                  slotN;          // its length in 64 KB units (kept across cycles)
     bool                  saved;          // the slot holds this texture's current content
+    // #235 TILE2e. pend: a restore is queued for the worker (it holds a reference).
+    // busy: the worker is moving this texture's content OUTSIDE g_gpLk. zombie: the
+    // game's last Release came while busy -- the worker finishes the free (GhGpDrop).
+    bool                  pend, busy, zombie;
 };
 struct GhGpChunk { ID3D12Heap* heap; UINT tiles; std::vector<std::pair<UINT, UINT>> fr; };   // fr: sorted free runs (base,len)
 
@@ -21488,6 +21493,33 @@ static unsigned GhGpStageMb()
 static unsigned GhGpPacked()
 { static const unsigned v = GhCfgNumZ(L"gh_gpu_packed.txt", "GH_GPU_PACKED", 1); return v; }
 
+// #235 TILE2e -- ASYNCHRONOUS PAGING. TILE2b0 froze the game 57 s at the first
+// world frame: every restore ran synchronously on the thread that published the
+// descriptor, under g_gpLk exclusive, and most had to save a victim first (a
+// save + a disk read, 36-583 ms each, hundreds of them). Now the page-fault
+// signals (CreateSRV, descriptor copy) only QUEUE a restore; one worker thread
+// does the saves and loads with g_gpLk held only for bookkeeping, and the copy
+// machinery (list, allocator, staging, file) behind its own lock g_gpIoLk.
+// Lock order: g_gpLk -> g_gpIoLk, never the reverse; never Release a resource
+// with either held (the Release hook takes g_gpLk). Until a queued restore lands
+// the texture reads ZERO (Tier 2) -- a pop, never a fault. A copy INTO an evicted
+// texture (GhGpTouch) stays synchronous: Tier 2 drops writes to unmapped tiles.
+// The worker also keeps gh_gpu_low_mb of the pool free once it is at its cap, so
+// a CreatePlacedResource rarely has to save a victim on the game's thread.
+//   gh_gpu_async.txt   1 (default) = worker, 0 = TILE2b's synchronous restores
+//   gh_gpu_low_mb.txt  free pool the worker keeps at the cap (default 32 MB)
+// FRAME: gpasync=queued/done/dropped/qNow/qMax/evictW/keepfree/busyWait
+static unsigned GhGpAsync()
+{ static const unsigned v = GhCfgNumZ(L"gh_gpu_async.txt", "GH_GPU_ASYNC", 1); return v; }
+static unsigned GhGpLowMb()
+{ static const unsigned v = GhCfgNumZ(L"gh_gpu_low_mb.txt", "GH_GPU_LOW_MB", 32); return v; }
+static SRWLOCK                    g_gpIoLk = SRWLOCK_INIT;
+static SRWLOCK                    g_gpQLk = SRWLOCK_INIT;
+static std::vector<ID3D12Resource*>* g_gpReq = nullptr;          // g_gpQLk; each holds our reference
+static HANDLE                     g_gpWkEv = nullptr;
+static volatile LONG   g_gpAqN = 0, g_gpAdone = 0, g_gpAdrop = 0, g_gpAqMax = 0, g_gpEvictW = 0,
+                       g_gpKeepFree = 0, g_gpBusyWait = 0;
+
 static ID3D12CommandAllocator*    g_gpCa = nullptr;
 static ID3D12GraphicsCommandList* g_gpCl = nullptr;
 static ID3D12Fence*               g_gpCopyF = nullptr;
@@ -21517,6 +21549,7 @@ template <class F> static F GhGpClFn(int slot)
 
 // g_gpLk held. Called once, from GhGpRig. A failure turns lossless paging off
 // (eviction zeroes, as before) -- it never refuses a placement.
+static DWORD WINAPI GhGpWorker(void*);   // #235 TILE2e
 static void GhGpCopyRig(ID3D12Device* dev)
 {
     if (!GhGpLossless()){ Diag("GPUPAGE io OFF (gh_gpu_lossless=0) -- eviction zeroes, as TILE2a/2d"); return; }
@@ -21576,6 +21609,16 @@ static void GhGpCopyRig(ID3D12Device* dev)
     }
     g_gpFileFr = new std::vector<std::pair<UINT, UINT>>();
     g_gpIoOn = true;
+    if (GhGpAsync()){                                  // #235 TILE2e
+        g_gpReq = new std::vector<ID3D12Resource*>();
+        g_gpReq->reserve(1024);
+        g_gpWkEv = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        HANDLE th = g_gpWkEv ? CreateThread(nullptr, 0, GhGpWorker, nullptr, 0, nullptr) : nullptr;
+        if (th) CloseHandle(th);
+        else { if (g_gpWkEv) CloseHandle(g_gpWkEv); g_gpWkEv = nullptr; }
+        Diag(std::string("GPUPAGE async ") + (g_gpWkEv ? "on" : "FAILED (synchronous restores)") +
+             " low=" + std::to_string((unsigned long)GhGpLowMb()) + "MB");
+    }
     Diag("GPUPAGE io on stage=" + std::to_string((unsigned long)GhGpStageMb()) + "MBx2 packed=" +
          std::to_string((unsigned long)GhGpPacked()) + " file=D:\\DevelopmentFiles\\gh_gpuspill_<pid>.bin");
 }
@@ -21613,11 +21656,13 @@ static bool GhGpFileIo(bool write, UINT64 off, void* p, DWORD n)
     return ok && got == n;
 }
 
-// g_gpLk held exclusive. Moves one texture's content between its tiles and its
-// file slot: in=false pages OUT (tiles -> readback -> file), in=true pages IN
-// (file -> upload -> tiles). The texture must be mapped. Work is cut into
-// batches no bigger than the stage; each batch is one submission and one wait.
-static bool GhGpXfer(GhGpRes* e, bool in)
+// g_gpIoLk held (and g_gpLk exclusive when lkHeld). Moves one texture's content
+// between its tiles and its file slot: in=false pages OUT (tiles -> readback ->
+// file), in=true pages IN (file -> upload -> tiles). The texture must be mapped.
+// Work is cut into batches no bigger than the stage; each batch is one
+// submission and one wait. Without g_gpLk the slot must already exist
+// (GhGpEnsureSlot), since the file allocator lives under g_gpLk.
+static bool GhGpXfer(GhGpRes* e, bool in, bool lkHeld = true)
 {
     if (!g_gpIoOn || !e || e->chunk < 0) return false;
     UINT nT = 0, nSub = 16; D3D12_PACKED_MIP_INFO pm{}; D3D12_TILE_SHAPE ts{}; D3D12_SUBRESOURCE_TILING st[16]{};
@@ -21654,6 +21699,7 @@ static bool GhGpXfer(GhGpRes* e, bool in)
     }
     const UINT need = nStd + (UINT)((pkB + 0xFFFFull) >> 16);
     if (!in){
+        if (!lkHeld && (e->slot < 0 || e->slotN < need)){ InterlockedIncrement(&g_gpIoFail); return false; }
         if (e->slot >= 0 && e->slotN < need){ GhGpFileFree((UINT)e->slot, e->slotN); e->slot = -1; }
         if (e->slot < 0){ e->slot = GhGpFileAlloc(need); e->slotN = need; }
     } else if (e->slot < 0 || !e->saved){
@@ -21671,12 +21717,16 @@ static bool GhGpXfer(GhGpRes* e, bool in)
     auto clReset   = GhGpClFn<HRESULT (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*, ID3D12PipelineState*)>(10);
     ID3D12Resource* buf = in ? g_gpUp : g_gpRb;
     uint8_t*        bp  = in ? g_gpUpP : g_gpRbP;
+    // The game's barrier notes can land while we copy (TILE2e runs without g_gpLk):
+    // both brackets must name the same states, so take one snapshot.
+    UINT sst[16];
+    for (UINT k = 0; k < 16; ++k) sst[k] = e->sst[k];
 
     // Bracket: every subresource from its recorded state to the copy state and back.
     auto Bracket = [&](bool back){
         D3D12_RESOURCE_BARRIER br[16]{}; UINT nb = 0;
         for (UINT sb = 0; sb < e->nSub && sb < 16; ++sb){
-            const UINT cur = e->sst[sb];
+            const UINT cur = sst[sb];
             UINT want = in ? (UINT)D3D12_RESOURCE_STATE_COPY_DEST : (UINT)D3D12_RESOURCE_STATE_COPY_SOURCE;
             if (!in && (cur & D3D12_RESOURCE_STATE_COPY_SOURCE) && cur != (UINT)D3D12_RESOURCE_STATE_COPY_DEST) want = cur;   // a read state that already allows it
             if (want == cur) continue;
@@ -21923,8 +21973,13 @@ static void GhGpMapWhole(GhGpRes* e, ID3D12Heap* heap, UINT base, bool signalNow
 // lossless paging on, a texture whose content could not be saved is NOT evicted.
 static bool GhGpEvictOne(GhGpRes* e)
 {
-    if (!e || e->chunk < 0) return false;
-    if (g_gpIoOn && !GhGpXfer(e, false)) return false;
+    if (!e || e->chunk < 0 || e->busy) return false;
+    if (g_gpIoOn){
+        AcquireSRWLockExclusive(&g_gpIoLk);
+        const bool ok = g_gpIoOn && GhGpXfer(e, false);
+        ReleaseSRWLockExclusive(&g_gpIoLk);
+        if (!ok) return false;
+    }
     GhGpMapWhole(e, nullptr, 0, false);          // whole-resource NULL: reads zero
     GhGpFreeRun(e->chunk, e->base, e->nTiles);
     const LONG64 bytes = (LONG64)e->nTiles << 16;
@@ -21948,7 +22003,7 @@ static bool GhGpReclaim(UINT n, int* ci, UINT* base)
     v.reserve(256);
     for (auto& kv : *g_gpMap){
         GhGpRes* e = kv.second;
-        if (e && e->chunk >= 0 && (now - e->lastUse) >= cut) v.push_back(e);
+        if (e && e->chunk >= 0 && !e->busy && (now - e->lastUse) >= cut) v.push_back(e);
     }
     // #235 TILE2c: the age cut is a PREFERENCE, not a VETO. When a small pool FIRST
     // fills, everything resident in it is seconds old, the aged list comes back empty,
@@ -21965,7 +22020,7 @@ static bool GhGpReclaim(UINT n, int* ci, UINT* base)
         InterlockedIncrement(&g_gpCutOverride);
         for (auto& kv : *g_gpMap){
             GhGpRes* e = kv.second;
-            if (e && e->chunk >= 0) v.push_back(e);
+            if (e && e->chunk >= 0 && !e->busy) v.push_back(e);
         }
         // Genuinely nothing resident to take: now it really is no victim.
         if (v.empty()){ InterlockedIncrement(&g_gpNoVictim); return false; }
@@ -22006,12 +22061,27 @@ static void GhGpRestoreByRes(void* res)
     AcquireSRWLockExclusive(&g_gpLk);
     auto it = g_gpMap->find(res);
     GhGpRes* e = it != g_gpMap->end() ? it->second : nullptr;
-    if (e && e->chunk < 0){
+    // #235 TILE2e: the worker is loading it (mapped, content not landed, map fence
+    // not yet signalled). A copy INTO it must be ordered after that load, so wait
+    // it out; the worker signals before it clears busy.
+    for (int w = 0; e && e->busy && w < 4000; ++w){
+        ReleaseSRWLockExclusive(&g_gpLk);
+        if (!w) InterlockedIncrement(&g_gpBusyWait);
+        Sleep(1);
+        AcquireSRWLockExclusive(&g_gpLk);
+        it = g_gpMap->find(res);
+        e = it != g_gpMap->end() ? it->second : nullptr;
+    }
+    if (e && e->chunk < 0 && !e->busy){
         int ci = -1; UINT base = 0;
         if (GhGpAlloc(e->nTiles, &ci, &base)){
             e->chunk = ci; e->base = base;
             GhGpMapWhole(e, (*g_gpChunks)[ci].heap, base, false);
-            if (g_gpIoOn) GhGpXfer(e, true);   // #235 TILE2b: queue-ordered after the map, on g_gpQ
+            if (g_gpIoOn){                      // #235 TILE2b: queue-ordered after the map, on g_gpQ
+                AcquireSRWLockExclusive(&g_gpIoLk);
+                if (g_gpIoOn) GhGpXfer(e, true);
+                ReleaseSRWLockExclusive(&g_gpIoLk);
+            }
             GhGpMapSignal();                    // guest queues wait for the map AND the content
             const LONG64 bytes = (LONG64)e->nTiles << 16;
             InterlockedAdd64(&g_gpLiveB, bytes);
@@ -22035,6 +22105,217 @@ static GhGpRes* GhGpFind(void* res)
     return e;
 }
 
+// ---- #235 TILE2e: the paging worker ----------------------------------------
+static GhGpHeap* GhGpDrop(GhGpRes* e);
+
+// g_gpLk held exclusive. The file slot a page-out needs, allocated before the
+// copy runs without g_gpLk. Same arithmetic as GhGpXfer's `need`.
+static bool GhGpEnsureSlot(GhGpRes* e)
+{
+    UINT nT = 0, nSub = 16; D3D12_PACKED_MIP_INFO pm{}; D3D12_TILE_SHAPE ts{}; D3D12_SUBRESOURCE_TILING st[16]{};
+    g_gpDev->GetResourceTiling(e->res, &nT, &pm, &ts, &nSub, 0, st);
+    if (!nT || nT != e->nTiles) return false;
+    UINT64 pkB = 0; UINT pkN = 0; const UINT pk0 = pm.NumStandardMips;
+    if (GhGpPacked() && pm.NumTilesForPackedMips){
+        for (UINT sb = pk0; sb < e->nSub && sb < 16; ++sb){
+            if ((e->desc0.Width >> sb) < 4 || (e->desc0.Height >> sb) < 4) break;
+            ++pkN;
+        }
+        if (pkN){
+            D3D12_RESOURCE_DESC d = e->desc0; d.MipLevels = (UINT16)e->nSub;
+            g_gpDev->GetCopyableFootprints(&d, pk0, pkN, 0, nullptr, nullptr, nullptr, &pkB);
+            if (!pkB || pkB > g_gpStageB) pkB = 0;
+        }
+    }
+    const UINT need = (nT - pm.NumTilesForPackedMips) + (UINT)((pkB + 0xFFFFull) >> 16);
+    if (e->slot >= 0 && e->slotN < need){ GhGpFileFree((UINT)e->slot, e->slotN); e->slot = -1; }
+    if (e->slot < 0){ e->slot = GhGpFileAlloc(need); e->slotN = need; }
+    return true;
+}
+
+// g_gpLk held. The coldest resident texture nobody is moving, aged ones only
+// when `agedOnly` (gh_gpu_evict_ms), else the coldest of all (TILE2c's override).
+static GhGpRes* GhGpColdest(bool agedOnly)
+{
+    const unsigned ms = GhGpEvictMs();
+    if (!ms) return nullptr;
+    const LONG64 now = GhNowUs(), cut = (LONG64)ms * 1000;
+    GhGpRes* best = nullptr;
+    for (auto& kv : *g_gpMap){
+        GhGpRes* e = kv.second;
+        if (!e || e->chunk < 0 || e->busy) continue;
+        if (agedOnly && (now - e->lastUse) < cut) continue;
+        if (!best || e->lastUse < best->lastUse) best = e;
+    }
+    return best;
+}
+
+// No lock held. Save one victim and unmap it, with g_gpLk held only around the
+// bookkeeping. False when there is nothing to take or the save failed.
+static bool GhGpEvictAsync(bool agedOnly)
+{
+    AcquireSRWLockExclusive(&g_gpLk);
+    GhGpRes* e = GhGpColdest(agedOnly);
+    if (!e && !agedOnly) InterlockedIncrement(&g_gpNoVictim);
+    if (e && !agedOnly && (GhNowUs() - e->lastUse) < (LONG64)GhGpEvictMs() * 1000) InterlockedIncrement(&g_gpCutOverride);
+    if (e && g_gpIoOn && !GhGpEnsureSlot(e)){ InterlockedIncrement(&g_gpIoFail); e = nullptr; }
+    ID3D12Resource* r = e ? e->res : nullptr;
+    if (e){ e->busy = true; r->AddRef(); }
+    ReleaseSRWLockExclusive(&g_gpLk);
+    if (!e) return false;
+    bool ok = true;
+    if (g_gpIoOn){
+        AcquireSRWLockExclusive(&g_gpIoLk);
+        ok = g_gpIoOn && GhGpXfer(e, false, false);
+        ReleaseSRWLockExclusive(&g_gpIoLk);
+    }
+    GhGpHeap* ph = nullptr;
+    AcquireSRWLockExclusive(&g_gpLk);
+    e->busy = false;
+    if (ok && e->chunk >= 0){
+        GhGpMapWhole(e, nullptr, 0, false);   // whole-resource NULL: reads zero
+        GhGpFreeRun(e->chunk, e->base, e->nTiles);
+        const LONG64 bytes = (LONG64)e->nTiles << 16;
+        e->chunk = -1; e->base = 0;
+        InterlockedAdd64(&g_gpLiveB, -bytes);
+        InterlockedAdd64(&g_gpEvictedB, bytes);
+        InterlockedAdd64(&g_gpEvictB, bytes);
+        InterlockedIncrement(&g_gpEvictN);
+        InterlockedIncrement(&g_gpEvictW);
+        GhGpMapSignal();
+    }
+    if (e->zombie) ph = GhGpDrop(e);
+    ReleaseSRWLockExclusive(&g_gpLk);
+    if (ph) ph->Release();
+    r->Release();   // through Hook_GpResRelease: may run the game's deferred free
+    return ok;
+}
+
+// No lock held; r carries the reference GhGpRequest took. Find room (saving
+// victims as needed), map, load, then signal -- the guest's queues wait on the
+// signal at their next submission, so the load is ordered before anything the
+// game submits after it lands.
+static void GhGpRestoreAsync(ID3D12Resource* r)
+{
+    const LONG64 t0 = GhNowUs();
+    for (int tries = 0; ; ++tries){
+        AcquireSRWLockExclusive(&g_gpLk);
+        auto it = g_gpMap->find(r);
+        GhGpRes* e = it != g_gpMap->end() ? it->second : nullptr;
+        if (!e || e->chunk >= 0 || e->busy){
+            if (e) e->pend = false;
+            ReleaseSRWLockExclusive(&g_gpLk);
+            InterlockedIncrement(&g_gpAdrop);
+            break;
+        }
+        int ci = -1; UINT base = 0;
+        if (GhGpAllocNoEvict(e->nTiles, &ci, &base)){
+            e->chunk = ci; e->base = base; e->busy = true; e->pend = false;
+            GhGpMapWhole(e, (*g_gpChunks)[ci].heap, base, false);
+            const LONG64 bytes = (LONG64)e->nTiles << 16;
+            InterlockedAdd64(&g_gpLiveB, bytes);
+            InterlockedAdd64(&g_gpEvictedB, -bytes);
+            InterlockedAdd64(&g_gpRestoreB, bytes);
+            InterlockedIncrement(&g_gpRestoreN);
+            ReleaseSRWLockExclusive(&g_gpLk);
+            if (g_gpIoOn){
+                AcquireSRWLockExclusive(&g_gpIoLk);
+                if (g_gpIoOn) GhGpXfer(e, true, false);
+                ReleaseSRWLockExclusive(&g_gpIoLk);
+            }
+            GhGpHeap* ph = nullptr;
+            AcquireSRWLockExclusive(&g_gpLk);
+            GhGpMapSignal();                      // map AND content, then busy clears
+            e->busy = false;
+            if (e->zombie) ph = GhGpDrop(e);
+            ReleaseSRWLockExclusive(&g_gpLk);
+            if (ph) ph->Release();
+            InterlockedIncrement(&g_gpAdone);
+            break;
+        }
+        ReleaseSRWLockExclusive(&g_gpLk);
+        if (tries >= 256 || !GhGpEvictAsync(false)){
+            AcquireSRWLockExclusive(&g_gpLk);
+            it = g_gpMap->find(r);
+            if (it != g_gpMap->end() && it->second) it->second->pend = false;
+            ReleaseSRWLockExclusive(&g_gpLk);
+            InterlockedIncrement(&g_gpAdrop);
+            break;
+        }
+    }
+    r->Release();
+    InterlockedAdd64(&g_gpPageUs, GhNowUs() - t0);
+}
+
+// No lock held. At the pool's cap, keep gh_gpu_low_mb free by saving aged
+// textures, then the coldest -- so a CreatePlacedResource on a game thread
+// rarely pays for a save. Bounded per pass so a restore request is never
+// starved for long.
+static void GhGpKeepFree()
+{
+    const UINT low = (UINT)(((UINT64)GhGpLowMb() << 20) >> 16);
+    for (int k = 0; k < 16 && low; ++k){
+        UINT64 freeT = 0; bool atCap;
+        AcquireSRWLockShared(&g_gpLk);
+        for (auto& c : *g_gpChunks) for (auto& fr : c.fr) freeT += fr.second;
+        atCap = (UINT64)g_gpPoolB + ((UINT64)low << 16) > ((UINT64)GhGpuPageMb() << 20);   // growing is cheaper than saving
+        ReleaseSRWLockShared(&g_gpLk);
+        if (!atCap || freeT >= low) return;
+        AcquireSRWLockShared(&g_gpQLk);
+        const bool waiting = g_gpReq && !g_gpReq->empty();
+        ReleaseSRWLockShared(&g_gpQLk);
+        if (waiting) return;
+        if (!GhGpEvictAsync(true) && !GhGpEvictAsync(false)) return;
+        InterlockedIncrement(&g_gpKeepFree);
+    }
+}
+
+static DWORD WINAPI GhGpWorker(void*)
+{
+    for (;;){
+        WaitForSingleObject(g_gpWkEv, 50);
+        for (;;){
+            ID3D12Resource* r = nullptr;
+            AcquireSRWLockExclusive(&g_gpQLk);
+            if (!g_gpReq->empty()){ r = g_gpReq->front(); g_gpReq->erase(g_gpReq->begin()); }
+            ReleaseSRWLockExclusive(&g_gpQLk);
+            if (!r) break;
+            GhGpRestoreAsync(r);
+        }
+        GhGpKeepFree();
+    }
+}
+
+static long GhGpQLen()
+{
+    if (!g_gpReq) return 0;
+    AcquireSRWLockShared(&g_gpQLk);
+    const long n = (long)g_gpReq->size();
+    ReleaseSRWLockShared(&g_gpQLk);
+    return n;
+}
+
+// Called from the page-fault signals (CreateSRV, descriptor copy) on game
+// threads. Queue the restore; never wait for it.
+static void GhGpRequest(ID3D12Resource* r)
+{
+    if (!GhGpAsync() || !g_gpWkEv){ GhGpRestoreByRes(r); return; }
+    bool q = false;
+    AcquireSRWLockExclusive(&g_gpLk);
+    auto it = g_gpMap->find(r);
+    GhGpRes* e = it != g_gpMap->end() ? it->second : nullptr;
+    if (e && e->chunk < 0 && !e->pend && !e->busy){ e->pend = true; r->AddRef(); q = true; }
+    ReleaseSRWLockExclusive(&g_gpLk);
+    if (!q) return;
+    AcquireSRWLockExclusive(&g_gpQLk);
+    g_gpReq->push_back(r);
+    const LONG n = (LONG)g_gpReq->size();
+    ReleaseSRWLockExclusive(&g_gpQLk);
+    InterlockedIncrement(&g_gpAqN);
+    for (LONG m = g_gpAqMax; n > m; m = g_gpAqMax) InterlockedCompareExchange(&g_gpAqMax, n, m);
+    SetEvent(g_gpWkEv);
+}
+
 // The reserved resource's vtable, hooked at three slots for the objects we made
 // and passed through for anything else on the same vtable: Release (2) frees
 // the run, GetDesc (10) answers in the game's words, GetHeapProperties (14)
@@ -22049,13 +22330,10 @@ static int GhGpVtIdx(void* self)
     for (LONG i = 0; i < n && i < 4; ++i) if (g_gpResVt[i] == (void*)vt) return (int)i;
     return -1;
 }
-static void GhGpOnFree(void* res)
+// g_gpLk held exclusive; e already out of g_gpMap. Returns the proxy whose
+// reference the caller must Release AFTER dropping the lock.
+static GhGpHeap* GhGpDrop(GhGpRes* e)
 {
-    if (!g_gpMap) return;
-    AcquireSRWLockExclusive(&g_gpLk);
-    auto it = g_gpMap->find(res);
-    GhGpRes* e = it != g_gpMap->end() ? it->second : nullptr;
-    if (e) g_gpMap->erase(it);
     GhGpHeap* ph = nullptr;
     if (e){
         if (e->chunk >= 0){ GhGpFreeRun(e->chunk, e->base, e->nTiles); InterlockedAdd64(&g_gpLiveB, -(LONG64)e->nTiles << 16); }
@@ -22070,6 +22348,18 @@ static void GhGpOnFree(void* res)
         }
         delete e;
     }
+    return ph;
+}
+static void GhGpOnFree(void* res)
+{
+    if (!g_gpMap) return;
+    AcquireSRWLockExclusive(&g_gpLk);
+    auto it = g_gpMap->find(res);
+    GhGpRes* e = it != g_gpMap->end() ? it->second : nullptr;
+    if (e) g_gpMap->erase(it);
+    GhGpHeap* ph = nullptr;
+    if (e && e->busy) e->zombie = true;   // #235 TILE2e: the worker holds it; it finishes the free
+    else ph = GhGpDrop(e);
     ReleaseSRWLockExclusive(&g_gpLk);
     if (ph) ph->Release();   // the occupant's reference on its proxy
 }
@@ -22229,7 +22519,7 @@ static bool GhGpConvert(ID3D12Device* dev, GhGpHeap* ph, UINT64 off, const D3D12
     e->created = e->lastUse = t0;
     e->ecl0 = (UINT32)InterlockedCompareExchange(&g_eclCount, 0, 0);
     for (UINT k = 0; k < 16; ++k) e->sst[k] = (UINT)st;
-    e->slot = -1; e->slotN = 0; e->saved = false;
+    e->slot = -1; e->slotN = 0; e->saved = false; e->pend = e->busy = e->zombie = false;
     GhGpMapWhole(e, (*g_gpChunks)[ci].heap, base);
     // The alias count: a placement overlapping a live occupant of the same proxy.
     // D3D12 makes the older occupant's contents undefined; nothing to do, but it
@@ -22307,7 +22597,7 @@ static void GhGpTouch(ID3D12Resource* r)
     if (!g_gpMap || !r) return;
     if (GhGpRes* e = GhGpFind(r)){
         e->lastUse = GhNowUs(); InterlockedIncrement(&g_gpTouch);
-        if (e->chunk < 0) GhGpRestoreByRes(r);   // a copy INTO an evicted texture would be dropped
+        if (e->chunk < 0 || e->busy) GhGpRestoreByRes(r);   // a copy INTO an evicted texture would be dropped
     }
 }
 static void GhGpSrvNote(ID3D12Resource* r)
@@ -22315,7 +22605,7 @@ static void GhGpSrvNote(ID3D12Resource* r)
     if (!g_gpMap || !r) return;
     if (GhGpRes* e = GhGpFind(r)){
         e->lastUse = GhNowUs(); InterlockedIncrement(&g_gpSrv);
-        if (e->chunk < 0) GhGpRestoreByRes(r);
+        if (e->chunk < 0) GhGpRequest(r);
     }
 }
 // gphot=MB<=1s/MB<=10s/MB<=60s/MBolder/MBnever: live mapped bytes bucketed by the
@@ -22352,7 +22642,7 @@ static void GhGpDescCopy(UINT64 src, UINT64 dst)
         e->lastUse = GhNowUs(); InterlockedIncrement(&g_gpDescHits);
         // the page-fault signal: the engine has just published this texture into a
         // shader-visible heap, so the list that samples it has not been submitted yet
-        if (e->chunk < 0) GhGpRestoreByRes(r);
+        if (e->chunk < 0) GhGpRequest(r);
     }
 }
 static std::string GhGpHotLine()
@@ -22422,7 +22712,16 @@ static std::string GhGpFrameLine()
            "/" + std::to_string((long)InterlockedCompareExchange(&g_gpTooBig, 0, 0)) +
            "/" + std::to_string((long)InterlockedCompareExchange(&g_gpNoContent, 0, 0)) +
            "/" + std::to_string((unsigned long)(g_gpFileEnd >> 4)) +
-           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpStateTr, 0, 0));
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpStateTr, 0, 0)) +
+           // #235 TILE2e gpasync=queued/done/dropped/qNow/qMax/evictW/keepfree/busyWait
+           " gpasync=" + std::to_string((long)InterlockedCompareExchange(&g_gpAqN, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpAdone, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpAdrop, 0, 0)) +
+           "/" + std::to_string((long)GhGpQLen()) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpAqMax, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpEvictW, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpKeepFree, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpBusyWait, 0, 0));
 }
 // The three device entry points the game has never been seen to call but that
 // could name a proxy: log-only for CreateSharedHandle (a proxy is refused, the
