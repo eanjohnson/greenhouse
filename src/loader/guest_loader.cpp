@@ -551,6 +551,7 @@ static void        GhLazyWhoDump(const char* where);          // #213 who promis
 static void        GhResLiveDump(const char* where);           // #202 the LIVE resource set, by site
 static std::string GhResLiveFrameLine();                       // #202 livresMB on every FRAME line
 static std::string GhGpFrameLine();                            // #235 gpupage= on every FRAME line
+static std::string GhGpQState();                              // #236 the pager queue's fences, for GPUHEARTBEAT
 static void        GhGpTouch(ID3D12Resource* r);               // #235 last-use signal (copy hooks)
 static void        GhGpNoteBarriers(UINT num, const D3D12_RESOURCE_BARRIER* b);   // #235 TILE2b state tracking
 static void GhGpSrvNote(ID3D12Resource* r);
@@ -14294,6 +14295,22 @@ static bool GhBufDimsOn()
     static const bool on = GhCfgNumZ(L"gh_bufdims.txt", "GH_BUFDIMS", 0) != 0;
     return on;
 }
+// 1 = the real count everywhere. 2 = the driver's own constants (BD4: a coherent
+// frame, so the table plumbing is sound). 3 = the real count where one is known
+// and nonzero, the driver's constant for every slot that would answer 0 (a null
+// view, a CBV or texture, a slot copied from a heap we never registered, a slot
+// never written). Several blobs test `count == 0` as "this optional buffer is
+// absent" (005b), and the console has only ever answered "present".
+// 5 = 3, except a null-resource STRUCTURED view answers 0: the volume passes
+// (5e0c, 1b73) loop `for i < count` over StructuredBuffer<Blob52>, and BD5's
+// unchanged fps says their slots are mostly null views, which 3 sends back to
+// 135,084 iterations. Typed/raw nulls, CBVs and textures keep the constant.
+// 6 = 5, and every real count is clamped at 135,084: BD6 counted 1.5 M views
+// whose real count exceeds the console's own bound (max 37,748,736), so a loop
+// could run hundreds of times longer than it ever has here -- the TDR hang in
+// every real-count cell (BD3, BD5, BD6). No loop may outrun the driver's answer.
+static UINT32 GhBdMode(){ static const UINT32 m = GhCfgNumZ(L"gh_bufdims.txt", "GH_BUFDIMS", 0); return m; }
+static const UINT32 kGhBdDrvStruct = 135084u, kGhBdDrvRaw = 147972u;
 struct GhBindlessRoot { UINT res, samp; UINT dims = UINT_MAX; };
 static std::mutex g_ghRsMu;
 static std::map<void*, GhBindlessRoot> g_ghRsBindless;
@@ -14943,6 +14960,19 @@ static volatile LONG g_bdhN = 0;
 static volatile LONG g_bdLast = 0, g_bdAdds = 0;
 static std::mutex g_bdAddMu;
 static volatile LONG64 g_bdPuts = 0, g_bdNonzero = 0, g_bdCopies = 0, g_bdNoBind = 0, g_bdRecycled = 0;
+// Where the zeros come from: a put into a heap we have no table for, a copy whose
+// source we have no table for (slots), a null-resource buffer view.
+static volatile LONG64 g_bdPutMiss = 0, g_bdCopyMiss = 0, g_bdCopyDstMiss = 0, g_bdNullBuf = 0;
+// What the views say: null views by class, real counts above the driver's constant
+// (a loop that now runs LONGER than it did on the console), and the largest count.
+static volatile LONG64 g_bdNullStruct = 0, g_bdNullTyped = 0, g_bdBig = 0, g_bdMax = 0;
+static void GhBdNote(bool nullRes, UINT32 stride, UINT32 v)
+{
+    if (nullRes){ InterlockedIncrement64(stride ? &g_bdNullStruct : &g_bdNullTyped); return; }
+    if (v > kGhBdDrvStruct) InterlockedIncrement64(&g_bdBig);
+    for (LONG64 m = g_bdMax; (LONG64)v > m; m = g_bdMax)
+        if (InterlockedCompareExchange64(&g_bdMax, (LONG64)v, m) == m) break;
+}
 static GhBdHeap* GhBdFind(UINT64 cpu)
 {
     LONG n = g_bdhN; if (n > kGhBdMax) n = kGhBdMax;
@@ -14995,6 +15025,8 @@ static void GhBdHeapAdd(ID3D12Device* dev, ID3D12DescriptorHeap* h, const D3D12_
     } else {   // a staging table is only ever a copy source; no 64 KB granule each
         vals = (UINT32*)calloc(d->NumDescriptors, 4);
     }
+    if (vals && GhBdMode() >= 3)
+        for (UINT k = 0; k < d->NumDescriptors; ++k) vals[k] = kGhBdDrvStruct;
     if (!vals){
         Diag("BUFDIMS heap vis=" + std::to_string((int)vis) + " num=" + std::to_string((unsigned)d->NumDescriptors) +
              " hr=" + Hex((uint32_t)hr) + " FAILED");
@@ -15031,10 +15063,14 @@ static void GhBdHeapAdd(ID3D12Device* dev, ID3D12DescriptorHeap* h, const D3D12_
              " va=" + Hex(va) + " hr=" + Hex((uint32_t)hr) + " adds=" + std::to_string((long)nb) +
              " recycled=" + std::to_string((long long)g_bdRecycled) + (i >= 0 ? " ok" : " FULL"));
 }
+static const UINT32 kGhBdZero = 0xFFFFFFFFu;   // mode 5: a zero that stays zero
 static void GhBdPut(UINT64 cpu, UINT32 v)
 {
     GhBdHeap* h = GhBdFind(cpu);
-    if (!h || !h->inc) return;
+    if (!h || !h->inc){ InterlockedIncrement64(&g_bdPutMiss); return; }
+    if (v == kGhBdZero) v = 0;
+    else if (!v && GhBdMode() >= 3) v = kGhBdDrvStruct;
+    else if (v > kGhBdDrvStruct && GhBdMode() >= 6) v = kGhBdDrvStruct;
     h->vals[(cpu - h->cpu0) / h->inc] = v;
     InterlockedIncrement64(&g_bdPuts);
     if (v) InterlockedIncrement64(&g_bdNonzero);
@@ -15043,24 +15079,27 @@ static void GhBdPut(UINT64 cpu, UINT32 v)
 static void GhBdCopy(UINT64 dst, UINT64 src, UINT n)
 {
     GhBdHeap* hd = GhBdFind(dst);
-    if (!hd || !hd->inc || !n) return;
+    if (!hd || !hd->inc || !n){ if (n) InterlockedIncrement64(&g_bdCopyDstMiss); return; }
     UINT64 di = (dst - hd->cpu0) / hd->inc;
     if (di + n > hd->num) n = (UINT)(hd->num - di);
     GhBdHeap* hs = GhBdFind(src);
     UINT64 si = hs && hs->inc ? (src - hs->cpu0) / hs->inc : 0;
     if (hs && si + n > hs->num) hs = nullptr;
     if (hs) memmove(&hd->vals[di], &hs->vals[si], (size_t)n * 4);
-    else    memset(&hd->vals[di], 0, (size_t)n * 4);
+    else {
+        InterlockedAdd64(&g_bdCopyMiss, (LONG64)n);
+        const UINT32 fill = GhBdMode() >= 3 ? kGhBdDrvStruct : 0u;
+        for (UINT k = 0; k < n; ++k) hd->vals[di + k] = fill;
+    }
     InterlockedIncrement64(&g_bdCopies);
 }
 // gh_bufdims=2 serves the driver's own wrong answers (GETDIMS2: 135084 for a
 // structured view, 147972 for raw and typed) through the table, so a cell can tell
 // the plumbing from the values.
-static UINT32 GhBdMode(){ static const UINT32 m = GhCfgNumZ(L"gh_bufdims.txt", "GH_BUFDIMS", 0); return m; }
 static UINT32 GhBdSrvVal(const D3D12_SHADER_RESOURCE_VIEW_DESC* d)
 {
     if (!d || d->ViewDimension != D3D12_SRV_DIMENSION_BUFFER) return 0;
-    if (GhBdMode() == 2) return d->Buffer.StructureByteStride ? 135084u : 147972u;
+    if (GhBdMode() == 2) return d->Buffer.StructureByteStride ? kGhBdDrvStruct : kGhBdDrvRaw;
     UINT64 n = d->Buffer.NumElements;
     if (d->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) n *= 4;   // ByteAddressBuffer answers bytes
     return n > 0xFFFFFFFFull ? 0xFFFFFFFFu : (UINT32)n;
@@ -15068,7 +15107,7 @@ static UINT32 GhBdSrvVal(const D3D12_SHADER_RESOURCE_VIEW_DESC* d)
 static UINT32 GhBdUavVal(const D3D12_UNORDERED_ACCESS_VIEW_DESC* d)
 {
     if (!d || d->ViewDimension != D3D12_UAV_DIMENSION_BUFFER) return 0;
-    if (GhBdMode() == 2) return d->Buffer.StructureByteStride ? 135084u : 147972u;
+    if (GhBdMode() == 2) return d->Buffer.StructureByteStride ? kGhBdDrvStruct : kGhBdDrvRaw;
     UINT64 n = d->Buffer.NumElements;
     if (d->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) n *= 4;
     return n > 0xFFFFFFFFull ? 0xFFFFFFFFu : (UINT32)n;
@@ -15441,7 +15480,15 @@ static void __stdcall Hook_D12CreateSRV(ID3D12Device* self, ID3D12Resource* res,
     const D3D12_SHADER_RESOURCE_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE dest)
 {
     GhSrvBufLog(d, res);   // #236 PROF7
-    if (GhBufDimsOn()) GhBdPut((UINT64)dest.ptr, GhBdSrvVal(d));
+    if (GhBufDimsOn()){
+        UINT32 v = GhBdSrvVal(d);
+        if (d && d->ViewDimension == D3D12_SRV_DIMENSION_BUFFER){
+            if (!res) InterlockedIncrement64(&g_bdNullBuf);
+            GhBdNote(!res, d->Buffer.StructureByteStride, v);
+            if (!res && d->Buffer.StructureByteStride && GhBdMode() >= 5) v = kGhBdZero;
+        }
+        GhBdPut((UINT64)dest.ptr, v);
+    }
     GhGpSrvNote(res);   // #235
     GhGpDescNote((UINT64)dest.ptr, res);
     if (GhDescTrackOn() || GhVaCheckOn()){
@@ -15461,7 +15508,15 @@ static void __stdcall Hook_D12CreateUAV(ID3D12Device* self, ID3D12Resource* res,
     ID3D12Resource* counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC* d,
     D3D12_CPU_DESCRIPTOR_HANDLE dest)
 {
-    if (GhBufDimsOn()) GhBdPut((UINT64)dest.ptr, GhBdUavVal(d));
+    if (GhBufDimsOn()){
+        UINT32 v = GhBdUavVal(d);
+        if (d && d->ViewDimension == D3D12_UAV_DIMENSION_BUFFER){
+            if (!res) InterlockedIncrement64(&g_bdNullBuf);
+            GhBdNote(!res, d->Buffer.StructureByteStride, v);
+            if (!res && d->Buffer.StructureByteStride && GhBdMode() >= 5) v = kGhBdZero;
+        }
+        GhBdPut((UINT64)dest.ptr, v);
+    }
     if (GhDescTrackOn() || GhVaCheckOn()){
         if (d && d->ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
             GhDescPut((UINT64)dest.ptr, res, 3, (unsigned)d->Format, 0, d->Buffer.FirstElement,
@@ -16610,7 +16665,16 @@ static void GhBindBindlessTables(ID3D12GraphicsCommandList* self, GhCLNote* nt)
                       " puts=" + std::to_string((long long)g_bdPuts) +
                       " nonzero=" + std::to_string((long long)g_bdNonzero) +
                       " copies=" + std::to_string((long long)g_bdCopies) +
-                      " nobind=" + std::to_string((long long)g_bdNoBind) : std::string()));
+                      " nobind=" + std::to_string((long long)g_bdNoBind) +
+                      " putmiss=" + std::to_string((long long)g_bdPutMiss) +
+                      " copymiss=" + std::to_string((long long)g_bdCopyMiss) +
+                      " dstmiss=" + std::to_string((long long)g_bdCopyDstMiss) +
+                      " nullbuf=" + std::to_string((long long)g_bdNullBuf) +
+                      " nullS=" + std::to_string((long long)g_bdNullStruct) +
+                      " nullT=" + std::to_string((long long)g_bdNullTyped) +
+                      " big=" + std::to_string((long long)g_bdBig) +
+                      " max=" + std::to_string((long long)g_bdMax) +
+                      " mode=" + std::to_string((unsigned)GhBdMode()) : std::string()));
     }
 }
 static void __stdcall Hook_CLSetGfxTable(ID3D12GraphicsCommandList* self, UINT idx,
@@ -19868,6 +19932,7 @@ static std::string GhGpuProgress()
     }
     ReleaseSRWLockShared(&g_waitLock);
     s += GhProgState();
+    s += GhGpQState();
     return s;
 }
 
@@ -22253,6 +22318,23 @@ static ID3D12GraphicsCommandList* g_gpCl = nullptr;
 static ID3D12Fence*               g_gpCopyF = nullptr;
 static HANDLE                     g_gpCopyEv = nullptr;
 static UINT64                     g_gpCopyV = 0;                 // g_gpLk held
+// #236 BD11. The guest's queues wait on g_gpMapFence (GhGpBeforeSubmit), so a stalled
+// pager queue blocks every one of them, and the heartbeat's own fence list (the game's)
+// cannot show it. Read without g_gpLk: GetCompletedValue is safe to call at any time, and
+// this runs from the watchdog while the device may already be gone.
+static std::string GhGpQState()
+{
+    if (!g_gpMapFence) return "";
+    const UINT64 mv = (UINT64)InterlockedCompareExchange64(&g_gpMapV, 0, 0);
+    const UINT64 md = g_gpMapFence->GetCompletedValue();
+    std::string s = " | gpq map=" + std::to_string((unsigned long long)md) + "/" + std::to_string((unsigned long long)mv) +
+                    (md < mv ? "!" : "");
+    if (g_gpCopyF){
+        const UINT64 cv = g_gpCopyV, cd = g_gpCopyF->GetCompletedValue();
+        s += " copy=" + std::to_string((unsigned long long)cd) + "/" + std::to_string((unsigned long long)cv) + (cd < cv ? "!" : "");
+    }
+    return s;
+}
 static ID3D12Resource*            g_gpRb = nullptr;
 static ID3D12Resource*            g_gpUp = nullptr;
 static uint8_t*                   g_gpRbP = nullptr;
@@ -37103,6 +37185,222 @@ static void GhRipCensus(const char* why, unsigned forceWords = 0)
     if (!out.empty()) Diag(out);
 }
 
+// #236 CPUPROF. BD13 ran the world at 2.2-3.6 game fps with both volume passes stood in,
+// where PROF5 leaves ~22 ms/present of GPU work, so most of the frame is somewhere on the
+// CPU. The RIP census above prints every thread's state once; this one accumulates. Every
+// gh_cpu_prof ms it samples each thread's RIP (the census's rule: nothing allocates while
+// a thread is suspended), and every 20 s it prints where the busy samples landed. "Busy"
+// excludes a thread parked in a syscall (RIP just after 0F 05 in a module), which is how
+// ntdll's wait stubs look. Buckets are 64 bytes of code, named afterwards with everything
+// running. MAIN = the guest's main thread, PRES = the thread that last presented.
+// 0.0.587.0: BD14 put MAIN in a syscall for 65% of its samples, and a RIP says nothing
+// about who is waiting. MAIN and PRES get their stack copied while suspended (the census's
+// rule again: no unwinding, no loader lock, nothing that allocates), and the copy is
+// unwound after ResumeThread. Frame pointers into the copied window are relocated; a frame
+// with no unwind data is only trusted as the leaf (the ntdll syscall stubs).
+static int GhUnwindCopy(CONTEXT c, const uint8_t* stk, uint64_t lo, size_t len, uint64_t* out, int cap)
+{
+    const int64_t off = (int64_t)(uintptr_t)stk - (int64_t)lo;
+    auto inReal = [&](uint64_t a){ return a >= lo && a + 8 <= lo + len; };
+    auto inCopy = [&](uint64_t a){ return a >= (uint64_t)(uintptr_t)stk && a + 8 <= (uint64_t)(uintptr_t)stk + len; };
+    int n = 0;
+    c.Rsp += off; if (inReal(c.Rbp)) c.Rbp += off;
+    __try {
+        while (n < cap && c.Rip && inCopy(c.Rsp)){
+            out[n++] = c.Rip;
+            const DWORD64 prev = c.Rsp; DWORD64 ib = 0;
+            PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &ib, nullptr);
+            if (!rf){
+                if (n != 1) break;
+                c.Rip = *(const DWORD64*)c.Rsp; c.Rsp += 8;
+            } else {
+                PVOID hd = nullptr; DWORD64 est = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, ib, c.Rip, rf, &c, &hd, &est, nullptr);
+                if (inReal(c.Rbp)) c.Rbp += off;
+            }
+            if (c.Rsp <= prev) break;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    return n;
+}
+
+static void GhCpuProfLoop(unsigned ms)
+{
+    const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+    const size_t kMax = 1u << 18;
+    struct Smp { DWORD tid; uint64_t rip; };
+    Smp* buf = (Smp*)VirtualAlloc(nullptr, kMax * sizeof(Smp), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!buf){ Diag("CPUPROF alloc failed"); return; }
+    std::vector<DWORD> tids; tids.reserve(256);
+    size_t n = 0; unsigned ticks = 0;
+    const size_t kStk = 64 * 1024, kChMax = 8192; const int kChF = 24;
+    struct Chain { DWORD tid; uint8_t nf; uint64_t f[24]; };
+    uint8_t* stk = (uint8_t*)VirtualAlloc(nullptr, kStk, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    Chain* chains = (Chain*)VirtualAlloc(nullptr, kChMax * sizeof(Chain), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!stk || !chains){ Diag("CPUPROF chain alloc failed"); return; }
+    size_t nch = 0; DWORD hotT = 0;   // the previous window's busiest non-MAIN/PRES thread
+    const uintptr_t ldrLo = (uintptr_t)GetModuleHandleW(nullptr);
+    const uintptr_t ldrHi = ldrLo + ((IMAGE_NT_HEADERS*)(ldrLo + ((IMAGE_DOS_HEADER*)ldrLo)->e_lfanew))->OptionalHeader.SizeOfImage;
+    ULONGLONG t0 = GetTickCount64();
+    Diag("CPUPROF on, every " + std::to_string(ms) + " ms");
+    while (!g_guestDone){
+        tids.clear();
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap != INVALID_HANDLE_VALUE){
+            THREADENTRY32 te{}; te.dwSize = sizeof te;
+            if (Thread32First(snap, &te)) do {
+                if (te.th32OwnerProcessID == pid && te.th32ThreadID != self) tids.push_back(te.th32ThreadID);
+            } while (Thread32Next(snap, &te));
+            CloseHandle(snap);
+        }
+        const DWORD mainNow = g_guestWorkerTid, presNow = (DWORD)InterlockedCompareExchange(&g_presentTid, 0, 0);
+        for (DWORD tid : tids){
+            if (n >= kMax) break;
+            HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, tid);
+            if (!h) continue;
+            const bool deep = (tid == mainNow || tid == presNow || tid == hotT) && nch < kChMax;
+            if (SuspendThread(h) != (DWORD)-1){
+                CONTEXT c{}; c.ContextFlags = deep ? CONTEXT_FULL : CONTEXT_CONTROL;
+                const bool got = GetThreadContext(h, &c) != 0;
+                if (got){ buf[n].tid = tid; buf[n].rip = c.Rip; ++n; }
+                size_t have = 0; uint64_t lo = c.Rsp & ~0xFull;
+                if (got && deep){
+                    // Page by page: the read stops at the stack base instead of failing whole.
+                    uint64_t a = lo;
+                    while (have < kStk){
+                        const size_t want = (size_t)std::min<uint64_t>(0x1000 - (a & 0xFFF), kStk - have);
+                        SIZE_T rd = 0;
+                        if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)a, stk + have, want, &rd) || rd != want) break;
+                        have += want; a += want;
+                    }
+                }
+                ResumeThread(h);
+                if (got && deep && have >= 64){
+                    Chain& ch = chains[nch++];
+                    ch.tid = tid; ch.nf = (uint8_t)GhUnwindCopy(c, stk, lo, have, ch.f, kChF);
+                }
+            }
+            CloseHandle(h);
+        }
+        ++ticks;
+        const ULONGLONG now = GetTickCount64();
+        if (now - t0 >= 20000 && n){
+            // Everything runs again: classify, bucket, name.
+            std::vector<GhModRange> mods; GhSnapModRanges(mods);
+            const DWORD mainT = g_guestWorkerTid, presT = (DWORD)InterlockedCompareExchange(&g_presentTid, 0, 0);
+            std::unordered_map<uint64_t, unsigned> bucket, bucketMain, bucketPres;
+            std::unordered_map<DWORD, std::pair<unsigned, unsigned>> perT;   // busy, total
+            unsigned busy = 0;
+            for (size_t i = 0; i < n; ++i){
+                const uint64_t r = buf[i].rip;
+                bool sys = false;
+                if (r >= 2 && GhInAnyMod(mods, (uintptr_t)r - 2)){
+                    unsigned char b[2]{}; SIZE_T got = 0;
+                    if (ReadProcessMemory(GetCurrentProcess(), (LPCVOID)(r - 2), b, 2, &got) && got == 2)
+                        sys = (b[0] == 0x0F && b[1] == 0x05);
+                }
+                auto& pt = perT[buf[i].tid]; ++pt.second;
+                if (sys) continue;
+                ++pt.first; ++busy;
+                const uint64_t k = r & ~0x3Full;
+                ++bucket[k];
+                if (buf[i].tid == mainT) ++bucketMain[k];
+                if (buf[i].tid == presT) ++bucketPres[k];
+            }
+            auto top = [](const std::unordered_map<uint64_t, unsigned>& m, size_t k){
+                std::vector<std::pair<unsigned, uint64_t>> v; v.reserve(m.size());
+                for (auto& e : m) v.push_back({ e.second, e.first });
+                std::sort(v.begin(), v.end(), [](auto& a, auto& b){ return a.first > b.first; });
+                if (v.size() > k) v.resize(k);
+                return v;
+            };
+            std::string out = "CPUPROF window=" + std::to_string((now - t0) / 1000) + "s ticks=" + std::to_string(ticks) +
+                              " samples=" + std::to_string(n) + " busy=" + std::to_string(busy) +
+                              " threads=" + std::to_string(perT.size()) +
+                              " main=" + std::to_string(mainT) + " pres=" + std::to_string(presT);
+            std::vector<std::pair<unsigned, DWORD>> tv;
+            for (auto& e : perT) tv.push_back({ e.second.first, e.first });
+            std::sort(tv.begin(), tv.end(), [](auto& a, auto& b){ return a.first > b.first; });
+            for (size_t i = 0; i < tv.size() && i < 12; ++i)
+                out += "\n  CPUT tid=" + std::to_string(tv[i].second) +
+                       (tv[i].second == mainT ? " MAIN" : tv[i].second == presT ? " PRES" : "") +
+                       " busy=" + std::to_string(tv[i].first) + "/" + std::to_string(perT[tv[i].second].second);
+            for (auto& e : top(bucket, 30))
+                out += "\n  CPUB all n=" + std::to_string(e.first) + " " + NameForCodeAddr((uintptr_t)e.second);
+            for (auto& e : top(bucketMain, 12))
+                out += "\n  CPUB main n=" + std::to_string(e.first) + " " + NameForCodeAddr((uintptr_t)e.second);
+            if (presT != mainT)
+                for (auto& e : top(bucketPres, 12))
+                    out += "\n  CPUB pres n=" + std::to_string(e.first) + " " + NameForCodeAddr((uintptr_t)e.second);
+            Diag(out);
+            // Chains: who owns each MAIN/PRES sample. The owner is the first frame, leaf
+            // upwards, inside our loader (LDR) or the guest EXE; a wait under an LDR frame
+            // is ours even when the leaf is ntdll or the driver.
+            const uintptr_t gLo = (uintptr_t)g_guestImageBase, gHi = gLo + g_guestImageSize;
+            DWORD nextHot = 0;
+            for (auto& e : tv) if (e.second != mainT && e.second != presT){ nextHot = e.second; break; }
+            for (int who = 0; who < 3; ++who){
+                const DWORD t = who == 2 ? hotT : who ? presT : mainT;
+                if (!t || (who == 1 && presT == mainT) || (who == 2 && (hotT == mainT || hotT == presT))) continue;
+                const std::string wn = who == 2 ? "HOT" + std::to_string(hotT) : who ? "PRES" : "MAIN";
+                unsigned tot = 0, sysN = 0, sysL = 0, sysG = 0, busL = 0, busG = 0, busO = 0;
+                std::map<std::pair<uint64_t, uint64_t>, std::pair<unsigned, size_t>> own;   // (sys|owner, caller) -> n, example
+                for (size_t i = 0; i < nch; ++i){
+                    const Chain& ch = chains[i];
+                    if (ch.tid != t || !ch.nf) continue;
+                    ++tot;
+                    const uint64_t r = ch.f[0];
+                    bool sys = false;
+                    if (r >= 2 && GhInAnyMod(mods, (uintptr_t)r - 2)){
+                        unsigned char b[2]{}; SIZE_T got = 0;
+                        if (ReadProcessMemory(GetCurrentProcess(), (LPCVOID)(r - 2), b, 2, &got) && got == 2)
+                            sys = (b[0] == 0x0F && b[1] == 0x05);
+                    }
+                    int oi = -1; bool ldr = false;
+                    for (int k = 0; k < ch.nf; ++k){
+                        const uintptr_t a = (uintptr_t)ch.f[k];
+                        if (a >= ldrLo && a < ldrHi){ oi = k; ldr = true; break; }
+                        if (gLo && a >= gLo && a < gHi){ oi = k; break; }
+                    }
+                    if (sys){ ++sysN; if (oi >= 0) (ldr ? sysL : sysG)++; }
+                    else if (oi < 0) ++busO; else (ldr ? busL : busG)++;
+                    const uint64_t o = oi >= 0 ? ch.f[oi] : ch.f[ch.nf - 1];
+                    const uint64_t up = (oi >= 0 && oi + 1 < ch.nf) ? ch.f[oi + 1] : 0;
+                    auto& e = own[{ o | (sys ? 1ull << 63 : 0), up }];
+                    if (!e.first) e.second = i;
+                    ++e.first;
+                }
+                std::string o2 = "CPUCH " + wn + " chains=" + std::to_string(tot) +
+                    " sys=" + std::to_string(sysN) + " (underLDR=" + std::to_string(sysL) + " underGUEST=" + std::to_string(sysG) +
+                    ") busy=" + std::to_string(tot - sysN) + " (underLDR=" + std::to_string(busL) + " underGUEST=" + std::to_string(busG) +
+                    " none=" + std::to_string(busO) + ")";
+                std::vector<std::pair<unsigned, std::pair<std::pair<uint64_t, uint64_t>, size_t>>> v;
+                for (auto& e : own) v.push_back({ e.second.first, { e.first, e.second.second } });
+                std::sort(v.begin(), v.end(), [](auto& a, auto& b){ return a.first > b.first; });
+                for (size_t k = 0; k < v.size() && k < 16; ++k){
+                    const Chain& ex = chains[v[k].second.second];
+                    const bool sys = (v[k].second.first.first >> 63) != 0;
+                    o2 += "\n  CPUC " + wn + " n=" + std::to_string(v[k].first) + (sys ? " SYS" : " RUN") +
+                          " leaf=" + NameForCodeAddr((uintptr_t)ex.f[0]);
+                    int oi = ex.nf - 1;
+                    for (int j = 0; j < ex.nf; ++j){
+                        const uintptr_t a = (uintptr_t)ex.f[j];
+                        if ((a >= ldrLo && a < ldrHi) || (gLo && a >= gLo && a < gHi)){ oi = j; break; }
+                    }
+                    for (int j = 1; j < ex.nf && j <= oi + 3; ++j){
+                        if (j == 4 && oi > 6){ o2 += " <- ..."; j = oi - 1; continue; }
+                        o2 += " <- " + NameForCodeAddr((uintptr_t)ex.f[j]);
+                    }
+                }
+                Diag(o2);
+            }
+            nch = 0; hotT = nextHot;
+            n = 0; ticks = 0; t0 = now;
+        }
+        Sleep(ms);
+    }
+}
+
 // The first version of this walked every thread in the process each tick. With
 // ~58 threads the suspend/resume traffic alone made a "700 ms" cadence run at
 // several seconds, so it produced ONE stack in a 20 s window and missed the end
@@ -37374,6 +37672,10 @@ static void SnapshotHostThreads()
                 if (!ms) return;
                 Diag("RIPCENSUS on, every " + std::to_string(ms) + " ms");
                 while (!g_guestDone){ GhRipCensus("tick"); Sleep(ms); }
+            }).detach();
+            std::thread([]{
+                const unsigned ms = (unsigned)GhCfgNum(L"gh_cpu_prof.txt", "GH_CPU_PROF", 0);   // #236
+                if (ms) GhCpuProfLoop(ms);
             }).detach();
             // patch j (#233 SPILL10): the app stalled at frame ~545 and was gone
             // within a minute with no exception and no exit -- nothing sampled
