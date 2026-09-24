@@ -5169,6 +5169,68 @@ static unsigned GhRawInput();
 // scored on and the pager has to be visible in it.
 static std::string GhPagerFrameLine();
 
+// #202 DoD instrument. WDP's /ext/screenshot returns 500 "Failed to take
+// screenshot" for the whole of PROF5's world phase (GPU saturated at ~190 ms per
+// present), so the "stick changes the frame" clause had no evidence. This grabs
+// the frame ourselves: when LocalState\gh_snap.txt exists (checked once a second),
+// the back buffer -- after the guest copy, before the cursor and overlay -- goes
+// through a staging texture into LocalState\gh_snap.bmp (480x270, 24-bit, ~380 KB,
+// written as .tmp then renamed), and the request file is deleted. The Map waits
+// for the GPU once per grab; nothing happens on any other present.
+static void GhSnapMaybe(ID3D11Resource* bb)
+{
+    static ULONGLONG last = 0;
+    static LONG seq = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - last < 1000) return;
+    last = now;
+    const std::wstring req = std::wstring(kLocalState) + L"gh_snap.txt";
+    if (GetFileAttributesW(req.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+    DeleteFileW(req.c_str());
+    com_ptr<ID3D11Texture2D> src;
+    if (!bb || FAILED(bb->QueryInterface(__uuidof(ID3D11Texture2D), src.put_void()))){ Diag("SNAP no texture"); return; }
+    D3D11_TEXTURE2D_DESC d{}; src->GetDesc(&d);
+    const bool bgra = d.Format == DXGI_FORMAT_B8G8R8A8_UNORM || d.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    const bool rgba = d.Format == DXGI_FORMAT_R8G8B8A8_UNORM || d.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    if (!bgra && !rgba){ Diag("SNAP unsupported format=" + std::to_string((int)d.Format)); return; }
+    D3D11_TEXTURE2D_DESC sd = d;
+    sd.MipLevels = 1; sd.ArraySize = 1; sd.SampleDesc.Count = 1; sd.SampleDesc.Quality = 0;
+    sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0;
+    com_ptr<ID3D11Texture2D> st;
+    if (FAILED(g_gfx.d11->CreateTexture2D(&sd, nullptr, st.put()))){ Diag("SNAP staging failed"); return; }
+    g_gfx.d11ctx->CopyResource(st.get(), src.get());
+    D3D11_MAPPED_SUBRESOURCE m{};
+    const ULONGLONG t0 = GetTickCount64();
+    if (FAILED(g_gfx.d11ctx->Map(st.get(), 0, D3D11_MAP_READ, 0, &m))){ Diag("SNAP map failed"); return; }
+    const UINT W = 480, H = 270, row = W * 3;
+    std::vector<uint8_t> f(54 + (size_t)row * H);
+    auto put32 = [&](size_t o, uint32_t v){ memcpy(&f[o], &v, 4); };
+    f[0] = 'B'; f[1] = 'M'; put32(2, (uint32_t)f.size()); put32(10, 54); put32(14, 40);
+    put32(18, W); put32(22, H); f[26] = 1; f[28] = 24; put32(34, (uint32_t)(row * H));
+    for (UINT y = 0; y < H; ++y){
+        const uint8_t* sr = (const uint8_t*)m.pData + (size_t)((H - 1 - y) * d.Height / H) * m.RowPitch;
+        uint8_t* o = &f[54 + (size_t)y * row];
+        for (UINT x = 0; x < W; ++x){
+            const uint8_t* px = sr + (size_t)(x * d.Width / W) * 4;
+            o[x * 3 + 0] = bgra ? px[0] : px[2];
+            o[x * 3 + 1] = px[1];
+            o[x * 3 + 2] = bgra ? px[2] : px[0];
+        }
+    }
+    g_gfx.d11ctx->Unmap(st.get(), 0);
+    const std::wstring tmp = std::wstring(kLocalState) + L"gh_snap.tmp";
+    const std::wstring out = std::wstring(kLocalState) + L"gh_snap.bmp";
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    DWORD wr = 0;
+    const bool ok = h != INVALID_HANDLE_VALUE && WriteFile(h, f.data(), (DWORD)f.size(), &wr, nullptr) && wr == f.size();
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    const bool mv = ok && MoveFileExW(tmp.c_str(), out.c_str(), MOVEFILE_REPLACE_EXISTING);
+    Diag("SNAP n=" + std::to_string((long)InterlockedIncrement(&seq)) + " present=" +
+         std::to_string((long long)InterlockedCompareExchange64(&g_gprPresents, 0, 0)) +
+         " src=" + std::to_string(d.Width) + "x" + std::to_string(d.Height) + " fmt=" + std::to_string((int)d.Format) +
+         " mapms=" + std::to_string((unsigned long long)(GetTickCount64() - t0)) + " ok=" + std::to_string(mv ? 1 : 0));
+}
+
 static HRESULT GfxPresent(UINT sync)
 {
     GhWatchTick("GfxPresent");
@@ -5341,6 +5403,7 @@ static HRESULT GfxPresent(UINT sync)
             g_gfx.on12->AcquireWrappedResources(src, 1);
             g_gfx.d11ctx->CopyResource(cur[0], src[0]);
             g_gfx.on12->ReleaseWrappedResources(src, 1);
+            GhSnapMaybe(cur[0]);             // #202 DoD: our own frame grab
         } else if (g_gfx.guestRT){
             g_gfx.d11ctx->CopyResource(cur[0], g_gfx.guestRT.get());
         }
@@ -17112,6 +17175,10 @@ static void GhDispLog(ID3D12GraphicsCommandList* self, void* pso, UINT x, UINT y
 {
     static const unsigned cap = GhCfgNumZ(L"gh_disp_log.txt", "GH_DISP_LOG", 0);
     if (!cap) return;
+    // PROF6: the menu alone spent 400 lines; gh_disp_log_at holds the log until that
+    // many frames have been presented (the world starts ~28,800-30,500 in).
+    static const unsigned at = GhCfgNumZ(L"gh_disp_log_at.txt", "GH_DISP_LOG_AT", 0);
+    if (at && InterlockedCompareExchange64(&g_gprPresents, 0, 0) < (LONG64)at) return;
     static volatile LONG64 set[4096];
     static volatile LONG   lines = 0;
     uint64_t h = (uint64_t)(uintptr_t)pso * 0x9E3779B97F4A7C15ull ^ ((uint64_t)x << 42) ^ ((uint64_t)y << 21) ^ z;
