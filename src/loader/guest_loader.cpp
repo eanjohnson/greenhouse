@@ -23173,6 +23173,62 @@ static void GhGpOnFree(void* res)
     ReleaseSRWLockExclusive(&g_gpLk);
     if (ph) ph->Release();   // the occupant's reference on its proxy
 }
+// #236 BD16: a third of MAIN's world samples sat in NtGdiDdDDIDestroyAllocation2
+// under this hook -- the driver's last Release waits in the kernel for the GPU to
+// be done with the allocation. gh_gp_defer_free hands that last Release to a
+// worker: 1 = only resources we converted (their tiles are already back in the
+// pool by GhGpOnFree, so the delay costs no commit), 2 = every resource on the
+// hooked vtable (the vtable is shared with the game's committed/placed ones).
+// We keep the peek reference; the worker drops it. The game sees rc 0 as before.
+// gpfree= counts the final Releases by class and the time the driver spent in
+// them wherever they ran, so the cell attributes the cost with or without the knob.
+static unsigned GhGpDeferFree()
+{ static const unsigned v = GhCfgNumZ(L"gh_gp_defer_free.txt", "GH_GP_DEFER_FREE", 0); return v; }
+static volatile LONG   g_gpFreeOurs = 0, g_gpFreeOther = 0, g_gpDeferQ = 0, g_gpDeferDone = 0, g_gpDeferMax = 0;
+static volatile LONG64 g_gpFreeOursUs = 0, g_gpFreeOtherUs = 0, g_gpDeferUs = 0;
+static SRWLOCK g_gpDeferLk = SRWLOCK_INIT;
+static std::vector<std::pair<IUnknown*, int>>* g_gpDeferList = nullptr;
+static HANDLE g_gpDeferEv = nullptr;
+static DWORD WINAPI GhGpDeferWorker(void*)
+{
+    std::vector<std::pair<IUnknown*, int>> batch;
+    for (;;){
+        WaitForSingleObject(g_gpDeferEv, 50);
+        AcquireSRWLockExclusive(&g_gpDeferLk);
+        if (g_gpDeferList) batch.swap(*g_gpDeferList);
+        ReleaseSRWLockExclusive(&g_gpDeferLk);
+        for (auto& b : batch){
+            const uint64_t t0 = GhNowUs();
+            ((ULONG (__stdcall*)(IUnknown*))g_gpResRel[b.second])(b.first);
+            const uint64_t t1 = GhNowUs();
+            if (t0 && t1 >= t0) InterlockedAdd64(&g_gpDeferUs, (LONG64)(t1 - t0));
+            InterlockedIncrement(&g_gpDeferDone);
+        }
+        batch.clear();
+    }
+}
+// false: the caller does the Release itself (queue could not be set up).
+static bool GhGpDeferPush(IUnknown* self, int i)
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&once, [](PINIT_ONCE, PVOID, PVOID*) -> BOOL {
+        g_gpDeferList = new std::vector<std::pair<IUnknown*, int>>();
+        g_gpDeferList->reserve(4096);
+        g_gpDeferEv = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        HANDLE th = g_gpDeferEv ? CreateThread(nullptr, 0, GhGpDeferWorker, nullptr, 0, nullptr) : nullptr;
+        if (th) CloseHandle(th); else g_gpDeferEv = nullptr;
+        return TRUE;
+    }, nullptr, nullptr);
+    if (!g_gpDeferEv) return false;
+    AcquireSRWLockExclusive(&g_gpDeferLk);
+    g_gpDeferList->emplace_back(self, i);
+    const LONG q = (LONG)g_gpDeferList->size();
+    ReleaseSRWLockExclusive(&g_gpDeferLk);
+    InterlockedIncrement(&g_gpDeferQ);
+    for (LONG m = g_gpDeferMax; q > m && InterlockedCompareExchange(&g_gpDeferMax, q, m) != m; m = g_gpDeferMax) {}
+    SetEvent(g_gpDeferEv);
+    return true;
+}
 static ULONG __stdcall Hook_GpResRelease(IUnknown* self)
 {
     const int i = GhGpVtIdx(self);
@@ -23183,9 +23239,25 @@ static ULONG __stdcall Hook_GpResRelease(IUnknown* self)
     // with the dead one. The peek is AddRef + the driver's own Release.
     const ULONG peek = self->AddRef();
     orig(self);
-    if (peek == 2) GhGpOnFree(self);
+    bool ours = false;
+    if (peek == 2){
+        ours = GhGpFind(self) != nullptr;
+        GhGpOnFree(self);
+        const unsigned df = GhGpDeferFree();
+        if ((df == 1 && ours) || df == 2){
+            if (GhGpDeferPush(self, i)) return 0;   // the worker drops the peek reference
+        }
+    }
+    const uint64_t t0 = peek == 2 ? GhNowUs() : 0;
     const ULONG rc = orig(self);
-    if (rc == 0) GhGpOnFree(self);   // idempotent: covers a peek that raced
+    if (rc == 0){
+        GhGpOnFree(self);   // idempotent: covers a peek that raced
+        const uint64_t t1 = GhNowUs();
+        if (t0 && t1 >= t0){
+            if (ours){ InterlockedIncrement(&g_gpFreeOurs);  InterlockedAdd64(&g_gpFreeOursUs,  (LONG64)(t1 - t0)); }
+            else     { InterlockedIncrement(&g_gpFreeOther); InterlockedAdd64(&g_gpFreeOtherUs, (LONG64)(t1 - t0)); }
+        }
+    }
     return rc;
 }
 static D3D12_RESOURCE_DESC* __stdcall Hook_GpResGetDesc(ID3D12Resource* self, D3D12_RESOURCE_DESC* out)
@@ -23504,6 +23576,16 @@ static std::string GhGpFrameLine()
            "/" + std::to_string((long)InterlockedCompareExchange(&g_gpFull, 0, 0)) +
            "/" + std::to_string((long)InterlockedCompareExchange(&g_gpFail, 0, 0)) +
            " gpalias=" + std::to_string((long)InterlockedCompareExchange(&g_gpAlias, 0, 0)) +
+           // #236 gpfree=oursN/oursMs/otherN/otherMs (last Releases run inline) gpdefer=mode/queued/done/qmax/workerMs
+           " gpfree=" + std::to_string((long)InterlockedCompareExchange(&g_gpFreeOurs, 0, 0)) +
+           "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpFreeOursUs, 0, 0) / 1000)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpFreeOther, 0, 0)) +
+           "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpFreeOtherUs, 0, 0) / 1000)) +
+           " gpdefer=" + std::to_string(GhGpDeferFree()) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpDeferQ, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpDeferDone, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpDeferMax, 0, 0)) +
+           "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpDeferUs, 0, 0) / 1000)) +
            " gpmaps=" + std::to_string((long)InterlockedCompareExchange(&g_gpMaps, 0, 0)) +
            "/" + std::to_string((long)InterlockedCompareExchange(&g_gpWaits, 0, 0)) +
            " gpms=" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpUs, 0, 0) / 1000)) +
