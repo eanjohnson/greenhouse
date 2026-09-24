@@ -15415,9 +15415,22 @@ static void* GhClOrig(void* self, int slot)
 // ps=... line names their shaders. Off unless gh_gpu_prof.txt is nonzero.
 static void GhCQSignalRaw(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v);
 static unsigned GhGprMode(){ static const unsigned v = GhCfgNumZ(L"gh_gpu_prof.txt", "GH_GPU_PROF", 0); return v; }
+// PROF1/1b/1c all died in the menu load, whose peak runs within ~40 MB of the ceiling,
+// so the profiler must cost nothing there: gh_gpu_prof > 1 arms it only once that
+// many frames have been presented (the world is ~30,000 in; the menu burst ~3,000).
+static bool GhGprArmed()
+{
+    const unsigned m = GhGprMode();
+    if (m <= 1) return m != 0;
+    static volatile LONG armed = 0;
+    if (InterlockedCompareExchange(&armed, 0, 0)) return true;
+    if (InterlockedCompareExchange64(&g_gprPresents, 0, 0) < (LONG64)m) return false;
+    if (InterlockedExchange(&armed, 1) == 0) Diag("GPUPROF armed at present " + std::to_string((unsigned long long)m));
+    return true;
+}
 static const LONG kGprBlk = 1024, kGprBlocks = 256, kGprPerList = 8;
 static const LONG kGprMaxRec = kGprBlk * kGprPerList;
-struct GhGprList { LONG n; LONG closed; LONG blk[kGprPerList]; LONG gen[kGprPerList]; void** rec; };
+struct GhGprList { LONG n; LONG closed; LONG cap; LONG blk[kGprPerList]; LONG gen[kGprPerList]; void** rec; };
 static GhGprList g_gprList[512]{};          // indexed by the GhCLNote slot; a list owns its slot for life
 static ID3D12QueryHeap* g_gprHeap = nullptr;
 static ID3D12Resource*  g_gprRb = nullptr;
@@ -15460,14 +15473,19 @@ static bool GhGprReady(ID3D12GraphicsCommandList* cl)
 // 4 indirect, 5 list start (Reset), 6 list end (Close).
 static void GhGprStamp(ID3D12GraphicsCommandList* self, unsigned kind)
 {
-    if (!GhGprMode()) return;
+    if (!GhGprArmed()) return;
     GhCLNote* n = GhCLFind(self);
     if (!n || (n->type != D3D12_COMMAND_LIST_TYPE_DIRECT && n->type != D3D12_COMMAND_LIST_TYPE_COMPUTE)) return;
     if (!GhGprReady(self)) return;
     GhGprList& g = g_gprList[n - g_clNotes];
     if (g.closed) return;
     if (g.n >= kGprMaxRec){ InterlockedIncrement(&g_gprTrunc); return; }
-    if (!g.rec && !(g.rec = new (std::nothrow) void*[kGprMaxRec])) return;
+    if (g.n >= g.cap){                          // grow a block at a time: 64 KB x every list was ~32 MB
+        void** r = new (std::nothrow) void*[(size_t)(g.cap + kGprBlk)];
+        if (!r) return;
+        if (g.rec){ memcpy(r, g.rec, sizeof(void*) * (size_t)g.n); delete[] g.rec; }
+        g.rec = r; g.cap += kGprBlk;
+    }
     const LONG bi = g.n / kGprBlk, si = g.n % kGprBlk;
     if (si == 0){
         const LONG b = (LONG)((ULONG)(InterlockedIncrement(&g_gprNextBlk) - 1) % (ULONG)kGprBlocks);
@@ -15480,13 +15498,13 @@ static void GhGprStamp(ID3D12GraphicsCommandList* self, unsigned kind)
 }
 static void GhGprReset(ID3D12GraphicsCommandList* self)
 {
-    if (!GhGprMode()) return;
+    if (!GhGprArmed()) return;
     if (GhCLNote* n = GhCLFind(self)){ g_gprList[n - g_clNotes].n = 0; g_gprList[n - g_clNotes].closed = 0; }
     GhGprStamp(self, 5);
 }
 static void GhGprClose(ID3D12GraphicsCommandList* self)
 {
-    if (!GhGprMode()) return;
+    if (!GhGprArmed()) return;
     GhCLNote* n = GhCLFind(self);
     if (!n) return;
     GhGprList& g = g_gprList[n - g_clNotes];
@@ -23931,6 +23949,20 @@ static HRESULT __stdcall Hook_D12CreateCommitted(ID3D12Device* self,
     D3D12_RESOURCE_DESC probeRd{};
     rd = GhFmtProbeDesc(&probeRd, rd);
     HRESULT hr = orig(self, hp, hf, rd, st, cv, riid, pp);
+    // #202 menu-load deaths (LF9, PROF1b/1c, PROF2): a ~300 MB burst lands between two
+    // reserve samples with nothing spilled yet, and the game's own committed buffer
+    // (8-16 MB) is refused -> VMEM box -> GUEST+0x43C635. CreateHeap has retried after
+    // a spill since #233; committed resources never did.
+    if (hr == E_OUTOFMEMORY && rd && GhLazySpillOn()){
+        const D3D12_RESOURCE_ALLOCATION_INFO ai = self->GetResourceAllocationInfo(0, 1, rd);
+        const uint64_t sz = (ai.SizeInBytes && ai.SizeInBytes != UINT64_MAX) ? ai.SizeInBytes : rd->Width;
+        if (GhLazySpillRoom(sz + (64ull << 20), "committed")){
+            hr = orig(self, hp, hf, rd, st, cv, riid, pp);
+            static LONG nr = 0;
+            if (InterlockedIncrement(&nr) <= 32)
+                Diag("D3D12 CreateCommittedResource RETRY after spill size=" + Hex(sz) + " hr=" + Hex((uint32_t)hr));
+        }
+    }
     if (SUCCEEDED(hr) && pp && *pp) GhRtAuditCreate(*pp, auditRd, didStrip);
     if (SUCCEEDED(hr) && pp && *pp) GhVaRegister((ID3D12Resource*)*pp, rd);
     if (SUCCEEDED(hr) && pp && *pp) GhRtDsRecord((ID3D12Resource*)*pp, rd, st);
