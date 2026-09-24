@@ -17104,10 +17104,37 @@ static void __stdcall Hook_CLDrawIndexed(ID3D12GraphicsCommandList* self, UINT a
     if (GhCLNote* nn = GhCLFind(self)) InterlockedIncrement(&nn->iIdraws);  // #158 issued-side
     GhBreadcrumbAfter(self, bcg);
 }
+// #236 PROF5: two 8x8x8 compute pipelines (cs 5e0c7990, 1b73b93c) are 69% of the
+// world's GPU time, and their cost is groups x a per-thread loop. gh_disp_log = N
+// prints each distinct (pipeline, x, y, z) once, up to N lines, so the group counts
+// can be read against the profiler's ms. Lock-free open-addressed set; 0 = off.
+static void GhDispLog(ID3D12GraphicsCommandList* self, void* pso, UINT x, UINT y, UINT z)
+{
+    static const unsigned cap = GhCfgNumZ(L"gh_disp_log.txt", "GH_DISP_LOG", 0);
+    if (!cap) return;
+    static volatile LONG64 set[4096];
+    static volatile LONG   lines = 0;
+    uint64_t h = (uint64_t)(uintptr_t)pso * 0x9E3779B97F4A7C15ull ^ ((uint64_t)x << 42) ^ ((uint64_t)y << 21) ^ z;
+    h |= 1;
+    for (unsigned i = 0, k = (unsigned)(h >> 52); i < 64; ++i, k = (k + 1) & 4095){
+        const LONG64 v = InterlockedCompareExchange64(&set[k], (LONG64)h, 0);
+        if (v == (LONG64)h) return;                       // seen
+        if (v == 0){
+            const LONG n = InterlockedIncrement(&lines);
+            if ((unsigned)n <= cap)
+                Diag("DISPSZ pso=" + Hex((uint64_t)(uintptr_t)pso) + " groups=" + std::to_string((unsigned long)x) +
+                     "," + std::to_string((unsigned long)y) + "," + std::to_string((unsigned long)z) +
+                     " cl=" + Hex((uint64_t)(uintptr_t)self) + " frame=" +
+                     std::to_string((long long)InterlockedCompareExchange64(&g_gprPresents, 0, 0)));
+            return;
+        }
+    }
+}
 static void __stdcall Hook_CLDispatch(ID3D12GraphicsCommandList* self, UINT x, UINT y, UINT z)
 {
     GhBarrFlushPending(self);
     if (GhCLNote* n = GhCLFind(self)) InterlockedIncrement(&n->disp);
+    if (GhCLNote* n = GhCLFind(self)) GhDispLog(self, n->lastPso, x, y, z);
     const LONG wi = GhWorkIndex(self);
     if (GhCLTraceOn()) GhCLOp(self, "w=" + std::to_string((long)wi) +
                                     " DISPATCH " + std::to_string((unsigned long)x) + "," +
@@ -31299,6 +31326,8 @@ static volatile LONG            g_spillGuardHits = 0;
 static volatile LONG            g_spillGuardFail = 0;
 static volatile LONG            g_spillArmed     = 0;
 static volatile LONG            g_spillRooms     = 0;       // GhLazySpillRoom calls
+static volatile LONG            g_spillFast      = 0;       // #202 PROF4: reserve-watcher rooms
+static volatile LONG64          g_spillFastMinMB = -1;      // lowest remaining budget the watcher saw
 static volatile LONG            g_spillRoomFault = 0;       //   ... of which from the fault/materialise paths
 static volatile LONG            g_spillRoomShort = 0;       //   ... that could not free what was asked
 static volatile LONG            g_spillRetryOk   = 0;       // commits that succeeded only after making room
@@ -32202,6 +32231,8 @@ static std::string GhLazyStats()
              " spillrooms=" + std::to_string((long)InterlockedCompareExchange(&g_spillRooms, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_spillRoomFault, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_spillRoomShort, 0, 0)) +
+             " spillfast=" + std::to_string((long)InterlockedCompareExchange(&g_spillFast, 0, 0)) +
+             "/" + std::to_string((long long)InterlockedCompareExchange64(&g_spillFastMinMB, 0, 0)) +
              " spillretry=" + std::to_string((long)InterlockedCompareExchange(&g_spillRetryOk, 0, 0)) +
              " spillfail=" + std::to_string((long)InterlockedCompareExchange(&g_spillEvictFail, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_spillIoFail, 0, 0)) +
@@ -32945,6 +32976,47 @@ static void GhLazySpillHookNtRead()
     }
 }
 
+// #202 PROF4. The reserve below is only enforced once per MEMORY sample, every
+// 3 s, and the menu->world load moved appused 4,249 -> 4,801 MB inside one of
+// them (the guest touching ~480 MB of its own pool promises). The next step ran
+// the container dry inside newbe's NB_CompilePipeline: scdxil threw bad_alloc and
+// the device was removed with 0x887A0020 -- a victim no retry can reach. So the
+// reserve gets its own watcher at gh_spill_poll_ms (default 100; 0 = off): it only
+// reads the cached budget, and spills only when the reserve is actually short.
+// The aging slice stays on the sampler.
+static void GhLazySpillWatchStart()
+{
+    static volatile LONG started = 0;
+    if (InterlockedExchange(&started, 1)) return;
+    const unsigned ms = GhCfgNumZ(L"gh_spill_poll_ms.txt", "GH_SPILL_POLL_MS", 100);
+    if (!ms) return;
+    std::thread([ms]{
+        while (!g_guestDone){
+            Sleep(ms);
+            if (!GhLazySpillOn() || InterlockedCompareExchange(&g_lazyCount, 0, 0) == 0) continue;
+            uint64_t used = 0, lim = 0;
+            GhAppBudget(&used, &lim);
+            if (!lim) continue;
+            const uint64_t rem = used < lim ? lim - used : 0;
+            const LONG64 remMB = (LONG64)(rem >> 20);
+            LONG64 cur = InterlockedCompareExchange64(&g_spillFastMinMB, 0, 0);
+            while ((cur < 0 || remMB < cur) &&
+                   InterlockedCompareExchange64(&g_spillFastMinMB, remMB, cur) != cur)
+                cur = InterlockedCompareExchange64(&g_spillFastMinMB, 0, 0);
+            if (rem >= g_lazySpill) continue;
+            const LONG n = InterlockedIncrement(&g_spillFast);
+            const uint64_t b0 = (uint64_t)InterlockedCompareExchange64(&g_spillBytes, 0, 0);
+            const uint64_t t0 = GetTickCount64();
+            const bool room = GhLazySpillRoom(g_lazySpill - rem + (32ull << 20), "reserve-fast");
+            const uint64_t b1 = (uint64_t)InterlockedCompareExchange64(&g_spillBytes, 0, 0);
+            if (n <= 64 || (n % 64) == 0)
+                Diag("LAZYSPILL fast n=" + std::to_string((long)n) + " remaining=" + Hex(rem) +
+                     " freed=" + Hex(b1 > b0 ? b1 - b0 : 0) + " room=" + std::to_string(room ? 1 : 0) +
+                     " ms=" + std::to_string((unsigned long long)(GetTickCount64() - t0)));
+        }
+    }).detach();
+}
+
 // Sampler thread, once per MEMORY sample. Two jobs: age a slice (drop up to
 // 4,096 committed granules from the working set, from the aging hand -- 256 MB
 // at 64 KB, so the whole set is re-aged every ~7 samples) and keep the reserve
@@ -32953,6 +33025,7 @@ static void GhLazySpillHookNtRead()
 static void GhLazySpillReserve()
 {
     if (!GhLazySpillOn()) return;
+    GhLazySpillWatchStart();
     GhLazySpillHookNtRead();
     if (InterlockedCompareExchange(&g_lazyCount, 0, 0) == 0) return;
     const uint64_t t0 = GetTickCount64();
