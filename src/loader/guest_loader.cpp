@@ -31041,6 +31041,7 @@ static volatile LONG            g_spillRoomFault = 0;       //   ... of which fr
 static volatile LONG            g_spillRoomShort = 0;       //   ... that could not free what was asked
 static volatile LONG            g_spillRetryOk   = 0;       // commits that succeeded only after making room
 static volatile LONG64          g_spillMs        = 0;
+static volatile LONG64          g_spillRsUs      = 0;   // LOOPFOLD9: guest-thread time inside fault restores
 static volatile LONG            g_spillLogs      = 0;
 static volatile LONG            g_spillRecommit  = 0;       // spilled granules restored under a guest MEM_COMMIT
 static volatile LONG            g_spillNtRead    = 0;       // NtReadFile buffers Materialise had to repair
@@ -31233,6 +31234,12 @@ static uint64_t GhLazyEvictOne(GhLazyRange& r, LONG bit);
 static bool     GhLazyRestoreLocked(uint8_t* p, uint64_t g, DWORD prot, LONG* bits, LONG* spilled,
                                     uint32_t* slot, LONG* back, LONG bit, bool lockHeld, GhLazyRange* rr = nullptr);
 static bool     GhLazySpillRoomLocked(uint64_t need, const char* why, bool count);
+// LOOPFOLD8/9: a room made with g_lazyLock already held (fault, restore,
+// materialise) blocks every exclusive waiter -- and, through the SRW convoy,
+// every later fault on every thread -- for its whole disk time. So it asks for
+// one granule plus 8 MB (~0.1 s to D:), not 64 MB (~0.8 s); the sampler's
+// chunked reserve does the bulk with the lock dropped between chunks.
+static const uint64_t kGhLockedRoomPad = 8ull << 20;
 static bool     GhLazySpillRoom(uint64_t need, const char* why);           // patch i: GhPhRestore needs it early
 
 // #213. `lazysaved` is the container's only free variable -- appused + lazysaved
@@ -31673,7 +31680,11 @@ static bool GhLazyFault(void* addr, const CONTEXT* ctx)
             while (_interlockedbittestandset(busy, bit)){ YieldProcessor(); SwitchToThread(); }
         }
         if (spilled[bit / 32] & (1L << (bit % 32))){
+            LARGE_INTEGER q0{}, q1{}, qf{};
+            QueryPerformanceCounter(&q0);
             const bool ok = GhLazyRestoreLocked(base, gsize, prot, bits, spilled, slot, back, bit, true, rr);
+            if (QueryPerformanceCounter(&q1) && QueryPerformanceFrequency(&qf) && qf.QuadPart && q1.QuadPart > q0.QuadPart)
+                InterlockedExchangeAdd64(&g_spillRsUs, (LONG64)((q1.QuadPart - q0.QuadPart) * 1000000 / qf.QuadPart));
             _interlockedbittestandreset(busy, bit);
             ReleaseSRWLockShared(&g_lazyLock);
             if (!ok){ InterlockedIncrement(&g_lazyFailed); return false; }
@@ -31694,7 +31705,7 @@ static bool GhLazyFault(void* addr, const CONTEXT* ctx)
         bool again = false;
         if (g_lazySpill){
             InterlockedIncrement(&g_spillRoomFault);
-            const bool room = spilled ? GhLazySpillRoomLocked(gsize + (64ull << 20), "fault", true)
+            const bool room = spilled ? GhLazySpillRoomLocked(gsize + kGhLockedRoomPad, "fault", true)
                                       : GhLazySpillRoom(gsize + (64ull << 20), "fault");
             if (room) again = phr ? GhPhCommitGranule(base, prot)
                                   : VirtualAlloc(base, (SIZE_T)gsize, MEM_COMMIT, prot) != nullptr;
@@ -31758,7 +31769,7 @@ static bool GhLazyMaterialise(const void* addr, SIZE_T size)
                         // patch j: the retry went through plain VirtualAlloc, which a
                         // placeholder refuses -- so a placeholder range could never be
                         // rescued under commit pressure.
-                        if (GhLazySpillRoomLocked(g + (64ull << 20), "materialise", true))
+                        if (GhLazySpillRoomLocked(g + kGhLockedRoomPad, "materialise", true))
                             ok = r.ph ? GhPhCommitGranule(r.base + o, r.prot, "materialise-retry")
                                       : VirtualAlloc(r.base + o, (SIZE_T)g, MEM_COMMIT, r.prot) != nullptr;
                         if (ok) InterlockedIncrement(&g_spillRetryOk);
@@ -31886,6 +31897,7 @@ static std::string GhLazyStats()
         sp = " lazyspilled=" + Hex((uint64_t)InterlockedCompareExchange64(&g_spillBytes, 0, 0)) +
              " spillev=" + std::to_string((long)InterlockedCompareExchange(&g_spillEvicts, 0, 0)) +
              " spillrs=" + std::to_string((long)InterlockedCompareExchange(&g_spillRestores, 0, 0)) +
+             " spillrsms=" + std::to_string((long long)(InterlockedCompareExchange64(&g_spillRsUs, 0, 0) / 1000)) +
              " spillaged=" + std::to_string((long)InterlockedCompareExchange(&g_spillGuardHits, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_spillArmed, 0, 0)) +
              " spillrooms=" + std::to_string((long)InterlockedCompareExchange(&g_spillRooms, 0, 0)) +
@@ -32060,7 +32072,7 @@ static bool GhPhRestore(GhLazyRange* rr, uint8_t* p, uint64_t g, DWORD prot, LON
         h = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, (DWORD)g_lazyGran, nullptr);
         if (h) break;
         if (attempt) break;
-        const bool room = lockHeld ? GhLazySpillRoomLocked(g + (64ull << 20), "restore", true)
+        const bool room = lockHeld ? GhLazySpillRoomLocked(g + kGhLockedRoomPad, "restore", true)
                                    : GhLazySpillRoom(g + (64ull << 20), "restore");
         if (!room) break;
         InterlockedIncrement(&g_spillRetryOk);
@@ -32128,7 +32140,7 @@ static bool GhLazyRestoreLocked(uint8_t* p, uint64_t g, DWORD prot, LONG* bits, 
     const DWORD cprot = stage ? PAGE_NOACCESS : prot;
     if (!VirtualAlloc(p, (SIZE_T)g, MEM_COMMIT, cprot)){
         InterlockedIncrement(&g_spillRoomFault);
-        const bool room = lockHeld ? GhLazySpillRoomLocked(g + (64ull << 20), "restore", true)
+        const bool room = lockHeld ? GhLazySpillRoomLocked(g + kGhLockedRoomPad, "restore", true)
                                    : GhLazySpillRoom(g + (64ull << 20), "restore");
         if (!room || !VirtualAlloc(p, (SIZE_T)g, MEM_COMMIT, cprot)) return false;
         InterlockedIncrement(&g_spillRetryOk);
