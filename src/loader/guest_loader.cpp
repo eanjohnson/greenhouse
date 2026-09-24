@@ -519,6 +519,7 @@ static unsigned GhDsNoGpu();              // #169: keep DirectStorage's DXIL out
 // rest in every run ever launched by the harness. Convert one knob at a time,
 // each with its own control cell.
 static unsigned GhCfgNumZ(const wchar_t* file, const char* envName, unsigned dflt);
+static volatile LONG64 g_gprPresents = 0;   // #236 gh_gpu_prof: presents, for ms/frame
 static void GhPsoDescKeepAdd(void* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d);   // #234 BREAD10
 static void GhRhCreate(void* p, unsigned kind, void* heap, UINT64 off, ID3D12Device* dev, const D3D12_RESOURCE_DESC* rd);   // #234 T33
 static void GhRhWrite(void* p);
@@ -5488,6 +5489,7 @@ static HRESULT GfxPresent(UINT sync)
         }
     }
     ++s_present_n;
+    InterlockedIncrement64(&g_gprPresents);   // #236
 
     {
         std::lock_guard<std::mutex> lk(g_d11Mutex);
@@ -15398,6 +15400,225 @@ static void* GhClOrig(void* self, int slot)
     return g_clVts[0].orig[slot];
 }
 
+// #236 gh_gpu_prof. LOOPFOLD11 put the world on screen at ~3 fps with every CPU
+// thread parked (RIPCENSUS) and every queue one or two fences behind, so the
+// frame is the GPU's -- and the game emits no PIX names to say which pass. So
+// stamp it ourselves: a TIMESTAMP query before every draw, dispatch and
+// ExecuteIndirect, one at Reset and one at Close, on DIRECT and COMPUTE lists.
+// The gap between one stamp and the next is charged to the op the first one
+// preceded (end-of-pipe stamps, so this is the op's MARGINAL cost: overlap with
+// its neighbours is not double counted, and a barrier or clear in between is
+// charged to the op before it). Close resolves the list's stamps into a
+// persistently mapped READBACK ring; each submission is fenced on a private
+// fence per queue, and completed submissions are summed by pipeline and printed
+// as GPUPROF lines every 20 s. Pipelines are pointers; the CREATED pso=... vs=...
+// ps=... line names their shaders. Off unless gh_gpu_prof.txt is nonzero.
+static void GhCQSignalRaw(ID3D12CommandQueue* q, ID3D12Fence* f, UINT64 v);
+static unsigned GhGprMode(){ static const unsigned v = GhCfgNumZ(L"gh_gpu_prof.txt", "GH_GPU_PROF", 0); return v; }
+static const LONG kGprBlk = 1024, kGprBlocks = 256, kGprPerList = 8;
+static const LONG kGprMaxRec = kGprBlk * kGprPerList;
+struct GhGprList { LONG n; LONG closed; LONG blk[kGprPerList]; LONG gen[kGprPerList]; void** rec; };
+static GhGprList g_gprList[512]{};          // indexed by the GhCLNote slot; a list owns its slot for life
+static ID3D12QueryHeap* g_gprHeap = nullptr;
+static ID3D12Resource*  g_gprRb = nullptr;
+static const volatile UINT64* g_gprTs = nullptr;
+static volatile LONG g_gprInit = 0;         // 0 none, 1 building, 2 ready, 3 failed
+static volatile LONG g_gprNextBlk = 0;
+static volatile LONG g_gprGen[kGprBlocks]{};
+static volatile LONG g_gprTrunc = 0, g_gprStale = 0, g_gprBatches = 0;
+static bool GhGprReady(ID3D12GraphicsCommandList* cl)
+{
+    const LONG s = InterlockedCompareExchange(&g_gprInit, 0, 0);
+    if (s == 2) return true;
+    if (s != 0 || InterlockedCompareExchange(&g_gprInit, 1, 0) != 0) return false;
+    bool ok = false;
+    HRESULT h1 = E_FAIL, h2 = E_FAIL, h3 = E_FAIL;
+    com_ptr<ID3D12Device> d;
+    if (SUCCEEDED(cl->GetDevice(__uuidof(ID3D12Device), d.put_void())) && d){
+        D3D12_QUERY_HEAP_DESC qd{};
+        qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP; qd.Count = (UINT)(kGprBlk * kGprBlocks);
+        h1 = d->CreateQueryHeap(&qd, __uuidof(ID3D12QueryHeap), (void**)&g_gprHeap);
+        if (SUCCEEDED(h1)){
+            D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = 8ull * kGprBlk * kGprBlocks;
+            rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            h2 = d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                            nullptr, __uuidof(ID3D12Resource), (void**)&g_gprRb);
+        }
+        void* p = nullptr;
+        if (SUCCEEDED(h2)) h3 = g_gprRb->Map(0, nullptr, &p);
+        if (SUCCEEDED(h3) && p){ g_gprTs = (const volatile UINT64*)p; ok = true; }
+    }
+    Diag("GPUPROF init heap=" + Hex((uint32_t)h1) + " readback=" + Hex((uint32_t)h2) + " map=" + Hex((uint32_t)h3) +
+         " queries=" + std::to_string((long)(kGprBlk * kGprBlocks)) + (ok ? " READY" : " FAILED -- profiler off"));
+    InterlockedExchange(&g_gprInit, ok ? 2 : 3);
+    return ok;
+}
+// kind in the low 3 bits of the pipeline pointer: 1 draw, 2 indexed, 3 dispatch,
+// 4 indirect, 5 list start (Reset), 6 list end (Close).
+static void GhGprStamp(ID3D12GraphicsCommandList* self, unsigned kind)
+{
+    if (!GhGprMode()) return;
+    GhCLNote* n = GhCLFind(self);
+    if (!n || (n->type != D3D12_COMMAND_LIST_TYPE_DIRECT && n->type != D3D12_COMMAND_LIST_TYPE_COMPUTE)) return;
+    if (!GhGprReady(self)) return;
+    GhGprList& g = g_gprList[n - g_clNotes];
+    if (g.closed) return;
+    if (g.n >= kGprMaxRec){ InterlockedIncrement(&g_gprTrunc); return; }
+    if (!g.rec && !(g.rec = new (std::nothrow) void*[kGprMaxRec])) return;
+    const LONG bi = g.n / kGprBlk, si = g.n % kGprBlk;
+    if (si == 0){
+        const LONG b = (LONG)((ULONG)(InterlockedIncrement(&g_gprNextBlk) - 1) % (ULONG)kGprBlocks);
+        g.blk[bi] = b; g.gen[bi] = InterlockedIncrement(&g_gprGen[b]);
+    }
+    const void* pso = (kind >= 5) ? nullptr : n->lastPso;
+    ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12QueryHeap*, D3D12_QUERY_TYPE, UINT))GhClOrig(self, 53))
+        (self, g_gprHeap, D3D12_QUERY_TYPE_TIMESTAMP, (UINT)(g.blk[bi] * kGprBlk + si));
+    g.rec[g.n++] = (void*)((uintptr_t)pso | (uintptr_t)kind);
+}
+static void GhGprReset(ID3D12GraphicsCommandList* self)
+{
+    if (!GhGprMode()) return;
+    if (GhCLNote* n = GhCLFind(self)){ g_gprList[n - g_clNotes].n = 0; g_gprList[n - g_clNotes].closed = 0; }
+    GhGprStamp(self, 5);
+}
+static void GhGprClose(ID3D12GraphicsCommandList* self)
+{
+    if (!GhGprMode()) return;
+    GhCLNote* n = GhCLFind(self);
+    if (!n) return;
+    GhGprList& g = g_gprList[n - g_clNotes];
+    if (g.n == 0 || g.closed) return;
+    GhGprStamp(self, 6);
+    for (LONG b = 0; b * kGprBlk < g.n; ++b){
+        const UINT cnt = (UINT)((g.n - b * kGprBlk) < kGprBlk ? (g.n - b * kGprBlk) : kGprBlk);
+        const UINT q0 = (UINT)(g.blk[b] * kGprBlk);
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12QueryHeap*, D3D12_QUERY_TYPE, UINT, UINT,
+                            ID3D12Resource*, UINT64))GhClOrig(self, 54))
+            (self, g_gprHeap, D3D12_QUERY_TYPE_TIMESTAMP, q0, cnt, g_gprRb, 8ull * q0);
+    }
+    g.closed = 1;
+}
+struct GhGprBatch { int qi; UINT64 fv; LONG type; LONG n; LONG blk[kGprPerList]; LONG gen[kGprPerList]; std::vector<void*> rec; };
+struct GhGprQ { ID3D12CommandQueue* q; ID3D12Fence* f; UINT64 v; UINT64 freq; };
+static GhGprQ   g_gprQ[8]{};
+static int      g_gprQN = 0;
+static SRWLOCK  g_gprLk = SRWLOCK_INIT;
+static std::vector<GhGprBatch>* g_gprPend = nullptr;
+struct GhGprAgg { double us; UINT64 n; };
+static std::unordered_map<uintptr_t, GhGprAgg>* g_gprAgg = nullptr;
+static double   g_gprTypeUs[4]{}, g_gprSpanUs[4]{};
+static ULONGLONG g_gprT0 = 0;
+static LONG64   g_gprP0 = 0;
+// Before the submission: copy each closed list's records (the guest may Reset it
+// the moment ExecuteCommandLists returns).
+static void GhGprSnap(UINT n, ID3D12CommandList* const* l, std::vector<GhGprBatch>& out)
+{
+    if (!GhGprMode() || InterlockedCompareExchange(&g_gprInit, 0, 0) != 2) return;
+    for (UINT i = 0; i < n; ++i){
+        GhCLNote* nt = GhCLFind(l[i]);
+        if (!nt) continue;
+        GhGprList& g = g_gprList[nt - g_clNotes];
+        if (!g.closed || g.n < 2 || !g.rec) continue;
+        GhGprBatch b{}; b.type = nt->type; b.n = g.n;
+        for (LONG k = 0; k < kGprPerList; ++k){ b.blk[k] = g.blk[k]; b.gen[k] = g.gen[k]; }
+        b.rec.assign(g.rec, g.rec + g.n);
+        out.push_back(std::move(b));
+    }
+}
+static void GhGprHarvestLocked();
+// After the submission: fence it on our own per-queue fence and queue it.
+static void GhGprAfter(ID3D12CommandQueue* q, std::vector<GhGprBatch>& snap)
+{
+    if (!GhGprMode() || InterlockedCompareExchange(&g_gprInit, 0, 0) != 2 || !q) return;
+    AcquireSRWLockExclusive(&g_gprLk);
+    if (!snap.empty()){
+        int qi = -1;
+        for (int i = 0; i < g_gprQN; ++i) if (g_gprQ[i].q == q){ qi = i; break; }
+        if (qi < 0 && g_gprQN < 8){
+            com_ptr<ID3D12Device> d; ID3D12Fence* f = nullptr; UINT64 fr = 0;
+            if (SUCCEEDED(q->GetDevice(__uuidof(ID3D12Device), d.put_void())) && d)
+                d->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), (void**)&f);
+            const HRESULT hf = q->GetTimestampFrequency(&fr);
+            if (f && SUCCEEDED(hf) && fr){
+                g_gprQ[g_gprQN] = GhGprQ{ q, f, 0, fr }; qi = g_gprQN++;
+                Diag("GPUPROF queue q=" + Hex((uint64_t)(uintptr_t)q) + " freq=" + std::to_string((unsigned long long)fr) + "Hz");
+            }
+        }
+        if (qi >= 0){
+            const UINT64 v = ++g_gprQ[qi].v;
+            GhCQSignalRaw(q, g_gprQ[qi].f, v);
+            if (!g_gprPend) g_gprPend = new std::vector<GhGprBatch>();
+            for (auto& b : snap){ b.qi = qi; b.fv = v; g_gprPend->push_back(std::move(b)); }
+            InterlockedAdd(&g_gprBatches, (LONG)snap.size());
+        }
+    }
+    GhGprHarvestLocked();
+    ReleaseSRWLockExclusive(&g_gprLk);
+}
+static void GhGprHarvestLocked()
+{
+    if (!g_gprPend) return;
+    if (!g_gprAgg) g_gprAgg = new std::unordered_map<uintptr_t, GhGprAgg>();
+    if (!g_gprT0){ g_gprT0 = GetTickCount64(); g_gprP0 = InterlockedCompareExchange64(&g_gprPresents, 0, 0); }
+    UINT64 done[8];
+    for (int i = 0; i < g_gprQN; ++i) done[i] = g_gprQ[i].f->GetCompletedValue();
+    auto& P = *g_gprPend;
+    size_t w = 0;
+    for (size_t r = 0; r < P.size(); ++r){
+        GhGprBatch& b = P[r];
+        if (done[b.qi] == UINT64_MAX || done[b.qi] < b.fv){ if (w != r) P[w] = std::move(b); ++w; continue; }
+        bool fresh = true;
+        for (LONG k = 0; k * kGprBlk < b.n; ++k)
+            if (InterlockedCompareExchange(&g_gprGen[b.blk[k]], 0, 0) != b.gen[k]) fresh = false;
+        if (!fresh){ InterlockedIncrement(&g_gprStale); continue; }
+        const double tick_us = 1e6 / (double)g_gprQ[b.qi].freq;
+        auto ts = [&](LONG k) -> UINT64 { return g_gprTs[(size_t)b.blk[k / kGprBlk] * kGprBlk + (size_t)(k % kGprBlk)]; };
+        const LONG ty = b.type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? 2 : 0;
+        const UINT64 first = ts(0), last = ts(b.n - 1);
+        if (first && last > first && (double)(last - first) * tick_us < 2e6) g_gprSpanUs[ty] += (double)(last - first) * tick_us;
+        for (LONG k = 0; k + 1 < b.n; ++k){
+            const UINT64 t0 = ts(k), t1 = ts(k + 1);
+            if (!t0 || t1 < t0) continue;
+            const double us = (double)(t1 - t0) * tick_us;
+            if (us > 2e6) continue;                       // a wrapped or never-written stamp
+            GhGprAgg& a = (*g_gprAgg)[(uintptr_t)b.rec[k]];
+            a.us += us; ++a.n; g_gprTypeUs[ty] += us;
+        }
+    }
+    P.resize(w);
+    const ULONGLONG now = GetTickCount64();
+    if (now - g_gprT0 < 20000) return;
+    const LONG64 pr = InterlockedCompareExchange64(&g_gprPresents, 0, 0);
+    const double frames = (double)(pr - g_gprP0 > 0 ? pr - g_gprP0 : 1);
+    std::vector<std::pair<double, uintptr_t>> top;
+    top.reserve(g_gprAgg->size());
+    for (auto& kv : *g_gprAgg) top.emplace_back(kv.second.us, kv.first);
+    std::sort(top.begin(), top.end(), [](auto& x, auto& y){ return x.first > y.first; });
+    const double all = g_gprTypeUs[0] + g_gprTypeUs[2];
+    char buf[256];
+    snprintf(buf, sizeof buf, "GPUPROF window=%.1fs frames=%.0f fps=%.2f | direct %.1f ms/frame (span %.1f) compute %.1f ms/frame (span %.1f) | pipelines=%zu pending=%zu stale=%ld trunc=%ld batches=%ld",
+             (now - g_gprT0) / 1000.0, frames, frames * 1000.0 / (double)(now - g_gprT0),
+             g_gprTypeUs[0] / 1000.0 / frames, g_gprSpanUs[0] / 1000.0 / frames,
+             g_gprTypeUs[2] / 1000.0 / frames, g_gprSpanUs[2] / 1000.0 / frames,
+             top.size(), P.size(), (long)g_gprStale, (long)g_gprTrunc, (long)g_gprBatches);
+    Diag(buf);
+    static const char* kn[8] = { "?", "DRAW", "DRAWIDX", "DISPATCH", "INDIRECT", "LISTSTART", "LISTEND", "?" };
+    for (size_t i = 0; i < top.size() && i < 40; ++i){
+        const uintptr_t key = top[i].second;
+        const GhGprAgg& a = (*g_gprAgg)[key];
+        snprintf(buf, sizeof buf, "GPUPROF #%zu pso=0x%llX %s ms/frame=%.2f share=%.1f%% ops/frame=%.1f us/op=%.1f",
+                 i + 1, (unsigned long long)(key & ~(uintptr_t)7), kn[key & 7], a.us / 1000.0 / frames,
+                 all > 0 ? 100.0 * a.us / all : 0.0, (double)a.n / frames, a.n ? a.us / (double)a.n : 0.0);
+        Diag(buf);
+    }
+    g_gprAgg->clear();
+    for (int i = 0; i < 4; ++i){ g_gprTypeUs[i] = 0; g_gprSpanUs[i] = 0; }
+    g_gprT0 = now; g_gprP0 = pr;
+}
+
 // #158. The command-list recorder needs GhCLNote, GhCLFind and GhClOrig, and every
 // capture site below needs the recorder -- so it lands exactly here.
 #include "gh_clrec.h"
@@ -16804,6 +17025,7 @@ static HRESULT __stdcall Hook_CLReset(ID3D12GraphicsCommandList* self,
                                                ID3D12CommandAllocator*,
                                                ID3D12PipelineState*))GhClOrig(self, 10))
                         (self, useA, pso);
+    if (SUCCEEDED(rhr)) GhGprReset(self);   // #236: the list-start stamp
     if (FAILED(rhr)){
         static volatile LONG nbad = 0;
         const LONG k = InterlockedIncrement(&nbad);
@@ -16832,6 +17054,7 @@ static void __stdcall Hook_CLDraw(ID3D12GraphicsCommandList* self, UINT a, UINT 
                                     " inst=" + std::to_string((unsigned long)b));
     if ((GhOpMask() & 1) || GhWorkOpDropped(self, wi)) return;
     t_bcOpArgs = GhOpArgs{ 12, { a, b, c, d, 0 } };
+    GhGprStamp(self, 1);   // #236
     const LONG bcg = GhBreadcrumbBefore(self);
     if (!GhRecCap12(self, a, b, c, d)){
         GhPsoRebindBefore(self);
@@ -16852,6 +17075,7 @@ static void __stdcall Hook_CLDrawIndexed(ID3D12GraphicsCommandList* self, UINT a
                                     " inst=" + std::to_string((unsigned long)b));
     if ((GhOpMask() & 1) || GhWorkOpDropped(self, wi)) return;
     t_bcOpArgs = GhOpArgs{ 13, { a, b, c, (UINT)d, e } };
+    GhGprStamp(self, 2);   // #236
     const LONG bcg = GhBreadcrumbBefore(self);
     if (!GhRecCap13(self, a, b, c, d, e)){
         GhPsoRebindBefore(self);
@@ -16872,6 +17096,7 @@ static void __stdcall Hook_CLDispatch(ID3D12GraphicsCommandList* self, UINT x, U
                                     std::to_string((unsigned long)y) + "," + std::to_string((unsigned long)z));
     if ((GhOpMask() & 2) || GhWorkOpDropped(self, wi)) return;
     t_bcOpArgs = GhOpArgs{ 14, { x, y, z, 0, 0 } };
+    GhGprStamp(self, 3);   // #236
     const LONG bcg = GhBreadcrumbBefore(self);
     if (!GhRecCap14(self, x, y, z))
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT))GhClOrig(self, 14))(self, x, y, z);
@@ -18093,6 +18318,7 @@ static void __stdcall Hook_CLBarrier(ID3D12GraphicsCommandList* self, UINT num,
 static HRESULT __stdcall Hook_CLClose(ID3D12GraphicsCommandList* self)
 {
     GhBarrFlushPending(self);
+    GhGprClose(self);   // #236: list-end stamp + resolve into the readback ring
     return ((HRESULT (__stdcall*)(ID3D12GraphicsCommandList*))GhClOrig(self, 9))(self);
 }
 static void __stdcall Hook_CLBeginEvent(ID3D12GraphicsCommandList* self, UINT meta,
@@ -18264,6 +18490,7 @@ static void __stdcall Hook_CLExecIndirect(ID3D12GraphicsCommandList* self, void*
         if (k <= 8) Diag("CLOP EXECUTEINDIRECT SKIPPED by gh_skip_indirect (#" + std::to_string((long)k) + ")");
         return;
     }
+    GhGprStamp(self, 4);   // #236
     const LONG bcg = GhBreadcrumbBefore(self);
     if (!GhRecCap59(self, sig, maxCount, args, argOff, cnt, cntOff))
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, void*, UINT, ID3D12Resource*, UINT64,
@@ -22898,6 +23125,8 @@ static void __stdcall Hook_CQExecute(ID3D12CommandQueue* self_, UINT n, ID3D12Co
             }
         }
     }
+    std::vector<GhGprBatch> gprSnap;   // #236: copied before the guest can Reset the lists
+    GhGprSnap(n, l, gprSnap);
     {
         int relTy = -1, relSlot = -1;
         ID3D12GraphicsCommandList* rel = GhBarrReloc()
@@ -22943,6 +23172,7 @@ static void __stdcall Hook_CQExecute(ID3D12CommandQueue* self_, UINT n, ID3D12Co
         }
     }
     GhProgSignal(self, seq);   // #234 PROGFENCE: which submission the GPU last finished, per queue
+    GhGprAfter(self, gprSnap);   // #236: fence this submission's stamps, harvest finished ones
     // #158 gh_dup_submit / gh_dup_nth: one extra, LEGAL execution of THIS submission.
     //
     // v0.0.325.0 submitted the duplicate back-to-back, and D3D12 rejected it outright:
@@ -31042,6 +31272,17 @@ static volatile LONG            g_spillRoomShort = 0;       //   ... that could 
 static volatile LONG            g_spillRetryOk   = 0;       // commits that succeeded only after making room
 static volatile LONG64          g_spillMs        = 0;
 static volatile LONG64          g_spillRsUs      = 0;   // LOOPFOLD9: guest-thread time inside fault restores
+// LOOPFOLD10: stack headroom (bytes above the thread's DeallocationStack) at
+// pager-fault entry. LF6/8/9/10 vanished with no trap, no WER report and no
+// dump while faulting hard; an exception taken with no stack left to push its
+// frame kills the process exactly that way. Min over the run, the thread that
+// set it, the guest RSP headroom at the fault, and how many faults came in
+// under 32 KB.
+static volatile LONG64          g_vehStkMin      = INT64_MAX;
+static volatile LONG64          g_vehStkGuest    = 0;
+static volatile LONG            g_vehStkTid      = 0;
+static volatile LONG            g_vehStkLow      = 0;
+static volatile LONG            g_vehFiber       = 0;   // pager faults taken on a fiber
 static volatile LONG            g_spillLogs      = 0;
 static volatile LONG            g_spillRecommit  = 0;       // spilled granules restored under a guest MEM_COMMIT
 static volatile LONG            g_spillNtRead    = 0;       // NtReadFile buffers Materialise had to repair
@@ -31603,6 +31844,26 @@ static bool GhLazyFault(void* addr, const CONTEXT* ctx)
                       ~InFlight(){ InterlockedDecrement(&g_lazyInFault); } } inflight;
     InterlockedExchange64(&g_lazyLastFaultAt, (LONG64)(uintptr_t)addr);
     InterlockedExchange(&g_lazyLastFaultTid, (LONG)GetCurrentThreadId());
+    {
+        uint8_t* dl = *(uint8_t**)((BYTE*)NtCurrentTeb() + 0x1478);   // TEB.DeallocationStack
+        uint8_t* here = (uint8_t*)_AddressOfReturnAddress();
+        if (IsThreadAFiber()) InterlockedIncrement(&g_vehFiber);
+        if (dl && here > dl){
+            const LONG64 room = (LONG64)(here - dl);
+            if (room < (32 << 10)) InterlockedIncrement(&g_vehStkLow);
+            LONG64 cur = InterlockedCompareExchange64(&g_vehStkMin, 0, 0);
+            while (room < cur){
+                const LONG64 prev = InterlockedCompareExchange64(&g_vehStkMin, room, cur);
+                if (prev == cur){
+                    InterlockedExchange(&g_vehStkTid, (LONG)GetCurrentThreadId());
+                    InterlockedExchange64(&g_vehStkGuest, ctx && (uint8_t*)(uintptr_t)ctx->Rsp > dl
+                                                          ? (LONG64)((uint8_t*)(uintptr_t)ctx->Rsp - dl) : -1);
+                    break;
+                }
+                cur = prev;
+            }
+        }
+    }
     uint8_t* base = nullptr; uint64_t gsize = 0; DWORD prot = 0; LONG bit = 0; LONG* bits = nullptr;
     GhLazyAcct* acct = nullptr;
     LONG* spilled = nullptr; LONG* busy = nullptr; uint32_t* slot = nullptr;   // #233
@@ -31898,6 +32159,12 @@ static std::string GhLazyStats()
              " spillev=" + std::to_string((long)InterlockedCompareExchange(&g_spillEvicts, 0, 0)) +
              " spillrs=" + std::to_string((long)InterlockedCompareExchange(&g_spillRestores, 0, 0)) +
              " spillrsms=" + std::to_string((long long)(InterlockedCompareExchange64(&g_spillRsUs, 0, 0) / 1000)) +
+             " vehstk=" + std::to_string((long long)(InterlockedCompareExchange64(&g_vehStkMin, 0, 0) == INT64_MAX ? -1
+                                                      : InterlockedCompareExchange64(&g_vehStkMin, 0, 0) >> 10)) +
+                 "K/" + std::to_string((long long)(InterlockedCompareExchange64(&g_vehStkGuest, 0, 0) >> 10)) +
+                 "K/" + std::to_string((long)InterlockedCompareExchange(&g_vehStkLow, 0, 0)) +
+                 "/tid" + std::to_string((long)InterlockedCompareExchange(&g_vehStkTid, 0, 0)) +
+                 " vehfiber=" + std::to_string((long)InterlockedCompareExchange(&g_vehFiber, 0, 0)) +
              " spillaged=" + std::to_string((long)InterlockedCompareExchange(&g_spillGuardHits, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_spillArmed, 0, 0)) +
              " spillrooms=" + std::to_string((long)InterlockedCompareExchange(&g_spillRooms, 0, 0)) +
