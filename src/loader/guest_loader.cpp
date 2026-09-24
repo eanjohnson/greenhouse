@@ -9920,6 +9920,135 @@ done:
     Diag("TILEDPROBE done t=" + Ms() + "ms");
 }
 
+// #236 PROF7: the world's two volume CS spend ~80 ms on ONE 1x2x3-group dispatch,
+// looping per voxel to GetDimensions() of a StructuredBuffer<Blob52> reached through
+// the heap-tier lowering's unbounded range. gh_getdims.bin (tmp/getdims/getdims.hlsl,
+// signed cs_6_5 with an embedded root signature) asks this driver what GetDimensions
+// answers for a 100-element, 52-byte-stride view, bound singly (t0) and through an
+// unbounded array range (t0 space1), and how many loop iterations it then runs.
+// A correct driver prints n=100 stride=52 it=100.
+static void GhGetDimsProbe()
+{
+    static const unsigned mode = GhCfgNumZ(L"gh_getdims_probe.txt", "GH_GETDIMS_PROBE", 0);
+    if (!mode) return;
+    std::vector<uint8_t> cs;
+    if (!ReadWholeFile(std::wstring(kLocalState) + L"gh_getdims.bin", cs, true) || cs.size() < 0x24){
+        Diag("GETDIMS no gh_getdims.bin -- VOID"); return;
+    }
+    ID3D12Device* dev = GhCompileOnlyDevice();
+    if (!dev){ Diag("GETDIMS no device -- VOID"); return; }
+    com_ptr<ID3D12RootSignature> rs; com_ptr<ID3D12PipelineState> pso;
+    HRESULT hr = dev->CreateRootSignature(0, cs.data(), cs.size(), __uuidof(ID3D12RootSignature), rs.put_void());
+    if (SUCCEEDED(hr)){
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = rs.get(); pd.CS = { cs.data(), cs.size() };
+        hr = dev->CreateComputePipelineState(&pd, __uuidof(ID3D12PipelineState), pso.put_void());
+    }
+    if (FAILED(hr) || !pso){ Diag("GETDIMS pso hr=" + Hex((uint32_t)hr) + " -- VOID"); return; }
+
+    com_ptr<ID3D12CommandQueue> q; com_ptr<ID3D12CommandAllocator> ca;
+    com_ptr<ID3D12GraphicsCommandList> cl; com_ptr<ID3D12Fence> fence;
+    D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    hr = dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), q.put_void());
+    if (SUCCEEDED(hr)) hr = dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                __uuidof(ID3D12CommandAllocator), ca.put_void());
+    if (SUCCEEDED(hr)) hr = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, ca.get(), pso.get(),
+                                __uuidof(ID3D12GraphicsCommandList), cl.put_void());
+    if (SUCCEEDED(hr)) hr = dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), fence.put_void());
+    if (FAILED(hr)){ Diag("GETDIMS rig hr=" + Hex((uint32_t)hr) + " -- VOID"); return; }
+
+    const UINT kN = 100, kStride = 52;
+    auto Buf = [&](UINT64 bytes, D3D12_HEAP_TYPE ht, D3D12_RESOURCE_FLAGS fl, D3D12_RESOURCE_STATES st,
+                   com_ptr<ID3D12Resource>& r) -> HRESULT {
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type = ht;
+        D3D12_RESOURCE_DESC rd{}; rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = bytes;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; rd.Flags = fl;
+        return dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, st, nullptr,
+                                            __uuidof(ID3D12Resource), r.put_void());
+    };
+    // The structured buffer is an UPLOAD buffer so it can be filled from the CPU:
+    // element i's first word = 1, so `sum` counts in-bounds iterations.
+    com_ptr<ID3D12Resource> sb, ub, rb;
+    hr = Buf(kN * kStride, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, sb);
+    if (SUCCEEDED(hr)) hr = Buf(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, ub);
+    if (SUCCEEDED(hr)) hr = Buf(256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, rb);
+    if (FAILED(hr)){ Diag("GETDIMS buffers hr=" + Hex((uint32_t)hr) + " -- VOID"); return; }
+    {
+        uint32_t* p = nullptr; D3D12_RANGE none{0, 0};
+        if (FAILED(sb->Map(0, &none, (void**)&p)) || !p){ Diag("GETDIMS map -- VOID"); return; }
+        memset(p, 0, kN * kStride);
+        for (UINT i = 0; i < kN; ++i) p[i * (kStride / 4)] = 1;
+        sb->Unmap(0, nullptr);
+    }
+    // GETDIMS2 layout (tmp/getdims/getdims2.hlsl): slots 0-4 = the same 5,200 bytes as
+    // structured/52, raw, typed R32_UINT, structured/4, structured/16; slot 5 = the output UAV.
+    // Table 2 (space2, a ByteAddressBuffer) and table 3 (space1, the unbounded array) both
+    // start at slot 0, so they read the structured/52 descriptor.
+    com_ptr<ID3D12DescriptorHeap> dh;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{}; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 6; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hr = dev->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap), dh.put_void());
+    if (FAILED(hr)){ Diag("GETDIMS heap hr=" + Hex((uint32_t)hr) + " -- VOID"); return; }
+    const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE c0 = dh->GetCPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE g0 = dh->GetGPUDescriptorHandleForHeapStart();
+    auto Srv = [&](UINT slot, DXGI_FORMAT fmt, UINT n, UINT stride, D3D12_BUFFER_SRV_FLAGS fl){
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER; sv.Format = fmt;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.Buffer.NumElements = n; sv.Buffer.StructureByteStride = stride; sv.Buffer.Flags = fl;
+        dev->CreateShaderResourceView(sb.get(), &sv, { c0.ptr + slot * inc });
+    };
+    const UINT bytes = kN * kStride;
+    Srv(0, DXGI_FORMAT_UNKNOWN,      kN,          kStride, D3D12_BUFFER_SRV_FLAG_NONE);   // s52
+    Srv(1, DXGI_FORMAT_R32_TYPELESS, bytes / 4,   0,       D3D12_BUFFER_SRV_FLAG_RAW);    // raw
+    Srv(2, DXGI_FORMAT_R32_UINT,     bytes / 4,   0,       D3D12_BUFFER_SRV_FLAG_NONE);   // typed
+    Srv(3, DXGI_FORMAT_UNKNOWN,      bytes / 4,   4,       D3D12_BUFFER_SRV_FLAG_NONE);   // s4
+    Srv(4, DXGI_FORMAT_UNKNOWN,      bytes / 16,  16,      D3D12_BUFFER_SRV_FLAG_NONE);   // s16
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+    uv.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; uv.Format = DXGI_FORMAT_R32_TYPELESS;
+    uv.Buffer.NumElements = 64; uv.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    dev->CreateUnorderedAccessView(ub.get(), nullptr, &uv, { c0.ptr + 5 * inc });
+
+    ID3D12DescriptorHeap* hs[1] = { dh.get() };
+    cl->SetDescriptorHeaps(1, hs);
+    cl->SetComputeRootSignature(rs.get());
+    cl->SetComputeRoot32BitConstant(0, 0, 0);
+    cl->SetComputeRootDescriptorTable(1, g0);
+    cl->SetComputeRootDescriptorTable(2, g0);
+    cl->SetComputeRootDescriptorTable(3, g0);
+    cl->Dispatch(1, 1, 1);
+    D3D12_RESOURCE_BARRIER b{}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = ub.get(); b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cl->ResourceBarrier(1, &b);
+    cl->CopyBufferRegion(rb.get(), 0, ub.get(), 0, 256);
+    cl->Close();
+    ID3D12CommandList* ls[1] = { cl.get() };
+    const LONG64 t0 = GhNowUs();
+    q->ExecuteCommandLists(1, ls);
+    q->Signal(fence.get(), 1);
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    bool ok = true;
+    if (fence->GetCompletedValue() < 1){ fence->SetEventOnCompletion(1, ev); ok = WaitForSingleObject(ev, 20000) == WAIT_OBJECT_0; }
+    if (ev) CloseHandle(ev);
+    const HRESULT rr = dev->GetDeviceRemovedReason();
+    const LONG64 us = GhNowUs() - t0;
+    if (!ok || rr != S_OK){ Diag("GETDIMS fence=" + std::string(ok ? "ok" : "TIMEOUT") + " removed=" + Hex((uint32_t)rr) + " -- VOID"); return; }
+    uint32_t* r = nullptr; D3D12_RANGE all{0, 256};
+    if (FAILED(rb->Map(0, &all, (void**)&r)) || !r){ Diag("GETDIMS readback map -- VOID"); return; }
+    auto U = [&](int i){ return std::to_string(r[i]); };
+    Diag("GETDIMS2 truth: s52 n=" + std::to_string(kN) + " | raw bytes=" + std::to_string(bytes) +
+         " | typed n=" + std::to_string(bytes / 4) + " | s4 n=" + std::to_string(bytes / 4) +
+         " | s16 n=" + std::to_string(bytes / 16) + " gpu+wait=" + std::to_string(us) + "us");
+    Diag("GETDIMS2 got:   s52 n=" + U(0) + " stride=" + U(1) + " | arr n=" + U(2) + " stride=" + U(3) +
+         " | raw=" + U(4) + " | typed=" + U(5) + " | s4 n=" + U(6) + " stride=" + U(7) +
+         " | s16 n=" + U(8) + " stride=" + U(9) + " | rawOnStruct=" + U(10) + " tag=" + Hex(r[11]));
+    D3D12_RANGE none{0, 0}; rb->Unmap(0, &none);
+}
+
 static void GhDxilControl()
 {
     static const unsigned mode = GhCfgNum(L"gh_dxil_ctl.txt", "GH_DXIL_CTL", 0);
@@ -14148,7 +14277,24 @@ static UINT GhRootCost(const D3D12_ROOT_PARAMETER1* p, UINT n)
 
 // Which two root parameter indices carry the bindless tables, per root signature.
 // The command lists need this to bind the descriptor heap base to them.
-struct GhBindlessRoot { UINT res, samp; };
+// #236 gh_bufdims. This console's DXIL back end answers every BUFFER GetDimensions
+// with a constant per view class -- GETDIMS2 (0.0.578.0) read 135084 for a
+// 100-element stride-52 StructuredBuffer and 147972 for raw and typed views, i.e.
+// the wrong dword of the buffer descriptor -- so a loop bounded by the count runs
+// ~135k iterations over zeros. The world's two volume passes spent ~160 ms of each
+// ~180 ms present that way (PROF5). No view type answers correctly, so the count
+// has to come from outside: one uint32 per slot of each CBV/SRV/UAV heap (the value
+// GetDimensions should return), kept by the view-creation and copy hooks, bound as
+// a root SRV at t0, space kGhBdSpace, and read by the shaders
+// toolchain/dxil/bufdims.py rewrote. Off (0) unless asked; a baked blob that reads
+// the table needs this on, or its PSO fails the root-signature match.
+static const UINT kGhBdSpace = 5190;   // bufdims.py BD_SPACE
+static bool GhBufDimsOn()
+{
+    static const bool on = GhCfgNumZ(L"gh_bufdims.txt", "GH_BUFDIMS", 0) != 0;
+    return on;
+}
+struct GhBindlessRoot { UINT res, samp; UINT dims = UINT_MAX; };
 static std::mutex g_ghRsMu;
 static std::map<void*, GhBindlessRoot> g_ghRsBindless;
 
@@ -14216,6 +14362,23 @@ static bool GhAppendBindlessRanges(const void* blob, SIZE_T len,
     t.DescriptorTable.NumDescriptorRanges = (UINT)sampR.size();
     t.DescriptorTable.pDescriptorRanges = sampR.data();
     params.push_back(t);
+    // #236: the GetDimensions table, a root SRV (2 DWORDs, no heap slot needed).
+    if (GhBufDimsOn()){
+        if (GhRootCost(params.data(), (UINT)params.size()) + 2 <= 64){
+            D3D12_ROOT_PARAMETER1 b{};
+            b.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            b.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            b.Descriptor.ShaderRegister = 0;
+            b.Descriptor.RegisterSpace = kGhBdSpace;
+            b.Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
+            where->dims = (UINT)params.size();
+            params.push_back(b);
+        } else {
+            static volatile LONG nr = 0;
+            if (InterlockedIncrement(&nr) <= 8)
+                Diag("  BUFDIMS no root room: " + std::to_string((unsigned)GhRootCost(params.data(), (UINT)params.size())) + "/64");
+        }
+    }
 
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC vr{};
     vr.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
@@ -14243,11 +14406,12 @@ static bool GhAppendBindlessRanges(const void* blob, SIZE_T len,
          " resRanges=" + std::to_string((unsigned)resR.size()) +
          " sampRanges=" + std::to_string((unsigned)sampR.size()) +
          " rootDwords " + std::to_string((unsigned)before) + " -> " +
-         std::to_string((unsigned)(before + 2)) + "/64" +
+         std::to_string((unsigned)GhRootCost(params.data(), (UINT)params.size())) + "/64" +
          " bytes " + std::to_string((unsigned)len) + " -> " +
          std::to_string((unsigned)out.size()) +
          " resParam=" + std::to_string((unsigned)where->res) +
-         " sampParam=" + std::to_string((unsigned)where->samp));
+         " sampParam=" + std::to_string((unsigned)where->samp) +
+         (where->dims != UINT_MAX ? " dimsParam=" + std::to_string((unsigned)where->dims) : std::string()));
     return true;
 }
 
@@ -14764,6 +14928,151 @@ static void GhDHAdd(ID3D12Device* dev, ID3D12DescriptorHeap* h,
         }
     }
 }
+// #236 gh_bufdims: the per-slot GetDimensions answers (see GhBufDimsOn). One table
+// per CBV/SRV/UAV heap: a mapped UPLOAD buffer for a shader-visible heap (the GPU
+// reads it through the root SRV), plain memory for a staging heap (only ever a
+// copy source). The game's own ring discipline for its descriptors covers ours,
+// because a slot's count is written exactly when its descriptor is.
+struct GhBdHeap { UINT64 cpu0, end; UINT32 inc, num; void* obj; UINT32* vals; UINT64 va; ID3D12Resource* buf; };
+// The game keeps ~280 small staging heaps alive (93 slots each, BD1), so the
+// registry is sized for thousands; a range that overlaps a new heap's belongs to a
+// dead heap and its entry is recycled rather than appended.
+static const LONG kGhBdMax = 4096;
+static GhBdHeap g_bdh[kGhBdMax]{};
+static volatile LONG g_bdhN = 0;
+static volatile LONG g_bdLast = 0, g_bdAdds = 0;
+static std::mutex g_bdAddMu;
+static volatile LONG64 g_bdPuts = 0, g_bdNonzero = 0, g_bdCopies = 0, g_bdNoBind = 0, g_bdRecycled = 0;
+static GhBdHeap* GhBdFind(UINT64 cpu)
+{
+    LONG n = g_bdhN; if (n > kGhBdMax) n = kGhBdMax;
+    const LONG c = g_bdLast;              // puts and copies come in runs on one heap
+    if (c < n){ GhBdHeap& h = g_bdh[c]; if (h.vals && cpu >= h.cpu0 && cpu < h.end) return &h; }
+    for (LONG i = n - 1; i >= 0; --i){
+        GhBdHeap& h = g_bdh[i];
+        if (h.vals && cpu >= h.cpu0 && cpu < h.end){ g_bdLast = i; return &h; }
+    }
+    return nullptr;
+}
+static UINT64 GhBdVaFor(void* heapObj)
+{
+    LONG n = g_bdhN; if (n > kGhBdMax) n = kGhBdMax;
+    for (LONG i = n - 1; i >= 0; --i)
+        if (g_bdh[i].obj == heapObj && g_bdh[i].vals && g_bdh[i].va) return g_bdh[i].va;
+    return 0;
+}
+// The biggest shader-visible table: a stand-in whose every index is in bounds.
+static UINT64 GhBdVaLargest()
+{
+    LONG n = g_bdhN; if (n > kGhBdMax) n = kGhBdMax;
+    UINT64 va = 0; UINT32 best = 0;
+    for (LONG i = 0; i < n; ++i)
+        if (g_bdh[i].vals && g_bdh[i].va && g_bdh[i].num > best){ best = g_bdh[i].num; va = g_bdh[i].va; }
+    return va;
+}
+static void GhBdHeapAdd(ID3D12Device* dev, ID3D12DescriptorHeap* h, const D3D12_DESCRIPTOR_HEAP_DESC* d)
+{
+    if (!GhBufDimsOn() || !dev || !h || !d || d->Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
+        !d->NumDescriptors) return;
+    const bool vis = (d->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0;
+    const UINT64 bytes = ((UINT64)d->NumDescriptors * 4 + 0xFFFF) & ~0xFFFFull;
+    UINT32* vals = nullptr; UINT64 va = 0; ID3D12Resource* buf = nullptr;
+    HRESULT hr = S_OK;
+    if (vis){
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = bytes; rd.Height = 1;
+        rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                          nullptr, __uuidof(ID3D12Resource), (void**)&buf);
+        if (SUCCEEDED(hr) && buf){
+            D3D12_RANGE none{0, 0};
+            hr = buf->Map(0, &none, (void**)&vals);
+            if (SUCCEEDED(hr) && vals){ memset(vals, 0, (size_t)bytes); va = buf->GetGPUVirtualAddress(); }
+            else vals = nullptr;
+        }
+    } else {   // a staging table is only ever a copy source; no 64 KB granule each
+        vals = (UINT32*)calloc(d->NumDescriptors, 4);
+    }
+    if (!vals){
+        Diag("BUFDIMS heap vis=" + std::to_string((int)vis) + " num=" + std::to_string((unsigned)d->NumDescriptors) +
+             " hr=" + Hex((uint32_t)hr) + " FAILED");
+        return;
+    }
+    const UINT64 cpu0 = (UINT64)h->GetCPUDescriptorHandleForHeapStart().ptr;
+    const UINT32 inc  = dev->GetDescriptorHandleIncrementSize(d->Type);
+    const UINT64 end  = cpu0 + (UINT64)inc * d->NumDescriptors;
+    LONG i = -1; bool recycled = false;
+    {
+        std::lock_guard<std::mutex> lk(g_bdAddMu);
+        LONG n = g_bdhN; if (n > kGhBdMax) n = kGhBdMax;
+        for (LONG k = 0; k < n; ++k){   // live heaps never overlap: an overlap is a dead heap
+            GhBdHeap& o = g_bdh[k];
+            if (o.vals && (o.obj == (void*)h || (cpu0 < o.end && o.cpu0 < end))){ i = k; recycled = true; break; }
+        }
+        if (i < 0 && n < kGhBdMax) i = InterlockedIncrement(&g_bdhN) - 1;
+        if (i >= 0){
+            GhBdHeap& e = g_bdh[i];
+            // The dead heap's table is leaked, not freed: a racing Put/Copy may hold it,
+            // and an UPLOAD buffer the GPU may still read cannot be released here.
+            e.vals = nullptr; MemoryBarrier();
+            e.cpu0 = cpu0; e.inc = inc; e.num = d->NumDescriptors; e.end = end;
+            e.obj  = (void*)h; e.va = va; e.buf = buf;
+            MemoryBarrier();
+            e.vals = vals;
+        }
+    }
+    if (recycled) InterlockedIncrement64(&g_bdRecycled);
+    const LONG nb = (LONG)InterlockedIncrement(&g_bdAdds);
+    if (vis || nb <= 8 || (nb % 100) == 0 || i < 0)
+        Diag("BUFDIMS heap #" + std::to_string((long)i) + " vis=" + std::to_string((int)vis) +
+             " num=" + std::to_string((unsigned)d->NumDescriptors) + " bytes=" + std::to_string((unsigned long long)bytes) +
+             " va=" + Hex(va) + " hr=" + Hex((uint32_t)hr) + " adds=" + std::to_string((long)nb) +
+             " recycled=" + std::to_string((long long)g_bdRecycled) + (i >= 0 ? " ok" : " FULL"));
+}
+static void GhBdPut(UINT64 cpu, UINT32 v)
+{
+    GhBdHeap* h = GhBdFind(cpu);
+    if (!h || !h->inc) return;
+    h->vals[(cpu - h->cpu0) / h->inc] = v;
+    InterlockedIncrement64(&g_bdPuts);
+    if (v) InterlockedIncrement64(&g_bdNonzero);
+}
+// A source slot we never saw written answers 0: an empty loop, never a runaway.
+static void GhBdCopy(UINT64 dst, UINT64 src, UINT n)
+{
+    GhBdHeap* hd = GhBdFind(dst);
+    if (!hd || !hd->inc || !n) return;
+    UINT64 di = (dst - hd->cpu0) / hd->inc;
+    if (di + n > hd->num) n = (UINT)(hd->num - di);
+    GhBdHeap* hs = GhBdFind(src);
+    UINT64 si = hs && hs->inc ? (src - hs->cpu0) / hs->inc : 0;
+    if (hs && si + n > hs->num) hs = nullptr;
+    if (hs) memmove(&hd->vals[di], &hs->vals[si], (size_t)n * 4);
+    else    memset(&hd->vals[di], 0, (size_t)n * 4);
+    InterlockedIncrement64(&g_bdCopies);
+}
+// gh_bufdims=2 serves the driver's own wrong answers (GETDIMS2: 135084 for a
+// structured view, 147972 for raw and typed) through the table, so a cell can tell
+// the plumbing from the values.
+static UINT32 GhBdMode(){ static const UINT32 m = GhCfgNumZ(L"gh_bufdims.txt", "GH_BUFDIMS", 0); return m; }
+static UINT32 GhBdSrvVal(const D3D12_SHADER_RESOURCE_VIEW_DESC* d)
+{
+    if (!d || d->ViewDimension != D3D12_SRV_DIMENSION_BUFFER) return 0;
+    if (GhBdMode() == 2) return d->Buffer.StructureByteStride ? 135084u : 147972u;
+    UINT64 n = d->Buffer.NumElements;
+    if (d->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) n *= 4;   // ByteAddressBuffer answers bytes
+    return n > 0xFFFFFFFFull ? 0xFFFFFFFFu : (UINT32)n;
+}
+static UINT32 GhBdUavVal(const D3D12_UNORDERED_ACCESS_VIEW_DESC* d)
+{
+    if (!d || d->ViewDimension != D3D12_UAV_DIMENSION_BUFFER) return 0;
+    if (GhBdMode() == 2) return d->Buffer.StructureByteStride ? 135084u : 147972u;
+    UINT64 n = d->Buffer.NumElements;
+    if (d->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) n *= 4;
+    return n > 0xFFFFFFFFull ? 0xFFFFFFFFu : (UINT32)n;
+}
 // D3D12 requires that a table handle live in a heap that is currently BOUND on
 // the list. A handle inside some other, unbound heap is undefined behaviour and
 // on this console the GPU dereferences it anyway.
@@ -15010,6 +15319,7 @@ static void __stdcall Hook_D12CreateCBV(ID3D12Device* self,
     // A CBV carries a raw address, not a resource. Recording nullptr here is what
     // made every constant buffer in the run invisible; keep the address.
     const UINT64 va = d ? (UINT64)d->BufferLocation : 0;
+    if (GhBufDimsOn()) GhBdPut((UINT64)dest.ptr, 0);
     if (GhDescTrackOn() || GhVaCheckOn()) GhDescPut((UINT64)dest.ptr, nullptr, 1, 0, va, 0, d ? (UINT32)d->SizeInBytes : 0u);
     if (GhVaCheckOn() && va){
         InterlockedIncrement(&g_vaChkCbv); GhVaTick();
@@ -15093,9 +15403,45 @@ static std::string GhRdBrief(const D3D12_RESOURCE_DESC* rd)
            " arraydepth=" + std::to_string((int)rd->DepthOrArraySize);
 }
 
+// #236 PROF7: the world's two volume CS (5e0c7990/1b73b93c, 69% of GPU time) loop, per
+// voxel, over GetDimensions() of a StructuredBuffer with a 52-byte element. That count is
+// the game's NumElements, so gh_srvbuf_stride=S logs buffer SRVs of stride S once per
+// distinct (NumElements, FirstElement, Flags), up to 256 lines, from gh_disp_log_at on.
+static void GhSrvBufLog(const D3D12_SHADER_RESOURCE_VIEW_DESC* d, ID3D12Resource* res)
+{
+    static const unsigned stride = GhCfgNumZ(L"gh_srvbuf_stride.txt", "GH_SRVBUF_STRIDE", 0);
+    if (!stride || !d || d->ViewDimension != D3D12_SRV_DIMENSION_BUFFER) return;
+    if (d->Buffer.StructureByteStride != stride) return;
+    static const unsigned at = GhCfgNumZ(L"gh_disp_log_at.txt", "GH_DISP_LOG_AT", 0);
+    if (at && InterlockedCompareExchange64(&g_gprPresents, 0, 0) < (LONG64)at) return;
+    static volatile LONG64 set[1024];
+    static volatile LONG   lines = 0;
+    uint64_t h = ((uint64_t)d->Buffer.NumElements * 0x9E3779B97F4A7C15ull) ^
+                 ((uint64_t)d->Buffer.FirstElement << 32) ^ (uint64_t)d->Buffer.Flags;
+    h |= 1;
+    for (unsigned i = 0, k = (unsigned)(h >> 54); i < 32; ++i, k = (k + 1) & 1023){
+        const LONG64 v = InterlockedCompareExchange64(&set[k], (LONG64)h, 0);
+        if (v == (LONG64)h) return;
+        if (v == 0){
+            if ((unsigned)InterlockedIncrement(&lines) <= 256){
+                UINT64 w = 0;
+                if (res){ D3D12_RESOURCE_DESC rd = res->GetDesc(); w = rd.Width; }
+                Diag("SRVBUF stride=" + std::to_string(stride) + " n=" + std::to_string((unsigned long)d->Buffer.NumElements) +
+                     " first=" + std::to_string((unsigned long long)d->Buffer.FirstElement) +
+                     " flags=" + std::to_string((unsigned)d->Buffer.Flags) + " res=" + Hex((uint64_t)(uintptr_t)res) +
+                     " bytes=" + std::to_string((unsigned long long)w) + " frame=" +
+                     std::to_string((long long)InterlockedCompareExchange64(&g_gprPresents, 0, 0)));
+            }
+            return;
+        }
+    }
+}
+
 static void __stdcall Hook_D12CreateSRV(ID3D12Device* self, ID3D12Resource* res,
     const D3D12_SHADER_RESOURCE_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE dest)
 {
+    GhSrvBufLog(d, res);   // #236 PROF7
+    if (GhBufDimsOn()) GhBdPut((UINT64)dest.ptr, GhBdSrvVal(d));
     GhGpSrvNote(res);   // #235
     GhGpDescNote((UINT64)dest.ptr, res);
     if (GhDescTrackOn() || GhVaCheckOn()){
@@ -15115,6 +15461,7 @@ static void __stdcall Hook_D12CreateUAV(ID3D12Device* self, ID3D12Resource* res,
     ID3D12Resource* counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC* d,
     D3D12_CPU_DESCRIPTOR_HANDLE dest)
 {
+    if (GhBufDimsOn()) GhBdPut((UINT64)dest.ptr, GhBdUavVal(d));
     if (GhDescTrackOn() || GhVaCheckOn()){
         if (d && d->ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
             GhDescPut((UINT64)dest.ptr, res, 3, (unsigned)d->Format, 0, d->Buffer.FirstElement,
@@ -15176,6 +15523,8 @@ static void __stdcall Hook_D12CopyDescSimple(ID3D12Device* self, UINT num,
     D3D12_CPU_DESCRIPTOR_HANDLE dst, D3D12_CPU_DESCRIPTOR_HANDLE src,
     D3D12_DESCRIPTOR_HEAP_TYPE type)
 {
+    if (GhBufDimsOn() && type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        GhBdCopy((UINT64)dst.ptr, (UINT64)src.ptr, num);
     if (GhDescTrackOn() || GhVaCheckOn()){
         UINT inc = self->GetDescriptorHandleIncrementSize(type);
         for (UINT k = 0; k < num && k < 4096; ++k){
@@ -15197,6 +15546,20 @@ static void __stdcall Hook_D12CopyDesc(ID3D12Device* self,
     UINT nSrc, const D3D12_CPU_DESCRIPTOR_HANDLE* src, const UINT* srcSizes,
     D3D12_DESCRIPTOR_HEAP_TYPE type)
 {
+    if (GhBufDimsOn() && type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && dst && src){
+        // Walk both range lists in runs, so each run is one memmove.
+        const UINT inc = self->GetDescriptorHandleIncrementSize(type);
+        UINT di = 0, dk = 0, si = 0, sk = 0;
+        while (di < nDst && si < nSrc){
+            const UINT dn = dstSizes ? dstSizes[di] : 1u;
+            const UINT sn = srcSizes ? srcSizes[si] : 1u;
+            if (dk >= dn){ ++di; dk = 0; continue; }
+            if (sk >= sn){ ++si; sk = 0; continue; }
+            const UINT run = (dn - dk) < (sn - sk) ? (dn - dk) : (sn - sk);
+            GhBdCopy((UINT64)dst[di].ptr + (UINT64)dk * inc, (UINT64)src[si].ptr + (UINT64)sk * inc, run);
+            dk += run; sk += run;
+        }
+    }
     if ((GhDescTrackOn() || GhVaCheckOn()) && dst && src){
         UINT inc = self->GetDescriptorHandleIncrementSize(type);
         UINT di = 0, dk = 0, si = 0, sk = 0;
@@ -16226,13 +16589,28 @@ static void GhBindBindlessTables(ID3D12GraphicsCommandList* self, GhCLNote* nt)
         if (!set) continue;
         if (res) set(self, w.res,  res->GetGPUDescriptorHandleForHeapStart());
         if (smp) set(self, w.samp, smp->GetGPUDescriptorHandleForHeapStart());
+        if (res && w.dims != UINT_MAX){   // #236 gh_bufdims
+            UINT64 va = GhBdVaFor(res);
+            if (!va){   // never leave the root SRV unset: a root descriptor has no bounds
+                InterlockedIncrement64(&g_bdNoBind);
+                va = GhBdVaLargest();
+            }
+            auto srv = (void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
+                                          D3D12_GPU_VIRTUAL_ADDRESS))GhClOrig(self, comp ? 39 : 40);
+            if (va && srv) srv(self, w.dims, (D3D12_GPU_VIRTUAL_ADDRESS)va);
+        }
         const LONG k = InterlockedIncrement(&nb);
         if (k <= 4 || (k % 2000) == 0)
             Diag("RSBINDLESS bound " + std::string(comp ? "compute" : "graphics") +
                  " res=" + std::to_string((unsigned)w.res) +
                  " samp=" + std::to_string((unsigned)w.samp) +
                  " heaps=" + std::string(res ? "R" : "-") + (smp ? "S" : "-") +
-                 " n=" + std::to_string((long)k));
+                 " n=" + std::to_string((long)k) +
+                 (GhBufDimsOn() ? " | BUFDIMS dims=" + std::to_string((unsigned)w.dims) +
+                      " puts=" + std::to_string((long long)g_bdPuts) +
+                      " nonzero=" + std::to_string((long long)g_bdNonzero) +
+                      " copies=" + std::to_string((long long)g_bdCopies) +
+                      " nobind=" + std::to_string((long long)g_bdNoBind) : std::string()));
     }
 }
 static void __stdcall Hook_CLSetGfxTable(ID3D12GraphicsCommandList* self, UINT idx,
@@ -23846,6 +24224,7 @@ static HRESULT __stdcall Hook_D12CreateDH(ID3D12Device* self, const D3D12_DESCRI
     }
     HRESULT hr;
     { GhD12CallScope _s("CreateDescriptorHeap"); hr = orig(self, d, riid, pp); }
+    if (SUCCEEDED(hr) && pp && *pp && GhBufDimsOn()) GhBdHeapAdd(self, (ID3D12DescriptorHeap*)*pp, d);
     if (SUCCEEDED(hr) && pp && *pp && (GhDescTrackOn() || GhVaCheckOn() || GhSubCensus())){
         GhDHAdd(self, (ID3D12DescriptorHeap*)*pp, d);
         {   // #158: the deep bind map needs the heap's real extent to tell a slot
@@ -39485,6 +39864,10 @@ static void RunGuest()
         // #235. Tier 2 tiled resources as a GPU page file -- proved here on the
         // throwaway device before anything is built on them. Off unless gh_tiled_probe.
         GhTiledProbe();
+
+        // #236. What GetDimensions answers for a 52-byte structured view on this
+        // driver (the world's volume CS loop to it). Off unless gh_getdims_probe.
+        GhGetDimsProbe();
 
         // ghwmm.dll: our WINMM replacement for the multimedia-timer functions the
         // container's slim WINMM lacks. Mono's import name is binary-patched
