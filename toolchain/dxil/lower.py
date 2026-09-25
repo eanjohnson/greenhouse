@@ -67,8 +67,10 @@ def lower_text(text, templates, report=None):
         text = lower66.lower_i64(text, report)
     # GH_RETILE=1: a >64-thread group with barriers AVs the console's back end; retile
     # the strided-loop shape to 64 threads exactly (§32.125, cells NT1/RT1).
+    # GH_RETILE_N=256 keeps 4 waves per group: NT1 CREATED at 256 too, and one
+    # wave per group ran the skinning pair ~8x serial (#236 BD19: 234 ms/dispatch).
     if os.environ.get('GH_RETILE') == '1':
-        text = lower66.lower_group512(text, report)
+        text = lower66.lower_group512(text, report, int(os.environ.get('GH_RETILE_N', '64')))
     return text
 
 

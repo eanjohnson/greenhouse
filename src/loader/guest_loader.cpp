@@ -31987,6 +31987,91 @@ static DWORD GhSpillCrc(const void* p, ULONG n)
     }
     return g_rtlCrc32 ? g_rtlCrc32(0, p, n) : 0;
 }
+// #236 BD19. SPILLSTAT (gh_spill_stat=1): would a compressed in-RAM tier in
+// front of the spill file absorb the world's thrash? Two numbers, measured
+// before anything is built. (1) Compressibility: every 8th eviction is XPRESS-
+// compressed and decompressed once into static scratch, under a try-lock (a
+// busy sampler skips; this runs inside the VEH, so no heap and no Diag).
+// (2) Reuse distance: each slot is stamped with the eviction sequence, and a
+// restore buckets the MB evicted since its granule left.
+static unsigned GhSpillStat()
+{ static const unsigned v = GhCfgNumZ(L"gh_spill_stat.txt", "GH_SPILL_STAT", 0); return v; }
+static uint32_t                 g_spillSeq[GH_SPILL_CRC_N];
+static volatile LONG            g_spillSeqN = 0;
+// MB evicted since: <16 <32 <64 <128 <256 <512 <1024 <2048 >=2048, then unstamped
+static volatile LONG            g_spillRd[10] = {};
+static volatile LONG            g_szBusy = 0, g_szN = 0, g_szZero = 0, g_szFail = 0, g_szInit = 0;
+static volatile LONG64          g_szIn = 0, g_szOut = 0, g_szCUs = 0, g_szDUs = 0;
+typedef NTSTATUS (NTAPI* PFN_GhRtlGetCwss)(USHORT, PULONG, PULONG);
+typedef NTSTATUS (NTAPI* PFN_GhRtlCompress)(USHORT, PUCHAR, ULONG, PUCHAR, ULONG, ULONG, PULONG, PVOID);
+typedef NTSTATUS (NTAPI* PFN_GhRtlDecompressEx)(USHORT, PUCHAR, ULONG, PUCHAR, ULONG, PULONG, PVOID);
+static PFN_GhRtlCompress        g_szComp = nullptr;
+static PFN_GhRtlDecompressEx    g_szDecomp = nullptr;
+alignas(16) static uint8_t      g_szWs[1u << 20];
+alignas(16) static uint8_t      g_szOutBuf[96u << 10];
+alignas(16) static uint8_t      g_szBack[64u << 10];
+static void GhSpillStatEvict(uint32_t s, const uint8_t* p, ULONG g)
+{
+    const LONG seq = InterlockedIncrement(&g_spillSeqN);
+    if (s < GH_SPILL_CRC_N) g_spillSeq[s] = (uint32_t)seq;
+    if ((seq & 7) || g > sizeof g_szBack) return;
+    if (InterlockedCompareExchange(&g_szBusy, 1, 0) != 0) return;
+    const USHORT fmt = 0x0003 /*COMPRESSION_FORMAT_XPRESS*/ | 0x0000 /*ENGINE_STANDARD*/;
+    if (!g_szInit){
+        g_szInit = 1;
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        auto ws = nt ? (PFN_GhRtlGetCwss)GetProcAddress(nt, "RtlGetCompressionWorkSpaceSize") : nullptr;
+        ULONG wc = 0, wd = 0;
+        if (ws && ws(fmt, &wc, &wd) == 0 && wc <= sizeof g_szWs && wd <= sizeof g_szWs){
+            g_szComp   = (PFN_GhRtlCompress)GetProcAddress(nt, "RtlCompressBuffer");
+            g_szDecomp = (PFN_GhRtlDecompressEx)GetProcAddress(nt, "RtlDecompressBufferEx");
+        }
+    }
+    if (!g_szComp || !g_szDecomp){ InterlockedIncrement(&g_szFail); InterlockedExchange(&g_szBusy, 0); return; }
+    bool zero = true;
+    for (ULONG i = 0; i < g / 8 && zero; ++i) zero = ((const uint64_t*)p)[i] == 0;
+    if (zero) InterlockedIncrement(&g_szZero);
+    LARGE_INTEGER f{}, a{}, b{}, c{};
+    QueryPerformanceFrequency(&f); QueryPerformanceCounter(&a);
+    ULONG outN = 0, backN = 0;
+    const NTSTATUS cs = g_szComp(fmt, (PUCHAR)p, g, g_szOutBuf, sizeof g_szOutBuf, 4096, &outN, g_szWs);
+    QueryPerformanceCounter(&b);
+    NTSTATUS ds = -1;
+    if (cs == 0) ds = g_szDecomp(fmt, g_szBack, g, g_szOutBuf, outN, &backN, g_szWs);
+    QueryPerformanceCounter(&c);
+    if (cs == 0x00000117L /*STATUS_BUFFER_ALL_ZEROS*/){ outN = 0; ds = 0; backN = g; }
+    const bool good = cs == 0 ? (ds == 0 && backN == g && memcmp(g_szBack, p, g) == 0) : cs == 0x00000117L;
+    if (!good) InterlockedIncrement(&g_szFail);
+    else if (f.QuadPart > 0 && a.QuadPart > 0){
+        InterlockedIncrement(&g_szN);
+        InterlockedExchangeAdd64(&g_szIn, g);
+        InterlockedExchangeAdd64(&g_szOut, outN);
+        InterlockedExchangeAdd64(&g_szCUs, (b.QuadPart - a.QuadPart) * 1000000 / f.QuadPart);
+        InterlockedExchangeAdd64(&g_szDUs, (c.QuadPart - b.QuadPart) * 1000000 / f.QuadPart);
+    }
+    InterlockedExchange(&g_szBusy, 0);
+}
+static void GhSpillStatRestore(uint32_t s)
+{
+    if (s >= GH_SPILL_CRC_N || !g_spillSeq[s]){ InterlockedIncrement(&g_spillRd[9]); return; }
+    const uint64_t grans = (uint32_t)(InterlockedCompareExchange(&g_spillSeqN, 0, 0) - (LONG)g_spillSeq[s]);
+    const uint64_t mb = (grans * 64) >> 10;          // g_lazyGran is 64 KB on every Tsushima run
+    const int k = mb < 16 ? 0 : mb < 32 ? 1 : mb < 64 ? 2 : mb < 128 ? 3 : mb < 256 ? 4 :
+                  mb < 512 ? 5 : mb < 1024 ? 6 : mb < 2048 ? 7 : 8;
+    InterlockedIncrement(&g_spillRd[k]);
+}
+// spillz=samples/allzero/fail/inKB/outKB/compressUs/decompressUs spillrd=<16/../>=2048MB/unstamped
+static std::string GhSpillStatLine()
+{
+    auto L = [](volatile LONG* v){ return std::to_string((long)InterlockedCompareExchange(v, 0, 0)); };
+    auto Q = [](volatile LONG64* v){ return std::to_string((long long)InterlockedCompareExchange64(v, 0, 0)); };
+    std::string o = " spillz=" + L(&g_szN) + "/" + L(&g_szZero) + "/" + L(&g_szFail) + "/" +
+                    std::to_string((long long)(InterlockedCompareExchange64(&g_szIn, 0, 0) >> 10)) + "/" +
+                    std::to_string((long long)(InterlockedCompareExchange64(&g_szOut, 0, 0) >> 10)) + "/" +
+                    Q(&g_szCUs) + "/" + Q(&g_szDUs) + " spillrd=";
+    for (int i = 0; i < 10; ++i) o += (i ? "/" : "") + L(&g_spillRd[i]);
+    return o;
+}
 // #233 patch i. Placeholder reservations: the only way a user-mode process can
 // make data appear at an address atomically is to map a pre-filled section
 // view over a placeholder. Reservations the pager owns are placeholders; each
@@ -32862,6 +32947,7 @@ static std::string GhLazyStats()
              " spillspin=" + std::to_string((long)InterlockedCompareExchange(&g_spillSpin, 0, 0)) +
              " spillcrc=" + std::to_string((long)InterlockedCompareExchange(&g_spillCrcBad, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_spillCrcN, 0, 0)) +
+             (GhSpillStat() ? GhSpillStatLine() : std::string()) +
              " lazyph=" + std::to_string((long)InterlockedCompareExchange(&g_phResN, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_phCommits, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_phViews, 0, 0)) +
@@ -32972,6 +33058,7 @@ static uint64_t GhLazyEvictOne(GhLazyRange& r, LONG bit)
     ov.Offset = (DWORD)fo; ov.OffsetHigh = (DWORD)(fo >> 32);
     DWORD wrote = 0;
     const DWORD crc = GhSpillCrc(p, (ULONG)g);   // patch h: the page is READONLY here, nobody writes it
+    if (GhSpillStat()) GhSpillStatEvict(s, p, (ULONG)g);
     const bool ok = WriteFile(g_spillFile, p, (DWORD)g, &wrote, &ov) && wrote == (DWORD)g;
     if (!ok || !(r.ph ? GhPhUncommitGranule(p, r.view, bit) : VirtualFree(p, (SIZE_T)g, MEM_DECOMMIT) != FALSE)){
         InterlockedIncrement(ok ? &g_spillEvictFail : &g_spillIoFail);
@@ -33007,6 +33094,7 @@ static bool GhPhRestore(GhLazyRange* rr, uint8_t* p, uint64_t g, DWORD prot, LON
     // readable, so no thread can observe the zero page. The section is charged
     // like private commit and can bounce at the ceiling the same way.
     const uint32_t s = slot[bit];
+    if (GhSpillStat()) GhSpillStatRestore(s);
     HANDLE h = nullptr;
     for (int attempt = 0; attempt < 2 && !h; ++attempt){
         h = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, (DWORD)g_lazyGran, nullptr);
@@ -33086,6 +33174,7 @@ static bool GhLazyRestoreLocked(uint8_t* p, uint64_t g, DWORD prot, LONG* bits, 
         InterlockedIncrement(&g_spillRetryOk);
     }
     const uint32_t s = slot[bit];
+    if (GhSpillStat()) GhSpillStatRestore(s);
     OVERLAPPED ov{}; const uint64_t fo = (uint64_t)s * g_lazyGran;
     ov.Offset = (DWORD)fo; ov.OffsetHigh = (DWORD)(fo >> 32);
     DWORD got = 0;
