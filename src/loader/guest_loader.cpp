@@ -22401,6 +22401,15 @@ static std::unordered_map<void*, GhGpRes*>*    g_gpMap = nullptr;
 static ID3D12Device*                           g_gpDev = nullptr;
 static ID3D12CommandQueue*                     g_gpQ = nullptr;       // DIRECT, ours, mappings only
 static ID3D12Fence*                            g_gpMapFence = nullptr;
+// #238 PG0: evicted textures map to ONE shared zeroed 64 KB tile instead of NULL.
+// TILE0 proved null-tile reads return zero through COPIES only; IA1b/LG2b hung in
+// bindless shaders reading textures the pager had just NULL-unmapped, PG0 (pager
+// off) did not. A real tile under every evicted resource keeps the shader's loads
+// on mapped memory. gh_gpu_evict_dummy=1 (default 0 = NULL, the TILE0e path).
+static ID3D12Heap*                             g_gpDummy = nullptr;
+static volatile LONG                           g_gpDummyMaps = 0;
+static unsigned GhGpEvictDummy()
+{ static const unsigned v = GhCfgNumZ(L"gh_gpu_evict_dummy.txt", "GH_GPU_EVICT_DUMMY", 0); return v; }
 static volatile LONG                           g_gpRigFailed = 0;
 
 template <class F> static F GhGpCq(ID3D12CommandQueue* q, int slot)
@@ -22822,6 +22831,20 @@ static bool GhGpRig(ID3D12Device* dev)
     g_gpMap->reserve(8192);
     Diag("GPUPAGE rig q=" + Hex((uint64_t)(uintptr_t)q) + " fence=" + Hex((uint64_t)(uintptr_t)f) +
          " cap=" + std::to_string((unsigned long)GhGpuPageMb()) + "MB");
+    if (GhGpEvictDummy()){
+        // Created here, never on the eviction path. D3D12 zeroes a new heap, and
+        // nothing may write it: converted textures carry no UAV/RT flags, and a
+        // copy into an evicted texture restores it first.
+        auto mk = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_HEAP_DESC*, REFIID, void**))g_d12vtOrig[28];
+        D3D12_HEAP_DESC hd{};
+        hd.SizeInBytes = 1u << 16; hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+        const HRESULT dh = mk(dev, &hd, __uuidof(ID3D12Heap), (void**)&g_gpDummy);
+        if (FAILED(dh)) g_gpDummy = nullptr;
+        Diag("GPUPAGE dummy tile heap hr=" + Hex((uint32_t)dh) + " heap=" + Hex((uint64_t)(uintptr_t)g_gpDummy) +
+             (g_gpDummy ? " -- evictions map to it, not NULL" : " -- evictions stay NULL"));
+    }
     GhGpCopyRig(dev);   // #235 TILE2b
     return true;
 }
@@ -22906,8 +22929,12 @@ static void GhGpMapWhole(GhGpRes* e, ID3D12Heap* heap, UINT base, bool signalNow
 {
     D3D12_TILED_RESOURCE_COORDINATE c{};
     D3D12_TILE_REGION_SIZE sz{}; sz.NumTiles = e->nTiles; sz.UseBox = FALSE;
-    const D3D12_TILE_RANGE_FLAGS rf = heap ? D3D12_TILE_RANGE_FLAG_NONE : D3D12_TILE_RANGE_FLAG_NULL;
-    const UINT off = base, cnt = e->nTiles;
+    D3D12_TILE_RANGE_FLAGS rf = heap ? D3D12_TILE_RANGE_FLAG_NONE : D3D12_TILE_RANGE_FLAG_NULL;
+    UINT off = base; const UINT cnt = e->nTiles;
+    if (!heap && g_gpDummy){                       // #238: every tile -> the one zeroed tile
+        heap = g_gpDummy; off = 0; rf = D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE;
+        InterlockedIncrement(&g_gpDummyMaps);
+    }
     GhGpCq<void (__stdcall*)(ID3D12CommandQueue*, ID3D12Resource*, UINT, const D3D12_TILED_RESOURCE_COORDINATE*,
         const D3D12_TILE_REGION_SIZE*, ID3D12Heap*, UINT, const D3D12_TILE_RANGE_FLAGS*, const UINT*, const UINT*,
         D3D12_TILE_MAPPING_FLAGS)>(g_gpQ, 8)(g_gpQ, e->res, 1, &c, &sz, heap, 1, &rf, &off, &cnt, D3D12_TILE_MAPPING_FLAG_NONE);
@@ -23725,6 +23752,7 @@ static std::string GhGpFrameLine()
            "/" + std::to_string((long)InterlockedCompareExchange(&g_gpFull, 0, 0)) +
            "/" + std::to_string((long)InterlockedCompareExchange(&g_gpFail, 0, 0)) +
            " gpalias=" + std::to_string((long)InterlockedCompareExchange(&g_gpAlias, 0, 0)) +
+           (g_gpDummy ? " gpdummy=" + std::to_string((long)InterlockedCompareExchange(&g_gpDummyMaps, 0, 0)) : std::string()) +
            // #236 gpfree=oursN/oursMs/otherN/otherMs (last Releases run inline) gpdefer=mode/queued/done/qmax/workerMs
            " gpfree=" + std::to_string((long)InterlockedCompareExchange(&g_gpFreeOurs, 0, 0)) +
            "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpFreeOursUs, 0, 0) / 1000)) +
