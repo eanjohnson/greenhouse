@@ -33944,6 +33944,8 @@ static void GhBbStampExc(GhBbExc* ring, volatile LONG* n, const EXCEPTION_RECORD
 // game's C++ throws included), so it is a handful of stores and nothing else: no
 // Diag, no lock, no stack to speak of -- it must still work on a thread whose
 // stack has just overflowed.
+static PVOID g_bbVehH  = nullptr;   // #236: registration handles, so the guest-VEH
+static PVOID g_obsVehH = nullptr;   // bed can move both back to the front of the chain
 static LONG CALLBACK GhBlackBoxVeh(EXCEPTION_POINTERS* ep)
 {
     GhBbTail* t = g_bbTail;
@@ -34004,7 +34006,8 @@ static void GhBlackBoxInit()
     if (mode >= 3){
         g_bbTail = (GhBbTail*)((GhBbRec*)(h + 1) + kBbN);
         g_bbTail->magic = 0x4C544247u;   // 'GBTL'
-        const bool veh  = AddVectoredExceptionHandler(1 /*first*/, &GhBlackBoxVeh) != nullptr;
+        g_bbVehH = AddVectoredExceptionHandler(1 /*first*/, &GhBlackBoxVeh);
+        const bool veh  = g_bbVehH != nullptr;
         HMODULE nt = GetModuleHandleW(L"ntdll.dll");
         void* pt = nt ? (void*)GetProcAddress(nt, "NtTerminateProcess") : nullptr;
         const bool term = pt && InstallInlineHook(pt, (void*)&Hook_GhBbNtTerminate, (void**)&g_realNtTerminate);
@@ -34733,10 +34736,13 @@ static HRESULT WINAPI Bed_DStorageGetFactory(REFIID riid, void** ppv)
     return ((GetFac)gp)(riid, ppv);
 }
 
+// #236 LG1: defined after CrashObserverVeh; keeps our pager ahead of guest VEHs.
+static PVOID WINAPI Bed_AddVectoredExceptionHandler(ULONG first, PVECTORED_EXCEPTION_HANDLER h);
 static const std::unordered_map<std::string, void*>& ShimTable()
 {
     static const std::unordered_map<std::string, void*> t = {
         {"GetCommandLineW",            (void*)&Bed_GetCommandLineW},
+        {"AddVectoredExceptionHandler", (void*)&Bed_AddVectoredExceptionHandler},
         {"GetCommandLineA",            (void*)&Bed_GetCommandLineA},
         {"GetStdHandle",               (void*)&Bed_GetStdHandle},
         {"WriteFile",                  (void*)&Bed_WriteFile},
@@ -35024,6 +35030,7 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
 {
     if (!h) return 0;
     static const struct { const char* fn; void* bed; } redirs[] = {
+        {"AddVectoredExceptionHandler", (void*)&Bed_AddVectoredExceptionHandler},
         {"GetCommandLineW", (void*)&Bed_GetCommandLineW}, {"GetCommandLineA", (void*)&Bed_GetCommandLineA},
         {"CreateFileW", (void*)&Bed_CreateFileW}, {"CreateFileA", (void*)&Bed_CreateFileA},
         {"CreateFile2", (void*)&Bed_CreateFile2},
@@ -36245,6 +36252,49 @@ static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
     struct Pop { int* p; ~Pop(){ --*p; } } pop{ &s_depth };
     ++s_depth;
     return GhCrashObserverVehBody(ep);
+}
+
+// #236 LG1. Tsushima registers its own crash handler (GUEST+0x4403E0) with
+// AddVectoredExceptionHandler(1, ...), which lands it AHEAD of CrashObserverVeh
+// and therefore ahead of the #145/#233 pager. It runs on every exception, and the
+// first thing it does is `mov rax,[0x141998300]; mov rax,[rax+0x18]` (GUEST+0x409427)
+// -- a read of a 0x120-byte object in the game's pool. When the spill pager has
+// taken that object's granule, that read faults INSIDE the handler; the fault is
+// dispatched to the same handler first, which faults again, and the pager behind
+// it never runs. LG1 died of exactly this: 4.2M exceptions, the last 32 all at
+// GUEST+0x409427, three STATUS_STACK_OVERFLOW in 265 ms, no NtTerminateProcess.
+// The class rule: no guest handler may run ahead of the pager. So after a guest
+// asks to be first, re-register ours in front of it (add the new registration
+// before removing the old, so there is no instant with no pager in the chain).
+// Guest handlers keep their order among themselves. gh_veh_front=0 turns it off;
+// it only acts while the demand-commit pager is configured.
+static PVOID WINAPI Bed_AddVectoredExceptionHandler(ULONG first, PVECTORED_EXCEPTION_HANDLER h)
+{
+    PVOID r = AddVectoredExceptionHandler(first, h);
+    static const unsigned front = GhCfgNumZ(L"gh_veh_front.txt", "GH_VEH_FRONT", 1);
+    static SRWLOCK lk = SRWLOCK_INIT;
+    static volatile LONG n = 0;
+    const LONG k = InterlockedIncrement(&n);
+    bool moved = false;
+    if (first && front && GhLazyOn()){
+        AcquireSRWLockExclusive(&lk);
+        if (g_obsVehH){
+            if (PVOID nh = AddVectoredExceptionHandler(1, &CrashObserverVeh)){
+                RemoveVectoredExceptionHandler(g_obsVehH); g_obsVehH = nh; moved = true;
+            }
+        }
+        if (g_bbVehH){   // the blackbox stays outermost: it must see the pager's faults too
+            if (PVOID nh = AddVectoredExceptionHandler(1, &GhBlackBoxVeh)){
+                RemoveVectoredExceptionHandler(g_bbVehH); g_bbVehH = nh;
+            }
+        }
+        ReleaseSRWLockExclusive(&lk);
+    }
+    if (k <= 32)
+        Diag("GUESTVEH n=" + std::to_string(k) + " first=" + std::to_string(first) +
+             " handler=" + Hex((uint64_t)(uintptr_t)h) + " caller=" + Hex((uint64_t)(uintptr_t)_ReturnAddress()) +
+             " reg=" + (r ? "OK" : "FAILED") + " front=" + (moved ? "MOVED" : (front ? "no" : "off")));
+    return r;
 }
 
 static LONG GhCrashObserverVehBody(EXCEPTION_POINTERS* ep)
@@ -40449,7 +40499,7 @@ static void RunGuest()
     {
         static bool vehOnce = false;
         if (!vehOnce) {
-            AddVectoredExceptionHandler(1 /*first*/, &CrashObserverVeh);
+            g_obsVehH = AddVectoredExceptionHandler(1 /*first*/, &CrashObserverVeh);
             vehOnce = true;
         }
     }

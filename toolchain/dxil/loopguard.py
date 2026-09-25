@@ -97,7 +97,7 @@ def dominators(order, succ):
     return dom, pred
 
 
-def guard(text, report, cap, fallback=True):
+def guard(text, report, cap, fallback=True, bounded=(), reset=True):
     lines = text.split('\n')
     # every function definition with a body
     fns = []
@@ -110,7 +110,7 @@ def guard(text, report, cap, fallback=True):
         i += 1
     edits = {}      # term line -> replacement lines
     entry_ins = {}  # first body line -> lines inserted before it
-    n = 0; skipped = 0; guarded = 0
+    n = 0; skipped = 0; guarded = 0; fixed = 0
     for fi, (ds, de) in enumerate(fns):
         order, first, term, succ = parse_fn(lines, ds + 1, de)
         if not order: continue
@@ -124,12 +124,18 @@ def guard(text, report, cap, fallback=True):
         p = '%%ghlg_p%d' % fi
         used = False
         phi_add = {}
+        bodies = {}
         for h, latches in loops.items():
             body = {h}; work = list(latches)
             while work:
                 x = work.pop()
                 if x in body: continue
                 body.add(x); work.extend(pred[x])
+            bodies[h] = body
+        for h, latches in loops.items():
+            if h in bounded:
+                fixed += 1; continue
+            body = bodies[h]
             cands = []
             for e in body:
                 t = term.get(e)
@@ -194,20 +200,59 @@ def guard(text, report, cap, fallback=True):
                 edits[k] = [re.sub(r'(\])(\s*(;.*)?)$', r'\1' + add.replace('\\', '\\\\') + r'\2',
                                    lines[k], count=1)]
                 k += 1
+        if used and reset:
+            # One budget per outermost loop nest, zeroed on the way in. A single
+            # function-wide budget carries a value out of every divergent loop into
+            # the next one, so the compiler has to treat even a uniform loop's exit
+            # as divergent (vector branch, vector loads for what were scalar ones).
+            # Resetting per nest keeps a uniform nest uniform; the total stays
+            # bounded by nests x CAP.
+            for h in loops:
+                if any(h in b for h2, b in bodies.items() if h2 != h):
+                    continue
+                for q in pred[h]:
+                    if q in bodies[h] or term.get(q) is None:
+                        continue
+                    t = term[q]
+                    edits[t] = ['  store i32 0, i32* %s, align 4' % p] + edits.get(t, [lines[t]])
         if used:
             e0 = first[order[0]]
             at = e0 + 1 if LABEL.match(lines[e0]) else e0
             entry_ins[at] = ['  %s = alloca i32, align 4' % p,
                              '  store i32 0, i32* %s, align 4' % p]
     if not n:
-        if skipped: report.append(' skipped=%d' % skipped)
+        if skipped or fixed: report.append(' skipped=%d fixed=%d' % (skipped, fixed))
         return text
     out = []
     for i, l in enumerate(lines):
         if i in entry_ins: out.extend(entry_ins[i])
         out.extend(edits.get(i, [l]))
-    report.append(' guarded=%d skipped=%d cap=%d' % (guarded, skipped, cap))
+    report.append(' guarded=%d skipped=%d fixed=%d cap=%d' % (guarded, skipped, fixed, cap))
     return '\n'.join(out)
+
+
+SCEV_MAX = re.compile(r'^Loop %([\w.]+): max backedge-taken count is (-?\d+)$')
+
+
+def bounded_loops(text, dxc, cap):
+    """Headers of loops LLVM's scalar evolution proves take < cap iterations.
+
+    A `for (i = 0; i < 4; ++i)` loop cannot run away on garbage data, and
+    guarding it costs twice: the budget exit stops the driver's compiler from
+    unrolling it (LG1 compiled ~9x slower per pipeline than BD32 with every
+    loop guarded), and the unrolled form is what ran on the GPU before."""
+    env = dict(os.environ, LD_LIBRARY_PATH=os.path.join(dxc, 'lib'))
+    with tempfile.TemporaryDirectory() as td:
+        a = os.path.join(td, 'a.ll')
+        open(a, 'w').write(text)
+        r = subprocess.run([os.path.join(dxc, 'bin', 'opt'), '-analyze', '-scalar-evolution', a],
+                           capture_output=True, text=True, env=env)
+    out = set()
+    for l in r.stdout.split('\n'):
+        m = SCEV_MAX.match(l.strip())
+        if m and 0 <= int(m.group(2)) < cap:
+            out.add(m.group(1))
+    return out
 
 
 def mem2reg(text, dxc):
@@ -243,7 +288,8 @@ if __name__ == '__main__':
         if 'dx.shaderModel' not in d.stdout:
             print('%-44s DISASM FAILED' % name, flush=True); bad += 1; continue
         rep = []
-        text = guard(d.stdout, rep, cap)
+        fixed = bounded_loops(d.stdout, DXC, cap)
+        text = guard(d.stdout, rep, cap, bounded=fixed)
         if 'guarded=' not in ''.join(rep):
             if rep: print('%-44s NONE %s' % (name, rep[0].strip()), flush=True)
             skip += 1; continue
@@ -258,7 +304,7 @@ if __name__ == '__main__':
             # the exit without a phi). Keep the loops the main path guards and
             # leave that one alone.
             rep2 = []
-            text2 = guard(d.stdout, rep2, cap, fallback=False)
+            text2 = guard(d.stdout, rep2, cap, fallback=False, bounded=fixed)
             if 'guarded=' not in ''.join(rep2):
                 print('%-44s FAIL %s' % (name, str(e)[:300].replace('\n', ' ')), flush=True); bad += 1; continue
             try:
