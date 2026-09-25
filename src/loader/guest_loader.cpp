@@ -33915,13 +33915,77 @@ static volatile LONG64 g_bbWatchBusy = 0;     // GetTickCount64 at top-up start,
 struct GhBbHdr { UINT32 magic, pid, recSize, n; volatile LONG idx; UINT32 startTick, pad[2]; };
 static const unsigned kBbN = 4095;
 static GhBbHdr* g_bb = nullptr;
+// BD30b: with the 25 ms recorder the last second of a vanish is an idle GPU, flat
+// memory (>= 200 MB headroom), a live reserve watcher and presents at their usual
+// slow pace -- no precursor at all, and no STAGE=guest_exit, so the guest did not
+// leave through its own ExitProcess/TerminateProcess beds. What is left is what
+// no Diag can see: a fault that re-faults inside our VEH (a stack overflow has no
+// room for Diag), a system DLL calling NtTerminateProcess directly, or a
+// __fastfail. gh_blackbox >= 3 adds a TAIL after the records: every exception is
+// stamped by a tiny first-in-chain VEH (all codes, and a second ring for the rare
+// ones), and NtTerminateProcess is hooked inline to stamp status, handle, tid and
+// a short backtrace. Neither path calls Diag or takes a lock. A vanish with an
+// empty terminate ring and no odd exception is a fastfail or an external kill.
+struct GhBbExc  { UINT32 code, tid, tick, flags; UINT64 addr; };
+struct GhBbTerm { UINT32 status, tid, tick, handleLow; UINT64 frames[8]; UINT64 bases[8]; };
+struct GhBbTail { UINT32 magic, pad0; volatile LONG excN, oddN, termN, pad1;
+                  GhBbExc all[32]; GhBbExc odd[32]; GhBbTerm term[8]; };
+static GhBbTail* g_bbTail = nullptr;
 static void GhBlackBoxTick(uint64_t used);
 static bool GhBlackBoxOn(){ static const bool on = GhCfgNumZ(L"gh_blackbox.txt", "GH_BLACKBOX", 0) != 0; return on; }
+static void GhBbStampExc(GhBbExc* ring, volatile LONG* n, const EXCEPTION_RECORD* er)
+{
+    const LONG i = InterlockedIncrement(n) - 1;
+    GhBbExc& e = ring[(unsigned)i % 32];
+    e.code = er->ExceptionCode; e.tid = GetCurrentThreadId(); e.tick = GetTickCount();
+    e.flags = er->ExceptionFlags; e.addr = (UINT64)(uintptr_t)er->ExceptionAddress;
+}
+// Runs ahead of every other handler, on every exception (the pager's AVs and the
+// game's C++ throws included), so it is a handful of stores and nothing else: no
+// Diag, no lock, no stack to speak of -- it must still work on a thread whose
+// stack has just overflowed.
+static LONG CALLBACK GhBlackBoxVeh(EXCEPTION_POINTERS* ep)
+{
+    GhBbTail* t = g_bbTail;
+    if (t && ep && ep->ExceptionRecord){
+        const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+        GhBbStampExc(t->all, &t->excN, er);
+        const DWORD c = er->ExceptionCode;
+        if (c != 0xC0000005u && c != 0xE06D7363u && c != 0x406D1388u && c != 0x40010006u &&
+            c != 0x4001000Au && c != 0x80000003u && c != 0x80000004u)
+            GhBbStampExc(t->odd, &t->oddN, er);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+typedef LONG (NTAPI* PFN_GhNtTerminate)(HANDLE, LONG);
+static PFN_GhNtTerminate g_realNtTerminate = nullptr;
+static LONG NTAPI Hook_GhBbNtTerminate(HANDLE h, LONG status)
+{
+    GhBbTail* t = g_bbTail;
+    if (t){
+        const LONG i = InterlockedIncrement(&t->termN) - 1;
+        GhBbTerm& r = t->term[(unsigned)i % 8];
+        r.status = (UINT32)status; r.tid = GetCurrentThreadId(); r.tick = GetTickCount();
+        r.handleLow = (UINT32)(uintptr_t)h;
+        void* fr[8] = {};
+        const USHORT got = RtlCaptureStackBackTrace(0, 8, fr, nullptr);
+        for (int k = 0; k < 8; ++k){
+            r.frames[k] = k < got ? (UINT64)(uintptr_t)fr[k] : 0;
+            // Module base by a read-only lookup: RtlPcToFileHeader takes no loader
+            // lock, so it is safe while other threads are being torn down.
+            PVOID base = nullptr;
+            if (fr[k]) RtlPcToFileHeader(fr[k], &base);
+            r.bases[k] = (UINT64)(uintptr_t)base;
+        }
+    }
+    return g_realNtTerminate(h, status);
+}
 static void GhBlackBoxInit()
 {
     if (!GhBlackBoxOn() || g_bb) return;
     const std::wstring path = std::wstring(kLocalState) + L"gh_blackbox.bin";
-    const DWORD bytes = (DWORD)(sizeof(GhBbHdr) + sizeof(GhBbRec) * kBbN);
+    const unsigned bbMode = GhCfgNumZ(L"gh_blackbox.txt", "GH_BLACKBOX", 0);
+    const DWORD bytes = (DWORD)(sizeof(GhBbHdr) + sizeof(GhBbRec) * kBbN + (bbMode >= 3 ? sizeof(GhBbTail) : 0));
     HANDLE f = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE){ Diag("BLACKBOX open failed err=" + std::to_string((unsigned long)GetLastError())); return; }
@@ -33934,10 +33998,21 @@ static void GhBlackBoxInit()
     h->magic = 0x58424847u; h->pid = GetCurrentProcessId(); h->recSize = sizeof(GhBbRec); h->n = kBbN;
     h->idx = 0; h->startTick = GetTickCount();
     g_bb = h;
-    const unsigned mode = GhCfgNumZ(L"gh_blackbox.txt", "GH_BLACKBOX", 0);
+    const unsigned mode = bbMode;
     const unsigned bms  = GhCfgNumZ(L"gh_blackbox_ms.txt", "GH_BLACKBOX_MS", 25);
+    std::string tail;
+    if (mode >= 3){
+        g_bbTail = (GhBbTail*)((GhBbRec*)(h + 1) + kBbN);
+        g_bbTail->magic = 0x4C544247u;   // 'GBTL'
+        const bool veh  = AddVectoredExceptionHandler(1 /*first*/, &GhBlackBoxVeh) != nullptr;
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        void* pt = nt ? (void*)GetProcAddress(nt, "NtTerminateProcess") : nullptr;
+        const bool term = pt && InstallInlineHook(pt, (void*)&Hook_GhBbNtTerminate, (void**)&g_realNtTerminate);
+        tail = std::string(" tail=") + std::to_string((unsigned long)sizeof(GhBbTail)) +
+               " veh=" + (veh ? "OK" : "FAILED") + " term=" + (term ? "OK" : "FAILED");
+    }
     Diag("BLACKBOX armed recs=" + std::to_string(kBbN) + " bytes=" + std::to_string((unsigned long)bytes) +
-         " mode=" + std::to_string(mode) + " ms=" + std::to_string(mode >= 2 ? bms : 100));
+         " mode=" + std::to_string(mode) + " ms=" + std::to_string(mode >= 2 ? bms : 100) + tail);
     if (mode >= 2){
         std::thread([bms]{
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
