@@ -16332,6 +16332,16 @@ static const unsigned kBcRingN = 4096;
 static GhBcSnap g_bcRing[kBcRingN];
 static void GhBcSnapTake(ID3D12GraphicsCommandList* self, LONG g);
 static void GhBcSnapDump(const char* where, UINT32 started, UINT32 finished);
+// #234 BD27. Whole-run stamping (mode 1) numbers every op, but a quiet trace prints no
+// BCOP lines and the snapshot ring above is mode >= 2 only, so BD26's world hang died
+// with bare g= numbers that name nothing. This ring records every stamped op in every
+// mode -- 32 bytes, no Diag, no lock -- and GhBcLiteDump resolves the in-flight range,
+// the retired op's list and the ops that list issued after it. Sized far past BD26's
+// issued-started gap (5,520 ops) so the hung range is still held at removal.
+struct GhBcLite { LONG g; UINT kind; void* cl; void* pso; UINT a[2]; };
+static const unsigned kBcLiteN = 65536;
+static GhBcLite* g_bcLite = nullptr;   // VirtualAlloc'd by GhBreadcrumbInit, never freed
+static void GhBcLiteDump(const char* where, UINT32 started, UINT32 finished, LONG issued);
 
 // #158. DRED is a dead end on this console -- it arms, and its breadcrumb list is
 // always empty with a page-fault VA of zero. So keep our own. A READBACK buffer
@@ -16387,6 +16397,7 @@ static void GhBreadcrumbInit(ID3D12Device* dev)
     g_bcCpu[0] = 0; g_bcCpu[1] = 0;
     g_bcCpu[2] = 0; g_bcCpu[3] = 0;   // #158 barrier-batch breadcrumb
     g_bcVa = g_bcRes->GetGPUVirtualAddress();
+    g_bcLite = (GhBcLite*)VirtualAlloc(nullptr, sizeof(GhBcLite) * kBcLiteN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3{};
     if (SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3))))
         g_bcWbiFlags = (UINT)o3.WriteBufferImmediateSupportFlags;
@@ -16440,6 +16451,14 @@ static LONG GhBreadcrumbBefore(ID3D12GraphicsCommandList* cl)
     if ((g <= 8192 || GhBcMode() >= 2) && !GhCLQuiet()) Diag("BCOP g=" + std::to_string((long)g) +
                         " cl=" + Hex((uint64_t)(uintptr_t)cl));
     GhBindDump(cl, g);
+    if (g_bcLite){
+        const GhCLNote* n = GhCLFind(cl);
+        GhBcLite& e = g_bcLite[(unsigned)g % kBcLiteN];
+        e.g = 0;                                   // torn-record guard: g is written last
+        e.kind = t_bcOpArgs.kind; e.cl = cl; e.pso = n ? n->lastPso : nullptr;
+        e.a[0] = t_bcOpArgs.a[0]; e.a[1] = t_bcOpArgs.a[1];
+        *(volatile LONG*)&e.g = g;
+    }
     if (GhBcMode() >= 2) GhBcSnapTake(cl, g);
     if (GhDumpPsoAt() && g == (LONG)GhDumpPsoAt()){
         const GhCLNote* n = GhCLFind(cl);
@@ -16553,6 +16572,7 @@ static void GhBreadcrumbDump(const char* where)
          " finished=" + std::to_string((unsigned long)g_bcCpu[1]) +
          " issued=" + std::to_string((long)InterlockedCompareExchange(&g_bcSeq, 0, 0)));
     GhBcSnapDump(where, g_bcCpu[0], g_bcCpu[1]);   // #234: the hung op's own state
+    GhBcLiteDump(where, g_bcCpu[0], g_bcCpu[1], InterlockedCompareExchange(&g_bcSeq, 0, 0));   // #234 BD27
     // #158: kept on its own line so a run with both draws and barriers stamped is
     // still readable, and so the two numbering schemes are never confused.
     if (GhBcBarriers())
@@ -17029,6 +17049,47 @@ static void GhBcSnapDump(const char* where, UINT32 started, UINT32 finished)
         }
         Diag("BCSAME total=" + std::to_string(same) + " (ring holds the last " + std::to_string(kBcRingN) + " stamped ops)");
     }
+}
+
+static std::string GhBcLiteLine(const GhBcLite& e, const char* tag)
+{
+    const char* k = e.kind == 12 ? "DRAW" : e.kind == 13 ? "DRAWINDEXED" : e.kind == 14 ? "DISPATCH" : e.kind == 59 ? "INDIRECT" : "op";
+    return std::string("BCLITE ") + tag + " g=" + std::to_string((long)e.g) + " cl=" + Hex((uint64_t)(uintptr_t)e.cl) +
+           " pso=" + Hex((uint64_t)(uintptr_t)e.pso) + " " + k + " a0=" + std::to_string((unsigned long)e.a[0]) +
+           " a1=" + std::to_string((unsigned long)e.a[1]);
+}
+static void GhBcLiteDump(const char* where, UINT32 started, UINT32 finished, LONG issued)
+{
+    if (!g_bcLite || !started || started == 0xFFFFFFFFu || finished == 0xFFFFFFFFu) return;
+    const UINT32 lo = finished > 8 ? finished - 8 : 1;
+    const UINT32 hi = (started > finished ? started : finished) + 8;
+    Diag(std::string("BCLITE at ") + where + " range=" + std::to_string((unsigned long)lo) + ".." +
+         std::to_string((unsigned long)hi) + " issued=" + std::to_string((long)issued) +
+         " ring=" + std::to_string(kBcLiteN));
+    std::vector<void*> psos;
+    unsigned printed = 0;
+    for (UINT32 g = lo; g <= hi && printed < 160; ++g){
+        const GhBcLite e = g_bcLite[g % kBcLiteN];
+        if ((UINT32)e.g != g){ Diag("BCLITE g=" + std::to_string((unsigned long)g) + " not held"); continue; }
+        Diag(GhBcLiteLine(e, g == finished ? "RETIRED" : g == started ? "STARTED" : g < finished ? "before" : g < started ? "inflight" : "after"));
+        if (std::find(psos.begin(), psos.end(), e.pso) == psos.end()) psos.push_back(e.pso);
+        ++printed;
+    }
+    // With lists recorded in parallel the stuck op is the next one on the SAME list as
+    // the last end-stamp (#234 rule), which can sit anywhere up to `issued`.
+    const GhBcLite f = g_bcLite[finished % kBcLiteN];
+    if ((UINT32)f.g == finished){
+        unsigned nx = 0;
+        for (LONG g = (LONG)finished + 1; g <= issued && g <= (LONG)finished + (LONG)kBcLiteN - 1 && nx < 6; ++g){
+            const GhBcLite e = g_bcLite[(unsigned)g % kBcLiteN];
+            if (e.g != g || e.cl != f.cl) continue;
+            Diag(GhBcLiteLine(e, nx == 0 ? "NEXT-ON-LIST" : "later-on-list"));
+            if (std::find(psos.begin(), psos.end(), e.pso) == psos.end()) psos.push_back(e.pso);
+            ++nx;
+        }
+        if (!nx) Diag("BCLITE no later op on the retired op's list up to issued");
+    }
+    if (GhPsoDescOn()) for (void* p : psos) Diag(GhPsoDescLine(p));
 }
 
 static unsigned GhOpStop()
@@ -19045,6 +19106,7 @@ static void __stdcall Hook_CLExecIndirect(ID3D12GraphicsCommandList* self, void*
         return;
     }
     GhGprStamp(self, 4);   // #236
+    t_bcOpArgs = GhOpArgs{ 59, { maxCount, 0, 0, 0, 0 } };   // #234 BD27: not a stale draw's args
     const LONG bcg = GhBreadcrumbBefore(self);
     if (!GhRecCap59(self, sig, maxCount, args, argOff, cnt, cntOff))
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, void*, UINT, ID3D12Resource*, UINT64,
