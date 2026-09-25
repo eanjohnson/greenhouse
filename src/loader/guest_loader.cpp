@@ -177,9 +177,11 @@ static uint64_t GhDiagCapBytes()
     if (mb > 512) mb = 512;      // the old 64 MB behaviour is still expressible
     return (uint64_t)mb * 1024 * 1024;
 }
+static volatile LONG g_diagLines = 0;   // #236 BD28: black-box liveness of the log itself
 static void Diag(const std::string& s)
 {
     DWORD savedErr = GetLastError();
+    InterlockedIncrement(&g_diagLines);
     {
         std::lock_guard<std::mutex> lk(g_diagRingMu);
         g_diagRing.push_back(s);
@@ -33893,18 +33895,72 @@ static void GhLazySpillHookNtRead()
 // reserve gets its own watcher at gh_spill_poll_ms (default 100; 0 = off): it only
 // reads the cached budget, and spills only when the reserve is actually short.
 // The aging slice stays on the sampler.
+// #236 BD28. Eight world runs have ended in a silent vanish: no 887A0006, no WER
+// dump, no death record, the game log unflushed, the last MEMORY sample 115-245 MB
+// under the ceiling. The diag samples memory every few seconds and cannot say what
+// stopped first. This is a flight recorder: a 128 KB FILE-BACKED view (no commit,
+// #143) that the 100 ms spill watcher stamps with one 32-byte record per tick.
+// Dirty mapped pages reach the file after the process dies, so the last seconds
+// before an unrecorded kill survive: commit, physical, presents (CPU progress),
+// the GPU's finished breadcrumb (GPU progress), pager restores and Diag lines.
+struct GhBbRec { UINT32 tick, present, issued, gpuDone; UINT16 usedMB, physMB, pageMB, lazyMB; UINT32 spillrs, diagN; };
+struct GhBbHdr { UINT32 magic, pid, recSize, n; volatile LONG idx; UINT32 startTick, pad[2]; };
+static const unsigned kBbN = 4095;
+static GhBbHdr* g_bb = nullptr;
+static bool GhBlackBoxOn(){ static const bool on = GhCfgNumZ(L"gh_blackbox.txt", "GH_BLACKBOX", 0) != 0; return on; }
+static void GhBlackBoxInit()
+{
+    if (!GhBlackBoxOn() || g_bb) return;
+    const std::wstring path = std::wstring(kLocalState) + L"gh_blackbox.bin";
+    const DWORD bytes = (DWORD)(sizeof(GhBbHdr) + sizeof(GhBbRec) * kBbN);
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE){ Diag("BLACKBOX open failed err=" + std::to_string((unsigned long)GetLastError())); return; }
+    HANDLE m = CreateFileMappingW(f, nullptr, PAGE_READWRITE, 0, bytes, nullptr);
+    void* v = m ? MapViewOfFile(m, FILE_MAP_WRITE, 0, 0, bytes) : nullptr;
+    if (!v){ Diag("BLACKBOX map failed err=" + std::to_string((unsigned long)GetLastError())); if (m) CloseHandle(m); CloseHandle(f); return; }
+    // The view keeps the section and the file alive; the handles are not needed.
+    CloseHandle(m); CloseHandle(f);
+    GhBbHdr* h = (GhBbHdr*)v;
+    h->magic = 0x58424847u; h->pid = GetCurrentProcessId(); h->recSize = sizeof(GhBbRec); h->n = kBbN;
+    h->idx = 0; h->startTick = GetTickCount();
+    g_bb = h;
+    Diag("BLACKBOX armed recs=" + std::to_string(kBbN) + " bytes=" + std::to_string((unsigned long)bytes));
+}
+static void GhBlackBoxTick(uint64_t used)
+{
+    if (!g_bb) return;
+    MEMORYSTATUSEX ms{}; ms.dwLength = sizeof ms;
+    GlobalMemoryStatusEx(&ms);
+    const LONG i = g_bb->idx;
+    GhBbRec& r = ((GhBbRec*)(g_bb + 1))[(unsigned)i % kBbN];
+    r.tick    = GetTickCount();
+    r.present = (UINT32)InterlockedCompareExchange(&g_presentN, 0, 0);
+    r.issued  = (UINT32)InterlockedCompareExchange(&g_bcSeq, 0, 0);
+    r.gpuDone = g_bcCpu ? g_bcCpu[1] : 0;
+    r.usedMB  = (UINT16)(used >> 20);
+    r.physMB  = (UINT16)(ms.ullAvailPhys >> 20);
+    r.pageMB  = (UINT16)(ms.ullAvailPageFile >> 20);
+    r.lazyMB  = (UINT16)((uint64_t)InterlockedCompareExchange64(&g_lazyCommitted, 0, 0) >> 20);
+    r.spillrs = (UINT32)InterlockedCompareExchange(&g_spillRestores, 0, 0);
+    r.diagN   = (UINT32)InterlockedCompareExchange(&g_diagLines, 0, 0);
+    InterlockedExchange(&g_bb->idx, i + 1);   // written last: idx-1 is always a whole record
+}
+
 static void GhLazySpillWatchStart()
 {
     static volatile LONG started = 0;
     if (InterlockedExchange(&started, 1)) return;
     const unsigned ms = GhCfgNumZ(L"gh_spill_poll_ms.txt", "GH_SPILL_POLL_MS", 100);
     if (!ms) return;
+    GhBlackBoxInit();
     std::thread([ms]{
         while (!g_guestDone){
             Sleep(ms);
             if (!GhLazySpillOn() || InterlockedCompareExchange(&g_lazyCount, 0, 0) == 0) continue;
             uint64_t used = 0, lim = 0;
             GhAppBudget(&used, &lim);
+            GhBlackBoxTick(used);
             if (!lim) continue;
             const uint64_t rem = used < lim ? lim - used : 0;
             const LONG64 remMB = (LONG64)(rem >> 20);
