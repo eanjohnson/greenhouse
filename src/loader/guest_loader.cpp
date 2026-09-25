@@ -32000,6 +32000,17 @@ static uint32_t                 g_spillSeq[GH_SPILL_CRC_N];
 static volatile LONG            g_spillSeqN = 0;
 // MB evicted since: <16 <32 <64 <128 <256 <512 <1024 <2048 >=2048, then unstamped
 static volatile LONG            g_spillRd[10] = {};
+// #236 BD25: restore ReadFile latency, us: <100 <500 <2000 <8000 <32000 >=32000.
+// A bimodal split says the system file cache already serves the short reuse
+// distances; all mass above 2 ms says every restore is a disk seek.
+static volatile LONG            g_spillRl[6] = {};
+static volatile LONG64          g_spillRlUs = 0;
+static void GhSpillStatReadUs(LONG64 us)
+{
+    const int k = us < 100 ? 0 : us < 500 ? 1 : us < 2000 ? 2 : us < 8000 ? 3 : us < 32000 ? 4 : 5;
+    InterlockedIncrement(&g_spillRl[k]);
+    InterlockedExchangeAdd64(&g_spillRlUs, us);
+}
 static volatile LONG            g_szBusy = 0, g_szN = 0, g_szZero = 0, g_szFail = 0, g_szInit = 0;
 static volatile LONG64          g_szIn = 0, g_szOut = 0, g_szCUs = 0, g_szDUs = 0;
 typedef NTSTATUS (NTAPI* PFN_GhRtlGetCwss)(USHORT, PULONG, PULONG);
@@ -32061,6 +32072,7 @@ static void GhSpillStatRestore(uint32_t s)
     InterlockedIncrement(&g_spillRd[k]);
 }
 // spillz=samples/allzero/fail/inKB/outKB/compressUs/decompressUs spillrd=<16/../>=2048MB/unstamped
+// spillrl=<0.1/<0.5/<2/<8/<32/>=32 ms restore reads, then their total us
 static std::string GhSpillStatLine()
 {
     auto L = [](volatile LONG* v){ return std::to_string((long)InterlockedCompareExchange(v, 0, 0)); };
@@ -32070,7 +32082,123 @@ static std::string GhSpillStatLine()
                     std::to_string((long long)(InterlockedCompareExchange64(&g_szOut, 0, 0) >> 10)) + "/" +
                     Q(&g_szCUs) + "/" + Q(&g_szDUs) + " spillrd=";
     for (int i = 0; i < 10; ++i) o += (i ? "/" : "") + L(&g_spillRd[i]);
+    o += " spillrl=";
+    for (int i = 0; i < 6; ++i) o += (i ? "/" : "") + L(&g_spillRl[i]);
+    o += "/" + Q(&g_spillRlUs);
     return o;
+}
+// #236 BD25. SPILLRING (gh_spill_ring_mb, 0 = off): a write-back victim cache
+// in front of the spill file, held in a FILE-BACKED view of its own file on D:.
+// BD23: restores are synchronous 64 KB HDD reads at 5.5 ms each, and 55% of
+// them come back within 128 MB of evictions (76% within 256 MB). BD24: the
+// commit reserve that would otherwise hold them is load-bearing (a 128 MB
+// reserve vanished in the load at appused 4,973). A mapped file's pages are
+// not commit (#143), so the ring spends the title's spare PHYSICAL memory
+// (availphys minus the commit headroom: ~160-600 MB) instead; when the OS
+// trims it, its pages go to the ring file and come back from there -- a miss
+// costs what every restore costs today. An eviction lands in the ring, NOT
+// the spill file; the spill file is written only when the ring slot is
+// recycled while its granule is still out (write-back), so a granule that
+// comes home within the ring's distance never touches the disk queue the
+// restores are waiting on. Evictions are serialised (the room guard), so the
+// head and the write-back have one writer; a restore validates owner, slot
+// and the eviction CRC and falls back to the file on any doubt. No Diag and no
+// heap here: this runs inside the VEH.
+enum : uint32_t { GH_RING_NONE = 0xFFFFFFFFu };
+static unsigned GhSpillRingMb()
+{ static const unsigned v = GhCfgNumZ(L"gh_spill_ring_mb.txt", "GH_SPILL_RING_MB", 0); return v; }
+static uint8_t*                 g_ring        = nullptr;
+static uint32_t                 g_ringN       = 0;       // slots of g_lazyGran
+static uint32_t                 g_ringHead    = 0;       // evictor-only
+static volatile LONG*           g_ringOwner   = nullptr; // ring slot -> spill slot
+static volatile LONG            g_ringOf[GH_SPILL_CRC_N];// spill slot -> ring slot
+static volatile LONG            g_ringPut = 0, g_ringHit = 0, g_ringMiss = 0, g_ringStale = 0,
+                                g_ringFault = 0, g_ringWb = 0, g_ringWbFail = 0;
+static void GhSpillRingInit(const std::wstring& path)
+{
+    const unsigned mb = GhSpillRingMb();
+    for (uint32_t i = 0; i < GH_SPILL_CRC_N; ++i) g_ringOf[i] = (LONG)GH_RING_NONE;
+    if (!mb || g_lazyGran != 0x10000) return;
+    const uint64_t bytes = (uint64_t)mb << 20;
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (f == INVALID_HANDLE_VALUE){ Diag("SPILLRING OFF: file refused err=" + std::to_string((unsigned long)GetLastError())); return; }
+    HANDLE m = CreateFileMappingW(f, nullptr, PAGE_READWRITE, (DWORD)(bytes >> 32), (DWORD)bytes, nullptr);
+    const DWORD me = m ? 0 : GetLastError();
+    CloseHandle(f);                                   // the section keeps the file open
+    if (!m){ Diag("SPILLRING OFF: section refused err=" + std::to_string((unsigned long)me)); return; }
+    void* v = MapViewOfFile(m, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, (SIZE_T)bytes);
+    const DWORD ve = v ? 0 : GetLastError();
+    CloseHandle(m);                                   // the view keeps the section alive
+    if (!v){ Diag("SPILLRING OFF: view refused err=" + std::to_string((unsigned long)ve)); return; }
+    const uint32_t n = (uint32_t)(bytes / g_lazyGran);
+    LONG* own = (LONG*)VirtualAlloc(nullptr, sizeof(LONG) * n, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!own){ UnmapViewOfFile(v); Diag("SPILLRING OFF: owner table refused"); return; }
+    for (uint32_t i = 0; i < n; ++i) own[i] = (LONG)GH_RING_NONE;
+    g_ringOwner = own; g_ringN = n; g_ring = (uint8_t*)v;
+    Diag("SPILLRING on " + std::to_string(mb) + " MB slots=" + std::to_string(n) +
+         " view=" + Hex((uint64_t)(uintptr_t)v) + " file=D:\\DevelopmentFiles\\gh_spillring_<pid>.bin");
+}
+static bool GhRingCopy(void* dst, const void* src, SIZE_T n)
+{
+    __try { memcpy(dst, src, n); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// Evictor only. True = the granule's bytes live in the ring (and nowhere else).
+static bool GhSpillRingPut(uint32_t s, const uint8_t* p, uint64_t g)
+{
+    if (!g_ring || s >= GH_SPILL_CRC_N || g != g_lazyGran) return false;
+    const uint32_t i = g_ringHead;
+    uint8_t* slot = g_ring + (uint64_t)i * g_lazyGran;
+    const uint32_t prev = (uint32_t)g_ringOwner[i];
+    if (prev < GH_SPILL_CRC_N && (uint32_t)g_ringOf[prev] == i){
+        // Still out and only here: write it to its own file slot first.
+        OVERLAPPED ov{}; const uint64_t fo = (uint64_t)prev * g_lazyGran;
+        ov.Offset = (DWORD)fo; ov.OffsetHigh = (DWORD)(fo >> 32);
+        DWORD wrote = 0;
+        if (!WriteFile(g_spillFile, slot, (DWORD)g_lazyGran, &wrote, &ov) || wrote != (DWORD)g_lazyGran){
+            InterlockedIncrement(&g_ringWbFail);
+            return false;                             // slot i keeps prev; this granule goes to the file
+        }
+        InterlockedIncrement(&g_ringWb);
+    }
+    InterlockedExchange(&g_ringOwner[i], (LONG)GH_RING_NONE);
+    if (prev < GH_SPILL_CRC_N) InterlockedCompareExchange(&g_ringOf[prev], (LONG)GH_RING_NONE, (LONG)i);
+    g_ringHead = (i + 1) % g_ringN;
+    if (!GhRingCopy(slot, p, (SIZE_T)g)){ InterlockedIncrement(&g_ringFault); return false; }
+    InterlockedExchange(&g_ringOwner[i], (LONG)s);
+    InterlockedExchange(&g_ringOf[s], (LONG)i);
+    InterlockedIncrement(&g_ringPut);
+    return true;
+}
+// Any thread. True = dst holds slot s's bytes, verified against its eviction CRC.
+static bool GhSpillRingGet(uint32_t s, void* dst, uint64_t g)
+{
+    if (!g_ring || s >= GH_SPILL_CRC_N || g != g_lazyGran) return false;
+    const uint32_t i = (uint32_t)g_ringOf[s];
+    if (i >= g_ringN || (uint32_t)g_ringOwner[i] != s){ InterlockedIncrement(&g_ringMiss); return false; }
+    if (!GhRingCopy(dst, g_ring + (uint64_t)i * g_lazyGran, (SIZE_T)g)){ InterlockedIncrement(&g_ringFault); return false; }
+    MemoryBarrier();
+    if ((uint32_t)g_ringOwner[i] != s || (uint32_t)g_ringOf[s] != i ||
+        (g_rtlCrc32 && GhSpillCrc(dst, (ULONG)g) != g_spillCrc[s])){
+        InterlockedIncrement(&g_ringStale); return false;
+    }
+    InterlockedIncrement(&g_ringHit);
+    return true;
+}
+// Slot s is free again (restored, discarded, or its eviction rolled back).
+static void GhSpillRingDrop(uint32_t s)
+{
+    if (!g_ring || s >= GH_SPILL_CRC_N) return;
+    const uint32_t i = (uint32_t)InterlockedExchange(&g_ringOf[s], (LONG)GH_RING_NONE);
+    if (i < g_ringN) InterlockedCompareExchange(&g_ringOwner[i], (LONG)GH_RING_NONE, (LONG)s);
+}
+static std::string GhSpillRingLine()
+{
+    if (!g_ring) return std::string();
+    auto L = [](volatile LONG* v){ return std::to_string((long)InterlockedCompareExchange(v, 0, 0)); };
+    return " spillring=" + L(&g_ringPut) + "/" + L(&g_ringHit) + "/" + L(&g_ringMiss) + "/" +
+           L(&g_ringStale) + "/" + L(&g_ringFault) + "/" + L(&g_ringWb) + "/" + L(&g_ringWbFail);
 }
 // #233 patch i. Placeholder reservations: the only way a user-mode process can
 // make data appear at an address atomically is to map a pre-filled section
@@ -32508,6 +32636,8 @@ static bool GhLazyOn()
                     if (!g_spillStage) Diag("LAZYSPILL staging refused err=" + std::to_string((unsigned long)GetLastError()));
                     Diag("LAZYSPILL on reserve=" + Hex(g_lazySpill) + " gran=" + Hex(g_lazyGran) +
                          " file=D:\\DevelopmentFiles\\gh_spill_<pid>.bin");
+                    GhSpillRingInit(std::wstring(kDevRoot) + L"gh_spillring_" +
+                                    std::to_wstring((unsigned long)GetCurrentProcessId()) + L".bin");
                     // patch i: placeholder reservations + section-view restores
                     g_lazyPh = GhCfgNumZ(L"gh_lazy_ph.txt", "GH_LAZY_PH", 1);
                     if (g_lazyPh) GhArenaPlaceholderApi();
@@ -32860,6 +32990,7 @@ static void GhLazySpillDiscard(GhLazyRange& r, uint64_t from, uint64_t to, bool 
         const uint64_t g = (r.size - o < g_lazyGran) ? (r.size - o) : g_lazyGran;
         if (r.busy[bit / 32] & m) continue;            // mid-flight elsewhere: leave it to its owner
         if (r.spilled[bit / 32] & m){
+            GhSpillRingDrop(r.slot[bit]);              // BD25: never written back
             AcquireSRWLockExclusive(&g_spillLock);
             if (g_spillFree.size() < g_spillFree.capacity()) g_spillFree.push_back(r.slot[bit]);
             ReleaseSRWLockExclusive(&g_spillLock);
@@ -32948,6 +33079,7 @@ static std::string GhLazyStats()
              " spillcrc=" + std::to_string((long)InterlockedCompareExchange(&g_spillCrcBad, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_spillCrcN, 0, 0)) +
              (GhSpillStat() ? GhSpillStatLine() : std::string()) +
+             GhSpillRingLine() +
              " lazyph=" + std::to_string((long)InterlockedCompareExchange(&g_phResN, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_phCommits, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_phViews, 0, 0)) +
@@ -33059,8 +33191,12 @@ static uint64_t GhLazyEvictOne(GhLazyRange& r, LONG bit)
     DWORD wrote = 0;
     const DWORD crc = GhSpillCrc(p, (ULONG)g);   // patch h: the page is READONLY here, nobody writes it
     if (GhSpillStat()) GhSpillStatEvict(s, p, (ULONG)g);
-    const bool ok = WriteFile(g_spillFile, p, (DWORD)g, &wrote, &ov) && wrote == (DWORD)g;
+    if (s < GH_SPILL_CRC_N) g_spillCrc[s] = crc;   // BD25: before the ring can serve it
+    GhSpillRingDrop(s);
+    const bool ok = GhSpillRingPut(s, p, g) ||
+                    (WriteFile(g_spillFile, p, (DWORD)g, &wrote, &ov) && wrote == (DWORD)g);
     if (!ok || !(r.ph ? GhPhUncommitGranule(p, r.view, bit) : VirtualFree(p, (SIZE_T)g, MEM_DECOMMIT) != FALSE)){
+        GhSpillRingDrop(s);
         InterlockedIncrement(ok ? &g_spillEvictFail : &g_spillIoFail);
         DWORD o2 = 0; VirtualProtect(p, (SIZE_T)g, r.prot, &o2);
         AcquireSRWLockExclusive(&g_spillLock);
@@ -33119,8 +33255,13 @@ static bool GhPhRestore(GhLazyRange* rr, uint8_t* p, uint64_t g, DWORD prot, LON
     OVERLAPPED ov{}; const uint64_t fo = (uint64_t)s * g_lazyGran;
     ov.Offset = (DWORD)fo; ov.OffsetHigh = (DWORD)(fo >> 32);
     DWORD got = 0;
-    const bool rd = ReadFile(g_spillFile, v, (DWORD)g, &got, &ov) && got == (DWORD)g;
-    if (rd && s < GH_SPILL_CRC_N && g_rtlCrc32){
+    LARGE_INTEGER qf{}, q0{}, q1{};
+    const bool hit = GhSpillRingGet(s, v, g);       // BD25: verified against the CRC already
+    if (!hit && GhSpillStat()){ QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0); }
+    const bool rd = hit || (ReadFile(g_spillFile, v, (DWORD)g, &got, &ov) && got == (DWORD)g);
+    if (!hit && GhSpillStat() && qf.QuadPart > 0 && q0.QuadPart > 0 && QueryPerformanceCounter(&q1))
+        GhSpillStatReadUs((q1.QuadPart - q0.QuadPart) * 1000000 / qf.QuadPart);
+    if (rd && !hit && s < GH_SPILL_CRC_N && g_rtlCrc32){
         InterlockedIncrement(&g_spillCrcN);
         if (GhSpillCrc(v, (ULONG)g) != g_spillCrc[s]){
             if (InterlockedIncrement(&g_spillCrcBad) <= 8)
@@ -33140,6 +33281,7 @@ static bool GhPhRestore(GhLazyRange* rr, uint8_t* p, uint64_t g, DWORD prot, LON
     _interlockedbittestandset(rr->view, bit);
     InterlockedIncrement(&g_phViews);
     InterlockedIncrement(&g_phRestores);
+    GhSpillRingDrop(s);                               // BD25: the slot is free again
     AcquireSRWLockExclusive(&g_spillLock);
     if (g_spillFree.size() < g_spillFree.capacity()) g_spillFree.push_back(s);
     ReleaseSRWLockExclusive(&g_spillLock);
@@ -33188,8 +33330,13 @@ static bool GhLazyRestoreLocked(uint8_t* p, uint64_t g, DWORD prot, LONG* bits, 
             SwitchToThread();
         }
         uint8_t* st = g_spillStage + (size_t)sb * g_lazyGran;
-        const bool rd = ReadFile(g_spillFile, st, (DWORD)g, &got, &ov) && got == (DWORD)g;
-        if (rd && s < GH_SPILL_CRC_N && g_rtlCrc32){                 // patch h: the file round trip, checked
+        LARGE_INTEGER qf{}, q0{}, q1{};
+        const bool hit = GhSpillRingGet(s, st, g);   // BD25
+        if (!hit && GhSpillStat()){ QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0); }
+        const bool rd = hit || (ReadFile(g_spillFile, st, (DWORD)g, &got, &ov) && got == (DWORD)g);
+        if (!hit && GhSpillStat() && qf.QuadPart > 0 && q0.QuadPart > 0 && QueryPerformanceCounter(&q1))
+            GhSpillStatReadUs((q1.QuadPart - q0.QuadPart) * 1000000 / qf.QuadPart);
+        if (rd && !hit && s < GH_SPILL_CRC_N && g_rtlCrc32){                 // patch h: the file round trip, checked
             InterlockedIncrement(&g_spillCrcN);
             if (GhSpillCrc(st, (ULONG)g) != g_spillCrc[s]){
                 if (InterlockedIncrement(&g_spillCrcBad) <= 8)
@@ -33205,12 +33352,13 @@ static bool GhLazyRestoreLocked(uint8_t* p, uint64_t g, DWORD prot, LONG* bits, 
             return false;
         }
         InterlockedIncrement(&g_spillStaged);
-    } else if (!ReadFile(g_spillFile, p, (DWORD)g, &got, &ov) || got != (DWORD)g){
+    } else if (!GhSpillRingGet(s, p, g) && (!ReadFile(g_spillFile, p, (DWORD)g, &got, &ov) || got != (DWORD)g)){
         // The page is committed but blank. Report the fault rather than hand the
         // guest silent zeroes; the counter names the cause.
         InterlockedIncrement(&g_spillIoFail);
         return false;
     }
+    GhSpillRingDrop(s);                               // BD25
     AcquireSRWLockExclusive(&g_spillLock);
     if (g_spillFree.size() < g_spillFree.capacity()) g_spillFree.push_back(s);
     ReleaseSRWLockExclusive(&g_spillLock);
