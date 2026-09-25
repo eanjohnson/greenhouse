@@ -22807,6 +22807,8 @@ static void GhGpNoteBarriers(UINT num, const D3D12_RESOURCE_BARRIER* b)
     }
 }
 
+static bool GhQPoolServe(ID3D12Device*, HRESULT (__stdcall*)(ID3D12Device*, const D3D12_COMMAND_QUEUE_DESC*, REFIID, void**),
+                         const D3D12_COMMAND_QUEUE_DESC*, REFIID, void**, HRESULT*);
 // g_gpLk held.
 static bool GhGpRig(ID3D12Device* dev)
 {
@@ -22816,7 +22818,11 @@ static bool GhGpRig(ID3D12Device* dev)
     auto mkf = (HRESULT (__stdcall*)(ID3D12Device*, UINT64, D3D12_FENCE_FLAGS, REFIID, void**))g_d12vtOrig[36];
     D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;   // never COMPUTE (TILE0d), never COPY
     ID3D12CommandQueue* q = nullptr; ID3D12Fence* f = nullptr;
-    HRESULT hr = mkq ? mkq(dev, &qd, __uuidof(ID3D12CommandQueue), (void**)&q) : dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), (void**)&q);
+    HRESULT hr = E_FAIL;
+    // #239: made after the game's COMPUTE queue, so under gh_copy_as_direct=3 it must come
+    // from the pool -- a fresh DIRECT queue here would remove the device (QP1).
+    if (!GhQPoolServe(dev, mkq, &qd, __uuidof(ID3D12CommandQueue), (void**)&q, &hr))
+        hr = mkq ? mkq(dev, &qd, __uuidof(ID3D12CommandQueue), (void**)&q) : dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), (void**)&q);
     if (SUCCEEDED(hr) && q)
         hr = mkf ? mkf(dev, 0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), (void**)&f) : dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), (void**)&f);
     if (FAILED(hr) || !q || !f){
@@ -24328,7 +24334,8 @@ static unsigned GhNoGpuTimeout()
 // gone the game's next request, an async COMPUTE queue, killed the device instead
 // (drrbefore=0x0, so that call did it) -- even though two COMPUTE queues in a row
 // are fine on a virgin device. Whatever the real precondition is, DIRECT is a
-// superset of both, so promoting both sidesteps the class.
+// superset of both, so promoting both sidesteps the class. 3 = promote COPY only and keep
+// COMPUTE real behind a DIRECT-queue pool (#239, GhQPoolServe below names the precondition).
 static unsigned GhCopyAsDirect()
 { static const unsigned n = (unsigned)GhCfgNum(L"gh_copy_as_direct.txt", "GH_COPY_AS_DIRECT", 1); return n; }
 
@@ -24337,7 +24344,7 @@ static bool GhTypeNeedsPromote(D3D12_COMMAND_LIST_TYPE t)
     const unsigned lvl = GhCopyAsDirect();
     if (!lvl) return false;
     return t == D3D12_COMMAND_LIST_TYPE_COPY ||
-           (lvl >= 2 && t == D3D12_COMMAND_LIST_TYPE_COMPUTE);
+           (lvl == 2 && t == D3D12_COMMAND_LIST_TYPE_COMPUTE);
 }
 
 static D3D12_COMMAND_LIST_TYPE GhPromoteCopy(D3D12_COMMAND_LIST_TYPE t, const char* where)
@@ -24348,6 +24355,70 @@ static D3D12_COMMAND_LIST_TYPE GhPromoteCopy(D3D12_COMMAND_LIST_TYPE t, const ch
         Diag(std::string("COPYPROMOTE ") + where + " type=" + std::to_string((int)t) +
              " -> DIRECT");
     return D3D12_COMMAND_LIST_TYPE_DIRECT;
+}
+
+// #239 QP1 names level 2's "real precondition": on a virgin device the probe sequence
+// COMPUTE, DIRECT removes the device on the DIRECT (hr=0x887A0005 drr=0x887A0006), while
+// twelve DIRECT or two COMPUTE in a row are fine. A queue that is not COMPUTE, created
+// after a COMPUTE queue exists, is the killer -- and AC1 (level 1) died exactly so, on the
+// promoted copy queue created after the game's compute queue. Level 2 paid for that with
+// the game's whole async-compute stream (43% of the world's GPU time) serialised behind
+// graphics on DIRECT. Level 3 keeps COMPUTE real and removes the order instead: just
+// before the first COMPUTE queue is created, gh_qpool_n plain DIRECT queues are made, and
+// every later non-COMPUTE request -- the game's promoted COPY queues, our #235 pager queue,
+// anything through the hooked device -- is handed one of those rather than created.
+static SRWLOCK                             g_qPoolLk = SRWLOCK_INIT;
+static std::vector<ID3D12CommandQueue*>*   g_qPool = nullptr;
+static volatile LONG                       g_qComputeMade = 0;
+static volatile LONG                       g_qPoolMiss = 0;
+static unsigned GhQPoolN()
+{ static const unsigned v = GhCfgNumZ(L"gh_qpool_n.txt", "GH_QPOOL_N", 8); return v; }
+typedef HRESULT (__stdcall* GhMkQueueFn)(ID3D12Device*, const D3D12_COMMAND_QUEUE_DESC*, REFIID, void**);
+
+// true = the request was answered from the pool (*hr set); false = the caller creates it.
+static bool GhQPoolServe(ID3D12Device* dev, GhMkQueueFn mk, const D3D12_COMMAND_QUEUE_DESC* d,
+                         REFIID riid, void** pp, HRESULT* hr)
+{
+    if (GhCopyAsDirect() < 3 || !dev || !mk || !d || !pp || !hr) return false;
+    if (d->Type == D3D12_COMMAND_LIST_TYPE_COMPUTE){
+        std::string said;
+        AcquireSRWLockExclusive(&g_qPoolLk);
+        if (!g_qPool){
+            g_qPool = new std::vector<ID3D12CommandQueue*>();
+            D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT; qd.NodeMask = d->NodeMask;
+            const unsigned want = GhQPoolN(); HRESULT ph = S_OK;
+            for (unsigned i = 0; i < want; ++i){
+                ID3D12CommandQueue* q = nullptr;
+                ph = mk(dev, &qd, __uuidof(ID3D12CommandQueue), (void**)&q);
+                if (FAILED(ph) || !q){ if (q) q->Release(); break; }
+                g_qPool->push_back(q);
+            }
+            said = "QPOOL made=" + std::to_string(g_qPool->size()) + " of " + std::to_string(want) +
+                   " hr=" + Hex((uint32_t)ph) + " drr=" + Hex((uint32_t)dev->GetDeviceRemovedReason()) +
+                   " -- DIRECT queues created ahead of the first COMPUTE queue";
+        }
+        ReleaseSRWLockExclusive(&g_qPoolLk);
+        InterlockedExchange(&g_qComputeMade, 1);
+        if (!said.empty()) Diag(said);
+        return false;
+    }
+    if (!InterlockedCompareExchange(&g_qComputeMade, 0, 0)) return false;
+    ID3D12CommandQueue* q = nullptr; size_t left = 0;
+    AcquireSRWLockExclusive(&g_qPoolLk);
+    if (g_qPool && !g_qPool->empty()){ q = g_qPool->back(); g_qPool->pop_back(); left = g_qPool->size(); }
+    ReleaseSRWLockExclusive(&g_qPoolLk);
+    if (!q){
+        InterlockedIncrement(&g_qPoolMiss);
+        Diag("QPOOL EMPTY asked type=" + std::to_string((int)d->Type) +
+             " -- creating a non-COMPUTE queue after COMPUTE, the QP1 device-killer; raise gh_qpool_n");
+        return false;
+    }
+    *hr = q->QueryInterface(riid, pp);
+    q->Release();
+    Diag("QPOOL served q=" + Hex((uint64_t)(uintptr_t)q) + " asked type=" + std::to_string((int)d->Type) +
+         " prio=" + std::to_string((int)d->Priority) + " flags=" + Hex((uint32_t)d->Flags) +
+         " hr=" + Hex((uint32_t)*hr) + " left=" + std::to_string(left));
+    return true;
 }
 
 static void GhQueueCeilingProbe(ID3D12Device* dev)
@@ -24449,7 +24520,9 @@ static HRESULT __stdcall Hook_D12CreateCQ(ID3D12Device* self, const D3D12_COMMAN
     // call that KILLED a live one, and those are different bugs.
     static volatile LONG s_cqMade = 0;
     const uint32_t drrBefore = (uint32_t)self->GetDeviceRemovedReason();
-    HRESULT hr = orig(self, use, riid, pp);
+    HRESULT hr = E_FAIL;
+    const bool pooled = GhQPoolServe(self, orig, d, riid, pp, &hr);   // #239 level 3
+    if (!pooled) hr = orig(self, use, riid, pp);
     if (FAILED(hr)){
         Diag("D3D12 CreateCommandQueue REFUSED hr=" + Hex((uint32_t)hr) +
              " type=" + std::to_string(d ? (int)d->Type : -1) +
@@ -24474,7 +24547,8 @@ static HRESULT __stdcall Hook_D12CreateCQ(ID3D12Device* self, const D3D12_COMMAN
              " prio=" + std::to_string(d ? (int)d->Priority : 0) +
              " flags=" + Hex((uint32_t)(use ? use->Flags : (D3D12_COMMAND_QUEUE_FLAGS)0)) +
              " askedflags=" + Hex((uint32_t)(d ? d->Flags : (D3D12_COMMAND_QUEUE_FLAGS)0)) +
-             " notimeout=" + std::to_string((int)(use == &patched)));
+             " notimeout=" + std::to_string((int)(use == &patched)) +
+             (pooled ? " pooled=1" : ""));
         GhHookCommandQueue((ID3D12CommandQueue*)*pp);
         GhQSubRegister(self, use, (ID3D12CommandQueue*)*pp);
         // #158: counts aggregate across queues on purpose -- the question is which
