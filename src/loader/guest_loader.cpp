@@ -10052,6 +10052,151 @@ static void GhGetDimsProbe()
     D3D12_RANGE none{0, 0}; rb->Unmap(0, &none);
 }
 
+// #248 magenta fire: this driver reports TypedUAVLoadAdditionalFormats=1 but
+// uavload=0 for R11G11B10_FLOAT (26), R10G10B10A2_UNORM (24) and R32G32_UINT (17),
+// and 44 of the game's served compute shaders do typed UAV texture loads. What
+// does a typed load of each format actually return here? gh_fmtload_cs.bin
+// (tmp/_fmtp/fl.hlsl, signed cs_6_0, embedded root signature
+// DescriptorTable(UAV(u0,2))) reads texel (0,0) of a texture cleared through an
+// RTV to (1.0, 0.5, 0.125, 1.0), stores the float4 bits to a raw buffer, and
+// typed-stores (0.25, 0.5, 1.0, 1.0) to texel (1,0). Controls: 10 and 2 report
+// uavload=1. 1 = run and continue, 2 = run and ExitProcess.
+static void GhFmtLoadProbe()
+{
+    static const unsigned mode = GhCfgNumZ(L"gh_fmtload_probe.txt", "GH_FMTLOAD_PROBE", 0);
+    if (!mode) return;
+    std::vector<uint8_t> cs;
+    if (!ReadWholeFile(std::wstring(kLocalState) + L"gh_fmtload_cs.bin", cs, true) || cs.size() < 0x24){
+        Diag("FMTLOAD no gh_fmtload_cs.bin -- VOID"); return;
+    }
+    ID3D12Device* dev = GhCompileOnlyDevice();
+    if (!dev){ Diag("FMTLOAD no device -- VOID"); return; }
+    com_ptr<ID3D12RootSignature> rs; com_ptr<ID3D12PipelineState> pso;
+    HRESULT hr = dev->CreateRootSignature(0, cs.data(), cs.size(), __uuidof(ID3D12RootSignature), rs.put_void());
+    if (SUCCEEDED(hr)){
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = rs.get(); pd.CS = { cs.data(), cs.size() };
+        hr = dev->CreateComputePipelineState(&pd, __uuidof(ID3D12PipelineState), pso.put_void());
+    }
+    if (FAILED(hr) || !pso){ Diag("FMTLOAD pso hr=" + Hex((uint32_t)hr) + " -- VOID"); return; }
+
+    com_ptr<ID3D12CommandQueue> q; com_ptr<ID3D12CommandAllocator> ca;
+    com_ptr<ID3D12GraphicsCommandList> cl; com_ptr<ID3D12Fence> fence;
+    D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    hr = dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), q.put_void());
+    if (SUCCEEDED(hr)) hr = dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                __uuidof(ID3D12CommandAllocator), ca.put_void());
+    if (SUCCEEDED(hr)) hr = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, ca.get(), nullptr,
+                                __uuidof(ID3D12GraphicsCommandList), cl.put_void());
+    if (SUCCEEDED(hr)) hr = dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), fence.put_void());
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (FAILED(hr) || !ev){ Diag("FMTLOAD rig hr=" + Hex((uint32_t)hr) + " -- VOID"); return; }
+    UINT64 fv = 0;
+
+    auto Buf = [&](UINT64 bytes, D3D12_HEAP_TYPE ht, D3D12_RESOURCE_FLAGS fl, D3D12_RESOURCE_STATES st,
+                   com_ptr<ID3D12Resource>& r) -> HRESULT {
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type = ht;
+        D3D12_RESOURCE_DESC rd{}; rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = bytes;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; rd.Flags = fl;
+        return dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, st, nullptr,
+                                            __uuidof(ID3D12Resource), r.put_void());
+    };
+    com_ptr<ID3D12DescriptorHeap> dh, rh;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{}; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 2; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hr = dev->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap), dh.put_void());
+    D3D12_DESCRIPTOR_HEAP_DESC rhd{}; rhd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; rhd.NumDescriptors = 1;
+    if (SUCCEEDED(hr)) hr = dev->CreateDescriptorHeap(&rhd, __uuidof(ID3D12DescriptorHeap), rh.put_void());
+    if (FAILED(hr)){ Diag("FMTLOAD heaps hr=" + Hex((uint32_t)hr) + " -- VOID"); return; }
+    const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const D3D12_CPU_DESCRIPTOR_HANDLE c0 = dh->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_GPU_DESCRIPTOR_HANDLE g0 = dh->GetGPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE r0 = rh->GetCPUDescriptorHandleForHeapStart();
+
+    static const DXGI_FORMAT kFmts[] = { DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R10G10B10A2_UNORM,
+        DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32G32B32A32_FLOAT };
+    for (DXGI_FORMAT f : kFmts){
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{}; fs.Format = f;
+        dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof fs);
+        com_ptr<ID3D12Resource> tex, ub, rb;
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC td{}; td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = 4; td.Height = 1; td.DepthOrArraySize = 1; td.MipLevels = 1; td.Format = f;
+        td.SampleDesc.Count = 1; td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                          nullptr, __uuidof(ID3D12Resource), tex.put_void());
+        if (SUCCEEDED(hr)) hr = Buf(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, ub);
+        if (SUCCEEDED(hr)) hr = Buf(512, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+                                    D3D12_RESOURCE_STATE_COPY_DEST, rb);
+        if (FAILED(hr)){ Diag("FMTLOAD fmt=" + std::to_string((int)f) + " create hr=" + Hex((uint32_t)hr)); continue; }
+        dev->CreateRenderTargetView(tex.get(), nullptr, r0);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC tv{}; tv.Format = f; tv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        dev->CreateUnorderedAccessView(tex.get(), nullptr, &tv, c0);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+        uv.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; uv.Format = DXGI_FORMAT_R32_TYPELESS;
+        uv.Buffer.NumElements = 64; uv.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        dev->CreateUnorderedAccessView(ub.get(), nullptr, &uv, { c0.ptr + inc });
+
+        const float clr[4] = { 1.0f, 0.5f, 0.125f, 1.0f };
+        cl->ClearRenderTargetView(r0, clr, 0, nullptr);
+        D3D12_RESOURCE_BARRIER b[2]{};
+        b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[0].Transition.pResource = tex.get();
+        b[0].Transition.Subresource = 0;
+        b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        cl->ResourceBarrier(1, b);
+        ID3D12DescriptorHeap* hs[1] = { dh.get() };
+        cl->SetDescriptorHeaps(1, hs);
+        cl->SetPipelineState(pso.get());
+        cl->SetComputeRootSignature(rs.get());
+        cl->SetComputeRootDescriptorTable(0, g0);
+        cl->Dispatch(1, 1, 1);
+        b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b[1] = b[0]; b[1].Transition.pResource = ub.get();
+        b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cl->ResourceBarrier(2, b);
+        cl->CopyBufferRegion(rb.get(), 0, ub.get(), 0, 256);
+        D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+        dst.pResource = rb.get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Offset = 256; dst.PlacedFootprint.Footprint.Format = f;
+        dst.PlacedFootprint.Footprint.Width = 4; dst.PlacedFootprint.Footprint.Height = 1;
+        dst.PlacedFootprint.Footprint.Depth = 1; dst.PlacedFootprint.Footprint.RowPitch = 256;
+        src.pResource = tex.get(); src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+        cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        cl->Close();
+        ID3D12CommandList* ls[1] = { cl.get() };
+        q->ExecuteCommandLists(1, ls);
+        ++fv; q->Signal(fence.get(), fv);
+        bool ok = true;
+        if (fence->GetCompletedValue() < fv){ fence->SetEventOnCompletion(fv, ev); ok = WaitForSingleObject(ev, 20000) == WAIT_OBJECT_0; }
+        ca->Reset(); cl->Reset(ca.get(), nullptr);
+        const HRESULT rr = dev->GetDeviceRemovedReason();
+        if (!ok || rr != S_OK){
+            Diag("FMTLOAD fmt=" + std::to_string((int)f) + " fence=" + std::string(ok ? "ok" : "TIMEOUT") +
+                 " removed=" + Hex((uint32_t)rr) + " -- stopping");
+            break;
+        }
+        uint32_t* r = nullptr; D3D12_RANGE all{0, 512};
+        if (FAILED(rb->Map(0, &all, (void**)&r)) || !r){ Diag("FMTLOAD readback map -- VOID"); continue; }
+        auto F = [&](int i){ float x; memcpy(&x, &r[i], 4); char s[48]; snprintf(s, sizeof s, "%.4f(%08X)", x, r[i]); return std::string(s); };
+        Diag("FMTLOAD fmt=" + std::to_string((int)f) + " sup2=" + Hex((uint32_t)fs.Support2) +
+             " uavload=" + std::to_string((fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) ? 1 : 0) +
+             " ran=" + Hex(r[4]) +
+             " load(0,0)= " + F(0) + " " + F(1) + " " + F(2) + " " + F(3) +
+             " want 1.0 0.5 0.125 1.0");
+        Diag("FMTLOAD fmt=" + std::to_string((int)f) + " texels raw: " + Hex(r[64]) + " " + Hex(r[65]) + " " +
+             Hex(r[66]) + " " + Hex(r[67]) + " " + Hex(r[68]) + " " + Hex(r[69]) +
+             " (texel0 = the clear, texel1 = the store of 0.25 0.5 1.0 1.0)");
+        D3D12_RANGE none{0, 0}; rb->Unmap(0, &none);
+    }
+    CloseHandle(ev);
+    if (mode >= 2){ Diag("FMTLOAD done -- exiting (gh_fmtload_probe=2)"); Sleep(500); ExitProcess(0); }
+}
+
 static void GhDxilControl()
 {
     static const unsigned mode = GhCfgNum(L"gh_dxil_ctl.txt", "GH_DXIL_CTL", 0);
@@ -40949,6 +41094,10 @@ static void RunGuest()
         // #236. What GetDimensions answers for a 52-byte structured view on this
         // driver (the world's volume CS loop to it). Off unless gh_getdims_probe.
         GhGetDimsProbe();
+
+        // #248. What a typed UAV load of R11G11B10/R10G10B10A2 returns on this
+        // driver, against two formats it admits it can load. Off unless gh_fmtload_probe.
+        GhFmtLoadProbe();
 
         // ghwmm.dll: our WINMM replacement for the multimedia-timer functions the
         // container's slim WINMM lacks. Mono's import name is binary-patched

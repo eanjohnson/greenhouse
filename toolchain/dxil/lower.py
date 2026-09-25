@@ -38,6 +38,12 @@ def lower_text(text, templates, report=None):
     # GH_WAVE_SIZE=64 for the GCN part in this console. Unset leaves op 112
     # in place, where the back end will take the device down (#175).
     wave = int(os.environ.get('GH_WAVE_SIZE') or 0)
+    # GH_WAVE_SLOTS=1: the per-wave partial-sum idiom, made exact by giving each
+    # lane its own slot (lower66.wave_slots). Only when the shape is present.
+    if os.environ.get('GH_WAVE_SLOTS') == '1':
+        t2 = lower66.wave_slots(text, report)
+        if t2 is not None:
+            text, wave = t2, 1
     text = lower66.fold_lane_count(text, wave, report) if wave else text
     # GH_WAVE1=1 re-expresses the cross-lane family as if each lane were alone,
     # which is the only way past waveActiveOp/wavePrefixOp (#175) but is only

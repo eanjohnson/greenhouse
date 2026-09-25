@@ -236,6 +236,47 @@ def _one(ty):
     return '1.000000e+00' if ty in ('float', 'double', 'half') else '1'
 
 
+def _quad_deriv(ind, dst, ret, v, qop):
+    """A pixel-shader quad read, rebuilt EXACTLY from fine derivatives.
+
+    op 123 takes the device down at any shader model (#185), so lane-solo
+    used to hand every lane its OWN value -- which breaks the idiom 1,018 of
+    the 1,020 PS blobs use it for: QuadAny(cond) = cond | acrossX | acrossY |
+    diag, which keeps a 2x2 quad executing together so that the texture
+    fetches inside the branch see real derivatives. A fine derivative is the
+    same quad exchange done by fixed-function hardware the back end has
+    always compiled: within a row ddx_fine(v) = v_right - v_left in both
+    lanes, so the other lane's value is v + ddx (left lane) or v - ddx
+    (right lane). Diagonal = across-Y of across-X. The side of the quad comes
+    from the real lane index (111, kept): GCN packs a pixel quad into four
+    consecutive lanes, TL TR BL BR. An i32 is only taken when it is a
+    `zext i1` (the QuadAny form), where float round-trips it exactly;
+    anything else stays on the lane-solo copy.
+    """
+    t = dst[1:]
+    o = []
+    f = v
+    if ret == 'i32':
+        o.append('%s%%%s_f = uitofp i32 %s to float' % (ind, t, v))
+        f = '%' + t + '_f'
+    o.append('%s%%%s_li = call i32 @dx.op.waveGetLaneIndex(i32 111)' % (ind, t))
+    steps = {0: [('x', 85, 1)], 1: [('y', 86, 2)], 2: [('x', 85, 1), ('y', 86, 2)]}[qop]
+    for ax, dop, bit in steps:
+        o.append('%s%%%s_%sb = and i32 %%%s_li, %d' % (ind, t, ax, t, bit))
+        o.append('%s%%%s_%sl = icmp eq i32 %%%s_%sb, 0' % (ind, t, ax, t, ax))
+        o.append('%s%%%s_%sd = call float @dx.op.unary.f32(i32 %d, float %s)' % (ind, t, ax, dop, f))
+        o.append('%s%%%s_%sn = fsub float -0.000000e+00, %%%s_%sd' % (ind, t, ax, t, ax))
+        o.append('%s%%%s_%ss = select i1 %%%s_%sl, float %%%s_%sd, float %%%s_%sn'
+                 % (ind, t, ax, t, ax, t, ax, t, ax))
+        o.append('%s%%%s_%sr = fadd float %s, %%%s_%ss' % (ind, t, ax, f, t, ax))
+        f = '%%%s_%sr' % (t, ax)
+    if ret == 'i32':
+        o.append('%s%s = fptoui float %s to i32' % (ind, dst, f))
+    else:
+        o.append('%s%s = fadd float %s, 0.000000e+00' % (ind, dst, f))
+    return o
+
+
 def lower_wave1(text, report=None):
     """Re-express every wave and quad op as if each wave held exactly one lane.
 
@@ -251,14 +292,19 @@ def lower_wave1(text, report=None):
     lane instead of one per wave.
 
     It is NOT correct where a reduction is used for its value: a group total that
-    one lane was meant to write becomes every lane racing to write its own. Quad
-    ops lose their neighbours outright. So this is opt-in per bake, and a shader
-    lowered this way is one that renders, not one that is right. Getting those
-    right needs LDS emulation, which is a different job.
+    one lane was meant to write becomes every lane racing to write its own. The
+    #244 census (4,196 phase-2 blobs) found that in exactly one shader, a4a5b0ab,
+    and GH_WAVE_SLOTS=1 (wave_slots) makes that idiom exact. Pixel-shader quad
+    ops are rebuilt exactly from fine derivatives (_quad_deriv); compute quad
+    ops (8 blobs, branch-only) and non-QuadAny i32 quad reads still copy the
+    lane's own value.
     """
     rep = report if report is not None else []
     alias, lines, structs, counts = {}, [], {}, {}
     need111 = set()
+    is_ps = bool(re.search(r'!\{!"ps", i32 6', text))
+    zext1 = set(re.findall(r'^\s*(%[\w.]+) = zext i1 ', text, re.M))
+    need_unary = False
 
     for line in text.split('\n'):
         m = _WAVE_CALL.match(line)
@@ -268,6 +314,13 @@ def lower_wave1(text, report=None):
             a = _args(rest)
             if op in _W1_KEEP:
                 lines.append(line)          # measured CREATED; means what it says
+                continue
+            if (op == 123 and is_ps and a[1][1] in ('0', '1', '2')
+                    and (ret == 'float' or (ret == 'i32' and a[0][1] in zext1))):
+                lines.extend(_quad_deriv(ind, dst, ret, a[0][1], int(a[1][1])))
+                counts[-123] = counts.get(-123, 0) + 1
+                need111.add(True)
+                need_unary = True
                 continue
             counts[op] = counts.get(op, 0) + 1
             if op == 110:
@@ -356,17 +409,72 @@ def lower_wave1(text, report=None):
                                    text) else m.group(0)
     text = re.sub(r'^declare [^\n]*@dx\.op\.((?:wave|quad)\w*)(?:\.[\w.]+)?\([^\n]*\n',
                   _drop, text, flags=re.M)
+    if need_unary and not re.search(r'^declare float @dx\.op\.unary\.f32\(', text, re.M):
+        text = re.sub(r'^(declare )', r'declare float @dx.op.unary.f32(i32, float) #0\n\n\1',
+                      text, count=1, flags=re.M)
     if need111 and not re.search(r'^declare i32 @dx\.op\.waveGetLaneIndex\(', text, re.M):
         text = re.sub(r'^(declare )', r'declare i32 @dx.op.waveGetLaneIndex(i32) #0\n\n\1',
                       text, count=1, flags=re.M)
     rep.append('  wave1 %s' % ', '.join(
-        ('%d extractvalue' % n) if op == -1 else ('op %d x%d' % (op, n))
+        ('%d extractvalue' % n) if op == -1 else
+        ('%d quadOp->deriv' % n) if op == -123 else ('op %d x%d' % (op, n))
         for op, n in sorted(counts.items())))
     return text
 
 
 LANECOUNT_RE = re.compile(
     r'^\s*(%[\w.]+) = call i32 @dx\.op\.waveGetLaneCount\(i32 112\).*$', re.M)
+
+
+def wave_slots(text, report=None):
+    """Make lane-solo EXACT for the per-wave partial-sum idiom, or return None.
+
+      r = WaveActiveSum(v); if (WaveIsFirstLane()) s[tid / WaveGetLaneCount()] = r;
+      GroupMemoryBarrier; total = sum of s[0 .. groupsize / WaveGetLaneCount()]
+
+    Under lane-solo with the real width (64) every lane is "first" and they all
+    race to write their OWN value into s[0], so the group total becomes one
+    lane's sample (a4a5b0ab, the EvalShBasis SH projection: 1 of 64). With the
+    width folded to 1 instead the idiom is exact -- each lane owns slot tid and
+    the tail loop sums all of them -- provided the slot array holds one entry
+    per THREAD rather than per wave. That out-of-bounds store is what #176
+    retired width 1 for; here the array is grown to the group size, so it
+    cannot happen. Only arrays indexed by `x / WaveGetLaneCount()` are grown.
+    Returns the rewritten text (caller folds op 112 to 1), or None if the
+    shader does not have the shape.
+    """
+    rep = report if report is not None else []
+    lcs = [m.group(1) for m in LANECOUNT_RE.finditer(text)]
+    if not lcs:
+        return None
+    lcpat = '|'.join(re.escape(d) for d in lcs)
+    qs = re.findall(r'^\s*(%[\w.]+) = udiv i32 %[\w.]+, (?:' + lcpat + r')\b', text, re.M)
+    if not qs:
+        return None
+    m = re.search(r'!\{[^\n]*\bi32 4, (![0-9]+)\}', text)
+    nt = m and re.search(r'^' + re.escape(m.group(1)) + r' = !\{i32 (\d+), i32 (\d+), i32 (\d+)\}',
+                         text, re.M)
+    if not nt:
+        return None
+    gs = int(nt.group(1)) * int(nt.group(2)) * int(nt.group(3))
+    grown = {}
+    for q in qs:
+        for g in re.finditer(r'getelementptr (?:inbounds )?\[(\d+) x (\w+)\], \[\d+ x \w+\] '
+                             r'addrspace\(3\)\* (@[^,\s]+), i32 0, i32 ' + re.escape(q) + r'\b',
+                             text):
+            if int(g.group(1)) < gs:
+                grown[g.group(3)] = (int(g.group(1)), g.group(2))
+    if not grown:
+        return None
+    out = []
+    for line in text.split('\n'):
+        for gname, (n, ty) in grown.items():
+            if gname in line:
+                line = line.replace('[%d x %s]' % (n, ty), '[%d x %s]' % (gs, ty))
+        out.append(line)
+    rep.append('  slots %s -> [%d] per thread (lane count folded to 1)'
+               % (', '.join('%s[%d]' % (g, n) for g, (n, _) in grown.items()), gs))
+    return '\n'.join(out)
 
 
 def fold_lane_count(text, wave, report=None):

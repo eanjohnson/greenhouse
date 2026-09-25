@@ -58,11 +58,16 @@ def bake(name):
         return (name, None, 'unsigned container -- no key')
     dst = os.path.join(DST, 'gh_lo_%s.bin' % k)
     base = dict(os.environ, GH_DXC=DXC, LD_LIBRARY_PATH=os.path.join(DXC, 'lib'))
-    for phase, extra in ((1, {'GH_WAVE_SIZE': '64'}),
-                         (2, {'GH_WAVE_SIZE': '64', 'GH_WAVE1': '1', 'GH_CS_LOD0': '1'})):
+    # GH_SWITCH in BOTH phases (#244 QD1/QD1b, 2026-09-25): no blob the console
+    # has ever created carries an LLVM `switch` (§32.125), and a re-bake of
+    # fa29971e without it re-emitted one -- scdxil threw DxilError and removed
+    # the device twice. The rewrite is exact, so it is not a per-blob choice.
+    for phase, extra in ((1, {'GH_WAVE_SIZE': '64', 'GH_SWITCH': '1'}),
+                         (2, {'GH_WAVE_SIZE': '64', 'GH_WAVE1': '1', 'GH_CS_LOD0': '1',
+                             'GH_WAVE_SLOTS': '1', 'GH_SWITCH': '1'})):
         env = dict(base, **extra)
         if phase == 1:
-            env.pop('GH_WAVE1', None); env.pop('GH_CS_LOD0', None)
+            env.pop('GH_WAVE1', None); env.pop('GH_CS_LOD0', None); env.pop('GH_WAVE_SLOTS', None)
         r = subprocess.run([sys.executable, os.path.join(HERE, 'lower.py'), src, dst],
                            capture_output=True, text=True, env=env)
         if r.returncode:
