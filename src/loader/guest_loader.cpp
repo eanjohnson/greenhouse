@@ -16344,6 +16344,7 @@ struct GhBcLite { LONG g; UINT kind; void* cl; void* pso; UINT a[2]; };
 static const unsigned kBcLiteN = 65536;
 static GhBcLite* g_bcLite = nullptr;   // VirtualAlloc'd by GhBreadcrumbInit, never freed
 static void GhBcLiteDump(const char* where, UINT32 started, UINT32 finished, LONG issued);
+static void GhIndRingDump(UINT32 lo, LONG issued);   // #236 LG2b: indirect args by breadcrumb index
 
 // #158. DRED is a dead end on this console -- it arms, and its breadcrumb list is
 // always empty with a page-fault VA of zero. So keep our own. A READBACK buffer
@@ -17091,6 +17092,7 @@ static void GhBcLiteDump(const char* where, UINT32 started, UINT32 finished, LON
         }
         if (!nx) Diag("BCLITE no later op on the retired op's list up to issued");
     }
+    GhIndRingDump(lo, issued);
     if (GhPsoDescOn()) for (void* p : psos) Diag(GhPsoDescLine(p));
 }
 
@@ -19001,7 +19003,7 @@ static bool GhIndEnsureRb(ID3D12GraphicsCommandList* self)
 static void GhIndCapture(ID3D12GraphicsCommandList* self, ID3D12Resource* args, UINT64 argOff,
                          UINT maxCount, LONG op)
 {
-    if (!GhIndArgsMode() || !args) return;
+    if (GhIndArgsMode() != 1 || !args) return;   // mode 2 is the ring below
     // Never read past the end of the argument buffer: the first version asked for 32
     // bytes from a 12-byte buffer, the runtime errored the command list, the guest's
     // Close() returned E_INVALIDARG and the game tore the device down at submission 8.
@@ -19028,7 +19030,7 @@ static void GhIndCapture(ID3D12GraphicsCommandList* self, ID3D12Resource* args, 
 
 static void GhIndDump(const char* when)
 {
-    if (!GhIndArgsMode() || !g_indRb) return;
+    if (GhIndArgsMode() != 1 || !g_indRb) return;
     LONG n = g_indN;
     if (n <= 0) return;
     void* p = nullptr;
@@ -19050,6 +19052,88 @@ static void GhIndDump(const char* when)
     }
     D3D12_RANGE none{0, 0};
     g_indRb->Unmap(0, &none);
+}
+
+// #236 LG2b. Mode 2: the same GPU-side copy, into a ring keyed by the breadcrumb
+// index instead of the first 64 calls, so the device-removed BCLITE dump can print
+// the thread-group counts (and the count-buffer value) of the ExecuteIndirect it
+// names. LG2b hung in an indirect dispatch (85003ba2) whose loops are bounded twice
+// (clampcount + loopguard); a garbage group count is the remaining way that op
+// hangs. The readback is persistently mapped (legal for READBACK heaps), so the
+// dump reads plain memory and does not need Map on a removed device.
+#define GH_INDR_N 8192
+struct GhIndRingE { LONG g; UINT maxCount; void* cl; UINT32 bytes; UINT32 counted; };
+static GhIndRingE        g_indRing[GH_INDR_N]{};
+static com_ptr<ID3D12Resource> g_indRingRb;
+static const UINT8*      g_indRingPtr   = nullptr;
+static bool              g_indRingTried = false;
+static SRWLOCK           g_indRingLk    = SRWLOCK_INIT;
+
+static void GhIndRingCapture(ID3D12GraphicsCommandList* self, ID3D12Resource* args, UINT64 argOff,
+                             UINT maxCount, ID3D12Resource* cnt, UINT64 cntOff, LONG g)
+{
+    if (GhIndArgsMode() != 2 || !args || g <= 0) return;
+    const D3D12_RESOURCE_DESC ad = args->GetDesc();
+    if (ad.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || ad.Width <= argOff) return;
+    UINT64 nb = ad.Width - argOff;
+    if (nb > 24) nb = 24;
+    nb &= ~(UINT64)3;
+    if (!nb) return;
+    AcquireSRWLockExclusive(&g_indRingLk);
+    if (!g_indRingRb && !g_indRingTried){
+        g_indRingTried = true;
+        com_ptr<ID3D12Device> dev;
+        if (SUCCEEDED(self->GetDevice(__uuidof(ID3D12Device), dev.put_void()))){
+            D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = (UINT64)GH_INDR_N * GH_IND_STRIDE;
+            rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+            rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
+            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr, __uuidof(ID3D12Resource), g_indRingRb.put_void());
+            void* mp = nullptr;
+            if (SUCCEEDED(hr) && SUCCEEDED(g_indRingRb->Map(0, nullptr, &mp)) && mp) g_indRingPtr = (const UINT8*)mp;
+            else g_indRingRb = nullptr;
+            Diag("INDRING readback hr=" + Hex((uint32_t)hr) + " mapped=" + (g_indRingPtr ? "yes" : "NO") +
+                 " slots=" + std::to_string((long)GH_INDR_N));
+        }
+    }
+    ID3D12Resource* rb = g_indRingRb.get();
+    const unsigned slot = (unsigned)g % GH_INDR_N;
+    UINT32 counted = 0;
+    if (rb){
+        UINT64 cw = 0;
+        if (cnt){ const D3D12_RESOURCE_DESC cd = cnt->GetDesc();
+                  if (cd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && cd.Width >= cntOff + 4) cw = 4; }
+        counted = cnt ? (cw ? 1u : 2u) : 0u;       // 2 = counted but unreadable
+        g_indRing[slot] = GhIndRingE{ g, maxCount, self, (UINT32)nb, counted };
+    }
+    ReleaseSRWLockExclusive(&g_indRingLk);
+    if (!rb) return;
+    auto copy = (void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT64,
+                                   ID3D12Resource*, UINT64, UINT64))GhClOrig(self, 15);
+    copy(self, rb, (UINT64)slot * GH_IND_STRIDE, args, argOff, nb);
+    if (counted == 1) copy(self, rb, (UINT64)slot * GH_IND_STRIDE + 28, cnt, cntOff, 4);
+}
+
+static void GhIndRingDump(UINT32 lo, LONG issued)
+{
+    if (GhIndArgsMode() != 2 || !g_indRingPtr) return;
+    unsigned printed = 0;
+    for (LONG g = (LONG)lo; g <= issued && g < (LONG)lo + GH_INDR_N && printed < 48; ++g){
+        const GhIndRingE& e = g_indRing[(unsigned)g % GH_INDR_N];
+        if (e.g != g) continue;
+        const UINT* a = (const UINT*)(g_indRingPtr + (size_t)((unsigned)g % GH_INDR_N) * GH_IND_STRIDE);
+        std::string s = "INDRING g=" + std::to_string((long)g) + " cl=" + Hex((uint64_t)(uintptr_t)e.cl) +
+                        " max=" + std::to_string((unsigned long)e.maxCount) + " u32=";
+        for (UINT k = 0; k < e.bytes / 4; ++k) s += Hex((uint32_t)a[k]) + (k + 1 < e.bytes / 4 ? "," : "");
+        if (e.counted == 1) s += " count=" + Hex((uint32_t)a[7]);
+        else if (e.counted == 2) s += " count=unreadable";
+        Diag(s);
+        ++printed;
+    }
+    if (!printed) Diag("INDRING no ExecuteIndirect held in " + std::to_string((unsigned long)lo) + ".." + std::to_string((long)issued));
 }
 
 static void __stdcall Hook_CLExecIndirect(ID3D12GraphicsCommandList* self, void* sig, UINT maxCount,
@@ -19110,6 +19194,7 @@ static void __stdcall Hook_CLExecIndirect(ID3D12GraphicsCommandList* self, void*
     GhGprStamp(self, 4);   // #236
     t_bcOpArgs = GhOpArgs{ 59, { maxCount, 0, 0, 0, 0 } };   // #234 BD27: not a stale draw's args
     const LONG bcg = GhBreadcrumbBefore(self);
+    GhIndRingCapture(self, args, argOff, maxCount, cnt, cntOff, bcg);
     if (!GhRecCap59(self, sig, maxCount, args, argOff, cnt, cntOff))
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, void*, UINT, ID3D12Resource*, UINT64,
                         ID3D12Resource*, UINT64))GhClOrig(self, 59))(self, sig, maxCount, args, argOff, cnt, cntOff);
