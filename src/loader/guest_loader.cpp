@@ -33903,10 +33903,19 @@ static void GhLazySpillHookNtRead()
 // Dirty mapped pages reach the file after the process dies, so the last seconds
 // before an unrecorded kill survive: commit, physical, presents (CPU progress),
 // the GPU's finished breadcrumb (GPU progress), pager restores and Diag lines.
-struct GhBbRec { UINT32 tick, present, issued, gpuDone; UINT16 usedMB, physMB, pageMB, lazyMB; UINT32 spillrs, diagN; };
+// BD29: the watcher stalled 0.8-1.8 s between ticks in the last 5 s before a
+// vanish, so the recorder went blind exactly when it mattered. gh_blackbox=2
+// stamps from its own TIME_CRITICAL thread every gh_blackbox_ms (default 25) with
+// a raw (uncached) budget read, and adds the watcher's own progress: its loop
+// count, and how long its current reserve top-up has been running (0 = idle).
+struct GhBbRec { UINT32 tick, present, issued, gpuDone; UINT16 usedMB, physMB, pageMB, lazyMB; UINT32 spillrs, diagN;
+                 UINT32 watchSeq, watchBusyMs, spillEv, pad; };
+static volatile LONG   g_bbWatchSeq  = 0;
+static volatile LONG64 g_bbWatchBusy = 0;     // GetTickCount64 at top-up start, 0 when idle
 struct GhBbHdr { UINT32 magic, pid, recSize, n; volatile LONG idx; UINT32 startTick, pad[2]; };
 static const unsigned kBbN = 4095;
 static GhBbHdr* g_bb = nullptr;
+static void GhBlackBoxTick(uint64_t used);
 static bool GhBlackBoxOn(){ static const bool on = GhCfgNumZ(L"gh_blackbox.txt", "GH_BLACKBOX", 0) != 0; return on; }
 static void GhBlackBoxInit()
 {
@@ -33925,8 +33934,21 @@ static void GhBlackBoxInit()
     h->magic = 0x58424847u; h->pid = GetCurrentProcessId(); h->recSize = sizeof(GhBbRec); h->n = kBbN;
     h->idx = 0; h->startTick = GetTickCount();
     g_bb = h;
-    Diag("BLACKBOX armed recs=" + std::to_string(kBbN) + " bytes=" + std::to_string((unsigned long)bytes));
+    const unsigned mode = GhCfgNumZ(L"gh_blackbox.txt", "GH_BLACKBOX", 0);
+    const unsigned bms  = GhCfgNumZ(L"gh_blackbox_ms.txt", "GH_BLACKBOX_MS", 25);
+    Diag("BLACKBOX armed recs=" + std::to_string(kBbN) + " bytes=" + std::to_string((unsigned long)bytes) +
+         " mode=" + std::to_string(mode) + " ms=" + std::to_string(mode >= 2 ? bms : 100));
+    if (mode >= 2){
+        std::thread([bms]{
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+            while (!g_guestDone){
+                Sleep(bms ? bms : 25);
+                GhBlackBoxTick(GhBillAppUsedRaw());
+            }
+        }).detach();
+    }
 }
+static bool GhBlackBoxOwnThread(){ static const bool v = GhCfgNumZ(L"gh_blackbox.txt", "GH_BLACKBOX", 0) >= 2; return v; }
 static void GhBlackBoxTick(uint64_t used)
 {
     if (!g_bb) return;
@@ -33944,6 +33966,11 @@ static void GhBlackBoxTick(uint64_t used)
     r.lazyMB  = (UINT16)((uint64_t)InterlockedCompareExchange64(&g_lazyCommitted, 0, 0) >> 20);
     r.spillrs = (UINT32)InterlockedCompareExchange(&g_spillRestores, 0, 0);
     r.diagN   = (UINT32)InterlockedCompareExchange(&g_diagLines, 0, 0);
+    r.watchSeq = (UINT32)InterlockedCompareExchange(&g_bbWatchSeq, 0, 0);
+    const LONG64 wb = InterlockedCompareExchange64(&g_bbWatchBusy, 0, 0);
+    r.watchBusyMs = wb ? (UINT32)(GetTickCount64() - (uint64_t)wb) : 0;
+    r.spillEv = (UINT32)InterlockedCompareExchange(&g_spillEvicts, 0, 0);
+    r.pad = 0;
     InterlockedExchange(&g_bb->idx, i + 1);   // written last: idx-1 is always a whole record
 }
 
@@ -33960,7 +33987,8 @@ static void GhLazySpillWatchStart()
             if (!GhLazySpillOn() || InterlockedCompareExchange(&g_lazyCount, 0, 0) == 0) continue;
             uint64_t used = 0, lim = 0;
             GhAppBudget(&used, &lim);
-            GhBlackBoxTick(used);
+            InterlockedIncrement(&g_bbWatchSeq);
+            if (!GhBlackBoxOwnThread()) GhBlackBoxTick(used);
             if (!lim) continue;
             const uint64_t rem = used < lim ? lim - used : 0;
             const LONG64 remMB = (LONG64)(rem >> 20);
@@ -33972,7 +34000,9 @@ static void GhLazySpillWatchStart()
             const LONG n = InterlockedIncrement(&g_spillFast);
             const uint64_t b0 = (uint64_t)InterlockedCompareExchange64(&g_spillBytes, 0, 0);
             const uint64_t t0 = GetTickCount64();
+            InterlockedExchange64(&g_bbWatchBusy, (LONG64)(t0 ? t0 : 1));
             const bool room = GhLazySpillRoom(g_lazySpill - rem + (32ull << 20), "reserve-fast");
+            InterlockedExchange64(&g_bbWatchBusy, 0);
             const uint64_t b1 = (uint64_t)InterlockedCompareExchange64(&g_spillBytes, 0, 0);
             if (n <= 64 || (n % 64) == 0)
                 Diag("LAZYSPILL fast n=" + std::to_string((long)n) + " remaining=" + Hex(rem) +
