@@ -562,7 +562,7 @@ static void GhGpRequest(ID3D12Resource* r);                 // #235 TILE2e
 // descriptors by CopyDescriptors from staging slots (BREAD6). A staging slot that
 // names a converted texture is noted at CreateSRV; every copy FROM such a slot is a
 // use of that texture this frame.
-static std::unordered_map<UINT64, ID3D12Resource*>* g_gpDescMap = nullptr;
+static volatile LONG g_gpdAny = 0;   // #240: set by the first note; gates the copy hooks
 static void GhGpDescNote(UINT64 cpu, ID3D12Resource* r);
 static void GhGpDescCopy(UINT64 src, UINT64 dst);
 static void GhIssuedPairsDump(const char* when);              // #158 executed-barrier tally
@@ -7812,19 +7812,13 @@ static bool GhPsoDenied(const void* code, SIZE_T n)
                 else { if (cur.size() == 32) deny.push_back(cur); cur.clear(); }
             }
         } else {
-            deny.assign({ "fa29971ed902b2fad02cec2d64a0052a",
-                          "44c53d006f299116f79ffbbf00f818d3",
-                          "4acdac3ea5b31940d101db7bd4ff712f",
-                          "86d22de2bf57fcd4874bafdda58d734c",
-                          // #195. The graphics pair #194 named. newbe.DLL's
-                          // optimizer throws hlsl::Exception on the lowered
-                          // form of the second, and D3D12Core answers by
-                          // removing the device. Denying the VS is enough --
-                          // it is the first stage checked -- but both are
-                          // listed because either could turn up paired with a
-                          // different partner later.
-                          "42ab5eed7418a101078f8eb5ea293076",
-                          "6c9bda7610bbf88f725fa1c1be8c43a8" });
+            // #243 (CLP1/CLP2, loader 0.0.601.0): one shader left. The other
+            // five this list used to carry -- fa29971e (#244 switch lowering),
+            // 4acdac3e (#236 bufdims), the cloth solver 86d22de2 and the #195
+            // graphics pair 42ab5eed/6c9bda76 -- all CREATE and run in the
+            // world with no removal on the current corpus, n=2. 44c53d00 still
+            // hangs the GPU in the world when served (#247, Q1).
+            deny.assign({ "44c53d006f299116f79ffbbf00f818d3" });
         }
         Diag("PSODENY list of " + std::to_string((unsigned)deny.size()) + " shaders");
     }
@@ -14560,12 +14554,19 @@ static const UINT32 kGhBdDrvStruct = 135084u, kGhBdDrvRaw = 147972u;
 // shader keeps the driver's own answer. Needs gh_bufdims (it reads that table).
 static const UINT kGhTbSpace = 5191;   // tbdims.py TB_SPACE
 static const UINT32 kGhTbNone = 0xFFFFFFFFu;
-static bool GhTbDimsOn()
+static unsigned GhTbMode()
 {
-    static const bool on = GhCfgNumZ(L"gh_tbdims.txt", "GH_TBDIMS", 0) != 0;
-    return on;
+    static const unsigned v = GhCfgNumZ(L"gh_tbdims.txt", "GH_TBDIMS", 0);
+    return v;
 }
+static bool GhTbDimsOn(){ return GhTbMode() != 0; }
 static volatile LONG64 g_tbSets = 0, g_tbHits = 0, g_tbOut = 0, g_tbRoot = 0;
+// TB1c's census: what count each mapped slot resolves to in the bufdims table,
+// sampled every 64th slot write. gh_tbdims=2 computes and counts the slot but
+// hands the shader "none" (the driver's answer), the control for the same blobs,
+// root signatures and cache keys. Buckets: 0 | 1-15 | 16-255 | 256-4095 |
+// 4096-65535 | 65536-135083 | 135084 (unwritten or clamped) | no table.
+static volatile LONG64 g_tbCen[8]{};
 static UINT g_tbInc = 0;   // CBV/SRV/UAV descriptor increment, from CreateRootSignature's device
 struct GhBindlessRoot { UINT res, samp; UINT dims = UINT_MAX;
                         UINT tb = UINT_MAX; UINT tbP[2] = {UINT_MAX, UINT_MAX}; UINT tbOff[2] = {0, 0}; };
@@ -15897,7 +15898,7 @@ static void __stdcall Hook_D12CopyDescSimple(ID3D12Device* self, UINT num,
             if (n) GhDescPut((UINT64)dst.ptr + (UINT64)k * inc, n->res, n->kind, n->fmt, n->va, n->voff, n->vlen, n->vstride, n->vraw);
         }
     }
-    if (g_gpDescMap){   // #235
+    if (g_gpdAny){   // #235
         const UINT inc = self->GetDescriptorHandleIncrementSize(type);
         for (UINT k = 0; k < num && k < 4096; ++k)
             GhGpDescCopy((UINT64)src.ptr + (UINT64)k * inc, (UINT64)dst.ptr + (UINT64)k * inc);
@@ -15938,7 +15939,7 @@ static void __stdcall Hook_D12CopyDesc(ID3D12Device* self,
             ++dk; ++sk;
         }
     }
-    if (g_gpDescMap && dst && src){   // #235
+    if (g_gpdAny && dst && src){   // #235
         const UINT inc = self->GetDescriptorHandleIncrementSize(type);
         UINT di = 0, dk = 0, si = 0, sk = 0;
         for (UINT guard = 0; guard < 8192 && di < nDst && si < nSrc; ++guard){
@@ -16078,7 +16079,7 @@ struct GhCLNote {
     // start and size, and the heap slot last written for t5/t6 (0xFFFFFFFF = none,
     // which the shader reads as "keep the driver's answer").
     UINT32  tbRoot[2], tbP[2][2], tbOff[2][2], tbv[2][2];
-    UINT64  tbHeap; UINT32 tbHeapN;
+    UINT64  tbHeap; UINT32 tbHeapN; void* tbHeapObj;
 };
 static GhCLNote g_clNotes[512]{};
 static SRWLOCK  g_clLock = SRWLOCK_INIT;
@@ -16965,6 +16966,36 @@ static void GhTbPut(ID3D12GraphicsCommandList* self, GhCLNote* nt, int comp)
         GhClFn(self, comp ? 35 : 36);   // Set{Compute,Graphics}Root32BitConstants
     put(self, nt->tbRoot[comp] - 1, 2, nt->tbv[comp], 0);
 }
+static void GhTbCensus(const GhCLNote* nt, int comp, int k, UINT32 slot, UINT64 ptr)
+{
+    const UINT32* vals = nullptr; UINT32 num = 0;
+    {
+        LONG n = g_bdhN; if (n > kGhBdMax) n = kGhBdMax;
+        for (LONG i = n - 1; i >= 0; --i)
+            if (g_bdh[i].obj == nt->tbHeapObj && g_bdh[i].vals && g_bdh[i].va){
+                vals = g_bdh[i].vals; num = g_bdh[i].num; break;
+            }
+    }
+    int b = 7; UINT32 v = 0;
+    if (vals && slot < num){
+        v = vals[slot];
+        b = v == 0 ? 0 : v < 16 ? 1 : v < 256 ? 2 : v < 4096 ? 3 : v < 65536 ? 4 :
+            v < kGhBdDrvStruct ? 5 : 6;
+    }
+    InterlockedIncrement64(&g_tbCen[b]);
+    static volatile LONG nl = 0;
+    const LONG q = InterlockedIncrement(&nl);
+    if (q <= 24 || (q % 20000) == 0){
+        auto at = [&](INT64 j) -> std::string {
+            return (vals && j >= 0 && (UINT64)j < num) ? std::to_string((unsigned)vals[j]) : std::string("-");
+        };
+        Diag("TBCENSUS " + std::string(comp ? "cs" : "gfx") + " t" + std::to_string(5 + k) +
+             " slot=" + std::to_string((unsigned)slot) + " tbl=" + Hex(ptr) + " heap=" + Hex(nt->tbHeap) +
+             " off=" + std::to_string((unsigned)nt->tbOff[comp][k]) +
+             " val=" + at(slot) + " prev=" + at((INT64)slot - 1) + " next=" + at((INT64)slot + 1) +
+             " n=" + std::to_string((long)q));
+    }
+}
 // #245: after the guest set root table idx for comp, recompute t5/t6's heap slot.
 static void GhTbTableSet(ID3D12GraphicsCommandList* self, int comp, UINT idx, UINT64 ptr)
 {
@@ -16979,11 +17010,11 @@ static void GhTbTableSet(ID3D12GraphicsCommandList* self, int comp, UINT idx, UI
             if (s < nt->tbHeapN) slot = (UINT32)s;
         }
         if (slot == kGhTbNone) InterlockedIncrement64(&g_tbOut);
-        nt->tbv[comp][k] = slot;
+        else if ((InterlockedIncrement64(&g_tbHits) & 63) == 0) GhTbCensus(nt, comp, k, slot, ptr);
+        nt->tbv[comp][k] = GhTbMode() == 2 ? kGhTbNone : slot;
         hit = true;
     }
     if (!hit) return;
-    InterlockedIncrement64(&g_tbHits);
     GhTbPut(self, nt, comp);
     InterlockedIncrement64(&g_tbSets);
 }
@@ -17003,6 +17034,7 @@ static void GhBindBindlessTables(ID3D12GraphicsCommandList* self, GhCLNote* nt)
     if (res){
         nt->tbHeap = res->GetGPUDescriptorHandleForHeapStart().ptr;
         nt->tbHeapN = res->GetDesc().NumDescriptors;
+        nt->tbHeapObj = (void*)res;
     }
 
     static volatile LONG nb = 0;
@@ -17065,7 +17097,13 @@ static void GhBindBindlessTables(ID3D12GraphicsCommandList* self, GhCLNote* nt)
                  (w.tb != UINT_MAX ? " | TBDIMS tb=" + std::to_string((unsigned)w.tb) +
                       " sets=" + std::to_string((long long)g_tbSets) +
                       " out=" + std::to_string((long long)g_tbOut) +
-                      " rootsrv=" + std::to_string((long long)g_tbRoot) : std::string()));
+                      " rootsrv=" + std::to_string((long long)g_tbRoot) +
+                      " mode=" + std::to_string((unsigned)GhTbMode()) +
+                      " cen=" + std::to_string((long long)g_tbCen[0]) + "/" + std::to_string((long long)g_tbCen[1]) +
+                      "/" + std::to_string((long long)g_tbCen[2]) + "/" + std::to_string((long long)g_tbCen[3]) +
+                      "/" + std::to_string((long long)g_tbCen[4]) + "/" + std::to_string((long long)g_tbCen[5]) +
+                      "/" + std::to_string((long long)g_tbCen[6]) + "/" + std::to_string((long long)g_tbCen[7])
+                    : std::string()));
     }
 }
 static void __stdcall Hook_CLSetGfxTable(ID3D12GraphicsCommandList* self, UINT idx,
@@ -22624,7 +22662,7 @@ static void GhD12CallWatchdog()
 //   gh_gpu_page_mb.txt  pool cap in MB (GhCfgNumZ; no runargs slot -- hand-
 //                       managed in LocalState, delete it by hand). 0 = off.
 //
-// FRAME line: gphot=MB<=1s/<=10s/<=60s/older/never gpround=allocMB gpdesc=notes/hits gpclass=askEver/askLive/matMB gpupage=poolMB/liveMB/liveN gpconv=conv/skip/mat/full/fail
+// FRAME line: gphot=MB<=1s/<=10s/<=60s/older/never gpround=allocMB gpdesc=notes/hits/heapsh/missm/recycledr gpclass=askEver/askLive/matMB gpupage=poolMB/liveMB/liveN gpconv=conv/skip/mat/full/fail
 //             gpalias=N gpmaps=maps/waits gpms=ms gpheaps=live/ever gptouch=copies/srvs
 //   pool  real pool bytes (chunks), live  mapped tile bytes, liveN  converted textures alive
 //   conv  placements converted, skip  not convertible (materialised), mat  proxies
@@ -24056,31 +24094,171 @@ static void GhGpSrvNote(ID3D12Resource* r)
 // age of the last CreateSRV or copy naming the texture (never = untouched since
 // creation). The residency policy's raw material: if the recent buckets are a
 // small fraction of the live set, CreateSRV is a read signal worth keying on.
-static SRWLOCK        g_gpDescLk = SRWLOCK_INIT;
 static volatile LONG  g_gpDescNotes = 0, g_gpDescHits = 0;
+// #240 (CPR1): this table used to be a std::unordered_map behind an SRW lock, taken
+// exclusively on every CreateSRV and shared on every copied descriptor -- 18.6 M
+// lookups in one world run, on the game's MAIN thread. Now it is flat: one entry per
+// CBV/SRV/UAV heap, registered at CreateDescriptorHeap (GhGpdHeapAdd -- NOT from g_dh,
+// which only fills under the #158 diagnostics and stops at 128 heaps; the game keeps
+// ~282, and GPD1 recorded zero notes on it), a page of kGpdPage slots allocated only
+// when a converted texture's SRV lands in it, and lock-free reads: a binary search of
+// a sorted snapshot that registration republishes. Old snapshots are leaked, not freed,
+// because a reader may hold one (282 heaps and 0 recycled per run: ~80 KB in total).
+static const UINT kGpdPage = 1024;
+struct GhGpdHeap { UINT64 cpu0, end; UINT32 inc, npages; ID3D12Resource** volatile* pages; };
+struct GhGpdSnap { LONG n; GhGpdHeap* h[1]; };
+static GhGpdSnap* volatile g_gpdSnap = nullptr;
+static SRWLOCK             g_gpdhLk = SRWLOCK_INIT;
+static volatile LONG       g_gpdHeaps = 0, g_gpdRecycled = 0;
+// Notes outside every registered heap (GPDMISS): the old map, kept for them only.
+static std::unordered_map<UINT64, ID3D12Resource*>* g_gpdMissMap = nullptr;
+static SRWLOCK             g_gpdMissLk = SRWLOCK_INIT;
+static volatile LONG       g_gpdMiss = 0, g_gpdMissN = 0;
+static void GhGpdHeapAdd(UINT64 cpu0, UINT32 inc, UINT32 num)
+{
+    if (!cpu0 || !inc || !num) return;
+    const UINT64 end = cpu0 + (UINT64)inc * num;
+    const UINT32 np = (num + kGpdPage - 1) / kGpdPage;
+    auto pg = (ID3D12Resource** volatile*)calloc(np, sizeof(void*));
+    auto e  = (GhGpdHeap*)calloc(1, sizeof(GhGpdHeap));
+    if (!pg || !e){ free((void*)pg); free(e); return; }
+    e->cpu0 = cpu0; e->end = end; e->inc = inc; e->npages = np; e->pages = pg;
+    AcquireSRWLockExclusive(&g_gpdhLk);
+    GhGpdSnap* old = g_gpdSnap;
+    const LONG on = old ? old->n : 0;
+    auto snap = (GhGpdSnap*)malloc(sizeof(GhGpdSnap) + sizeof(GhGpdHeap*) * (size_t)on);
+    if (snap){
+        LONG k = 0; bool put = false;
+        for (LONG i = 0; i < on; ++i){
+            GhGpdHeap* o = old->h[i];
+            if (o->cpu0 < end && cpu0 < o->end){ InterlockedIncrement(&g_gpdRecycled); continue; }  // a dead heap
+            if (!put && cpu0 < o->cpu0){ snap->h[k++] = e; put = true; }
+            snap->h[k++] = o;
+        }
+        if (!put) snap->h[k++] = e;
+        snap->n = k;
+        MemoryBarrier();
+        g_gpdSnap = snap;
+        InterlockedIncrement(&g_gpdHeaps);
+    }
+    ReleaseSRWLockExclusive(&g_gpdhLk);
+}
+static GhGpdHeap* GhGpdFind(UINT64 cpu)
+{
+    const GhGpdSnap* s = g_gpdSnap;
+    if (!s) return nullptr;
+    LONG lo = 0, hi = s->n - 1;
+    while (lo <= hi){
+        const LONG m = (lo + hi) >> 1;
+        GhGpdHeap* h = s->h[m];
+        if (cpu < h->cpu0) hi = m - 1;
+        else if (cpu >= h->end) lo = m + 1;
+        else return h;
+    }
+    return nullptr;
+}
+static ID3D12Resource** GhGpdSlot(UINT64 cpu, bool add)
+{
+    GhGpdHeap* h = GhGpdFind(cpu);
+    if (!h) return nullptr;
+    const UINT64 idx = (cpu - h->cpu0) / h->inc;
+    const UINT32 p = (UINT32)(idx / kGpdPage);
+    if (p >= h->npages) return nullptr;
+    ID3D12Resource** page = h->pages[p];
+    if (!page){
+        if (!add) return nullptr;
+        auto fresh = (ID3D12Resource**)calloc(kGpdPage, sizeof(void*));
+        if (!fresh) return nullptr;
+        page = (ID3D12Resource**)InterlockedCompareExchangePointer(
+            (PVOID volatile*)&h->pages[p], fresh, nullptr);
+        if (page) free(fresh); else page = fresh;
+    }
+    return &page[idx % kGpdPage];
+}
+// gh_gpd_map=1 (LocalState, hand-managed): the 0.0.601.0 map for EVERY note, the
+// A/B arm for GPD2/GPD4 (the table arm streamed ~9 k more resources into a world
+// that then ran at the spill pager's edge). Same binary, one knob.
+static bool GhGpdMapMode()
+{
+    static const bool v = [](){
+        const unsigned k = GhCfgNumZ(L"gh_gpd_map.txt", "GH_GPD_MAP", 0);
+        Diag("CFG gh_gpd_map.txt = " + std::to_string(k) + " (Z)");   // GhCfgNumZ is silent
+        return k != 0;
+    }();
+    return v;
+}
 static void GhGpDescNote(UINT64 cpu, ID3D12Resource* r)
 {
     if (!GhGpOn() || !cpu) return;
     const bool ours = r && g_gpMap && GhGpFind(r) != nullptr;
-    AcquireSRWLockExclusive(&g_gpDescLk);
-    if (!g_gpDescMap) g_gpDescMap = new std::unordered_map<UINT64, ID3D12Resource*>();
-    if (ours){ (*g_gpDescMap)[cpu] = r; InterlockedIncrement(&g_gpDescNotes); }
-    else if (!g_gpDescMap->empty()) g_gpDescMap->erase(cpu);   // the slot now names something else
-    ReleaseSRWLockExclusive(&g_gpDescLk);
+    if (GhGpdMapMode()){
+        AcquireSRWLockExclusive(&g_gpdMissLk);
+        if (!g_gpdMissMap) g_gpdMissMap = new std::unordered_map<UINT64, ID3D12Resource*>();
+        if (ours){ (*g_gpdMissMap)[cpu] = r; InterlockedIncrement(&g_gpDescNotes); }
+        else if (!g_gpdMissMap->empty()) g_gpdMissMap->erase(cpu);
+        ReleaseSRWLockExclusive(&g_gpdMissLk);
+        if (!g_gpdAny) InterlockedExchange(&g_gpdAny, 1);
+        return;
+    }
+    // A slot with no page has never named one of ours, so there is nothing to clear.
+    ID3D12Resource** s = GhGpdSlot(cpu, ours);
+    if (!s){
+        // #240 GPD2/GPD3: the pager's restore count left its n=4 constant (9 -> 24) on
+        // this table, so some notes land outside every registered heap. Keep those in
+        // the old map (same semantics as 0.0.601.0) and count them.
+        if (!ours && !g_gpdMissN) return;
+        if (ours && GhGpdFind(cpu) == nullptr){
+            const LONG q = InterlockedIncrement(&g_gpdMiss);
+            if (q <= 12)
+                Diag("GPDMISS cpu=" + Hex(cpu) + " res=" + Hex((UINT64)r) +
+                     " heaps=" + std::to_string((long)g_gpdHeaps) + " n=" + std::to_string((long)q));
+        }
+        AcquireSRWLockExclusive(&g_gpdMissLk);
+        if (!g_gpdMissMap) g_gpdMissMap = new std::unordered_map<UINT64, ID3D12Resource*>();
+        if (ours) (*g_gpdMissMap)[cpu] = r; else g_gpdMissMap->erase(cpu);
+        g_gpdMissN = (LONG)g_gpdMissMap->size();
+        ReleaseSRWLockExclusive(&g_gpdMissLk);
+        if (ours){
+            InterlockedIncrement(&g_gpDescNotes);
+            if (!g_gpdAny) InterlockedExchange(&g_gpdAny, 1);
+        }
+        return;
+    }
+    *s = ours ? r : nullptr;   // the slot now names something else when !ours
+    if (ours){
+        InterlockedIncrement(&g_gpDescNotes);
+        if (!g_gpdAny) InterlockedExchange(&g_gpdAny, 1);
+    }
 }
 // A copy from a noted staging slot is a use. Only the source side is looked up: a
 // copied-to ring slot is rewritten next frame, so tracking it would only grow the
-// map to the ring's 1.17M slots. A freed texture's stale note simply misses in
+// table over the ring's 1.17M slots. A freed texture's stale note simply misses in
 // g_gpMap (or, if the address was reused, touches the new occupant -- census noise).
 static void GhGpDescCopy(UINT64 src, UINT64 dst)
 {
     (void)dst;
-    if (!g_gpDescMap) return;
-    ID3D12Resource* r = nullptr;
-    AcquireSRWLockShared(&g_gpDescLk);
-    auto it = g_gpDescMap->find(src);
-    if (it != g_gpDescMap->end()) r = it->second;
-    ReleaseSRWLockShared(&g_gpDescLk);
+    if (!g_gpdAny) return;
+    if (GhGpdMapMode()){
+        ID3D12Resource* r = nullptr;
+        AcquireSRWLockShared(&g_gpdMissLk);
+        auto it = g_gpdMissMap->find(src);
+        if (it != g_gpdMissMap->end()) r = it->second;
+        ReleaseSRWLockShared(&g_gpdMissLk);
+        if (!r) return;
+        if (GhGpRes* e = GhGpFind(r)){
+            e->lastUse = GhNowUs(); InterlockedIncrement(&g_gpDescHits);
+            if (e->chunk < 0) GhGpRequest(r);
+        }
+        return;
+    }
+    ID3D12Resource** s = GhGpdSlot(src, false);
+    ID3D12Resource* r = s ? *s : nullptr;
+    if (!r && g_gpdMissN && !GhGpdFind(src)){
+        AcquireSRWLockShared(&g_gpdMissLk);
+        auto it = g_gpdMissMap->find(src);
+        if (it != g_gpdMissMap->end()) r = it->second;
+        ReleaseSRWLockShared(&g_gpdMissLk);
+    }
     if (!r) return;
     if (GhGpRes* e = GhGpFind(r)){
         e->lastUse = GhNowUs(); InterlockedIncrement(&g_gpDescHits);
@@ -24109,6 +24287,9 @@ static std::string GhGpHotLine()
     return o + " gpround=" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpAllocB, 0, 0) >> 20)) +
            " gpdesc=" + std::to_string((long)InterlockedCompareExchange(&g_gpDescNotes, 0, 0)) +
            "/" + std::to_string((long)InterlockedCompareExchange(&g_gpDescHits, 0, 0)) +
+           "/" + std::to_string((long)g_gpdHeaps) + "h" +     // #240: heaps in the flat table
+           "/" + std::to_string((long)g_gpdMiss) + "m" +      // notes outside them (old map)
+           "/" + std::to_string((long)g_gpdRecycled) + "r" +  // heaps dropped as overlapped
            // gpclass=askEver/askLive/mat: what the game asked the per-texture 0x44 class
            // for (baseline CreateHeap bytes) vs the real heaps we still create for it.
            // Our spend on the class = mat + poolMB; baseline would have been askLive.
@@ -25020,6 +25201,9 @@ static HRESULT __stdcall Hook_D12CreateDH(ID3D12Device* self, const D3D12_DESCRI
     HRESULT hr;
     { GhD12CallScope _s("CreateDescriptorHeap"); hr = orig(self, d, riid, pp); }
     if (SUCCEEDED(hr) && pp && *pp && GhBufDimsOn()) GhBdHeapAdd(self, (ID3D12DescriptorHeap*)*pp, d);
+    if (SUCCEEDED(hr) && pp && *pp && d && d->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && GhGpOn())
+        GhGpdHeapAdd((UINT64)((ID3D12DescriptorHeap*)*pp)->GetCPUDescriptorHandleForHeapStart().ptr,
+                     self->GetDescriptorHandleIncrementSize(d->Type), d->NumDescriptors);
     if (SUCCEEDED(hr) && pp && *pp && (GhDescTrackOn() || GhVaCheckOn() || GhSubCensus())){
         GhDHAdd(self, (ID3D12DescriptorHeap*)*pp, d);
         {   // #158: the deep bind map needs the heap's real extent to tell a slot
@@ -30288,6 +30472,57 @@ static DWORD WINAPI Bed_SetThreadIdealProcessor(HANDLE h, DWORD n)
     return prev == (DWORD)-1 ? 0 : prev;
 }
 
+// #240 GPD2..5: the guest's wall clock decides what "Continue" plays. Every cell pins
+// the same auto.sav, yet from the 08:17 press on 2026-09-26 the game played a
+// letterboxed story cutscene before the camp (VAC1 at 07:17 went straight in), and
+// the cutscene's content left ~9 k more resources and ~300 MB more working set in the
+// world, at the spill pager's edge. The only input that moved is the clock (the save is
+// pinned, the hive is replaced whole). gh_clock_pin (LocalState, unix seconds UTC,
+// 0 = off) starts the guest's system time at that instant and lets it run at the real
+// rate, so a pinned save never ages past the trigger and old baselines stay comparable.
+// Guest EXE only (ShimTable); GetTickCount/QPC are untouched.
+static INT64 GhClockOffset()   // 100-ns units to ADD to real FILETIMEs; 0 = off
+{
+    static INT64 off = [](){
+        const unsigned pin = GhCfgNumZ(L"gh_clock_pin.txt", "GH_CLOCK_PIN", 0);
+        if (!pin) return (INT64)0;
+        FILETIME ft{}; GetSystemTimePreciseAsFileTime(&ft);
+        const INT64 now = (INT64)(((UINT64)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
+        const INT64 o = (INT64)pin * 10000000LL + 116444736000000000LL - now;
+        Diag("CFG gh_clock_pin.txt = " + std::to_string(pin) + " (file) offset_h=" +
+             std::to_string((long long)(o / 36000000000LL)));
+        return o ? o : (INT64)1;
+    }();
+    return off;
+}
+static void GhClockShift(FILETIME* ft, const char* api)
+{
+    const INT64 o = GhClockOffset();
+    if (!o || !ft) return;
+    UINT64 v = ((UINT64)ft->dwHighDateTime << 32) | ft->dwLowDateTime;
+    v = (UINT64)((INT64)v + o);
+    ft->dwLowDateTime = (DWORD)v; ft->dwHighDateTime = (DWORD)(v >> 32);
+    static volatile LONG n = 0;
+    if (InterlockedIncrement(&n) <= 4)
+        Diag(std::string("CLOCKPIN ") + api + " -> " + std::to_string((unsigned long long)((v - 116444736000000000ULL) / 10000000ULL)));
+}
+static void WINAPI Bed_GetSystemTimeAsFileTime(LPFILETIME ft)
+{ GetSystemTimeAsFileTime(ft); GhClockShift(ft, "GetSystemTimeAsFileTime"); }
+static void WINAPI Bed_GetSystemTimePreciseAsFileTime(LPFILETIME ft)
+{ GetSystemTimePreciseAsFileTime(ft); GhClockShift(ft, "GetSystemTimePreciseAsFileTime"); }
+static void WINAPI Bed_GetSystemTime(LPSYSTEMTIME st)
+{
+    if (!GhClockOffset()){ GetSystemTime(st); return; }
+    FILETIME ft; GetSystemTimeAsFileTime(&ft); GhClockShift(&ft, "GetSystemTime");
+    FileTimeToSystemTime(&ft, st);
+}
+static void WINAPI Bed_GetLocalTime(LPSYSTEMTIME st)
+{
+    if (!GhClockOffset()){ GetLocalTime(st); return; }
+    FILETIME ft, lft; GetSystemTimeAsFileTime(&ft); GhClockShift(&ft, "GetLocalTime");
+    FileTimeToLocalFileTime(&ft, &lft); FileTimeToSystemTime(&lft, st);
+}
+
 static BOOL WINAPI Bed_GetMonitorInfoW(HMONITOR h, LPMONITORINFO mi){
     static LONG n = 0;
     if (InterlockedIncrement(&n) <= 4)
@@ -35399,6 +35634,11 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"GlobalMemoryStatusEx", (void*)&Bed_GlobalMemoryStatusEx},
         {"GlobalMemoryStatus",   (void*)&Bed_GlobalMemoryStatus},
         {"GetPhysicallyInstalledSystemMemory", (void*)&Bed_GetPhysicallyInstalledSystemMemory},
+        // #240 gh_clock_pin: the guest's wall clock (inert when the knob is 0).
+        {"GetSystemTimeAsFileTime",        (void*)&Bed_GetSystemTimeAsFileTime},
+        {"GetSystemTimePreciseAsFileTime", (void*)&Bed_GetSystemTimePreciseAsFileTime},
+        {"GetSystemTime",                  (void*)&Bed_GetSystemTime},
+        {"GetLocalTime",                   (void*)&Bed_GetLocalTime},
         // Display surrogate. MUST live here, not only in PatchModuleForGuest.
         // The guest exe is mapped by our loader and resolves imports through
         // ShimTable; PatchModuleForGuest only rewrites modules the HOST loaded.
