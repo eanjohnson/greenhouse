@@ -10052,6 +10052,90 @@ static void GhGetDimsProbe()
     D3D12_RANGE none{0, 0}; rb->Unmap(0, &none);
 }
 
+// #243 generic compute probe: does the console's DXIL back end COMPUTE what the
+// shader says? gh_csprobe_cs.bin is any signed CS with an embedded root signature
+// "UAV(u0)" (one root UAV); it is dispatched once, (gh_csprobe_groups) groups, and
+// the first 2 KB of u0 are logged as CSPROBE rows of 8 dwords, for an offline diff
+// against the host's answer. First use: tmp/_i64p/i64.hlsl, the cloth solver's
+// 64-bit bit-scan loop (1<<n, ~, &, >>) per lane n = 0..63. 1 = run and continue,
+// 2 = run and ExitProcess.
+static void GhCsProbe()
+{
+    static const unsigned mode = GhCfgNumZ(L"gh_csprobe.txt", "GH_CSPROBE", 0);
+    if (!mode) return;
+    std::vector<uint8_t> cs;
+    if (!ReadWholeFile(std::wstring(kLocalState) + L"gh_csprobe_cs.bin", cs, true) || cs.size() < 0x24){
+        Diag("CSPROBE no gh_csprobe_cs.bin -- VOID"); return;
+    }
+    ID3D12Device* dev = GhCompileOnlyDevice();
+    if (!dev){ Diag("CSPROBE no device -- VOID"); return; }
+    com_ptr<ID3D12RootSignature> rs; com_ptr<ID3D12PipelineState> pso;
+    HRESULT hr = dev->CreateRootSignature(0, cs.data(), cs.size(), __uuidof(ID3D12RootSignature), rs.put_void());
+    if (SUCCEEDED(hr)){
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = rs.get(); pd.CS = { cs.data(), cs.size() };
+        hr = dev->CreateComputePipelineState(&pd, __uuidof(ID3D12PipelineState), pso.put_void());
+    }
+    if (FAILED(hr) || !pso){ Diag("CSPROBE pso hr=" + Hex((uint32_t)hr) + " -- VOID"); return; }
+    com_ptr<ID3D12CommandQueue> q; com_ptr<ID3D12CommandAllocator> ca;
+    com_ptr<ID3D12GraphicsCommandList> cl; com_ptr<ID3D12Fence> fence;
+    D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    hr = dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), q.put_void());
+    if (SUCCEEDED(hr)) hr = dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                __uuidof(ID3D12CommandAllocator), ca.put_void());
+    if (SUCCEEDED(hr)) hr = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, ca.get(), pso.get(),
+                                __uuidof(ID3D12GraphicsCommandList), cl.put_void());
+    if (SUCCEEDED(hr)) hr = dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), fence.put_void());
+    if (FAILED(hr)){ Diag("CSPROBE rig hr=" + Hex((uint32_t)hr) + " -- VOID"); return; }
+    const UINT kBytes = 2048;
+    com_ptr<ID3D12Resource> ub, rb;
+    auto Buf = [&](D3D12_HEAP_TYPE ht, D3D12_RESOURCE_FLAGS fl, D3D12_RESOURCE_STATES st,
+                   com_ptr<ID3D12Resource>& r) -> HRESULT {
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type = ht;
+        D3D12_RESOURCE_DESC rd{}; rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = kBytes;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; rd.Flags = fl;
+        return dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, st, nullptr,
+                                            __uuidof(ID3D12Resource), r.put_void());
+    };
+    hr = Buf(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, ub);
+    if (SUCCEEDED(hr)) hr = Buf(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, rb);
+    if (FAILED(hr)){ Diag("CSPROBE buffers hr=" + Hex((uint32_t)hr) + " -- VOID"); return; }
+    const UINT groups = GhCfgNum(L"gh_csprobe_groups.txt", "GH_CSPROBE_GROUPS", 1);
+    cl->SetComputeRootSignature(rs.get());
+    cl->SetComputeRootUnorderedAccessView(0, ub->GetGPUVirtualAddress());
+    cl->Dispatch(groups, 1, 1);
+    D3D12_RESOURCE_BARRIER b{}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = ub.get(); b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cl->ResourceBarrier(1, &b);
+    cl->CopyBufferRegion(rb.get(), 0, ub.get(), 0, kBytes);
+    cl->Close();
+    const LONG64 t0 = GhNowUs();
+    ID3D12CommandList* ls[1] = { cl.get() };
+    q->ExecuteCommandLists(1, ls);
+    q->Signal(fence.get(), 1);
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    bool ok = true;
+    if (fence->GetCompletedValue() < 1){ fence->SetEventOnCompletion(1, ev); ok = WaitForSingleObject(ev, 20000) == WAIT_OBJECT_0; }
+    if (ev) CloseHandle(ev);
+    const HRESULT rr = dev->GetDeviceRemovedReason();
+    const LONG64 us = GhNowUs() - t0;
+    if (!ok || rr != S_OK){ Diag("CSPROBE fence=" + std::string(ok ? "ok" : "TIMEOUT") + " removed=" + Hex((uint32_t)rr) + " -- VOID"); return; }
+    uint32_t* r = nullptr; D3D12_RANGE all{0, kBytes};
+    if (FAILED(rb->Map(0, &all, (void**)&r)) || !r){ Diag("CSPROBE readback map -- VOID"); return; }
+    Diag("CSPROBE ran bytes=" + std::to_string(cs.size()) + " groups=" + std::to_string(groups) +
+         " gpu+wait=" + std::to_string(us) + "us");
+    for (UINT row = 0; row < kBytes / 32; ++row){
+        std::string l = "CSPROBE " + std::to_string(row) + ":";
+        for (UINT i = 0; i < 8; ++i) l += " " + Hex(r[row * 8 + i]);
+        Diag(l);
+    }
+    D3D12_RANGE none{0, 0}; rb->Unmap(0, &none);
+    if (mode >= 2){ Diag("CSPROBE done -- exiting (gh_csprobe=2)"); Sleep(500); ExitProcess(0); }
+}
+
 // #248 magenta fire: this driver reports TypedUAVLoadAdditionalFormats=1 but
 // uavload=0 for R11G11B10_FLOAT (26), R10G10B10A2_UNORM (24) and R32G32_UINT (17),
 // and 44 of the game's served compute shaders do typed UAV texture loads. What
@@ -10114,8 +10198,8 @@ static void GhFmtLoadProbe()
     const D3D12_GPU_DESCRIPTOR_HANDLE g0 = dh->GetGPUDescriptorHandleForHeapStart();
     const D3D12_CPU_DESCRIPTOR_HANDLE r0 = rh->GetCPUDescriptorHandleForHeapStart();
 
-    static const DXGI_FORMAT kFmts[] = { DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R10G10B10A2_UNORM,
-        DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32G32B32A32_FLOAT };
+    static const DXGI_FORMAT kFmts[] = { DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+        DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R11G11B10_FLOAT };
     for (DXGI_FORMAT f : kFmts){
         D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{}; fs.Format = f;
         dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof fs);
@@ -10129,7 +10213,7 @@ static void GhFmtLoadProbe()
                                           nullptr, __uuidof(ID3D12Resource), tex.put_void());
         if (SUCCEEDED(hr)) hr = Buf(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS, ub);
-        if (SUCCEEDED(hr)) hr = Buf(512, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+        if (SUCCEEDED(hr)) hr = Buf(1024, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
                                     D3D12_RESOURCE_STATE_COPY_DEST, rb);
         if (FAILED(hr)){ Diag("FMTLOAD fmt=" + std::to_string((int)f) + " create hr=" + Hex((uint32_t)hr)); continue; }
         dev->CreateRenderTargetView(tex.get(), nullptr, r0);
@@ -10162,12 +10246,18 @@ static void GhFmtLoadProbe()
         cl->CopyBufferRegion(rb.get(), 0, ub.get(), 0, 256);
         D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
         dst.pResource = rb.get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        dst.PlacedFootprint.Offset = 256; dst.PlacedFootprint.Footprint.Format = f;
+        dst.PlacedFootprint.Offset = 512; dst.PlacedFootprint.Footprint.Format = f;
         dst.PlacedFootprint.Footprint.Width = 4; dst.PlacedFootprint.Footprint.Height = 1;
         dst.PlacedFootprint.Footprint.Depth = 1; dst.PlacedFootprint.Footprint.RowPitch = 256;
         src.pResource = tex.get(); src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
         cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-        cl->Close();
+        // A list whose Close() fails removes the device when executed (0x887A0001:
+        // run prb1's 256-byte footprint offset), and a removal poisons the process.
+        hr = cl->Close();
+        if (FAILED(hr)){
+            Diag("FMTLOAD fmt=" + std::to_string((int)f) + " close hr=" + Hex((uint32_t)hr) + " -- skipped");
+            ca->Reset(); cl->Reset(ca.get(), nullptr); continue;
+        }
         ID3D12CommandList* ls[1] = { cl.get() };
         q->ExecuteCommandLists(1, ls);
         ++fv; q->Signal(fence.get(), fv);
@@ -10180,7 +10270,7 @@ static void GhFmtLoadProbe()
                  " removed=" + Hex((uint32_t)rr) + " -- stopping");
             break;
         }
-        uint32_t* r = nullptr; D3D12_RANGE all{0, 512};
+        uint32_t* r = nullptr; D3D12_RANGE all{0, 1024};
         if (FAILED(rb->Map(0, &all, (void**)&r)) || !r){ Diag("FMTLOAD readback map -- VOID"); continue; }
         auto F = [&](int i){ float x; memcpy(&x, &r[i], 4); char s[48]; snprintf(s, sizeof s, "%.4f(%08X)", x, r[i]); return std::string(s); };
         Diag("FMTLOAD fmt=" + std::to_string((int)f) + " sup2=" + Hex((uint32_t)fs.Support2) +
@@ -10188,8 +10278,8 @@ static void GhFmtLoadProbe()
              " ran=" + Hex(r[4]) +
              " load(0,0)= " + F(0) + " " + F(1) + " " + F(2) + " " + F(3) +
              " want 1.0 0.5 0.125 1.0");
-        Diag("FMTLOAD fmt=" + std::to_string((int)f) + " texels raw: " + Hex(r[64]) + " " + Hex(r[65]) + " " +
-             Hex(r[66]) + " " + Hex(r[67]) + " " + Hex(r[68]) + " " + Hex(r[69]) +
+        Diag("FMTLOAD fmt=" + std::to_string((int)f) + " texels raw: " + Hex(r[128]) + " " + Hex(r[129]) + " " +
+             Hex(r[130]) + " " + Hex(r[131]) + " " + Hex(r[132]) + " " + Hex(r[133]) +
              " (texel0 = the clear, texel1 = the store of 0.25 0.5 1.0 1.0)");
         D3D12_RANGE none{0, 0}; rb->Unmap(0, &none);
     }
@@ -14458,7 +14548,27 @@ static bool GhBufDimsOn()
 // every real-count cell (BD3, BD5, BD6). No loop may outrun the driver's answer.
 static UINT32 GhBdMode(){ static const UINT32 m = GhCfgNumZ(L"gh_bufdims.txt", "GH_BUFDIMS", 0); return m; }
 static const UINT32 kGhBdDrvStruct = 135084u, kGhBdDrvRaw = 147972u;
-struct GhBindlessRoot { UINT res, samp; UINT dims = UINT_MAX; };
+// #245 gh_tbdims. The #238 census: 476 more buffer GetDimensions sites in 212
+// served compute blobs, every one of them a single StructuredBuffer at t5 or t6,
+// space 0, bound through the GAME's descriptor tables -- where bufdims cannot
+// reach, because the shader cannot know which heap slot its table put there. The
+// loader can: the root signature says which table holds t5/t6 and at what offset,
+// and SetComputeRootDescriptorTable says where that table starts in the heap. So
+// append two root constants at b0, space kGhTbSpace and keep them equal to the
+// heap slot of t5 and t6; toolchain/dxil/tbdims.py makes the shader read the count
+// for that slot out of the bufdims table. 0xFFFFFFFF means "no slot" and the
+// shader keeps the driver's own answer. Needs gh_bufdims (it reads that table).
+static const UINT kGhTbSpace = 5191;   // tbdims.py TB_SPACE
+static const UINT32 kGhTbNone = 0xFFFFFFFFu;
+static bool GhTbDimsOn()
+{
+    static const bool on = GhCfgNumZ(L"gh_tbdims.txt", "GH_TBDIMS", 0) != 0;
+    return on;
+}
+static volatile LONG64 g_tbSets = 0, g_tbHits = 0, g_tbOut = 0, g_tbRoot = 0;
+static UINT g_tbInc = 0;   // CBV/SRV/UAV descriptor increment, from CreateRootSignature's device
+struct GhBindlessRoot { UINT res, samp; UINT dims = UINT_MAX;
+                        UINT tb = UINT_MAX; UINT tbP[2] = {UINT_MAX, UINT_MAX}; UINT tbOff[2] = {0, 0}; };
 static std::mutex g_ghRsMu;
 static std::map<void*, GhBindlessRoot> g_ghRsBindless;
 
@@ -14543,6 +14653,56 @@ static bool GhAppendBindlessRanges(const void* blob, SIZE_T len,
                 Diag("  BUFDIMS no root room: " + std::to_string((unsigned)GhRootCost(params.data(), (UINT)params.size())) + "/64");
         }
     }
+    // #245: find t5/t6 (SRV, space 0) in the guest's own tables. A range with
+    // OFFSET_APPEND starts where the previous one ended; an unbounded range ends
+    // the walk. A root-descriptor t5/t6 has no heap slot: counted, left at none.
+    std::string tbWhy;
+    if (GhTbDimsOn() && where->dims != UINT_MAX){
+        bool any = false;
+        for (UINT k = 0; k < 2; ++k){
+            const UINT reg = 5 + k;
+            for (UINT p = 0; p < src.NumParameters && where->tbP[k] == UINT_MAX; ++p){
+                const D3D12_ROOT_PARAMETER1& rp = src.pParameters[p];
+                if (rp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV &&
+                    rp.Descriptor.RegisterSpace == 0 && rp.Descriptor.ShaderRegister == reg){
+                    tbWhy += " t" + std::to_string(reg) + "=rootSRV@" + std::to_string(p);
+                    InterlockedIncrement64(&g_tbRoot);
+                    break;
+                }
+                if (rp.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) continue;
+                UINT off = 0;
+                for (UINT r = 0; r < rp.DescriptorTable.NumDescriptorRanges; ++r){
+                    const D3D12_DESCRIPTOR_RANGE1& dr = rp.DescriptorTable.pDescriptorRanges[r];
+                    const UINT start = dr.OffsetInDescriptorsFromTableStart ==
+                        D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND ? off : dr.OffsetInDescriptorsFromTableStart;
+                    if (dr.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && dr.RegisterSpace == 0 &&
+                        reg >= dr.BaseShaderRegister &&
+                        (dr.NumDescriptors == UINT_MAX || reg - dr.BaseShaderRegister < dr.NumDescriptors)){
+                        where->tbP[k] = p;
+                        where->tbOff[k] = start + (reg - dr.BaseShaderRegister);
+                        tbWhy += " t" + std::to_string(reg) + "=tbl" + std::to_string(p) +
+                                 "+" + std::to_string(where->tbOff[k]);
+                        any = true;
+                        break;
+                    }
+                    if (dr.NumDescriptors == UINT_MAX) break;
+                    off = start + dr.NumDescriptors;
+                }
+            }
+        }
+        if (any && GhRootCost(params.data(), (UINT)params.size()) + 2 <= 64){
+            D3D12_ROOT_PARAMETER1 c{};
+            c.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            c.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            c.Constants.ShaderRegister = 0;
+            c.Constants.RegisterSpace = kGhTbSpace;
+            c.Constants.Num32BitValues = 2;
+            where->tb = (UINT)params.size();
+            params.push_back(c);
+        } else if (any){
+            tbWhy += " NOROOM";
+        }
+    }
 
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC vr{};
     vr.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
@@ -14575,7 +14735,9 @@ static bool GhAppendBindlessRanges(const void* blob, SIZE_T len,
          std::to_string((unsigned)out.size()) +
          " resParam=" + std::to_string((unsigned)where->res) +
          " sampParam=" + std::to_string((unsigned)where->samp) +
-         (where->dims != UINT_MAX ? " dimsParam=" + std::to_string((unsigned)where->dims) : std::string()));
+         (where->dims != UINT_MAX ? " dimsParam=" + std::to_string((unsigned)where->dims) : std::string()) +
+         (where->tb != UINT_MAX ? " tbParam=" + std::to_string((unsigned)where->tb) : std::string()) +
+         (tbWhy.empty() ? std::string() : " TBDIMS" + tbWhy));
     return true;
 }
 
@@ -14613,6 +14775,7 @@ static HRESULT __stdcall Hook_D12CreateRS(ID3D12Device* self, UINT node,
     std::vector<uint8_t> rw;
     GhBindlessRoot where{};
     bool rewrote = false;
+    if (!g_tbInc && self) g_tbInc = self->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     if (GhRsBindless() && blob && len){
         static volatile LONG nrs = 0, nfail = 0;
         rewrote = GhAppendBindlessRanges(blob, len, rw, &where);
@@ -15910,6 +16073,12 @@ struct GhCLNote {
     // time either the signature or the heaps change.
     void*   rsGfx;
     void*   rsComp;
+    // #245 gh_tbdims. Per pipeline type (0 gfx, 1 compute): where the bound root
+    // signature keeps t5/t6 and our slot constants, the CBV/SRV/UAV heap's GPU
+    // start and size, and the heap slot last written for t5/t6 (0xFFFFFFFF = none,
+    // which the shader reads as "keep the driver's answer").
+    UINT32  tbRoot[2], tbP[2][2], tbOff[2][2], tbv[2][2];
+    UINT64  tbHeap; UINT32 tbHeapN;
 };
 static GhCLNote g_clNotes[512]{};
 static SRWLOCK  g_clLock = SRWLOCK_INIT;
@@ -16781,6 +16950,43 @@ static void __stdcall Hook_CLSetHeaps(ID3D12GraphicsCommandList* self, UINT n,
 // a root signature change. Original vtable slots, never our own hooks: routing a
 // loader-issued bind back through Hook_CLSetGfxTable would poison the #158 bind
 // shadow and the op census with calls the guest never made.
+// A command-list method by vtable slot: our saved original when the slot is
+// hooked, the live entry when it is not (GhClOrig answers null for those).
+static void* GhClFn(void* self, int slot)
+{
+    void* f = GhClOrig(self, slot);
+    return f ? f : (*(void***)self)[slot];
+}
+// #245: write the t5/t6 heap slots of pipeline type comp into the root constants.
+static void GhTbPut(ID3D12GraphicsCommandList* self, GhCLNote* nt, int comp)
+{
+    if (!nt->tbRoot[comp]) return;
+    auto put = (void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, UINT, const void*, UINT))
+        GhClFn(self, comp ? 35 : 36);   // Set{Compute,Graphics}Root32BitConstants
+    put(self, nt->tbRoot[comp] - 1, 2, nt->tbv[comp], 0);
+}
+// #245: after the guest set root table idx for comp, recompute t5/t6's heap slot.
+static void GhTbTableSet(ID3D12GraphicsCommandList* self, int comp, UINT idx, UINT64 ptr)
+{
+    GhCLNote* nt = GhCLFind(self);
+    if (!nt || !nt->tbRoot[comp]) return;
+    bool hit = false;
+    for (int k = 0; k < 2; ++k){
+        if (nt->tbP[comp][k] != idx + 1) continue;
+        UINT32 slot = kGhTbNone;
+        if (g_tbInc && nt->tbHeap && ptr >= nt->tbHeap){
+            const UINT64 s = (ptr - nt->tbHeap) / g_tbInc + nt->tbOff[comp][k];
+            if (s < nt->tbHeapN) slot = (UINT32)s;
+        }
+        if (slot == kGhTbNone) InterlockedIncrement64(&g_tbOut);
+        nt->tbv[comp][k] = slot;
+        hit = true;
+    }
+    if (!hit) return;
+    InterlockedIncrement64(&g_tbHits);
+    GhTbPut(self, nt, comp);
+    InterlockedIncrement64(&g_tbSets);
+}
 static void GhBindBindlessTables(ID3D12GraphicsCommandList* self, GhCLNote* nt)
 {
     if (!GhRsBindless() || !self || !nt) return;
@@ -16794,9 +17000,14 @@ static void GhBindBindlessTables(ID3D12GraphicsCommandList* self, GhCLNote* nt)
         else if (d.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) smp = h;
     }
     if (!res && !smp) return;
+    if (res){
+        nt->tbHeap = res->GetGPUDescriptorHandleForHeapStart().ptr;
+        nt->tbHeapN = res->GetDesc().NumDescriptors;
+    }
 
     static volatile LONG nb = 0;
     for (int comp = 0; comp < 2; ++comp){
+        nt->tbRoot[comp] = 0;
         void* rs = comp ? nt->rsComp : nt->rsGfx;
         if (!rs) continue;
         GhBindlessRoot w{};
@@ -16805,6 +17016,14 @@ static void GhBindBindlessTables(ID3D12GraphicsCommandList* self, GhCLNote* nt)
             auto it = g_ghRsBindless.find(rs);
             if (it == g_ghRsBindless.end()) continue;
             w = it->second;
+        }
+        if (w.tb != UINT_MAX){   // #245 gh_tbdims: never leave the constants undefined
+            nt->tbRoot[comp] = w.tb + 1;
+            for (int k = 0; k < 2; ++k){
+                nt->tbP[comp][k] = w.tbP[k] == UINT_MAX ? 0 : w.tbP[k] + 1;
+                nt->tbOff[comp][k] = w.tbOff[k];
+            }
+            GhTbPut(self, nt, comp);
         }
         const int slot = comp ? 31 : 32;
         auto set = (void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
@@ -16842,7 +17061,11 @@ static void GhBindBindlessTables(ID3D12GraphicsCommandList* self, GhCLNote* nt)
                       " nullT=" + std::to_string((long long)g_bdNullTyped) +
                       " big=" + std::to_string((long long)g_bdBig) +
                       " max=" + std::to_string((long long)g_bdMax) +
-                      " mode=" + std::to_string((unsigned)GhBdMode()) : std::string()));
+                      " mode=" + std::to_string((unsigned)GhBdMode()) : std::string()) +
+                 (w.tb != UINT_MAX ? " | TBDIMS tb=" + std::to_string((unsigned)w.tb) +
+                      " sets=" + std::to_string((long long)g_tbSets) +
+                      " out=" + std::to_string((long long)g_tbOut) +
+                      " rootsrv=" + std::to_string((long long)g_tbRoot) : std::string()));
     }
 }
 static void __stdcall Hook_CLSetGfxTable(ID3D12GraphicsCommandList* self, UINT idx,
@@ -16864,9 +17087,11 @@ static void __stdcall Hook_CLSetGfxTable(ID3D12GraphicsCommandList* self, UINT i
         }
     }
     if (GhOpMask() & 131072) return;
-    if (!GhRecCap32(self, idx, hnd))
+    if (!GhRecCap32(self, idx, hnd)){
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
         D3D12_GPU_DESCRIPTOR_HANDLE))GhClOrig(self, 32))(self, idx, hnd);
+        if (GhTbDimsOn()) GhTbTableSet(self, 0, idx, (UINT64)hnd.ptr);
+    }
 }
 static void GhNoteRootVa(ID3D12GraphicsCommandList* self, UINT idx, UINT64 va)
 {
@@ -16912,7 +17137,10 @@ static void __stdcall Hook_CLSetCompRootSig(ID3D12GraphicsCommandList* self,
     if (!GhRecCap29(self, rs))
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12RootSignature*))GhClOrig(self, 29))(self, rs);
     if (GhRsBindless()){
-        if (GhCLNote* nt = GhCLFind(self)){ nt->rsComp = rs; GhBindBindlessTables(self, nt); }
+        if (GhCLNote* nt = GhCLFind(self)){
+            if (nt->rsComp != rs) nt->tbv[1][0] = nt->tbv[1][1] = kGhTbNone;
+            nt->rsComp = rs; GhBindBindlessTables(self, nt);
+        }
     }
 }
 static void __stdcall Hook_CLSetGfxRootSig(ID3D12GraphicsCommandList* self,
@@ -16922,7 +17150,10 @@ static void __stdcall Hook_CLSetGfxRootSig(ID3D12GraphicsCommandList* self,
     if (!GhRecCap30(self, rs))
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12RootSignature*))GhClOrig(self, 30))(self, rs);
     if (GhRsBindless()){
-        if (GhCLNote* nt = GhCLFind(self)){ nt->rsGfx = rs; GhBindBindlessTables(self, nt); }
+        if (GhCLNote* nt = GhCLFind(self)){
+            if (nt->rsGfx != rs) nt->tbv[0][0] = nt->tbv[0][1] = kGhTbNone;
+            nt->rsGfx = rs; GhBindBindlessTables(self, nt);
+        }
     }
 }
 static void __stdcall Hook_CLSetViewports(ID3D12GraphicsCommandList* self, UINT n,
@@ -17731,6 +17962,8 @@ static HRESULT __stdcall Hook_CLReset(ID3D12GraphicsCommandList* self,
         n->tblSet = n->vaSet = 0;
         n->heaps[0] = n->heaps[1] = nullptr;
         n->rsGfx = n->rsComp = nullptr;   // #173, same rule: Reset clears the root signature
+        n->tbRoot[0] = n->tbRoot[1] = 0; n->tbHeap = 0; n->tbHeapN = 0;
+        for (int c = 0; c < 2; ++c) n->tbv[c][0] = n->tbv[c][1] = kGhTbNone;
         n->nrt = n->hasDsv = n->nvp = n->nsc = 0;
         n->dsv = 0;
         for (int i = 0; i < 16; ++i){ n->tbl[i] = 0; n->rootva[i] = 0; }
@@ -19928,9 +20161,11 @@ static void __stdcall Hook_CLSetCompTable(ID3D12GraphicsCommandList* self, UINT 
                         (UINT64)(uintptr_t)nb->heaps[0]);
         }
     }
-    if (!GhRecCap31(self, i, h))
+    if (!GhRecCap31(self, i, h)){
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT,
             D3D12_GPU_DESCRIPTOR_HANDLE))GhClOrig(self, 31))(self, i, h);
+        if (GhTbDimsOn()) GhTbTableSet(self, 1, i, (UINT64)h.ptr);
+    }
 }
 static void GhNoteCmpRootVa(ID3D12GraphicsCommandList* self, UINT idx, UINT64 va)
 {
@@ -41097,6 +41332,7 @@ static void RunGuest()
 
         // #248. What a typed UAV load of R11G11B10/R10G10B10A2 returns on this
         // driver, against two formats it admits it can load. Off unless gh_fmtload_probe.
+        GhCsProbe();
         GhFmtLoadProbe();
 
         // ghwmm.dll: our WINMM replacement for the multimedia-timer functions the
