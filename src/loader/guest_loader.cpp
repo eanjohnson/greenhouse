@@ -20431,9 +20431,10 @@ static unsigned GhProgMode(){ static const unsigned m = GhCfgNum(L"gh_prog_fence
 // Values are seq*64 + k: k = 63 for the whole submission, k = 1..n for list k of a
 // submission split per list (bit 4 of gh_prog_fence, armed window only). Monotonic
 // per queue either way, so GetCompletedValue reads as "submission.list".
+static unsigned GhGpOrder();
 static void GhProgSignalV(ID3D12CommandQueue* q, LONG seq, unsigned k)
 {
-    const unsigned m = GhProgMode();
+    const unsigned m = GhProgMode() | (GhGpOrder() ? 2u : 0u);   // #250: the pager orders on these
     if (!m || !q) return;
     if (!(m & 2) && !GhCLTraceOn()) return;
     GhProgQ* e = nullptr;
@@ -22810,6 +22811,13 @@ struct GhGpRes {
     // busy: the worker is moving this texture's content OUTSIDE g_gpLk. zombie: the
     // game's last Release came while busy -- the worker finishes the free (GhGpDrop).
     bool                  pend, busy, zombie;
+    // #250 gh_gp_order: the g_gpEvFence value its last unmap signals on g_gpEQ. A
+    // restore must not map it again until that unmap has executed.
+    UINT64                evV;
+    // #250 v2: when the game last RECORDED a copy into it (GhGpTouch). The copy runs at
+    // the list's ExecuteCommandLists, possibly much later; evicting before then saves
+    // the run's previous tenant and the late copy lands on the dummy tile.
+    LONG64                lastDst;
 };
 struct GhGpChunk { ID3D12Heap* heap; UINT tiles; std::vector<std::pair<UINT, UINT>> fr; };   // fr: sorted free runs (base,len)
 
@@ -22819,6 +22827,25 @@ static std::unordered_map<void*, GhGpRes*>*    g_gpMap = nullptr;
 static ID3D12Device*                           g_gpDev = nullptr;
 static ID3D12CommandQueue*                     g_gpQ = nullptr;       // DIRECT, ours, mappings only
 static ID3D12Fence*                            g_gpMapFence = nullptr;
+// #250. Texture High evicts hundreds of textures at world entry, and g_gpQ unmapped
+// them while the game's already-submitted frames were still reading them -- only
+// FUTURE submissions wait on g_gpMapFence -- and the freed run went straight to the
+// next texture. gh_gp_order=1 moves every eviction unmap to a second DIRECT queue,
+// g_gpEQ, which first GPU-waits on every game queue's PROGFENCE value at the time of
+// the eviction; the run stays quarantined until g_gpEvFence says the unmap executed.
+// Nothing waits on g_gpEQ on the GPU (the CPU polls its fence), so it cannot close a
+// cycle with the game's own cross-queue waits.
+static unsigned GhGpOrder(){ static const unsigned v = GhCfgNum(L"gh_gp_order.txt", "GH_GP_ORDER", 0); return v; }
+static ID3D12CommandQueue*                     g_gpEQ = nullptr;
+static ID3D12Fence*                            g_gpEvFence = nullptr;
+static volatile LONG64                         g_gpEvV = 0;
+struct GhGpQuar { int ci; UINT base, n; UINT64 v; ID3D12Resource* r; };
+static std::vector<GhGpQuar>*                  g_gpQuar = nullptr;      // g_gpLk
+static std::vector<ID3D12Resource*>*           g_gpQuarRel = nullptr;   // g_gpLk; released by the worker, unlocked
+static volatile LONG   g_gpOrdEv = 0, g_gpOrdWaits = 0, g_gpOrdRw = 0, g_gpOrdStall = 0, g_gpOrdPreTo = 0;
+static volatile LONG64 g_gpQuarB = 0;
+static volatile LONG   g_gpLateMap = 0, g_gpLateMiss = 0;   // #250 v4: loads mapped after the read / fell back
+static HANDLE          g_gpOrdEvt = nullptr;   // the worker's SetEventOnCompletion target
 // #238 PG0: evicted textures map to ONE shared zeroed 64 KB tile instead of NULL.
 // TILE0 proved null-tile reads return zero through COPIES only; IA1b/LG2b hung in
 // bindless shaders reading textures the pager had just NULL-unmapped, PG0 (pager
@@ -23048,7 +23075,10 @@ static bool GhGpFileIo(bool write, UINT64 off, void* p, DWORD n)
 // Work is cut into batches no bigger than the stage; each batch is one
 // submission and one wait. Without g_gpLk the slot must already exist
 // (GhGpEnsureSlot), since the file allocator lives under g_gpLk.
-static bool GhGpXfer(GhGpRes* e, bool in, bool lkHeld = true)
+static void GhGpMapWhole(GhGpRes* e, ID3D12Heap* heap, UINT base, bool signalNow, ID3D12CommandQueue* mq);
+// #250 v4: mh != null (a load) maps e's fresh run on g_gpQ right before the first copy
+// list is submitted, i.e. after the bytes are already in the stage; *mapped says it did.
+static bool GhGpXfer(GhGpRes* e, bool in, bool lkHeld = true, ID3D12Heap* mh = nullptr, UINT mb = 0, bool* mapped = nullptr)
 {
     if (!g_gpIoOn || !e || e->chunk < 0) return false;
     UINT nT = 0, nSub = 16; D3D12_PACKED_MIP_INFO pm{}; D3D12_TILE_SHAPE ts{}; D3D12_SUBRESOURCE_TILING st[16]{};
@@ -23172,6 +23202,7 @@ static bool GhGpXfer(GhGpRes* e, bool in, bool lkHeld = true)
             if (in) clCopyTex(g_gpCl, &t, 0, 0, 0, &f, nullptr); else clCopyTex(g_gpCl, &f, 0, 0, 0, &t, nullptr);
         }
         Bracket(true);
+        if (in && mh && mapped && !*mapped){ GhGpMapWhole(e, mh, mb, false, nullptr); *mapped = true; }   // #250 v4
         if (!Run()) return false;
         if (!in){
             for (size_t i = a; i < b; ++i)
@@ -23250,6 +23281,18 @@ static bool GhGpRig(ID3D12Device* dev)
         return false;
     }
     g_gpDev = dev; g_gpQ = q; g_gpMapFence = f;
+    if (GhGpOrder()){
+        ID3D12CommandQueue* eq = nullptr; ID3D12Fence* ef = nullptr;
+        HRESULT h2 = mkq ? mkq(dev, &qd, __uuidof(ID3D12CommandQueue), (void**)&eq) : E_FAIL;
+        if (SUCCEEDED(h2) && eq) h2 = mkf ? mkf(dev, 0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), (void**)&ef) : E_FAIL;
+        if (SUCCEEDED(h2) && eq && ef){
+            g_gpEQ = eq; g_gpEvFence = ef;
+            g_gpQuar = new std::vector<GhGpQuar>(); g_gpQuarRel = new std::vector<ID3D12Resource*>();
+            g_gpOrdEvt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        } else if (eq) eq->Release();
+        Diag("GPUPAGE order eq=" + Hex((uint64_t)(uintptr_t)eq) + " fence=" + Hex((uint64_t)(uintptr_t)ef) +
+             " hr=" + Hex((uint32_t)h2) + (g_gpEQ ? " ON" : " FAILED -- evictions stay on g_gpQ"));
+    }
     g_gpChunks = new std::vector<GhGpChunk>();
     g_gpMap = new std::unordered_map<void*, GhGpRes*>();
     g_gpMap->reserve(8192);
@@ -23275,8 +23318,10 @@ static bool GhGpRig(ID3D12Device* dev)
 
 // g_gpLk held. First fit over the chunks, growing the pool by one chunk (256 MB,
 // or what is left under the cap) when nothing fits.
+static void GhGpQuarDrain();
 static bool GhGpAllocNoEvict(UINT n, int* ci, UINT* base)
 {
+    GhGpQuarDrain();   // #250
     for (size_t c = 0; c < g_gpChunks->size(); ++c){
         auto& fr = (*g_gpChunks)[c].fr;
         for (size_t i = 0; i < fr.size(); ++i) if (fr[i].second >= n){
@@ -23349,8 +23394,9 @@ static void GhGpMapSignal()
 
 // g_gpLk held. One region covering the whole resource, one range, on OUR direct
 // queue, then a signal the guest's queues wait on (GhGpBeforeSubmit).
-static void GhGpMapWhole(GhGpRes* e, ID3D12Heap* heap, UINT base, bool signalNow = true)
+static void GhGpMapWhole(GhGpRes* e, ID3D12Heap* heap, UINT base, bool signalNow = true, ID3D12CommandQueue* mq = nullptr)
 {
+    if (!mq) mq = g_gpQ;
     D3D12_TILED_RESOURCE_COORDINATE c{};
     D3D12_TILE_REGION_SIZE sz{}; sz.NumTiles = e->nTiles; sz.UseBox = FALSE;
     D3D12_TILE_RANGE_FLAGS rf = heap ? D3D12_TILE_RANGE_FLAG_NONE : D3D12_TILE_RANGE_FLAG_NULL;
@@ -23361,7 +23407,7 @@ static void GhGpMapWhole(GhGpRes* e, ID3D12Heap* heap, UINT base, bool signalNow
     }
     GhGpCq<void (__stdcall*)(ID3D12CommandQueue*, ID3D12Resource*, UINT, const D3D12_TILED_RESOURCE_COORDINATE*,
         const D3D12_TILE_REGION_SIZE*, ID3D12Heap*, UINT, const D3D12_TILE_RANGE_FLAGS*, const UINT*, const UINT*,
-        D3D12_TILE_MAPPING_FLAGS)>(g_gpQ, 8)(g_gpQ, e->res, 1, &c, &sz, heap, 1, &rf, &off, &cnt, D3D12_TILE_MAPPING_FLAG_NONE);
+        D3D12_TILE_MAPPING_FLAGS)>(mq, 8)(mq, e->res, 1, &c, &sz, heap, 1, &rf, &off, &cnt, D3D12_TILE_MAPPING_FLAG_NONE);
     InterlockedIncrement(&g_gpMaps);
     if (signalNow) GhGpMapSignal();
 }
@@ -23378,20 +23424,119 @@ static void GhGpMapWhole(GhGpRes* e, ID3D12Heap* heap, UINT base, bool signalNow
 // signal actually demand an evicted texture back. TILE2b adds the CopyTiles +
 // D:\DevelopmentFiles ring so a restore returns real content.
 
+// #250, g_gpLk held exclusive. The eviction unmap, ordered after every game
+// submission already made: g_gpEQ waits on each game queue's PROGFENCE value, then
+// maps the resource to the dummy tile, then signals g_gpEvFence. The run and a
+// reference on the resource are quarantined until that signal lands.
+// g_gpLk held. g_gpEQ waits for every game submission made so far AND for every
+// mapping already signalled on g_gpQ (a fresh texture's first map is async there;
+// an unmap overtaking it would leave the late map pointing at a freed run).
+static void GhGpEqWaitAll()
+{
+    AcquireSRWLockShared(&g_progLock);
+    for (int i = 0; i < g_progN; ++i){
+        GhProgQ& p = g_prog[i];
+        if (!p.f || p.q == g_gpQ || p.q == g_gpEQ) continue;
+        const LONG64 last = InterlockedCompareExchange64(&p.last, 0, 0);
+        if (last <= 0 || p.f->GetCompletedValue() >= (UINT64)last) continue;
+        GhGpCq<HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64)>(g_gpEQ, 15)(g_gpEQ, p.f, (UINT64)last);
+        InterlockedIncrement(&g_gpOrdWaits);
+    }
+    ReleaseSRWLockShared(&g_progLock);
+    const UINT64 mv = (UINT64)InterlockedCompareExchange64(&g_gpMapV, 0, 0);
+    if (mv && g_gpMapFence->GetCompletedValue() < mv)
+        GhGpCq<HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64)>(g_gpEQ, 15)(g_gpEQ, g_gpMapFence, mv);
+}
+// g_gpLk held. #250 v2: a marker on g_gpEQ behind GhGpEqWaitAll. The SAVE must not
+// copy a victim out before the game's in-flight uploads into it have landed (it
+// would save the run's previous tenant and restore that as the texture), so the
+// evicting thread waits for this marker, WITHOUT g_gpLk, before GhGpXfer.
+static UINT64 GhGpPreFence()
+{
+    GhGpEqWaitAll();
+    const UINT64 v = (UINT64)InterlockedIncrement64(&g_gpEvV);
+    GhGpCq<HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64)>(g_gpEQ, 14)(g_gpEQ, g_gpEvFence, v);
+    return v;
+}
+static bool GhGpEvWait(UINT64 v, DWORD ms)
+{
+    if (g_gpEvFence->GetCompletedValue() >= v) return true;
+    HANDLE h = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!h) return false;
+    bool ok = SUCCEEDED(g_gpEvFence->SetEventOnCompletion(v, h)) && WaitForSingleObject(h, ms) == WAIT_OBJECT_0;
+    CloseHandle(h);
+    if (!ok) InterlockedIncrement(&g_gpOrdPreTo);
+    return ok || g_gpEvFence->GetCompletedValue() >= v;
+}
+static void GhGpUnmapOrdered(GhGpRes* e)
+{
+    GhGpEqWaitAll();
+    GhGpMapWhole(e, nullptr, 0, false, g_gpEQ);
+    const UINT64 v = (UINT64)InterlockedIncrement64(&g_gpEvV);
+    GhGpCq<HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64)>(g_gpEQ, 14)(g_gpEQ, g_gpEvFence, v);
+    e->res->AddRef();
+    g_gpQuar->push_back(GhGpQuar{ e->chunk, e->base, e->nTiles, v, e->res });
+    e->evV = v;
+    InterlockedAdd64(&g_gpQuarB, (LONG64)e->nTiles << 16);
+    InterlockedIncrement(&g_gpOrdEv);
+}
+// g_gpLk held exclusive. Runs whose unmap has executed go back to the free lists;
+// their references go to g_gpQuarRel for the worker to drop without the lock.
+static void GhGpQuarDrain()
+{
+    if (!g_gpQuar || g_gpQuar->empty()) return;
+    const UINT64 done = g_gpEvFence->GetCompletedValue();
+    size_t k = 0;
+    for (auto& q : *g_gpQuar){
+        if (q.v <= done){
+            GhGpFreeRun(q.ci, q.base, q.n);
+            InterlockedAdd64(&g_gpQuarB, -((LONG64)q.n << 16));
+            g_gpQuarRel->push_back(q.r);
+        } else (*g_gpQuar)[k++] = q;
+    }
+    g_gpQuar->resize(k);
+}
+// No lock held (the worker). Drop the quarantine's references.
+static void GhGpQuarRelease()
+{
+    if (!g_gpQuarRel) return;
+    std::vector<ID3D12Resource*> v;
+    AcquireSRWLockExclusive(&g_gpLk);
+    GhGpQuarDrain();
+    v.swap(*g_gpQuarRel);
+    ReleaseSRWLockExclusive(&g_gpLk);
+    for (auto* r : v) r->Release();   // through Hook_GpResRelease: may be the game's last
+}
+// g_gpLk held. Before a restore maps e again: its eviction unmap must have run on
+// g_gpEQ, or it would land on top of the new mapping. Normally long done; if not,
+// g_gpQ waits for it on the GPU.
+static void GhGpRestoreOrder(GhGpRes* e)
+{
+    if (!g_gpEQ || !e->evV || g_gpEvFence->GetCompletedValue() >= e->evV) return;
+    GhGpCq<HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64)>(g_gpQ, 15)(g_gpQ, g_gpEvFence, e->evV);
+    InterlockedIncrement(&g_gpOrdRw);
+}
+
 // g_gpLk held exclusive. Save the content (TILE2b), unmap whole, give the run
 // back. No signal: the caller batches one GhGpMapSignal for the whole sweep. With
 // lossless paging on, a texture whose content could not be saved is NOT evicted.
 static bool GhGpEvictOne(GhGpRes* e)
 {
     if (!e || e->chunk < 0 || e->busy) return false;
+    // #250 v2: g_gpLk is held here, so the wait for the game's in-flight writes is short
+    // and a miss refuses the victim instead of saving a half-written texture.
+    if (g_gpEQ && g_gpIoOn && GhGpOrder() >= 2 && !GhGpEvWait(GhGpPreFence(), 30)) return false;
     if (g_gpIoOn){
         AcquireSRWLockExclusive(&g_gpIoLk);
         const bool ok = g_gpIoOn && GhGpXfer(e, false);
         ReleaseSRWLockExclusive(&g_gpIoLk);
         if (!ok) return false;
     }
-    GhGpMapWhole(e, nullptr, 0, false);          // whole-resource NULL: reads zero
-    GhGpFreeRun(e->chunk, e->base, e->nTiles);
+    if (g_gpEQ) GhGpUnmapOrdered(e);             // #250: after in-flight game work; run quarantined
+    else {
+        GhGpMapWhole(e, nullptr, 0, false);      // whole-resource NULL: reads zero
+        GhGpFreeRun(e->chunk, e->base, e->nTiles);
+    }
     const LONG64 bytes = (LONG64)e->nTiles << 16;
     e->chunk = -1; e->base = 0;
     InterlockedAdd64(&g_gpLiveB, -bytes);
@@ -23401,6 +23546,13 @@ static bool GhGpEvictOne(GhGpRes* e)
     return true;
 }
 
+// #250 v2 (gh_gp_order=2): a texture with a copy recorded into it in the last 3 s is
+// never a victim, not even for TILE2c's override -- the list carrying the copy may not
+// have been submitted yet, so no fence can order the save behind it.
+static bool GhGpDstGuard(const GhGpRes* e, LONG64 now)
+{
+    return GhGpOrder() >= 2 && e->lastDst && (now - e->lastDst) < 3000000;
+}
 // g_gpLk held exclusive. Evict cold textures, coldest first, retrying the
 // first-fit after each one (GhGpFreeRun coalesces, so neighbours merge into a
 // usable hole). Bounded so a pathological sweep cannot stall a frame.
@@ -23413,7 +23565,7 @@ static bool GhGpReclaim(UINT n, int* ci, UINT* base)
     v.reserve(256);
     for (auto& kv : *g_gpMap){
         GhGpRes* e = kv.second;
-        if (e && e->chunk >= 0 && !e->busy && (now - e->lastUse) >= cut) v.push_back(e);
+        if (e && e->chunk >= 0 && !e->busy && (now - e->lastUse) >= cut && !GhGpDstGuard(e, now)) v.push_back(e);
     }
     // #235 TILE2c: the age cut is a PREFERENCE, not a VETO. When a small pool FIRST
     // fills, everything resident in it is seconds old, the aged list comes back empty,
@@ -23430,7 +23582,7 @@ static bool GhGpReclaim(UINT n, int* ci, UINT* base)
         InterlockedIncrement(&g_gpCutOverride);
         for (auto& kv : *g_gpMap){
             GhGpRes* e = kv.second;
-            if (e && e->chunk >= 0 && !e->busy) v.push_back(e);
+            if (e && e->chunk >= 0 && !e->busy && !GhGpDstGuard(e, now)) v.push_back(e);
         }
         // Genuinely nothing resident to take: now it really is no victim.
         if (v.empty()){ InterlockedIncrement(&g_gpNoVictim); return false; }
@@ -23486,12 +23638,18 @@ static void GhGpRestoreByRes(void* res)
         int ci = -1; UINT base = 0;
         if (GhGpAlloc(e->nTiles, &ci, &base)){
             e->chunk = ci; e->base = base;
-            GhGpMapWhole(e, (*g_gpChunks)[ci].heap, base, false);
+            GhGpRestoreOrder(e);   // #250
+            ID3D12Heap* const rh = (*g_gpChunks)[ci].heap;
+            const bool late = GhGpOrder() >= 3 && g_gpIoOn;   // #250 v4: map after the read
+            bool mapped = false;
+            if (!late){ GhGpMapWhole(e, rh, base, false); mapped = true; }
             if (g_gpIoOn){                      // #235 TILE2b: queue-ordered after the map, on g_gpQ
                 AcquireSRWLockExclusive(&g_gpIoLk);
-                if (g_gpIoOn) GhGpXfer(e, true);
+                if (g_gpIoOn) GhGpXfer(e, true, true, late ? rh : nullptr, base, &mapped);
                 ReleaseSRWLockExclusive(&g_gpIoLk);
             }
+            if (!mapped){ GhGpMapWhole(e, rh, base, false); InterlockedIncrement(&g_gpLateMiss); }
+            else if (late) InterlockedIncrement(&g_gpLateMap);
             GhGpMapSignal();                    // guest queues wait for the map AND the content
             const LONG64 bytes = (LONG64)e->nTiles << 16;
             InterlockedAdd64(&g_gpLiveB, bytes);
@@ -23553,7 +23711,7 @@ static GhGpRes* GhGpColdest(bool agedOnly)
     GhGpRes* best = nullptr;
     for (auto& kv : *g_gpMap){
         GhGpRes* e = kv.second;
-        if (!e || e->chunk < 0 || e->busy) continue;
+        if (!e || e->chunk < 0 || e->busy || GhGpDstGuard(e, now)) continue;
         if (agedOnly && (now - e->lastUse) < cut) continue;
         if (!best || e->lastUse < best->lastUse) best = e;
     }
@@ -23571,10 +23729,12 @@ static bool GhGpEvictAsync(bool agedOnly)
     if (e && g_gpIoOn && !GhGpEnsureSlot(e)){ InterlockedIncrement(&g_gpIoFail); e = nullptr; }
     ID3D12Resource* r = e ? e->res : nullptr;
     if (e){ e->busy = true; r->AddRef(); }
+    const UINT64 pv = (e && g_gpEQ && g_gpIoOn && GhGpOrder() >= 2) ? GhGpPreFence() : 0;
     ReleaseSRWLockExclusive(&g_gpLk);
     if (!e) return false;
     bool ok = true;
-    if (g_gpIoOn){
+    if (pv && !GhGpEvWait(pv, 500)) ok = false;   // #250 v2: the game's writes into it land first
+    if (ok && g_gpIoOn){
         AcquireSRWLockExclusive(&g_gpIoLk);
         ok = g_gpIoOn && GhGpXfer(e, false, false);
         ReleaseSRWLockExclusive(&g_gpIoLk);
@@ -23583,8 +23743,11 @@ static bool GhGpEvictAsync(bool agedOnly)
     AcquireSRWLockExclusive(&g_gpLk);
     e->busy = false;
     if (ok && e->chunk >= 0){
-        GhGpMapWhole(e, nullptr, 0, false);   // whole-resource NULL: reads zero
-        GhGpFreeRun(e->chunk, e->base, e->nTiles);
+        if (g_gpEQ) GhGpUnmapOrdered(e);      // #250: after in-flight game work; run quarantined
+        else {
+            GhGpMapWhole(e, nullptr, 0, false);   // whole-resource NULL: reads zero
+            GhGpFreeRun(e->chunk, e->base, e->nTiles);
+        }
         const LONG64 bytes = (LONG64)e->nTiles << 16;
         e->chunk = -1; e->base = 0;
         InterlockedAdd64(&g_gpLiveB, -bytes);
@@ -23608,6 +23771,7 @@ static bool GhGpEvictAsync(bool agedOnly)
 static void GhGpRestoreAsync(ID3D12Resource* r)
 {
     const LONG64 t0 = GhNowUs();
+    int qwaits = 0;
     for (int tries = 0; ; ++tries){
         AcquireSRWLockExclusive(&g_gpLk);
         auto it = g_gpMap->find(r);
@@ -23621,7 +23785,11 @@ static void GhGpRestoreAsync(ID3D12Resource* r)
         int ci = -1; UINT base = 0;
         if (GhGpAllocNoEvict(e->nTiles, &ci, &base)){
             e->chunk = ci; e->base = base; e->busy = true; e->pend = false;
-            GhGpMapWhole(e, (*g_gpChunks)[ci].heap, base, false);
+            GhGpRestoreOrder(e);   // #250
+            ID3D12Heap* const rh = (*g_gpChunks)[ci].heap;
+            const bool late = GhGpOrder() >= 3 && g_gpIoOn;   // #250 v4: map after the read
+            bool mapped = false;
+            if (!late){ GhGpMapWhole(e, rh, base, false); mapped = true; }
             const LONG64 bytes = (LONG64)e->nTiles << 16;
             InterlockedAdd64(&g_gpLiveB, bytes);
             InterlockedAdd64(&g_gpEvictedB, -bytes);
@@ -23630,9 +23798,11 @@ static void GhGpRestoreAsync(ID3D12Resource* r)
             ReleaseSRWLockExclusive(&g_gpLk);
             if (g_gpIoOn){
                 AcquireSRWLockExclusive(&g_gpIoLk);
-                if (g_gpIoOn) GhGpXfer(e, true, false);
+                if (g_gpIoOn) GhGpXfer(e, true, false, late ? rh : nullptr, base, &mapped);
                 ReleaseSRWLockExclusive(&g_gpIoLk);
             }
+            if (!mapped){ GhGpMapWhole(e, rh, base, false); InterlockedIncrement(&g_gpLateMiss); }   // busy: no eviction can race
+            else if (late) InterlockedIncrement(&g_gpLateMap);
             GhGpHeap* ph = nullptr;
             AcquireSRWLockExclusive(&g_gpLk);
             GhGpMapSignal();                      // map AND content, then busy clears
@@ -23643,7 +23813,20 @@ static void GhGpRestoreAsync(ID3D12Resource* r)
             InterlockedIncrement(&g_gpAdone);
             break;
         }
+        // #250: runs already evicted but still quarantined come free as soon as their
+        // unmap executes -- wait for that (bounded) rather than evict more.
+        UINT64 qv = 0;
+        if (g_gpQuar) for (auto& qq : *g_gpQuar) if (qq.v > qv) qv = qq.v;
         ReleaseSRWLockExclusive(&g_gpLk);
+        if (qv && qwaits < 8){
+            ++qwaits;
+            InterlockedIncrement(&g_gpOrdStall);
+            if (g_gpEvFence->GetCompletedValue() < qv && g_gpOrdEvt){
+                g_gpEvFence->SetEventOnCompletion(qv, g_gpOrdEvt);
+                WaitForSingleObject(g_gpOrdEvt, 250);
+            }
+            continue;
+        }
         if (tries >= 256 || !GhGpEvictAsync(false)){
             AcquireSRWLockExclusive(&g_gpLk);
             it = g_gpMap->find(r);
@@ -23668,6 +23851,7 @@ static void GhGpKeepFree()
         UINT64 freeT = 0; bool atCap;
         AcquireSRWLockShared(&g_gpLk);
         for (auto& c : *g_gpChunks) for (auto& fr : c.fr) freeT += fr.second;
+        if (g_gpQuar) for (auto& qq : *g_gpQuar) freeT += qq.n;   // #250: free once its unmap runs
         atCap = (UINT64)g_gpPoolB + ((UINT64)low << 16) > ((UINT64)GhGpuPageMb() << 20);   // growing is cheaper than saving
         ReleaseSRWLockShared(&g_gpLk);
         if (!atCap || freeT >= low) return;
@@ -23678,6 +23862,99 @@ static void GhGpKeepFree()
         if (!GhGpEvictAsync(true) && !GhGpEvictAsync(false)) return;
         InterlockedIncrement(&g_gpKeepFree);
     }
+}
+
+// #250 v3: gh_gp_dummy_chk. Every evicted texture reads the ONE dummy tile
+// (REUSE_SINGLE_TILE). If anything ever writes it -- a copy into a texture that is
+// evicted by the time the copy runs -- every evicted texture on screen shows the same
+// 64 KB of garbage. 1 = read it back every ~2 s and log when it is not zero;
+// 2 = also clear it. Worker thread only; g_gpIoLk around the stage and our list.
+static unsigned GhGpDummyChk(){ static const unsigned v = GhCfgNum(L"gh_gp_dummy_chk.txt", "GH_GP_DUMMY_CHK", 0); return v; }
+static ID3D12Resource* g_gpDz = nullptr;
+static bool            g_gpDzOff = false;
+static volatile LONG   g_gpDzChk = 0, g_gpDzDirty = 0, g_gpDzClr = 0;
+static LONG64          g_gpDzLast = 0;
+static bool GhGpDzRun()
+{
+    auto clClose = GhGpClFn<HRESULT (__stdcall*)(ID3D12GraphicsCommandList*)>(9);
+    if (FAILED(clClose(g_gpCl))) return false;
+    ID3D12CommandList* l = g_gpCl;
+    GhGpCq<void (__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*)>(g_gpQ, 10)(g_gpQ, 1, &l);
+    const UINT64 v = ++g_gpCopyV;
+    GhGpCq<HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64)>(g_gpQ, 14)(g_gpQ, g_gpCopyF, v);
+    if (g_gpCopyF->GetCompletedValue() < v){
+        g_gpCopyF->SetEventOnCompletion(v, g_gpCopyEv);
+        if (WaitForSingleObject(g_gpCopyEv, 5000) != WAIT_OBJECT_0){
+            g_gpIoOn = false;
+            Diag("GPUPAGE dummychk copy wait TIMED OUT -- lossless paging OFF");
+            return false;
+        }
+    }
+    return true;
+}
+static bool GhGpDzBegin()
+{
+    auto clReset = GhGpClFn<HRESULT (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*, ID3D12PipelineState*)>(10);
+    return SUCCEEDED(g_gpCa->Reset()) && SUCCEEDED(clReset(g_gpCl, g_gpCa, nullptr));
+}
+static void GhGpDummyCheck()
+{
+    const unsigned m = GhGpDummyChk();
+    if (!m || g_gpDzOff || !g_gpDummy || !g_gpIoOn || !g_gpCl || !g_gpRbP || !g_gpUpP || g_gpStageB < 65536) return;
+    const LONG64 now = GhNowUs();
+    if (now - g_gpDzLast < 2000000) return;
+    g_gpDzLast = now;
+    D3D12_TILED_RESOURCE_COORDINATE c{};
+    D3D12_TILE_REGION_SIZE rs{}; rs.NumTiles = 1; rs.UseBox = FALSE;
+    if (!g_gpDz){
+        D3D12_RESOURCE_DESC d{};
+        d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; d.Width = 128; d.Height = 128;   // RGBA8 128x128 = one 64 KB tile
+        d.DepthOrArraySize = 1; d.MipLevels = 1; d.Format = DXGI_FORMAT_R8G8B8A8_UNORM; d.SampleDesc.Count = 1;
+        d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+        auto mkr = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
+                    const D3D12_CLEAR_VALUE*, REFIID, void**))g_d12vtOrig[30];
+        const HRESULT hr = mkr(g_gpDev, &d, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, __uuidof(ID3D12Resource), (void**)&g_gpDz);
+        Diag("GPUPAGE dummychk mode=" + std::to_string(m) + " reserved hr=" + Hex((uint32_t)hr));
+        if (FAILED(hr)){ g_gpDz = nullptr; g_gpDzOff = true; return; }
+        D3D12_TILE_RANGE_FLAGS rf = D3D12_TILE_RANGE_FLAG_NONE; UINT off = 0, cnt = 1;
+        GhGpCq<void (__stdcall*)(ID3D12CommandQueue*, ID3D12Resource*, UINT, const D3D12_TILED_RESOURCE_COORDINATE*,
+            const D3D12_TILE_REGION_SIZE*, ID3D12Heap*, UINT, const D3D12_TILE_RANGE_FLAGS*, const UINT*, const UINT*,
+            D3D12_TILE_MAPPING_FLAGS)>(g_gpQ, 8)(g_gpQ, g_gpDz, 1, &c, &rs, g_gpDummy, 1, &rf, &off, &cnt, D3D12_TILE_MAPPING_FLAG_NONE);
+    }
+    auto clTiles = GhGpClFn<void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*, const D3D12_TILED_RESOURCE_COORDINATE*,
+                                             const D3D12_TILE_REGION_SIZE*, ID3D12Resource*, UINT64, D3D12_TILE_COPY_FLAGS)>(18);
+    auto clBarrier = GhGpClFn<void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*)>(26);
+    AcquireSRWLockExclusive(&g_gpIoLk);
+    if (g_gpIoOn && GhGpDzBegin()){
+        clTiles(g_gpCl, g_gpDz, &c, &rs, g_gpRb, 0, D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+        if (GhGpDzRun()){
+            InterlockedIncrement(&g_gpDzChk);
+            UINT nz = 0, first = 0xFFFFFFFFu;
+            for (UINT i = 0; i < 65536; ++i) if (g_gpRbP[i]){ if (first == 0xFFFFFFFFu) first = i; ++nz; }
+            if (nz){
+                const LONG k = InterlockedIncrement(&g_gpDzDirty);
+                if (k <= 8 || (k % 32) == 0){
+                    std::string hx;
+                    for (UINT i = first; i < first + 16 && i < 65536; ++i){ char b[4]; wsprintfA(b, "%02x", g_gpRbP[i]); hx += b; }
+                    Diag("GPUPAGE dummychk DIRTY n=" + std::to_string((long)k) + " nonzero=" + std::to_string(nz) +
+                         " first=" + std::to_string(first) + " bytes=" + hx + " evictedMB=" +
+                         std::to_string((long long)(InterlockedCompareExchange64(&g_gpEvictedB, 0, 0) >> 20)));
+                }
+                if (m >= 2 && GhGpDzBegin()){
+                    memset(g_gpUpP, 0, 65536);
+                    D3D12_RESOURCE_BARRIER br{}; br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    br.Transition.pResource = g_gpDz; br.Transition.Subresource = 0;
+                    br.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE; br.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                    clBarrier(g_gpCl, 1, &br);
+                    clTiles(g_gpCl, g_gpDz, &c, &rs, g_gpUp, 0, D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
+                    br.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST; br.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                    clBarrier(g_gpCl, 1, &br);
+                    if (GhGpDzRun()) InterlockedIncrement(&g_gpDzClr);
+                }
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&g_gpIoLk);
 }
 
 static DWORD WINAPI GhGpWorker(void*)
@@ -23691,8 +23968,11 @@ static DWORD WINAPI GhGpWorker(void*)
             ReleaseSRWLockExclusive(&g_gpQLk);
             if (!r) break;
             GhGpRestoreAsync(r);
+            GhGpDummyCheck();    // #250 v4: rate-limited to 2 s; the drain never ends in the world
         }
+        GhGpQuarRelease();   // #250
         GhGpKeepFree();
+        GhGpDummyCheck();    // #250 v3
     }
 }
 
@@ -24078,7 +24358,7 @@ static void GhGpTouch(ID3D12Resource* r)
 {
     if (!g_gpMap || !r) return;
     if (GhGpRes* e = GhGpFind(r)){
-        e->lastUse = GhNowUs(); InterlockedIncrement(&g_gpTouch);
+        e->lastUse = e->lastDst = GhNowUs(); InterlockedIncrement(&g_gpTouch);
         if (e->chunk < 0 || e->busy) GhGpRestoreByRes(r);   // a copy INTO an evicted texture would be dropped
     }
 }
@@ -24320,6 +24600,13 @@ static std::string GhGpFrameLine()
            "/" + std::to_string((long)InterlockedCompareExchange(&g_gpFail, 0, 0)) +
            " gpalias=" + std::to_string((long)InterlockedCompareExchange(&g_gpAlias, 0, 0)) +
            (g_gpDummy ? " gpdummy=" + std::to_string((long)InterlockedCompareExchange(&g_gpDummyMaps, 0, 0)) : std::string()) +
+           // #250 v3 gpdz=checks/dirty/cleared
+           (g_gpDz ? " gpdz=" + std::to_string((long)InterlockedCompareExchange(&g_gpDzChk, 0, 0)) +
+                     "/" + std::to_string((long)InterlockedCompareExchange(&g_gpDzDirty, 0, 0)) +
+                     "/" + std::to_string((long)InterlockedCompareExchange(&g_gpDzClr, 0, 0)) : std::string()) +
+           // #250 v4 gplate=loads mapped after their read / loads that fell back to map-first
+           " gplate=" + std::to_string((long)InterlockedCompareExchange(&g_gpLateMap, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_gpLateMiss, 0, 0)) +
            // #236 gpfree=oursN/oursMs/otherN/otherMs (last Releases run inline) gpdefer=mode/queued/done/qmax/workerMs
            " gpfree=" + std::to_string((long)InterlockedCompareExchange(&g_gpFreeOurs, 0, 0)) +
            "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpFreeOursUs, 0, 0) / 1000)) +
@@ -24330,6 +24617,13 @@ static std::string GhGpFrameLine()
            "/" + std::to_string((long)InterlockedCompareExchange(&g_gpDeferDone, 0, 0)) +
            "/" + std::to_string((long)InterlockedCompareExchange(&g_gpDeferMax, 0, 0)) +
            "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpDeferUs, 0, 0) / 1000)) +
+           // #250 gpord=evictions/gameWaits/restoreWaits/stalls/quarantinedMB/preSaveTimeouts
+           (g_gpEQ ? " gpord=" + std::to_string((long)InterlockedCompareExchange(&g_gpOrdEv, 0, 0)) +
+                     "/" + std::to_string((long)InterlockedCompareExchange(&g_gpOrdWaits, 0, 0)) +
+                     "/" + std::to_string((long)InterlockedCompareExchange(&g_gpOrdRw, 0, 0)) +
+                     "/" + std::to_string((long)InterlockedCompareExchange(&g_gpOrdStall, 0, 0)) +
+                     "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpQuarB, 0, 0) >> 20)) +
+                     "/" + std::to_string((long)InterlockedCompareExchange(&g_gpOrdPreTo, 0, 0)) : std::string()) +
            " gpmaps=" + std::to_string((long)InterlockedCompareExchange(&g_gpMaps, 0, 0)) +
            "/" + std::to_string((long)InterlockedCompareExchange(&g_gpWaits, 0, 0)) +
            " gpms=" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpUs, 0, 0) / 1000)) +
@@ -29971,6 +30265,17 @@ static void  WINAPI Bed_XInputEnable(BOOL){}
 static void KM_OnKey(winrt::Windows::UI::Core::KeyEventArgs const& e, bool down){
     int vk = (int)e.VirtualKey();
     if (vk <= 0 || vk > 255) return;
+    // The Xbox shell also reports every controller button as a CoreWindow key
+    // (VK_GAMEPAD_A 0xC3 .. VK_GAMEPAD_RIGHT_THUMBSTICK_LEFT 0xDA). A desktop pad
+    // never produces WM_KEYDOWN, and a guest that sees one latches its input kind
+    // to keyboard/mouse (Tsushima GUEST+0x44AF40 path), then ignores the pad.
+    // The pad already reaches the guest through XInput/WGI, so drop these here.
+    if (vk >= 0xC3 && vk <= 0xDA && g_guestRunning) {
+        static std::atomic<unsigned> s_padVk{0};
+        if (s_padVk.fetch_add(1) == 0)
+            Diag("INPUT km: controller key vk=" + std::to_string(vk) + " withheld from guest (pad goes via XInput/WGI)");
+        return;
+    }
     auto st = e.KeyStatus();
     {
         std::lock_guard<std::mutex> lk(g_kmMutex);
