@@ -562,7 +562,13 @@ static void GhGpRequest(ID3D12Resource* r);                 // #235 TILE2e
 // descriptors by CopyDescriptors from staging slots (BREAD6). A staging slot that
 // names a converted texture is noted at CreateSRV; every copy FROM such a slot is a
 // use of that texture this frame.
-static volatile LONG g_gpdAny = 0;   // #240: set by the first note; gates the copy hooks
+// #251: gen tells a slot written for THIS converted texture from one written for a dead
+// texture at the same address; the view is kept so the slot can be rewritten clamped.
+struct GhGpSlot { ID3D12Resource* r; UINT gen; bool hasDesc; D3D12_SHADER_RESOURCE_VIEW_DESC d; };
+static std::unordered_map<UINT64, GhGpSlot>* g_gpDescMap = nullptr;
+static bool GhGpSrvCreate(ID3D12Device* self, ID3D12Resource* r, const D3D12_SHADER_RESOURCE_VIEW_DESC* d, UINT64 cpu);
+static void GhGpDescForget(UINT64 cpu);
+static void GhGpSvAdd(ID3D12Device* dev, ID3D12DescriptorHeap* h, const D3D12_DESCRIPTOR_HEAP_DESC* d);
 static void GhGpDescNote(UINT64 cpu, ID3D12Resource* r);
 static void GhGpDescCopy(UINT64 src, UINT64 dst);
 static void GhIssuedPairsDump(const char* when);              // #158 executed-barrier tally
@@ -7812,13 +7818,19 @@ static bool GhPsoDenied(const void* code, SIZE_T n)
                 else { if (cur.size() == 32) deny.push_back(cur); cur.clear(); }
             }
         } else {
-            // #243 (CLP1/CLP2, loader 0.0.601.0): one shader left. The other
-            // five this list used to carry -- fa29971e (#244 switch lowering),
-            // 4acdac3e (#236 bufdims), the cloth solver 86d22de2 and the #195
-            // graphics pair 42ab5eed/6c9bda76 -- all CREATE and run in the
-            // world with no removal on the current corpus, n=2. 44c53d00 still
-            // hangs the GPU in the world when served (#247, Q1).
-            deny.assign({ "44c53d006f299116f79ffbbf00f818d3" });
+            deny.assign({ "fa29971ed902b2fad02cec2d64a0052a",
+                          "44c53d006f299116f79ffbbf00f818d3",
+                          "4acdac3ea5b31940d101db7bd4ff712f",
+                          "86d22de2bf57fcd4874bafdda58d734c",
+                          // #195. The graphics pair #194 named. newbe.DLL's
+                          // optimizer throws hlsl::Exception on the lowered
+                          // form of the second, and D3D12Core answers by
+                          // removing the device. Denying the VS is enough --
+                          // it is the first stage checked -- but both are
+                          // listed because either could turn up paired with a
+                          // different partner later.
+                          "42ab5eed7418a101078f8eb5ea293076",
+                          "6c9bda7610bbf88f725fa1c1be8c43a8" });
         }
         Diag("PSODENY list of " + std::to_string((unsigned)deny.size()) + " shaders");
     }
@@ -9899,6 +9911,76 @@ static void GhTiledProbe()
                         }
                     }
                     texH = nullptr;
+                }
+            }
+
+            // j. #251 v3: the split texture's remap shape. MIP2 remapped only the top
+            // (region = tiles [0, pgT)) and TILE0d says a partial remap is not honoured by
+            // the read side. j1/j2 repeat v2's shape (control); j3-j5 are v3's: ONE
+            // whole-resource region, two ranges in one heap (top -> a run or the heap's
+            // own zero tile via REUSE_SINGLE_TILE, tail -> its run).
+            {
+                const UINT pgT = pm.NumStandardMips > 2 ? st[2].StartTileIndexInOverallResource : 0;
+                if (!pgT || pgT >= nStd) Diag("TILEDPROBE j SKIP pgT=" + std::to_string(pgT));
+                else {
+                    const UINT tailT = nTiles - pgT, zT = 4000;
+                    auto Sum = [&](const std::string& m) -> std::string {
+                        UINT a[256]{}, b[256]{};
+                        for (UINT i = 0; i < (UINT)m.size(); ++i) (i < pgT ? a : b)[(unsigned char)m[i]]++;
+                        std::string o = "top{";
+                        for (UINT ch = 0; ch < 256; ++ch) if (a[ch]) o += std::string(1, (char)ch) + ":" + std::to_string(a[ch]) + " ";
+                        o += "} tail{";
+                        for (UINT ch = 0; ch < 256; ++ch) if (b[ch]) o += std::string(1, (char)ch) + ":" + std::to_string(b[ch]) + " ";
+                        return o + "}";
+                    };
+                    auto Look = [&](ID3D12Resource* r, const char* tag, const char* expect) -> bool {
+                        ReadBoth(r, false);
+                        if (!Run(tag)){ Diag(std::string("TILEDPROBE VERDICT: reading removed the device at ") + tag); return false; }
+                        const std::string m = ScanR(tag);
+                        ScanMip0R(tag);
+                        Diag(std::string("TILEDPROBE ") + tag + " SUM " + Sum(m) + " expect " + expect);
+                        return true;
+                    };
+                    auto TopOnly = [&](ID3D12Resource* r, UINT off, bool zero, const char* tag) -> bool {   // v2 shape
+                        D3D12_TILED_RESOURCE_COORDINATE c0{}; D3D12_TILE_REGION_SIZE rs{}; rs.NumTiles = pgT;
+                        D3D12_TILE_RANGE_FLAGS rf = zero ? D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE : D3D12_TILE_RANGE_FLAG_NONE;
+                        UINT o = zero ? zT : off, cnt = pgT;
+                        q->UpdateTileMappings(r, 1, &c0, &rs, pool.get(), 1, &rf, &o, &cnt, D3D12_TILE_MAPPING_FLAG_NONE);
+                        return Sync(tag);
+                    };
+                    auto Split2 = [&](ID3D12Resource* r, UINT off, bool zero, UINT tb, const char* tag) -> bool {   // v3 shape
+                        D3D12_TILED_RESOURCE_COORDINATE c0{}; D3D12_TILE_REGION_SIZE rs{}; rs.NumTiles = nTiles;
+                        D3D12_TILE_RANGE_FLAGS rf[2] = { zero ? D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE : D3D12_TILE_RANGE_FLAG_NONE,
+                                                         D3D12_TILE_RANGE_FLAG_NONE };
+                        UINT o[2] = { zero ? zT : off, tb }, cnt[2] = { pgT, tailT };
+                        q->UpdateTileMappings(r, 1, &c0, &rs, pool.get(), 2, rf, o, cnt, D3D12_TILE_MAPPING_FLAG_NONE);
+                        return Sync(tag);
+                    };
+                    auto TopFillB = [&](ID3D12Resource* r, const char* tag) -> bool {
+                        Barrier(r, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                        for (UINT i = 0; i < pgT; ++i){
+                            D3D12_TILED_RESOURCE_COORDINATE c{}; if (!Coord(i, &c)) continue;
+                            D3D12_TILE_REGION_SIZE one{}; one.NumTiles = 1; one.UseBox = FALSE;
+                            cl->CopyTiles(r, &c, &one, upB.get(), tileB * i, D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
+                        }
+                        Barrier(r, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        return Run(tag);
+                    };
+                    Diag("TILEDPROBE j pgT=" + std::to_string(pgT) + " tailT=" + std::to_string(tailT) + " nStd=" + std::to_string(nStd) +
+                         " zeroTile=" + std::to_string(zT) + " -- a STALE read shows the previous run's pattern where Z is expected");
+                    com_ptr<ID3D12Resource> texE, texF;
+                    if (!MkTex(texE, "j0 E") || !MapAll(texE.get(), 24 * nTiles, "j0 mapE-base24n") || !FillA(texE.get(), true, "j0 fillE")) goto done;
+                    if (!TopOnly(texE.get(), 0, true, "j1 v2 top->zero tile") || !Look(texE.get(), "j1 read", "top Z tail A (stale: top A)")) goto done;
+                    if (!TopOnly(texE.get(), 26 * nTiles, false, "j2 v2 top->fresh 26n") || !Look(texE.get(), "j2 read", "top Z tail A (stale: top A)")) goto done;
+                    const UINT fb = 28 * nTiles, ftb = fb + pgT;
+                    if (!MkTex(texF, "j3 F") || !MapAll(texF.get(), fb, "j3 mapF-base28n") || !FillA(texF.get(), true, "j3 fillF")) goto done;
+                    if (!Split2(texF.get(), 0, true, ftb, "j3 v3 top->zero tile, tail kept") || !Look(texF.get(), "j3 read", "top Z tail A (stale: top A)")) goto done;
+                    if (!Split2(texF.get(), 30 * nTiles, false, ftb, "j4 v3 top->fresh 30n") || !Look(texF.get(), "j4 read", "top Z tail A")) goto done;
+                    if (!TopFillB(texF.get(), "j4 fill top B") || !Look(texF.get(), "j4 read after fill", "top B tail A")) goto done;
+                    if (!Split2(texF.get(), 0, true, ftb, "j5 v3 top->zero tile again") || !Look(texF.get(), "j5 read out", "top Z tail A (stale: top B)")) goto done;
+                    if (!Split2(texF.get(), 32 * nTiles, false, ftb, "j5 v3 top->fresh 32n") || !Look(texF.get(), "j5 read fresh", "top Z tail A (stale: top B)")) goto done;
+                    if (!Split2(texF.get(), 30 * nTiles, false, ftb, "j5 v3 top->back to 30n") || !Look(texF.get(), "j5 read old run", "top B tail A")) goto done;
+                    Diag("TILEDPROBE j VERDICT: v3 shape honoured iff j3..j5 SUM == expect on both paths (mip0 grid too); j1/j2 say whether v2's partial shape reads stale");
                 }
             }
 
@@ -15669,6 +15751,7 @@ static void __stdcall Hook_D12CreateCBV(ID3D12Device* self,
     // A CBV carries a raw address, not a resource. Recording nullptr here is what
     // made every constant buffer in the run invisible; keep the address.
     const UINT64 va = d ? (UINT64)d->BufferLocation : 0;
+    GhGpDescForget((UINT64)dest.ptr);   // #251
     if (GhBufDimsOn()) GhBdPut((UINT64)dest.ptr, 0);
     if (GhDescTrackOn() || GhVaCheckOn()) GhDescPut((UINT64)dest.ptr, nullptr, 1, 0, va, 0, d ? (UINT32)d->SizeInBytes : 0u);
     if (GhVaCheckOn() && va){
@@ -15801,7 +15884,7 @@ static void __stdcall Hook_D12CreateSRV(ID3D12Device* self, ID3D12Resource* res,
         GhBdPut((UINT64)dest.ptr, v);
     }
     GhGpSrvNote(res);   // #235
-    GhGpDescNote((UINT64)dest.ptr, res);
+    const bool gpDone = GhGpSrvCreate(self, res, d, (UINT64)dest.ptr);   // #251: may make the driver call itself
     if (GhDescTrackOn() || GhVaCheckOn()){
         if (d && d->ViewDimension == D3D12_SRV_DIMENSION_BUFFER)
             GhDescPut((UINT64)dest.ptr, res, 2, (unsigned)d->Format, 0, d->Buffer.FirstElement,
@@ -15811,6 +15894,7 @@ static void __stdcall Hook_D12CreateSRV(ID3D12Device* self, ID3D12Resource* res,
     GH_FIRST("srv", ((uint64_t)(d ? (unsigned)d->Format : 0u) << 8) ^ (uint64_t)(d ? (unsigned)d->ViewDimension : 0u),
              "fmt=" + std::to_string((int)(d ? (unsigned)d->Format : 0u)) +
              " viewdim=" + std::to_string((int)(d ? (unsigned)d->ViewDimension : 0u)));
+    if (gpDone) return;
     ((void (__stdcall*)(ID3D12Device*, ID3D12Resource*,
         const D3D12_SHADER_RESOURCE_VIEW_DESC*,
         D3D12_CPU_DESCRIPTOR_HANDLE))g_d12vtOrig[18])(self, res, d, dest);
@@ -15819,6 +15903,7 @@ static void __stdcall Hook_D12CreateUAV(ID3D12Device* self, ID3D12Resource* res,
     ID3D12Resource* counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC* d,
     D3D12_CPU_DESCRIPTOR_HANDLE dest)
 {
+    GhGpDescForget((UINT64)dest.ptr);   // #251
     if (GhBufDimsOn()){
         UINT32 v = GhBdUavVal(d);
         if (d && d->ViewDimension == D3D12_UAV_DIMENSION_BUFFER){
@@ -15898,9 +15983,9 @@ static void __stdcall Hook_D12CopyDescSimple(ID3D12Device* self, UINT num,
             if (n) GhDescPut((UINT64)dst.ptr + (UINT64)k * inc, n->res, n->kind, n->fmt, n->va, n->voff, n->vlen, n->vstride, n->vraw);
         }
     }
-    if (g_gpdAny){   // #235
+    if (g_gpDescMap){   // #235 (#251 v2: every descriptor, no cap)
         const UINT inc = self->GetDescriptorHandleIncrementSize(type);
-        for (UINT k = 0; k < num && k < 4096; ++k)
+        for (UINT k = 0; k < num; ++k)
             GhGpDescCopy((UINT64)src.ptr + (UINT64)k * inc, (UINT64)dst.ptr + (UINT64)k * inc);
     }
     ((void (__stdcall*)(ID3D12Device*, UINT, D3D12_CPU_DESCRIPTOR_HANDLE,
@@ -15939,10 +16024,10 @@ static void __stdcall Hook_D12CopyDesc(ID3D12Device* self,
             ++dk; ++sk;
         }
     }
-    if (g_gpdAny && dst && src){   // #235
+    if (g_gpDescMap && dst && src){   // #235 (#251 v2: every descriptor, no cap)
         const UINT inc = self->GetDescriptorHandleIncrementSize(type);
         UINT di = 0, dk = 0, si = 0, sk = 0;
-        for (UINT guard = 0; guard < 8192 && di < nDst && si < nSrc; ++guard){
+        while (di < nDst && si < nSrc){
             const UINT dn = dstSizes ? dstSizes[di] : 1u;
             const UINT sn = srcSizes ? srcSizes[si] : 1u;
             if (dk >= dn){ ++di; dk = 0; continue; }
@@ -22663,7 +22748,7 @@ static void GhD12CallWatchdog()
 //   gh_gpu_page_mb.txt  pool cap in MB (GhCfgNumZ; no runargs slot -- hand-
 //                       managed in LocalState, delete it by hand). 0 = off.
 //
-// FRAME line: gphot=MB<=1s/<=10s/<=60s/older/never gpround=allocMB gpdesc=notes/hits/heapsh/missm/recycledr gpclass=askEver/askLive/matMB gpupage=poolMB/liveMB/liveN gpconv=conv/skip/mat/full/fail
+// FRAME line: gphot=MB<=1s/<=10s/<=60s/older/never gpround=allocMB gpdesc=notes/hits gpclass=askEver/askLive/matMB gpupage=poolMB/liveMB/liveN gpconv=conv/skip/mat/full/fail
 //             gpalias=N gpmaps=maps/waits gpms=ms gpheaps=live/ever gptouch=copies/srvs
 //   pool  real pool bytes (chunks), live  mapped tile bytes, liveN  converted textures alive
 //   conv  placements converted, skip  not convertible (materialised), mat  proxies
@@ -22818,6 +22903,18 @@ struct GhGpRes {
     // the list's ExecuteCommandLists, possibly much later; evicting before then saves
     // the run's previous tenant and the late copy lands on the dummy tile.
     LONG64                lastDst;
+    // #251 gh_gp_mips. pgT = tiles [0, pgT) the pager moves (mips < mipK; == nTiles when
+    // the texture is not split); the tail [pgT, nTiles) is pinned at tchunk/tbase for the
+    // resource's life. clampWant is what the SRVs should carry (g_gpLk writers);
+    // clampCur/slots are what they DO carry and where they live (g_gpDescLk).
+    UINT                  pgT, mipK, tailT;
+    int                   tchunk;
+    UINT                  tbase;
+    UINT                  gen;
+    volatile LONG         clampWant;
+    UINT                  clampCur;
+    UINT                  slotCap;
+    std::vector<UINT64>*  slots;
 };
 struct GhGpChunk { ID3D12Heap* heap; UINT tiles; std::vector<std::pair<UINT, UINT>> fr; };   // fr: sorted free runs (base,len)
 
@@ -22836,6 +22933,23 @@ static ID3D12Fence*                            g_gpMapFence = nullptr;
 // Nothing waits on g_gpEQ on the GPU (the CPU polls its fence), so it cannot close a
 // cycle with the game's own cross-queue waits.
 static unsigned GhGpOrder(){ static const unsigned v = GhCfgNum(L"gh_gp_order.txt", "GH_GP_ORDER", 0); return v; }
+static unsigned GhGpMips(){ static const unsigned v = GhCfgNumZ(L"gh_gp_mips.txt", "GH_GP_MIPS", 0); return v; }
+static unsigned GhGpMipWait(){ static const unsigned v = GhCfgNumZ(L"gh_gp_mip_wait.txt", "GH_GP_MIP_WAIT", 2); return v; }
+// #251 v2: split only when tail * ratio <= tiles (the pinned tail is at most 1/ratio of it)
+static unsigned GhGpMipRatio(){ static const unsigned v = GhCfgNumZ(L"gh_gp_mip_ratio.txt", "GH_GP_MIP_RATIO", 8); return v; }
+// #251 v3: a split texture is remapped as ONE whole-resource region, two ranges (top, tail)
+// in the tail's chunk. MIP2: a top remapped alone read its old run (TILE0d: a partial
+// remap is not honoured by the read side) -- the green 30-px lattice.
+static unsigned GhGpSplitWhole(){ static const unsigned v = GhCfgNumZ(L"gh_gp_split_whole.txt", "GH_GP_SPLIT_WHOLE", 1); return v; }
+static volatile LONG   g_gpNoRoom = 0, g_gpXheap = 0, g_gpChunkZ = 0, g_gpOnlyMiss = 0;   // #251 v3
+static int             g_gpOnly = -1;   // #251 v3, g_gpLk exclusive: allocations and victims confined to this chunk
+static volatile LONG   g_gpMipSmall = 0, g_gpClampSkip = 0, g_gpSvNoTrack = 0;   // #251 v2
+static volatile LONG   g_gpMipSplit = 0, g_gpMipWhole = 0, g_gpClampUp = 0, g_gpClampDn = 0, g_gpClampRw = 0,
+                       g_gpClampStale = 0, g_gpMipNoWait = 0, g_gpMipWaitTo = 0, g_gpSrvClamped = 0, g_gpDescCopyIn = 0,
+                       g_gpGen = 0;
+static volatile LONG64 g_gpTailB = 0, g_gpMipWaitUs = 0;
+static SRWLOCK                    g_gpCtLk = SRWLOCK_INIT;
+static std::vector<ID3D12Resource*>* g_gpClampQ = nullptr;     // g_gpCtLk; each holds our reference
 static ID3D12CommandQueue*                     g_gpEQ = nullptr;
 static ID3D12Fence*                            g_gpEvFence = nullptr;
 static volatile LONG64                         g_gpEvV = 0;
@@ -23085,10 +23199,12 @@ static bool GhGpXfer(GhGpRes* e, bool in, bool lkHeld = true, ID3D12Heap* mh = n
     g_gpDev->GetResourceTiling(e->res, &nT, &pm, &ts, &nSub, 0, st);
     if (!nT || nT != e->nTiles){ InterlockedIncrement(&g_gpIoFail); return false; }
     const UINT nStd = nT - pm.NumTilesForPackedMips;
+    const bool split = e->tailT != 0;                // #251: the tail never moves
+    const UINT mipLim = split ? e->mipK : 16u;
     const UINT stageT = (UINT)(g_gpStageB >> 16);
     struct Pc { UINT sub, y, n; UINT64 fo; UINT64 so; };   // n tiles of mip `sub` from tile row y; file + stage offsets
     std::vector<Pc> pcs; pcs.reserve(32);
-    for (UINT sb = 0; sb < pm.NumStandardMips && sb < nSub && sb < 16; ++sb){
+    for (UINT sb = 0; sb < pm.NumStandardMips && sb < nSub && sb < mipLim; ++sb){
         const UINT w = st[sb].WidthInTiles, h = st[sb].HeightInTiles;
         if (!w || !h) continue;
         if (w > stageT){ InterlockedIncrement(&g_gpTooBig); return false; }
@@ -23101,7 +23217,7 @@ static bool GhGpXfer(GhGpRes* e, bool in, bool lkHeld = true, ID3D12Heap* mh = n
     // The packed tail: every packed subresource of at least one 4x4 block.
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp[16]{}; UINT pkN = 0; UINT64 pkB = 0;
     const UINT pk0 = pm.NumStandardMips;
-    if (GhGpPacked() && pm.NumTilesForPackedMips){
+    if (!split && GhGpPacked() && pm.NumTilesForPackedMips){
         for (UINT sb = pk0; sb < e->nSub && sb < 16; ++sb){
             if ((e->desc0.Width >> sb) < 4 || (e->desc0.Height >> sb) < 4) break;
             ++pkN;
@@ -23113,7 +23229,7 @@ static bool GhGpXfer(GhGpRes* e, bool in, bool lkHeld = true, ID3D12Heap* mh = n
             if (!pkB || pkB > g_gpStageB){ pkN = 0; pkB = 0; }
         }
     }
-    const UINT need = nStd + (UINT)((pkB + 0xFFFFull) >> 16);
+    const UINT need = split ? e->pgT : nStd + (UINT)((pkB + 0xFFFFull) >> 16);
     if (!in){
         if (!lkHeld && (e->slot < 0 || e->slotN < need)){ InterlockedIncrement(&g_gpIoFail); return false; }
         if (e->slot >= 0 && e->slotN < need){ GhGpFileFree((UINT)e->slot, e->slotN); e->slot = -1; }
@@ -23141,7 +23257,7 @@ static bool GhGpXfer(GhGpRes* e, bool in, bool lkHeld = true, ID3D12Heap* mh = n
     // Bracket: every subresource from its recorded state to the copy state and back.
     auto Bracket = [&](bool back){
         D3D12_RESOURCE_BARRIER br[16]{}; UINT nb = 0;
-        for (UINT sb = 0; sb < e->nSub && sb < 16; ++sb){
+        for (UINT sb = 0; sb < e->nSub && sb < 16 && sb < mipLim; ++sb){   // #251: never the tail the game samples
             const UINT cur = sst[sb];
             UINT want = in ? (UINT)D3D12_RESOURCE_STATE_COPY_DEST : (UINT)D3D12_RESOURCE_STATE_COPY_SOURCE;
             if (!in && (cur & D3D12_RESOURCE_STATE_COPY_SOURCE) && cur != (UINT)D3D12_RESOURCE_STATE_COPY_DEST) want = cur;   // a read state that already allows it
@@ -23221,7 +23337,7 @@ static bool GhGpXfer(GhGpRes* e, bool in, bool lkHeld = true, ID3D12Heap* mh = n
     if (pkN && pkSo + pkB > g_gpStageB){ if (!Batch(a, pcs.size(), false, 0)) return false; a = pcs.size(); pkSo = 0; }
     if ((a < pcs.size() || pkN) && !Batch(a, pcs.size(), pkN != 0, pkSo)) return false;
 
-    const UINT64 moved = ((UINT64)nStd << 16) + pkB;
+    const UINT64 moved = split ? ((UINT64)e->pgT << 16) : ((UINT64)nStd << 16) + pkB;
     const LONG64 us = GhNowUs() - t0;
     if (in){ InterlockedAdd64(&g_gpReadB, (LONG64)moved); InterlockedAdd64(&g_gpReadUs, us); }
     else   { InterlockedAdd64(&g_gpWriteB, (LONG64)moved); InterlockedAdd64(&g_gpWriteUs, us); e->saved = true; }
@@ -23298,6 +23414,10 @@ static bool GhGpRig(ID3D12Device* dev)
     g_gpMap->reserve(8192);
     Diag("GPUPAGE rig q=" + Hex((uint64_t)(uintptr_t)q) + " fence=" + Hex((uint64_t)(uintptr_t)f) +
          " cap=" + std::to_string((unsigned long)GhGpuPageMb()) + "MB");
+    Diag("GPUPAGE mips=" + std::to_string(GhGpMips()) + " mipwait=" + std::to_string(GhGpMipWait()) +
+         " mipratio=" + std::to_string(GhGpMipRatio()) + " v2=straddle,nosv,fullwalk" +
+         " v3=wholesplit=" + std::to_string(GhGpSplitWhole()) +
+         (GhGpMips() ? " -- top mips paged, tail pinned, SRVs clamped while out" : " -- whole-resource paging"));   // #251
     if (GhGpEvictDummy()){
         // Created here, never on the eviction path. D3D12 zeroes a new heap, and
         // nothing may write it: converted textures carry no UAV/RT flags, and a
@@ -23322,6 +23442,17 @@ static void GhGpQuarDrain();
 static bool GhGpAllocNoEvict(UINT n, int* ci, UINT* base)
 {
     GhGpQuarDrain();   // #250
+    if (g_gpOnly >= 0){   // #251 v3: the top must share its tail's heap -- that chunk or nothing
+        if ((size_t)g_gpOnly >= g_gpChunks->size()) return false;
+        auto& fr = (*g_gpChunks)[g_gpOnly].fr;
+        for (size_t i = 0; i < fr.size(); ++i) if (fr[i].second >= n){
+            *ci = g_gpOnly; *base = fr[i].first;
+            fr[i].first += n; fr[i].second -= n;
+            if (!fr[i].second) fr.erase(fr.begin() + i);
+            return true;
+        }
+        return false;
+    }
     for (size_t c = 0; c < g_gpChunks->size(); ++c){
         auto& fr = (*g_gpChunks)[c].fr;
         for (size_t i = 0; i < fr.size(); ++i) if (fr[i].second >= n){
@@ -23333,9 +23464,9 @@ static bool GhGpAllocNoEvict(UINT n, int* ci, UINT* base)
     }
     const UINT64 cap = (UINT64)GhGpuPageMb() << 20;
     UINT64 chunkB = (UINT64)GhGpChunkMb() << 20;
-    if (chunkB < ((UINT64)n << 16)) chunkB = (((UINT64)n << 16) + 0xFFFFFFull) & ~0xFFFFFFull;   // one texture always fits a chunk
+    if (chunkB < ((UINT64)(n + 1) << 16)) chunkB = (((UINT64)(n + 1) << 16) + 0xFFFFFFull) & ~0xFFFFFFull;   // one texture (+ the zero tile) always fits a chunk
     if ((UINT64)g_gpPoolB + chunkB > cap) chunkB = cap > (UINT64)g_gpPoolB ? (cap - (UINT64)g_gpPoolB) & ~0xFFFFull : 0;
-    if (chunkB < (UINT64)n << 16) return false;
+    if (chunkB < (UINT64)(n + 1) << 16) return false;
     auto mk = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_HEAP_DESC*, REFIID, void**))g_d12vtOrig[28];
     D3D12_HEAP_DESC hd{};
     hd.SizeInBytes = chunkB; hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
@@ -23353,7 +23484,7 @@ static bool GhGpAllocNoEvict(UINT n, int* ci, UINT* base)
             Diag("GPUPAGE chunk REFUSED hr=" + Hex((uint32_t)hr) + " poolMB=" + std::to_string((long long)(g_gpPoolB >> 20)));
         return false;
     }
-    GhGpChunk c{}; c.heap = h; c.tiles = (UINT)(chunkB >> 16); c.fr.push_back({0u, c.tiles});
+    GhGpChunk c{}; c.heap = h; c.tiles = (UINT)(chunkB >> 16); c.fr.push_back({1u, c.tiles - 1});   // #251 v3: tile 0 = this chunk's zero tile, never allocated
     g_gpChunks->push_back(c);
     InterlockedAdd64(&g_gpPoolB, (LONG64)chunkB);
     InterlockedAdd64(&g_heapBytes, (LONG64)chunkB);   // heapMB keeps its meaning: real heaps, pool included
@@ -23397,10 +23528,30 @@ static void GhGpMapSignal()
 static void GhGpMapWhole(GhGpRes* e, ID3D12Heap* heap, UINT base, bool signalNow = true, ID3D12CommandQueue* mq = nullptr)
 {
     if (!mq) mq = g_gpQ;
+    if (!e->pgT) return;
+    if (e->tailT && e->tchunk >= 0 && GhGpSplitWhole()){   // #251 v3
+        ID3D12Heap* const th = (*g_gpChunks)[e->tchunk].heap;
+        if (!heap || heap == th){
+            D3D12_TILED_RESOURCE_COORDINATE c{};
+            D3D12_TILE_REGION_SIZE sz{}; sz.NumTiles = e->pgT + e->tailT; sz.UseBox = FALSE;   // the whole resource
+            D3D12_TILE_RANGE_FLAGS rf[2] = { heap ? D3D12_TILE_RANGE_FLAG_NONE : D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE,
+                                             D3D12_TILE_RANGE_FLAG_NONE };
+            UINT off[2] = { heap ? base : 0u, e->tbase };   // out: the chunk's own zero tile 0
+            UINT cnt[2] = { e->pgT, e->tailT };
+            GhGpCq<void (__stdcall*)(ID3D12CommandQueue*, ID3D12Resource*, UINT, const D3D12_TILED_RESOURCE_COORDINATE*,
+                const D3D12_TILE_REGION_SIZE*, ID3D12Heap*, UINT, const D3D12_TILE_RANGE_FLAGS*, const UINT*, const UINT*,
+                D3D12_TILE_MAPPING_FLAGS)>(mq, 8)(mq, e->res, 1, &c, &sz, th, 2, rf, off, cnt, D3D12_TILE_MAPPING_FLAG_NONE);
+            if (!heap) InterlockedIncrement(&g_gpChunkZ);
+            InterlockedIncrement(&g_gpMaps);
+            if (signalNow) GhGpMapSignal();
+            return;
+        }
+        InterlockedIncrement(&g_gpXheap);   // top outside the tail's heap: v2's partial shape (a bug if it counts)
+    }
     D3D12_TILED_RESOURCE_COORDINATE c{};
-    D3D12_TILE_REGION_SIZE sz{}; sz.NumTiles = e->nTiles; sz.UseBox = FALSE;
+    D3D12_TILE_REGION_SIZE sz{}; sz.NumTiles = e->pgT; sz.UseBox = FALSE;   // #251: the paged part (== nTiles unsplit)
     D3D12_TILE_RANGE_FLAGS rf = heap ? D3D12_TILE_RANGE_FLAG_NONE : D3D12_TILE_RANGE_FLAG_NULL;
-    UINT off = base; const UINT cnt = e->nTiles;
+    UINT off = base; const UINT cnt = e->pgT;
     if (!heap && g_gpDummy){                       // #238: every tile -> the one zeroed tile
         heap = g_gpDummy; off = 0; rf = D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE;
         InterlockedIncrement(&g_gpDummyMaps);
@@ -23410,6 +23561,47 @@ static void GhGpMapWhole(GhGpRes* e, ID3D12Heap* heap, UINT base, bool signalNow
         D3D12_TILE_MAPPING_FLAGS)>(mq, 8)(mq, e->res, 1, &c, &sz, heap, 1, &rf, &off, &cnt, D3D12_TILE_MAPPING_FLAG_NONE);
     InterlockedIncrement(&g_gpMaps);
     if (signalNow) GhGpMapSignal();
+}
+// #251, g_gpLk held. The pinned tail: tiles [pgT, nTiles) from the tail's first
+// subresource (a packed mip's coordinate is its first packed subresource, X = 0).
+static void GhGpMapTail(GhGpRes* e)
+{
+    if (!e->tailT || e->tchunk < 0 || GhGpSplitWhole()) return;   // #251 v3: GhGpMapWhole maps the tail too
+    D3D12_TILED_RESOURCE_COORDINATE c{}; c.Subresource = e->mipK;
+    D3D12_TILE_REGION_SIZE sz{}; sz.NumTiles = e->tailT; sz.UseBox = FALSE;
+    D3D12_TILE_RANGE_FLAGS rf = D3D12_TILE_RANGE_FLAG_NONE;
+    UINT off = e->tbase; const UINT cnt = e->tailT;
+    GhGpCq<void (__stdcall*)(ID3D12CommandQueue*, ID3D12Resource*, UINT, const D3D12_TILED_RESOURCE_COORDINATE*,
+        const D3D12_TILE_REGION_SIZE*, ID3D12Heap*, UINT, const D3D12_TILE_RANGE_FLAGS*, const UINT*, const UINT*,
+        D3D12_TILE_MAPPING_FLAGS)>(g_gpQ, 8)(g_gpQ, e->res, 1, &c, &sz, (*g_gpChunks)[e->tchunk].heap, 1, &rf, &off, &cnt,
+                                             D3D12_TILE_MAPPING_FLAG_NONE);
+    InterlockedIncrement(&g_gpMaps);
+}
+// #251. No lock held. The unmap of a clamped top must come after every list that
+// may still carry an UNCLAMPED ring copy: those were recorded before the clamp and
+// are all submitted by the time the game has presented gh_gp_mip_wait more frames.
+static void GhGpPresentWait(LONG p0)
+{
+    const unsigned n = GhGpMipWait();
+    if (!n) return;
+    const LONG64 t0 = GhNowUs();
+    for (int i = 0; ; ++i){
+        if (InterlockedCompareExchange(&g_presentN, 0, 0) - p0 >= (LONG)n) break;
+        if (i >= 400){ InterlockedIncrement(&g_gpMipWaitTo); break; }
+        Sleep(3);
+    }
+    InterlockedAdd64(&g_gpMipWaitUs, GhNowUs() - t0);
+}
+// #251, g_gpLk held (the sync eviction path, which may not take g_gpDescLk): the
+// worker applies the clamp moments later.
+static void GhGpClampTodo(ID3D12Resource* r)
+{
+    r->AddRef();
+    AcquireSRWLockExclusive(&g_gpCtLk);
+    if (!g_gpClampQ) g_gpClampQ = new std::vector<ID3D12Resource*>();
+    g_gpClampQ->push_back(r);
+    ReleaseSRWLockExclusive(&g_gpCtLk);
+    if (g_gpWkEv) SetEvent(g_gpWkEv);
 }
 
 // #235 Phase 2. Eviction: a converted texture whose last use is older than
@@ -23475,9 +23667,9 @@ static void GhGpUnmapOrdered(GhGpRes* e)
     const UINT64 v = (UINT64)InterlockedIncrement64(&g_gpEvV);
     GhGpCq<HRESULT (__stdcall*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64)>(g_gpEQ, 14)(g_gpEQ, g_gpEvFence, v);
     e->res->AddRef();
-    g_gpQuar->push_back(GhGpQuar{ e->chunk, e->base, e->nTiles, v, e->res });
+    g_gpQuar->push_back(GhGpQuar{ e->chunk, e->base, e->pgT, v, e->res });
     e->evV = v;
-    InterlockedAdd64(&g_gpQuarB, (LONG64)e->nTiles << 16);
+    InterlockedAdd64(&g_gpQuarB, (LONG64)e->pgT << 16);
     InterlockedIncrement(&g_gpOrdEv);
 }
 // g_gpLk held exclusive. Runs whose unmap has executed go back to the free lists;
@@ -23532,12 +23724,17 @@ static bool GhGpEvictOne(GhGpRes* e)
         ReleaseSRWLockExclusive(&g_gpIoLk);
         if (!ok) return false;
     }
+    if (e->tailT){                               // #251: no present wait possible here (g_gpLk, maybe a game thread)
+        InterlockedExchange(&e->clampWant, (LONG)e->mipK);
+        GhGpClampTodo(e->res);
+        InterlockedIncrement(&g_gpMipNoWait);
+    }
     if (g_gpEQ) GhGpUnmapOrdered(e);             // #250: after in-flight game work; run quarantined
     else {
         GhGpMapWhole(e, nullptr, 0, false);      // whole-resource NULL: reads zero
-        GhGpFreeRun(e->chunk, e->base, e->nTiles);
+        GhGpFreeRun(e->chunk, e->base, e->pgT);
     }
-    const LONG64 bytes = (LONG64)e->nTiles << 16;
+    const LONG64 bytes = (LONG64)e->pgT << 16;
     e->chunk = -1; e->base = 0;
     InterlockedAdd64(&g_gpLiveB, -bytes);
     InterlockedAdd64(&g_gpEvictedB, bytes);
@@ -23565,7 +23762,8 @@ static bool GhGpReclaim(UINT n, int* ci, UINT* base)
     v.reserve(256);
     for (auto& kv : *g_gpMap){
         GhGpRes* e = kv.second;
-        if (e && e->chunk >= 0 && !e->busy && (now - e->lastUse) >= cut && !GhGpDstGuard(e, now)) v.push_back(e);
+        if (e && e->pgT && e->chunk >= 0 && !e->busy && (now - e->lastUse) >= cut && !GhGpDstGuard(e, now) &&
+            (g_gpOnly < 0 || e->chunk == g_gpOnly)) v.push_back(e);   // #251 v3
     }
     // #235 TILE2c: the age cut is a PREFERENCE, not a VETO. When a small pool FIRST
     // fills, everything resident in it is seconds old, the aged list comes back empty,
@@ -23582,7 +23780,8 @@ static bool GhGpReclaim(UINT n, int* ci, UINT* base)
         InterlockedIncrement(&g_gpCutOverride);
         for (auto& kv : *g_gpMap){
             GhGpRes* e = kv.second;
-            if (e && e->chunk >= 0 && !e->busy && !GhGpDstGuard(e, now)) v.push_back(e);
+            if (e && e->pgT && e->chunk >= 0 && !e->busy && !GhGpDstGuard(e, now) &&
+                (g_gpOnly < 0 || e->chunk == g_gpOnly)) v.push_back(e);   // #251 v3
         }
         // Genuinely nothing resident to take: now it really is no victim.
         if (v.empty()){ InterlockedIncrement(&g_gpNoVictim); return false; }
@@ -23606,6 +23805,24 @@ static bool GhGpReclaim(UINT n, int* ci, UINT* base)
 
 // g_gpLk held exclusive. The allocator the conversion and restore paths use:
 // grow/first-fit as before, and only when that is exhausted, page something out.
+static bool GhGpAlloc(UINT n, int* ci, UINT* base);
+// #251, g_gpLk held. Pinned tails are carved from the END of the highest free run
+// that fits, so they gather at the top of each chunk and leave the low addresses in
+// long runs for the paged tops (first-fit from the start).
+static bool GhGpAllocTail(UINT n, int* ci, UINT* base)
+{
+    GhGpQuarDrain();
+    for (size_t c = g_gpChunks->size(); c-- > 0;){
+        auto& fr = (*g_gpChunks)[c].fr;
+        for (size_t i = fr.size(); i-- > 0;) if (fr[i].second >= n){
+            *ci = (int)c; *base = fr[i].first + fr[i].second - n;
+            fr[i].second -= n;
+            if (!fr[i].second) fr.erase(fr.begin() + i);
+            return true;
+        }
+    }
+    return GhGpAlloc(n, ci, base);
+}
 static bool GhGpAlloc(UINT n, int* ci, UINT* base)
 {
     if (GhGpAllocNoEvict(n, ci, base)) return true;
@@ -23616,10 +23833,12 @@ static bool GhGpAlloc(UINT n, int* ci, UINT* base)
 // it. Called from the CreateSRV / descriptor-copy / copy-into hooks on game
 // threads, so it re-finds the entry under the lock rather than trusting the
 // pointer the caller raced on. Contents are NOT restored in TILE2a (zeros).
+static void GhGpSyncClamp(ID3D12Resource* r);   // #251
 static void GhGpRestoreByRes(void* res)
 {
     if (!g_gpMap || !res) return;
     const LONG64 t0 = GhNowUs();
+    bool unclamp = false;   // #251
     AcquireSRWLockExclusive(&g_gpLk);
     auto it = g_gpMap->find(res);
     GhGpRes* e = it != g_gpMap->end() ? it->second : nullptr;
@@ -23636,7 +23855,11 @@ static void GhGpRestoreByRes(void* res)
     }
     if (e && e->chunk < 0 && !e->busy){
         int ci = -1; UINT base = 0;
-        if (GhGpAlloc(e->nTiles, &ci, &base)){
+        if (e->tailT && GhGpSplitWhole()) g_gpOnly = e->tchunk;   // #251 v3
+        const bool gotRun = GhGpAlloc(e->pgT, &ci, &base);
+        if (!gotRun && g_gpOnly >= 0) InterlockedIncrement(&g_gpOnlyMiss);
+        g_gpOnly = -1;
+        if (gotRun){
             e->chunk = ci; e->base = base;
             GhGpRestoreOrder(e);   // #250
             ID3D12Heap* const rh = (*g_gpChunks)[ci].heap;
@@ -23651,7 +23874,8 @@ static void GhGpRestoreByRes(void* res)
             if (!mapped){ GhGpMapWhole(e, rh, base, false); InterlockedIncrement(&g_gpLateMiss); }
             else if (late) InterlockedIncrement(&g_gpLateMap);
             GhGpMapSignal();                    // guest queues wait for the map AND the content
-            const LONG64 bytes = (LONG64)e->nTiles << 16;
+            if (e->tailT){ InterlockedExchange(&e->clampWant, 0); unclamp = true; }   // #251: content has landed
+            const LONG64 bytes = (LONG64)e->pgT << 16;
             InterlockedAdd64(&g_gpLiveB, bytes);
             InterlockedAdd64(&g_gpEvictedB, -bytes);
             InterlockedAdd64(&g_gpRestoreB, bytes);
@@ -23659,6 +23883,7 @@ static void GhGpRestoreByRes(void* res)
         }
     }
     ReleaseSRWLockExclusive(&g_gpLk);
+    if (unclamp) GhGpSyncClamp((ID3D12Resource*)res);   // #251: the caller holds the resource
     InterlockedAdd64(&g_gpPageUs, GhNowUs() - t0);
 }
 
@@ -23695,7 +23920,7 @@ static bool GhGpEnsureSlot(GhGpRes* e)
             if (!pkB || pkB > g_gpStageB) pkB = 0;
         }
     }
-    const UINT need = (nT - pm.NumTilesForPackedMips) + (UINT)((pkB + 0xFFFFull) >> 16);
+    const UINT need = e->tailT ? e->pgT : (nT - pm.NumTilesForPackedMips) + (UINT)((pkB + 0xFFFFull) >> 16);   // #251
     if (e->slot >= 0 && e->slotN < need){ GhGpFileFree((UINT)e->slot, e->slotN); e->slot = -1; }
     if (e->slot < 0){ e->slot = GhGpFileAlloc(need); e->slotN = need; }
     return true;
@@ -23703,7 +23928,7 @@ static bool GhGpEnsureSlot(GhGpRes* e)
 
 // g_gpLk held. The coldest resident texture nobody is moving, aged ones only
 // when `agedOnly` (gh_gpu_evict_ms), else the coldest of all (TILE2c's override).
-static GhGpRes* GhGpColdest(bool agedOnly)
+static GhGpRes* GhGpColdest(bool agedOnly, int only = -1)
 {
     const unsigned ms = GhGpEvictMs();
     if (!ms) return nullptr;
@@ -23711,7 +23936,8 @@ static GhGpRes* GhGpColdest(bool agedOnly)
     GhGpRes* best = nullptr;
     for (auto& kv : *g_gpMap){
         GhGpRes* e = kv.second;
-        if (!e || e->chunk < 0 || e->busy || GhGpDstGuard(e, now)) continue;
+        if (!e || !e->pgT || e->chunk < 0 || e->busy || GhGpDstGuard(e, now)) continue;
+        if (only >= 0 && e->chunk != only) continue;   // #251 v3
         if (agedOnly && (now - e->lastUse) < cut) continue;
         if (!best || e->lastUse < best->lastUse) best = e;
     }
@@ -23720,18 +23946,22 @@ static GhGpRes* GhGpColdest(bool agedOnly)
 
 // No lock held. Save one victim and unmap it, with g_gpLk held only around the
 // bookkeeping. False when there is nothing to take or the save failed.
-static bool GhGpEvictAsync(bool agedOnly)
+static bool GhGpEvictAsync(bool agedOnly, int only = -1)
 {
     AcquireSRWLockExclusive(&g_gpLk);
-    GhGpRes* e = GhGpColdest(agedOnly);
+    GhGpRes* e = GhGpColdest(agedOnly, only);
     if (!e && !agedOnly) InterlockedIncrement(&g_gpNoVictim);
     if (e && !agedOnly && (GhNowUs() - e->lastUse) < (LONG64)GhGpEvictMs() * 1000) InterlockedIncrement(&g_gpCutOverride);
     if (e && g_gpIoOn && !GhGpEnsureSlot(e)){ InterlockedIncrement(&g_gpIoFail); e = nullptr; }
     ID3D12Resource* r = e ? e->res : nullptr;
     if (e){ e->busy = true; r->AddRef(); }
+    const bool mipc = e && e->tailT;   // #251
+    if (mipc) InterlockedExchange(&e->clampWant, (LONG)e->mipK);
     const UINT64 pv = (e && g_gpEQ && g_gpIoOn && GhGpOrder() >= 2) ? GhGpPreFence() : 0;
     ReleaseSRWLockExclusive(&g_gpLk);
     if (!e) return false;
+    LONG p0 = 0;
+    if (mipc){ GhGpSyncClamp(r); p0 = InterlockedCompareExchange(&g_presentN, 0, 0); }   // #251: clamp first
     bool ok = true;
     if (pv && !GhGpEvWait(pv, 500)) ok = false;   // #250 v2: the game's writes into it land first
     if (ok && g_gpIoOn){
@@ -23739,16 +23969,19 @@ static bool GhGpEvictAsync(bool agedOnly)
         ok = g_gpIoOn && GhGpXfer(e, false, false);
         ReleaseSRWLockExclusive(&g_gpIoLk);
     }
+    if (ok && mipc) GhGpPresentWait(p0);          // #251: stale unclamped ring copies are submitted by now
+    bool unclamp = false;
     GhGpHeap* ph = nullptr;
     AcquireSRWLockExclusive(&g_gpLk);
     e->busy = false;
+    if (!ok && mipc){ InterlockedExchange(&e->clampWant, 0); unclamp = true; }   // #251: stays resident
     if (ok && e->chunk >= 0){
         if (g_gpEQ) GhGpUnmapOrdered(e);      // #250: after in-flight game work; run quarantined
         else {
             GhGpMapWhole(e, nullptr, 0, false);   // whole-resource NULL: reads zero
-            GhGpFreeRun(e->chunk, e->base, e->nTiles);
+            GhGpFreeRun(e->chunk, e->base, e->pgT);
         }
-        const LONG64 bytes = (LONG64)e->nTiles << 16;
+        const LONG64 bytes = (LONG64)e->pgT << 16;
         e->chunk = -1; e->base = 0;
         InterlockedAdd64(&g_gpLiveB, -bytes);
         InterlockedAdd64(&g_gpEvictedB, bytes);
@@ -23760,6 +23993,7 @@ static bool GhGpEvictAsync(bool agedOnly)
     if (e->zombie) ph = GhGpDrop(e);
     ReleaseSRWLockExclusive(&g_gpLk);
     if (ph) ph->Release();
+    if (unclamp) GhGpSyncClamp(r);
     r->Release();   // through Hook_GpResRelease: may run the game's deferred free
     return ok;
 }
@@ -23783,14 +24017,18 @@ static void GhGpRestoreAsync(ID3D12Resource* r)
             break;
         }
         int ci = -1; UINT base = 0;
-        if (GhGpAllocNoEvict(e->nTiles, &ci, &base)){
+        const int only = (e->tailT && GhGpSplitWhole()) ? e->tchunk : -1;   // #251 v3
+        g_gpOnly = only;
+        const bool gotRun = GhGpAllocNoEvict(e->pgT, &ci, &base);
+        g_gpOnly = -1;
+        if (gotRun){
             e->chunk = ci; e->base = base; e->busy = true; e->pend = false;
             GhGpRestoreOrder(e);   // #250
             ID3D12Heap* const rh = (*g_gpChunks)[ci].heap;
             const bool late = GhGpOrder() >= 3 && g_gpIoOn;   // #250 v4: map after the read
             bool mapped = false;
             if (!late){ GhGpMapWhole(e, rh, base, false); mapped = true; }
-            const LONG64 bytes = (LONG64)e->nTiles << 16;
+            const LONG64 bytes = (LONG64)e->pgT << 16;
             InterlockedAdd64(&g_gpLiveB, bytes);
             InterlockedAdd64(&g_gpEvictedB, -bytes);
             InterlockedAdd64(&g_gpRestoreB, bytes);
@@ -23806,10 +24044,13 @@ static void GhGpRestoreAsync(ID3D12Resource* r)
             GhGpHeap* ph = nullptr;
             AcquireSRWLockExclusive(&g_gpLk);
             GhGpMapSignal();                      // map AND content, then busy clears
+            const bool unclamp = e->tailT != 0;   // #251: the top is back -- lift the clamp
+            if (unclamp) InterlockedExchange(&e->clampWant, 0);
             e->busy = false;
             if (e->zombie) ph = GhGpDrop(e);
             ReleaseSRWLockExclusive(&g_gpLk);
             if (ph) ph->Release();
+            if (unclamp) GhGpSyncClamp(r);        // r is the request's reference
             InterlockedIncrement(&g_gpAdone);
             break;
         }
@@ -23827,7 +24068,8 @@ static void GhGpRestoreAsync(ID3D12Resource* r)
             }
             continue;
         }
-        if (tries >= 256 || !GhGpEvictAsync(false)){
+        if (tries >= 256 || !GhGpEvictAsync(false, only)){
+            if (only >= 0) InterlockedIncrement(&g_gpOnlyMiss);   // #251 v3
             AcquireSRWLockExclusive(&g_gpLk);
             it = g_gpMap->find(r);
             if (it != g_gpMap->end() && it->second) it->second->pend = false;
@@ -23957,6 +24199,15 @@ static void GhGpDummyCheck()
     ReleaseSRWLockExclusive(&g_gpIoLk);
 }
 
+// #251: clamps queued by the sync eviction path, applied without g_gpLk.
+static void GhGpClampDrain()
+{
+    std::vector<ID3D12Resource*> v;
+    AcquireSRWLockExclusive(&g_gpCtLk);
+    if (g_gpClampQ) v.swap(*g_gpClampQ);
+    ReleaseSRWLockExclusive(&g_gpCtLk);
+    for (auto* r : v){ GhGpSyncClamp(r); r->Release(); }
+}
 static DWORD WINAPI GhGpWorker(void*)
 {
     for (;;){
@@ -23970,6 +24221,7 @@ static DWORD WINAPI GhGpWorker(void*)
             GhGpRestoreAsync(r);
             GhGpDummyCheck();    // #250 v4: rate-limited to 2 s; the drain never ends in the world
         }
+        GhGpClampDrain();    // #251
         GhGpQuarRelease();   // #250
         GhGpKeepFree();
         GhGpDummyCheck();    // #250 v3
@@ -24026,8 +24278,14 @@ static GhGpHeap* GhGpDrop(GhGpRes* e)
 {
     GhGpHeap* ph = nullptr;
     if (e){
-        if (e->chunk >= 0){ GhGpFreeRun(e->chunk, e->base, e->nTiles); InterlockedAdd64(&g_gpLiveB, -(LONG64)e->nTiles << 16); }
-        else InterlockedAdd64(&g_gpEvictedB, -(LONG64)e->nTiles << 16);   // #235: released while evicted -- stop counting it as out
+        if (e->chunk >= 0){ GhGpFreeRun(e->chunk, e->base, e->pgT); InterlockedAdd64(&g_gpLiveB, -(LONG64)e->pgT << 16); }
+        else InterlockedAdd64(&g_gpEvictedB, -(LONG64)e->pgT << 16);   // #235: released while evicted -- stop counting it as out
+        if (e->tailT && e->tchunk >= 0){                                   // #251: the pinned tail
+            GhGpFreeRun(e->tchunk, e->tbase, e->tailT);
+            InterlockedAdd64(&g_gpLiveB, -(LONG64)e->tailT << 16);
+            InterlockedAdd64(&g_gpTailB, -(LONG64)e->tailT << 16);
+        }
+        delete e->slots;
         if (e->slot >= 0) GhGpFileFree((UINT)e->slot, e->slotN);          // #235 TILE2b
         InterlockedAdd64(&g_gpAllocB, -(LONG64)e->size);
         InterlockedDecrement(&g_gpLiveN); InterlockedIncrement(&g_gpFreed);
@@ -24256,11 +24514,44 @@ static bool GhGpConvert(ID3D12Device* dev, GhGpHeap* ph, UINT64 off, const D3D12
         return false;
     }
     const D3D12_RESOURCE_ALLOCATION_INFO ai = dev->GetResourceAllocationInfo(0, 1, rd);
+    // #251: where the pinned tail starts. K = the first resident mip: keep the
+    // gh_gp_mips-1 lowest standard mips (and always the packed tail), page mip 0 at least.
+    UINT pgT = nTiles, tailT = 0, mipK = 0;
+    if (GhGpMips() && pm.NumStandardMips){
+        D3D12_SUBRESOURCE_TILING stl[16]{}; UINT nSubT = 16, nT2 = 0;
+        D3D12_PACKED_MIP_INFO pm2{}; D3D12_TILE_SHAPE ts2{};
+        dev->GetResourceTiling(res, &nT2, &pm2, &ts2, &nSubT, 0, stl);
+        const UINT L = GhGpMips() - 1, nStd = pm.NumStandardMips;
+        const UINT K = nStd > L ? nStd - L : 1u;
+        UINT start = nTiles;
+        if (K < nStd && K < 16) start = stl[K].StartTileIndexInOverallResource;
+        else if (K == nStd && pm.NumPackedMips && pm.NumTilesForPackedMips) start = pm.StartTileIndexInOverallResource;
+        if (start > 0 && start < nTiles){
+            const UINT r = GhGpMipRatio();
+            if (!r || (UINT64)(nTiles - start) * r <= nTiles){ pgT = start; tailT = nTiles - start; mipK = K; }
+            else InterlockedIncrement(&g_gpMipSmall);   // #251 v2: tail too large a share: page it whole
+        }
+    }
+    InterlockedIncrement(tailT ? &g_gpMipSplit : &g_gpMipWhole);
 
     AcquireSRWLockExclusive(&g_gpLk);
     if (!GhGpRig(dev)){ ReleaseSRWLockExclusive(&g_gpLk); res->Release(); return false; }
-    int ci = -1; UINT base = 0;
-    if (!GhGpAlloc(nTiles, &ci, &base)){
+    int ci = -1; UINT base = 0, tbase = 0; int tci = -1;
+    bool got = !tailT || GhGpAllocTail(tailT, &tci, &tbase);
+    if (got && tailT && GhGpSplitWhole()) g_gpOnly = tci;   // #251 v3: the top shares the tail's heap
+    if (got && !GhGpAlloc(pgT, &ci, &base)){
+        if (tailT) GhGpFreeRun(tci, tbase, tailT);
+        got = false;
+        if (tailT && GhGpSplitWhole()){   // #251 v3: no room beside its tail -- page it whole
+            g_gpOnly = -1;
+            InterlockedIncrement(&g_gpNoRoom);
+            InterlockedDecrement(&g_gpMipSplit); InterlockedIncrement(&g_gpMipWhole);
+            pgT = nTiles; tailT = 0; mipK = 0; tci = -1; tbase = 0;
+            got = GhGpAlloc(pgT, &ci, &base);
+        }
+    }
+    g_gpOnly = -1;
+    if (!got){
         ReleaseSRWLockExclusive(&g_gpLk);
         res->Release();
         const LONG k = InterlockedIncrement(&g_gpFull);
@@ -24282,6 +24573,10 @@ static bool GhGpConvert(ID3D12Device* dev, GhGpHeap* ph, UINT64 off, const D3D12
     e->ecl0 = (UINT32)InterlockedCompareExchange(&g_eclCount, 0, 0);
     for (UINT k = 0; k < 16; ++k) e->sst[k] = (UINT)st;
     e->slot = -1; e->slotN = 0; e->saved = false; e->pend = e->busy = e->zombie = false;
+    e->pgT = pgT; e->tailT = tailT; e->mipK = mipK; e->tchunk = tailT ? tci : -1; e->tbase = tbase;   // #251
+    e->gen = (UINT)InterlockedIncrement(&g_gpGen); e->clampWant = 0; e->clampCur = 0; e->slotCap = 64; e->slots = nullptr;
+    GhGpMapTail(e);
+    if (tailT) InterlockedAdd64(&g_gpTailB, (LONG64)tailT << 16);
     GhGpMapWhole(e, (*g_gpChunks)[ci].heap, base);
     // The alias count: a placement overlapping a live occupant of the same proxy.
     // D3D12 makes the older occupant's contents undefined; nothing to do, but it
@@ -24312,6 +24607,8 @@ static bool GhGpConvert(ID3D12Device* dev, GhGpHeap* ph, UINT64 off, const D3D12
              ", packed " + std::to_string((unsigned)pm.NumTilesForPackedMips) + ") alloc=" + Hex((uint64_t)ai.SizeInBytes) +
              " chunk=" + std::to_string(ci) + " base=" + std::to_string(base) +
              " aliased=" + std::to_string((long)aliased) +
+             (tailT ? " split K=" + std::to_string(mipK) + " pgT=" + std::to_string(pgT) + " tail=" + std::to_string(tailT) +
+                      " tchunk=" + std::to_string(tci) + " tbase=" + std::to_string(tbase) : std::string()) +
              " us=" + std::to_string((long long)(GhNowUs() - t0)) +
              " poolMB=" + std::to_string((long long)(g_gpPoolB >> 20)) + " liveMB=" + std::to_string((long long)(g_gpLiveB >> 20)));
     *pp = res; *hrOut = S_OK;
@@ -24374,170 +24671,176 @@ static void GhGpSrvNote(ID3D12Resource* r)
 // age of the last CreateSRV or copy naming the texture (never = untouched since
 // creation). The residency policy's raw material: if the recent buckets are a
 // small fraction of the live set, CreateSRV is a read signal worth keying on.
+static SRWLOCK        g_gpDescLk = SRWLOCK_INIT;
 static volatile LONG  g_gpDescNotes = 0, g_gpDescHits = 0;
-// #240 (CPR1): this table used to be a std::unordered_map behind an SRW lock, taken
-// exclusively on every CreateSRV and shared on every copied descriptor -- 18.6 M
-// lookups in one world run, on the game's MAIN thread. Now it is flat: one entry per
-// CBV/SRV/UAV heap, registered at CreateDescriptorHeap (GhGpdHeapAdd -- NOT from g_dh,
-// which only fills under the #158 diagnostics and stops at 128 heaps; the game keeps
-// ~282, and GPD1 recorded zero notes on it), a page of kGpdPage slots allocated only
-// when a converted texture's SRV lands in it, and lock-free reads: a binary search of
-// a sorted snapshot that registration republishes. Old snapshots are leaked, not freed,
-// because a reader may hold one (282 heaps and 0 recycled per run: ~80 KB in total).
-static const UINT kGpdPage = 1024;
-struct GhGpdHeap { UINT64 cpu0, end; UINT32 inc, npages; ID3D12Resource** volatile* pages; };
-struct GhGpdSnap { LONG n; GhGpdHeap* h[1]; };
-static GhGpdSnap* volatile g_gpdSnap = nullptr;
-static SRWLOCK             g_gpdhLk = SRWLOCK_INIT;
-static volatile LONG       g_gpdHeaps = 0, g_gpdRecycled = 0;
-// Notes outside every registered heap (GPDMISS): the old map, kept for them only.
-static std::unordered_map<UINT64, ID3D12Resource*>* g_gpdMissMap = nullptr;
-static SRWLOCK             g_gpdMissLk = SRWLOCK_INIT;
-static volatile LONG       g_gpdMiss = 0, g_gpdMissN = 0;
-static void GhGpdHeapAdd(UINT64 cpu0, UINT32 inc, UINT32 num)
+// #251: the shader-visible CBV/SRV/UAV heaps. A copy INTO one of them is the
+// per-frame ring (refreshed from staging every frame), so it is not tracked.
+static struct { UINT64 a, b; } g_gpSv[16]{};
+static volatile LONG g_gpSvN = 0;
+static void GhGpSvAdd(ID3D12Device* dev, ID3D12DescriptorHeap* h, const D3D12_DESCRIPTOR_HEAP_DESC* d)
 {
-    if (!cpu0 || !inc || !num) return;
-    const UINT64 end = cpu0 + (UINT64)inc * num;
-    const UINT32 np = (num + kGpdPage - 1) / kGpdPage;
-    auto pg = (ID3D12Resource** volatile*)calloc(np, sizeof(void*));
-    auto e  = (GhGpdHeap*)calloc(1, sizeof(GhGpdHeap));
-    if (!pg || !e){ free((void*)pg); free(e); return; }
-    e->cpu0 = cpu0; e->end = end; e->inc = inc; e->npages = np; e->pages = pg;
-    AcquireSRWLockExclusive(&g_gpdhLk);
-    GhGpdSnap* old = g_gpdSnap;
-    const LONG on = old ? old->n : 0;
-    auto snap = (GhGpdSnap*)malloc(sizeof(GhGpdSnap) + sizeof(GhGpdHeap*) * (size_t)on);
-    if (snap){
-        LONG k = 0; bool put = false;
-        for (LONG i = 0; i < on; ++i){
-            GhGpdHeap* o = old->h[i];
-            if (o->cpu0 < end && cpu0 < o->end){ InterlockedIncrement(&g_gpdRecycled); continue; }  // a dead heap
-            if (!put && cpu0 < o->cpu0){ snap->h[k++] = e; put = true; }
-            snap->h[k++] = o;
+    if (!GhGpOn() || !GhGpMips() || !dev || !h || !d) return;
+    if (d->Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !(d->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) return;
+    const LONG i = InterlockedIncrement(&g_gpSvN) - 1;
+    if (i < 0 || i >= 16) return;
+    const UINT64 a = (UINT64)h->GetCPUDescriptorHandleForHeapStart().ptr;
+    g_gpSv[i].b = a + (UINT64)dev->GetDescriptorHandleIncrementSize(d->Type) * d->NumDescriptors;
+    g_gpSv[i].a = a;
+}
+static bool GhGpSvSlot(UINT64 cpu)
+{
+    LONG n = InterlockedCompareExchange(&g_gpSvN, 0, 0); if (n > 16) n = 16;
+    for (LONG i = 0; i < n; ++i) if (cpu >= g_gpSv[i].a && cpu < g_gpSv[i].b) return true;
+    return false;
+}
+// g_gpDescLk held. The view with ResourceMinLODClamp raised to `clamp` (absolute mip).
+static bool GhGpClampDesc(const GhGpRes* e, const GhGpSlot& s, UINT clamp, D3D12_SHADER_RESOURCE_VIEW_DESC* out)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC d{};
+    if (s.hasDesc) d = s.d;
+    else {
+        d.Format = e->desc0.Format; d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; d.Texture2D.MipLevels = (UINT)-1;
+    }
+    const FLOAT c = (FLOAT)clamp;
+    // #251 v2: only a view whose mip range straddles the clamp gets one. The last mip of
+    // the view must be >= clamp (else MinLOD would lie past the view), and its first mip
+    // must be < clamp (else it never reaches the paged top).
+    UINT mdm = 0, ml = 0;
+    if (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D){ mdm = d.Texture2D.MostDetailedMip; ml = d.Texture2D.MipLevels; }
+    else if (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY){ mdm = d.Texture2DArray.MostDetailedMip; ml = d.Texture2DArray.MipLevels; }
+    else return false;
+    const UINT resMips = e->desc0.MipLevels ? (UINT)e->desc0.MipLevels : 1u;
+    if (ml == (UINT)-1 || ml == 0 || mdm + ml > resMips) ml = resMips > mdm ? resMips - mdm : 0;
+    if (!(mdm < clamp && mdm + ml > clamp)){ InterlockedIncrement(&g_gpClampSkip); return false; }
+    if (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D){ if (d.Texture2D.ResourceMinLODClamp < c) d.Texture2D.ResourceMinLODClamp = c; }
+    else { if (d.Texture2DArray.ResourceMinLODClamp < c) d.Texture2DArray.ResourceMinLODClamp = c; }
+    *out = d;
+    return true;
+}
+// g_gpDescLk held exclusive. Remember a slot holding e's SRV; prune dead slots when
+// the list reaches its cap, so a texture published into a ring does not grow it forever.
+static void GhGpSlotAdd(GhGpRes* e, UINT64 cpu)
+{
+    if (!e->slots) e->slots = new std::vector<UINT64>();
+    auto& v = *e->slots;
+    for (size_t i = v.size(), k = 0; i-- > 0 && k < 4; ++k) if (v[i] == cpu) return;
+    if (v.size() >= e->slotCap){
+        size_t k = 0;
+        for (size_t i = 0; i < v.size(); ++i){
+            auto it = g_gpDescMap->find(v[i]);
+            if (it != g_gpDescMap->end() && it->second.r == e->res && it->second.gen == e->gen) v[k++] = v[i];
         }
-        if (!put) snap->h[k++] = e;
-        snap->n = k;
-        MemoryBarrier();
-        g_gpdSnap = snap;
-        InterlockedIncrement(&g_gpdHeaps);
+        v.resize(k);
+        if (v.size() * 2 > e->slotCap) e->slotCap = (UINT)(v.size() * 2);
     }
-    ReleaseSRWLockExclusive(&g_gpdhLk);
+    v.push_back(cpu);
 }
-static GhGpdHeap* GhGpdFind(UINT64 cpu)
+// Hook_D12CreateSRV. Returns true when it has already made the driver call: a
+// converted texture's SRV is written under g_gpDescLk, clamped if its top is out, so
+// a clamp sweep can never interleave with it.
+static bool GhGpSrvCreate(ID3D12Device* self, ID3D12Resource* r, const D3D12_SHADER_RESOURCE_VIEW_DESC* d, UINT64 cpu)
 {
-    const GhGpdSnap* s = g_gpdSnap;
-    if (!s) return nullptr;
-    LONG lo = 0, hi = s->n - 1;
-    while (lo <= hi){
-        const LONG m = (lo + hi) >> 1;
-        GhGpdHeap* h = s->h[m];
-        if (cpu < h->cpu0) hi = m - 1;
-        else if (cpu >= h->end) lo = m + 1;
-        else return h;
-    }
-    return nullptr;
-}
-static ID3D12Resource** GhGpdSlot(UINT64 cpu, bool add)
-{
-    GhGpdHeap* h = GhGpdFind(cpu);
-    if (!h) return nullptr;
-    const UINT64 idx = (cpu - h->cpu0) / h->inc;
-    const UINT32 p = (UINT32)(idx / kGpdPage);
-    if (p >= h->npages) return nullptr;
-    ID3D12Resource** page = h->pages[p];
-    if (!page){
-        if (!add) return nullptr;
-        auto fresh = (ID3D12Resource**)calloc(kGpdPage, sizeof(void*));
-        if (!fresh) return nullptr;
-        page = (ID3D12Resource**)InterlockedCompareExchangePointer(
-            (PVOID volatile*)&h->pages[p], fresh, nullptr);
-        if (page) free(fresh); else page = fresh;
-    }
-    return &page[idx % kGpdPage];
-}
-// gh_gpd_map=1 (LocalState, hand-managed): the 0.0.601.0 map for EVERY note, the
-// A/B arm for GPD2/GPD4 (the table arm streamed ~9 k more resources into a world
-// that then ran at the spill pager's edge). Same binary, one knob.
-static bool GhGpdMapMode()
-{
-    static const bool v = [](){
-        const unsigned k = GhCfgNumZ(L"gh_gpd_map.txt", "GH_GPD_MAP", 0);
-        Diag("CFG gh_gpd_map.txt = " + std::to_string(k) + " (Z)");   // GhCfgNumZ is silent
-        return k != 0;
-    }();
-    return v;
-}
-static void GhGpDescNote(UINT64 cpu, ID3D12Resource* r)
-{
-    if (!GhGpOn() || !cpu) return;
-    const bool ours = r && g_gpMap && GhGpFind(r) != nullptr;
-    if (GhGpdMapMode()){
-        AcquireSRWLockExclusive(&g_gpdMissLk);
-        if (!g_gpdMissMap) g_gpdMissMap = new std::unordered_map<UINT64, ID3D12Resource*>();
-        if (ours){ (*g_gpdMissMap)[cpu] = r; InterlockedIncrement(&g_gpDescNotes); }
-        else if (!g_gpdMissMap->empty()) g_gpdMissMap->erase(cpu);
-        ReleaseSRWLockExclusive(&g_gpdMissLk);
-        if (!g_gpdAny) InterlockedExchange(&g_gpdAny, 1);
-        return;
-    }
-    // A slot with no page has never named one of ours, so there is nothing to clear.
-    ID3D12Resource** s = GhGpdSlot(cpu, ours);
-    if (!s){
-        // #240 GPD2/GPD3: the pager's restore count left its n=4 constant (9 -> 24) on
-        // this table, so some notes land outside every registered heap. Keep those in
-        // the old map (same semantics as 0.0.601.0) and count them.
-        if (!ours && !g_gpdMissN) return;
-        if (ours && GhGpdFind(cpu) == nullptr){
-            const LONG q = InterlockedIncrement(&g_gpdMiss);
-            if (q <= 12)
-                Diag("GPDMISS cpu=" + Hex(cpu) + " res=" + Hex((UINT64)r) +
-                     " heaps=" + std::to_string((long)g_gpdHeaps) + " n=" + std::to_string((long)q));
-        }
-        AcquireSRWLockExclusive(&g_gpdMissLk);
-        if (!g_gpdMissMap) g_gpdMissMap = new std::unordered_map<UINT64, ID3D12Resource*>();
-        if (ours) (*g_gpdMissMap)[cpu] = r; else g_gpdMissMap->erase(cpu);
-        g_gpdMissN = (LONG)g_gpdMissMap->size();
-        ReleaseSRWLockExclusive(&g_gpdMissLk);
-        if (ours){
-            InterlockedIncrement(&g_gpDescNotes);
-            if (!g_gpdAny) InterlockedExchange(&g_gpdAny, 1);
-        }
-        return;
-    }
-    *s = ours ? r : nullptr;   // the slot now names something else when !ours
-    if (ours){
+    if (!GhGpOn() || !cpu) return false;
+    auto orig = (void (__stdcall*)(ID3D12Device*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*,
+                                   D3D12_CPU_DESCRIPTOR_HANDLE))g_d12vtOrig[18];
+    bool done = false;
+    AcquireSRWLockExclusive(&g_gpDescLk);
+    GhGpRes* e = (r && g_gpMap) ? GhGpFind(r) : nullptr;   // order: g_gpDescLk -> g_gpLk (shared)
+    if (!g_gpDescMap) g_gpDescMap = new std::unordered_map<UINT64, GhGpSlot>();
+    if (e){
+        GhGpSlot sl{}; sl.r = r; sl.gen = e->gen; sl.hasDesc = d != nullptr; if (d) sl.d = *d;
+        (*g_gpDescMap)[cpu] = sl;
         InterlockedIncrement(&g_gpDescNotes);
-        if (!g_gpdAny) InterlockedExchange(&g_gpdAny, 1);
+        if (GhGpMips()){
+            if (!GhGpSvSlot(cpu)) GhGpSlotAdd(e, cpu);   // #251 v2: shader-visible slots are never rewritten
+            else InterlockedIncrement(&g_gpSvNoTrack);
+            D3D12_CPU_DESCRIPTOR_HANDLE h{}; h.ptr = (SIZE_T)cpu;
+            D3D12_SHADER_RESOURCE_VIEW_DESC cd{};
+            if (e->clampCur && GhGpClampDesc(e, sl, e->clampCur, &cd)){ orig(self, r, &cd, h); InterlockedIncrement(&g_gpSrvClamped); }
+            else orig(self, r, d, h);
+            done = true;
+        }
+    } else if (!g_gpDescMap->empty()) g_gpDescMap->erase(cpu);   // the slot now names something else
+    ReleaseSRWLockExclusive(&g_gpDescLk);
+    return done;
+}
+// Hook_D12CreateUAV / CreateCBV: the slot no longer holds our SRV.
+static void GhGpDescForget(UINT64 cpu)
+{
+    if (!g_gpDescMap || !GhGpMips()) return;
+    AcquireSRWLockShared(&g_gpDescLk);
+    const bool has = g_gpDescMap->find(cpu) != g_gpDescMap->end();
+    ReleaseSRWLockShared(&g_gpDescLk);
+    if (!has) return;
+    AcquireSRWLockExclusive(&g_gpDescLk);
+    g_gpDescMap->erase(cpu);
+    ReleaseSRWLockExclusive(&g_gpDescLk);
+}
+// #251. No lock held; the caller holds a reference on r. Bring every tracked slot of
+// r to the clamp r should carry now (clampWant), and remember it (clampCur).
+static void GhGpSyncClamp(ID3D12Resource* r)
+{
+    if (!GhGpMips() || !r || !g_gpDev) return;
+    auto orig = (void (__stdcall*)(ID3D12Device*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*,
+                                   D3D12_CPU_DESCRIPTOR_HANDLE))g_d12vtOrig[18];
+    AcquireSRWLockExclusive(&g_gpDescLk);
+    GhGpRes* e = GhGpFind(r);
+    if (e && e->tailT){
+        const UINT want = (UINT)InterlockedCompareExchange(&e->clampWant, 0, 0);
+        if (want != e->clampCur){
+            InterlockedIncrement(want ? &g_gpClampUp : &g_gpClampDn);
+            e->clampCur = want;
+            if (e->slots && g_gpDescMap){
+                auto& v = *e->slots;
+                size_t k = 0;
+                for (size_t i = 0; i < v.size(); ++i){
+                    auto it = g_gpDescMap->find(v[i]);
+                    if (it == g_gpDescMap->end() || it->second.r != r || it->second.gen != e->gen){ InterlockedIncrement(&g_gpClampStale); continue; }
+                    D3D12_CPU_DESCRIPTOR_HANDLE h{}; h.ptr = (SIZE_T)v[i];
+                    D3D12_SHADER_RESOURCE_VIEW_DESC cd{};
+                    // #251 v2: a view the clamp does not apply to is left exactly as the game wrote it
+                    if (GhGpClampDesc(e, it->second, want ? want : e->mipK, &cd)){
+                        if (want) orig(g_gpDev, r, &cd, h);
+                        else orig(g_gpDev, r, it->second.hasDesc ? &it->second.d : nullptr, h);
+                        InterlockedIncrement(&g_gpClampRw);
+                    }
+                    v[k++] = v[i];
+                }
+                v.resize(k);
+            }
+        }
     }
+    ReleaseSRWLockExclusive(&g_gpDescLk);
 }
 // A copy from a noted staging slot is a use. Only the source side is looked up: a
 // copied-to ring slot is rewritten next frame, so tracking it would only grow the
-// table over the ring's 1.17M slots. A freed texture's stale note simply misses in
+// map to the ring's 1.17M slots. A freed texture's stale note simply misses in
 // g_gpMap (or, if the address was reused, touches the new occupant -- census noise).
 static void GhGpDescCopy(UINT64 src, UINT64 dst)
 {
-    (void)dst;
-    if (!g_gpdAny) return;
-    if (GhGpdMapMode()){
-        ID3D12Resource* r = nullptr;
-        AcquireSRWLockShared(&g_gpdMissLk);
-        auto it = g_gpdMissMap->find(src);
-        if (it != g_gpdMissMap->end()) r = it->second;
-        ReleaseSRWLockShared(&g_gpdMissLk);
-        if (!r) return;
-        if (GhGpRes* e = GhGpFind(r)){
-            e->lastUse = GhNowUs(); InterlockedIncrement(&g_gpDescHits);
-            if (e->chunk < 0) GhGpRequest(r);
-        }
-        return;
-    }
-    ID3D12Resource** s = GhGpdSlot(src, false);
-    ID3D12Resource* r = s ? *s : nullptr;
-    if (!r && g_gpdMissN && !GhGpdFind(src)){
-        AcquireSRWLockShared(&g_gpdMissLk);
-        auto it = g_gpdMissMap->find(src);
-        if (it != g_gpdMissMap->end()) r = it->second;
-        ReleaseSRWLockShared(&g_gpdMissLk);
+    if (!g_gpDescMap) return;
+    ID3D12Resource* r = nullptr;
+    bool hd = false;
+    const bool mips = GhGpMips() != 0;
+    AcquireSRWLockShared(&g_gpDescLk);
+    auto it = g_gpDescMap->find(src);
+    if (it != g_gpDescMap->end()) r = it->second.r;
+    if (mips) hd = g_gpDescMap->find(dst) != g_gpDescMap->end();
+    ReleaseSRWLockShared(&g_gpDescLk);
+    // #251: a staging-to-staging copy of our SRV is a slot the clamp must reach; a copy
+    // over a tracked slot means that slot no longer holds our SRV.
+    if (mips && (hd || (r && !GhGpSvSlot(dst)))){
+        AcquireSRWLockExclusive(&g_gpDescLk);
+        auto si = g_gpDescMap->find(src);
+        GhGpRes* e = si != g_gpDescMap->end() ? GhGpFind(si->second.r) : nullptr;
+        if (e && e->gen == si->second.gen){
+            const GhGpSlot sl = si->second;
+            (*g_gpDescMap)[dst] = sl;
+            GhGpSlotAdd(e, dst);
+            InterlockedIncrement(&g_gpDescCopyIn);
+        } else g_gpDescMap->erase(dst);
+        ReleaseSRWLockExclusive(&g_gpDescLk);
     }
     if (!r) return;
     if (GhGpRes* e = GhGpFind(r)){
@@ -24567,9 +24870,6 @@ static std::string GhGpHotLine()
     return o + " gpround=" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpAllocB, 0, 0) >> 20)) +
            " gpdesc=" + std::to_string((long)InterlockedCompareExchange(&g_gpDescNotes, 0, 0)) +
            "/" + std::to_string((long)InterlockedCompareExchange(&g_gpDescHits, 0, 0)) +
-           "/" + std::to_string((long)g_gpdHeaps) + "h" +     // #240: heaps in the flat table
-           "/" + std::to_string((long)g_gpdMiss) + "m" +      // notes outside them (old map)
-           "/" + std::to_string((long)g_gpdRecycled) + "r" +  // heaps dropped as overlapped
            // gpclass=askEver/askLive/mat: what the game asked the per-texture 0x44 class
            // for (baseline CreateHeap bytes) vs the real heaps we still create for it.
            // Our spend on the class = mat + poolMB; baseline would have been askLive.
@@ -24604,6 +24904,29 @@ static std::string GhGpFrameLine()
            (g_gpDz ? " gpdz=" + std::to_string((long)InterlockedCompareExchange(&g_gpDzChk, 0, 0)) +
                      "/" + std::to_string((long)InterlockedCompareExchange(&g_gpDzDirty, 0, 0)) +
                      "/" + std::to_string((long)InterlockedCompareExchange(&g_gpDzClr, 0, 0)) : std::string()) +
+           // #251 gpmip=split/whole/tailMB/clampUp/clampDown/slotRewrites/stale/srvClamped/copyIn/noWait/waitMs/waitTO/slots
+           (GhGpMips() ? " gpmip=" + std::to_string((long)InterlockedCompareExchange(&g_gpMipSplit, 0, 0)) +
+                "/" + std::to_string((long)InterlockedCompareExchange(&g_gpMipWhole, 0, 0)) +
+                "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpTailB, 0, 0) >> 20)) +
+                "/" + std::to_string((long)InterlockedCompareExchange(&g_gpClampUp, 0, 0)) +
+                "/" + std::to_string((long)InterlockedCompareExchange(&g_gpClampDn, 0, 0)) +
+                "/" + std::to_string((long)InterlockedCompareExchange(&g_gpClampRw, 0, 0)) +
+                "/" + std::to_string((long)InterlockedCompareExchange(&g_gpClampStale, 0, 0)) +
+                "/" + std::to_string((long)InterlockedCompareExchange(&g_gpSrvClamped, 0, 0)) +
+                "/" + std::to_string((long)InterlockedCompareExchange(&g_gpDescCopyIn, 0, 0)) +
+                "/" + std::to_string((long)InterlockedCompareExchange(&g_gpMipNoWait, 0, 0)) +
+                "/" + std::to_string((long long)(InterlockedCompareExchange64(&g_gpMipWaitUs, 0, 0) / 1000)) +
+                "/" + std::to_string((long)InterlockedCompareExchange(&g_gpMipWaitTo, 0, 0)) +
+                "/" + std::to_string((unsigned long long)(g_gpDescMap ? g_gpDescMap->size() : 0)) +
+                // #251 v2 gpmip2=small(whole by ratio)/clampSkip(view not straddling)/svNoTrack
+                " gpmip2=" + std::to_string((long)InterlockedCompareExchange(&g_gpMipSmall, 0, 0)) +
+                "/" + std::to_string((long)InterlockedCompareExchange(&g_gpClampSkip, 0, 0)) +
+                "/" + std::to_string((long)InterlockedCompareExchange(&g_gpSvNoTrack, 0, 0)) +
+                // #251 v3 gpmip3=noRoom(paged whole)/xheap/chunkZeroMaps/onlyMiss
+                " gpmip3=" + std::to_string((long)InterlockedCompareExchange(&g_gpNoRoom, 0, 0)) +
+                "/" + std::to_string((long)InterlockedCompareExchange(&g_gpXheap, 0, 0)) +
+                "/" + std::to_string((long)InterlockedCompareExchange(&g_gpChunkZ, 0, 0)) +
+                "/" + std::to_string((long)InterlockedCompareExchange(&g_gpOnlyMiss, 0, 0)) : std::string()) +
            // #250 v4 gplate=loads mapped after their read / loads that fell back to map-first
            " gplate=" + std::to_string((long)InterlockedCompareExchange(&g_gpLateMap, 0, 0)) +
            "/" + std::to_string((long)InterlockedCompareExchange(&g_gpLateMiss, 0, 0)) +
@@ -25495,9 +25818,7 @@ static HRESULT __stdcall Hook_D12CreateDH(ID3D12Device* self, const D3D12_DESCRI
     HRESULT hr;
     { GhD12CallScope _s("CreateDescriptorHeap"); hr = orig(self, d, riid, pp); }
     if (SUCCEEDED(hr) && pp && *pp && GhBufDimsOn()) GhBdHeapAdd(self, (ID3D12DescriptorHeap*)*pp, d);
-    if (SUCCEEDED(hr) && pp && *pp && d && d->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && GhGpOn())
-        GhGpdHeapAdd((UINT64)((ID3D12DescriptorHeap*)*pp)->GetCPUDescriptorHandleForHeapStart().ptr,
-                     self->GetDescriptorHandleIncrementSize(d->Type), d->NumDescriptors);
+    if (SUCCEEDED(hr) && pp && *pp) GhGpSvAdd(self, (ID3D12DescriptorHeap*)*pp, d);   // #251
     if (SUCCEEDED(hr) && pp && *pp && (GhDescTrackOn() || GhVaCheckOn() || GhSubCensus())){
         GhDHAdd(self, (ID3D12DescriptorHeap*)*pp, d);
         {   // #158: the deep bind map needs the heap's real extent to tell a slot
@@ -30777,57 +31098,6 @@ static DWORD WINAPI Bed_SetThreadIdealProcessor(HANDLE h, DWORD n)
     return prev == (DWORD)-1 ? 0 : prev;
 }
 
-// #240 GPD2..5: the guest's wall clock decides what "Continue" plays. Every cell pins
-// the same auto.sav, yet from the 08:17 press on 2026-09-26 the game played a
-// letterboxed story cutscene before the camp (VAC1 at 07:17 went straight in), and
-// the cutscene's content left ~9 k more resources and ~300 MB more working set in the
-// world, at the spill pager's edge. The only input that moved is the clock (the save is
-// pinned, the hive is replaced whole). gh_clock_pin (LocalState, unix seconds UTC,
-// 0 = off) starts the guest's system time at that instant and lets it run at the real
-// rate, so a pinned save never ages past the trigger and old baselines stay comparable.
-// Guest EXE only (ShimTable); GetTickCount/QPC are untouched.
-static INT64 GhClockOffset()   // 100-ns units to ADD to real FILETIMEs; 0 = off
-{
-    static INT64 off = [](){
-        const unsigned pin = GhCfgNumZ(L"gh_clock_pin.txt", "GH_CLOCK_PIN", 0);
-        if (!pin) return (INT64)0;
-        FILETIME ft{}; GetSystemTimePreciseAsFileTime(&ft);
-        const INT64 now = (INT64)(((UINT64)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
-        const INT64 o = (INT64)pin * 10000000LL + 116444736000000000LL - now;
-        Diag("CFG gh_clock_pin.txt = " + std::to_string(pin) + " (file) offset_h=" +
-             std::to_string((long long)(o / 36000000000LL)));
-        return o ? o : (INT64)1;
-    }();
-    return off;
-}
-static void GhClockShift(FILETIME* ft, const char* api)
-{
-    const INT64 o = GhClockOffset();
-    if (!o || !ft) return;
-    UINT64 v = ((UINT64)ft->dwHighDateTime << 32) | ft->dwLowDateTime;
-    v = (UINT64)((INT64)v + o);
-    ft->dwLowDateTime = (DWORD)v; ft->dwHighDateTime = (DWORD)(v >> 32);
-    static volatile LONG n = 0;
-    if (InterlockedIncrement(&n) <= 4)
-        Diag(std::string("CLOCKPIN ") + api + " -> " + std::to_string((unsigned long long)((v - 116444736000000000ULL) / 10000000ULL)));
-}
-static void WINAPI Bed_GetSystemTimeAsFileTime(LPFILETIME ft)
-{ GetSystemTimeAsFileTime(ft); GhClockShift(ft, "GetSystemTimeAsFileTime"); }
-static void WINAPI Bed_GetSystemTimePreciseAsFileTime(LPFILETIME ft)
-{ GetSystemTimePreciseAsFileTime(ft); GhClockShift(ft, "GetSystemTimePreciseAsFileTime"); }
-static void WINAPI Bed_GetSystemTime(LPSYSTEMTIME st)
-{
-    if (!GhClockOffset()){ GetSystemTime(st); return; }
-    FILETIME ft; GetSystemTimeAsFileTime(&ft); GhClockShift(&ft, "GetSystemTime");
-    FileTimeToSystemTime(&ft, st);
-}
-static void WINAPI Bed_GetLocalTime(LPSYSTEMTIME st)
-{
-    if (!GhClockOffset()){ GetLocalTime(st); return; }
-    FILETIME ft, lft; GetSystemTimeAsFileTime(&ft); GhClockShift(&ft, "GetLocalTime");
-    FileTimeToLocalFileTime(&ft, &lft); FileTimeToSystemTime(&lft, st);
-}
-
 static BOOL WINAPI Bed_GetMonitorInfoW(HMONITOR h, LPMONITORINFO mi){
     static LONG n = 0;
     if (InterlockedIncrement(&n) <= 4)
@@ -35939,11 +36209,6 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"GlobalMemoryStatusEx", (void*)&Bed_GlobalMemoryStatusEx},
         {"GlobalMemoryStatus",   (void*)&Bed_GlobalMemoryStatus},
         {"GetPhysicallyInstalledSystemMemory", (void*)&Bed_GetPhysicallyInstalledSystemMemory},
-        // #240 gh_clock_pin: the guest's wall clock (inert when the knob is 0).
-        {"GetSystemTimeAsFileTime",        (void*)&Bed_GetSystemTimeAsFileTime},
-        {"GetSystemTimePreciseAsFileTime", (void*)&Bed_GetSystemTimePreciseAsFileTime},
-        {"GetSystemTime",                  (void*)&Bed_GetSystemTime},
-        {"GetLocalTime",                   (void*)&Bed_GetLocalTime},
         // Display surrogate. MUST live here, not only in PatchModuleForGuest.
         // The guest exe is mapped by our loader and resolves imports through
         // ShimTable; PatchModuleForGuest only rewrites modules the HOST loaded.
