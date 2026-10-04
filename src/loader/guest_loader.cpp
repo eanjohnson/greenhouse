@@ -7596,6 +7596,52 @@ static bool GhXfwOn(){ return GhXfwMode() != 0; }
 // XFW8: sample the GPU-driven ExecuteIndirect draws instead of the direct ones (they were never
 // sampled: ~1,100/s in the level). 1 = census + sample, 2 = also read back each sampled draw's args.
 static unsigned GhXfwEi(){ static const unsigned m = GhCfgNum(L"gh_xfw_ei.txt", "GH_XFW_EI", 0); return m; }
+// XFW9: the watched VS are the instanced props (vs_SetMaterial_techDefault rocks/spikes), which
+// read t1[srt+56] -> instance header P, and per instance StructuredBuffer<64> t0 space2 and
+// StructuredBuffer<48> t2 space2 at hdr[0]/hdr[2] + SV_InstanceID. 1 = snapshot those instead
+// of the character record layout (heap census, RACE on them, per-mesh instance JUMP).
+static unsigned GhXfwInst(){ static const unsigned m = GhCfgNum(L"gh_xfw_inst.txt", "GH_XFW_INST", 0); return m; }
+// XB1 (#252): gh_xfw_bar=1 records a UAV barrier on ALL resources (pResource = NULL) in front of every
+// watched draw, before XFW9c's readback copy. Log-and-order test, not a fix: if the rock records are
+// stale because the draw overlaps the pass that writes them, this wait removes it.
+static unsigned GhXfwBar(){ static const unsigned m = GhCfgNum(L"gh_xfw_bar.txt", "GH_XFW_BAR", 0); return m; }
+static volatile LONG64 g_xfwBarN = 0;
+// XFW10 (#252): gh_xfw_who=P names the pass that writes the odd rock records. Every P-th frame (two
+// frames armed), after each dispatch of a pipeline seen inside the UAV window (g_xwPsoSet, XFW4/9f),
+// the regions that odd GPU records were read from are copied to a READBACK ring behind a UAV barrier.
+// The watcher orders those copies before each sampled rock draw of an armed list and reports which
+// pipeline last changed each instance, and whether the value it left is what the draw read.
+static unsigned GhXfwWho(){ static const unsigned m = GhCfgNum(L"gh_xfw_who.txt", "GH_XFW_WHO", 0); return m; }
+// XFW11 gh_cull_dump=N: in every N-th present (8 dumps at most), log each fa29971e (rock culling) dispatch's
+// CPU-written header as the GPU will read it, and each sampled rock draw's instance-stream record. Log-only;
+// needs gh_xfw on (root-signature map, draw snapshots).
+static unsigned GhCullDump(){ static const unsigned v = GhCfgNum(L"gh_cull_dump.txt", "GH_CULL_DUMP", 0); return v; }
+static volatile LONG g_cullDumps = 0;
+static volatile LONG64 g_cullLastFrame = -1;
+static std::unordered_map<void*, UINT8>* g_cullPsos = nullptr;   // 1 fa29971e cull, 2 6ff4d302 LOD pass, 3 e65bf0bf reset
+static SRWLOCK g_cullLk = SRWLOCK_INIT;
+static void GhCullNoteDisp(ID3D12GraphicsCommandList* self, UINT x);
+static void GhCullRbClose(ID3D12GraphicsCommandList* self);   // XFW12
+// XFW12d: the counter buffers of the culling (heap index from its header) and of the LOD pass (one view below it),
+// so a copy OUT of either -- the game's readback of the counts it sizes regions from -- can be named.
+static void* volatile g_cullCntRes[2] = { nullptr, nullptr };
+static unsigned GhCullRb();
+static void GhCullCopyNote(ID3D12GraphicsCommandList* self, ID3D12Resource* d, UINT64 dOff, ID3D12Resource* sr, UINT64 sOff, UINT64 n);
+static void GhCullRbDrain(LONG64 now);
+static UINT8 GhCullPso(void* p)
+{
+    if (!p) return 0;
+    AcquireSRWLockShared(&g_cullLk);
+    UINT8 r = 0;
+    if (g_cullPsos){ auto it = g_cullPsos->find(p); if (it != g_cullPsos->end()) r = it->second; }
+    ReleaseSRWLockShared(&g_cullLk);
+    return r;
+}
+static std::unordered_set<void*>* g_xwPsoSet = nullptr;
+static std::vector<void*>* g_xwPsoVec = nullptr;   // XFW10b: candidates in first-seen order, under g_xwPsoLk
+static SRWLOCK g_xwPsoLk = SRWLOCK_INIT;
+static const UINT32 kXinN = 16;
+static const UINT32 kXinStride[2] = { 64, 48 };
 static bool GhXfwDesc(){ return GhXfwMode() >= 2; }
 
 // gh_texlod0: serve gh_tl_<key>.bin (constant-lod-0 texture GetDimensions made
@@ -10363,6 +10409,158 @@ static void GhTexDimsProbe()
         GhTexDimsProbeOne(L"gh_texdims_tl.bin", "TEXDIMS-TL");
 }
 
+// #253 CUBE1: the blue burning trees are drawn by 85003ba2, the clustered reflection pass, whose
+// unusual reads are TextureCubeArray SampleLevel calls with a per-pixel cube index. Ask this driver
+// which texel such a sample returns. gh_cubeprobe.bin = tmp/cubeprobe/cubeprobe.hlsl (cs_6_5,
+// embedded root signature). Resource: 5 cubes 8x8, 4 mips, RGBA16F; texel of cube c, face f,
+// mip m = (1000+100c+10f+m, 2, 3, 4).
+static void GhCubeProbe()
+{
+    static const unsigned mode = GhCfgNum(L"gh_cube_probe.txt", "GH_CUBE_PROBE", 0);
+    if (!mode) return;
+    const std::string T = "CUBE";
+    std::vector<uint8_t> cs;
+    if (!ReadWholeFile(std::wstring(kLocalState) + L"gh_cubeprobe.bin", cs, true) || cs.size() < 0x24){
+        Diag(T + " no blob -- VOID"); return;
+    }
+    ID3D12Device* dev = GhCompileOnlyDevice();
+    if (!dev){ Diag(T + " no device -- VOID"); return; }
+    com_ptr<ID3D12RootSignature> rs; com_ptr<ID3D12PipelineState> pso;
+    HRESULT hr = dev->CreateRootSignature(0, cs.data(), cs.size(), __uuidof(ID3D12RootSignature), rs.put_void());
+    if (SUCCEEDED(hr)){
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = rs.get(); pd.CS = { cs.data(), cs.size() };
+        hr = dev->CreateComputePipelineState(&pd, __uuidof(ID3D12PipelineState), pso.put_void());
+    }
+    if (FAILED(hr) || !pso){ Diag(T + " pso hr=" + Hex((uint32_t)hr) + " -- VOID"); return; }
+
+    com_ptr<ID3D12CommandQueue> q; com_ptr<ID3D12CommandAllocator> ca;
+    com_ptr<ID3D12GraphicsCommandList> cl; com_ptr<ID3D12Fence> fence;
+    D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    hr = dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), q.put_void());
+    if (SUCCEEDED(hr)) hr = dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                __uuidof(ID3D12CommandAllocator), ca.put_void());
+    if (SUCCEEDED(hr)) hr = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, ca.get(), pso.get(),
+                                __uuidof(ID3D12GraphicsCommandList), cl.put_void());
+    if (SUCCEEDED(hr)) hr = dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), fence.put_void());
+    if (FAILED(hr)){ Diag(T + " rig hr=" + Hex((uint32_t)hr) + " -- VOID"); return; }
+
+    const UINT kCubes = 5, kMips = 4, kFaces = kCubes * 6;
+    com_ptr<ID3D12Resource> tex, ub, rb, up;
+    {
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd{}; rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = 8; rd.Height = 8;
+        rd.DepthOrArraySize = (UINT16)kFaces; rd.MipLevels = (UINT16)kMips; rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                          __uuidof(ID3D12Resource), tex.put_void());
+    }
+    auto Buf = [&](UINT64 bytes, D3D12_HEAP_TYPE ht, D3D12_RESOURCE_FLAGS fl, D3D12_RESOURCE_STATES st,
+                   com_ptr<ID3D12Resource>& r) -> HRESULT {
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type = ht;
+        D3D12_RESOURCE_DESC rd{}; rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = bytes;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; rd.Flags = fl;
+        return dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, st, nullptr,
+                                            __uuidof(ID3D12Resource), r.put_void());
+    };
+    if (SUCCEEDED(hr)) hr = Buf(1024, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, ub);
+    if (SUCCEEDED(hr)) hr = Buf(1024, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, rb);
+    if (FAILED(hr)){ Diag(T + " resources hr=" + Hex((uint32_t)hr) + " -- VOID"); return; }
+
+    // Fill every subresource with its own (1000+100c+10f+m, 2, 3, 4) in half floats.
+    const UINT nsub = kFaces * kMips;
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> fp(nsub); std::vector<UINT> rows(nsub); std::vector<UINT64> rowB(nsub);
+    UINT64 total = 0;
+    { D3D12_RESOURCE_DESC td = tex->GetDesc(); dev->GetCopyableFootprints(&td, 0, nsub, 0, fp.data(), rows.data(), rowB.data(), &total); }
+    if (FAILED(Buf(total, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, up))){ Diag(T + " upload -- VOID"); return; }
+    {
+        uint8_t* m = nullptr; D3D12_RANGE none{0, 0};
+        if (FAILED(up->Map(0, &none, (void**)&m)) || !m){ Diag(T + " upload map -- VOID"); return; }
+        auto Half = [](float f) -> uint16_t {            // exact for the small integers used here
+            uint32_t x; memcpy(&x, &f, 4);
+            const uint32_t sgn = (x >> 16) & 0x8000; int e = (int)((x >> 23) & 0xFF) - 127 + 15; uint32_t mant = x & 0x7FFFFF;
+            if (e <= 0) return (uint16_t)sgn;
+            return (uint16_t)(sgn | (e << 10) | (mant >> 13));
+        };
+        for (UINT sub = 0; sub < nsub; ++sub){
+            const UINT mip = sub % kMips, slice = sub / kMips, c = slice / 6, f = slice % 6;
+            const uint16_t px[4] = { Half(1000.0f + 100.0f * c + 10.0f * f + mip), Half(2.0f), Half(3.0f), Half(4.0f) };
+            for (UINT y = 0; y < rows[sub]; ++y){
+                uint16_t* row = (uint16_t*)(m + fp[sub].Offset + (UINT64)y * fp[sub].Footprint.RowPitch);
+                for (UINT x = 0; x < fp[sub].Footprint.Width; ++x) memcpy(row + 4 * x, px, 8);
+            }
+        }
+        up->Unmap(0, nullptr);
+        for (UINT sub = 0; sub < nsub; ++sub){
+            D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+            dst.pResource = tex.get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.SubresourceIndex = sub;
+            src.pResource = up.get(); src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src.PlacedFootprint = fp[sub];
+            cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+        D3D12_RESOURCE_BARRIER tb{}; tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        tb.Transition.pResource = tex.get(); tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST; tb.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        cl->ResourceBarrier(1, &tb);
+    }
+
+    com_ptr<ID3D12DescriptorHeap> dh;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{}; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 3; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hr = dev->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap), dh.put_void());
+    if (FAILED(hr)){ Diag(T + " heap hr=" + Hex((uint32_t)hr) + " -- VOID"); return; }
+    const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const D3D12_CPU_DESCRIPTOR_HANDLE c0 = dh->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_GPU_DESCRIPTOR_HANDLE g0 = dh->GetGPUDescriptorHandleForHeapStart();
+    auto At = [&](UINT slot) -> D3D12_CPU_DESCRIPTOR_HANDLE { return { c0.ptr + slot * inc }; };
+    for (UINT v = 0; v < 2; ++v){
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{}; sv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY; sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.TextureCubeArray.MipLevels = (UINT)-1;
+        sv.TextureCubeArray.First2DArrayFace = v ? 6 : 0; sv.TextureCubeArray.NumCubes = v ? kCubes - 1 : kCubes;
+        dev->CreateShaderResourceView(tex.get(), &sv, At(v));
+    }
+    { D3D12_UNORDERED_ACCESS_VIEW_DESC uv{}; uv.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; uv.Format = DXGI_FORMAT_R32_TYPELESS;
+      uv.Buffer.NumElements = 256; uv.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+      dev->CreateUnorderedAccessView(ub.get(), nullptr, &uv, At(2)); }
+
+    ID3D12DescriptorHeap* hs[1] = { dh.get() };
+    cl->SetDescriptorHeaps(1, hs);
+    cl->SetComputeRootSignature(rs.get());
+    cl->SetComputeRoot32BitConstant(0, 0, 0);           // arr[0] = slot 0, the full view
+    cl->SetComputeRootDescriptorTable(1, g0);
+    cl->SetComputeRootDescriptorTable(2, g0);
+    cl->Dispatch(1, 1, 1);
+    D3D12_RESOURCE_BARRIER b{}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = ub.get(); b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cl->ResourceBarrier(1, &b);
+    cl->CopyBufferRegion(rb.get(), 0, ub.get(), 0, 1024);
+    cl->Close();
+    ID3D12CommandList* ls[1] = { cl.get() };
+    q->ExecuteCommandLists(1, ls);
+    q->Signal(fence.get(), 1);
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    bool ok = true;
+    if (fence->GetCompletedValue() < 1){ fence->SetEventOnCompletion(1, ev); ok = WaitForSingleObject(ev, 20000) == WAIT_OBJECT_0; }
+    if (ev) CloseHandle(ev);
+    const HRESULT rr = dev->GetDeviceRemovedReason();
+    if (!ok || rr != S_OK){ Diag(T + " fence=" + std::string(ok ? "ok" : "TIMEOUT") + " removed=" + Hex((uint32_t)rr) + " -- VOID"); return; }
+    uint32_t* r = nullptr; D3D12_RANGE all{0, 1024};
+    if (FAILED(rb->Map(0, &all, (void**)&r)) || !r){ Diag(T + " readback map -- VOID"); return; }
+    auto F = [&](int i){ float f; memcpy(&f, &r[i], 4); char t[24]; snprintf(t, sizeof t, "%g", f); return std::string(t); };
+    auto Row = [&](int base, int n){ std::string o; for (int i = 0; i < n; ++i){ if (i && i % 6 == 0) o += " |"; o += " " + F(base + i); } return o; };
+    Diag(T + " tag=" + Hex(r[103]) + " (want 0xC0BE0001); value = 1000+100*cube+10*face+mip");
+    Diag(T + "A full view, dyn cube, mip0 (want 1000.. 1405 by cube|face):" + Row(0, 30));
+    Diag(T + "B First2DArrayFace=6 (want cube+1: 1100..1405):" + Row(30, 24));
+    Diag(T + "C lod 2, +X (want 1002 1102 1202 1302 1402):" + Row(54, 5));
+    Diag(T + "D cube c+0.4, +X (want 1000 1100 1200 1300 1400):" + Row(59, 5));
+    Diag(T + "E bindless arr[0], dyn cube (want = A):" + Row(64, 30));
+    Diag(T + "F cube3 face4 mip1 rgba (want 1341 2 3 4): " + F(96) + " " + F(97) + " " + F(98) + " " + F(99));
+    D3D12_RANGE none{0, 0}; rb->Unmap(0, &none);
+}
+
 // Scatter-jump DRAWID1: rocks AND trees jump around the world (user, TD2b), i.e. instanced
 // scenery draws with another instance's data. Ask this driver what a VS sees for
 // SV_VertexID / SV_InstanceID under start/base offsets, and whether a per-command root
@@ -10749,6 +10947,185 @@ static void GhFmtLoadProbe()
     }
     CloseHandle(ev);
     if (mode >= 2){ Diag("FMTLOAD done -- exiting (gh_fmtload_probe=2)"); Sleep(500); ExitProcess(0); }
+}
+
+// #252 gh_buffmt_probe: typed UAV load/store through small-integer BUFFER views, the
+// path the rock culling pair takes (e65bf0bf typed-stores and fa29971e typed-loads a
+// RWBuffer<int> the game views as R8_SINT, a format it never asks FORMAT_SUPPORT about).
+// Source bytes are 0..255 repeating; each format is loaded as its HLSL class (int/uint/
+// float) and, for the integer classes, stored back as 127-t / 255-t. Log-only.
+static float GhHalfToF(uint16_t h)
+{
+    const uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
+    float v = e == 0 ? std::ldexp((float)m, -24) : e == 31 ? (m ? NAN : INFINITY)
+                     : std::ldexp((float)(m | 1024), (int)e - 25);
+    return s ? -v : v;
+}
+static void GhBufFmtProbe()
+{
+    static const unsigned mode = GhCfgNumZ(L"gh_buffmt_probe.txt", "GH_BUFFMT_PROBE", 0);
+    if (!mode) return;
+    std::vector<uint8_t> cs;
+    if (!ReadWholeFile(std::wstring(kLocalState) + L"gh_buffmt_cs.bin", cs, true) || cs.size() < 0x24){
+        Diag("BUFFMT no gh_buffmt_cs.bin -- VOID"); return;
+    }
+    ID3D12Device* dev = GhCompileOnlyDevice();
+    if (!dev){ Diag("BUFFMT no device -- VOID"); return; }
+    com_ptr<ID3D12RootSignature> rs; com_ptr<ID3D12PipelineState> pso;
+    HRESULT hr = dev->CreateRootSignature(0, cs.data(), cs.size(), __uuidof(ID3D12RootSignature), rs.put_void());
+    if (SUCCEEDED(hr)){
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = rs.get(); pd.CS = { cs.data(), cs.size() };
+        hr = dev->CreateComputePipelineState(&pd, __uuidof(ID3D12PipelineState), pso.put_void());
+    }
+    if (FAILED(hr) || !pso){ Diag("BUFFMT pso hr=" + Hex((uint32_t)hr) + " -- VOID"); return; }
+    com_ptr<ID3D12CommandQueue> q; com_ptr<ID3D12CommandAllocator> ca;
+    com_ptr<ID3D12GraphicsCommandList> cl; com_ptr<ID3D12Fence> fence;
+    D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    hr = dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), q.put_void());
+    if (SUCCEEDED(hr)) hr = dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                __uuidof(ID3D12CommandAllocator), ca.put_void());
+    if (SUCCEEDED(hr)) hr = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, ca.get(), nullptr,
+                                __uuidof(ID3D12GraphicsCommandList), cl.put_void());
+    if (SUCCEEDED(hr)) hr = dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), fence.put_void());
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (FAILED(hr) || !ev){ Diag("BUFFMT rig hr=" + Hex((uint32_t)hr) + " -- VOID"); return; }
+    UINT64 fv = 0;
+    auto Buf = [&](UINT64 bytes, D3D12_HEAP_TYPE ht, D3D12_RESOURCE_FLAGS fl, D3D12_RESOURCE_STATES st,
+                   com_ptr<ID3D12Resource>& r) -> HRESULT {
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type = ht;
+        D3D12_RESOURCE_DESC rd{}; rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = bytes;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; rd.Flags = fl;
+        return dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, st, nullptr,
+                                            __uuidof(ID3D12Resource), r.put_void());
+    };
+    com_ptr<ID3D12DescriptorHeap> dh;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{}; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 6; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hr = dev->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap), dh.put_void());
+    com_ptr<ID3D12Resource> up;
+    if (SUCCEEDED(hr)) hr = Buf(4096, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, up);
+    uint8_t* upp = nullptr;
+    if (SUCCEEDED(hr)) hr = up->Map(0, nullptr, (void**)&upp);
+    if (FAILED(hr) || !upp){ Diag("BUFFMT heap/upload hr=" + Hex((uint32_t)hr) + " -- VOID"); return; }
+    for (int i = 0; i < 4096; ++i) upp[i] = (uint8_t)i;
+    const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const D3D12_CPU_DESCRIPTOR_HANDLE c0 = dh->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_GPU_DESCRIPTOR_HANDLE g0 = dh->GetGPUDescriptorHandleForHeapStart();
+    // fmt, class (0 int, 1 uint, 2 float), bytes per element, byte offset of channel x, channel bytes
+    struct F { DXGI_FORMAT f; int k, eb, xb; };
+    static const F kF[] = {
+        { DXGI_FORMAT_R8_SINT, 0, 1, 1 }, { DXGI_FORMAT_R16_SINT, 0, 2, 2 }, { DXGI_FORMAT_R32_SINT, 0, 4, 4 },
+        { DXGI_FORMAT_R8G8_SINT, 0, 2, 1 },
+        { DXGI_FORMAT_R8_UINT, 1, 1, 1 }, { DXGI_FORMAT_R16_UINT, 1, 2, 2 }, { DXGI_FORMAT_R8G8_UINT, 1, 2, 1 },
+        { DXGI_FORMAT_R8G8B8A8_UINT, 1, 4, 1 }, { DXGI_FORMAT_R32_UINT, 1, 4, 4 },
+        { DXGI_FORMAT_R8_UNORM, 2, 1, 1 }, { DXGI_FORMAT_R8G8_UNORM, 2, 2, 1 }, { DXGI_FORMAT_R16G16_FLOAT, 2, 4, 2 },
+        { DXGI_FORMAT_R16G16B16A16_FLOAT, 2, 8, 2 }, { DXGI_FORMAT_R16G16B16A16_UNORM, 2, 8, 2 },
+        { DXGI_FORMAT_R8_SNORM, 2, 1, 1 } };
+    const DXGI_FORMAT kNull[3] = { DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_FLOAT };
+    for (const F& t : kF){
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{}; fs.Format = t.f;
+        dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof fs);
+        com_ptr<ID3D12Resource> src, dst, out, rb;
+        hr = Buf(4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST, src);
+        if (SUCCEEDED(hr)) hr = Buf(4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, dst);
+        if (SUCCEEDED(hr)) hr = Buf(1024, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, out);
+        if (SUCCEEDED(hr)) hr = Buf(8192, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, rb);
+        if (FAILED(hr)){ Diag("BUFFMT fmt=" + std::to_string((int)t.f) + " create hr=" + Hex((uint32_t)hr)); continue; }
+        auto View = [&](int slot, ID3D12Resource* r, DXGI_FORMAT f){
+            D3D12_UNORDERED_ACCESS_VIEW_DESC v{}; v.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; v.Format = f;
+            v.Buffer.NumElements = 256;
+            dev->CreateUnorderedAccessView(r, nullptr, &v, { c0.ptr + (SIZE_T)slot * inc });
+        };
+        View(0, t.k == 0 ? src.get() : nullptr, t.k == 0 ? t.f : kNull[0]);
+        View(2, t.k == 0 ? dst.get() : nullptr, t.k == 0 ? t.f : kNull[0]);
+        View(3, t.k == 1 ? src.get() : nullptr, t.k == 1 ? t.f : kNull[1]);
+        View(4, t.k == 1 ? dst.get() : nullptr, t.k == 1 ? t.f : kNull[1]);
+        View(5, t.k == 2 ? src.get() : nullptr, t.k == 2 ? t.f : kNull[2]);
+        { D3D12_UNORDERED_ACCESS_VIEW_DESC v{}; v.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+          v.Format = DXGI_FORMAT_R32_TYPELESS; v.Buffer.NumElements = 256; v.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+          dev->CreateUnorderedAccessView(out.get(), nullptr, &v, { c0.ptr + inc }); }
+        cl->CopyBufferRegion(src.get(), 0, up.get(), 0, 4096);
+        D3D12_RESOURCE_BARRIER b[3]{};
+        for (auto& x : b){ x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; x.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; }
+        b[0].Transition.pResource = src.get();
+        b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST; b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        cl->ResourceBarrier(1, b);
+        ID3D12DescriptorHeap* hs[1] = { dh.get() };
+        cl->SetDescriptorHeaps(1, hs);
+        cl->SetPipelineState(pso.get());
+        cl->SetComputeRootSignature(rs.get());
+        cl->SetComputeRoot32BitConstant(0, (UINT)t.k, 0);
+        cl->SetComputeRootDescriptorTable(1, g0);
+        cl->Dispatch(4, 1, 1);
+        b[0].Transition.pResource = out.get();
+        b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b[1] = b[0]; b[1].Transition.pResource = dst.get();
+        cl->ResourceBarrier(2, b);
+        cl->CopyBufferRegion(rb.get(), 0, out.get(), 0, 1024);
+        cl->CopyBufferRegion(rb.get(), 4096, dst.get(), 0, 4096);
+        hr = cl->Close();
+        if (FAILED(hr)){ Diag("BUFFMT fmt=" + std::to_string((int)t.f) + " close hr=" + Hex((uint32_t)hr) + " -- skipped");
+                         ca->Reset(); cl->Reset(ca.get(), nullptr); continue; }
+        ID3D12CommandList* ls[1] = { cl.get() };
+        q->ExecuteCommandLists(1, ls);
+        ++fv; q->Signal(fence.get(), fv);
+        bool ok = true;
+        if (fence->GetCompletedValue() < fv){ fence->SetEventOnCompletion(fv, ev); ok = WaitForSingleObject(ev, 20000) == WAIT_OBJECT_0; }
+        ca->Reset(); cl->Reset(ca.get(), nullptr);
+        const HRESULT rr = dev->GetDeviceRemovedReason();
+        if (!ok || rr != S_OK){
+            Diag("BUFFMT fmt=" + std::to_string((int)t.f) + " fence=" + std::string(ok ? "ok" : "TIMEOUT") +
+                 " removed=" + Hex((uint32_t)rr) + " -- stopping");
+            break;
+        }
+        const uint8_t* r = nullptr; D3D12_RANGE all{0, 8192};
+        if (FAILED(rb->Map(0, &all, (void**)&r)) || !r){ Diag("BUFFMT readback map -- VOID"); continue; }
+        auto LE = [&](int off, int n){ uint32_t v = 0; for (int i = 0; i < n; ++i) v |= (uint32_t)upp[off + i] << (8 * i); return v; };
+        int bad = 0, sbad = 0; std::string ex, sex;
+        for (int e = 0; e < 256; ++e){
+            uint32_t got; std::memcpy(&got, r + 4 * e, 4);
+            const uint32_t x = LE(e * t.eb, t.xb);
+            uint32_t want; bool fl = false; float wf = 0;
+            if (t.k == 0) want = t.xb == 1 ? (uint32_t)(int32_t)(int8_t)x : t.xb == 2 ? (uint32_t)(int32_t)(int16_t)x : x;
+            else if (t.k == 1) want = x;
+            else {
+                fl = true; want = 0;
+                const DXGI_FORMAT f = t.f;
+                wf = f == DXGI_FORMAT_R8_UNORM || f == DXGI_FORMAT_R8G8_UNORM ? x / 255.0f
+                   : f == DXGI_FORMAT_R8_SNORM ? (std::max)(-1.0f, (int8_t)x / 127.0f)
+                   : f == DXGI_FORMAT_R16G16B16A16_UNORM ? x / 65535.0f : GhHalfToF((uint16_t)x);
+            }
+            bool m;
+            if (fl){ float gf; std::memcpy(&gf, &got, 4);
+                     m = !(std::isnan(wf) || std::isinf(wf)) && std::fabs(gf - wf) > 1e-3f * (std::max)(1.0f, std::fabs(wf)); }
+            else m = got != want;
+            if (m && ++bad <= 4){
+                char s[96];
+                if (fl){ float gf; std::memcpy(&gf, &got, 4); snprintf(s, sizeof s, " [%d src=%02X got=%g want=%g]", e, x & 0xFF, gf, wf); }
+                else snprintf(s, sizeof s, " [%d src=%X got=%08X want=%08X]", e, x, got, want);
+                ex += s;
+            }
+            if (t.k != 2){
+                const uint32_t sv = t.k == 0 ? (uint32_t)(127 - e) : (uint32_t)(255 - e);
+                const int sb = t.f == DXGI_FORMAT_R8G8B8A8_UINT ? 1 : t.xb;
+                const uint32_t mask = sb == 4 ? 0xFFFFFFFFu : ((1u << (8 * sb)) - 1);
+                uint32_t sg = 0; for (int i = 0; i < sb; ++i) sg |= (uint32_t)r[4096 + e * t.eb + i] << (8 * i);
+                if ((sg & mask) != (sv & mask) && ++sbad <= 3){
+                    char s[80]; snprintf(s, sizeof s, " [%d got=%X want=%X]", e, sg, sv & mask); sex += s;
+                }
+            }
+        }
+        Diag("BUFFMT fmt=" + std::to_string((int)t.f) + " class=" + std::string(t.k == 0 ? "int" : t.k == 1 ? "uint" : "float") +
+             " sup1=" + Hex((uint32_t)fs.Support1) + " sup2=" + Hex((uint32_t)fs.Support2) +
+             " uavload=" + std::to_string((fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) ? 1 : 0) +
+             " LOAD=" + (bad ? "BAD(" + std::to_string(bad) + "/256)" + ex : std::string("OK")) +
+             (t.k != 2 ? std::string(" STORE=") + (sbad ? "BAD(" + std::to_string(sbad) + ")" + sex : std::string("OK")) : std::string()));
+        D3D12_RANGE none{0, 0}; rb->Unmap(0, &none);
+    }
+    CloseHandle(ev);
+    if (mode >= 2){ Diag("BUFFMT done -- exiting (gh_buffmt_probe=2)"); Sleep(500); ExitProcess(0); }
 }
 
 static void GhDxilControl()
@@ -13858,8 +14235,74 @@ static std::string GhPagerFrameLine()
 
 static void GhXfwNotePso(void* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d);   // #252
 static void GhVsKeyNote(void* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d);    // VSSKIP
+static void GhVsKeyNoteCs(void* pso, const std::string& keys);                       // #253 CSSKIP
+static void GhVarBuild(ID3D12Device* dev, GhCpsRawFn fn, const D3D12_COMPUTE_PIPELINE_STATE_DESC* d, void* real,
+                       const std::string& keys);   // #253 VARSWAP
 static void GhXfwNoteRs(void* rs, const void* blob, SIZE_T len);
 static void GhXfwDraw(ID3D12GraphicsCommandList* self);
+static void GhXwBefore(ID3D12GraphicsCommandList* self, bool indirect);  // XFW10b
+static void GhXwStreamNote(ID3D12Resource* r);   // XFW10b
+static void GhXwListReset(ID3D12GraphicsCommandList* self);   // XFW10c
+static void GhXwListClose(ID3D12GraphicsCommandList* self);   // XFW10c
+static void GhXwAfter(ID3D12GraphicsCommandList* self, bool indirect);   // XFW10
+// #253 PSOUT helpers. Per render target i, bits 4i..4i+3 = the components the pixel shader exports to
+// SV_Target<i> (declared mask minus the never-writes mask). 0xFFFFFFFF = could not parse (caller leaves it).
+static uint32_t GhPsTargetMasks(const void* bc, size_t len)
+{
+    const uint8_t* b = (const uint8_t*)bc;
+    if (!b || len < 32 || memcmp(b, "DXBC", 4) != 0) return 0xFFFFFFFFu;
+    uint32_t nch = 0; memcpy(&nch, b + 28, 4);
+    if (nch > 64 || 32 + 4ull * nch > len) return 0xFFFFFFFFu;
+    for (uint32_t c = 0; c < nch; ++c){
+        uint32_t off = 0; memcpy(&off, b + 32 + 4 * c, 4);
+        if ((size_t)off + 8 > len) return 0xFFFFFFFFu;
+        size_t esz = 0, pre = 0;
+        if (!memcmp(b + off, "OSG1", 4)){ esz = 32; pre = 4; }
+        else if (!memcmp(b + off, "OSG5", 4)){ esz = 28; pre = 4; }
+        else if (!memcmp(b + off, "OSGN", 4)){ esz = 24; pre = 0; }
+        else continue;
+        uint32_t csz = 0; memcpy(&csz, b + off + 4, 4);
+        const uint8_t* d = b + off + 8;
+        if ((size_t)off + 8 + csz > len || csz < 8) return 0xFFFFFFFFu;
+        uint32_t n = 0, eo = 0; memcpy(&n, d, 4); memcpy(&eo, d + 4, 4);
+        if ((size_t)eo + (size_t)n * esz > csz) return 0xFFFFFFFFu;
+        uint32_t out = 0;
+        for (uint32_t i = 0; i < n; ++i){
+            // after the optional stream: name offset, semantic index, system value, component type, register,
+            // then the declared mask byte and the never-writes mask byte (outputs)
+            const uint8_t* e = d + eo + i * esz + pre;
+            uint32_t no = 0, si = 0; memcpy(&no, e, 4); memcpy(&si, e + 4, 4);
+            if (no >= csz) return 0xFFFFFFFFu;
+            const char* nm = (const char*)d + no;
+            const size_t room = csz - no;
+            if (strnlen(nm, room) == room) return 0xFFFFFFFFu;
+            if (_stricmp(nm, "SV_Target") != 0 || si >= 8) continue;
+            const uint8_t m = e[20] & 0xF, never = e[21] & 0xF;
+            out |= (uint32_t)(m & ~never & 0xF) << (4 * si);
+        }
+        return out;
+    }
+    return 0;   // no output signature chunk: exports nothing
+}
+// The components a format stores (R=1 G=2 B=4 A=8); unknown formats count as all four.
+static UINT8 GhFmtChannels(DXGI_FORMAT f)
+{
+    switch (f){
+    case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R32_SINT:
+    case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SNORM: case DXGI_FORMAT_R16_SINT:
+    case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_R8_SNORM: case DXGI_FORMAT_R8_SINT:
+        return 1;
+    case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R32G32_UINT: case DXGI_FORMAT_R32G32_SINT:
+    case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16_UNORM: case DXGI_FORMAT_R16G16_UINT: case DXGI_FORMAT_R16G16_SNORM: case DXGI_FORMAT_R16G16_SINT:
+    case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R8G8_SNORM: case DXGI_FORMAT_R8G8_SINT:
+        return 3;
+    case DXGI_FORMAT_R11G11B10_FLOAT: case DXGI_FORMAT_R32G32B32_FLOAT: case DXGI_FORMAT_R32G32B32_UINT: case DXGI_FORMAT_R32G32B32_SINT:
+    case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        return 7;
+    default:
+        return 15;
+    }
+}
 static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** pp)
 {
@@ -14165,6 +14608,87 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
             use = &local;
         } else if (use != &local){
             // nothing swapped -- leave `use` pointing at the guest's own desc
+        }
+    }
+
+    // #253 the blue fire. Where a flipbook alpha-tested object's depth-only pre-pass (ps_DepthOnly ccfce513)
+    // wrote depth, the scene shows blue garbage, and no colour PS removes it -- as if the object's colour
+    // pass ran with DepthFunc EQUAL and never matched (depth-only VS and colour VS compiled separately by
+    // the console's back end need not agree to the bit). gh_depth_eq=1 relaxes EQUAL to the "or equal" of
+    // the direction the game's other depth-tested pipelines use (reversed-Z -> GREATER_EQUAL); the census
+    // (DEPTHFUNC line) is always logged.
+    if (use && use->DepthStencilState.DepthEnable){
+        static volatile LONG fc[9] = {};
+        const int f = (int)use->DepthStencilState.DepthFunc;
+        const LONG n = InterlockedIncrement(&fc[(f >= 1 && f <= 8) ? f : 0]);
+        static const unsigned deq = GhCfgNum(L"gh_depth_eq.txt", "GH_DEPTH_EQ", 0);
+        if (f == D3D12_COMPARISON_FUNC_EQUAL){
+            const bool greater = (fc[D3D12_COMPARISON_FUNC_GREATER] + fc[D3D12_COMPARISON_FUNC_GREATER_EQUAL]) >=
+                                 (fc[D3D12_COMPARISON_FUNC_LESS] + fc[D3D12_COMPARISON_FUNC_LESS_EQUAL]);
+            if (deq){
+                if (use != &local){ local = *use; use = &local; }
+                local.DepthStencilState.DepthFunc = greater ? D3D12_COMPARISON_FUNC_GREATER_EQUAL
+                                                            : D3D12_COMPARISON_FUNC_LESS_EQUAL;
+            }
+            if (n <= 16 || (n % 64) == 0)
+                Diag("DEPTHEQ n=" + std::to_string((long)n) + (deq ? (greater ? " -> GREATER_EQUAL" : " -> LESS_EQUAL")
+                                                                    : " (kept)") + psoKeys);
+        }
+        static volatile LONG tot = 0;
+        if ((InterlockedIncrement(&tot) % 256) == 1)
+            Diag("DEPTHFUNC never=" + std::to_string((long)fc[1]) + " less=" + std::to_string((long)fc[2]) +
+                 " equal=" + std::to_string((long)fc[3]) + " lessequal=" + std::to_string((long)fc[4]) +
+                 " greater=" + std::to_string((long)fc[5]) + " notequal=" + std::to_string((long)fc[6]) +
+                 " greaterequal=" + std::to_string((long)fc[7]) + " always=" + std::to_string((long)fc[8]) +
+                 " gh_depth_eq=" + std::to_string(deq));
+    }
+
+    // #253 PSOUT. A render target whose write mask covers components the pixel shader never exports (no
+    // SV_Target<i> at all, e.g. a depth-only PS with the colour targets still bound, or an SV_Target<i> narrower
+    // than the target) gets UNDEFINED values there. PC drivers export nothing/zero; this console's back end may
+    // export whatever is in the registers -- garbage that only shows where those pipelines draw. Always counted
+    // and logged; gh_ps_outmask=1 narrows each such write mask to what the shader exports (the "not written"
+    // reading of undefined).
+    if (use && use->PS.pShaderBytecode && use->NumRenderTargets){
+        const uint32_t pm = GhPsTargetMasks(use->PS.pShaderBytecode, use->PS.BytecodeLength);
+        static const unsigned om = GhCfgNum(L"gh_ps_outmask.txt", "GH_PS_OUTMASK", 0);
+        if (pm != 0xFFFFFFFFu){
+            const UINT nrt = use->NumRenderTargets > 8 ? 8 : use->NumRenderTargets;
+            std::string what;
+            UINT8 newMask[8] = {};
+            bool bad = false;
+            for (UINT i = 0; i < nrt; ++i){
+                const UINT8 wm = use->BlendState.IndependentBlendEnable ? use->BlendState.RenderTarget[i].RenderTargetWriteMask
+                                                                        : use->BlendState.RenderTarget[0].RenderTargetWriteMask;
+                newMask[i] = wm;
+                if (use->RTVFormats[i] == DXGI_FORMAT_UNKNOWN) continue;
+                const UINT8 need = wm & GhFmtChannels(use->RTVFormats[i]);
+                const UINT8 have = (UINT8)((pm >> (4 * i)) & 0xF);
+                if (need & ~have){
+                    bad = true;
+                    newMask[i] = (UINT8)(wm & have);
+                    what += " rt" + std::to_string(i) + "(fmt=" + std::to_string((int)use->RTVFormats[i]) +
+                            " wm=" + Hex((uint32_t)wm) + " ps=" + Hex((uint32_t)have) + ")";
+                }
+            }
+            if (bad){
+                static volatile LONG nb = 0;
+                const LONG k = InterlockedIncrement(&nb);
+                if (om){
+                    if (use != &local){ local = *use; use = &local; }
+                    if (!local.BlendState.IndependentBlendEnable){
+                        for (int i = 1; i < 8; ++i) local.BlendState.RenderTarget[i] = local.BlendState.RenderTarget[0];
+                        local.BlendState.IndependentBlendEnable = TRUE;
+                    }
+                    for (UINT i = 0; i < nrt; ++i) local.BlendState.RenderTarget[i].RenderTargetWriteMask = newMask[i];
+                }
+                if (k <= 64 || (k % 64) == 0)
+                    Diag("PSOUT n=" + std::to_string((long)k) + (om ? " MASKED" : " (kept)") + " nrt=" +
+                         std::to_string((unsigned)nrt) + what + psoKeys);
+            }
+        } else {
+            static volatile LONG nu = 0;
+            if (InterlockedIncrement(&nu) <= 8) Diag("PSOUT unparsed output signature" + psoKeys);
         }
     }
 
@@ -14625,6 +15149,18 @@ static HRESULT __stdcall Hook_D12CreateCPS(ID3D12Device* self,
             res += " CREATED pso=" + Hex((uint64_t)(uintptr_t)*pp) +
                    " cidx=" + std::to_string((long)InterlockedIncrement(&cpsIdx));
             res += psoKeys;   // #234
+            GhVsKeyNoteCs(GhPsoRealOf((ID3D12PipelineState*)*pp), psoKeys);   // #253 CSSKIP
+            GhVarBuild(self, (GhCpsRawFn)orig, d, GhPsoRealOf((ID3D12PipelineState*)*pp), psoKeys);   // #253 VARSWAP
+            const UINT8 ck = psoKeys.find("cs=fa29971e") != std::string::npos ? 1 :
+                             psoKeys.find("cs=6ff4d302") != std::string::npos ? 2 :
+                             psoKeys.find("cs=e65bf0bf") != std::string::npos ? 3 : 0;
+            if (GhCullDump() && ck){   // XFW11 (+XFW12c: the LOD pass and the reset, for ordering)
+                AcquireSRWLockExclusive(&g_cullLk);
+                if (!g_cullPsos) g_cullPsos = new std::unordered_map<void*, UINT8>();
+                (*g_cullPsos)[*pp] = ck;
+                ReleaseSRWLockExclusive(&g_cullLk);
+                res += " CULLPSO" + std::to_string((int)ck);
+            }
             if (d) res += " cs=" + std::to_string((unsigned long long)d->CS.BytecodeLength);
             // #202 the PSO pager, compute half. Gated on !cpsFault for the same
             // reason the publish below is: a faulted create can still leave a
@@ -16258,6 +16794,7 @@ static bool GhFirstSeen(const char* kind, uint64_t key)
 // run), so gh_cl_trace_first=N arms the per-op trace at FIRST #N for the next
 // gh_cl_trace_span submissions (default 400). Off (0) unless asked.
 static volatile LONG g_clTraceArmEcl = -1;
+static volatile LONG g_clTraceSpanLive = 0;   // #253 CLNOW: span of a live-armed window (gh_cl_trace_now.txt)
 static LONG GhEclNowEarly();
 static void GhFirstSay(const char* kind, const std::string& what)
 {
@@ -16679,6 +17216,11 @@ struct GhCLNote {
     UINT64  xfwB14[32], xfwT1[32]; UINT32 xfwT1Off[32]; UINT8 xfwT1Kind[32];
     void*   xfwHeap[32]; void* xfwPso[32]; LONG xfwN;
     UINT32  xfwEiGen[32];           // XFW8: args readback ring generation (0 = none)
+    // XFW9: per sampled draw, the draw call (kind + 5 args) and the space2 instance-stream
+    // bindings (t0, t2): root VA (kind 1) or table GPU handle + offset (kind 2).
+    UINT32  xinArgs[32][6]; UINT64 xinS[32][2]; UINT32 xinSOff[32][2]; UINT8 xinSK[32][2];
+    UINT32  xinRb[32];              // XFW9c: readback-ring generation of the GPU-memory instance records (0 = none)
+    UINT64  xinRt[32], xinDs[32]; float xinView[32][4];   // XFW9d: RTV0 / DSV handle and viewport 0 (x,y,w,h) at the draw
     void*   xfwRs;                  // graphics root signature, kept whatever gh_rs_bindless says
     UINT32  xfwK[16]; UINT32 xfwKSet;   // SetGraphicsRoot32BitConstant(s) dword 0, per root index
     UINT8   xfwW[64]; UINT32 xfwWAny;   // XFW3: write kinds per watched transform buffer since Reset
@@ -16686,6 +17228,18 @@ struct GhCLNote {
     // buffers this list has transitioned to UAV and not yet out of it (the writer-dispatch window).
     void*   xcpSrc[256]; UINT64 xcpSOff[256], xcpDOff[256], xcpN[256]; UINT8 xcpBone[256]; LONG xcpCnt;
     UINT64  xfwUav;
+    // XFW9f: the same window as an ordered event log (1 open, 2 close, 3 dispatch, 4 indirect), replayed
+    // at submission against the queue's own UAV state -- the game opens the window in one list and
+    // dispatches in another, which the per-list window above never sees.
+    struct { void* pso; UINT8 k, bone; } xev[256]; LONG xevN;
+    // XFW10: armed at Reset (frame xwFrame); ring generations of this list's after-dispatch copies in
+    // list order, and per sampled draw the dispatch ordinal it follows and the regions it read.
+    UINT8 xwOn; UINT32 xwOrd; LONG64 xwFrame; LONG xwGen[512]; LONG xwGenN; LONG xwPend;
+    void* xinRegR[32][2]; UINT64 xinRegO[32][2]; UINT32 xinOrd[32];
+    // XFW11 (gh_cull_dump): compute root state, and the culling dispatches a dump-frame list recorded.
+    void* cxRs; UINT64 cxVa[16]; UINT32 cxVaSet; UINT32 cxK[16]; UINT32 cxKSet; UINT64 cxTbl[16]; UINT32 cxTblSet;
+    UINT8 cullOn; LONG64 cullFrame; UINT32 cullN, cullOrd;
+    struct { UINT64 b14, t1; UINT32 t1Off, gx, ord; UINT8 t1Kind, kind; } cull[256];
 };
 static GhCLNote g_clNotes[512]{};
 static SRWLOCK  g_clLock = SRWLOCK_INIT;
@@ -16736,7 +17290,16 @@ static void GhXfwNoteUav(ID3D12CommandList* self, const void* res, bool open)
     if (!g_xfwBoneN || !res || !GhXfwCpOn()) return;
     const int i = GhXfwBoneIdx(res);
     if (i < 0) return;
-    if (GhCLNote* n = GhCLFind(self)){ if (open) n->xfwUav |= 1ull << i; else n->xfwUav &= ~(1ull << i); }
+    if (GhCLNote* n = GhCLFind(self)){
+        if (open) n->xfwUav |= 1ull << i; else n->xfwUav &= ~(1ull << i);
+        if (n->xevN < 256){ auto& e = n->xev[n->xevN++]; e.pso = nullptr; e.k = open ? 1 : 2; e.bone = (UINT8)i; }
+    }
+}
+static void GhXfwNoteDisp(ID3D12CommandList* self, bool indirect)   // XFW9f
+{
+    if (!g_xfwBoneN || !GhXfwCpOn()) return;
+    if (GhCLNote* n = GhCLFind(self))
+        if (n->xevN < 256){ auto& e = n->xev[n->xevN++]; e.pso = n->lastPso; e.k = indirect ? 4 : 3; e.bone = 0; }
 }
 static volatile LONG64 g_xcpOver = 0;   // copies past the 8 a list can hold
 static void GhXfwNoteCopy(ID3D12CommandList* self, const void* d, UINT64 dOff, void* sr, UINT64 sOff, UINT64 nb)
@@ -16757,6 +17320,20 @@ static std::mutex g_xcsMu;
 static std::map<std::pair<void*, UINT64>, LONG64>* g_xcs = nullptr;
 static void GhXfwCsNote(void* pso, UINT64 mask, UINT x, UINT y, UINT z)
 {
+    if (GhXfwWho() && pso){   // XFW10: the candidate writers, not capped with g_xcs
+        AcquireSRWLockShared(&g_xwPsoLk);
+        const bool have = g_xwPsoSet && g_xwPsoSet->count(pso);
+        ReleaseSRWLockShared(&g_xwPsoLk);
+        if (!have){
+            AcquireSRWLockExclusive(&g_xwPsoLk);
+            if (!g_xwPsoSet) g_xwPsoSet = new std::unordered_set<void*>();
+            if (g_xwPsoSet->size() < 4096 && g_xwPsoSet->insert(pso).second){
+                if (!g_xwPsoVec) g_xwPsoVec = new std::vector<void*>();
+                g_xwPsoVec->push_back(pso);
+            }
+            ReleaseSRWLockExclusive(&g_xwPsoLk);
+        }
+    }
     const std::pair<void*, UINT64> key(pso, mask);
     size_t nd = 0; bool first = false;
     {
@@ -16771,7 +17348,8 @@ static void GhXfwCsNote(void* pso, UINT64 mask, UINT x, UINT y, UINT z)
     }
     if (first)
         Diag("XFW BONECS pso=" + Hex((uint64_t)(uintptr_t)pso) + " bones=" + Hex((uint64_t)mask) +
-             (x == 0xEEEEEEEEu ? " grp=EI max=" + std::to_string((unsigned long)y)
+             (x == 0xCCCCCCCCu ? std::string(" grp=XLIST") + (y ? "/EI" : "") :
+              x == 0xEEEEEEEEu ? " grp=EI max=" + std::to_string((unsigned long)y)
                                : " grp=" + std::to_string((unsigned long)x) + "," +
                                  std::to_string((unsigned long)y) + "," + std::to_string((unsigned long)z)) +
              " distinct=" + std::to_string((unsigned long long)nd));
@@ -17125,7 +17703,10 @@ static bool GhCLTraceOn()
     static const unsigned span = GhCfgNumZ(L"gh_cl_trace_span.txt", "GH_CL_TRACE_SPAN", 400);
     const LONG e = InterlockedCompareExchange(&g_eclCount, 0, 0);
     const LONG arm = InterlockedCompareExchange(&g_clTraceArmEcl, 0, 0);
-    if (arm >= 0) return e >= arm && e <= arm + (LONG)span;   // #234: armed by gh_cl_trace_first
+    if (arm >= 0){
+        const LONG sl = InterlockedCompareExchange(&g_clTraceSpanLive, 0, 0);   // #253 CLNOW
+        return e >= arm && e <= arm + (sl > 0 ? sl : (LONG)span);   // #234: armed by gh_cl_trace_first
+    }
     if (!lo && !hi) return e <= 64;
     return e >= (LONG)lo && (!hi || e <= (LONG)hi);
 }
@@ -17848,9 +18429,22 @@ static void __stdcall Hook_CLSetGfx32s(ID3D12GraphicsCommandList* self, UINT idx
         UINT32 v; std::memcpy(&v, src, 4); n->xfwK[idx] = v; n->xfwKSet |= 1u << idx; }
     ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, UINT, const void*, UINT))GhClOrig(self, 36))(self, idx, num, src, at);
 }
+// XFW11: the compute twins of Hook_CLSetGfx32/32s (slots 33/35), installed only with gh_cull_dump.
+static void __stdcall Hook_CLSetCmp32(ID3D12GraphicsCommandList* self, UINT idx, UINT v, UINT at)
+{
+    if (at == 0 && idx < 16) if (GhCLNote* n = GhCLFind(self)){ n->cxK[idx] = v; n->cxKSet |= 1u << idx; }
+    ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT))GhClOrig(self, 33))(self, idx, v, at);
+}
+static void __stdcall Hook_CLSetCmp32s(ID3D12GraphicsCommandList* self, UINT idx, UINT num, const void* src, UINT at)
+{
+    if (at == 0 && num && src && idx < 16) if (GhCLNote* n = GhCLFind(self)){
+        UINT32 v; std::memcpy(&v, src, 4); n->cxK[idx] = v; n->cxKSet |= 1u << idx; }
+    ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, UINT, const void*, UINT))GhClOrig(self, 35))(self, idx, num, src, at);
+}
 static void __stdcall Hook_CLSetCompRootSig(ID3D12GraphicsCommandList* self,
                                            ID3D12RootSignature* rs)
 {
+    if (GhCullDump()) if (GhCLNote* n = GhCLFind(self)){ n->cxRs = rs; n->cxVaSet = n->cxKSet = n->cxTblSet = 0; }   // XFW11
     if (GhOpMask() & 131072) return;
     if (!GhRecCap29(self, rs))
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12RootSignature*))GhClOrig(self, 29))(self, rs);
@@ -18684,7 +19278,33 @@ static HRESULT __stdcall Hook_CLReset(ID3D12GraphicsCommandList* self,
         n->rsGfx = n->rsComp = nullptr;   // #173, same rule: Reset clears the root signature
         n->xfwN = 0; n->xfwRs = nullptr; n->xfwKSet = 0;   // #252
         if (n->xfwWAny){ std::memset(n->xfwW, 0, sizeof n->xfwW); n->xfwWAny = 0; }
-        n->xcpCnt = 0; n->xfwUav = 0;   // XFW4
+        n->xcpCnt = 0; n->xfwUav = 0; n->xevN = 0;   // XFW4, XFW9f
+        n->xwOrd = 0; n->xwGenN = 0; n->xwOn = 0; n->xwPend = -1;   // XFW10
+        n->cxRs = nullptr; n->cxVaSet = n->cxKSet = n->cxTblSet = 0; n->cullN = n->cullOrd = 0; n->cullOn = 0;   // XFW11
+        if (const unsigned C = GhCullDump()){
+            n->cullFrame = InterlockedCompareExchange64(&g_gprPresents, 0, 0);
+            GhCullRbDrain(n->cullFrame);   // XFW12
+            // Armed by a trigger file dropped once the level is live (checked every 300 presents), so the
+            // 8 dumps are not spent in the menu.
+            static volatile LONG64 s_chk = -1; static volatile LONG s_go = 0;
+            if (n->cullFrame / 300 != InterlockedCompareExchange64(&s_chk, 0, 0)){
+                InterlockedExchange64(&s_chk, n->cullFrame / 300);
+                const bool go = GetFileAttributesW((std::wstring(kLocalState) + L"gh_cull_go.txt").c_str()) != INVALID_FILE_ATTRIBUTES;
+                if (go != (InterlockedCompareExchange(&s_go, 0, 0) != 0)){
+                    InterlockedExchange(&s_go, go ? 1 : 0);
+                    Diag(std::string("CULLDUMP trigger ") + (go ? "ON" : "off") + " frame=" + std::to_string((long long)n->cullFrame));
+                }
+            }
+            // XFW12b: gh_cull_rb=N dumps N consecutive frames per window (the capacity the CPU writes at frame F
+            // against the GPU counts of F-1, F-2, ...).
+            const unsigned span = GhCullRb() > 1 ? GhCullRb() : 1;
+            n->cullOn = (UINT8)(GhXfwOn() && InterlockedCompareExchange(&s_go, 0, 0) && (n->cullFrame % C) < span &&
+                                InterlockedCompareExchange(&g_cullDumps, 0, 0) < (LONG)(8 * span));
+        }
+        if (const unsigned P = GhXfwWho()){
+            n->xwFrame = InterlockedCompareExchange64(&g_gprPresents, 0, 0);
+            n->xwOn = (UINT8)(GhXfwOn() && (n->xwFrame % P) < 2);
+        }
         n->tbRoot[0] = n->tbRoot[1] = 0; n->tbHeap = 0; n->tbHeapN = 0;
         for (int c = 0; c < 2; ++c) n->tbv[c][0] = n->tbv[c][1] = kGhTbNone;
         n->nrt = n->hasDsv = n->nvp = n->nsc = 0;
@@ -18715,6 +19335,7 @@ static HRESULT __stdcall Hook_CLReset(ID3D12GraphicsCommandList* self,
                                                ID3D12PipelineState*))GhClOrig(self, 10))
                         (self, useA, pso);
     if (SUCCEEDED(rhr)) GhGprReset(self);   // #236: the list-start stamp
+    if (SUCCEEDED(rhr)) GhXwListReset(self);   // XFW10c
     if (FAILED(rhr)){
         static volatile LONG nbad = 0;
         const LONG k = InterlockedIncrement(&nbad);
@@ -18733,25 +19354,138 @@ static HRESULT __stdcall Hook_CLReset(ID3D12GraphicsCommandList* self,
     }
     return rhr;
 }
-// VSSKIP (debug, scatter hunt): drop every draw whose pipeline's VS key (first 8 hex digits of the
+// VSSKIP (debug, scatter hunt): drop every draw whose pipeline's VS or PS key (first 8 hex digits of the
 // original container digest) is listed in LocalState gh_vs_skip_list.txt. The list is re-read every
 // 2 s, so a whole bisection runs inside one level session, judged from screenshots. gh_vs_skip=1 arms
 // it; off, the only cost is one static load per draw.
 static unsigned GhVsSkipOn(){ static const unsigned m = GhCfgNum(L"gh_vs_skip.txt", "GH_VS_SKIP", 0); return m; }
 static SRWLOCK g_vskLk = SRWLOCK_INIT;
-static std::unordered_map<void*, UINT32>* g_vskKey = nullptr;   // real pso -> VS key prefix
+static std::unordered_map<void*, UINT64>* g_vskKey = nullptr;   // real pso -> VS key prefix | PS key prefix << 32
 static std::unordered_set<UINT32>* volatile g_vskSet = nullptr;  // published, never freed (tiny)
-static volatile LONG64 g_vskSkipped = 0, g_vskSeen = 0;
+static volatile LONG64 g_vskSkipped = 0, g_vskSeen = 0, g_vskUnkDraws = 0;
+static std::unordered_map<void*, UINT64>* g_vskUnk = nullptr;   // #253 unkeyed pso -> draws (under g_vskLk)
 static void GhVsKeyNote(void* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d)
 {
     if (!GhVsSkipOn() || !pso || !d || !d->VS.pShaderBytecode || d->VS.BytecodeLength < 20) return;
     char k[33];
     if (!GhShaderKey(d->VS.pShaderBytecode, d->VS.BytecodeLength, k)) return;
-    const UINT32 v = (UINT32)std::strtoul(std::string(k, 8).c_str(), nullptr, 16);
+    UINT64 v = (UINT32)std::strtoul(std::string(k, 8).c_str(), nullptr, 16);
+    // #253: the PS key rides in the high half, so a listed PS drops its draws too (the blue fire is a colour bug)
+    if (d->PS.pShaderBytecode && d->PS.BytecodeLength >= 20 && GhShaderKey(d->PS.pShaderBytecode, d->PS.BytecodeLength, k))
+        v |= (UINT64)(UINT32)std::strtoul(std::string(k, 8).c_str(), nullptr, 16) << 32;
     AcquireSRWLockExclusive(&g_vskLk);
-    if (!g_vskKey) g_vskKey = new std::unordered_map<void*, UINT32>();
+    if (!g_vskKey) g_vskKey = new std::unordered_map<void*, UINT64>();
     (*g_vskKey)[pso] = v;
     ReleaseSRWLockExclusive(&g_vskLk);
+}
+// #253 CSSKIP: a compute pipeline's CS key rides in the low half, so the same list drops its dispatches
+// (Dispatch and ExecuteIndirect). BF1-BF5 bisected every graphics draw and no keyed one paints the blue fire;
+// compute was never tested.
+static void GhVsKeyNoteCs(void* pso, const std::string& keys)
+{
+    if (!GhVsSkipOn() || !pso) return;
+    const size_t at = keys.find("cs=");
+    if (at == std::string::npos || at + 11 > keys.size()) return;
+    const std::string h = keys.substr(at + 3, 8);
+    for (char c : h) if (!std::isxdigit((unsigned char)c)) return;
+    AcquireSRWLockExclusive(&g_vskLk);
+    if (!g_vskKey) g_vskKey = new std::unordered_map<void*, UINT64>();
+    (*g_vskKey)[pso] = (UINT32)std::strtoul(h.c_str(), nullptr, 16);
+    ReleaseSRWLockExclusive(&g_vskLk);
+}
+// #253 VARSWAP (debug): live A/B of a compute shader's variants inside one level session. When a compute
+// pipeline is created and LocalState holds gh_var_<key8>_<n>.bin (n = 1..9), a pipeline is built from each with
+// the game's own root signature. gh_var_sel.txt = "<key8> <n>" (re-read with the skip list) makes every
+// Dispatch/ExecuteIndirect of that key bind variant n for the one call; "0" or no file = the real pipeline.
+static std::unordered_map<void*, std::vector<ID3D12PipelineState*>>* g_varPso = nullptr;   // real pso -> variants (under g_vskLk)
+static volatile LONG64 g_varSel = 0;   // key8 << 8 | n
+static volatile LONG64 g_varSwaps = 0;
+struct GhVarCtx { ID3D12Device* dev; GhCpsRawFn fn; D3D12_COMPUTE_PIPELINE_STATE_DESC d; void* real; std::string h; };
+static std::vector<GhVarCtx>* g_varCtx = nullptr;   // every debug-mode compute pipeline (under g_vskLk)
+// Builds variant n (1..9) of one pipeline from LocalState gh_var_<key8>_<n>.bin (re-read each time).
+static ID3D12PipelineState* GhVarMake(const GhVarCtx& c, int n)
+{
+    std::vector<uint8_t> blob;
+    const std::wstring f = std::wstring(kLocalState) + L"gh_var_" + std::wstring(c.h.begin(), c.h.end()) + L"_" +
+                           std::to_wstring(n) + L".bin";
+    if (!ReadWholeFile(f, blob, true) || blob.size() < 0x24) return nullptr;
+    auto* keep = new std::vector<uint8_t>(std::move(blob));   // the driver may keep the pointer: never freed
+    D3D12_COMPUTE_PIPELINE_STATE_DESC vd = c.d;
+    vd.CS = { keep->data(), keep->size() };
+    vd.CachedPSO = D3D12_CACHED_PIPELINE_STATE{};
+    void* out = nullptr; DWORD fault = 0;
+    const HRESULT hr = GhCallCpsGuarded(c.fn, c.dev, &vd, __uuidof(ID3D12PipelineState), &out, &fault);
+    Diag("VARPSO key=" + c.h + " n=" + std::to_string(n) + " bytes=" + std::to_string((unsigned)keep->size()) +
+         " hr=" + Hex((uint32_t)hr) + (fault ? " FAULT=" + Hex((uint32_t)fault) : "") +
+         " pso=" + Hex((uint64_t)(uintptr_t)out) + " real=" + Hex((uint64_t)(uintptr_t)c.real));
+    return SUCCEEDED(hr) ? (ID3D12PipelineState*)out : nullptr;
+}
+static void GhVarBuild(ID3D12Device* dev, GhCpsRawFn fn, const D3D12_COMPUTE_PIPELINE_STATE_DESC* d, void* real,
+                       const std::string& keys)
+{
+    if (!GhVsSkipOn() || !dev || !d || !real) return;
+    const size_t at = keys.find("cs=");
+    if (at == std::string::npos || at + 11 > keys.size()) return;
+    GhVarCtx c{ dev, fn, *d, real, keys.substr(at + 3, 8) };
+    c.d.CS = {}; c.d.CachedPSO = D3D12_CACHED_PIPELINE_STATE{};
+    if (c.d.pRootSignature) c.d.pRootSignature->AddRef();   // kept for live rebuilds (VARSEL)
+    std::vector<ID3D12PipelineState*> vs(9, nullptr);
+    bool any = false;
+    for (int n = 1; n <= 9; ++n) if ((vs[n - 1] = GhVarMake(c, n))) any = true;
+    AcquireSRWLockExclusive(&g_vskLk);
+    if (!g_varCtx) g_varCtx = new std::vector<GhVarCtx>();
+    g_varCtx->push_back(c);
+    if (any){
+        if (!g_varPso) g_varPso = new std::unordered_map<void*, std::vector<ID3D12PipelineState*>>();
+        (*g_varPso)[real] = vs;
+    }
+    ReleaseSRWLockExclusive(&g_vskLk);
+}
+// VARSEL change: rebuild variant n of every pipeline with that key from the file as it is NOW, so new variants
+// can be uploaded and tried inside one level session. The old variant leaks (a list in flight may still use it).
+static void GhVarRebuild(UINT32 key, int n)
+{
+    std::vector<GhVarCtx> cs;
+    AcquireSRWLockShared(&g_vskLk);
+    if (g_varCtx) for (const auto& c : *g_varCtx) if ((UINT32)std::strtoul(c.h.c_str(), nullptr, 16) == key) cs.push_back(c);
+    ReleaseSRWLockShared(&g_vskLk);
+    for (const auto& c : cs){
+        ID3D12PipelineState* p = GhVarMake(c, n);
+        if (!p) continue;
+        AcquireSRWLockExclusive(&g_vskLk);
+        if (!g_varPso) g_varPso = new std::unordered_map<void*, std::vector<ID3D12PipelineState*>>();
+        auto& v = (*g_varPso)[c.real];
+        if (v.size() != 9) v.assign(9, nullptr);
+        v[n - 1] = p;
+        ReleaseSRWLockExclusive(&g_vskLk);
+    }
+}
+// Binds the selected variant for one dispatch; returns the real pipeline to restore (null = nothing swapped).
+static ID3D12PipelineState* GhVarSwapBefore(ID3D12GraphicsCommandList* self)
+{
+    const LONG64 sel = g_varSel;
+    if (!sel || !g_varPso) return nullptr;
+    GhCLNote* n = GhCLFind(self);
+    if (!n || !n->lastPso) return nullptr;
+    ID3D12PipelineState* v = nullptr;
+    AcquireSRWLockShared(&g_vskLk);
+    if (g_vskKey){
+        auto ik = g_vskKey->find(n->lastPso);
+        if (ik != g_vskKey->end() && (UINT32)ik->second == (UINT32)(sel >> 8)){
+            auto it = g_varPso->find(n->lastPso);
+            const int k = (int)(sel & 0xFF);
+            if (it != g_varPso->end() && k >= 1 && k <= 9) v = it->second[k - 1];
+        }
+    }
+    ReleaseSRWLockShared(&g_vskLk);
+    if (!v) return nullptr;
+    ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*))GhClOrig(self, 25))(self, v);
+    InterlockedIncrement64(&g_varSwaps);
+    return (ID3D12PipelineState*)n->lastPso;
+}
+static void GhVarSwapAfter(ID3D12GraphicsCommandList* self, ID3D12PipelineState* real)
+{
+    if (real) ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*))GhClOrig(self, 25))(self, real);
 }
 static DWORD WINAPI GhVsSkipReader(void*)
 {
@@ -18774,6 +19508,40 @@ static DWORD WINAPI GhVsSkipReader(void*)
                  std::to_string((long long)InterlockedCompareExchange64(&g_vskSkipped, 0, 0)) +
                  " seen=" + std::to_string((long long)InterlockedCompareExchange64(&g_vskSeen, 0, 0)));
         }
+        {   // #253 VARSWAP selection
+            static std::string lastSel = "\x01";
+            std::vector<uint8_t> vf;
+            std::string vs;
+            if (ReadWholeFile(std::wstring(kLocalState) + L"gh_var_sel.txt", vf, true)) vs.assign(vf.begin(), vf.end());
+            if (vs != lastSel){
+                lastSel = vs;
+                const UINT32 key = (UINT32)std::strtoul(vs.c_str(), nullptr, 16);
+                const size_t sp = vs.find_first_of(" \t");
+                const long nn = sp == std::string::npos ? 0 : std::strtol(vs.c_str() + sp, nullptr, 10);
+                const LONG64 v = (key && nn >= 1 && nn <= 9) ? (((LONG64)key << 8) | nn) : 0;
+                InterlockedExchange64(&g_varSel, 0);
+                if (v) GhVarRebuild(key, (int)nn);
+                InterlockedExchange64(&g_varSel, v);
+                Diag("VARSEL key=" + Hex(key) + " n=" + std::to_string(nn) + (v ? " ON" : " OFF") +
+                     " swaps=" + std::to_string((long long)InterlockedCompareExchange64(&g_varSwaps, 0, 0)));
+            }
+        }
+        // #253 CLNOW: gh_cl_trace_now.txt (content = span in submissions, default 25) arms the
+        // CL trace window at the current submission, once per file; the file is deleted.
+        {
+            std::vector<uint8_t> tf;
+            const std::wstring tp = std::wstring(kLocalState) + L"gh_cl_trace_now.txt";
+            if (ReadWholeFile(tp, tf, true)){
+                std::string ts(tf.begin(), tf.end());
+                long sp = std::strtol(ts.c_str(), nullptr, 10);
+                if (sp <= 0 || sp > 2000) sp = 25;
+                DeleteFileW(tp.c_str());
+                InterlockedExchange(&g_clTraceSpanLive, (LONG)sp);
+                const LONG e = GhEclNow();
+                InterlockedExchange(&g_clTraceArmEcl, e);
+                Diag("CLTRACE armed live ecl=" + std::to_string((long)e) + " span=" + std::to_string(sp));
+            }
+        }
         Sleep(2000);
     }
 }
@@ -18786,15 +19554,30 @@ static bool GhVsSkipDraw(ID3D12GraphicsCommandList* self)
         if (t) CloseHandle(t);
     }
     const std::unordered_set<UINT32>* set = g_vskSet;
-    if (!set || set->empty()) return false;
     GhCLNote* n = GhCLFind(self);
     if (!n || !n->lastPso) return false;
-    UINT32 v = 0; bool have = false;
+    UINT64 v = 0; bool have = false;
     AcquireSRWLockShared(&g_vskLk);
     if (g_vskKey){ auto it = g_vskKey->find(n->lastPso); if (it != g_vskKey->end()){ v = it->second; have = true; } }
     ReleaseSRWLockShared(&g_vskLk);
     InterlockedIncrement64(&g_vskSeen);
-    if (!have || !set->count(v)) return false;
+    if (!have){
+        // #253 VSKUNK: the draws no list can drop. Named once per pipeline (and the running count every 4096th
+        // draw), so the pointer can be matched to its creation line and the bisection's blind spot measured.
+        AcquireSRWLockExclusive(&g_vskLk);
+        if (!g_vskUnk) g_vskUnk = new std::unordered_map<void*, UINT64>();
+        const UINT64 c = ++(*g_vskUnk)[n->lastPso];
+        const size_t np = g_vskUnk->size();
+        ReleaseSRWLockExclusive(&g_vskLk);
+        const LONG64 tot = InterlockedIncrement64(&g_vskUnkDraws);
+        if ((c == 1 && np <= 256) || (c % 4096) == 0)
+            Diag("VSKUNK pso=" + Hex((uint64_t)(uintptr_t)n->lastPso) + " draws=" + std::to_string((unsigned long long)c) +
+                 " standin=" + std::to_string((int)GhIsStandIn(n->lastPso)) + " psos=" + std::to_string((unsigned long long)np) +
+                 " unkeyed=" + std::to_string((long long)tot) + " seen=" +
+                 std::to_string((long long)InterlockedCompareExchange64(&g_vskSeen, 0, 0)));
+    }
+    if (!set || set->empty()) return false;
+    if (!have || !(set->count((UINT32)v) || ((v >> 32) && set->count((UINT32)(v >> 32))))) return false;
     InterlockedIncrement64(&g_vskSkipped);
     return true;
 }
@@ -18880,16 +19663,23 @@ static void __stdcall Hook_CLDispatch(ID3D12GraphicsCommandList* self, UINT x, U
     if (GhCLNote* n = GhCLFind(self)) InterlockedIncrement(&n->disp);
     if (GhCLNote* n = GhCLFind(self)) GhDispLog(self, n->lastPso, x, y, z);
     if (GhCLNote* n = GhCLFind(self)) if (n->xfwUav) GhXfwCsNote(n->lastPso, n->xfwUav, x, y, z);   // XFW4
+    if (GhCullDump()) GhCullNoteDisp(self, x);   // XFW11
+    GhXfwNoteDisp(self, false);   // XFW9f
     const LONG wi = GhWorkIndex(self);
     if (GhCLTraceOn()) GhCLOp(self, "w=" + std::to_string((long)wi) +
                                     " DISPATCH " + std::to_string((unsigned long)x) + "," +
                                     std::to_string((unsigned long)y) + "," + std::to_string((unsigned long)z));
     if ((GhOpMask() & 2) || GhWorkOpDropped(self, wi)) return;
+    if (GhVsSkipDraw(self)) return;   // #253 CSSKIP
     t_bcOpArgs = GhOpArgs{ 14, { x, y, z, 0, 0 } };
     GhGprStamp(self, 3);   // #236
     const LONG bcg = GhBreadcrumbBefore(self);
+    GhXwBefore(self, false);   // XFW10b
+    ID3D12PipelineState* varReal = GhVarSwapBefore(self);   // #253 VARSWAP
     if (!GhRecCap14(self, x, y, z))
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT))GhClOrig(self, 14))(self, x, y, z);
+    GhVarSwapAfter(self, varReal);
+    GhXwAfter(self, false);   // XFW10b
     if (GhCLNote* nn = GhCLFind(self)) InterlockedIncrement(&nn->iDisp);  // #158 issued-side
     GhBreadcrumbAfter(self, bcg);
 }
@@ -18919,7 +19709,14 @@ static void __stdcall Hook_CLSetPso(ID3D12GraphicsCommandList* self, ID3D12Pipel
             GhPagerPin((GhPsoProxy*)pso, "bundle");
     }
     if (GhCLTraceOn())
-        Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " SETPSO " + Hex((uint64_t)(uintptr_t)rp));
+    {
+        UINT64 kk = 0; bool hk = false;   // #253 CLNOW: name the pipeline by its shader keys
+        AcquireSRWLockShared(&g_vskLk);
+        if (g_vskKey){ auto it = g_vskKey->find(rp); if (it != g_vskKey->end()){ kk = it->second; hk = true; } }
+        ReleaseSRWLockShared(&g_vskLk);
+        Diag("CLOP " + Hex((uint64_t)(uintptr_t)self) + " SETPSO " + Hex((uint64_t)(uintptr_t)rp) +
+             (hk ? " k=" + Hex((uint64_t)kk) : std::string()));
+    }
     // A proxy whose rematerialise failed is a null, and a null here is the exact
     // fault #196 fixed. Swallow it the same way rather than hand the runtime one.
     if (pso && !rp){
@@ -20122,6 +20919,8 @@ static HRESULT __stdcall Hook_CLClose(ID3D12GraphicsCommandList* self)
 {
     GhBarrFlushPending(self);
     GhGprClose(self);   // #236: list-end stamp + resolve into the readback ring
+    GhXwListClose(self);   // XFW10c
+    if (GhCullDump()) GhCullRbClose(self);   // XFW12
     return ((HRESULT (__stdcall*)(ID3D12GraphicsCommandList*))GhClOrig(self, 9))(self);
 }
 static void __stdcall Hook_CLBeginEvent(ID3D12GraphicsCommandList* self, UINT meta,
@@ -20397,6 +21196,7 @@ static void __stdcall Hook_CLExecIndirect(ID3D12GraphicsCommandList* self, void*
     GhIndCapture(self, args, argOff, maxCount, wi);
     GhSigUse(sig, maxCount, cnt != nullptr);   // scatter-jump CMDSIG
     if (GhCLNote* n = GhCLFind(self)) if (n->xfwUav) GhXfwCsNote(n->lastPso, n->xfwUav, 0xEEEEEEEEu, maxCount, 0);   // XFW4
+    GhXfwNoteDisp(self, true);   // XFW9f
     if (GhCLTraceOn()){
         std::string extra;
         if (args){
@@ -20444,9 +21244,14 @@ static void __stdcall Hook_CLExecIndirect(ID3D12GraphicsCommandList* self, void*
     const LONG bcg = GhBreadcrumbBefore(self);
     GhIndRingCapture(self, args, argOff, maxCount, cnt, cntOff, bcg);
     if (GhXfwEi()) GhXeiDraw(self, sig, args, argOff);   // XFW8
-    if (!GhVsSkipDraw(self) && !GhRecCap59(self, sig, maxCount, args, argOff, cnt, cntOff))   // VSSKIP
+    GhXwBefore(self, true);   // XFW10b
+    if (!GhVsSkipDraw(self) && !GhRecCap59(self, sig, maxCount, args, argOff, cnt, cntOff)){   // VSSKIP
+        ID3D12PipelineState* varReal = GhVarSwapBefore(self);   // #253 VARSWAP
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, void*, UINT, ID3D12Resource*, UINT64,
                         ID3D12Resource*, UINT64))GhClOrig(self, 59))(self, sig, maxCount, args, argOff, cnt, cntOff);
+        GhVarSwapAfter(self, varReal);
+    }
+    GhXwAfter(self, true);   // XFW10
     GhBreadcrumbAfter(self, bcg);
 }
 // Copies and clears: the two categories left in a command list once draws,
@@ -20460,6 +21265,7 @@ static void __stdcall Hook_CLCopyBufferRegion(ID3D12GraphicsCommandList* self,
     GhRhWrite(d);   // #234 T33HIST
     GhXfwNoteW(self, d, 1);   // #252 XFW3
     GhXfwNoteCopy(self, d, dOff, sr, sOff, n);   // XFW4
+    if (GhCullDump() && sr && (sr == g_cullCntRes[0] || sr == g_cullCntRes[1])) GhCullCopyNote(self, d, dOff, sr, sOff, n);   // XFW12d
     if (!GhRecCap15(self, d, dOff, sr, sOff, n))
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT64,
                         ID3D12Resource*, UINT64, UINT64))GhClOrig(self, 15))(self, d, dOff, sr, sOff, n);
@@ -20850,6 +21656,7 @@ static void __stdcall Hook_CLCopyResource(ID3D12GraphicsCommandList* self,
     GhGpTouch(d);   // #235 last-use
     GhXfwNoteW(self, d, 1);   // #252 XFW3
     GhXfwNoteCopy(self, d, 0, sr, 0, ~0ull);   // XFW4: whole resource
+    if (GhCullDump() && sr && (sr == g_cullCntRes[0] || sr == g_cullCntRes[1])) GhCullCopyNote(self, d, 0, sr, 0, ~0ull);   // XFW12d
     if (!GhRecCap17(self, d, sr))
         ((void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*,
                         ID3D12Resource*))GhClOrig(self, 17))(self, d, sr);
@@ -21028,6 +21835,7 @@ static void __stdcall Hook_CLOMSetStencilRef(ID3D12GraphicsCommandList* self, UI
 static void __stdcall Hook_CLSetCompTable(ID3D12GraphicsCommandList* self, UINT i,
                                           D3D12_GPU_DESCRIPTOR_HANDLE h)
 {
+    if (GhCullDump() && i < 16) if (GhCLNote* n = GhCLFind(self)){ n->cxTbl[i] = (UINT64)h.ptr; n->cxTblSet |= 1u << i; }   // XFW11
     if (GhVaCheckOn() && h.ptr){
         InterlockedIncrement(&g_vaChkCmpTbl); GhVaTick();
         if (!GhGpuHandleToCpu((UINT64)h.ptr))
@@ -21046,6 +21854,7 @@ static void __stdcall Hook_CLSetCompTable(ID3D12GraphicsCommandList* self, UINT 
 }
 static void GhNoteCmpRootVa(ID3D12GraphicsCommandList* self, UINT idx, UINT64 va)
 {
+    if (GhCullDump() && idx < 16) if (GhCLNote* n = GhCLFind(self)){ n->cxVa[idx] = va; n->cxVaSet |= 1u << idx; }   // XFW11
     if (GhVaCheckOn() && va){
         InterlockedIncrement(&g_vaChkCmpRoot); GhVaTick();
         if (!GhVaInBuffer(va)) GhVaBad("CMPROOTVA", va, idx, self, 0);
@@ -21212,6 +22021,10 @@ static void GhHookCommandList(ID3D12CommandList* cl)
     if (GhXfwOn()){   // #252
         set.orig[34] = vt[34]; vt[34] = (void*)&Hook_CLSetGfx32;
         set.orig[36] = vt[36]; vt[36] = (void*)&Hook_CLSetGfx32s;
+        if (GhCullDump()){   // XFW11
+            set.orig[33] = vt[33]; vt[33] = (void*)&Hook_CLSetCmp32;
+            set.orig[35] = vt[35]; vt[35] = (void*)&Hook_CLSetCmp32s;
+        }
     }
     VirtualProtect(vt, sizeof(void*) * 64, old, &old);
     ++g_clVtsN;
@@ -23753,7 +24566,9 @@ template <class F> static F GhGpCq(ID3D12CommandQueue* q, int slot)
 //
 //   gh_gpu_lossless.txt  1 (default) = save/restore content, 0 = TILE2a/2d zeroing
 //   gh_gpu_stage_mb.txt  READBACK + UPLOAD staging, MB each (default 16; billed)
-//   gh_gpu_packed.txt    1 (default) = carry the packed tail, 0 = standard tiles only
+//   gh_gpu_packed.txt    1 (default) = carry the packed tail, 0 = standard tiles only,
+//                        2 = also the mips below 4x4 (#253: a restore otherwise leaves the
+//                        run's previous tenant in the smallest mips, the ones far draws sample)
 //
 // FRAME: gpio=saves/loads/writeMB/readMB/writeMs/readMs/fail/toobig/nocontent/fileMB/stateTr
 static unsigned GhGpLossless()
@@ -23979,7 +24794,7 @@ static bool GhGpXfer(GhGpRes* e, bool in, bool lkHeld = true, ID3D12Heap* mh = n
     const UINT pk0 = pm.NumStandardMips;
     if (!split && GhGpPacked() && pm.NumTilesForPackedMips){
         for (UINT sb = pk0; sb < e->nSub && sb < 16; ++sb){
-            if ((e->desc0.Width >> sb) < 4 || (e->desc0.Height >> sb) < 4) break;
+            if (GhGpPacked() < 2 && ((e->desc0.Width >> sb) < 4 || (e->desc0.Height >> sb) < 4)) break;   // #253: 2 = sub-4x4 too
             ++pkN;
         }
         if (pkN){
@@ -24732,7 +25547,7 @@ static bool GhGpEnsureSlot(GhGpRes* e)
     UINT64 pkB = 0; UINT pkN = 0; const UINT pk0 = pm.NumStandardMips;
     if (GhGpPacked() && pm.NumTilesForPackedMips){
         for (UINT sb = pk0; sb < e->nSub && sb < 16; ++sb){
-            if ((e->desc0.Width >> sb) < 4 || (e->desc0.Height >> sb) < 4) break;
+            if (GhGpPacked() < 2 && ((e->desc0.Width >> sb) < 4 || (e->desc0.Height >> sb) < 4)) break;   // #253: 2 = sub-4x4 too
             ++pkN;
         }
         if (pkN){
@@ -25849,6 +26664,121 @@ static HRESULT __stdcall Hook_D12SetResidencyPriority(ID3D12Device* self, UINT n
     }
     return orig(self, num, objs, prio);
 }
+// #253 the blue fire: ID3D12Device2::CreatePipelineState (slot 47, pipeline STATE STREAMS) was never hooked,
+// so a pipeline the game builds that way skips the whole corpus substitution (6.6 -> 6.5 lowering, the
+// screen, deny list, stand-ins) and reaches a driver that compiles nothing above 6.5. The flipbook cards'
+// depth pass (CreateGraphicsPipelineState) exists while no colour pass for them was ever seen, which is what
+// a stream-created colour PSO the driver refused would look like. Always logged (PSS lines); gh_pss=1 turns
+// a stream that maps onto a plain graphics/compute desc into one and routes it through Hook_D12CreateGPS /
+// Hook_D12CreateCPS, so it gets exactly the treatment every other pipeline gets.
+static unsigned GhPssOn(){ static const unsigned v = GhCfgNum(L"gh_pss.txt", "GH_PSS", 0); return v; }
+template <class T> static size_t GhPssSub(size_t& payloadOff)
+{
+    const size_t a = alignof(T) > 4 ? alignof(T) : 4;
+    payloadOff = (sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) + a - 1) / a * a;
+    const size_t end = payloadOff + sizeof(T);
+    return (end + sizeof(void*) - 1) / sizeof(void*) * sizeof(void*);
+}
+static HRESULT __stdcall Hook_D12CreatePSS(ID3D12Device* self, const D3D12_PIPELINE_STATE_STREAM_DESC* sd,
+                                           REFIID riid, void** pp)
+{
+    static volatile LONG n = 0;
+    const LONG i = InterlockedIncrement(&n);
+    auto orig = (HRESULT (__stdcall*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**))
+                g_d12vtOrig[47];
+    if (!sd || !sd->pPipelineStateSubobjectStream) return orig(self, sd, riid, pp);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC g{};
+    D3D12_COMPUTE_PIPELINE_STATE_DESC c{};
+    // the runtime's defaults for absent subobjects (d3dx12 CD3DX12_*_DESC(D3D12_DEFAULT))
+    g.BlendState.RenderTarget[0].SrcBlend = g.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+    g.BlendState.RenderTarget[0].DestBlend = g.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
+    for (auto& rt : g.BlendState.RenderTarget){
+        rt.SrcBlend = rt.SrcBlendAlpha = D3D12_BLEND_ONE; rt.DestBlend = rt.DestBlendAlpha = D3D12_BLEND_ZERO;
+        rt.BlendOp = rt.BlendOpAlpha = D3D12_BLEND_OP_ADD; rt.LogicOp = D3D12_LOGIC_OP_NOOP;
+        rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+    g.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID; g.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    g.RasterizerState.DepthClipEnable = TRUE;
+    g.DepthStencilState.DepthEnable = TRUE; g.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    g.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    g.DepthStencilState.StencilReadMask = g.DepthStencilState.StencilWriteMask = 0xFF;
+    g.DepthStencilState.FrontFace = g.DepthStencilState.BackFace =
+        { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS };
+    g.SampleMask = UINT_MAX; g.SampleDesc.Count = 1;
+    std::string types;
+    bool ok = true, gfx = false, cs = false;
+    const char* p = (const char*)sd->pPipelineStateSubobjectStream;
+    const char* e = p + sd->SizeInBytes;
+    while (p + sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) <= e){
+        const auto t = *(const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE*)p;
+        types += " " + std::to_string((int)t);
+        size_t off = 0, step = 0;
+        const char* q = nullptr;
+        switch (t){
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE:
+            step = GhPssSub<ID3D12RootSignature*>(off); q = p + off;
+            g.pRootSignature = c.pRootSignature = *(ID3D12RootSignature* const*)q; break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: step = GhPssSub<D3D12_SHADER_BYTECODE>(off); g.VS = *(const D3D12_SHADER_BYTECODE*)(p + off); gfx = true; break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS: step = GhPssSub<D3D12_SHADER_BYTECODE>(off); g.PS = *(const D3D12_SHADER_BYTECODE*)(p + off); gfx = true; break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS: step = GhPssSub<D3D12_SHADER_BYTECODE>(off); g.DS = *(const D3D12_SHADER_BYTECODE*)(p + off); gfx = true; break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS: step = GhPssSub<D3D12_SHADER_BYTECODE>(off); g.HS = *(const D3D12_SHADER_BYTECODE*)(p + off); gfx = true; break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: step = GhPssSub<D3D12_SHADER_BYTECODE>(off); g.GS = *(const D3D12_SHADER_BYTECODE*)(p + off); gfx = true; break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS: step = GhPssSub<D3D12_SHADER_BYTECODE>(off); c.CS = *(const D3D12_SHADER_BYTECODE*)(p + off); cs = true; break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: step = GhPssSub<D3D12_STREAM_OUTPUT_DESC>(off); g.StreamOutput = *(const D3D12_STREAM_OUTPUT_DESC*)(p + off); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: step = GhPssSub<D3D12_BLEND_DESC>(off); g.BlendState = *(const D3D12_BLEND_DESC*)(p + off); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK: step = GhPssSub<UINT>(off); g.SampleMask = *(const UINT*)(p + off); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER: step = GhPssSub<D3D12_RASTERIZER_DESC>(off); g.RasterizerState = *(const D3D12_RASTERIZER_DESC*)(p + off); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: step = GhPssSub<D3D12_DEPTH_STENCIL_DESC>(off); g.DepthStencilState = *(const D3D12_DEPTH_STENCIL_DESC*)(p + off); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: step = GhPssSub<D3D12_INPUT_LAYOUT_DESC>(off); g.InputLayout = *(const D3D12_INPUT_LAYOUT_DESC*)(p + off); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE: step = GhPssSub<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>(off); g.IBStripCutValue = *(const D3D12_INDEX_BUFFER_STRIP_CUT_VALUE*)(p + off); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY: step = GhPssSub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>(off); g.PrimitiveTopologyType = *(const D3D12_PRIMITIVE_TOPOLOGY_TYPE*)(p + off); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: {
+            step = GhPssSub<D3D12_RT_FORMAT_ARRAY>(off);
+            const auto& rf = *(const D3D12_RT_FORMAT_ARRAY*)(p + off);
+            g.NumRenderTargets = rf.NumRenderTargets;
+            for (int k = 0; k < 8; ++k) g.RTVFormats[k] = rf.RTFormats[k];
+            break; }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT: step = GhPssSub<DXGI_FORMAT>(off); g.DSVFormat = *(const DXGI_FORMAT*)(p + off); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC: step = GhPssSub<DXGI_SAMPLE_DESC>(off); g.SampleDesc = *(const DXGI_SAMPLE_DESC*)(p + off); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK: step = GhPssSub<UINT>(off); g.NodeMask = c.NodeMask = *(const UINT*)(p + off); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: step = GhPssSub<D3D12_CACHED_PIPELINE_STATE>(off); break;   // dropped, as Hook_D12CreateGPS strips the game's own
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS: step = GhPssSub<D3D12_PIPELINE_STATE_FLAGS>(off); g.Flags = c.Flags = *(const D3D12_PIPELINE_STATE_FLAGS*)(p + off); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: {
+            step = GhPssSub<D3D12_DEPTH_STENCIL_DESC1>(off);
+            const auto& d1 = *(const D3D12_DEPTH_STENCIL_DESC1*)(p + off);
+            if (d1.DepthBoundsTestEnable) ok = false;   // no plain-desc equivalent
+            g.DepthStencilState = *(const D3D12_DEPTH_STENCIL_DESC*)&d1;
+            break; }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: {
+            step = GhPssSub<D3D12_VIEW_INSTANCING_DESC>(off);
+            if (((const D3D12_VIEW_INSTANCING_DESC*)(p + off))->ViewInstanceCount > 1) ok = false;
+            break; }
+        default:   // AS/MS, DEPTH_STENCIL2, RASTERIZER1/2: no plain-desc equivalent here -- pass through
+            ok = false; step = 0; break;
+        }
+        if (!step) break;
+        p += step;
+    }
+    if (p < e) ok = false;
+    if (gfx && cs) ok = false;
+    const bool route = ok && GhPssOn() && (gfx || cs);
+    HRESULT hr = route ? (gfx ? Hook_D12CreateGPS(self, &g, riid, pp) : Hook_D12CreateCPS(self, &c, riid, pp))
+                       : orig(self, sd, riid, pp);
+    if (i <= 64 || (i % 256) == 0 || FAILED(hr)){
+        char k[33];
+        std::string keys;
+        const D3D12_SHADER_BYTECODE* st[3] = { &g.VS, &g.PS, &c.CS };
+        const char* nm[3] = { "vs", "ps", "cs" };
+        for (int s = 0; s < 3; ++s)
+            if (st[s]->pShaderBytecode && GhShaderKey(st[s]->pShaderBytecode, st[s]->BytecodeLength, k))
+                keys += std::string(" ") + nm[s] + "=" + std::string(k, 8) + "/" + std::to_string((unsigned)st[s]->BytecodeLength);
+        Diag("PSS n=" + std::to_string((long)i) + " bytes=" + std::to_string((unsigned long long)sd->SizeInBytes) +
+             " types=[" + types + " ]" + keys + (ok ? "" : " UNMAPPABLE") +
+             (route ? " -> routed" : " -> driver") + " hr=" + Hex((uint32_t)hr) +
+             " out=" + Hex((uint64_t)(uintptr_t)(pp ? *pp : nullptr)));
+    }
+    return hr;
+}
 static HRESULT __stdcall Hook_D12EnqueueMakeResident(ID3D12Device* self, D3D12_RESIDENCY_FLAGS fl, UINT num,
     ID3D12Pageable* const* objs, ID3D12Fence* f, UINT64 v)
 {
@@ -25882,7 +26812,8 @@ static HRESULT __stdcall Hook_D12EnqueueMakeResident(ID3D12Device* self, D3D12_R
 //          GPU-written default memory (h=1), which no CPU read can see.
 // Only upload/readback buffers are ever mapped, each AddRef'd at submission (when
 // the list referencing it is certainly alive) and released when the watch ends.
-struct GhXfwRs { int pB14 = -1, b14Kind = 0, pT1 = -1, t1Kind = 0; UINT t1Off = 0; };
+struct GhXfwRs { int pB14 = -1, b14Kind = 0, pT1 = -1, t1Kind = 0; UINT t1Off = 0;
+                 int pS[2] = { -1, -1 }, sKind[2] = { 0, 0 }; UINT sOff[2] = { 0, 0 }; };   // XFW9: t0/t2 space2
 static SRWLOCK g_xfwLk = SRWLOCK_INIT;
 static std::unordered_map<void*, GhXfwRs>* g_xfwRsMap = nullptr;
 static std::unordered_map<void*, int>*     g_xfwPsoMap = nullptr;
@@ -25890,13 +26821,19 @@ static std::set<std::string>*              g_xfwKeys = nullptr;
 enum { XC_DRAW, XC_NORS, XC_NOB14, XC_NOT1, XC_CAP, XC_SNAP, XC_DROP, XC_DONE, XC_RACE, XC_CHG,
        XC_JUMP, XC_BOUNCE, XC_ABSURD, XC_SKIN, XC_UNRES, XC_OOB, XC_TIMEOUT, XC_PSO, XC_RS,
        XC_RSB14, XC_BONE, XC_BONECHG, XC_RECS, XC_BW, XC_BR, XC_RAW, XC_WAR, XC_WAW, XC_HUNK,
-       XC_BRES, XC_CPY, XC_CPSNAP, XC_CPNR, XC_SRCRACE, XC_CPCHG, XC_CPDONE, XC_DESCW, XC_DESCRACE, XC_TELEM, XC_TJUMP, XC_TBOUNCE, XC_TSAME, XC_TSTATIC, XC_TSTATJ, XC_TSTATRET, XC_TRELN, XC_TOUTL, XC_TOBOUNCE, XC_DWRN, XC_DWRNONE, XC_DWRSAME, XC_DWRCUR, XC_DWRPREV, XC_DWROLD, XC_DWRPART, XC_EIDRAW, XC_EIWATCH, XC_EINOKEY, XC_EIARG, XC_EISTALE, XC_EIMESH, XC_EIINST, XC_EISINST, XC_EIBAD, XC_EIZERO, XC_N };
+       XC_BRES, XC_CPY, XC_CPSNAP, XC_CPNR, XC_SRCRACE, XC_CPCHG, XC_CPDONE, XC_DESCW, XC_DESCRACE, XC_TELEM, XC_TJUMP, XC_TBOUNCE, XC_TSAME, XC_TSTATIC, XC_TSTATJ, XC_TSTATRET, XC_TRELN, XC_TOUTL, XC_TOBOUNCE, XC_DWRN, XC_DWRNONE, XC_DWRSAME, XC_DWRCUR, XC_DWRPREV, XC_DWROLD, XC_DWRPART, XC_EIDRAW, XC_EIWATCH, XC_EINOKEY, XC_EIARG, XC_EISTALE, XC_EIMESH, XC_EIINST, XC_EISINST, XC_EIBAD, XC_EIZERO,
+       XC_ISNAP, XC_INOS, XC_INRD, XC_IOOB, XC_ISI, XC_IBAD, XC_IJUMP, XC_ISHUF, XC_ICMP, XC_ICNT,
+       XC_VPN, XC_VPREF, XC_VPODD, XC_VPSING, XC_RBCAP, XC_RBNO, XC_RBSTALE, XC_RBUSE, XC_RBODD, XC_VODDMAIN, XC_VODDOTHER, XC_VMAINN, XC_WNOREF, XC_WOK, XC_WODD, XC_WPREV, XC_WSAME, XC_WNONE, XC_WCPUODD,
+       XC_WHOREG, XC_WHOSKIP, XC_WHOCPY, XC_WHOOVER, XC_WHOARM, XC_WHOODD, XC_WHONOE, XC_WHOUNSEEN, XC_WHOCONST, XC_WHOWASOK, XC_WHOOK, XC_WHOOKNOE, XC_WHOOKUNSEEN, XC_WHOSTALE, XC_N };
 static const char* const kXfwCn[XC_N] = { "draws", "nors", "nob14", "not1", "capped", "snaps", "dropped",
     "done", "RACE", "chgAfter", "JUMP", "BOUNCE", "ABSURD", "skinned", "unres", "oob", "timeout",
     "psos", "rs", "rsB14", "bones", "boneJump", "recs", "bw", "br", "RAW", "WAR", "WAW", "hazUnk",
-    "boneRes", "cpy", "cpSnap", "cpNotReadable", "SRCRACE", "cpChgAfter", "cpDone", "descW", "DESCRACE", "tElems", "TJUMP", "TBOUNCE", "TSAME", "TSTATIC", "TSTATJ", "TSTATRET", "tRelN", "TOUTL", "TOBOUNCE", "dwrN", "DWRNONE", "dwrSameSub", "dwrCur", "dwrPrev", "DWROLD", "DWRPART", "eiDraw", "eiWatched", "eiNoKey", "eiArg", "eiStale", "EIMESH", "eiInstChg", "EISINST", "EIBAD", "eiZeroInst" };
+    "boneRes", "cpy", "cpSnap", "cpNotReadable", "SRCRACE", "cpChgAfter", "cpDone", "descW", "DESCRACE", "tElems", "TJUMP", "TBOUNCE", "TSAME", "TSTATIC", "TSTATJ", "TSTATRET", "tRelN", "TOUTL", "TOBOUNCE", "dwrN", "DWRNONE", "dwrSameSub", "dwrCur", "dwrPrev", "DWROLD", "DWRPART", "eiDraw", "eiWatched", "eiNoKey", "eiArg", "eiStale", "EIMESH", "eiInstChg", "EISINST", "EIBAD", "eiZeroInst",
+    "iSnap", "iNoStream", "iNotReadable", "iOob", "iStartInst", "IBAD", "IJUMP", "ISHUF", "iCmp", "iCntChg",
+    "vpN", "vpRef", "VPODD", "vpSingular", "rbCap", "rbNo", "rbStale", "rbUse", "RBODD", "VODDMAIN", "voddOther", "vMainN", "wNoRef", "wOk", "WODD", "WPREV", "WSAME", "WNONE", "wCpuOdd",
+    "whoReg", "whoSkip", "whoCpy", "whoOver", "whoArmDraw", "WHOODD", "whoOddNoEnt", "WHOUNSEEN", "whoConst", "WHOWASOK", "whoOk", "whoOkNoEnt", "whoOkUnseen", "whoStale" };
 static volatile LONG64 g_xfwC[XC_N]{};
-static volatile LONG64 g_xfwHeapC[3][8]{};   // [b14,t1,bone][heap type; 0 = unknown, 6 = readable custom]
+static volatile LONG64 g_xfwHeapC[5][8]{};   // [b14,t1,bone,s0,s2][heap type; 0 = unknown, 6 = readable custom]
 static void GhXfwInc(int c){ InterlockedIncrement64(&g_xfwC[c]); }
 
 static void GhXfwNoteRs(void* rs, const void* blob, SIZE_T len)
@@ -25917,6 +26854,28 @@ static void GhXfwNoteRs(void* rs, const void* blob, SIZE_T len)
         const D3D12_ROOT_PARAMETER1& p = d.pParameters[i];
         if (p.ShaderVisibility != D3D12_SHADER_VISIBILITY_ALL &&
             p.ShaderVisibility != D3D12_SHADER_VISIBILITY_VERTEX) continue;
+        if (GhXfwInst()){   // XFW9: where t0 and t2 space2 live
+            for (int j = 0; j < 2; ++j){
+                const UINT reg = j ? 2u : 0u;
+                if (w.pS[j] >= 0) continue;
+                if (p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV &&
+                    p.Descriptor.ShaderRegister == reg && p.Descriptor.RegisterSpace == 2){ w.pS[j] = (int)i; w.sKind[j] = 1; }
+                else if (p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE){
+                    UINT off = 0;
+                    for (UINT r = 0; r < p.DescriptorTable.NumDescriptorRanges; ++r){
+                        const D3D12_DESCRIPTOR_RANGE1& g = p.DescriptorTable.pDescriptorRanges[r];
+                        if (g.OffsetInDescriptorsFromTableStart != D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND)
+                            off = g.OffsetInDescriptorsFromTableStart;
+                        if (g.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && g.RegisterSpace == 2 && g.BaseShaderRegister <= reg &&
+                            (g.NumDescriptors == UINT_MAX || reg < g.BaseShaderRegister + g.NumDescriptors)){
+                            w.pS[j] = (int)i; w.sKind[j] = 2; w.sOff[j] = off + (reg - g.BaseShaderRegister); break;
+                        }
+                        if (g.NumDescriptors == UINT_MAX) break;
+                        off += g.NumDescriptors;
+                    }
+                }
+            }
+        }
         if (w.pB14 < 0 && p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV &&
             p.Descriptor.ShaderRegister == 14 && p.Descriptor.RegisterSpace == 0){ w.pB14 = (int)i; w.b14Kind = 1; }
         else if (w.pB14 < 0 && p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS &&
@@ -25948,7 +26907,9 @@ static void GhXfwNoteRs(void* rs, const void* blob, SIZE_T len)
         if (k <= 24)
             Diag("XFW RS rs=" + Hex((uint64_t)(uintptr_t)rs) + " params=" + std::to_string(d.NumParameters) +
                  " b14=" + std::to_string(w.pB14) + (w.b14Kind == 2 ? "(consts)" : "(cbv)") +
-                 " t1=" + std::to_string(w.pT1) + (w.t1Kind == 1 ? "(srv)" : w.t1Kind == 2 ? "(table+" + std::to_string(w.t1Off) + ")" : "(none)"));
+                 " t1=" + std::to_string(w.pT1) + (w.t1Kind == 1 ? "(srv)" : w.t1Kind == 2 ? "(table+" + std::to_string(w.t1Off) + ")" : "(none)") +
+                 (GhXfwInst() ? " s0=" + std::to_string(w.pS[0]) + "/" + std::to_string(w.sKind[0]) + "+" + std::to_string(w.sOff[0]) +
+                                " s2=" + std::to_string(w.pS[1]) + "/" + std::to_string(w.sKind[1]) + "+" + std::to_string(w.sOff[1]) : std::string()));
     }
 }
 
@@ -25994,6 +26955,7 @@ static void GhXfwNotePso(void* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d)
 // Record time: remember what this draw's b14/t1 were bound to. Cheap on purpose --
 // every read happens at submission, off the list's recording thread.
 static thread_local bool t_xeiCall = false;   // XFW8: GhXfwDraw is being called for an ExecuteIndirect draw
+static UINT32 GhXinCapture(ID3D12GraphicsCommandList* self, GhCLNote* n, LONG i);   // XFW9c
 static void GhXfwDraw(ID3D12GraphicsCommandList* self)
 {
     if (!GhXfwOn()) return;
@@ -26009,6 +26971,12 @@ static void GhXfwDraw(ID3D12GraphicsCommandList* self)
     }
     ReleaseSRWLockShared(&g_xfwLk);
     if (!watched) return;
+    if (GhXfwBar()){   // XB1
+        D3D12_RESOURCE_BARRIER ub{}; ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; ub.UAV.pResource = nullptr;
+        ((void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*))GhClOrig(self, 26))(self, 1, &ub);
+        const LONG64 k = InterlockedIncrement64(&g_xfwBarN);
+        if (k == 1 || (k & (k - 1)) == 0) Diag("XFW BAR n=" + std::to_string((long long)k));
+    }
     GhXfwInc(XC_DRAW);
     if (!haveRs){ GhXfwInc(XC_NORS); return; }
     UINT64 b14 = 0, t1 = 0;
@@ -26024,6 +26992,21 @@ static void GhXfwDraw(ID3D12GraphicsCommandList* self)
     if (i >= 32){ GhXfwInc(XC_CAP); return; }
     n->xfwB14[i] = b14; n->xfwT1[i] = t1; n->xfwT1Kind[i] = (UINT8)w.t1Kind; n->xfwT1Off[i] = w.t1Off;
     n->xfwHeap[i] = n->heaps[0]; n->xfwPso[i] = n->lastPso; n->xfwEiGen[i] = 0;
+    if (GhXfwInst()){   // XFW9
+        n->xinArgs[i][0] = t_bcOpArgs.kind;
+        for (int a = 0; a < 5; ++a) n->xinArgs[i][1 + a] = t_bcOpArgs.a[a];
+        for (int j = 0; j < 2; ++j){
+            n->xinS[i][j] = 0; n->xinSK[i][j] = (UINT8)w.sKind[j]; n->xinSOff[i][j] = w.sOff[j];
+            const int ps = w.pS[j];
+            if (ps < 0 || ps >= 16) continue;
+            if (w.sKind[j] == 1 && (n->vaSet & (1u << ps))) n->xinS[i][j] = n->rootva[ps];
+            else if (w.sKind[j] == 2 && (n->tblSet & (1u << ps))) n->xinS[i][j] = n->tbl[ps];
+        }
+        n->xinOrd[i] = n->xwOrd; n->xinRegR[i][0] = n->xinRegR[i][1] = nullptr;   // XFW10
+        n->xinRb[i] = GhXfwInst() >= 2 ? GhXinCapture(self, n, i) : 0;
+        n->xinRt[i] = n->nrt ? n->rtv[0] : 0; n->xinDs[i] = n->hasDsv ? n->dsv : 0;   // XFW9d
+        for (int v = 0; v < 4; ++v) n->xinView[i][v] = n->nvp ? n->vp[0][v] : 0.f;
+    }
     n->xfwN = i + 1;
 }
 
@@ -26167,17 +27150,389 @@ static bool GhXfwRd(const GhXfwMap& m, UINT64 off, void* dst, UINT64 n)
     return true;
 }
 
+// XFW9c (gh_xfw_inst=2): ~27% of the rock draws in the level read their instance records from
+// DEFAULT (GPU) memory the CPU cannot see. At record time, find the header the draw will use
+// (b14 constant -> t1 upload record, already written), and copy the exact instance records the
+// draw reads (t0: nI x 64 B, t2: nI x 48 B) into a persistently mapped READBACK ring, recorded
+// just before the draw on the same list. The watcher reads them after the fence (GhXfwFinish).
+#define GH_XIN_RB_N 4096
+#define GH_XIN_RB_SLOT 2048
+static com_ptr<ID3D12Resource> g_xinRb;
+static const UINT8* g_xinRbPtr = nullptr;
+static bool g_xinRbTried = false;
+static SRWLOCK g_xinRbLk = SRWLOCK_INIT;
+static volatile LONG g_xinRbNext = 0;
+static volatile LONG g_xinRbGenOf[GH_XIN_RB_N]{};
+static bool GhXinStream(UINT64 h, UINT8 kind, UINT32 off, UINT32 stride, ID3D12Resource** res, UINT64* base, UINT32* heap)
+{
+    GhXfwBuf b{};
+    if (h && kind == 1){
+        if (!GhXfwFind(h, nullptr, &b)) return false;
+        *res = b.res; *base = h - b.lo; *heap = b.heap; return true;
+    }
+    if (h && kind == 2){
+        UINT inc = 0;
+        const UINT64 cpu0 = GhGpuHandleToCpu(h, &inc);
+        const GhDescNote* dn = cpu0 ? GhDescGet(cpu0 + (UINT64)off * inc) : nullptr;
+        if (!dn || !dn->res || !GhXfwFind(0, dn->res, &b)) return false;
+        *res = dn->res; *base = dn->voff * (dn->vstride ? dn->vstride : stride); *heap = b.heap; return true;
+    }
+    return false;
+}
+
+// XFW11: at Dispatch in a dump-frame list, remember where the culling dispatch's header comes from
+// (b14 = root CBV VA or root constant, t1 = root SRV VA or table handle). Resolved at submission.
+static void GhCullNoteDisp(ID3D12GraphicsCommandList* self, UINT x)
+{
+    GhCLNote* n = GhCLFind(self);
+    if (!n) return;
+    const UINT32 ord = n->cullOrd++;
+    const UINT8 kind = GhCullPso(n->lastPso);
+    if (!n->cullOn || n->cullN >= 256 || !kind) return;
+    GhXfwRs w; bool have = false;
+    AcquireSRWLockShared(&g_xfwLk);
+    if (g_xfwRsMap){ auto it = g_xfwRsMap->find(n->cxRs); if (it != g_xfwRsMap->end()){ w = it->second; have = true; } }
+    ReleaseSRWLockShared(&g_xfwLk);
+    UINT64 b14 = 0, t1 = 0;
+    if (have && w.pB14 >= 0 && w.pB14 < 16){
+        if (w.b14Kind == 1 && (n->cxVaSet & (1u << w.pB14))) b14 = n->cxVa[w.pB14];
+        else if (w.b14Kind == 2 && (n->cxKSet & (1u << w.pB14))) b14 = 0x8000000000000000ull | n->cxK[w.pB14];
+    }
+    if (have && w.pT1 >= 0 && w.pT1 < 16){
+        if (w.t1Kind == 1 && (n->cxVaSet & (1u << w.pT1))) t1 = n->cxVa[w.pT1];
+        else if (w.t1Kind == 2 && (n->cxTblSet & (1u << w.pT1))) t1 = n->cxTbl[w.pT1];
+    }
+    auto& c = n->cull[n->cullN++];
+    c.b14 = b14; c.t1 = t1; c.t1Off = have ? w.t1Off : 0; c.t1Kind = (UINT8)(have ? w.t1Kind : 0); c.gx = x; c.ord = ord; c.kind = kind;
+}
+// XFW11: at submission (the CPU has written this frame's headers), log each recorded culling
+// dispatch: srt (the b14 dword the shader adds to every header offset) and header dwords 0..151.
+static void GhCullSubmit(GhCLNote* n, ID3D12CommandList* l, ID3D12CommandQueue* q, LONG seq)
+{
+    if (!n || !n->cullOn || !n->cullN) return;
+    const LONG64 prev = InterlockedExchange64(&g_cullLastFrame, n->cullFrame);
+    if (prev != n->cullFrame)
+        Diag("CULLDUMP begin #" + std::to_string((long)InterlockedIncrement(&g_cullDumps)) +
+             " frame=" + std::to_string((long long)n->cullFrame));
+    for (UINT32 i = 0; i < n->cullN; ++i){
+        const auto& c = n->cull[i];
+        std::string line = "CULL f=" + std::to_string((long long)n->cullFrame) + " L=" + Hex((uint64_t)(uintptr_t)l) +
+                           " d=" + std::to_string((unsigned long)c.ord) + " gx=" + std::to_string((unsigned long)c.gx) +
+                           " k=" + std::to_string((int)c.kind) + " q=" + Hex((uint64_t)(uintptr_t)q) + " s=" + std::to_string((long)seq);
+        UINT32 srt = 0; bool okS = false;
+        if (c.b14 & 0x8000000000000000ull){ srt = (UINT32)c.b14; okS = true; }
+        else if (c.b14){
+            GhXfwBuf b{}; GhXfwMap m{};
+            if (GhXfwFind(c.b14, nullptr, &b) && GhXfwReadable(b.heap) && GhXfwOpen(b, &m)){
+                okS = GhXfwRd(m, c.b14 - b.lo, &srt, 4); GhXfwClose(&m);
+            }
+        }
+        if (!okS){ Diag(line + " NOSRT b14=" + Hex(c.b14)); continue; }
+        ID3D12Resource* tr = nullptr; UINT64 tb = 0; UINT32 th = 0;
+        if (!GhXinStream(c.t1, c.t1Kind, c.t1Off, 4, &tr, &tb, &th) || !GhXfwReadable(th)){
+            Diag(line + " srt=" + std::to_string((unsigned long)srt) + " NOT1 kind=" + std::to_string((int)c.t1Kind) + " heap=" + std::to_string((unsigned long)th));
+            continue;
+        }
+        GhXfwBuf b{}; GhXfwMap m{};
+        UINT32 h[152]{}; bool okH = false;
+        if (GhXfwFind(0, tr, &b) && GhXfwOpen(b, &m)){ okH = GhXfwRd(m, tb + srt, h, sizeof h); GhXfwClose(&m); }
+        if (!okH){ Diag(line + " srt=" + std::to_string((unsigned long)srt) + " NOHDR"); continue; }
+        std::string hx; hx.reserve(152 * 9);
+        char w8[12];
+        for (int k = 0; k < 152; ++k){ snprintf(w8, sizeof w8, "%08X", h[k]); hx += (k ? " " : ""); hx += w8; }
+        Diag(line + " t1=" + Hex((uint64_t)(uintptr_t)tr) + "+" + std::to_string((unsigned long long)tb) +
+             " srt=" + std::to_string((unsigned long)srt) + " H=" + hx);
+    }
+}
+// XFW12 (gh_cull_rb=1, rides on a XFW11 dump frame): the CPU packs the culling regions back to back
+// (stream base = previous base + the count the CPU expects to survive, not + n), so a dispatch that
+// passes more instances than the CPU counted writes into the head of the next region. At Close of a
+// dump-armed list, read back what the GPU decided: each culling dispatch's final counter and its n
+// LOD bytes, with a UAV->COPY_SOURCE->UAV round trip. Logged a few frames later as CULLRB.
+static unsigned GhCullRb(){ static const unsigned v = GhCfgNum(L"gh_cull_rb.txt", "GH_CULL_RB", 0); return v; }
+#define GH_CRB_BYTES (16u << 20)
+struct GhCrbEnt { LONG64 frame; void* L; UINT32 d, n, f152, base, cntRb, lodRb, lodSkip, cntIdx, lodIdx, lodH, lcRb; UINT8 a; };
+
+static com_ptr<ID3D12Resource> g_crb;
+static const UINT8* g_crbPtr = nullptr;
+static bool g_crbTried = false;
+static SRWLOCK g_crbLk = SRWLOCK_INIT;
+static std::vector<GhCrbEnt>* g_crbEnt = nullptr;   // under g_crbLk
+static UINT32 g_crbUsed = 0;                          // under g_crbLk
+static LONG64 g_crbFrame = -1;                        // under g_crbLk
+// CR4: every LOD region (view heap index << 32 | element base -> n) a culling dispatch has read. At Close
+// of a list that runs the LOD pass, the same regions are snapshotted (CULLRBA), so the bytes the LOD pass
+// left can be compared with what the culling reads one submission later.
+static std::unordered_map<UINT64, UINT32>* g_crbRegs = nullptr;   // under g_crbLk
+static bool GhCullHdr(UINT64 b14, UINT64 t1, UINT8 t1Kind, UINT32 t1Off, UINT32 h[152])
+{
+    UINT32 srt = 0; bool okS = false;
+    if (b14 & 0x8000000000000000ull){ srt = (UINT32)b14; okS = true; }
+    else if (b14){
+        GhXfwBuf b{}; GhXfwMap m{};
+        if (GhXfwFind(b14, nullptr, &b) && GhXfwReadable(b.heap) && GhXfwOpen(b, &m)){ okS = GhXfwRd(m, b14 - b.lo, &srt, 4); GhXfwClose(&m); }
+    }
+    if (!okS) return false;
+    ID3D12Resource* tr = nullptr; UINT64 tb = 0; UINT32 th = 0;
+    if (!GhXinStream(t1, t1Kind, t1Off, 4, &tr, &tb, &th) || !GhXfwReadable(th)) return false;
+    GhXfwBuf b{}; GhXfwMap m{}; bool ok = false;
+    if (GhXfwFind(0, tr, &b) && GhXfwOpen(b, &m)){ ok = GhXfwRd(m, tb + srt, h, 152 * 4); GhXfwClose(&m); }
+    return ok;
+}
+// A bindless heap index of the list's CBV/SRV/UAV heap -> the buffer view the loader shadowed there.
+static const GhDescNote* GhCullView(GhCLNote* n, UINT32 idx)
+{
+    LONG dn = g_dhN; if (dn > 128) dn = 128;
+    for (int k = 0; k < 2; ++k){
+        if (!n->heaps[k]) continue;
+        for (LONG i = 0; i < dn; ++i){
+            const GhDHNote& d = g_dh[i];
+            if (d.obj != n->heaps[k] || d.type != 0 || !d.inc || idx >= d.num) continue;
+            const GhDescNote* v = GhDescGet(d.cpu0 + (UINT64)idx * d.inc);
+            return (v && v->res) ? v : nullptr;
+        }
+    }
+    return nullptr;
+}
+static void GhCullRbClose(ID3D12GraphicsCommandList* self)
+{
+    GhCLNote* n = GhCLFind(self);
+    if (!n || !n->cullOn || !n->cullN || !GhCullRb()) return;
+    AcquireSRWLockExclusive(&g_crbLk);
+    if (!g_crb && !g_crbTried){
+        g_crbTried = true;
+        com_ptr<ID3D12Device> dev;
+        HRESULT hr = self->GetDevice(__uuidof(ID3D12Device), dev.put_void());
+        if (SUCCEEDED(hr)){
+            D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = GH_CRB_BYTES;
+            rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+            rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                              __uuidof(ID3D12Resource), g_crb.put_void());
+            void* mp = nullptr;
+            if (SUCCEEDED(hr) && SUCCEEDED(g_crb->Map(0, nullptr, &mp)) && mp) g_crbPtr = (const UINT8*)mp;
+            else g_crb = nullptr;
+        }
+        g_crbEnt = new std::vector<GhCrbEnt>();
+        Diag("CULLRB ring hr=" + Hex((uint32_t)hr) + " mapped=" + (g_crbPtr ? "yes" : "NO"));
+    }
+    const LONG64 span = GhCullRb() > 1 ? GhCullRb() : 1;
+    if (!g_crb || (g_crbFrame >= 0 && (n->cullFrame < g_crbFrame || n->cullFrame > g_crbFrame + span))){
+        ReleaseSRWLockExclusive(&g_crbLk); return;   // the previous window is not drained yet
+    }
+    if (g_crbFrame < 0) g_crbFrame = n->cullFrame;
+    struct Cp { ID3D12Resource* r; UINT64 so; UINT32 dst, len; };
+    std::vector<Cp> cps; std::vector<ID3D12Resource*> rs;
+    UINT32 bad = 0;
+    bool hasLod = false;
+    for (UINT32 i = 0; i < n->cullN; ++i){
+        const auto& c = n->cull[i];
+        if (c.kind == 2) hasLod = true;
+        if (c.kind != 1) continue;   // the readback is for the culling dispatches only
+        UINT32 h[152]{};
+        if (!GhCullHdr(c.b14, c.t1, c.t1Kind, c.t1Off, h)){ ++bad; continue; }
+        const UINT32 cnt = h[132], cntH = h[134], lodB = h[106], lodH = h[102], nn = h[101] < 4096 ? h[101] : 4096;
+        const GhDescNote* vc = GhCullView(n, cntH);
+        const GhDescNote* vl = GhCullView(n, lodH);
+        const GhDescNote* vp = cntH ? GhCullView(n, cntH - 1) : nullptr;   // the LOD pass's per-object counters
+        if (!vc || !vl){ ++bad; continue; }
+        g_cullCntRes[0] = vc->res; if (vp) g_cullCntRes[1] = vp->res;
+        const UINT64 cOff = (vc->voff + cnt) * (UINT64)(vc->vstride ? vc->vstride : 4);
+        const UINT64 lOff = vl->voff + lodB;            // R8_SINT: one byte per element
+        const UINT64 lA = lOff & ~3ull, lLen = ((lOff + nn + 3) & ~3ull) - lA;
+        const UINT64 wc = vc->res->GetDesc().Width, wl = vl->res->GetDesc().Width;
+        if (cOff + 4 > wc || lA + lLen > wl || g_crbUsed + 8 + lLen > GH_CRB_BYTES){ ++bad; continue; }
+        const UINT64 pOff = vp ? (vp->voff + cnt) * (UINT64)(vp->vstride ? vp->vstride : 4) : ~0ull;
+        const bool pOk = vp && pOff + 4 <= vp->res->GetDesc().Width;
+        GhCrbEnt e{}; e.frame = n->cullFrame; e.L = self; e.d = c.ord; e.n = nn; e.f152 = h[38]; e.base = h[120];
+        e.cntIdx = cnt; e.lodIdx = lodB; e.lodH = lodH;
+        e.cntRb = g_crbUsed; cps.push_back({ vc->res, cOff, g_crbUsed, 4 }); g_crbUsed += 4;
+        e.lodRb = g_crbUsed; e.lodSkip = (UINT32)(lOff - lA); cps.push_back({ vl->res, lA, g_crbUsed, (UINT32)lLen }); g_crbUsed += (UINT32)lLen;
+        e.lcRb = ~0u;
+        if (pOk){ e.lcRb = g_crbUsed; cps.push_back({ vp->res, pOff, g_crbUsed, 4 }); g_crbUsed += 4; }
+        g_crbEnt->push_back(e);
+        if (!g_crbRegs) g_crbRegs = new std::unordered_map<UINT64, UINT32>();
+        if (g_crbRegs->size() < 8192) (*g_crbRegs)[((UINT64)lodH << 32) | lodB] = nn;
+        for (ID3D12Resource* r : { vc->res, vl->res }) if (std::find(rs.begin(), rs.end(), r) == rs.end()) rs.push_back(r);
+        if (pOk && std::find(rs.begin(), rs.end(), vp->res) == rs.end()) rs.push_back(vp->res);
+    }
+    UINT32 nA = 0, badA = 0;
+    if (hasLod && g_crbRegs){
+        for (const auto& kv : *g_crbRegs){
+            const UINT32 lodH = (UINT32)(kv.first >> 32), lodB = (UINT32)kv.first, nn = kv.second;
+            const GhDescNote* vl = GhCullView(n, lodH);
+            if (!vl){ ++badA; continue; }
+            const UINT64 lOff = vl->voff + lodB, lA = lOff & ~3ull, lLen = ((lOff + nn + 3) & ~3ull) - lA;
+            if (lA + lLen > vl->res->GetDesc().Width || g_crbUsed + lLen > GH_CRB_BYTES){ ++badA; continue; }
+            GhCrbEnt e{}; e.frame = n->cullFrame; e.L = self; e.n = nn; e.lodIdx = lodB; e.lodH = lodH; e.a = 1;
+            e.lodRb = g_crbUsed; e.lodSkip = (UINT32)(lOff - lA); e.lcRb = ~0u;
+            cps.push_back({ vl->res, lA, g_crbUsed, (UINT32)lLen }); g_crbUsed += (UINT32)lLen;
+            g_crbEnt->push_back(e); ++nA;
+            if (std::find(rs.begin(), rs.end(), vl->res) == rs.end()) rs.push_back(vl->res);
+        }
+    }
+    ID3D12Resource* rb = g_crb.get();
+    ReleaseSRWLockExclusive(&g_crbLk);
+    if (cps.empty()){ Diag("CULLRB L=" + Hex((uint64_t)(uintptr_t)self) + " nothing bad=" + std::to_string((unsigned long)bad)); return; }
+    auto bar = (void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*))GhClOrig(self, 26);
+    auto copy = (void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64, UINT64))GhClOrig(self, 15);
+    std::vector<D3D12_RESOURCE_BARRIER> tb(rs.size() + 1);
+    tb[0] = {}; tb[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;   // the culling's writes are done
+    for (size_t k = 0; k < rs.size(); ++k){
+        auto& b = tb[k + 1]; b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = rs[k]; b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    }
+    bar(self, (UINT)tb.size(), tb.data());
+    for (const Cp& c : cps) copy(self, rb, c.dst, c.r, c.so, c.len);
+    for (size_t k = 0; k < rs.size(); ++k) std::swap(tb[k + 1].Transition.StateBefore, tb[k + 1].Transition.StateAfter);
+    bar(self, (UINT)rs.size(), tb.data() + 1);
+    Diag("CULLRB L=" + Hex((uint64_t)(uintptr_t)self) + " f=" + std::to_string((long long)n->cullFrame) + " copies=" +
+         std::to_string((unsigned long)cps.size()) + " res=" + std::to_string((unsigned long)rs.size()) + " bad=" + std::to_string((unsigned long)bad) +
+         (hasLod ? " lodA=" + std::to_string((unsigned long)nA) + " badA=" + std::to_string((unsigned long)badA) : std::string()));
+}
+static void GhCullCopyNote(ID3D12GraphicsCommandList* self, ID3D12Resource* d, UINT64 dOff, ID3D12Resource* sr, UINT64 sOff, UINT64 n)
+{
+    static volatile LONG k = 0;
+    if (InterlockedIncrement(&k) > 400) return;
+    D3D12_HEAP_PROPERTIES hp{}; D3D12_HEAP_FLAGS hf{};
+    const HRESULT hr = d ? d->GetHeapProperties(&hp, &hf) : E_POINTER;
+    Diag("CULLCOPY L=" + Hex((uint64_t)(uintptr_t)self) + " frame=" + std::to_string((long long)InterlockedCompareExchange64(&g_gprPresents, 0, 0)) +
+         " src=" + std::string(sr == g_cullCntRes[0] ? "CULLCNT" : "LODCNT") + "+" + std::to_string((unsigned long long)sOff) +
+         " n=" + std::to_string((unsigned long long)n) + " dst=" + Hex((uint64_t)(uintptr_t)d) + "+" + std::to_string((unsigned long long)dOff) +
+         " dstHeap=" + (SUCCEEDED(hr) ? std::to_string((int)hp.Type) : std::string("?")));
+}
+// Called from list Reset: once the window's frame is 10 presents old, every copy has retired.
+static void GhCullRbDrain(LONG64 now)
+{
+    if (!GhCullRb()) return;
+    AcquireSRWLockExclusive(&g_crbLk);
+    const LONG64 span = GhCullRb() > 1 ? GhCullRb() : 1;
+    if (g_crbFrame < 0 || now < g_crbFrame + span + 10 || !g_crbPtr || !g_crbEnt){ ReleaseSRWLockExclusive(&g_crbLk); return; }
+    std::vector<GhCrbEnt> ents; ents.swap(*g_crbEnt);
+    g_crbUsed = 0; g_crbFrame = -1;
+    // Log under the lock: the next window cannot start copying into the ring until this is read.
+    for (const GhCrbEnt& e : ents){
+        if (e.a){
+            const UINT8* v = g_crbPtr + e.lodRb + e.lodSkip;
+            std::string hx; hx.reserve(e.n * 2); char b3[4];
+            for (UINT32 t = 0; t < e.n; ++t){ snprintf(b3, sizeof b3, "%02X", (unsigned)v[t]); hx += b3; }
+            Diag("CULLRBA f=" + std::to_string((long long)e.frame) + " L=" + Hex((uint64_t)(uintptr_t)e.L) +
+                 " lod=" + std::to_string((unsigned long)e.lodIdx) + "@" + std::to_string((unsigned long)e.lodH) +
+                 " n=" + std::to_string((unsigned long)e.n) + " V=" + hx);
+            continue;
+        }
+        UINT32 cnt = 0; std::memcpy(&cnt, g_crbPtr + e.cntRb, 4);
+        INT64 lodc = -1; if (e.lcRb != ~0u){ UINT32 x = 0; std::memcpy(&x, g_crbPtr + e.lcRb, 4); lodc = x; }
+        const INT8* v = (const INT8*)(g_crbPtr + e.lodRb + e.lodSkip);
+        UINT32 vis = 0; std::string hx; hx.reserve(e.n * 2);
+        char b3[4];
+        for (UINT32 t = 0; t < e.n; ++t){
+            const int x = v[t], ax = x < 0 ? -x : x;
+            const bool pass = ax < 126 || x == 127;
+            const bool vi = !(e.f152 & 16) ? (x != 0 && pass) : !(e.f152 & 8) ? (x == 0 && pass) : pass;
+            vis += vi ? 1 : 0;
+            snprintf(b3, sizeof b3, "%02X", (unsigned)(UINT8)x); hx += b3;
+        }
+        Diag("CULLRB f=" + std::to_string((long long)e.frame) + " L=" + Hex((uint64_t)(uintptr_t)e.L) + " d=" + std::to_string((unsigned long)e.d) +
+             " n=" + std::to_string((unsigned long)e.n) + " base=" + std::to_string((unsigned long)e.base) +
+             " gpu=" + std::to_string((unsigned long)cnt) + " vis=" + std::to_string((unsigned long)vis) +
+             " lodc=" + std::to_string((long long)lodc) +
+             " cnt=" + std::to_string((unsigned long)e.cntIdx) + " lod=" + std::to_string((unsigned long)e.lodIdx) +
+             "@" + std::to_string((unsigned long)e.lodH) + " V=" + hx);
+    }
+    ReleaseSRWLockExclusive(&g_crbLk);
+}
+static UINT32 GhXinCapture(ID3D12GraphicsCommandList* self, GhCLNote* n, LONG i)
+{
+    const UINT32 ic = (n->xinArgs[i][0] == 12 || n->xinArgs[i][0] == 13) ? n->xinArgs[i][2] : 0;
+    const UINT32 nI = ic < kXinN ? ic : kXinN;
+    if (!nI || !(n->xfwB14[i] & 0x8000000000000000ull)) return 0;
+    ID3D12Resource* sr[2]{}; UINT64 sb[2]{}; UINT32 sh[2]{};
+    for (int j = 0; j < 2; ++j)
+        if (!GhXinStream(n->xinS[i][j], n->xinSK[i][j], n->xinSOff[i][j], kXinStride[j], &sr[j], &sb[j], &sh[j])) return 0;
+    if (GhXfwReadable(sh[0]) || GhXfwReadable(sh[1])) return 0;   // CPU-visible: the submission snapshot covers it
+    // the header, from the t1 upload record
+    ID3D12Resource* tr = nullptr; UINT64 tb = 0; UINT32 th = 0;
+    if (!GhXinStream(n->xfwT1[i], n->xfwT1Kind[i], n->xfwT1Off[i], 4, &tr, &tb, &th) || !GhXfwReadable(th)){ GhXfwInc(XC_RBNO); return 0; }
+    GhXfwBuf b{};
+    if (!GhXfwFind(0, tr, &b)){ GhXfwInc(XC_RBNO); return 0; }
+    GhXfwMap m{};
+    if (!GhXfwOpen(b, &m)){ GhXfwInc(XC_RBNO); return 0; }
+    const UINT32 srt = (UINT32)n->xfwB14[i];
+    UINT32 P = 0, hdr[3]{};
+    const bool okh = GhXfwRd(m, tb + srt + 56, &P, 4) && GhXfwRd(m, tb + P, hdr, 12);
+    GhXfwClose(&m);
+    if (!okh){ GhXfwInc(XC_RBNO); return 0; }
+    for (int j = 0; j < 2; ++j){
+        const D3D12_RESOURCE_DESC rd = sr[j]->GetDesc();
+        const UINT32 hb = j ? hdr[2] : hdr[0];
+        if (sb[j] + (UINT64)(hb + nI) * kXinStride[j] > rd.Width){ GhXfwInc(XC_RBNO); return 0; }
+    }
+    AcquireSRWLockExclusive(&g_xinRbLk);
+    if (!g_xinRb && !g_xinRbTried){
+        g_xinRbTried = true;
+        com_ptr<ID3D12Device> dev;
+        HRESULT hr = self->GetDevice(__uuidof(ID3D12Device), dev.put_void());
+        if (SUCCEEDED(hr)){
+            D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = (UINT64)GH_XIN_RB_N * GH_XIN_RB_SLOT;
+            rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+            rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
+            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                              __uuidof(ID3D12Resource), g_xinRb.put_void());
+            void* mp = nullptr;
+            if (SUCCEEDED(hr) && SUCCEEDED(g_xinRb->Map(0, nullptr, &mp)) && mp) g_xinRbPtr = (const UINT8*)mp;
+            else g_xinRb = nullptr;
+        }
+        Diag("XFW INRING hr=" + Hex((uint32_t)hr) + " mapped=" + (g_xinRbPtr ? "yes" : "NO") + " slots=" + std::to_string((long)GH_XIN_RB_N));
+    }
+    ID3D12Resource* rb = g_xinRb.get();
+    ReleaseSRWLockExclusive(&g_xinRbLk);
+    if (!rb){ GhXfwInc(XC_RBNO); return 0; }
+    LONG gen = InterlockedIncrement(&g_xinRbNext);
+    if (gen == 0) gen = InterlockedIncrement(&g_xinRbNext);
+    const unsigned slot = (unsigned)gen % GH_XIN_RB_N;
+    InterlockedExchange(&g_xinRbGenOf[slot], gen);
+    auto copy = (void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64, UINT64))GhClOrig(self, 15);
+    for (int j = 0; j < 2; ++j){
+        const UINT64 so = sb[j] + (UINT64)(j ? hdr[2] : hdr[0]) * kXinStride[j];
+        copy(self, rb, (UINT64)slot * GH_XIN_RB_SLOT + (j ? 1024 : 0), sr[j], so, (UINT64)nI * kXinStride[j]);
+        n->xinRegR[i][j] = sr[j]; n->xinRegO[i][j] = so;   // XFW10
+        if (GhXfwWho()) GhXwStreamNote(sr[j]);
+    }
+    GhXfwInc(XC_RBCAP);
+    return (UINT32)gen;
+}
+
 struct GhXfwSnap {
     ID3D12CommandQueue* q; UINT64 val; LONG seq; LONG64 t0; void* pso;
     GhXfwMap mB14, mT1, mBone;
     UINT64 oB14, oT1, oBone;
-    UINT32 srt, rec, f104; bool consts;
+    UINT32 srt, rec, f104; bool consts; UINT32 recN;   // recN: bytes of recB captured (0 = 152)
     uint8_t recB[152]; uint8_t bone[48]; bool hasBone, raced;
     // XFW5: the descriptors this draw read through, as the loader's shadow saw them at
     // submission -- the t1 table entry and the transform-buffer view at heap slot rec+20.
     UINT64 tCpu, bCpu; UINT32 tSeq, bSeq; void* tRes; void* bRes; UINT64 tVoff, bVoff; bool dRaced;
     UINT32 eiGen;   // XFW8
+    // XFW9: instance streams (0 = t0 space2 stride 64, 1 = t2 space2 stride 48), the first nI
+    // instances of this draw as submitted, and the draw call.
+    bool inst; UINT32 args[6]; UINT32 nI; GhXfwMap mS[2]; UINT64 oS[2]; bool hasS[2]; UINT32 rbGen; bool fromRb;
+    void* sRes[2]; UINT64 sVoff[2]; UINT32 sHeap[2];
+    uint8_t sDat[2][16 * 64];
+    UINT64 rt, ds; float view[4];   // XFW9d: the view the draw rendered into
+    LONG64 frame;                   // XFW9e: presents at submission
+    bool wArmed; LONG64 wFrame; UINT16 wLi; UINT32 wOrd; void* wR[2]; UINT64 wO[2];   // XFW10
 };
+static void GhXfwCloseAll(GhXfwSnap* s)
+{
+    GhXfwClose(&s->mB14); GhXfwClose(&s->mT1); GhXfwClose(&s->mBone);
+    GhXfwClose(&s->mS[0]); GhXfwClose(&s->mS[1]);
+}
 static std::mutex g_xfwPendMu;
 static std::deque<GhXfwSnap*>* g_xfwPend = nullptr;
 struct GhXfwHist { UINT32 m36, m52, flags, seen; float a[3], b[3], bn[3]; LONG seq; bool hasA, hasBone; };
@@ -26209,14 +27564,21 @@ static unsigned GhXfwDiff(const GhXfwSnap& s, int* off)
     unsigned m = 0; *off = -1;
     UINT32 srt = s.srt, rec = 0;
     if (!s.consts && GhXfwRd(s.mB14, s.oB14, &srt, 4) && srt != s.srt) m |= 1;
-    if (GhXfwRd(s.mT1, s.oT1 + (UINT64)s.srt + 64, &rec, 4) && rec != s.rec) m |= 2;
+    if (GhXfwRd(s.mT1, s.oT1 + (UINT64)s.srt + (s.inst ? 56 : 64), &rec, 4) && rec != s.rec) m |= 2;
     uint8_t r[152];
-    if (GhXfwRd(s.mT1, s.oT1 + (UINT64)s.rec, r, sizeof r) && std::memcmp(r, s.recB, sizeof r)){
+    const UINT32 rn = s.recN ? s.recN : 152;
+    if (GhXfwRd(s.mT1, s.oT1 + (UINT64)s.rec, r, rn) && std::memcmp(r, s.recB, rn)){
         m |= 4;
-        for (int i = 0; i < 152; ++i) if (r[i] != s.recB[i]){ *off = i; break; }
+        for (UINT32 i = 0; i < rn; ++i) if (r[i] != s.recB[i]){ *off = (int)i; break; }
     }
     uint8_t b[48];
     if (s.hasBone && GhXfwRd(s.mBone, s.oBone, b, sizeof b) && std::memcmp(b, s.bone, sizeof b)) m |= 8;
+    for (int j = 0; j < 2; ++j){   // XFW9: 16 = t0 space2 instances, 32 = t2 space2 instances
+        if (!s.hasS[j]) continue;
+        uint8_t d[16 * 64];
+        const UINT64 nb = (UINT64)s.nI * kXinStride[j];
+        if (GhXfwRd(s.mS[j], s.oS[j], d, nb) && std::memcmp(d, s.sDat[j], (size_t)nb)) m |= 16u << j;
+    }
     return m;
 }
 static UINT64 GhXfwDoneVal(ID3D12CommandQueue* q)
@@ -26273,11 +27635,615 @@ static void GhXeiFinish(const GhXfwSnap* s, UINT64 key, UINT32 m36, UINT32 m52)
     }
     std::memcpy(h.a, a, sizeof a); h.m36 = m36; h.m52 = m52; h.seq = s->seq;
 }
+// XFW9: per mesh draw (pipeline, index count/start, base vertex), the t2-space2 translations of
+// the first kXinN instances. Between two samples of the same draw with the same instance count,
+// the index-matched deltas share one camera term (their per-axis median); an instance that moves
+// more than 2 units away from that is a jump (IJUMP), and most of them at once is a reorder (ISHUF).
+struct GhXinHist { UINT32 ic, nI; float t[kXinN][3]; LONG seq; UINT32 P, hdr2; };
+static std::unordered_map<UINT64, GhXinHist>* g_xinHist = nullptr;   // watcher thread only
+// XFW9b: SV_Position comes ONLY from the t0 stream, a per-instance 4x4 clip matrix C (row-vector
+// convention: clip = (p,1) * C). The t2 stream is the instance's 3x4 world matrix W (world = W * (p,1)).
+// If C = A(W) * VP with A(W) = [[W3^T, 0], [t, 1]], every instance drawn in one pass with one camera
+// gives the SAME VP = A(W)^-1 * C. An instance whose VP differs from the first one seen for that
+// submission + pipeline was given another object's (or another view's) clip matrix: drawn elsewhere.
+struct GhVpRef { float vp[16]; LONG seq; void* pso; UINT32 n; };
+static std::unordered_map<UINT64, GhVpRef>* g_vpRef = nullptr;   // watcher thread only
+static bool GhXinVp(const uint8_t* c64, const uint8_t* w48, float* vp)
+{
+    float C[16], W[12];
+    std::memcpy(C, c64, 64); std::memcpy(W, w48, 48);
+    // R[k][i] = W[i][k]; t[i] = W[i][3]
+    float R[3][3], t[3];
+    for (int i = 0; i < 3; ++i){ for (int k = 0; k < 3; ++k) R[k][i] = W[i * 4 + k]; t[i] = W[i * 4 + 3]; }
+    const float det = R[0][0] * (R[1][1] * R[2][2] - R[1][2] * R[2][1]) - R[0][1] * (R[1][0] * R[2][2] - R[1][2] * R[2][0]) +
+                      R[0][2] * (R[1][0] * R[2][1] - R[1][1] * R[2][0]);
+    if (!std::isfinite(det) || std::fabs(det) < 1e-12f) return false;
+    float I[3][3];
+    I[0][0] =  (R[1][1] * R[2][2] - R[1][2] * R[2][1]) / det; I[0][1] = -(R[0][1] * R[2][2] - R[0][2] * R[2][1]) / det;
+    I[0][2] =  (R[0][1] * R[1][2] - R[0][2] * R[1][1]) / det; I[1][0] = -(R[1][0] * R[2][2] - R[1][2] * R[2][0]) / det;
+    I[1][1] =  (R[0][0] * R[2][2] - R[0][2] * R[2][0]) / det; I[1][2] = -(R[0][0] * R[1][2] - R[0][2] * R[1][0]) / det;
+    I[2][0] =  (R[1][0] * R[2][1] - R[1][1] * R[2][0]) / det; I[2][1] = -(R[0][0] * R[2][1] - R[0][1] * R[2][0]) / det;
+    I[2][2] =  (R[0][0] * R[1][1] - R[0][1] * R[1][0]) / det;
+    // A^-1 = [[I, 0], [-t I, 1]]
+    float Ai[4][4] = {};
+    for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) Ai[r][c] = I[r][c];
+    for (int c = 0; c < 3; ++c) Ai[3][c] = -(t[0] * I[0][c] + t[1] * I[1][c] + t[2] * I[2][c]);
+    Ai[3][3] = 1.0f;
+    for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c)
+        vp[r * 4 + c] = Ai[r][0] * C[0 * 4 + c] + Ai[r][1] * C[1 * 4 + c] + Ai[r][2] * C[2 * 4 + c] + Ai[r][3] * C[3 * 4 + c];
+    for (int k = 0; k < 16; ++k) if (!std::isfinite(vp[k])) return false;
+    return true;
+}
+static std::string GhXinRow(const float* v)
+{
+    char b[128]; std::snprintf(b, sizeof b, "(%.4g,%.4g,%.4g,%.4g)", v[0], v[1], v[2], v[3]); return b;
+}
+static void GhXinVpCheck(const GhXfwSnap* s)
+{
+    if (!s->hasS[0] || !s->hasS[1] || !s->nI) return;
+    if (!g_vpRef) g_vpRef = new std::unordered_map<UINT64, GhVpRef>();
+    if (g_vpRef->size() > 4096) g_vpRef->clear();
+    // XFW9d (gh_xfw_inst >= 3): one camera per VIEW (render target, depth target, viewport) per
+    // submission, across pipelines -- a shadow cascade or a probe capture drawn with the same
+    // pipeline is its own view, not a mismatch. "Main" = a 16:9 viewport at least 1280 wide.
+    const bool byView = GhXfwInst() >= 3;
+    const bool mainV = s->view[2] >= 1280.f && std::fabs(s->view[2] * 9.f - s->view[3] * 16.f) < 32.f;
+    UINT64 key = ((UINT64)(uintptr_t)s->pso * 0x9E3779B97F4A7C15ull) ^ (UINT64)(ULONG)s->seq;
+    if (byView){
+        UINT64 vk = s->rt * 0x9E3779B97F4A7C15ull ^ s->ds * 0xC2B2AE3D27D4EB4Full;
+        for (int v = 0; v < 4; ++v){ UINT32 u; std::memcpy(&u, &s->view[v], 4); vk = (vk ^ u) * 0x100000001B3ull; }
+        key = vk ^ (UINT64)(ULONG)s->seq;
+        if (mainV) GhXfwInc(XC_VMAINN);
+    }
+    for (UINT32 i = 0; i < s->nI; ++i){
+        float vp[16];
+        if (!GhXinVp(s->sDat[0] + (size_t)i * 64, s->sDat[1] + (size_t)i * 48, vp)){ GhXfwInc(XC_VPSING); continue; }
+        GhXfwInc(XC_VPN);
+        auto it = g_vpRef->find(key);
+        if (it == g_vpRef->end()){
+            GhVpRef r{}; std::memcpy(r.vp, vp, sizeof vp); r.seq = s->seq; r.pso = s->pso; r.n = 1;
+            g_vpRef->emplace(key, r); GhXfwInc(XC_VPREF);
+            if (InterlockedCompareExchange64(&g_xfwC[XC_VPREF], 0, 0) <= (byView ? 48 : 6)){
+                char vw[160]; std::snprintf(vw, sizeof vw, " rt=0x%llX ds=0x%llX view=(%.0f,%.0f,%.0f,%.0f)%s src=%s",
+                    (unsigned long long)s->rt, (unsigned long long)s->ds, s->view[0], s->view[1], s->view[2], s->view[3],
+                    mainV ? " MAIN" : "", s->fromRb ? "gpu" : "cpu");
+                Diag("XFW VPREF #" + std::to_string((long)s->seq) + " pso=" + Hex((uint64_t)(uintptr_t)s->pso) +
+                     " vp=" + GhXinRow(vp) + GhXinRow(vp + 4) + GhXinRow(vp + 8) + GhXinRow(vp + 12) + vw);
+            }
+            continue;
+        }
+        GhVpRef& r = it->second; ++r.n;
+        float worst = 0; int wk = -1;
+        for (int row = 0; row < 4; ++row){
+            float m = 0;
+            for (int c = 0; c < 4; ++c) m = (std::max)(m, (std::max)(std::fabs(r.vp[row * 4 + c]), std::fabs(vp[row * 4 + c])));
+            for (int c = 0; c < 4; ++c){
+                const float e = std::fabs(r.vp[row * 4 + c] - vp[row * 4 + c]) / (m + 1e-6f);
+                if (e > worst){ worst = e; wk = row * 4 + c; }
+            }
+        }
+        if (worst > 0.02f){
+            GhXfwInc(XC_VPODD);
+            if (s->fromRb) GhXfwInc(XC_RBODD);
+            if (byView) GhXfwInc(mainV ? XC_VODDMAIN : XC_VODDOTHER);
+            if (GhXfwLogOk(XC_VPODD)){
+                char vw[160]; std::snprintf(vw, sizeof vw, " rt=0x%llX ds=0x%llX view=(%.0f,%.0f,%.0f,%.0f)%s",
+                    (unsigned long long)s->rt, (unsigned long long)s->ds, s->view[0], s->view[1], s->view[2], s->view[3], mainV ? " MAIN" : "");
+                const float* C = (const float*)(s->sDat[0] + (size_t)i * 64);
+                const float* W = (const float*)(s->sDat[1] + (size_t)i * 48);
+                char wt[96]; std::snprintf(wt, sizeof wt, "(%.2f,%.2f,%.2f)", W[3], W[7], W[11]);
+                Diag("XFW VPODD #" + std::to_string((long)s->seq) + (s->fromRb ? " src=gpu" : " src=cpu") + " pso=" + Hex((uint64_t)(uintptr_t)s->pso) +
+                     " idx=" + std::to_string(s->args[1]) + "@" + std::to_string(s->args[3]) + " ic=" + std::to_string(s->args[2]) +
+                     " inst=" + std::to_string(i) + " worst=" + std::to_string(worst) + " at=" + std::to_string(wk) +
+                     " P=" + Hex(s->rec) + " wT=" + wt + " cT=" + GhXinRow(C + 12) +
+                     " vp=" + GhXinRow(vp) + GhXinRow(vp + 4) + GhXinRow(vp + 8) + GhXinRow(vp + 12) +
+                     " ref=" + GhXinRow(r.vp) + GhXinRow(r.vp + 4) + GhXinRow(r.vp + 8) + GhXinRow(r.vp + 12) + " refN=" + std::to_string(r.n) + vw);
+            }
+        }
+    }
+}
+// XFW9e (gh_xfw_inst >= 4): whose camera does an odd GPU-memory record carry? The reference per
+// (view, submission) now comes ONLY from CPU-written records (XI1/XI2: ~0.3% odd), with the view's
+// last CPU reference of the same frame as a fallback. Every reference goes into a history ring; an
+// odd GPU record is matched against it: WPREV = a camera from an EARLIER frame (the fill ran with, or
+// was left from, an old camera), WSAME = another view of the SAME frame (the fill used the wrong
+// view), WNONE = no camera seen recently.
+struct GhVpHist { float vp[16]; UINT64 vk; LONG seq; LONG64 frame; };
+static GhVpHist g_vpHist[512];
+static int g_vpHistN = 0, g_vpHistPos = 0;
+static std::unordered_map<UINT64, GhVpHist>* g_vpLastByView = nullptr;
+static float GhXinVpErr(const float* a, const float* b)
+{
+    float worst = 0;
+    for (int row = 0; row < 4; ++row){
+        float m = 0;
+        for (int c = 0; c < 4; ++c) m = (std::max)(m, (std::max)(std::fabs(a[row * 4 + c]), std::fabs(b[row * 4 + c])));
+        for (int c = 0; c < 4; ++c) worst = (std::max)(worst, std::fabs(a[row * 4 + c] - b[row * 4 + c]) / (m + 1e-6f));
+    }
+    return worst;
+}
+// XFW10b (gh_xfw_who=P): who writes the odd rock records. The rock instance slots are allocated by the
+// CPU per frame (XB1 IJUMP: the same mesh's instance base moves every frame), so no region can be
+// watched ahead of time. Instead one candidate pipeline is examined per armed window (frames with
+// presents % P < 2, the pipelines taking turns in the order they were first seen in the UAV window):
+// right before and right after its first two dispatches of the window, the whole instance-stream buffers
+// (every resource a GPU rock record was read from, at most 4, 8 MB in all) are copied to a READBACK
+// ring, each copy fenced by a UAV barrier. A sampled rock draw that ran after such a pair in the same
+// frame window then says, per instance and per stream (t0 clip / t2 world), whether that dispatch
+// changed it, and whether the value it left is what the draw read.
+#define GH_XW_SLOT  (8ull << 20)
+#define GH_XW_SLOTS 4
+struct GhXwPair {
+    volatile LONG gen; volatile LONG seq; UINT16 li; UINT32 ord; LONG64 frame; void* pso; UINT8 ind;
+    int nres; ID3D12Resource* res[4]; UINT64 off[4], size[4]; UINT32 slotA, slotB;
+};
+static GhXwPair g_xwPair[GH_XW_SLOTS / 2];
+// The stream buffers are the GAME's resources and the game replaces them (XW2: new 4 MB / 3.2 MB buffers at
+// the level load, then the old ones were freed under our copies -> device removed 0x887A0001). So each one
+// is AddRef'd here, only those a rock draw used in the last 16 frames are copied, and one unseen for 240
+// frames is released (long after the last list that could copy it has run).
+#define GH_XW_SRES 6
+static ID3D12Resource* g_xwSres[GH_XW_SRES]{};
+static UINT64 g_xwSresW[GH_XW_SRES]{};
+static volatile LONG64 g_xwSresSeen[GH_XW_SRES]{};
+static int g_xwSresN = 0;
+static SRWLOCK g_xwSresLk = SRWLOCK_INIT;
+static void GhXwStreamNote(ID3D12Resource* r)
+{
+    if (!r) return;
+    const LONG64 now = InterlockedCompareExchange64(&g_gprPresents, 0, 0);
+    AcquireSRWLockShared(&g_xwSresLk);
+    bool have = false;
+    for (int k = 0; k < g_xwSresN; ++k) if (g_xwSres[k] == r){ InterlockedExchange64(&g_xwSresSeen[k], now); have = true; break; }
+    ReleaseSRWLockShared(&g_xwSresLk);
+    if (have) return;
+    const UINT64 w = r->GetDesc().Width;
+    ID3D12Resource* drop = nullptr;
+    AcquireSRWLockExclusive(&g_xwSresLk);
+    for (int k = 0; k < g_xwSresN; ++k) if (g_xwSres[k] == r) have = true;
+    if (!have && w <= GH_XW_SLOT){
+        int k = g_xwSresN < GH_XW_SRES ? g_xwSresN : -1;
+        if (k < 0){   // full: reuse the stalest entry if it has been unseen long enough
+            int old = 0;
+            for (int j = 1; j < g_xwSresN; ++j) if (g_xwSresSeen[j] < g_xwSresSeen[old]) old = j;
+            if (now - g_xwSresSeen[old] > 240){ k = old; drop = g_xwSres[old]; }
+        } else ++g_xwSresN;
+        if (k >= 0){
+            r->AddRef();
+            g_xwSres[k] = r; g_xwSresW[k] = w; InterlockedExchange64(&g_xwSresSeen[k], now);
+            Diag("XFW WHOSTREAM i=" + std::to_string(k) + " res=" + Hex((uint64_t)(uintptr_t)r) + " bytes=" +
+                 std::to_string((unsigned long long)w) + (drop ? " replaces=" + Hex((uint64_t)(uintptr_t)drop) : std::string()));
+        } else GhXfwInc(XC_WHOOVER);
+    }
+    ReleaseSRWLockExclusive(&g_xwSresLk);
+    if (drop) drop->Release();
+}
+static com_ptr<ID3D12Resource> g_xwRb;
+static const UINT8* g_xwPtr = nullptr;
+static bool g_xwTried = false;
+static SRWLOCK g_xwRbLk = SRWLOCK_INIT;
+static volatile LONG g_xwNext = 0;
+static volatile LONG64 g_xwWin = -1;
+static volatile LONG g_xwWinPairs = 0;
+// per pipeline: [odd/ok][t0/t2][changed->final, changed->not final, untouched->final, untouched->not final]
+static std::unordered_map<void*, std::array<LONG64, 16>>* g_xwTally = nullptr;   // watcher thread only
+static void* GhXwTarget(LONG64 frame)
+{
+    const unsigned P = GhXfwWho();
+    void* t = nullptr;
+    AcquireSRWLockShared(&g_xwPsoLk);
+    if (g_xwPsoVec && !g_xwPsoVec->empty()) t = (*g_xwPsoVec)[(size_t)((frame / P) % (LONG64)g_xwPsoVec->size())];
+    ReleaseSRWLockShared(&g_xwPsoLk);
+    return t;
+}
+static bool GhXwRing(ID3D12GraphicsCommandList* self)
+{
+    AcquireSRWLockExclusive(&g_xwRbLk);
+    if (!g_xwRb && !g_xwTried){
+        g_xwTried = true;
+        com_ptr<ID3D12Device> dev;
+        HRESULT hr = self->GetDevice(__uuidof(ID3D12Device), dev.put_void());
+        if (SUCCEEDED(hr)){
+            D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = GH_XW_SLOT * GH_XW_SLOTS;
+            rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+            rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
+            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                              __uuidof(ID3D12Resource), g_xwRb.put_void());
+            void* mp = nullptr;
+            if (SUCCEEDED(hr) && SUCCEEDED(g_xwRb->Map(0, nullptr, &mp)) && mp) g_xwPtr = (const UINT8*)mp;
+            else g_xwRb = nullptr;
+        }
+        Diag("XFW WHORING hr=" + Hex((uint32_t)hr) + " mapped=" + (g_xwPtr ? "yes" : "NO") + " MB=" +
+             std::to_string((unsigned long long)(GH_XW_SLOT * GH_XW_SLOTS >> 20)));
+    }
+    const bool ok = g_xwRb.get() != nullptr;
+    ReleaseSRWLockExclusive(&g_xwRbLk);
+    return ok;
+}
+static void GhXwCopyAll(ID3D12GraphicsCommandList* self, GhXwPair& p, UINT32 slot)
+{
+    auto barrier = (void (__stdcall*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*))GhClOrig(self, 26);
+    auto copy = (void (__stdcall*)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64, UINT64))GhClOrig(self, 15);
+    D3D12_RESOURCE_BARRIER ub{}; ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; ub.UAV.pResource = nullptr;
+    barrier(self, 1, &ub);
+    for (int k = 0; k < p.nres; ++k)
+        copy(self, g_xwRb.get(), (UINT64)slot * GH_XW_SLOT + p.off[k], p.res[k], 0, p.size[k]);
+    barrier(self, 1, &ub);
+}
+// Before the dispatch: is this the window's pipeline, and is there a pair left? Copy "before".
+// XFW10c (gh_xfw_who_list=1): XW3 found that no candidate PIPELINE ever changes a rock instance, so the unit
+// examined becomes the whole COMMAND LIST (any writer: copy, graphics UAV, indirect, a pipeline outside the set):
+// the stream buffers are copied right after the target list's Reset and right before its Close. The lists
+// (direct/compute only) take turns per armed window, in the order they were first closed in an armed frame.
+static unsigned GhXfwWhoList(){ static const unsigned m = GhCfgNum(L"gh_xfw_who_list.txt", "GH_XFW_WHO_LIST", 0); return m; }
+static std::vector<void*>* g_xwListVec = nullptr;   // under g_xwPsoLk
+static std::unordered_set<void*>* g_xwListSet = nullptr;
+static void* GhXwTargetList(LONG64 frame)
+{
+    void* t = nullptr;
+    AcquireSRWLockShared(&g_xwPsoLk);
+    if (g_xwListVec && !g_xwListVec->empty()) t = (*g_xwListVec)[(size_t)((frame / GhXfwWho()) % (LONG64)g_xwListVec->size())];
+    ReleaseSRWLockShared(&g_xwPsoLk);
+    return t;
+}
+// Open a pair on this list ("before" copy) for the examined unit `key` (a pipeline, or the list itself).
+static void GhXwPairBegin(ID3D12GraphicsCommandList* self, GhCLNote* n, void* key, UINT8 kind)
+{
+    n->xwPend = -1;
+    const LONG64 win = n->xwFrame / (LONG64)GhXfwWho();
+    const LONG64 prevWin = InterlockedExchange64(&g_xwWin, win);
+    if (prevWin != win) InterlockedExchange(&g_xwWinPairs, 0);
+    const LONG k = InterlockedIncrement(&g_xwWinPairs);
+    if (k > GH_XW_SLOTS / 2){ GhXfwInc(XC_WHOOVER); return; }
+    if (!GhXwRing(self)) return;
+    LONG gen = InterlockedIncrement(&g_xwNext);
+    if (gen == 0) gen = InterlockedIncrement(&g_xwNext);
+    const int pi = (int)((unsigned)gen % (GH_XW_SLOTS / 2));
+    GhXwPair& p = g_xwPair[pi];
+    InterlockedExchange(&p.gen, 0); InterlockedExchange(&p.seq, 0);
+    p.pso = key; p.frame = n->xwFrame; p.ind = kind; p.li = 0; p.ord = n->xwOrd;
+    p.slotA = (UINT32)(pi * 2); p.slotB = (UINT32)(pi * 2 + 1);
+    AcquireSRWLockShared(&g_xwSresLk);
+    p.nres = 0; UINT64 o = 0;
+    for (int r = 0; r < g_xwSresN && p.nres < 4; ++r){   // only buffers a rock draw used in the last 16 frames
+        if (n->xwFrame - InterlockedCompareExchange64(&g_xwSresSeen[r], 0, 0) > 16) continue;
+        if (o + g_xwSresW[r] > GH_XW_SLOT) continue;
+        p.res[p.nres] = g_xwSres[r]; p.off[p.nres] = o; p.size[p.nres] = g_xwSresW[r]; o += g_xwSresW[r]; ++p.nres;
+    }
+    ReleaseSRWLockShared(&g_xwSresLk);
+    if (!p.nres) return;
+    GhXwCopyAll(self, p, p.slotA);
+    n->xwPend = gen;
+    GhXfwInc(XC_WHOCPY);
+}
+// Close the pair ("after" copy) and publish it; `ord` orders it against draws of the same list.
+static void GhXwPairEnd(ID3D12GraphicsCommandList* self, GhCLNote* n, UINT32 ord)
+{
+    const LONG gen = n->xwPend;
+    n->xwPend = -1;
+    if (gen <= 0) return;
+    GhXwPair& p = g_xwPair[(unsigned)gen % (GH_XW_SLOTS / 2)];
+    p.ord = ord;
+    GhXwCopyAll(self, p, p.slotB);
+    InterlockedExchange(&p.gen, gen);
+    if (n->xwGenN < 512) n->xwGen[n->xwGenN++] = gen;
+}
+// Before a dispatch (pipeline mode): is this the window's pipeline?
+static void GhXwBefore(ID3D12GraphicsCommandList* self, bool indirect)
+{
+    if (!GhXfwWho() || GhXfwWhoList()) return;
+    GhCLNote* n = GhCLFind(self);
+    if (!n || !n->xwOn || !n->lastPso) return;
+    n->xwPend = -1;
+    if (n->lastPso != GhXwTarget(n->xwFrame)){ GhXfwInc(XC_WHOSKIP); return; }
+    GhXwPairBegin(self, n, n->lastPso, indirect ? 1 : 0);
+}
+// After the dispatch: copy "after" and publish the pair; draws later in this list follow it.
+static void GhXwAfter(ID3D12GraphicsCommandList* self, bool indirect)
+{
+    (void)indirect;
+    if (!GhXfwWho()) return;
+    GhCLNote* n = GhCLFind(self);
+    if (!n || !n->xwOn) return;
+    const UINT32 ord = n->xwOrd++;
+    if (GhXfwWhoList()) return;
+    GhXwPairEnd(self, n, ord);
+}
+// List mode: right after Reset (list open, nothing recorded yet) and right before Close.
+static void GhXwListReset(ID3D12GraphicsCommandList* self)
+{
+    if (!GhXfwWho() || !GhXfwWhoList()) return;
+    GhCLNote* n = GhCLFind(self);
+    if (!n || !n->xwOn) return;
+    if (n->type != (LONG)D3D12_COMMAND_LIST_TYPE_DIRECT && n->type != (LONG)D3D12_COMMAND_LIST_TYPE_COMPUTE) return;
+    if ((void*)self != GhXwTargetList(n->xwFrame)){ GhXfwInc(XC_WHOSKIP); return; }
+    GhXwPairBegin(self, n, (void*)self, 2);
+}
+static void GhXwListClose(ID3D12GraphicsCommandList* self)
+{
+    if (!GhXfwWho() || !GhXfwWhoList()) return;
+    GhCLNote* n = GhCLFind(self);
+    if (!n || !n->xwOn) return;
+    if (n->type != (LONG)D3D12_COMMAND_LIST_TYPE_DIRECT && n->type != (LONG)D3D12_COMMAND_LIST_TYPE_COMPUTE) return;
+    AcquireSRWLockShared(&g_xwPsoLk);
+    const bool known = g_xwListSet && g_xwListSet->count((void*)self);
+    ReleaseSRWLockShared(&g_xwPsoLk);
+    if (!known){
+        AcquireSRWLockExclusive(&g_xwPsoLk);
+        if (!g_xwListSet){ g_xwListSet = new std::unordered_set<void*>(); g_xwListVec = new std::vector<void*>(); }
+        if (g_xwListSet->size() < 1024 && g_xwListSet->insert((void*)self).second) g_xwListVec->push_back((void*)self);
+        ReleaseSRWLockExclusive(&g_xwPsoLk);
+    }
+    if (n->xwPend > 0){
+        static volatile LONG nlog = 0;
+        if (InterlockedIncrement(&nlog) <= 600){
+            std::string ps;
+            for (LONG i = 0; i < n->psoN && i < 8; ++i) ps += " " + Hex((uint64_t)(uintptr_t)n->psos[i]);
+            Diag("XFW WHOLIST list=" + Hex((uint64_t)(uintptr_t)self) + " type=" + std::to_string((long)n->type) +
+                 " draws=" + std::to_string((long)n->draws) + " disp=" + std::to_string((long)n->disp) +
+                 " barriers=" + std::to_string((long)n->barriers) + " psoN=" + std::to_string((long)n->psoN) + " psos=" + ps +
+                 " frame=" + std::to_string((long long)n->xwFrame));
+        }
+        GhXwPairEnd(self, n, 0xFFFFFFFFu);
+    }
+}
+static void GhXwStamp(LONG seq, UINT n, ID3D12CommandList* const* l)
+{
+    for (UINT li = 0; li < n; ++li){
+        GhCLNote* nt = GhCLFind(l[li]);
+        if (!nt) continue;
+        for (LONG e = 0; e < nt->xwGenN; ++e){
+            const LONG g = nt->xwGen[e];
+            GhXwPair& p = g_xwPair[(unsigned)g % (GH_XW_SLOTS / 2)];
+            if (InterlockedCompareExchange(&p.gen, 0, 0) != g) continue;
+            p.li = (UINT16)li;
+            InterlockedExchange(&p.seq, seq);
+        }
+    }
+}
+// Where one instance of one stream sits inside a pair's copies (nullptr if the pair did not copy it).
+static const UINT8* GhXwAt(const GhXwPair& p, UINT32 slot, ID3D12Resource* r, UINT64 off, UINT32 len)
+{
+    for (int k = 0; k < p.nres; ++k)
+        if (p.res[k] == r && off + len <= p.size[k]) return g_xwPtr + (size_t)slot * GH_XW_SLOT + p.off[k] + off;
+    return nullptr;
+}
+// One sampled GPU rock record (odd or ok per instance against ref): every pair that ran before it.
+static void GhXwEval(const GhXfwSnap* s, UINT32 i, const float* ref, float e, bool odd)
+{
+    if (!g_xwPtr || !s->wArmed || !s->wR[0] || !s->wR[1]) return;
+    for (int pi = 0; pi < GH_XW_SLOTS / 2; ++pi){
+        const GhXwPair& p = g_xwPair[pi];
+        const LONG g = InterlockedCompareExchange((volatile LONG*)&p.gen, 0, 0);
+        const LONG sq = InterlockedCompareExchange((volatile LONG*)&p.seq, 0, 0);
+        if (!g || !sq) continue;
+        if (p.frame + 1 < s->wFrame || p.frame > s->wFrame + 1) continue;
+        if (sq > s->seq || (sq == s->seq && (p.li > s->wLi || (p.li == s->wLi && p.ord >= s->wOrd)))) continue;
+        GhXfwInc(XC_WHOARM);
+        const UINT8* bf[2]; const UINT8* af[2];
+        bool have = true;
+        for (int j = 0; j < 2; ++j){
+            const UINT64 off = s->wO[j] + (UINT64)i * kXinStride[j];
+            bf[j] = GhXwAt(p, p.slotA, (ID3D12Resource*)s->wR[j], off, kXinStride[j]);
+            af[j] = GhXwAt(p, p.slotB, (ID3D12Resource*)s->wR[j], off, kXinStride[j]);
+            if (!bf[j] || !af[j]) have = false;
+        }
+        if (!have){ GhXfwInc(odd ? XC_WHONOE : XC_WHOOKNOE); continue; }
+        int cls[2];
+        bool chgAny = false;
+        for (int j = 0; j < 2; ++j){
+            const UINT8* fin = s->sDat[j] + (size_t)i * kXinStride[j];
+            const bool chg = std::memcmp(bf[j], af[j], kXinStride[j]) != 0;
+            const bool fa = std::memcmp(af[j], fin, kXinStride[j]) == 0;
+            cls[j] = chg ? (fa ? 0 : 1) : (fa ? 2 : 3);
+            chgAny |= chg;
+        }
+        if (InterlockedCompareExchange((volatile LONG*)&p.gen, 0, 0) != g){ GhXfwInc(XC_WHOSTALE); continue; }
+        if (!g_xwTally) g_xwTally = new std::unordered_map<void*, std::array<LONG64, 16>>();
+        if (g_xwTally->size() < 4096){
+            auto& t = (*g_xwTally)[p.pso];
+            for (int j = 0; j < 2; ++j) ++t[(odd ? 0 : 8) + j * 4 + cls[j]];
+        }
+        if (!chgAny) continue;
+        GhXfwInc(odd ? XC_WHOODD : XC_WHOOK);
+        if (odd && (cls[0] <= 1 || cls[1] <= 1)){
+            const LONG64 k = InterlockedCompareExchange64(&g_xfwC[XC_WHOODD], 0, 0);
+            if (k <= 48 || (k % 64) == 0){
+                float vb[16], va[16]; float eb = 9.f, ea = 9.f;
+                if (GhXinVp(bf[0], bf[1], vb)) eb = GhXinVpErr(ref, vb);
+                if (GhXinVp(af[0], af[1], va)) ea = GhXinVpErr(ref, va);
+                char b[260]; std::snprintf(b, sizeof b, " pso=%llX%s inst=%u errDraw=%.3f errBefore=%.3f errAfter=%.3f t0=%s t2=%s dSeq=%ld frame=%lld",
+                    (unsigned long long)(uintptr_t)p.pso, p.ind == 2 ? "(LIST)" : p.ind ? "(EI)" : "", i, e, eb, ea,
+                    cls[0] == 0 ? "wrote-final" : cls[0] == 1 ? "wrote-later-changed" : cls[0] == 2 ? "same-final" : "same-later-written",
+                    cls[1] == 0 ? "wrote-final" : cls[1] == 1 ? "wrote-later-changed" : cls[1] == 2 ? "same-final" : "same-later-written",
+                    (long)(s->seq - sq), (long long)s->wFrame);
+                Diag("XFW WHO #" + std::to_string((long)s->seq) + " draw=" + Hex((uint64_t)(uintptr_t)s->pso) + b);
+            }
+        }
+    }
+}
+static void GhXwTopLine()
+{
+    if (!g_xwTally) return;
+    std::vector<std::pair<LONG64, void*>> v;
+    for (auto& kv : *g_xwTally){
+        const auto& t = kv.second;
+        v.push_back({ t[0] + t[1] + t[4] + t[5] + t[8] + t[9] + t[12] + t[13], kv.first });
+    }
+    std::sort(v.begin(), v.end(), [](const std::pair<LONG64, void*>& a, const std::pair<LONG64, void*>& b){ return a.first > b.first; });
+    std::string m = "XFW WHOTOP psos=" + std::to_string(v.size()) +
+                    " (per pso: odd t0 wF/wC/sF/sL t2 ... | ok t0 ... t2 ...)";
+    for (size_t k = 0; k < v.size() && k < 10; ++k){
+        const auto& t = (*g_xwTally)[v[k].second];
+        m += "\n    " + Hex((uint64_t)(uintptr_t)v[k].second) + " odd";
+        for (int c = 0; c < 8; ++c) m += (c == 4 ? " |" : " ") + std::to_string((long long)t[c]);
+        m += " || ok";
+        for (int c = 8; c < 16; ++c) m += (c == 12 ? " |" : " ") + std::to_string((long long)t[c]);
+    }
+    AcquireSRWLockShared(&g_xwPsoLk);
+    m += "\n    candidates=" + std::to_string(g_xwPsoVec ? g_xwPsoVec->size() : 0) +
+         " lists=" + std::to_string(g_xwListVec ? g_xwListVec->size() : 0);
+    ReleaseSRWLockShared(&g_xwPsoLk);
+    m += " examined=" + std::to_string(g_xwTally->size());
+    Diag(m);
+}
+static void GhXinVpCheck4(const GhXfwSnap* s)
+{
+    if (!s->hasS[0] || !s->hasS[1] || !s->nI) return;
+    if (!g_vpRef) g_vpRef = new std::unordered_map<UINT64, GhVpRef>();
+    if (!g_vpLastByView) g_vpLastByView = new std::unordered_map<UINT64, GhVpHist>();
+    if (g_vpRef->size() > 4096) g_vpRef->clear();
+    if (g_vpLastByView->size() > 4096) g_vpLastByView->clear();
+    UINT64 vk = s->rt * 0x9E3779B97F4A7C15ull ^ s->ds * 0xC2B2AE3D27D4EB4Full;
+    for (int v = 0; v < 4; ++v){ UINT32 u; std::memcpy(&u, &s->view[v], 4); vk = (vk ^ u) * 0x100000001B3ull; }
+    const UINT64 key = vk ^ (UINT64)(ULONG)s->seq;
+    for (UINT32 i = 0; i < s->nI; ++i){
+        float vp[16];
+        if (!GhXinVp(s->sDat[0] + (size_t)i * 64, s->sDat[1] + (size_t)i * 48, vp)){ GhXfwInc(XC_VPSING); continue; }
+        GhXfwInc(XC_VPN);
+        auto it = g_vpRef->find(key);
+        if (!s->fromRb){   // CPU record: the reference side
+            if (it == g_vpRef->end()){
+                GhVpRef r{}; std::memcpy(r.vp, vp, sizeof vp); r.seq = s->seq; r.pso = s->pso; r.n = 1;
+                g_vpRef->emplace(key, r); GhXfwInc(XC_VPREF);
+                GhVpHist h{}; std::memcpy(h.vp, vp, sizeof vp); h.vk = vk; h.seq = s->seq; h.frame = s->frame;
+                g_vpHist[g_vpHistPos] = h; g_vpHistPos = (g_vpHistPos + 1) % 512; if (g_vpHistN < 512) ++g_vpHistN;
+                (*g_vpLastByView)[vk] = h;
+                if (InterlockedCompareExchange64(&g_xfwC[XC_VPREF], 0, 0) <= 24){
+                    char vw[160]; std::snprintf(vw, sizeof vw, " rt=0x%llX ds=0x%llX view=(%.0f,%.0f,%.0f,%.0f) frame=%lld",
+                        (unsigned long long)s->rt, (unsigned long long)s->ds, s->view[0], s->view[1], s->view[2], s->view[3], (long long)s->frame);
+                    Diag("XFW VPREF #" + std::to_string((long)s->seq) + " pso=" + Hex((uint64_t)(uintptr_t)s->pso) +
+                         " vp=" + GhXinRow(vp) + GhXinRow(vp + 4) + GhXinRow(vp + 8) + GhXinRow(vp + 12) + vw);
+                }
+            } else if (GhXinVpErr(it->second.vp, vp) > 0.02f) GhXfwInc(XC_WCPUODD);
+            continue;
+        }
+        const float* ref = nullptr;
+        if (it != g_vpRef->end()) ref = it->second.vp;
+        else {
+            auto lv = g_vpLastByView->find(vk);
+            if (lv != g_vpLastByView->end() && lv->second.frame == s->frame) ref = lv->second.vp;
+        }
+        if (!ref){ GhXfwInc(XC_WNOREF); continue; }
+        const float e = GhXinVpErr(ref, vp);
+        if (GhXfwWho()) GhXwEval(s, i, ref, e, e > 0.02f);   // XFW10b
+        if (e <= 0.02f){ GhXfwInc(XC_WOK); continue; }
+        GhXfwInc(XC_WODD); GhXfwInc(XC_RBODD);
+        int best = -1; float be = 1e30f;
+        for (int h = 0; h < g_vpHistN; ++h){
+            const float eh = GhXinVpErr(g_vpHist[h].vp, vp);
+            if (eh < be){ be = eh; best = h; }
+        }
+        int cls = XC_WNONE;
+        LONG64 dF = 0; bool sameV = false; LONG hseq = 0;
+        if (best >= 0 && be <= 0.02f){
+            const GhVpHist& h = g_vpHist[best];
+            dF = s->frame - h.frame; sameV = h.vk == vk; hseq = h.seq;
+            cls = dF > 0 ? XC_WPREV : XC_WSAME;
+        }
+        GhXfwInc(cls);
+        if (GhXfwLogOk(XC_WODD)){
+            char b[256]; std::snprintf(b, sizeof b, " worst=%.4f match=%s err=%.4f dFrame=%lld sameView=%d matchSeq=%ld frame=%lld view=(%.0f,%.0f,%.0f,%.0f) rt=0x%llX",
+                e, cls == XC_WPREV ? "PREV" : cls == XC_WSAME ? "SAMEFRAME" : "NONE", be, (long long)dF, sameV ? 1 : 0, (long)hseq,
+                (long long)s->frame, s->view[0], s->view[1], s->view[2], s->view[3], (unsigned long long)s->rt);
+            Diag("XFW VPWHO #" + std::to_string((long)s->seq) + " pso=" + Hex((uint64_t)(uintptr_t)s->pso) +
+                 " idx=" + std::to_string(s->args[1]) + "@" + std::to_string(s->args[3]) + " ic=" + std::to_string(s->args[2]) +
+                 " inst=" + std::to_string(i) + b + " vp=" + GhXinRow(vp) + GhXinRow(vp + 4) + GhXinRow(vp + 8) + GhXinRow(vp + 12) +
+                 " ref=" + GhXinRow(ref) + GhXinRow(ref + 4) + GhXinRow(ref + 8) + GhXinRow(ref + 12));
+        }
+    }
+}
+static void GhXinFinish(const GhXfwSnap* s)
+{
+    if (GhXfwInst() >= 4) GhXinVpCheck4(s); else
+    GhXinVpCheck(s);   // XFW9b
+    if (GhCullDump()){   // XFW11: the sampled rock draws of a dump frame, to pair with its CULL lines
+        const LONG64 df = InterlockedCompareExchange64(&g_cullLastFrame, 0, 0);
+        if (df >= 0 && s->frame >= df && s->frame <= df + 1){
+            UINT32 hr3[3]{}; std::memcpy(hr3, s->recB, 12);
+            Diag("CULLDRAW f=" + std::to_string((long long)s->frame) + " #" + std::to_string((long)s->seq) +
+                 " pso=" + Hex((uint64_t)(uintptr_t)s->pso) + " args=" + std::to_string(s->args[0]) + "/" + std::to_string(s->args[1]) +
+                 "/" + std::to_string(s->args[2]) + "/" + std::to_string(s->args[3]) + "/" + std::to_string(s->args[4]) +
+                 " P=" + Hex(s->rec) + " hdr=" + std::to_string(hr3[0]) + "," + std::to_string(hr3[1]) + "," + std::to_string(hr3[2]) +
+                 " nI=" + std::to_string(s->nI) + " rt=" + Hex((uint64_t)s->rt) +
+                 " s0=" + Hex((uint64_t)(uintptr_t)s->sRes[0]) + "+" + std::to_string((unsigned long long)s->sVoff[0]) +
+                 " s2=" + Hex((uint64_t)(uintptr_t)s->sRes[1]) + "+" + std::to_string((unsigned long long)s->sVoff[1]));
+        }
+    }
+    if (!s->hasS[1] || !s->nI) return;
+    float t[kXinN][3];
+    for (UINT32 i = 0; i < s->nI; ++i){
+        const uint8_t* r = s->sDat[1] + (size_t)i * 48;
+        std::memcpy(&t[i][0], r + 12, 4); std::memcpy(&t[i][1], r + 28, 4); std::memcpy(&t[i][2], r + 44, 4);
+        for (int c = 0; c < 3; ++c) if (!std::isfinite(t[i][c]) || std::fabs(t[i][c]) > 1e6f){
+            GhXfwInc(XC_IBAD);
+            if (GhXfwLogOk(XC_IBAD))
+                Diag("XFW IBAD #" + std::to_string((long)s->seq) + " pso=" + Hex((uint64_t)(uintptr_t)s->pso) + " inst=" + std::to_string(i) +
+                     " t=" + GhXfwV3(t[i]) + " P=" + Hex(s->rec));
+            return;
+        }
+    }
+    UINT64 key = (UINT64)(uintptr_t)s->pso * 0x9E3779B97F4A7C15ull;
+    key ^= ((UINT64)s->args[1] << 32 | s->args[3]) * 0xC2B2AE3D27D4EB4Full;
+    key ^= (UINT64)s->args[4] * 0x165667B19E3779F9ull;
+    if (!g_xinHist) g_xinHist = new std::unordered_map<UINT64, GhXinHist>();
+    if (g_xinHist->size() > 50000) g_xinHist->clear();
+    UINT32 hdr2 = 0; std::memcpy(&hdr2, s->recB + 8, 4);
+    const UINT32 ic = s->args[2];
+    auto it = g_xinHist->find(key);
+    auto store = [&](GhXinHist& h){ h.ic = ic; h.nI = s->nI; std::memcpy(h.t, t, sizeof t); h.seq = s->seq; h.P = s->rec; h.hdr2 = hdr2; };
+    if (it == g_xinHist->end()){ GhXinHist h{}; store(h); g_xinHist->emplace(key, h); return; }
+    GhXinHist& h = it->second;
+    if (h.seq == s->seq) return;
+    if (h.ic != ic || h.nI != s->nI){ GhXfwInc(XC_ICNT); store(h); return; }
+    GhXfwInc(XC_ICMP);
+    float med[3];
+    for (int c = 0; c < 3; ++c){
+        float d[kXinN];
+        for (UINT32 i = 0; i < s->nI; ++i) d[i] = t[i][c] - h.t[i][c];
+        std::nth_element(d, d + s->nI / 2, d + s->nI);
+        med[c] = d[s->nI / 2];
+    }
+    UINT32 out = 0, first = 0; float worst = 0;
+    for (UINT32 i = 0; i < s->nI; ++i){
+        const float x = t[i][0] - h.t[i][0] - med[0], y = t[i][1] - h.t[i][1] - med[1], z = t[i][2] - h.t[i][2] - med[2];
+        const float e = std::sqrt(x * x + y * y + z * z);
+        if (e > 2.0f){ if (!out) first = i; ++out; if (e > worst) worst = e; }
+    }
+    if (out){
+        const bool shuf = out * 2 > s->nI;
+        GhXfwInc(shuf ? XC_ISHUF : XC_IJUMP);
+        if (GhXfwLogOk(shuf ? XC_ISHUF : XC_IJUMP))
+            Diag(std::string(shuf ? "XFW ISHUF #" : "XFW IJUMP #") + std::to_string((long)s->seq) +
+                 " pso=" + Hex((uint64_t)(uintptr_t)s->pso) + " idx=" + std::to_string(s->args[1]) + "@" + std::to_string(s->args[3]) +
+                 " bv=" + std::to_string((int)s->args[4]) + " ic=" + std::to_string(ic) + " out=" + std::to_string(out) + "/" + std::to_string(s->nI) +
+                 " inst=" + std::to_string(first) + " prev=" + GhXfwV3(h.t[first]) + " now=" + GhXfwV3(t[first]) +
+                 " cam=" + GhXfwV3(med) + " worst=" + std::to_string(worst) +
+                 " P=" + Hex(h.P) + "->" + Hex(s->rec) + " hdr2=" + Hex(h.hdr2) + "->" + Hex(hdr2) +
+                 " lastSeen=#" + std::to_string((long)h.seq));
+    }
+    store(h);
+}
 static void GhXfwFinish(GhXfwSnap* s)
 {
     int off = -1;
     if (GhXfwDiff(*s, &off)) GhXfwInc(XC_CHG);
     GhXfwInc(XC_DONE);
+    if (s->inst){   // XFW9: the character record layout does not apply
+        if (s->rbGen && g_xinRbPtr && !s->hasS[0] && !s->hasS[1]){   // XFW9c: the GPU-memory records, as the draw read them
+            const unsigned slot = s->rbGen % GH_XIN_RB_N;
+            const UINT32 ic = s->args[2]; const UINT32 nI = ic < kXinN ? ic : kXinN;
+            std::memcpy(s->sDat[0], g_xinRbPtr + (size_t)slot * GH_XIN_RB_SLOT, (size_t)nI * 64);
+            std::memcpy(s->sDat[1], g_xinRbPtr + (size_t)slot * GH_XIN_RB_SLOT + 1024, (size_t)nI * 48);
+            if (InterlockedCompareExchange(&g_xinRbGenOf[slot], 0, 0) != (LONG)s->rbGen) GhXfwInc(XC_RBSTALE);
+            else { s->nI = nI; s->hasS[0] = s->hasS[1] = true; s->fromRb = true; GhXfwInc(XC_RBUSE); }
+        }
+        GhXinFinish(s);
+        return;
+    }
     if (!g_xfwHist) g_xfwHist = new std::unordered_map<UINT64, GhXfwHist>();
     if (g_xfwHist->size() > 100000) g_xfwHist->clear();   // ~8 MB: the container is commit-bound
     const UINT64 key = ((UINT64)(uintptr_t)s->mT1.res * 0x9E3779B97F4A7C15ull) ^ (s->oT1 + s->rec);
@@ -26618,11 +28584,13 @@ static void GhXfwSummary()
 {
     static int nsum = 0;
     if (GhXfwHazOn() && (++nsum % 6) == 0) GhXfwBoneCensus();   // XFW3, every 30 s
+    static int nwho = 0;
+    if (GhXfwWho() && (++nwho % 6) == 0) GhXwTopLine();        // XFW10, every 30 s
     std::string m = "XFW SUM";
     for (int c = 0; c < XC_N; ++c)
         m += " " + std::string(kXfwCn[c]) + "=" + std::to_string((long long)InterlockedCompareExchange64(&g_xfwC[c], 0, 0));
-    const char* role[3] = { "b14", "t1", "bone" };
-    for (int r = 0; r < 3; ++r){
+    const char* role[5] = { "b14", "t1", "bone", "s0", "s2" };
+    for (int r = 0; r < 5; ++r){
         m += std::string(" ") + role[r] + "Heap=";
         for (int h = 0; h < 8; ++h){
             if (h) m += "/";
@@ -26673,6 +28641,7 @@ static DWORD WINAPI GhXfwWatcher(void*)
                             v = " recOff=" + std::to_string(o4) + " snap=" + Hex(a) + " live=" + Hex(b);
                         }
                         Diag("XFW RACE #" + std::to_string((long)s->seq) + " what=" + Hex(m) +
+                             " pso=" + Hex((uint64_t)(uintptr_t)s->pso) + (s->inst ? " inst" : "") +
                              " after=" + std::to_string((long long)(now - s->t0)) + "us" +
                              " t1=" + Hex((uint64_t)(uintptr_t)s->mT1.res) + " srt=" + Hex(s->srt) +
                              " rec=" + Hex(s->oT1 + s->rec) + v);
@@ -26687,7 +28656,7 @@ static DWORD WINAPI GhXfwWatcher(void*)
         }
         for (GhXfwSnap* s : done){
             if (s->val) GhXfwFinish(s);
-            GhXfwClose(&s->mB14); GhXfwClose(&s->mT1); GhXfwClose(&s->mBone);
+            GhXfwCloseAll(s);
             delete s;
         }
         if (GhXfwCpOn()){ static unsigned it = 0; GhXcpWatch((++it & 3) == 0); }   // XFW4, re-hash every ~8 ms
@@ -26950,8 +28919,10 @@ static void GhXfwSubmit(ID3D12CommandQueue* q, LONG seq, UINT n, ID3D12CommandLi
         Diag("XFW watcher started mode=" + std::to_string(GhXfwMode()));
     }
     if (GhXfwMode() >= 7) GhXwrSubmit(seq, n, l);   // XFW7b: this batch's copies first, then its draws
+    if (GhXfwWho()) GhXwStamp(seq, n, l);   // XFW10: where this batch's after-dispatch copies sit in queue order
     int budget = 48;
     UINT8 xrd[64] = {};   // XFW3: watched transform buffers read by this submission's sampled draws
+    if (GhCullDump()) for (UINT li = 0; li < n; ++li) GhCullSubmit(GhCLFind(l[li]), l[li], q, seq);   // XFW11
     for (UINT li = 0; li < n && budget > 0; ++li){
         GhCLNote* nt = GhCLFind(l[li]);
         if (!nt) continue;
@@ -26962,6 +28933,12 @@ static void GhXfwSubmit(ID3D12CommandQueue* q, LONG seq, UINT n, ID3D12CommandLi
             }
             auto* s = new GhXfwSnap{};
             s->q = q; s->seq = seq; s->val = (UINT64)seq * 64 + 63; s->pso = nt->xfwPso[k]; s->eiGen = nt->xfwEiGen[k];
+            s->frame = InterlockedCompareExchange64(&g_gprPresents, 0, 0);   // XFW9e
+            s->inst = GhXfwInst() != 0;   // XFW9
+            if (s->inst){ for (int a = 0; a < 6; ++a) s->args[a] = nt->xinArgs[k][a]; s->rbGen = nt->xinRb[k];
+                          s->rt = nt->xinRt[k]; s->ds = nt->xinDs[k]; for (int v = 0; v < 4; ++v) s->view[v] = nt->xinView[k][v];
+                          s->wArmed = nt->xwOn != 0; s->wFrame = nt->xwFrame; s->wLi = (UINT16)li; s->wOrd = nt->xinOrd[k];   // XFW10
+                          for (int j = 0; j < 2; ++j){ s->wR[j] = nt->xinRegR[k][j]; s->wO[j] = nt->xinRegO[k][j]; } }
             GhXfwBuf b{};
             bool ok = true;
             // b14
@@ -26996,14 +28973,86 @@ static void GhXfwSubmit(ID3D12CommandQueue* q, LONG seq, UINT n, ID3D12CommandLi
                     if (!GhXfwReadable(b.heap) || !GhXfwOpen(b, &s->mT1)) ok = false;
                     else {
                         s->oT1 = base;
+                        if (s->inst){   // XFW9: t1[srt+56] = instance header P; the header is recB
+                            if (!GhXfwRd(s->mT1, s->oT1 + (UINT64)s->srt + 56, &s->rec, 4)){ GhXfwInc(XC_OOB); ok = false; }
+                            else if (!GhXfwRd(s->mT1, s->oT1 + (UINT64)s->rec, s->recB, sizeof s->recB)){
+                                if (GhXfwRd(s->mT1, s->oT1 + (UINT64)s->rec, s->recB, 48)) s->recN = 48;
+                                else { GhXfwInc(XC_OOB); ok = false; }
+                            }
+                        } else
                         if (!GhXfwRd(s->mT1, s->oT1 + (UINT64)s->srt + 64, &s->rec, 4) ||
                             !GhXfwRd(s->mT1, s->oT1 + (UINT64)s->srt + 104, &s->f104, 4) ||
                             !GhXfwRd(s->mT1, s->oT1 + (UINT64)s->rec, s->recB, sizeof s->recB)){ GhXfwInc(XC_OOB); ok = false; }
                     }
                 }
             }
+            // XFW9: the instance streams, first kXinN instances at hdr base (+ SV_InstanceID)
+            if (ok && s->inst){
+                GhXfwInc(XC_ISNAP);
+                const UINT32 ic = (s->args[0] == 12 || s->args[0] == 13) ? s->args[2] : 0;
+                const UINT32 si = s->args[0] == 13 ? s->args[5] : s->args[0] == 12 ? s->args[4] : 0;
+                if (si) GhXfwInc(XC_ISI);
+                s->nI = ic < kXinN ? ic : kXinN;
+                for (int j = 0; j < 2; ++j){
+                    UINT32 hb = 0; std::memcpy(&hb, s->recB + (j ? 8 : 0), 4);
+                    const UINT64 h = nt->xinS[k][j]; const UINT32 st = kXinStride[j];
+                    GhXfwBuf sb{}; UINT64 base = 0; bool got = false;
+                    if (h && nt->xinSK[k][j] == 1){
+                        got = GhXfwFind(h, nullptr, &sb);
+                        if (got){ base = h - sb.lo; s->sRes[j] = sb.res; }
+                    } else if (h && nt->xinSK[k][j] == 2){
+                        UINT inc = 0;
+                        const UINT64 cpu0 = GhGpuHandleToCpu(h, &inc);
+                        const GhDescNote* dn = cpu0 ? GhDescGet(cpu0 + (UINT64)nt->xinSOff[k][j] * inc) : nullptr;
+                        if (dn && dn->res && GhXfwFind(0, dn->res, &sb)){
+                            got = true; s->sRes[j] = dn->res; s->sVoff[j] = dn->voff;
+                            base = dn->voff * (dn->vstride ? dn->vstride : st);
+                        }
+                    }
+                    if (!got){ GhXfwInc(XC_INOS); continue; }
+                    s->sHeap[j] = sb.heap;
+                    InterlockedIncrement64(&g_xfwHeapC[3 + j][sb.heap & 7]);
+                    if (GhXfwHazOn() && !GhXfwReadable(sb.heap)){   // XFW9c: its writers (copies, UAV, queues) are tracked like XH1/XH2's
+                        const int bi = GhXfwBoneAdd((ID3D12Resource*)s->sRes[j], sb, 0, nullptr);
+                        if (bi >= 0) xrd[bi] = 1;
+                    }
+                    if (!GhXfwReadable(sb.heap)){
+                        const LONG64 nr = InterlockedIncrement64(&g_xfwC[XC_INRD]);
+                        if (nr <= 16 || (nr % 4096) == 0)
+                            Diag("XFW INRD n=" + std::to_string((long long)nr) + " #" + std::to_string((long)seq) + " stream=" + std::to_string(j) +
+                                 " pso=" + Hex((uint64_t)(uintptr_t)s->pso) + " res=" + Hex((uint64_t)(uintptr_t)s->sRes[j]) + "+" +
+                                 std::to_string((unsigned long long)s->sVoff[j]) + " heap=" + std::to_string(sb.heap) + " base=" + Hex(hb) +
+                                 " args=" + std::to_string(s->args[1]) + "," + std::to_string(s->args[2]) + "," + std::to_string(s->args[3]) +
+                                 " P=" + Hex(s->rec));
+                        continue;
+                    }
+                    if (!s->nI || !GhXfwOpen(sb, &s->mS[j])) continue;
+                    s->oS[j] = base + (UINT64)hb * st;
+                    s->hasS[j] = GhXfwRd(s->mS[j], s->oS[j], s->sDat[j], (UINT64)s->nI * st);
+                    if (!s->hasS[j]) GhXfwInc(XC_IOOB);
+                }
+                const LONG64 isn = InterlockedCompareExchange64(&g_xfwC[XC_ISNAP], 0, 0);
+                if (isn <= 16 || (isn % 4096) == 0){
+                    std::string hx;
+                    for (int i = 0; i < 12; ++i){ UINT32 v = 0; std::memcpy(&v, s->recB + 4 * i, 4); hx += (i ? "," : "") + Hex(v); }
+                    std::string sv;
+                    for (int j = 0; j < 2; ++j){
+                        sv += std::string(j ? " s2=" : " s0=") + Hex((uint64_t)(uintptr_t)s->sRes[j]) + "+" + std::to_string((unsigned long long)s->sVoff[j]) +
+                              "/h" + std::to_string(s->sHeap[j]) + (s->hasS[j] ? "/rd" : "/-");
+                        if (s->hasS[j]){
+                            float f[4]; std::memcpy(f, s->sDat[j] + (j ? 0 : 48), 16);   // s2 row 0; s0 row 3 (translation row)
+                            char b[96]; std::snprintf(b, sizeof b, "(%.2f,%.2f,%.2f,%.2f)", f[0], f[1], f[2], f[3]); sv += b;
+                        }
+                    }
+                    Diag("XFW ISNAP n=" + std::to_string((long long)isn) + " #" + std::to_string((long)seq) +
+                         " pso=" + Hex((uint64_t)(uintptr_t)s->pso) + " op=" + std::to_string(s->args[0]) +
+                         " args=" + std::to_string(s->args[1]) + "," + std::to_string(s->args[2]) + "," + std::to_string(s->args[3]) + "," +
+                         std::to_string((int)s->args[4]) + "," + std::to_string(s->args[5]) +
+                         " srt=" + Hex(s->srt) + " P=" + Hex(s->rec) + " hdr=" + hx + sv);
+                }
+            }
             // bones (mode 2): flags bit 0, heap slot at rec+20, element 0
-            if (ok && GhXfwDesc() && (s->recB[0] & 1) && nt->xfwHeap[k] && g_tbInc){
+            if (ok && !s->inst && GhXfwDesc() && (s->recB[0] & 1) && nt->xfwHeap[k] && g_tbInc){
                 GhXfwInc(XC_SKIN);
                 UINT32 slot = 0; std::memcpy(&slot, s->recB + 20, 4);
                 const UINT64 cpu = (UINT64)((ID3D12DescriptorHeap*)nt->xfwHeap[k])->GetCPUDescriptorHandleForHeapStart().ptr +
@@ -27022,7 +29071,7 @@ static void GhXfwSubmit(ID3D12CommandQueue* q, LONG seq, UINT n, ID3D12CommandLi
                     }
                 }
             }
-            if (!ok){ GhXfwClose(&s->mB14); GhXfwClose(&s->mT1); GhXfwClose(&s->mBone); delete s; continue; }
+            if (!ok){ GhXfwCloseAll(s); delete s; continue; }
             s->t0 = GhNowUs();
             const LONG64 sn = InterlockedIncrement64(&g_xfwC[XC_SNAP]);
             if (sn <= 6){
@@ -27038,6 +29087,26 @@ static void GhXfwSubmit(ID3D12CommandQueue* q, LONG seq, UINT n, ID3D12CommandLi
         }
     }
     if (GhXfwCpOn()) GhXcpSubmit(q, seq, n, l);   // XFW4
+    if (GhXfwCpOn()){   // XFW9f: replay the lists' UAV windows against this queue's state
+        static std::mutex mu; static std::unordered_map<void*, UINT64>* qs = nullptr;
+        std::vector<std::pair<void*, std::pair<UINT64, bool>>> hits;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            if (!qs) qs = new std::unordered_map<void*, UINT64>();
+            UINT64& m = (*qs)[q];
+            for (UINT li = 0; li < n; ++li){
+                GhCLNote* nt = GhCLFind(l[li]);
+                if (!nt) continue;
+                for (LONG e = 0; e < nt->xevN; ++e){
+                    const auto& ev = nt->xev[e];
+                    if (ev.k == 1) m |= 1ull << ev.bone;
+                    else if (ev.k == 2) m &= ~(1ull << ev.bone);
+                    else if (m && ev.pso) hits.push_back({ ev.pso, { m, ev.k == 4 } });
+                }
+            }
+        }
+        for (auto& h : hits) GhXfwCsNote(h.first, h.second.first, 0xCCCCCCCCu, h.second.second ? 1u : 0u, 0);
+    }
     if (GhXfwHazOn()){   // XFW3: every submission advances its queue's clock, bone traffic or not
         UINT8 xwr[64] = {};
         for (UINT li = 0; li < n; ++li)
@@ -30339,6 +32408,7 @@ static void GhHookD12Device(ID3D12Device* dev)
     // present here: slot 48 above is OpenExistingHeapFromAddress).
     g_d12vtOrig[31] = vt[31]; vt[31] = (void*)&Hook_D12CreateSharedHandle;
     g_d12vtOrig[46] = vt[46]; vt[46] = (void*)&Hook_D12SetResidencyPriority;
+    g_d12vtOrig[47] = vt[47]; vt[47] = (void*)&Hook_D12CreatePSS;   // #253 ID3D12Device2::CreatePipelineState
     g_d12vtOrig[50] = vt[50]; vt[50] = (void*)&Hook_D12EnqueueMakeResident;
     VirtualProtect(vt, sizeof(void*) * 56, old, &old);
     Diag("D3D12 vtable hooked GPS/CPS/CFS/RS/RTV/CCR/CH/CPR/OEHFA");
@@ -30387,7 +32457,7 @@ static void GhHookD12Device(ID3D12Device* dev)
         // for every format the chain actually touches. Support1 bit 0x80000 is
         // TYPED_UNORDERED_ACCESS_VIEW; Support2 0x40 is UAV_TYPED_LOAD, 0x80 UAV_TYPED_STORE.
         {
-            static const UINT kFmts[] = { 26, 41, 28, 54, 10, 24, 12, 17, 42, 2 };
+            static const UINT kFmts[] = { 26, 41, 28, 54, 10, 24, 12, 17, 42, 2, 61, 62, 63, 64 };   // #252: + the R8 family (rock LOD bytes are R8_SINT)
             for (UINT fi = 0; fi < _countof(kFmts); ++fi){
                 D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{};
                 fs.Format = (DXGI_FORMAT)kFmts[fi];
@@ -44170,6 +46240,9 @@ static void RunGuest()
         // Rock-pop: what Texture GetDimensions answers on this driver. Off unless gh_texdims_probe.
         GhTexDimsProbe();
 
+        // #253 blue fire: which texel a dynamic-index TextureCubeArray sample returns. Off unless gh_cube_probe.
+        GhCubeProbe();
+
         // Scatter-jump: SV_VertexID/SV_InstanceID and ExecuteIndirect root constants. Off unless gh_drawid_probe.
         GhDrawIdProbe();
 
@@ -44177,6 +46250,7 @@ static void RunGuest()
         // driver, against two formats it admits it can load. Off unless gh_fmtload_probe.
         GhCsProbe();
         GhFmtLoadProbe();
+        GhBufFmtProbe();   // #252: small-integer buffer typed UAV load/store. Off unless gh_buffmt_probe.
 
         // ghwmm.dll: our WINMM replacement for the multimedia-timer functions the
         // container's slim WINMM lacks. Mono's import name is binary-patched
