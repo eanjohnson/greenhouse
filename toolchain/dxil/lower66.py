@@ -415,6 +415,23 @@ def lower_wave1(text, report=None):
     if need111 and not re.search(r'^declare i32 @dx\.op\.waveGetLaneIndex\(', text, re.M):
         text = re.sub(r'^(declare )', r'declare i32 @dx.op.waveGetLaneIndex(i32) #0\n\n\1',
                       text, count=1, flags=re.M)
+    # #252: 117-120 return a WAVE-UNIFORM value, and the compiler leaned on that:
+    # scalarization loops (`u = ReadLaneFirst(obj); if (obj == u) T[rec[u].idx]`)
+    # emit their handles with nonUniformIndex = false. Copying the lane's own value
+    # makes those indices vary across the wave while the handle still promises
+    # uniformity, and GCN then uses the first active lane's descriptor for every
+    # lane (the rock LOD pass 6ff4d302 wrote other objects' LOD bytes into one
+    # object's buffer -> floating rocks). Mark every dynamic-index handle
+    # NonUniform; exact whatever the index is.
+    if any(op in counts for op in (117, 118, 119, 120)):
+        text, n_nu = re.subn(
+            r'(call %dx\.types\.Handle @dx\.op\.createHandle\(i32 57, i8 \d+, i32 \d+, i32 %[\w.]+, i1 )false\)',
+            r'\g<1>true)', text)
+        text, n_nh = re.subn(
+            r'(call %dx\.types\.Handle @dx\.op\.createHandleFromHeap\(i32 218, i32 %[\w.]+, i1 (?:true|false), i1 )false\)',
+            r'\g<1>true)', text)
+        if n_nu + n_nh:
+            rep.append('  wave1 nonuniform %d handle%s' % (n_nu + n_nh, '' if n_nu + n_nh == 1 else 's'))
     rep.append('  wave1 %s' % ', '.join(
         ('%d extractvalue' % n) if op == -1 else
         ('%d quadOp->deriv' % n) if op == -123 else ('op %d x%d' % (op, n))
