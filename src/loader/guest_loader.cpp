@@ -102,9 +102,32 @@ using namespace winrt::Windows::Storage;
 
 // Absolute path to the app's LocalState (WDP-readable). Declared up top so both
 // diagnostics and the VFS host-bridge can use it.
-static const wchar_t* kLocalState =
-    L"U:\\Users\\UserMgr0\\AppData\\Local\\Packages\\"
-    L"" GH_PKG_FAMILY L"\\LocalState\\";
+//
+// Resolved at startup from LOCALAPPDATA, the way the steam_api64 shim resolves
+// its own LocalState files. It used to be the literal U:\ path below, but the
+// drive letter differs per console (a Series X mounts it as Q:): there the shim
+// wrote Q:\...\gh_qr_url.txt, MapToReal did not recognise Q:\ as LocalState and
+// virtualized it into LocalState\vfs\Q\..., and the launcher never saw the QR
+// (every knob, diag and credential path pointed at the wrong folder too). The
+// literal is kept only as the fallback when the variable is missing.
+static bool g_localStateFromEnv = false;
+static const wchar_t* GhResolveLocalState()
+{
+    static std::wstring s;
+    wchar_t lad[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", lad, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        std::wstring base(lad, n);
+        size_t p = base.find(L"\\Packages\\");   // in the container it points INTO our package
+        if (p != std::wstring::npos) base.resize(p);
+        s = base + L"\\Packages\\" GH_PKG_FAMILY L"\\LocalState\\";
+        g_localStateFromEnv = true;
+    } else {
+        s = L"U:\\Users\\UserMgr0\\AppData\\Local\\Packages\\" GH_PKG_FAMILY L"\\LocalState\\";
+    }
+    return s.c_str();
+}
+static const wchar_t* kLocalState = GhResolveLocalState();
 // Dev-Mode scratch (D:), grown by Dev Home "Manage dev storage". LocalState on U:
 // is a separate ~2GB userdata pool; Steam downloads must land here to use the
 // slider. Proven writable in-process (GhProbeUsb T2).
@@ -201,13 +224,78 @@ static void Diag(const std::string& s)
     // the log unreadable over WDP (a whole-file GET simply hangs). The cap keeps
     // the failure diagnosable and, more importantly, keeps a debug session from
     // filling the console's storage. Counted, not stat()ed, so it costs nothing.
+    //
+    // TAIL. A cap that simply stops writing keeps the START of a run and loses its
+    // END, and the end is where the death is. a tester's Continue run (0.0.664.0) sat on
+    // the menu for 90 minutes, its periodic lines (~2.6 KB/s: RSBINDLESS,
+    // GPUHEARTBEAT, MEMORY, FRAME) spent all 16 MB there, and the level load, the
+    // ~1 fps thrash and the stack-overflow death were never written. So the budget
+    // is now split: half for the head (loader_diag.txt, startup and the first
+    // minutes), and two quarters that the rest of the run alternates between
+    // (loader_diag_tail0.txt / _tail1.txt, each truncated when it is reused). The
+    // total on disk never exceeds gh_diag_cap_mb, and the newest lines always
+    // survive. The tail segment that holds the end of the run is the one whose
+    // first line has the higher segment number.
     static std::atomic<uint64_t> written{0};
-    static std::atomic<bool>     capped{false};
-    static const uint64_t kCap = GhDiagCapBytes();
+    static std::atomic<bool>     capped{false};     // LocalState full: stop everything
+    static std::atomic<bool>     tailing{false};    // head budget spent: write the tail
+    static const uint64_t kCap  = GhDiagCapBytes();
+    static const uint64_t kSeg  = (kCap / 4 < (256ull << 10)) ? (256ull << 10) : kCap / 4;
+    static const uint64_t kHead = kCap > 2 * kSeg ? kCap - 2 * kSeg : kCap / 2;
+    static const std::wstring kTail[2] = { std::wstring(kLocalState) + L"loader_diag_tail0.txt",
+                                           std::wstring(kLocalState) + L"loader_diag_tail1.txt" };
+    // A fresh log (the harness deletes loader_diag.txt before every launch) must
+    // not sit beside the previous run's tail segments. A launch that APPENDS to an
+    // existing head (a player relaunching, no harness) leaves them: they may hold
+    // the previous run's death, and every segment header names its pid, which the
+    // head's own lines can be matched against.
+    static const bool kTailCleared = [](){
+        const std::wstring head = std::wstring(kLocalState) + L"loader_diag.txt";
+        if (GetFileAttributesW(head.c_str()) == INVALID_FILE_ATTRIBUTES){
+            DeleteFileW(kTail[0].c_str()); DeleteFileW(kTail[1].c_str());
+        }
+        return true;
+    }();
+    (void)kTailCleared;
     if (capped.load(std::memory_order_relaxed)){ SetLastError(savedErr); return; }
-    if (written.fetch_add(s.size() + 2, std::memory_order_relaxed) > kCap){
-        capped.store(true, std::memory_order_relaxed);
-        // fall through once to write the notice below
+    bool headNotice = false;
+    if (!tailing.load(std::memory_order_relaxed) &&
+        written.fetch_add(s.size() + 2, std::memory_order_relaxed) > kHead){
+        if (!tailing.exchange(true, std::memory_order_relaxed)) headNotice = true;   // one notice, in the head
+    }
+    if (tailing.load(std::memory_order_relaxed) && !headNotice){
+        static std::mutex tailMu;
+        static uint64_t   segBytes = 0;
+        static unsigned   segNo    = 0;      // segments started so far
+        std::lock_guard<std::mutex> lk(tailMu);
+        std::string line = s + "\r\n";
+        bool fresh = false;
+        if (segNo == 0 || segBytes + line.size() > kSeg){ ++segNo; segBytes = 0; fresh = true; }
+        const std::wstring& path = kTail[(segNo - 1) & 1];
+        if (fresh) line = "DIAG TAIL pid=" + std::to_string((unsigned long)GetCurrentProcessId()) +
+                          " segment=" + std::to_string(segNo) + " (segment " +
+                          std::to_string(segNo - 1) + " is the other tail file; each is " +
+                          std::to_string(kSeg >> 10) + " KB, the head is loader_diag.txt) t=" +
+                          std::to_string(GhUpMs()) + "ms\r\n" + line;
+        HANDLE th = INVALID_HANDLE_VALUE;
+        for (int attempt = 0; attempt < 40 && th == INVALID_HANDLE_VALUE; ++attempt){
+            th = CreateFileW(path.c_str(), fresh ? GENERIC_WRITE : FILE_APPEND_DATA,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                             fresh ? CREATE_ALWAYS : OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (th == INVALID_HANDLE_VALUE) Sleep(attempt < 8 ? 0 : 1);
+        }
+        if (th != INVALID_HANDLE_VALUE){
+            SetFilePointer(th, 0, nullptr, FILE_END);
+            DWORD w = 0;
+            const BOOL ok = WriteFile(th, line.data(), (DWORD)line.size(), &w, nullptr);
+            const DWORD werr = ok ? 0 : GetLastError();
+            CloseHandle(th);
+            segBytes += line.size();
+            if (!ok && (werr == ERROR_DISK_FULL || werr == ERROR_HANDLE_DISK_FULL))
+                capped.store(true, std::memory_order_relaxed);
+        }
+        SetLastError(savedErr);
+        return;
     }
     // SHARING. This opened with FILE_SHARE_READ only, which meant that while one
     // thread held the log every other thread's CreateFileW failed and its line was
@@ -235,10 +323,11 @@ static void Diag(const std::string& s)
     if (h == INVALID_HANDLE_VALUE) dropped.fetch_add(1, std::memory_order_relaxed);
     if (h != INVALID_HANDLE_VALUE)
     {
-        std::string line = capped.load(std::memory_order_relaxed)
-            ? ("DIAG CAPPED at " + std::to_string(kCap >> 20) +
-               "MB -- suppressing further output so the GAME's log keeps its share "
-               "of the LocalState quota (the lines above here repeat)\r\n")
+        std::string line = headNotice
+            ? (s + "\r\nDIAG HEAD FULL at " + std::to_string(kHead >> 20) +
+               "MB -- the rest of this run alternates between loader_diag_tail0.txt and "
+               "loader_diag_tail1.txt (" + std::to_string(kSeg >> 10) + " KB each; total cap " +
+               std::to_string(kCap >> 20) + "MB, so the GAME's log keeps its share of LocalState)\r\n")
             : (s + "\r\n");
         // Report accumulated drops on the next line that does get through, so a
         // gap in the log is visible instead of silent.
@@ -715,6 +804,80 @@ static std::wstring g_guestDataDir; // set in RunGuest: the Unity _Data folder
 #ifdef GH_LAUNCHER
 static std::wstring g_lastGameDir;  // last launched game dir (survives ResetGuestForRelaunch)
 #endif
+
+// ---------------------------------------------------------------------------
+// Per-title defaults (2026-10-05).
+//
+// Every knob is a LocalState file, and every file is global: whatever is on disk
+// applies to every game the console launches. The console Tsushima was brought
+// up on carries ~50 such files by hand, so a second console that installs the
+// package and downloads the game gets none of them -- on a friend's Series X the
+// game spun forever on its first divide-by-zero and never drew a frame.
+//
+// A title's table is the play config that works on the reference console, used
+// ONLY where its file is absent: a file on disk, or an env var, still wins, so
+// a console that already has the files behaves exactly as before. `early` marks
+// knobs read before a game is chosen (the D3D12 device and its DDI/shader-cache
+// patches are built at Launcher startup; the guest worker's stack, the #145
+// pager, keepalive, raw input and the PSO-cache hide are each decided once per
+// process, before the picker); those apply from startup whenever the title is
+// installed -- to every game that console runs, exactly as the reference
+// console's global files do. a tester's 0.0.659.0 log found the second group, and
+// 0.0.660.0 the spill size (read at startup once the pager is on there), and
+// 0.0.661.0 the spill ring/stat and the blackbox that follow it. Any
+// other title knob read before the title is chosen is reported at GhTitleBegin
+// (TITLE late), because its default cannot take effect that run.
+//
+// gh_engine_off is deliberately absent. In the Launcher the engine comes up at
+// sign-in, before the picker, so a per-title value cannot reach it; Tsushima
+// runs with the engine up (the #217 cost, 67 MB) unless the file says otherwise.
+struct GhTitleKnob { const wchar_t* file; unsigned value; bool early; };
+struct GhTitle {
+    const wchar_t* exe;           // guest exe basename
+    const wchar_t* installProbe;  // under kDevGames: proves the title is installed
+    const GhTitleKnob* knobs; size_t nKnobs;
+    const char* psoDeny;          // gh_pso_deny.txt when that file is absent, or null
+};
+static const GhTitleKnob kTsushimaKnobs[] = {
+    // device-time: read while the Launcher builds its D3D12 device
+    { L"gh_ddi_sm.txt", 66, true },           { L"gh_ddi_probe.txt", 1, true },
+    { L"gh_scache.txt", 3, true },            { L"gh_scache_x.txt", 128, true },
+    { L"gh_rip_ms.txt", 15000, true },
+    // PS PC SDK: trust + init patches (pspc-sdk-in-container)
+    { L"gh_pspc_trust.txt", 2, false },       { L"gh_pspc_init.txt", 1, false },
+    // shaders and pipelines
+    { L"gh_dxil_maxsm.txt", 65, false },      { L"gh_fake_sm.txt", 102, false },
+    { L"gh_scdxil.txt", 2, false },           { L"gh_shader_sub.txt", 1, false },
+    { L"gh_ds_nogpu.txt", 3, false },         { L"gh_texlod0.txt", 1, false },
+    { L"gh_bufdims.txt", 6, false },          { L"gh_tbdims.txt", 1, false },
+    { L"gh_srvbuf_stride.txt", 52, false },   { L"gh_rs_bindless.txt", 1, false },
+    { L"gh_pso_cache_hide.txt", 1, true },   { L"gh_pso_desc.txt", 1, false },
+    { L"gh_pso_faults.txt", 1000, false },    { L"gh_pso_guard.txt", 2, false },
+    { L"gh_pso_log.txt", 16, false },         { L"gh_pso_standin.txt", 2, false },
+    { L"gh_copy_as_direct.txt", 2, false },   { L"gh_prog_fence.txt", 5, false },
+    // memory: arena, demand-commit pager + spill, GPU heap pagefile
+    { L"gh_arena_cap_mb.txt", 2048, false },  { L"gh_arena_chunk_mb.txt", 64, false },
+    { L"gh_arena_lru.txt", 1, false },        { L"gh_arena_site.txt", 5172690, false },
+    { L"gh_lazy_mb.txt", 1, true },           { L"gh_lazy_spill_mb.txt", 256, true },
+    { L"gh_spill_ring_mb.txt", 256, true },  { L"gh_spill_stat.txt", 1, true },
+    { L"gh_drv_commit.txt", 100000, false },  { L"gh_guest_stack_mb.txt", 64, true },
+    { L"gh_gpu_page_mb.txt", 256, false },    { L"gh_gpu_chunk_mb.txt", 64, false },
+    { L"gh_gpu_evict_ms.txt", 60000, false }, { L"gh_gpu_evict_dummy.txt", 1, false },
+    { L"gh_gp_defer_free.txt", 2, false },    { L"gh_gp_keep_uncomp.txt", 1, false },
+    // input
+    { L"gh_rawinput.txt", 111, true },        { L"gh_wgi_inject.txt", 5, false },
+    // crash record and diagnostics the reference console runs with
+    { L"gh_veh_max.txt", 12, false },         { L"gh_keepalive.txt", 1, true },
+    { L"gh_blackbox.txt", 3, true },         { L"gh_cl_trace_quiet.txt", 1, false },
+    { L"gh_cl_trace_span.txt", 1000, false }, { L"gh_disp_log.txt", 3000, false },
+    { L"gh_disp_log_at.txt", 31000, false },
+};
+static const GhTitle kTitles[] = {
+    { L"GhostOfTsushima.exe", L"app_2215430\\GhostOfTsushima.exe",
+      kTsushimaKnobs, sizeof kTsushimaKnobs / sizeof kTsushimaKnobs[0],
+      "44c53d006f299116f79ffbbf00f818d3" },   // tsushima-44c53d00-stays-denied
+};
+static const GhTitle* g_title = nullptr;      // set by GhTitleBegin for each guest, before it runs
 static bool StartsWithNoCase(const std::wstring& s, const std::wstring& pre)
 {
     if (pre.empty() || s.size() < pre.size()) return false;
@@ -1925,8 +2088,21 @@ static void RegHiveLoad()
 {
     std::vector<uint8_t> b;
     if (!ReadWholeFile(GhRegHivePath(), b, true) || b.empty()){
-        Diag("REG hive none (" + RegNarrow(GhRegHivePath()) + ")");
-        return;
+        // No hive yet: start from the title's settings seed in the package, if it
+        // has one (Tsushima: the reference console's graphics settings, Texture
+        // Low). The seed is only read; RegHiveSave writes the real file as usual.
+        std::wstring seed;
+        if (g_title){
+            std::wstring base = g_title->exe;
+            if (base.size() > 4) base.resize(base.size() - 4);
+            EnsureInstallDir();
+            seed = g_installDir + L"guest\\seed\\" + base + L"\\hive.txt";
+        }
+        if (seed.empty() || !ReadWholeFile(seed, b, true) || b.empty()){
+            Diag("REG hive none (" + RegNarrow(GhRegHivePath()) + ")");
+            return;
+        }
+        Diag("REG hive none yet -- seeded from " + RegNarrow(seed));
     }
     std::string text((const char*)b.data(), b.size());
     size_t pos = 0, n = 0;
@@ -5766,7 +5942,25 @@ struct SwapProxy : IDXGISwapChain4
         return hr;
     }
     // IDXGISwapChain
-    HRESULT __stdcall Present(UINT sync, UINT) noexcept override { const HRESULT hr = GfxPresent(sync); BbAdvance(hr); return hr; }
+    // DXGI_PRESENT_TEST asks "would a present be occluded?" and presents nothing.
+    // Tsushima asks it before EVERY real present (GhostOfTsushima.exe+0x434DC1,
+    // Present(sync, 1), then the real one on S_OK). Dropping the flags turned each
+    // question into a second blit + Present + vblank wait: 60 presents/s for 30
+    // rendered frames (the ecl counts alternate [7..11, 1] in 341 of 477 windows of
+    // SAMPERF1) and a 2-vblank floor on every frame. gh_present_test=0 restores it.
+    static bool PresentIsTest(UINT flags) noexcept
+    {
+        if (!(flags & DXGI_PRESENT_TEST)) return false;
+        static const bool honour = GhCfgNumZ(L"gh_present_test.txt", "GH_PRESENT_TEST", 1) != 0;
+        static volatile LONG n = 0;
+        const LONG k = InterlockedIncrement(&n);
+        if (k == 1 || (k % 3600) == 0)
+            Diag("PRESENT test n=" + std::to_string((long)k) + " flags=" + Hex(flags) +
+                 (honour ? " answered S_OK, not presented" : " PRESENTED (gh_present_test=0)"));
+        return honour;
+    }
+    HRESULT __stdcall Present(UINT sync, UINT flags) noexcept override
+    { if (PresentIsTest(flags)) return S_OK; const HRESULT hr = GfxPresent(sync); BbAdvance(hr); return hr; }
     volatile LONG bbIdx = 0;
     void BbAdvance(HRESULT hr) noexcept
     {
@@ -5830,8 +6024,8 @@ struct SwapProxy : IDXGISwapChain4
     HRESULT __stdcall GetHwnd(HWND* h) noexcept override
     { if (!h) return E_INVALIDARG; *h = kFakeHwnd; return S_OK; }
     HRESULT __stdcall GetCoreWindow(REFIID, void**) noexcept override { return E_NOINTERFACE; }
-    HRESULT __stdcall Present1(UINT sync, UINT, const DXGI_PRESENT_PARAMETERS*) noexcept override
-    { const HRESULT hr = GfxPresent(sync); BbAdvance(hr); return hr; }
+    HRESULT __stdcall Present1(UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS*) noexcept override
+    { if (PresentIsTest(flags)) return S_OK; const HRESULT hr = GfxPresent(sync); BbAdvance(hr); return hr; }
     BOOL    __stdcall IsTemporaryMonoSupported() noexcept override { return FALSE; }
     HRESULT __stdcall GetRestrictToOutput(IDXGIOutput** o) noexcept override
     { if (o) *o = nullptr; return S_OK; }
@@ -7505,6 +7699,38 @@ static const GhCorpusDirs& GhCorpusDirsGet()
 }
 static const std::wstring& GhDumpDir()    { return GhCorpusDirsGet().dump; }
 static const std::wstring& GhCorpusDir()  { return GhCorpusDirsGet().read; }
+// The package's own copy of the corpus (2026-10-06): <install>\guest\ghlo\, staged
+// by iterate-launcher.sh from corpus/redist/ghlo. Read LAST, after LocalState and
+// D:\DevelopmentFiles\ghlo, so a console with its own corpus serves exactly what
+// it served before. A console without one (a friend's Series X: 196 misses, 0
+// hits, and the device removed at frame ~105) gets the reference console's.
+static const std::wstring& GhPkgCorpusDir()
+{
+    static const std::wstring d = []{
+        EnsureInstallDir();
+        std::wstring p = g_installDir + L"guest\\ghlo\\";
+        const bool there = GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+        Diag("CORPUSDIR package " + std::string(p.begin(), p.end()) + (there ? " present" : " ABSENT"));
+        return there ? p : std::wstring();
+    }();
+    return d;
+}
+// gh_corpus_pkg_only = 1: a test of the package copy on a console that has its
+// own -- every LocalState and D: corpus read below is skipped, so the run sees
+// exactly what a fresh console sees. 0 (default) = normal lookup.
+static bool GhCorpusPkgOnly()
+{ static const bool v = GhCfgNumZ(L"gh_corpus_pkg_only.txt", "GH_CORPUS_PKG_ONLY", 0) != 0; return v; }
+static bool GhReadPkgBlob(const wchar_t* prefix, const std::wstring& wkey, std::vector<uint8_t>& out)
+{
+    const std::wstring& d = GhPkgCorpusDir();
+    if (d.empty()) return false;
+    ReadWholeFile(d + prefix + wkey + L".bin", out, true);
+    if (out.empty()) return false;
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) <= 3)
+        Diag("SHADERSUB served from the package corpus: " + std::string(wkey.begin(), wkey.end()));
+    return true;
+}
 static bool GhShaderSubOn()
 {
     static const bool on = GhCfgNum(L"gh_shader_sub.txt", "GH_SHADER_SUB", 0) != 0;
@@ -7719,19 +7945,24 @@ static GhBlobPtr GhLoweredBlob(const void* code, SIZE_T n)
     // own gh_tl_ prefix so the gh_lo_ corpus is never touched. Knob off = not even
     // probed, i.e. exactly the old lookup; rollback is deleting the knob file.
     bool tl = false;
+    const bool own = !GhCorpusPkgOnly();
     if (GhTexLod0On()){
-        ReadWholeFile(std::wstring(kLocalState) + L"gh_tl_" + wkey + L".bin", *bytes, true);
-        if (bytes->empty())
+        if (own) ReadWholeFile(std::wstring(kLocalState) + L"gh_tl_" + wkey + L".bin", *bytes, true);
+        if (own && bytes->empty())
             ReadWholeFile(GhCorpusDir() + L"gh_tl_" + wkey + L".bin", *bytes, true);
+        if (bytes->empty())
+            GhReadPkgBlob(L"gh_tl_", wkey, *bytes);
         tl = !bytes->empty();
     }
-    if (bytes->empty())
+    if (own && bytes->empty())
         ReadWholeFile(std::wstring(kLocalState) + L"gh_lo_" + wkey + L".bin", *bytes, true);
-    if (bytes->empty())
+    if (own && bytes->empty())
         ReadWholeFile(std::wstring(kLocalState) + L"ghlo\\" + wkey + L".bin", *bytes, true);
     // #188: and D:, where a corpus too big for the quota is staged.
-    if (bytes->empty())
+    if (own && bytes->empty())
         ReadWholeFile(GhCorpusDir() + L"gh_lo_" + wkey + L".bin", *bytes, true);
+    if (bytes->empty())
+        GhReadPkgBlob(L"gh_lo_", wkey, *bytes);
 
     const bool firstLook = (e.state == kUnknown);
     e.state = bytes->empty() ? kMiss : kHit;
@@ -7906,7 +8137,14 @@ static bool GhPsoDenied(const void* code, SIZE_T n)
     if (!loaded){
         loaded = true;
         std::vector<uint8_t> f;
-        if (ReadWholeFile(std::wstring(kLocalState) + L"gh_pso_deny.txt", f, true) && !f.empty()){
+        bool have = ReadWholeFile(std::wstring(kLocalState) + L"gh_pso_deny.txt", f, true) && !f.empty();
+        if (!have && g_title && g_title->psoDeny){
+            // The title's play-config list stands in for the absent file.
+            f.assign(g_title->psoDeny, g_title->psoDeny + strlen(g_title->psoDeny));
+            have = true;
+            Diag("PSODENY gh_pso_deny.txt absent -- using the title default list");
+        }
+        if (have){
             std::string cur;
             for (size_t i = 0; i <= f.size(); ++i){
                 const char c = (i < f.size()) ? (char)f[i] : '\n';
@@ -8008,7 +8246,10 @@ static void GhPsoRecStash(const void* code, SIZE_T n, char keyOut[40])
     if (GetFileAttributesW((std::wstring(kLocalState) + L"gh_lo_" + wkey + L".bin").c_str())
             != INVALID_FILE_ATTRIBUTES ||
         GetFileAttributesW((GhCorpusDir() + L"gh_lo_" + wkey + L".bin").c_str())
-            != INVALID_FILE_ATTRIBUTES)
+            != INVALID_FILE_ATTRIBUTES ||
+        (!GhPkgCorpusDir().empty() &&
+         GetFileAttributesW((GhPkgCorpusDir() + L"gh_lo_" + wkey + L".bin").c_str())
+            != INVALID_FILE_ATTRIBUTES))
         return;                                  // the lowered blob is already staged
     HANDLE h = CreateFileW((std::wstring(kLocalState) + L"gh_ps_" + wkey + L".bin").c_str(),
                            GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
@@ -16997,9 +17238,35 @@ static void __stdcall Hook_D12CreateDSV(ID3D12Device* self, ID3D12Resource* res,
 // of resolution, and be inherited by the injected degenerate draw exactly as the dose curve
 // requires.  Closing the gap decides between them, and costs one build.
 static volatile LONG64 g_smpN = 0;
+// Series X (2026-10-09). The console's D3D12Core validates every sampler and
+// accepts a MINIMUM/MAXIMUM reduction filter (D3D12_FILTER 0x100-0x1D5) only when
+// TiledResourcesTier >= 2 -- the D3D rule that ties min/max filtering to tiled
+// tier 2. a tester's Series X reports tier 1, so Tsushima's first min/max sampler made
+// the runtime remove the device with INVALID_CALL from inside CreateSampler
+// (D3D12Core+0x4B3A6, a CPU-side removal: no GPU work, DRED empty). The UMD under
+// it is byte-identical to the Xbox One's, which samples min/max natively.
+//   gh_minmax_samp = 0  leave both alone (the device dies on a tier-1 console)
+//                    1  tier < 2: unlock D3D12Core's sampler check (faithful)
+//                    2  tier < 2: rewrite min/max filters to the STANDARD
+//                       reduction (renders differently; the fallback if 1 misbehaves)
+static volatile LONG g_tiledTier = -1;
+static unsigned GhMinMaxSampMode()
+{ static const unsigned v = GhCfgNumZ(L"gh_minmax_samp.txt", "GH_MINMAX_SAMP", 1); return v; }
+static volatile LONG g_minmaxRewritten = 0;
 static void __stdcall Hook_D12CreateSampler(ID3D12Device* self,
     const D3D12_SAMPLER_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE dest)
 {
+    D3D12_SAMPLER_DESC mm;
+    if (d && ((unsigned)d->Filter & 0x180u) >= 0x100u &&
+        InterlockedCompareExchange(&g_tiledTier, 0, 0) >= 0 &&
+        InterlockedCompareExchange(&g_tiledTier, 0, 0) < 2 && GhMinMaxSampMode() == 2){
+        mm = *d;
+        mm.Filter = (D3D12_FILTER)((unsigned)d->Filter & ~0x180u);
+        if (InterlockedIncrement(&g_minmaxRewritten) <= 4)
+            Diag("MINMAXSAMP rewrote filter " + Hex((uint32_t)d->Filter) + " -> " +
+                 Hex((uint32_t)mm.Filter) + " (tiled tier < 2, gh_minmax_samp=2)");
+        d = &mm;
+    }
     if (GhDescTrackOn() || GhVaCheckOn() || GhXfwDesc()){
         UINT64 packed = 0;
         if (d) packed = (UINT64)(unsigned)d->AddressU
@@ -21535,6 +21802,47 @@ static bool GhPatchUmdPlanarCopy()
     done = true;
     return done;
 }
+// gh_minmax_samp=1 (see Hook_D12CreateSampler). D3D12Core asks one tiny helper
+// "is TiledResourcesTier >= 2?" -- `sub rsp,28h; call caps; cmp eax,2; setge al;
+// add rsp,28h; ret` -- and only its two sampler validators (CreateSampler and its
+// sibling) call it. Found by its bytes, not an RVA, and patched only when exactly
+// one copy exists, to `mov al,1; ret`. Every other tier-2 check is untouched.
+static void GhPatchD3D12CoreMinMaxSampler()
+{
+    static LONG once = 0;
+    if (InterlockedCompareExchange(&once, 1, 0) != 0) return;
+    HMODULE m = GetModuleHandleW(L"D3D12Core.dll");
+    if (!m){ Diag("MINMAXSAMP D3D12Core.dll not loaded -- not patching"); return; }
+    BYTE* const base = (BYTE*)m;
+    auto* nt = (IMAGE_NT_HEADERS64*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
+    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    static const BYTE kHead[] = { 0x48,0x83,0xEC,0x28, 0xE8 };
+    static const BYTE kTail[] = { 0x83,0xF8,0x02, 0x0F,0x9D,0xC0, 0x48,0x83,0xC4,0x28, 0xC3 };
+    BYTE* hit = nullptr; unsigned nHit = 0;
+    for (UINT i = 0; i < nt->FileHeader.NumberOfSections; ++i){
+        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        BYTE* p = base + sec[i].VirtualAddress;
+        const DWORD n = sec[i].Misc.VirtualSize;
+        for (DWORD k = 0; k + 20 <= n; ++k){
+            if (memcmp(p + k, kHead, sizeof(kHead)) == 0 &&
+                memcmp(p + k + 9, kTail, sizeof(kTail)) == 0){ hit = p + k; ++nHit; }
+        }
+    }
+    if (nHit != 1){
+        Diag("MINMAXSAMP tier>=2 helper matches=" + std::to_string(nHit) + " in D3D12Core -- not patching");
+        return;
+    }
+    DWORD prot = 0;
+    if (!VirtualProtect(hit, 3, PAGE_EXECUTE_READWRITE, &prot)){
+        Diag("MINMAXSAMP VirtualProtect failed err=" + Hex(GetLastError())); return;
+    }
+    static const BYTE kPatch[] = { 0xB0,0x01, 0xC3 };   // mov al,1 ; ret
+    memcpy(hit, kPatch, sizeof(kPatch));
+    VirtualProtect(hit, 3, prot, &prot);
+    FlushInstructionCache(GetCurrentProcess(), hit, 16);
+    Diag("MINMAXSAMP D3D12Core+" + Hex((uint32_t)(uint64_t)(hit - base)) +
+         " patched: min/max sampler filters now validate on this tiled-tier-1 device");
+}
 // gh_copytex_ds=2. One DEFAULT-heap buffer, grown on demand, shared by every
 // re-routed copy and serialised by the barriers around it. These copies are rare
 // (Tsushima makes one per frame), so a second buffer would buy nothing.
@@ -24329,7 +24637,23 @@ static void GhD12CallWatchdog()
 static bool GhLazySpillOn();
 static unsigned GhGpuPageMb()
 { static const unsigned v = GhCfgNumZ(L"gh_gpu_page_mb.txt", "GH_GPU_PAGE_MB", 0); return v; }
-static bool GhGpOn(){ return GhGpuPageMb() != 0; }
+// The pager is built on Tier 2 tiled resources: a read from an unmapped tile
+// returns zero, and NULL / REUSE_SINGLE_TILE mappings are legal. An Xbox Series X
+// reports TiledResourcesTier=1, and its driver (umd12ddi_arden) DebugBreak()s
+// inside the pager's very first UpdateTileMappings -- the game exits before a
+// frame. On anything below Tier 2 the pager stands aside entirely: no proxy
+// heaps, every texture placed in a real heap exactly as with the knob at 0.
+// Set from the bridge device at startup; -1 = not known yet (no pager either).
+static bool GhGpOn()
+{
+    if (GhGpuPageMb() == 0) return false;
+    if (g_tiledTier >= 2) return true;
+    static LONG said = 0;
+    if (!InterlockedExchange(&said, 1))
+        Diag("GPUPAGE OFF: gh_gpu_page_mb=" + std::to_string(GhGpuPageMb()) + " but tiledtier=" +
+             std::to_string((long)g_tiledTier) + " (the pager needs Tier 2) -- every texture stays in a real heap");
+    return false;
+}
 // gh_gpu_chunk_mb (LocalState, hand-managed, default 256): the pool grows in real
 // 0x44 heaps of this size. TILE1 pre-billed up to a whole 256 MB chunk of idle
 // pool at the ceiling and its fifth chunk was refused with 132 MB free.
@@ -32424,6 +32748,9 @@ static void GhHookD12Device(ID3D12Device* dev)
              " hr=" + Hex((uint32_t)ehr));
         D3D12_FEATURE_DATA_D3D12_OPTIONS o{};
         HRESULT ohr = dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof o);
+        if (SUCCEEDED(ohr)) InterlockedExchange(&g_tiledTier, (LONG)o.TiledResourcesTier);
+        if (SUCCEEDED(ohr) && (int)o.TiledResourcesTier < 2 && GhMinMaxSampMode() == 1)
+            GhPatchD3D12CoreMinMaxSampler();
         Diag("D3D12 OPTIONS tiledtier=" + std::to_string((int)o.TiledResourcesTier) +
              " resourcebindingtier=" + std::to_string((int)o.ResourceBindingTier) +
              " resourceheaptier=" + std::to_string((int)o.ResourceHeapTier) +
@@ -32588,13 +32915,31 @@ static void ReturnBridgedDevice(ID3D11Device** dev, ID3D11DeviceContext** ctx,
     if (fl)  *fl  = g_gfx.level;
 }
 
+// Unity asks for a second, "dedicated video" device (flags 0x820: VIDEO_SUPPORT |
+// BGRA) right after the main one, and every call here hands back the same bridged
+// device. Unity's Media Foundation path then decides the decode device IS the main
+// device and skips fetching the reader's video transform, but its per-frame code
+// does not make the same check and calls through the NULL transform
+// (UnityPlayer+0xFC7596, "Get video transform"). The Xbox One never reached that
+// frame because its hardware decode setup fails first; a Series X decodes, and
+// Lethal Company died the moment the ship's video players prepared on hosting.
+// Refusing the second video device is what Unity is written for: it logs
+// "Dedicated video D3D11 device creation failed" and decodes without one.
+static LONG g_d11Handed = 0;
 static HRESULT WINAPI Bed_D3D11CreateDevice(
-    IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT, const D3D_FEATURE_LEVEL*, UINT, UINT,
+    IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT flags, const D3D_FEATURE_LEVEL*, UINT, UINT,
     ID3D11Device** dev, D3D_FEATURE_LEVEL* fl, ID3D11DeviceContext** ctx)
 {
-    Diag("BED D3D11CreateDevice");
+    Diag("BED D3D11CreateDevice flags=" + Hex((uint32_t)flags));
     if (!EnsureBridge()) return E_FAIL;
+    if ((flags & D3D11_CREATE_DEVICE_VIDEO_SUPPORT) && dev && InterlockedCompareExchange(&g_d11Handed, 0, 0)){
+        *dev = nullptr;
+        if (ctx) *ctx = nullptr;
+        Diag("BED D3D11CreateDevice second VIDEO_SUPPORT device refused (only one bridged device exists)");
+        return DXGI_ERROR_UNSUPPORTED;
+    }
     ReturnBridgedDevice(dev, ctx, fl);
+    if (dev) InterlockedExchange(&g_d11Handed, 1);
     return S_OK;
 }
 
@@ -32606,6 +32951,7 @@ static HRESULT WINAPI Bed_D3D11CreateDeviceAndSwapChain(
     Diag("BED D3D11CreateDeviceAndSwapChain");
     if (!EnsureBridge()) return E_FAIL;
     ReturnBridgedDevice(dev, ctx, fl);
+    if (dev) InterlockedExchange(&g_d11Handed, 1);
     if (swap){
         SwapProxy* proxy = new SwapProxy();
         if (scDesc) proxy->desc = *scDesc;
@@ -35667,6 +36013,37 @@ static bool Bed_crs_start_handler()
 // Deduplicated by file name so a knob read on a hot path cannot flood the log,
 // and Diag is safe to call from here: it reads its own cap inline and never
 // calls back into GhCfgNum.
+// Per-title defaults (see kTitles). Consulted only when the knob's file is absent.
+static SRWLOCK g_titleLk = SRWLOCK_INIT;
+static std::vector<std::wstring>* g_titleEarly = nullptr;   // title knobs read before any title was chosen
+
+static bool GhTitleInstalled(const GhTitle& t)
+{
+    return GetFileAttributesW((std::wstring(kDevGames) + t.installProbe).c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+static bool GhTitleKnobDefault(const wchar_t* file, unsigned* out, const char** src)
+{
+    const GhTitle* cur = g_title;
+    for (const GhTitle& t : kTitles){
+        for (size_t i = 0; i < t.nKnobs; ++i){
+            const GhTitleKnob& k = t.knobs[i];
+            if (_wcsicmp(k.file, file) != 0) continue;
+            if (cur == &t){ *out = k.value; *src = "title"; return true; }
+            if (!cur && k.early && GhTitleInstalled(t)){ *out = k.value; *src = "title/installed"; return true; }
+            if (!cur){
+                AcquireSRWLockExclusive(&g_titleLk);
+                if (!g_titleEarly) g_titleEarly = new std::vector<std::wstring>();
+                bool seen = false;
+                for (const std::wstring& e : *g_titleEarly) if (_wcsicmp(e.c_str(), file) == 0){ seen = true; break; }
+                if (!seen) g_titleEarly->push_back(file);
+                ReleaseSRWLockExclusive(&g_titleLk);
+            }
+        }
+    }
+    return false;
+}
+
 static void GhCfgTrace(const wchar_t* file, const char* src, unsigned val,
                        DWORD err, const char* raw)
 {
@@ -35698,7 +36075,13 @@ static unsigned GhCfgNum(const wchar_t* file, const char* envName, unsigned dflt
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE){
-        GhCfgTrace(file, "default/NOFILE", dflt, GetLastError(), nullptr);
+        const DWORD err = GetLastError();
+        unsigned tv = 0; const char* tsrc = nullptr;
+        if (GhTitleKnobDefault(file, &tv, &tsrc) && tv){
+            GhCfgTrace(file, tsrc, tv, 0, nullptr);
+            return tv;
+        }
+        GhCfgTrace(file, "default/NOFILE", dflt, err, nullptr);
         return dflt;
     }
     char raw[64] = {}; DWORD got = 0;
@@ -35727,7 +36110,13 @@ static unsigned GhCfgNumZ(const wchar_t* file, const char* envName, unsigned dfl
     std::wstring path = std::wstring(kLocalState) + file;
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return dflt;
+    if (h == INVALID_HANDLE_VALUE){
+        // Untraced on purpose, like the rest of this reader -- except a title
+        // default, which must say where its value came from.
+        unsigned tv = 0; const char* tsrc = nullptr;
+        if (GhTitleKnobDefault(file, &tv, &tsrc)){ GhCfgTrace(file, tsrc, tv, 0, nullptr); return tv; }
+        return dflt;
+    }
     char raw[64] = {}; DWORD got = 0;
     ReadFile(h, raw, sizeof raw - 1, &got, nullptr);
     CloseHandle(h);
@@ -35736,6 +36125,73 @@ static unsigned GhCfgNumZ(const wchar_t* file, const char* envName, unsigned dfl
         if (raw[i] >= '0' && raw[i] <= '9') ascii[n++] = raw[i];
     if (!n) return dflt;                       // file exists but holds no digits
     return (unsigned)strtoul(ascii, nullptr, 10);
+}
+
+// Copy a package seed tree into LocalState, never overwriting: a file that is
+// already there is the console's own (possibly hand-tuned) copy and wins.
+static void GhSeedCopyTree(const std::wstring& src, const std::wstring& dst,
+                           const std::wstring& rel, int& copied, int& kept, int& failed)
+{
+    WIN32_FIND_DATAW fd;
+    HANDLE f = FindFirstFileW((src + L"*").c_str(), &fd);
+    if (f == INVALID_HANDLE_VALUE) return;
+    do {
+        const std::wstring n = fd.cFileName;
+        if (n == L"." || n == L"..") continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY){
+            CreateDirectoryW((dst + n).c_str(), nullptr);
+            GhSeedCopyTree(src + n + L"\\", dst + n + L"\\", rel + n + L"\\", copied, kept, failed);
+        } else if (GetFileAttributesW((dst + n).c_str()) != INVALID_FILE_ATTRIBUTES){
+            ++kept;
+        } else if (CopyFileW((src + n).c_str(), (dst + n).c_str(), TRUE)){
+            ++copied;
+            Diag("SEED copied " + RegNarrow(rel + n));
+        } else {
+            ++failed;
+            Diag("SEED FAILED " + RegNarrow(rel + n) + " err=" + Hex(GetLastError()));
+        }
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+}
+
+// The guest has been chosen: pin its title defaults and stage what the package
+// carries for it. Runs before the hive is loaded and before any guest code.
+//
+// <install>\guest\seed\<exe base>\localstate\ mirrors LocalState. For Tsushima it
+// holds the PS PC SDK folder under ghprogramdata\ (PsPcSdk.dll + libScePad.dll,
+// the VC++ runtime it imports, and our tbs.dll stand-in -- pspc-sdk-in-container),
+// and the hive seed RegHiveLoad falls back to lives beside it.
+static void GhTitleBegin(const std::wstring& exePath)
+{
+    size_t s = exePath.find_last_of(L"\\/");
+    const std::wstring exe = (s == std::wstring::npos) ? exePath : exePath.substr(s + 1);
+    g_title = nullptr;
+    for (const GhTitle& t : kTitles)
+        if (_wcsicmp(t.exe, exe.c_str()) == 0){ g_title = &t; break; }
+    if (!g_title){ Diag("TITLE none for " + RegNarrow(exe) + " -- no per-title defaults"); return; }
+    Diag("TITLE " + RegNarrow(exe) + ": " + std::to_string(g_title->nKnobs) +
+         " knob defaults (a LocalState file still wins)");
+    AcquireSRWLockExclusive(&g_titleLk);
+    std::vector<std::wstring> early = g_titleEarly ? *g_titleEarly : std::vector<std::wstring>();
+    ReleaseSRWLockExclusive(&g_titleLk);
+    for (size_t i = 0; i < g_title->nKnobs; ++i)
+        for (const std::wstring& e : early)
+            if (_wcsicmp(e.c_str(), g_title->knobs[i].file) == 0)
+                Diag("TITLE late " + RegNarrow(e) + ": read before the game was chosen, so its title default " +
+                     std::to_string(g_title->knobs[i].value) + " does NOT apply this run");
+
+    EnsureInstallDir();
+    std::wstring base = exe;
+    if (base.size() > 4 && _wcsicmp(base.c_str() + base.size() - 4, L".exe") == 0) base.resize(base.size() - 4);
+    const std::wstring seed = g_installDir + L"guest\\seed\\" + base + L"\\localstate\\";
+    if (GetFileAttributesW(seed.c_str()) == INVALID_FILE_ATTRIBUTES){
+        Diag("SEED none in the package for " + RegNarrow(base));
+        return;
+    }
+    int copied = 0, kept = 0, failed = 0;
+    GhSeedCopyTree(seed, kLocalState, L"", copied, kept, failed);
+    Diag("SEED " + RegNarrow(base) + ": copied=" + std::to_string(copied) + " kept=" +
+         std::to_string(kept) + " failed=" + std::to_string(failed));
 }
 
 // 0 = report the truth. Otherwise the megabytes to report as installed/total.
@@ -37424,6 +37880,21 @@ static volatile LONG64          g_lazyPromised  = 0;
 static volatile LONG64          g_lazyCommitted = 0;
 static volatile LONG            g_lazyFaults    = 0;
 static volatile LONG            g_lazyFailed    = 0;
+// a tester's Continue run (0.0.664.0): at the 5,120 MB ceiling a restore's commit was
+// refused, room-making freed too little, and the fault returned false after ONE
+// retry. Returning false at that point is certain death, not an honest report:
+// Tsushima's own VEH (GUEST+0x4403E0) is next in line, re-faults on the same
+// page, and recurses to 0xC00000FD on every thread that touches it. So a commit
+// SHORTAGE is now answered "try again": the fault drops every lock and busy bit,
+// sleeps briefly, and returns handled; the guest re-runs the instruction,
+// re-faults, and the pager starts from the top with a larger room request --
+// while other threads free, spill and finish. Only after gh_lazy_fault_wait_ms
+// of failing on the same granule does it give up. I/O and CRC failures are not
+// shortages and still fail at once.
+static volatile LONG            g_lazyBackoff     = 0;   // re-faults handed back after a shortage
+static volatile LONG            g_lazyBackoffOk   = 0;   // shortages that later succeeded
+static volatile LONG            g_lazyBackoffGive = 0;   // shortages that outlived the wait
+static volatile LONG64          g_lazyBackoffMax  = 0;   // longest wait that succeeded, ms
 static volatile LONG            g_lazyNoAccess  = 0; // kernel writes we had to rescue
 // #218. A fault inside no tracked range used to return false here leaving NO
 // TRACE AT ALL. That is how cell VPON ended: an AV on 0x40C7E290010, a page the
@@ -37894,8 +38365,10 @@ static bool GhLazyTouched(uint8_t* p, uint64_t g)
     return false;
 }
 static uint64_t GhLazyEvictOne(GhLazyRange& r, LONG bit);
+static unsigned GhLazyFaultWaitMs();
 static bool     GhLazyRestoreLocked(uint8_t* p, uint64_t g, DWORD prot, LONG* bits, LONG* spilled,
-                                    uint32_t* slot, LONG* back, LONG bit, bool lockHeld, GhLazyRange* rr = nullptr);
+                                    uint32_t* slot, LONG* back, LONG bit, bool lockHeld, GhLazyRange* rr = nullptr,
+                                    bool* shortage = nullptr);
 static bool     GhLazySpillRoomLocked(uint64_t need, const char* why, bool count);
 // LOOPFOLD8/9: a room made with g_lazyLock already held (fault, restore,
 // materialise) blocks every exclusive waiter -- and, through the SRW convoy,
@@ -38144,6 +38617,7 @@ static bool GhLazyOn()
             while (g < ((uint64_t)kb << 10)) g <<= 1;      // round up to a power of two
             g_lazyGran = g;
             g_lazyMin  = (uint64_t)GhCfgNum(L"gh_lazy_min_mb.txt", "GH_LAZY_MIN_MB", 16) << 20;
+            (void)GhLazyFaultWaitMs();   // first read here, not inside the VEH
             // #213: attribute the commits. Read-only; see the block above.
             g_lazyWho  = GhCfgNumZ(L"gh_lazy_who.txt", "GH_LAZY_WHO", 0);
             // #213: stop lying to our own shim. See GhRaInShim above. 1 = the
@@ -38260,6 +38734,59 @@ static GhLazyRange* GhLazyLocate(const void* p)
 }
 
 // The fault path. Must not allocate, must not log, must not recurse.
+// The commit-shortage wait (see g_lazyBackoff). Read once at pager init, never
+// first from inside the VEH: GhCfgNumZ opens a file and logs a CFG line.
+static unsigned GhLazyFaultWaitMs()
+{
+    static const unsigned v = GhCfgNumZ(L"gh_lazy_fault_wait_ms.txt", "GH_LAZY_FAULT_WAIT_MS", 2000);
+    return v;
+}
+// One clock per thread: the granule this thread is waiting on and since when.
+// Caller has released g_lazyLock and the granule's busy bit. true = the fault is
+// handled (the guest re-faults and we try again); false = give up.
+static thread_local uint8_t*  t_lazyWaitGran = nullptr;
+static thread_local ULONGLONG t_lazyWaitT0   = 0;
+static thread_local unsigned  t_lazyWaitN    = 0;
+static bool GhLazyBackoff(uint8_t* gran)
+{
+    const unsigned waitMs = GhLazyFaultWaitMs();
+    if (!waitMs) return false;
+    const ULONGLONG now = GetTickCount64();
+    if (t_lazyWaitGran != gran || !t_lazyWaitT0){ t_lazyWaitGran = gran; t_lazyWaitT0 = now; t_lazyWaitN = 0; }
+    if (now - t_lazyWaitT0 >= waitMs){
+        t_lazyWaitGran = nullptr; t_lazyWaitT0 = 0;
+        InterlockedIncrement(&g_lazyBackoffGive);
+        return false;
+    }
+    InterlockedIncrement(&g_lazyBackoff);
+    // Yield first, then sleep: most shortages clear when a sibling's room or free
+    // lands, and a whole-millisecond sleep on the render thread costs a frame.
+    if (t_lazyWaitN++ < 4) SwitchToThread(); else Sleep(t_lazyWaitN < 32 ? 1 : 4);
+    return true;
+}
+// The fault for this thread's waited-on granule finally succeeded.
+static void GhLazyBackoffDone(uint8_t* gran)
+{
+    if (!t_lazyWaitT0 || t_lazyWaitGran != gran) return;
+    const LONG64 ms = (LONG64)(GetTickCount64() - t_lazyWaitT0);
+    InterlockedIncrement(&g_lazyBackoffOk);
+    LONG64 cur = InterlockedCompareExchange64(&g_lazyBackoffMax, 0, 0);
+    while (ms > cur){
+        const LONG64 prev = InterlockedCompareExchange64(&g_lazyBackoffMax, ms, cur);
+        if (prev == cur) break;
+        cur = prev;
+    }
+    t_lazyWaitGran = nullptr; t_lazyWaitT0 = 0;
+}
+// The room a retry asks for grows with the wait: one granule plus 8 MB the first
+// time (the LOOPFOLD8/9 limit for a room made under the lock), doubling per
+// retry on the same granule up to 64 MB.
+static uint64_t GhLazyRetryPad()
+{
+    const unsigned n = (t_lazyWaitT0 && t_lazyWaitN < 3) ? t_lazyWaitN : (t_lazyWaitT0 ? 3 : 0);
+    return kGhLockedRoomPad << n;
+}
+
 static bool GhLazyFault(void* addr, const CONTEXT* ctx)
 {
     const uint64_t rip = ctx ? (uint64_t)ctx->Rip : 0;
@@ -38367,12 +38894,17 @@ static bool GhLazyFault(void* addr, const CONTEXT* ctx)
         if (spilled[bit / 32] & (1L << (bit % 32))){
             LARGE_INTEGER q0{}, q1{}, qf{};
             QueryPerformanceCounter(&q0);
-            const bool ok = GhLazyRestoreLocked(base, gsize, prot, bits, spilled, slot, back, bit, true, rr);
+            bool shortage = false;
+            const bool ok = GhLazyRestoreLocked(base, gsize, prot, bits, spilled, slot, back, bit, true, rr, &shortage);
             if (QueryPerformanceCounter(&q1) && QueryPerformanceFrequency(&qf) && qf.QuadPart && q1.QuadPart > q0.QuadPart)
                 InterlockedExchangeAdd64(&g_spillRsUs, (LONG64)((q1.QuadPart - q0.QuadPart) * 1000000 / qf.QuadPart));
             _interlockedbittestandreset(busy, bit);
             ReleaseSRWLockShared(&g_lazyLock);
-            if (!ok){ InterlockedIncrement(&g_lazyFailed); return false; }
+            if (!ok){
+                if (shortage && GhLazyBackoff(base)) return true;   // still spilled; the guest re-faults
+                InterlockedIncrement(&g_lazyFailed); return false;
+            }
+            GhLazyBackoffDone(base);
             InterlockedIncrement(&g_lazyFaults);
             return true;
         }
@@ -38390,18 +38922,24 @@ static bool GhLazyFault(void* addr, const CONTEXT* ctx)
         bool again = false;
         if (g_lazySpill){
             InterlockedIncrement(&g_spillRoomFault);
-            const bool room = spilled ? GhLazySpillRoomLocked(gsize + kGhLockedRoomPad, "fault", true)
+            const bool room = spilled ? GhLazySpillRoomLocked(gsize + GhLazyRetryPad(), "fault", true)
                                       : GhLazySpillRoom(gsize + (64ull << 20), "fault");
             if (room) again = phr ? GhPhCommitGranule(base, prot)
                                   : VirtualAlloc(base, (SIZE_T)gsize, MEM_COMMIT, prot) != nullptr;
         }
         if (!again){
+            // The claim must not outlive the failed commit: a placeholder granule
+            // whose bit stays set is never committed by anyone again (only the
+            // claimant commits), and every later fault on it spins forever.
+            if (first) _interlockedbittestandreset(bits, bit);
             if (spilled){ _interlockedbittestandreset(busy, bit); ReleaseSRWLockShared(&g_lazyLock); }
+            if (GhLazyBackoff(base)) return true;    // a shortage: wait for room, the guest re-faults
             InterlockedIncrement(&g_lazyFailed);
-            return false;                   // genuinely out of memory: report it honestly
+            return false;                   // out of memory for the whole wait: report it honestly
         }
         InterlockedIncrement(&g_spillRetryOk);
     }
+    GhLazyBackoffDone(base);
     if (first){
         InterlockedExchangeAdd64(&g_lazyCommitted, (LONG64)gsize);
         GhLazyNoteCommit(acct, gsize, rip, ctx);    // #213
@@ -38636,6 +39174,10 @@ static std::string GhLazyStats()
            " lazysaved=" + Hex((uint64_t)(promised > committed ? promised - committed : 0)) +
            " lazyfaults=" + std::to_string((long)InterlockedCompareExchange(&g_lazyFaults, 0, 0)) +
            " lazyfailed=" + std::to_string((long)InterlockedCompareExchange(&g_lazyFailed, 0, 0)) +
+           " lazywait=" + std::to_string((long)InterlockedCompareExchange(&g_lazyBackoff, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_lazyBackoffOk, 0, 0)) +
+           "/" + std::to_string((long)InterlockedCompareExchange(&g_lazyBackoffGive, 0, 0)) +
+           " lazywaitmax=" + std::to_string((long long)InterlockedCompareExchange64(&g_lazyBackoffMax, 0, 0)) + "ms" +
            " lazymiss=" + std::to_string((long)InterlockedCompareExchange(&g_lazyMiss, 0, 0)) +
            "/" + std::to_string((long)InterlockedCompareExchange(&g_lazyMissRsv, 0, 0)) +
            " lazynoaccess=" + std::to_string((long)InterlockedCompareExchange(&g_lazyNoAccess, 0, 0)) +
@@ -38761,7 +39303,7 @@ static uint64_t GhLazyEvictOne(GhLazyRange& r, LONG bit)
 // says whether g_lazyLock is already held (shared) by this thread -- SRW locks
 // do not recurse, so the room-maker must not take it twice.
 static bool GhPhRestore(GhLazyRange* rr, uint8_t* p, uint64_t g, DWORD prot, LONG* bits, LONG* spilled,
-                        uint32_t* slot, LONG* back, LONG bit, bool lockHeld)
+                        uint32_t* slot, LONG* back, LONG bit, bool lockHeld, bool* shortage)
 {
     // Patch i. Fill a pagefile-backed section through a scratch view, then map
     // it over the granule's placeholder: the bytes exist before the address is
@@ -38774,19 +39316,22 @@ static bool GhPhRestore(GhLazyRange* rr, uint8_t* p, uint64_t g, DWORD prot, LON
         h = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, (DWORD)g_lazyGran, nullptr);
         if (h) break;
         if (attempt) break;
-        const bool room = lockHeld ? GhLazySpillRoomLocked(g + kGhLockedRoomPad, "restore", true)
+        const bool room = lockHeld ? GhLazySpillRoomLocked(g + GhLazyRetryPad(), "restore", true)
                                    : GhLazySpillRoom(g + (64ull << 20), "restore");
         if (!room) break;
         InterlockedIncrement(&g_spillRetryOk);
     }
     if (!h){
         const DWORD e = GetLastError();
+        if (shortage) *shortage = true;             // the section is charged like commit: a ceiling refusal
         if (InterlockedIncrement(&g_phViewFail) <= 8) GhPhLog("section refused err=" + Hex(e));
         return false;
     }
     void* v = g_mv3(h, GetCurrentProcess(), nullptr, 0, (SIZE_T)g_lazyGran, 0, PAGE_READWRITE, nullptr, 0);
     if (!v){
         const DWORD e = GetLastError(); CloseHandle(h);
+        if (shortage) *shortage = e == ERROR_COMMITMENT_LIMIT || e == ERROR_NOT_ENOUGH_MEMORY ||
+                                  e == ERROR_OUTOFMEMORY;
         if (InterlockedIncrement(&g_phViewFail) <= 8) GhPhLog("scratch view refused err=" + Hex(e));
         return false;
     }
@@ -38812,6 +39357,8 @@ static bool GhPhRestore(GhLazyRange* rr, uint8_t* p, uint64_t g, DWORD prot, LON
     const DWORD me = m ? 0 : GetLastError();
     CloseHandle(h);                                   // the view keeps the section alive
     if (!m){
+        if (shortage) *shortage = me == ERROR_COMMITMENT_LIMIT || me == ERROR_NOT_ENOUGH_MEMORY ||
+                                  me == ERROR_OUTOFMEMORY;
         if (InterlockedIncrement(&g_phViewFail) <= 8)
             GhPhLog("publish failed p=" + Hex((uint64_t)(uintptr_t)p) + " err=" + Hex(me));
         return false;
@@ -38833,9 +39380,11 @@ static bool GhPhRestore(GhLazyRange* rr, uint8_t* p, uint64_t g, DWORD prot, LON
 }
 
 static bool GhLazyRestoreLocked(uint8_t* p, uint64_t g, DWORD prot, LONG* bits, LONG* spilled,
-                                uint32_t* slot, LONG* back, LONG bit, bool lockHeld, GhLazyRange* rr)
+                                uint32_t* slot, LONG* back, LONG bit, bool lockHeld, GhLazyRange* rr,
+                                bool* shortage)
 {
-    if (rr && rr->ph && rr->view) return GhPhRestore(rr, p, g, prot, bits, spilled, slot, back, bit, lockHeld);
+    if (shortage) *shortage = false;
+    if (rr && rr->ph && rr->view) return GhPhRestore(rr, p, g, prot, bits, spilled, slot, back, bit, lockHeld, shortage);
 
     // Patch f. SPILL2 and SPILL4 both died reading a NULL object pointer out of
     // pool memory with every counter clean: a second thread that touches a
@@ -38848,9 +39397,12 @@ static bool GhLazyRestoreLocked(uint8_t* p, uint64_t g, DWORD prot, LONG* bits, 
     const DWORD cprot = stage ? PAGE_NOACCESS : prot;
     if (!VirtualAlloc(p, (SIZE_T)g, MEM_COMMIT, cprot)){
         InterlockedIncrement(&g_spillRoomFault);
-        const bool room = lockHeld ? GhLazySpillRoomLocked(g + kGhLockedRoomPad, "restore", true)
+        const bool room = lockHeld ? GhLazySpillRoomLocked(g + GhLazyRetryPad(), "restore", true)
                                    : GhLazySpillRoom(g + (64ull << 20), "restore");
-        if (!room || !VirtualAlloc(p, (SIZE_T)g, MEM_COMMIT, cprot)) return false;
+        if (!room || !VirtualAlloc(p, (SIZE_T)g, MEM_COMMIT, cprot)){
+            if (shortage) *shortage = true;          // nothing committed, still spilled: safe to retry
+            return false;
+        }
         InterlockedIncrement(&g_spillRetryOk);
     }
     const uint32_t s = slot[bit];
@@ -40920,8 +41472,19 @@ static HMODULE LoadGuestDll(const char* dll)
                 full = flat;
             } else if (!g_installDir.empty()) {
                 std::wstring inpkg = g_installDir + base;
+                // Last: the VC++ runtime the package carries in guest\vcrt\. Steam
+                // games often ship without it (the redist is a separate installer),
+                // and a missing MSVCP140 does not fail loudly here: every import
+                // becomes a stub returning 0, and Tsushima's Streamline then divided
+                // by a zero QueryPerformanceFrequency forever on a fresh console.
+                std::wstring vcrt = g_installDir + L"guest\\vcrt\\" + base;
                 if (GetFileAttributesW(inpkg.c_str()) != INVALID_FILE_ATTRIBUTES)
                     full = inpkg;
+                else if (GetFileAttributesW(vcrt.c_str()) != INVALID_FILE_ATTRIBUTES){
+                    full = vcrt;
+                    Diag("GUESTDLL " + RegNarrow(base) + " not shipped by the game -- using the package's " +
+                         RegNarrow(vcrt));
+                }
             }
         }
     }
@@ -42007,8 +42570,12 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
                 }
                 // Name the caller: the message is only useful if we know which
                 // module printed it. Frame 2 is past RaiseException's own frames.
-                void* bt[8] = {};
-                const USHORT n2 = RtlCaptureStackBackTrace(0, 8, bt, nullptr);
+                // 0.0.663.0: 8 frames were not enough -- our VEH, ntdll's dispatcher
+                // and RaiseException used all of them, so the Series X removal printed
+                // "DBGSTR ?". Walk 48, and for the device-removal message print the
+                // whole stack: which API call (draw, PSO, view, Close) removed it.
+                void* bt[48] = {};
+                const USHORT n2 = RtlCaptureStackBackTrace(0, 48, bt, nullptr);
                 std::string who;
                 for (USHORT k = 0; k < n2; ++k){
                     const std::string nm = NameForCodeAddr((uintptr_t)bt[k]);
@@ -42018,6 +42585,22 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
                 }
                 const std::string line = "DBGSTR " + (who.empty() ? std::string("?") : who) + ": " + txt;
                 GhDbgStrNote(line);
+                // 0.0.665.0: Steam's tier0 prints "OUT OF MEMORY! attempted allocation
+                // size: N" on the allocating thread right before _ExitOnFatalAssert ends the
+                // process (a tester's Series X, Tsushima level load: N = the low dword of a CUser
+                // pointer). Same stack, so the steamclient caller is named.
+                const bool rmStack = txt.find("Removing Device") != std::string::npos;
+                static volatile LONG s_oomStacks = 0;
+                const bool oomStack = !rmStack && txt.find("OUT OF MEMORY") != std::string::npos &&
+                                      InterlockedIncrement(&s_oomStacks) == 1;
+                if (rmStack || oomStack){
+                    Diag(std::string(rmStack ? "DBGSTR removal stack" : "DBGSTR oom stack") + " tid=" + std::to_string((unsigned long)GetCurrentThreadId()) +
+                         " frames=" + std::to_string((unsigned)n2));
+                    for (USHORT k = 0; k < n2; ++k){
+                        Diag("  RMBT#" + std::to_string((unsigned)k) + " " + Hex((uint64_t)(uintptr_t)bt[k]) +
+                             " " + NameForCodeAddr((uintptr_t)bt[k]));
+                    }
+                }
                 // Two budgets, not one. Before the removal a forward cap keeps
                 // the log sane and the ring holds the tail; after it, every
                 // message is evidence and gets its own allowance.
@@ -45634,10 +46217,8 @@ static void FinishGuestSession()
 
     Diag("EXITCODE=" + std::to_string(g_guestExitCode));
     Diag("CAPTURED_BYTES=" + std::to_string(g_capturedOut.size()));
-    static const wchar_t* outPath =
-        L"U:\\Users\\UserMgr0\\AppData\\Local\\Packages\\"
-        L"" GH_PKG_FAMILY L"\\LocalState\\guest_stdout.txt";
-    HANDLE h = CreateFileW(outPath, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    static const std::wstring outPath = std::wstring(kLocalState) + L"guest_stdout.txt";
+    HANDLE h = CreateFileW(outPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h != INVALID_HANDLE_VALUE){ DWORD w=0; WriteFile(h, g_capturedOut.data(), (DWORD)g_capturedOut.size(), &w, nullptr); CloseHandle(h); }
 }
 
@@ -46049,6 +46630,7 @@ static void RunGuest()
     Diag("guest=" + std::string(gp.begin(), gp.end()));
     g_guestExePath = gp;
     g_mainModule = GetModuleHandleW(nullptr);   // real host exe base; GetModuleFileName beds map it to the guest
+    GhTitleBegin(gp);                           // per-title knob defaults + package seeds, before any guest code
     {   // guest\ -- where a guest's own shipped DLLs live
         size_t slash = gp.find_last_of(L"\\/");
         if (slash != std::wstring::npos) g_guestDir = gp.substr(0, slash + 1);
@@ -46774,6 +47356,8 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
         // this slot the preload fails gracefully, the login hooks stay null, LauncherSteamLogin
         // is a no-op, and the launched game logs in itself exactly as before Phase C.
         std::wstring loginStatus = L"not signed in · guest login";
+        Diag(std::string("LOCALSTATE ") + (g_localStateFromEnv ? "env " : "FALLBACK ") +
+             std::string(kLocalState, kLocalState + wcslen(kLocalState)));
         {
             std::wstring lsh = g_guestDir + L"steam_api64.dll";
             std::wstring ov  = std::wstring(kLocalState) + L"ovl\\steam_api64.dll";

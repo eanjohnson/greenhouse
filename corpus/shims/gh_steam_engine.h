@@ -476,9 +476,32 @@ static uint32_t  gh_probe_u32(const void* addr);
 
 // Build + send ONE CMsgClientGamesPlayed through a specific CCMInterface. No scanning — cheap enough
 // to call on any thread. SEH-guarded; a wrong ccm degrades to a no-op.
+// Only a real CCMInterface may reach the send scaffold. g_gh_client_user is the flat IClientUser
+// (vtRva 0x12b8938), NOT a CUser, so "g_gh_client_user + 0x48" was never a CM: its first qword
+// reads 0 in every DIAG-CCM dump. Handing it to sendw made steamclient read +0x168/+0x1ec/+0x1f4/
+// +0x5f4 of whatever heap block followed the interface, copy those into a live message header, and
+// look up a connection by the "session" found there -- once a minute for the whole game. On a tester's
+// Series X a Tsushima level load died in tier0 ("OUT OF MEMORY! attempted allocation size:
+// 2010161232" = the low dword of the real CUser pointer) in the window of that re-send. Cached
+// g_gh_ccm_list entries are re-checked on every use for the same reason: the scan ran once, and a
+// CM freed by a reconnect is a dangling pointer by the next tick.
+static bool gh_is_live_ccm(const void* ccm) {
+    HMODULE sc = GetModuleHandleA("steamclient64.dll");
+    if (!sc || !ccm) return false;
+    return gh_probe_ptr(ccm) == (uintptr_t)sc + 0x12491d8;   // CCMInterface vtable (RTTI-confirmed)
+}
+static void gh_note_not_ccm(const char* who, const void* ccm) {
+    static volatile LONG n = 0;
+    LONG k = InterlockedIncrement(&n);
+    if (k <= 4 || (k % 100) == 0)
+        gh_diag_writef("%s skip ccm=%p: not a CCMInterface (vt=0x%llx) #%ld", who, ccm,
+                       (unsigned long long)gh_probe_ptr(ccm), k);
+}
+
 static bool gh_send_gp_via(void* ccm, uint32_t appid) {
     HMODULE sc = GetModuleHandleA("steamclient64.dll");
     if (!sc || !ccm) return false;
+    if (!gh_is_live_ccm(ccm)) { gh_note_not_ccm("GAMES-PLAYED", ccm); return false; }
     const uintptr_t B = (uintptr_t)sc;
     typedef void  (*CtorFn)(void*, uint32_t, uint32_t);
     typedef void* (*P1Fn)(void*);
@@ -589,6 +612,7 @@ static bool gh_send_games_played(uint32_t appid) {
 static bool gh_send_changestatus_via(void* ccm, uint32_t persona_state) {
     HMODULE sc = GetModuleHandleA("steamclient64.dll");
     if (!sc || !ccm) return false;
+    if (!gh_is_live_ccm(ccm)) { gh_note_not_ccm("CHANGESTATUS", ccm); return false; }
     const uintptr_t B = (uintptr_t)sc;
     typedef void  (*CtorFn)(void*, uint32_t, uint32_t);
     typedef void* (*P1Fn)(void*);

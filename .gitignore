@@ -14,6 +14,7 @@ gh_gp_harness.exe
 # fetched third-party binaries
 corpus/bin/
 corpus/downloads/
+corpus/redist/
 
 # Microsoft MSIX packaging clone + Windows SDK bits (~600MB)
 toolchain/msix-packaging-src/
@@ -67,3 +68,4 @@ __pycache__/
 # task, not repo content -- GREENHOUSE.md is where anything durable goes.
 claudeghostbtw
 claudespidey*
+tester_logs/

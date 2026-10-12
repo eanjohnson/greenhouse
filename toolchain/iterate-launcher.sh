@@ -104,6 +104,53 @@ for stub in opengl32_stub:opengl32 ghwmm:ghwmm; do
   rm -f "$STAGE/guest/${dst}.lib" "$STAGE/guest/${dst}.exp"
 done
 
+# Fresh consoles (2026-10-05). A friend's Series X ran Tsushima with none of the
+# hand-staged files the reference console has, and it spun forever: no MSVCP140
+# meant every import was a stub returning 0, and Streamline divided by a zero
+# QueryPerformanceFrequency. Ship what was staged by hand:
+#   guest\vcrt\   the VC++ runtime many Steam games omit; LoadGuestDll's last fallback
+#   guest\seed\GhostOfTsushima\   localstate\ (PS PC SDK folder, copied into
+#                 LocalState when missing) and hive.txt (settings when no hive exists)
+# Third-party binaries live in corpus/redist/ (gitignored), taken byte-for-byte
+# from the reference console; tbs.dll is built from our own stub.
+echo "== stage VC++ runtime + title seeds =="
+RED="$GH/corpus/redist"
+mkdir -p "$STAGE/guest/vcrt"
+for d in MSVCP140.dll VCRUNTIME140.dll VCRUNTIME140_1.dll; do
+  cp "$RED/vcrt/$d" "$STAGE/guest/vcrt/$d" || { echo "FATAL: missing $RED/vcrt/$d"; exit 1; }
+done
+TSEED="$STAGE/guest/seed/GhostOfTsushima"
+PSPC="$TSEED/localstate/ghprogramdata/Sony Interactive Entertainment Inc/PSPC_SDK/S22/2.50.00.10"
+mkdir -p "$PSPC"
+for d in PsPcSdk.dll libScePad.dll; do
+  cp "$RED/pspc/$d" "$PSPC/$d" || { echo "FATAL: missing $RED/pspc/$d"; exit 1; }
+done
+cp "$RED/vcrt/"*.dll "$PSPC/"
+clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link /MT /O2 /LD \
+  /imsvc "$SDK/crt/include" /imsvc "$SDK/sdk/include/$SDKVER/ucrt" \
+  /imsvc "$SDK/sdk/include/$SDKVER/um" /imsvc "$SDK/sdk/include/$SDKVER/shared" \
+  "$GH/corpus/shims/tbs_stub.c" \
+  -o "$PSPC/tbs.dll" \
+  /link /libpath:"$SDK/crt/lib/x86_64" /libpath:"$SDK/sdk/lib/um/x86_64" /libpath:"$SDK/sdk/lib/ucrt/x86_64" \
+        kernel32.lib libcmt.lib libvcruntime.lib libucrt.lib /DLL \
+  || { echo "FATAL: tbs_stub build failed"; exit 1; }
+rm -f "$PSPC/tbs.lib" "$PSPC/tbs.exp"
+cp "$GH/corpus/seed/GhostOfTsushima/hive.txt" "$TSEED/hive.txt" || { echo "FATAL: missing Tsushima hive seed"; exit 1; }
+# Tsushima's shader corpus (2026-10-06): the reference console's
+# D:\DevelopmentFiles\ghlo, pulled byte-for-byte into corpus/redist/ghlo, with its
+# LocalState gh_tl_ blobs (the lane-solo NonUniform fixes, which win over ghlo
+# there) laid on top. The loader reads guest\ghlo\ LAST, so a console with its own
+# corpus is unchanged; a fresh one (a tester's Series X) gets this one.
+GHLO="$RED/ghlo"
+NLO=$(find "$GHLO" -maxdepth 1 -name 'gh_*.bin' 2>/dev/null | wc -l)
+[ "$NLO" -ge 10000 ] || { echo "FATAL: corpus/redist/ghlo has $NLO blobs (expected ~13.5k) -- pull it from the reference console"; exit 1; }
+rm -rf "$STAGE/guest/ghlo"; mkdir -p "$STAGE/guest/ghlo"
+cp "$GHLO"/gh_*.bin "$STAGE/guest/ghlo/"
+NTL=0
+for f in "$RED/ghlo_localstate"/gh_tl_*.bin; do [ -e "$f" ] || continue; cp "$f" "$STAGE/guest/ghlo/"; NTL=$((NTL+1)); done
+echo "  corpus: $NLO blobs + $NTL LocalState gh_tl_ overlays, $(du -sm "$STAGE/guest/ghlo" | cut -f1) MB"
+find "$STAGE/guest/vcrt" "$TSEED" -type f -printf '  %8s %P\n'
+
 # #126: real per-module TLS. Each ghtlsN.dll is an identical DLL whose only job
 # is to own a large __declspec(thread) reserve, so the OS assigns it a genuine
 # TLS index and maintains a block for every thread. The loader points a guest
@@ -151,7 +198,7 @@ PFN="Greenhouse.Launcher_${NEW}_x64__mgw46vk3ppz9w"
 # whatever version IS registered, so without this a failed update runs the OLD
 # loader and reports success.
 REGISTERED=""
-for i in $(seq 1 30); do
+for i in $(seq 1 100); do   # 300 s: the package carries the 270 MB shader corpus since 0.0.661.0
   sleep 3
   python3 - <<PYEOF && REGISTERED=1 && break
 import sys; sys.path.insert(0, "$TMP")
@@ -161,7 +208,7 @@ names = [p.get('PackageFullName','') for p in (d or {}).get('InstalledPackages',
 sys.exit(0 if "$PFN" in names else 1)
 PYEOF
 done
-[ -n "$REGISTERED" ] || { echo "FATAL: $PFN never registered after 90s"; exit 1; }
+[ -n "$REGISTERED" ] || { echo "FATAL: $PFN never registered after 300s"; exit 1; }
 CSRF=$(python3 "$TMP/wdp.py" csrf | awk '{print $2}')
 curl -sk -b "$TMP/wdp_cookies.txt" -H "X-CSRF-Token: $CSRF" -H "Content-Length: 0" -X POST \
   "https://${XBOX}/api/debug/dump/usermode/crashcontrol?packageFullName=$PFN" >/dev/null 2>&1 || true
