@@ -43472,7 +43472,18 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
     // Dedicated slots still let the game's handler run (it may print a Unity
     // stack, then TerminateProcess which we already bed). The launcher must
     // survive: stop the guest worker and return to the picker with this log.
-    if (g_guestWorkerTid && GetCurrentThreadId() == g_guestWorkerTid) {
+    // Not for a fault in JIT'd code, though. Since #236 this observer runs AHEAD
+    // of the guest's own handlers, and Mono implements every C# null check as a
+    // first-chance access violation in JIT code that its VEH (behind us) turns
+    // into a NullReferenceException. Ending the guest here killed Cheese Rolling
+    // on its first managed null (0.0.680.0: `mov rax,[rax]` with rax=0 at a
+    // non-image rip). A JIT fault the runtime cannot handle still ends the run
+    // through guest_seh or the bedded TerminateProcess.
+    MEMORY_BASIC_INFORMATION ipm{};
+    const bool jit = VirtualQuery(addr, &ipm, sizeof ipm) == sizeof ipm &&
+                     ipm.State == MEM_COMMIT && ipm.Type != MEM_IMAGE;
+    if (jit) Diag("  fault rip is outside every image (JIT code) -- left to the guest's handler");
+    if (!jit && g_guestWorkerTid && GetCurrentThreadId() == g_guestWorkerTid) {
         g_guestCrashed = true;
         if (g_guestFailWhy.empty()) g_guestFailWhy = line;
         Bed_exit((int)code);            // noreturn: FinishGuestSession + ExitThread

@@ -1390,6 +1390,30 @@ static std::vector<LauncherItem> LuiEnumerate()
     std::vector<LauncherItem> out;
     size_t n = 0; const LibrarySource* src = LuiSources(n);
     for (size_t k = 0; k < n; ++k) src[k].enumerate(out);
+
+    // A supported title (a config with a store app id) that no source listed gets
+    // an acquire row, so a source that claims app ids can fetch it. Steam leaves a
+    // free-to-play game out of the owned list until it has playtime, and Cheese
+    // Rolling is one. Placed after the console's own rows, before the library's.
+    {
+        size_t at = 0;
+        while (at < out.size() && out[at].kind != LauncherItem::kAcquire) ++at;
+        for (const GhTitle& t : GhTitles()) {
+            if (!t.steamAppId) continue;
+            bool listed = false, ok = true;
+            for (const auto& e : out) if (e.app == t.steamAppId) { listed = true; break; }
+            for (const std::string& svc : t.services) if (!LuiServiceProvided(svc)) ok = false;
+            if (listed || !ok) continue;
+            LauncherItem it;
+            it.kind = LauncherItem::kAcquire; it.guest = L"@@addon";
+            it.app = t.steamAppId;
+            it.display = ghrepo::Widen(t.name.empty() ? t.id : t.name);
+            it.sub = L"not installed";
+            it.source = "titles";
+            Diag("LAUNCHER title row '" + t.id + "' app=" + std::to_string(t.steamAppId) + " (no source listed it)");
+            out.insert(out.begin() + at++, std::move(it));
+        }
+    }
     for (size_t k = 0; k < n; ++k) if (src[k].enrich) src[k].enrich(out);
 
     // A title config can say the game needs a runtime service ("steam-runtime"):
