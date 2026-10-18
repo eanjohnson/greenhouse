@@ -218,6 +218,9 @@ static const char* gh_cred_path() {
 }
 
 void gh_shim_save_credentials(const char* account, unsigned long long steamid, const char* token) {
+#ifdef GH_NO_STEAM
+    (void)account; (void)steamid; (void)token; return;   // no Steam login in this build
+#endif
     if (!account || !*account || !token || !*token || !steamid) return;
     char buf[2048];
     int n = snprintf(buf, sizeof(buf), "%s\n%llu\n%s\n", account, steamid, token);
@@ -237,6 +240,9 @@ void gh_shim_save_credentials(const char* account, unsigned long long steamid, c
 // straight into the caller's buffer for immediate hand-off to SetLoginToken; the caller must scrub it.
 bool gh_shim_load_credentials(char* acctOut, size_t acctSz, unsigned long long* sidOut,
                               char* tokOut, size_t tokSz) {
+#ifdef GH_NO_STEAM
+    (void)acctSz; (void)tokSz; return false;
+#endif
     if (!acctOut || !sidOut || !tokOut) return false;
     HANDLE h = CreateFileA(gh_cred_path(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -272,6 +278,9 @@ bool gh_shim_load_credentials(char* acctOut, size_t acctSz, unsigned long long* 
 }
 
 void gh_shim_clear_credentials() {
+#ifdef GH_NO_STEAM
+    return;
+#endif
     DeleteFileA(gh_cred_path());
     gh_logf("[gh-shim]   cached credentials cleared");
 }
@@ -1902,6 +1911,16 @@ static void* gh_iface_for_version(const char* ver) {
             gh_try_acquire_matchmaking();
         if (gh_engine_wait_ready(15000) && g_gh_isteamclient)
             real = gh_sc_get_iface(route->slot, ver, route->useUser);
+        // An anonymous session (no sign-in) must not reach the game as a user: its
+        // AnonUser SteamID names the save folder (Tsushima: "Unable to create the
+        // game's save folder", §35). Hand out the built-in ISteamUser, whose
+        // GetSteamID is kFakeSteamID -- the same answer the engine-off build gives.
+        // Not cached, so a call after a real login gets the engine's object.
+        if (real && route->slot == GH_SC_GetISteamUser && g_gh_client_user &&
+            gh_sid_is_anon(gh_iu_getsteamid(g_gh_client_user))) {
+            gh_logf("[gh-shim] iface \"%s\": session is anonymous -> built-in user", ver);
+            real = nullptr;
+        }
     }
 
     // #220. The fallback for a NATIVE C++ consumer must be an object with a
@@ -2051,7 +2070,7 @@ __declspec(dllexport) bool SteamAPI_ISteamUser_BLoggedOn(void*) {
 __declspec(dllexport) uint64_steamid SteamAPI_ISteamUser_GetSteamID(void*) {
     if (g_gh_engine_state == 2 && g_gh_client_user) {
         uint64_t sid = gh_iu_getsteamid(g_gh_client_user);
-        if (sid) return sid;
+        if (sid && !gh_sid_is_anon(sid)) return sid;
     }
     return kFakeSteamID;
 }

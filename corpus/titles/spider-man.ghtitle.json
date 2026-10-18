@@ -1,0 +1,8 @@
+{
+  "schema": "greenhouse.title/1",
+  "id": "spider-man",
+  "name": "Marvel's Spider-Man Remastered",
+  "match": { "exe": "Spider-Man.exe", "steamAppId": 1817070 },
+  "requires": { "loader": "0.0.669.0", "services": [] },
+  "args": " -nolauncher"
+}

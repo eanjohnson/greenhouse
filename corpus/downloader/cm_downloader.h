@@ -427,7 +427,8 @@ struct CmClient {
         // dies with 11). The response echoes it back as jobid_target in field 11.
         Bytes h; pb_fix64(h,1,steamid); if(sessionid)pb_u32(h,2,(uint32_t)sessionid);
         if(jid!=0xFFFFFFFFFFFFFFFFull)pb_fix64(h,10,jid); if(!method.empty())pb_str(h,12,method); return h; }
-    bool um(const std::string& method,const Bytes& body,Bytes& respbody){
+    // er (optional) receives the response's EResult.
+    bool um(const std::string& method,const Bytes& body,Bytes& respbody,int32_t* er=nullptr){
         uint64_t myjid=jobid;
         Bytes f=build_proto_frame(EMsg_ServiceMethodCallFromClient,header(jobid++,method),body); if(!send_enc(f))return false;
         // Read past the post-login flood (hundreds of EMsg 766 persona-state updates for the
@@ -444,7 +445,54 @@ struct CmClient {
             } }
             (void)reads; }
         if(best.emsg==0) return false;
+        if(er) *er=best.eresult;
         respbody=best.body; return true; }
+
+    // ---- QR device auth over this connection (no steamclient engine) ----
+    // The same two calls the shim makes through the engine (corpus/shims/gh_steam_qr.h),
+    // and like the engine they need login_anon() first: the TCP CM closes the socket on
+    // a non-authed call (EMsg 9804) sent with no logon, with or without a steamid in the
+    // header (cm_qr_test modes none/zero, 2026-10-18).
+    // Only the user scans the challenge URL. The refresh token qr_poll may return is
+    // a SECRET: callers persist it and scrub it, and nothing here logs it.
+    struct QrSession { uint64_t client_id=0; Bytes request_id; std::string url; float interval=5.f; };
+    int32_t qr_begin(const std::string& device,QrSession& qs){
+        Bytes dd; pb_str(dd,1,device); pb_u32(dd,2,1);              // device_details: name, platform SteamClient
+        Bytes body; pb_str(body,1,device); pb_u32(body,2,1);         // device_friendly_name, platform_type
+        pb_bytes(body,3,dd); pb_str(body,4,"Client");                // device_details, website_id
+        Bytes r; int32_t er=2;
+        if(!um("Authentication.BeginAuthSessionViaQR#1",body,r,&er)) return -1;
+        if(er!=1) return er;
+        PbReader pr(r.data(),r.size()); uint32_t f,w;
+        while(pr.next(f,w)){
+            if(f==1&&w==0) qs.client_id=pr.varint();
+            else if(f==2&&w==2){ Bytes b=pr.lendelim(); qs.url.assign(b.begin(),b.end()); }
+            else if(f==3&&w==2) qs.request_id=pr.lendelim();
+            else if(f==4&&w==5){ uint32_t v=0; for(int i=0;i<4&&pr.p<pr.end;i++) v|=(uint32_t)(*pr.p++)<<(8*i); memcpy(&qs.interval,&v,4); }
+            else pr.skip(w);
+        }
+        return (qs.client_id && !qs.url.empty()) ? 1 : -2;
+    }
+    // One poll. Follows challenge rotation in place (qs.client_id / qs.url change;
+    // rotated reports it). Returns the EResult; token/account are set only once
+    // the user has approved on their phone.
+    int32_t qr_poll(QrSession& qs,bool& remote,bool& rotated,std::string& token,std::string& account){
+        remote=false; rotated=false;
+        Bytes body; pb_u64(body,1,qs.client_id); pb_bytes(body,2,qs.request_id);
+        Bytes r; int32_t er=2;
+        if(!um("Authentication.PollAuthSessionStatus#1",body,r,&er)) return -1;
+        if(er!=1) return er;
+        PbReader pr(r.data(),r.size()); uint32_t f,w;
+        while(pr.next(f,w)){
+            if(f==1&&w==0){ uint64_t v=pr.varint(); if(v&&v!=qs.client_id){ qs.client_id=v; rotated=true; } }
+            else if(f==2&&w==2){ Bytes b=pr.lendelim(); if(b.size()>1){ qs.url.assign(b.begin(),b.end()); rotated=true; } }
+            else if(f==3&&w==2){ Bytes b=pr.lendelim(); token.assign(b.begin(),b.end()); }   // refresh_token (SECRET)
+            else if(f==5&&w==0) remote=pr.varint()!=0;
+            else if(f==6&&w==2){ Bytes b=pr.lendelim(); account.assign(b.begin(),b.end()); }
+            else pr.skip(w);
+        }
+        return 1;
+    }
     bool connect_and_secure(){
         WSADATA wsa; WSAStartup(MAKEWORD(2,2),&wsa); Bytes jb;
         { HINTERNET hS=WinHttpOpen(L"gh",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,0,0,0); HINTERNET hC=WinHttpConnect(hS,L"api.steampowered.com",443,0);

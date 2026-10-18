@@ -1,0 +1,19 @@
+{
+  "schema": "greenhouse.vendor/1",
+  "id": "steam-runtime",
+  "name": "Steam runtime (fetched from Valve by the console)",
+  "notes": "The three Valve DLLs the Steam engine needs. Our repository publishes only their hashes; the console fetches the bytes from Valve's own client-update CDN. Pinned to SteamCMD's steamcmd_bins_win32 package of 2026-01-30 (steamclient 10.41.26.25): the build every RVA in gh_steam_engine.h / GREENHOUSE.md 25.5 and 26.10 was reverse-engineered on. A different build is refused, not installed.",
+  "provides": ["runtime:steamclient"],
+  "source": {
+    "url": "https://client-update.steamstatic.com/steamcmd_bins_win32.zip.7ae579f513787b332395a86b4515b400c2f57eaa",
+    "size": 23455433,
+    "sha256": "89af5e9c4a781f4849544fe6194f3681af6f8f9d89ced3a9dfa58bf9dd14041a"
+  },
+  "files": [
+    { "entry": "steamclient64.dll",
+      "patches": [ { "find": "MapVirtualKeyExA", "replace": "CharUpperW",
+                     "why": "the slim Xbox user32 has no MapVirtualKeyExA, so the OS loader refuses the DLL; the same import-name rename as UnityPlayer.dll (GREENHOUSE.md 19), byte-identical to the copy every Steam test so far ran" } ] },
+    { "entry": "tier0_s64.dll" },
+    { "entry": "vstdlib_s64.dll" }
+  ]
+}

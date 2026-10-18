@@ -30,10 +30,20 @@
 #include <winrt/windows.ui.text.core.h>
 #include <winrt/windows.ui.viewmanagement.h>
 #include <winrt/windows.ui.viewmanagement.core.h>
+// GH_NO_STEAM (v1 product build, design/package-audit.md): no Steam sign-in,
+// no owned-library fetch and no depot downloader. Games come from the user's own
+// files (USB / ghlibrary.txt / game folders), and the Valve engine is never staged.
+#ifndef GH_NO_STEAM
 #include "cm_downloader.h"   // in-process Steam depot downloader (namespace ghdl)
 extern "C" {
 #include "qrcodegen.h"       // Nayuki QR Code generator (MIT), for on-screen Steam login (Phase C)
 }
+#endif
+#include "gh_repo.h"         // package repository client (Step 3): Packages page, update check
+#include "gh_addon_abi.h"    // add-on DLL ABI (Step 4): an installed add-on is one more library source
+// Packages startup check (LuiRepoStartupCheck): -2 not started, -1 no repository /
+// failed, else the number of updates available. Read by the picker's header badge.
+static std::atomic<int> g_repoUpdates{-2};
 
 // ---------------------------------------------------------------------------
 // D2D/DWrite state, built once over the existing bridge device (g_gfx.d11).
@@ -84,6 +94,11 @@ static int      (*g_ghConsumeOpenInviteDialog)(unsigned long long*) = nullptr;
 
 static void GhResolveOverlayExports(HMODULE stm)
 {
+#ifdef GH_NO_STEAM
+    // No engine, so no friends or invites: leave every hook null and the overlay
+    // says "Friends list unavailable".
+    (void)stm; return;
+#endif
     if (!stm) return;
     g_ghFriendCount = (int(*)())GetProcAddress(stm, "GhFriendCount");
     g_ghFriendAt    = (int(*)(int, unsigned long long*, char*, int, int*))GetProcAddress(stm, "GhFriendAt");
@@ -108,8 +123,12 @@ struct LauncherItem {
     std::wstring display;
     std::wstring guest;      // empty => "continue with default guest"
     std::wstring sub;        // source hint shown dim (e.g. "installed", "USB", "configured")
-    uint32_t     app = 0;    // Steam appid for "owned" (@@lib) entries -> download-on-select
+    uint32_t     app = 0;    // title id (Steam appid): SteamAppId env, input profiles, downloads
     bool         incomplete = false;  // gh_install.txt complete=0, or <64-byte PE
+    enum Kind : uint8_t { kLaunch, kPlaceholder, kAcquire } kind = kLaunch;
+    const char*  source = "";               // id of the LibrarySource that made the row
+    const struct LibrarySource* acq = nullptr;  // source that can download/repair/verify it
+    std::wstring blocked;    // non-empty: not launchable, and why ("needs the Steam add-on")
 };
 
 static std::string LuiNarrow(const std::wstring& w) { return std::string(w.begin(), w.end()); }
@@ -267,14 +286,6 @@ static bool LuiCanUninstall(const LauncherItem& it)
     return under(scratch) || under(legacy);
 }
 
-// Steam-style verify needs an appid and a Greenhouse-managed tree (manifest + CDN).
-static bool LuiCanVerify(const LauncherItem& it)
-{
-    if (!it.app) return false;
-    if (it.guest.empty() || it.guest[0] == L'@') return false;
-    return LuiCanUninstall(it);
-}
-
 // gh_install.txt: 1 = complete, 0 = incomplete, -1 = no marker (legacy trees).
 static int LuiInstallComplete(const std::wstring& folder)
 {
@@ -339,7 +350,9 @@ static uint32_t LuiReadAppIdFile(const std::wstring& dir)
     return (uint32_t)strtoul(s.c_str(), nullptr, 10);
 }
 
-// Steam title for an appid from the cached library list (ASCII names).
+#ifndef GH_NO_STEAM
+// Steam title for an appid from the cached library list (ASCII names). Only the
+// Steam library source asks (a NO_STEAM build must not read a stale gh_owned.txt).
 static std::wstring LuiOwnedName(uint32_t app)
 {
     if (!app) return L"";
@@ -362,6 +375,7 @@ static std::wstring LuiOwnedName(uint32_t app)
     }
     return L"";
 }
+#endif
 
 static std::wstring LuiFindAppFolder(const std::wstring& gameDir, uint32_t app)
 {
@@ -458,142 +472,6 @@ static std::wstring LuiPickExe(const std::wstring& dir, const std::wstring& fold
     }
     if (!any.empty()) return any;                      // helpers only -- better than nothing
     return prefer;                                     // folder exists; use <folder>.exe even if missing
-}
-
-static std::vector<LauncherItem> LuiEnumerate()
-{
-    std::vector<LauncherItem> out;
-    auto seen = [&](const std::wstring& g){
-        for (auto& it : out) if (!g.empty() && it.guest == g) return true; return false;
-    };
-
-    // 1) Installed games: D:\DevelopmentFiles\gh_games (Dev scratch) then
-    // leftover <LocalState>\game. One row per steam_appid.txt. Guest is an
-    // absolute path so RunGuest uses the USB/ABSOLUTE branch.
-    auto scanRoot = [&](const std::wstring& gameDir, const wchar_t* tag) {
-        WIN32_FIND_DATAW fd{};
-        HANDLE h = FindFirstFileW((gameDir + L"*").c_str(), &fd);
-        if (h == INVALID_HANDLE_VALUE) return;
-        do {
-            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-            std::wstring sub = fd.cFileName;
-            if (sub == L"." || sub == L"..") continue;
-            uint32_t app = LuiReadAppIdFile(gameDir + sub + L"\\");
-            if (app) {
-                bool dup = false;
-                for (auto& it : out) if (it.app == app) { dup = true; break; }
-                if (dup) {
-                    Diag(std::string("LAUNCHER merge folder='") + LuiNarrow(sub) + "' app=" + std::to_string(app));
-                    continue;
-                }
-            }
-            std::wstring exe = LuiPickExe(gameDir + sub + L"\\", sub);
-            if (exe.empty()) exe = sub + L".exe";
-            LauncherItem it;
-            it.guest = gameDir + sub + L"\\" + exe;   // absolute
-            it.app   = app;
-            it.display = LuiOwnedName(app);
-            if (it.display.empty()) it.display = sub;
-            if (it.display.empty()) {
-                wchar_t fb[32]; swprintf(fb, 32, L"App %u", app); it.display = fb;
-            }
-            int inst = LuiInstallComplete(gameDir + sub + L"\\");
-            DWORD gsz = LuiFileSize(it.guest);
-            if (inst == 0 || gsz < 64) { it.sub = L"incomplete"; it.incomplete = true; }
-            else it.sub = L"installed";
-            Diag(std::string("LAUNCHER slot '") + LuiNarrow(it.display) + "' " + LuiNarrow(tag) +
-                 " folder='" + LuiNarrow(sub) + "' exe='" + LuiNarrow(exe) +
-                 "' app=" + std::to_string(app) + " sub=" + LuiNarrow(it.sub));
-            if (!seen(it.guest)) out.push_back(it);
-        } while (FindNextFileW(h, &fd));
-        FindClose(h);
-    };
-    scanRoot(std::wstring(kDevGames), L"scratch");
-    scanRoot(std::wstring(kLocalState) + L"game\\", L"legacy");
-
-    // 2) The currently-configured guest (may be an absolute USB path).
-    std::wstring cfg = ReadCfgW(L"ghguest.txt", L"");
-    if (!cfg.empty() && !seen(cfg)) {
-        LauncherItem it;
-        it.guest = cfg;
-        it.display = LuiExeBase(cfg);
-        it.sub = (cfg.size() >= 2 && cfg[1] == L':') ? L"USB" : L"configured";
-        out.push_back(it);
-    }
-
-    // 3) Manual absolute-path list (USB titles): ghlibrary.txt, one path per line.
-    {
-        std::wstring lib = std::wstring(kLocalState) + L"ghlibrary.txt";
-        std::vector<uint8_t> b;
-        if (ReadWholeFile(lib, b) && !b.empty()) {   // ReadWholeFile: guest_loader.cpp:2821
-            std::wstring all = LuiDecode(b);
-            size_t p = 0;
-            while (p < all.size()) {
-                size_t e = all.find_first_of(L"\r\n", p);
-                std::wstring line = all.substr(p, e == std::wstring::npos ? e : e - p);
-                p = (e == std::wstring::npos) ? all.size() : e + 1;
-                while (!line.empty() && (line.back()==L' '||line.back()==L'\t')) line.pop_back();
-                while (!line.empty() && (line.front()==L' '||line.front()==L'\t')) line.erase(line.begin());
-                if (line.empty() || seen(line)) continue;
-                LauncherItem it; it.guest = line; it.display = LuiExeBase(line); it.sub = L"USB";
-                out.push_back(it);
-            }
-        }
-    }
-
-    // 4) Owned Steam library: gh_owned.txt ("<appid>\t<name>" per line), written by the
-    //    shim after login (Player.GetOwnedGames#1). These are games the account OWNS but
-    //    aren't installed on the console -- shown as "owned" entries (guest "@@lib"). Pressing
-    //    A on one resolves its depots via PICS and downloads it (LauncherRunAppDownload). Skip
-    //    any whose name already matches an installed/configured item (soft de-dup by name).
-    {
-        std::wstring owned = std::wstring(kLocalState) + L"gh_owned.txt";
-        std::vector<uint8_t> b;
-        if (ReadWholeFile(owned, b) && !b.empty()) {
-            std::wstring all = LuiDecode(b);
-            std::vector<LauncherItem> lib;
-            size_t p = 0;
-            while (p < all.size()) {
-                size_t e = all.find_first_of(L"\r\n", p);
-                std::wstring line = all.substr(p, e == std::wstring::npos ? e : e - p);
-                p = (e == std::wstring::npos) ? all.size() : e + 1;
-                size_t tab = line.find(L'\t');
-                if (tab == std::wstring::npos) continue;
-                std::wstring appid = line.substr(0, tab);
-                std::wstring name  = line.substr(tab + 1);
-                while (!name.empty() && (name.back()==L' '||name.back()==L'\r')) name.pop_back();
-                if (name.empty()) continue;
-                bool dup = false;
-                uint32_t appn = (uint32_t)wcstoul(appid.c_str(), nullptr, 10);
-                for (auto& it : out) {
-                    bool same = (appn && it.app == appn);
-                    if (_wcsicmp(it.display.c_str(), name.c_str()) == 0) same = true;
-                    std::wstring folder = LuiFolderOf(it.guest);
-                    if (!folder.empty() && _wcsicmp(folder.c_str(), name.c_str()) == 0) same = true;
-                    if (_wcsicmp(LuiExeBase(it.guest).c_str(), name.c_str()) == 0) same = true;
-                    if (same) {
-                        if (!it.app) it.app = appn;
-                        if (it.display.empty()) it.display = name;
-                        dup = true; break;
-                    }
-                }
-                if (dup) continue;
-                LauncherItem it; it.display = name; it.guest = L"@@lib"; it.sub = L"owned";
-                it.app = (uint32_t)wcstoul(appid.c_str(), nullptr, 10);
-                lib.push_back(it);
-            }
-            std::sort(lib.begin(), lib.end(), [](const LauncherItem& a, const LauncherItem& b){
-                return _wcsicmp(a.display.c_str(), b.display.c_str()) < 0; });
-            for (auto& it : lib) out.push_back(std::move(it));
-        }
-    }
-
-    // No "Continue"/default-guest fallback here: an empty guest makes RunGuest launch the
-    // dev default (7za.exe), which prints help and exits immediately -> the guest-wait loop
-    // ends and CoreApplication::Exit() closes the whole app (looked like "pressing A on the
-    // launch button closes the launcher"). The caller adds a non-launchable "No games
-    // installed" placeholder instead when the library is empty.
-    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -781,6 +659,13 @@ static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const s
     LuiText(L"GREENHOUSE", g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
     LuiText((L"\u25CF  " + status).c_str(), g_lui.fmtSmall.get(),
             D2D1::RectF(84, 140, W - 80, 182), g_lui.brAccent.get());
+    {   // Packages badge (START). The count comes from LuiRepoStartupCheck's background fetch.
+        const int up = g_repoUpdates.load();
+        std::wstring pk = L"\u2261  START  Packages";
+        if (up > 0) pk += L" \u00B7 " + std::to_wstring(up) + (up == 1 ? L" update" : L" updates");
+        LuiText(pk.c_str(), g_lui.fmtSmall.get(), D2D1::RectF(W - 760, 140, W - 80, 182),
+                up > 0 ? g_lui.brAccent.get() : g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
 
     std::wstring sline = query.empty()
         ? (g_pickOskOpen ? L"Search:  _" : L"Search:  Y for on-screen keyboard")
@@ -831,11 +716,19 @@ static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const s
         IDWriteTextFormat* fs = g_lui.fmtSmall.get();
         ID2D1Brush* dim = g_lui.brDim.get();
         const wchar_t* left = L"\u25B2 \u25BC  Move      \u25C0 \u25B6  Jump 5      A  Launch      X  Uninstall      ";
+#ifdef GH_NO_STEAM
+        (void)cy;   // no Verify (it re-downloads from Steam), so no View glyph
+        const wchar_t* right = L"Y  Search      B  Back";
+        float wl = LuiMeasure(left, fs);
+        LuiText(left, fs, D2D1::RectF(x, y0, x + wl + 2.f, y1), dim);
+        x += wl;
+#else
         const wchar_t* right = L"  Verify      Y  Search      B  Back";
         float wl = LuiMeasure(left, fs);
         LuiText(left, fs, D2D1::RectF(x, y0, x + wl + 2.f, y1), dim);
         x += wl;
         x += LuiDrawViewBtn(x, cy, dim);
+#endif
         LuiText(right, fs, D2D1::RectF(x, y0, W - 80.f, y1), dim);
     }
 
@@ -898,6 +791,7 @@ static void LuiPresent()
     g_gfx.on12->AcquireWrappedResources(next, 1);
 }
 
+#ifndef GH_NO_STEAM
 // ---------------------------------------------------------------------------
 // Phase C: on-screen Steam QR login. The shim's QR flow (gh_steam_qr.h) writes
 // the PUBLIC challenge_url to <LocalState>\gh_qr_url.txt; we encode it in-process
@@ -1038,6 +932,11 @@ static uint64_t LauncherSteamLogin(int timeoutSec)
     }
 }
 
+#else
+static void LauncherClearQrUrl() {}
+static uint64_t LauncherSteamLogin(int) { return 0; }
+#endif
+
 // A centered full-screen status line (used while a blocking step runs, e.g. fetching
 // the library). Draws its own frame; caller Presents.
 static void LuiDrawStatus(const std::wstring& msg)
@@ -1052,6 +951,43 @@ static void LuiDrawStatus(const std::wstring& msg)
     dc->EndDraw();
 }
 
+// Progress state shared with the download callback and the add-on host API
+// (same UI thread). Outside the Steam block: add-ons draw it in every build.
+struct LauncherDlProg { std::wstring name, phase; int percent=0, fdone=0, ftot=0; unsigned long long bytes=0; bool verify=false; };
+static LauncherDlProg g_dlProg;
+
+static void LuiDrawProgress()
+{
+    auto* dc = g_lui.dc.get();
+    const float W = (float)g_lui.w, H = (float)g_lui.h;
+    dc->BeginDraw();
+    dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
+    LuiText(L"GREENHOUSE", g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
+    LuiText((std::wstring(g_dlProg.verify ? L"●  Verifying " : L"●  Downloading ") + g_dlProg.name).c_str(), g_lui.fmtSmall.get(),
+            D2D1::RectF(84, 140, W - 80, 182), g_lui.brAccent.get());
+    // progress bar
+    const float x0 = 84, x1 = W - 84, y = H * 0.5f - 20, hgt = 40;
+    D2D1_ROUNDED_RECT track = D2D1::RoundedRect(D2D1::RectF(x0, y, x1, y + hgt), 8, 8);
+    dc->FillRoundedRectangle(track, g_lui.brPanel.get());
+    float frac = g_dlProg.percent / 100.f; if (frac < 0) frac = 0; if (frac > 1) frac = 1;
+    if (frac > 0.001f) {
+        D2D1_ROUNDED_RECT fill = D2D1::RoundedRect(D2D1::RectF(x0, y, x0 + (x1 - x0) * frac, y + hgt), 8, 8);
+        dc->FillRoundedRectangle(fill, g_lui.brAccent.get());
+    }
+    wchar_t line[256];
+    if (g_dlProg.ftot > 0)
+        swprintf(line, 256, L"%ls   %d%%   files %d/%d   %.1f MB",
+                 g_dlProg.phase.c_str(), g_dlProg.percent, g_dlProg.fdone, g_dlProg.ftot,
+                 g_dlProg.bytes / (1024.0 * 1024.0));
+    else                                             // add-on progress: no file count
+        swprintf(line, 256, L"%ls   %d%%   %.1f MB",
+                 g_dlProg.phase.c_str(), g_dlProg.percent, g_dlProg.bytes / (1024.0 * 1024.0));
+    LuiText(line, g_lui.fmtSmall.get(), D2D1::RectF(x0, y + hgt + 16, x1, y + hgt + 60),
+            g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+    dc->EndDraw();
+}
+
+#ifndef GH_NO_STEAM
 // ---------------------------------------------------------------------------
 // Owned-library fetch. Reads the on-device cached credential (gh_cred.txt: 3 lines
 // account/steamid/token) and enumerates owned games over the downloader's CM client
@@ -1103,7 +1039,7 @@ static void LauncherFetchLibrary()
 // Download flow (Phase B1c): a request dropped at <LocalState>\gh_download.txt
 // ("app depot manifest name [branch]") becomes a "Download" item in the picker.
 // Selecting it runs the in-process downloader (ghdl::DownloadDepot) on the UI
-// thread, drawing a live progress bar, into <LocalState>\game\<name>.
+// thread, drawing a live progress bar, into D:\DevelopmentFiles\gh_games\<name>.
 // ---------------------------------------------------------------------------
 struct LauncherDlReq { uint32_t app=0, depot=0; uint64_t manifest=0; std::string name, branch="public"; bool ok=false; };
 
@@ -1124,37 +1060,6 @@ static LauncherDlReq LauncherReadDlReq()
     return r;
 }
 
-// Progress state shared with the download callback (same UI thread).
-struct LauncherDlProg { std::wstring name, phase; int percent=0, fdone=0, ftot=0; unsigned long long bytes=0; bool verify=false; };
-static LauncherDlProg g_dlProg;
-
-static void LuiDrawProgress()
-{
-    auto* dc = g_lui.dc.get();
-    const float W = (float)g_lui.w, H = (float)g_lui.h;
-    dc->BeginDraw();
-    dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
-    LuiText(L"GREENHOUSE", g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
-    LuiText((std::wstring(g_dlProg.verify ? L"●  Verifying " : L"●  Downloading ") + g_dlProg.name).c_str(), g_lui.fmtSmall.get(),
-            D2D1::RectF(84, 140, W - 80, 182), g_lui.brAccent.get());
-    // progress bar
-    const float x0 = 84, x1 = W - 84, y = H * 0.5f - 20, hgt = 40;
-    D2D1_ROUNDED_RECT track = D2D1::RoundedRect(D2D1::RectF(x0, y, x1, y + hgt), 8, 8);
-    dc->FillRoundedRectangle(track, g_lui.brPanel.get());
-    float frac = g_dlProg.percent / 100.f; if (frac < 0) frac = 0; if (frac > 1) frac = 1;
-    if (frac > 0.001f) {
-        D2D1_ROUNDED_RECT fill = D2D1::RoundedRect(D2D1::RectF(x0, y, x0 + (x1 - x0) * frac, y + hgt), 8, 8);
-        dc->FillRoundedRectangle(fill, g_lui.brAccent.get());
-    }
-    wchar_t line[256];
-    swprintf(line, 256, L"%ls   %d%%   files %d/%d   %.1f MB",
-             g_dlProg.phase.c_str(), g_dlProg.percent, g_dlProg.fdone, g_dlProg.ftot,
-             g_dlProg.bytes / (1024.0 * 1024.0));
-    LuiText(line, g_lui.fmtSmall.get(), D2D1::RectF(x0, y + hgt + 16, x1, y + hgt + 60),
-            g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-    dc->EndDraw();
-}
-
 static void LauncherDlCallback(void*, const char* phase, int percent, int fdone, int ftot, unsigned long long bytes)
 {
     g_dlProg.phase.assign(phase, phase + strlen(phase));
@@ -1172,22 +1077,15 @@ static bool LauncherRunDownload(const LauncherDlReq& req)
     g_dlProg.phase = L"starting";
     LuiDrawProgress(); LuiPresent();
 
-    // read an optional Steam token for owned games (never logged/echoed)
-    std::string token; uint64_t token_sid = 0;
-    std::wstring credp = std::wstring(kLocalState) + L"gh_cred.txt";
-    HANDLE hc = CreateFileW(credp.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (hc != INVALID_HANDLE_VALUE) {
-        DWORD sz = GetFileSize(hc, nullptr); std::string s(sz, 0); DWORD rd = 0;
-        ReadFile(hc, &s[0], sz, &rd, nullptr); CloseHandle(hc); s.resize(rd);
-        // gh_cred.txt format: "<steamid> <refresh_token>" (token stays in memory only)
-        size_t sp = s.find_first_of(" \t\r\n");
-        if (sp != std::string::npos) { token_sid = strtoull(s.substr(0, sp).c_str(), 0, 10);
-            size_t b = s.find_first_not_of(" \t\r\n", sp); if (b != std::string::npos) { token = s.substr(b); token.erase(token.find_last_not_of(" \t\r\n") + 1); } }
-    }
+    // Optional Steam token for owned games (never logged/echoed). gh_cred.txt is the
+    // shim's 3-line account/steamid/token file; without it the download is anonymous.
+    std::string token, account; uint64_t token_sid = 0;
+    if (!LauncherReadCred(token_sid, token, account)) { token.clear(); token_sid = 0; }
 
     std::wstring outdir = std::wstring(kDevGames) + std::wstring(req.name.begin(), req.name.end());
     int rc = ghdl::DownloadDepot(req.app, req.depot, req.manifest, outdir, req.branch,
                                  token, token_sid, LauncherDlCallback, nullptr);
+    token.clear();                                   // scrub token
     Diag("LAUNCHER download rc=" + std::to_string(rc) + " '" + req.name + "'");
     if (rc == 0) {
         // consume the request so it doesn't re-offer next boot
@@ -1201,7 +1099,8 @@ static bool LauncherRunDownload(const LauncherDlReq& req)
 
 // Download an OWNED library title straight from its appid (no pre-staged gh_download.txt):
 // reads the cached credential, resolves the app's depots via PICS, and runs the in-process
-// multi-depot downloader (ghdl::DownloadApp) into <LocalState>\game\<name>, drawing the same
+// multi-depot downloader (ghdl::DownloadApp) into LuiInstallDir (D:\DevelopmentFiles\gh_games\,
+// or a leftover <LocalState>\game\ tree that already holds the appid), drawing the same
 // live progress bar. Returns true once the game tree is written. The token stays in memory
 // and is scrubbed -- never logged.
 static bool LauncherRunAppDownload(uint32_t app, const std::wstring& name, bool verify=false)
@@ -1228,6 +1127,835 @@ static bool LauncherRunAppDownload(uint32_t app, const std::wstring& name, bool 
     if (rc == 0) return true;
     for (int i = 0; i < 180; ++i) { LuiDrawProgress(); LuiPresent(); Sleep(16); }   // show error ~3s
     return false;
+}
+#else
+static void LauncherFetchLibrary() {}
+#endif
+
+// ---------------------------------------------------------------------------
+// Library sources (step 2 of the library-source plan, GREENHOUSE.md §34-35).
+// Each place a game can come from is one LibrarySource. LuiEnumerate runs every
+// source's enumerate in table order, then every enrich, then tags rows whose title
+// config needs a runtime service that no source provides. Steam is just one row of
+// the table (and is absent from the GH_NO_STEAM build); a later Steam add-on
+// supplies the same struct from a DLL.
+// ---------------------------------------------------------------------------
+enum LuiAcquireMode { kAcqNew = 0, kAcqResume = 1, kAcqVerify = 2 };
+
+struct LibrarySource {
+    const char* id;                                         // "installed", "configured", "usb", "steam"
+    void (*enumerate)(std::vector<LauncherItem>& out);      // add rows (may back-fill earlier rows)
+    void (*enrich)(std::vector<LauncherItem>& rows);        // optional: claim/annotate others' rows
+    std::wstring (*nameFor)(uint32_t app);                  // optional: library name for a title id
+    bool (*acquire)(const LauncherItem& it, int mode);      // optional: download / resume / verify
+    bool (*canVerify)(const LauncherItem& it);              // optional
+    const char* service;                                    // runtime service it provides, or nullptr
+};
+
+static const LibrarySource* LuiSources(size_t& n);
+
+// The title config (greenhouse.title/1) whose exe matches this row's guest, if any.
+static const GhTitle* LuiTitleFor(const LauncherItem& it)
+{
+    if (it.guest.empty() || it.guest[0] == L'@') return nullptr;
+    size_t s = it.guest.find_last_of(L"\\/");
+    std::wstring exe = (s == std::wstring::npos) ? it.guest : it.guest.substr(s + 1);
+    for (const GhTitle& t : GhTitles())
+        if (_wcsicmp(t.exe.c_str(), exe.c_str()) == 0) return &t;
+    return nullptr;
+}
+
+// Display name for an installed row: a library source's name for the title id
+// (Steam's owned list), then the title config's name, then the exe's own name.
+static std::wstring LuiRowName(const LauncherItem& it)
+{
+    size_t n = 0; const LibrarySource* src = LuiSources(n);
+    for (size_t k = 0; k < n; ++k)
+        if (src[k].nameFor && it.app) {
+            std::wstring nm = src[k].nameFor(it.app);
+            if (!nm.empty()) return nm;
+        }
+    if (const GhTitle* t = LuiTitleFor(it))
+        if (!t->name.empty()) return GhUtf8ToW(t->name);
+    return LuiExeBase(it.guest);
+}
+
+static bool LuiSeenGuest(const std::vector<LauncherItem>& out, const std::wstring& g)
+{
+    for (auto& it : out) if (!g.empty() && it.guest == g) return true;
+    return false;
+}
+
+// --- installed: D:\DevelopmentFiles\gh_games (Dev scratch) then leftover
+// <LocalState>\game. One row per steam_appid.txt. Guest is an absolute path so
+// RunGuest uses the USB/ABSOLUTE branch.
+static void LuiSrcInstalledScan(std::vector<LauncherItem>& out, const std::wstring& gameDir, const wchar_t* tag)
+{
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((gameDir + L"*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        std::wstring sub = fd.cFileName;
+        if (sub == L"." || sub == L"..") continue;
+        uint32_t app = LuiReadAppIdFile(gameDir + sub + L"\\");
+        if (app) {
+            bool dup = false;
+            for (auto& it : out) if (it.app == app) { dup = true; break; }
+            if (dup) {
+                Diag(std::string("LAUNCHER merge folder='") + LuiNarrow(sub) + "' app=" + std::to_string(app));
+                continue;
+            }
+        }
+        std::wstring exe = LuiPickExe(gameDir + sub + L"\\", sub);
+        if (exe.empty()) exe = sub + L".exe";
+        LauncherItem it;
+        it.guest = gameDir + sub + L"\\" + exe;   // absolute
+        it.app   = app;
+        it.source = "installed";
+        // No library name (signed out, or GH_NO_STEAM) and no title config: the exe's
+        // own name ("GhostOfTsushima") reads better than the scratch folder ("app_2215430").
+        it.display = LuiRowName(it);
+        if (it.display.empty()) it.display = sub;
+        if (it.display.empty()) {
+            wchar_t fb[32]; swprintf(fb, 32, L"App %u", app); it.display = fb;
+        }
+        int inst = LuiInstallComplete(gameDir + sub + L"\\");
+        DWORD gsz = LuiFileSize(it.guest);
+        if (inst == 0 || gsz < 64) { it.sub = L"incomplete"; it.incomplete = true; }
+        else it.sub = L"installed";
+        Diag(std::string("LAUNCHER slot '") + LuiNarrow(it.display) + "' " + LuiNarrow(tag) +
+             " folder='" + LuiNarrow(sub) + "' exe='" + LuiNarrow(exe) +
+             "' app=" + std::to_string(app) + " sub=" + LuiNarrow(it.sub));
+        if (!LuiSeenGuest(out, it.guest)) out.push_back(it);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+static void LuiSrcInstalled(std::vector<LauncherItem>& out)
+{
+    LuiSrcInstalledScan(out, std::wstring(kDevGames), L"scratch");
+    LuiSrcInstalledScan(out, std::wstring(kLocalState) + L"game\\", L"legacy");
+}
+
+// --- configured: the current ghguest.txt (may be an absolute USB path).
+static void LuiSrcConfigured(std::vector<LauncherItem>& out)
+{
+    std::wstring cfg = ReadCfgW(L"ghguest.txt", L"");
+    if (cfg.empty() || LuiSeenGuest(out, cfg)) return;
+    LauncherItem it;
+    it.guest = cfg;
+    it.display = LuiExeBase(cfg);
+    it.sub = (cfg.size() >= 2 && cfg[1] == L':') ? L"USB" : L"configured";
+    it.source = "configured";
+    out.push_back(it);
+}
+
+// --- usb: manual absolute-path list, ghlibrary.txt, one path per line.
+static void LuiSrcUsb(std::vector<LauncherItem>& out)
+{
+    std::wstring lib = std::wstring(kLocalState) + L"ghlibrary.txt";
+    std::vector<uint8_t> b;
+    if (!ReadWholeFile(lib, b) || b.empty()) return;   // ReadWholeFile: guest_loader.cpp
+    std::wstring all = LuiDecode(b);
+    size_t p = 0;
+    while (p < all.size()) {
+        size_t e = all.find_first_of(L"\r\n", p);
+        std::wstring line = all.substr(p, e == std::wstring::npos ? e : e - p);
+        p = (e == std::wstring::npos) ? all.size() : e + 1;
+        while (!line.empty() && (line.back()==L' '||line.back()==L'\t')) line.pop_back();
+        while (!line.empty() && (line.front()==L' '||line.front()==L'\t')) line.erase(line.begin());
+        if (line.empty() || LuiSeenGuest(out, line)) continue;
+        LauncherItem it; it.guest = line; it.display = LuiExeBase(line); it.sub = L"USB";
+        it.source = "usb";
+        out.push_back(it);
+    }
+}
+
+#ifndef GH_NO_STEAM
+// --- steam: the owned library (gh_owned.txt, "<appid>\t<name>" per line, written
+// after login by LauncherFetchLibrary) plus a pre-staged gh_download.txt request.
+static LauncherDlReq g_steamDlReq;     // the pending gh_download.txt row's request
+static const LibrarySource* LuiSteamSource();
+
+// Owned games the account has but the console has not -- "owned" rows (guest "@@lib").
+// A on one resolves its depots via PICS and downloads it. Any whose app id or name
+// matches an earlier row is not added; that row gets the app id / name instead.
+static void LuiSrcSteam(std::vector<LauncherItem>& out)
+{
+    std::wstring owned = std::wstring(kLocalState) + L"gh_owned.txt";
+    std::vector<uint8_t> b;
+    if (ReadWholeFile(owned, b) && !b.empty()) {
+        std::wstring all = LuiDecode(b);
+        std::vector<LauncherItem> lib;
+        size_t p = 0;
+        while (p < all.size()) {
+            size_t e = all.find_first_of(L"\r\n", p);
+            std::wstring line = all.substr(p, e == std::wstring::npos ? e : e - p);
+            p = (e == std::wstring::npos) ? all.size() : e + 1;
+            size_t tab = line.find(L'\t');
+            if (tab == std::wstring::npos) continue;
+            std::wstring appid = line.substr(0, tab);
+            std::wstring name  = line.substr(tab + 1);
+            while (!name.empty() && (name.back()==L' '||name.back()==L'\r')) name.pop_back();
+            if (name.empty()) continue;
+            bool dup = false;
+            uint32_t appn = (uint32_t)wcstoul(appid.c_str(), nullptr, 10);
+            for (auto& it : out) {
+                bool same = (appn && it.app == appn);
+                if (_wcsicmp(it.display.c_str(), name.c_str()) == 0) same = true;
+                std::wstring folder = LuiFolderOf(it.guest);
+                if (!folder.empty() && _wcsicmp(folder.c_str(), name.c_str()) == 0) same = true;
+                if (_wcsicmp(LuiExeBase(it.guest).c_str(), name.c_str()) == 0) same = true;
+                if (same) {
+                    if (!it.app) it.app = appn;
+                    if (it.display.empty()) it.display = name;
+                    dup = true; break;
+                }
+            }
+            if (dup) continue;
+            LauncherItem it; it.display = name; it.guest = L"@@lib"; it.sub = L"owned";
+            it.app = appn; it.source = "steam"; it.kind = LauncherItem::kAcquire; it.acq = LuiSteamSource();
+            lib.push_back(it);
+        }
+        std::sort(lib.begin(), lib.end(), [](const LauncherItem& a, const LauncherItem& b){
+            return _wcsicmp(a.display.c_str(), b.display.c_str()) < 0; });
+        for (auto& it : lib) out.push_back(std::move(it));
+    }
+
+    // A staged gh_download.txt request is the first row.
+    g_steamDlReq = LauncherReadDlReq();
+    if (g_steamDlReq.ok) {
+        LauncherItem it; it.display = L"⤓  Download: " + std::wstring(g_steamDlReq.name.begin(), g_steamDlReq.name.end());
+        it.guest = L"@@download"; it.sub = L"from Steam";
+        it.source = "steam"; it.kind = LauncherItem::kAcquire; it.acq = LuiSteamSource();
+        out.insert(out.begin(), it);
+    }
+}
+
+// Any row with a Steam app id can be downloaded, resumed and verified through Steam.
+static void LuiSrcSteamEnrich(std::vector<LauncherItem>& rows)
+{
+    for (auto& it : rows) if (it.app && !it.acq) it.acq = LuiSteamSource();
+}
+
+static bool LuiSrcSteamAcquire(const LauncherItem& it, int mode)
+{
+    if (it.guest == L"@@download") return LauncherRunDownload(g_steamDlReq);
+    if (!it.app) return false;
+    return LauncherRunAppDownload(it.app, it.display, mode == kAcqVerify);
+}
+
+// Steam-style verify needs an app id and a Greenhouse-managed tree (manifest + CDN).
+static bool LuiSrcSteamCanVerify(const LauncherItem& it)
+{
+    if (!it.app) return false;
+    if (it.guest.empty() || it.guest[0] == L'@') return false;
+    return LuiCanUninstall(it);
+}
+#endif
+
+static const LibrarySource kLuiSources[] = {
+    { "installed",  LuiSrcInstalled,  nullptr, nullptr, nullptr, nullptr, nullptr },
+    { "configured", LuiSrcConfigured, nullptr, nullptr, nullptr, nullptr, nullptr },
+    { "usb",        LuiSrcUsb,        nullptr, nullptr, nullptr, nullptr, nullptr },
+#ifndef GH_NO_STEAM
+    { "steam",      LuiSrcSteam, LuiSrcSteamEnrich, LuiOwnedName, LuiSrcSteamAcquire, LuiSrcSteamCanVerify, "steam-runtime" },
+#endif
+};
+// ---------------------------------------------------------------------------
+// Add-on library sources (Step 4, gh_addon_abi.h). An installed add-on package
+// whose root holds addon.dll is loaded once, the first time the source table is
+// asked for: its bytes must still hash to the entrySha256 recorded when the
+// signed package was installed, then GhAddonInit fills a GhAddonApi. Each add-on
+// becomes one LibrarySource; the fixed trampolines below give it the plain
+// function pointers the table holds, so no call site knows the difference.
+// An add-on whose id is already a built-in source (e.g. "steam" in the dev
+// build) is refused, so the two can never both claim the same rows.
+// ---------------------------------------------------------------------------
+struct LuiAddon {
+    std::string pkg;            // package id
+    std::wstring dir;           // its install folder, trailing backslash
+    HMODULE mod = nullptr;
+    GhHostApi host{};
+    GhAddonApi api{};
+};
+static constexpr int kLuiMaxAddons = 4;
+static LuiAddon g_luiAddons[kLuiMaxAddons];
+static int g_luiAddonN = 0;
+
+static void LuiAddonLog(const char* s) { if (s) Diag(std::string(s)); }
+
+static LauncherItem LuiAddonRowToItem(int k, const GhAddonRow* r)
+{
+    LauncherItem it;
+    it.display = (r->display && *r->display) ? r->display : L"(unnamed)";
+    if (r->sub) it.sub = r->sub;
+    it.app = r->app;
+    it.source = g_luiAddons[k].api.id;
+    if (r->kind == GH_ROW_LAUNCH && r->guest && *r->guest) { it.kind = LauncherItem::kLaunch; it.guest = r->guest; }
+    else if (r->kind == GH_ROW_ACQUIRE) { it.kind = LauncherItem::kAcquire; it.guest = L"@@addon"; }
+    else { it.kind = LauncherItem::kPlaceholder; it.guest = L"@@none"; }
+    return it;
+}
+static GhAddonRow LuiItemToAddonRow(const LauncherItem& it)
+{
+    GhAddonRow r{};
+    r.size = sizeof r;
+    r.kind = it.kind == LauncherItem::kAcquire ? GH_ROW_ACQUIRE : it.kind == LauncherItem::kLaunch ? GH_ROW_LAUNCH : GH_ROW_INFO;
+    r.app = it.app;
+    r.display = it.display.c_str();
+    r.sub = it.sub.c_str();
+    r.guest = (it.kind == LauncherItem::kLaunch) ? it.guest.c_str() : nullptr;
+    return r;
+}
+
+static const LibrarySource* LuiAddonSource(int k);
+struct LuiAddonEmitCtx { int k; std::vector<LauncherItem>* out; };
+template <int K> static void LuiAddonEnum(std::vector<LauncherItem>& out)
+{
+    LuiAddon& a = g_luiAddons[K];
+    if (!a.api.enumerate) return;
+    LuiAddonEmitCtx ctx{ K, &out };
+    a.api.enumerate(&ctx, [](void* c, const GhAddonRow* r) {
+        auto* x = (LuiAddonEmitCtx*)c;
+        if (!r || r->size < sizeof(GhAddonRow)) return;
+        LauncherItem it = LuiAddonRowToItem(x->k, r);
+        if (it.kind == LauncherItem::kAcquire || g_luiAddons[x->k].api.canVerify) it.acq = LuiAddonSource(x->k);
+        x->out->push_back(std::move(it));
+    });
+}
+template <int K> static std::wstring LuiAddonName(uint32_t app)
+{
+    wchar_t buf[256] = {};
+    const uint32_t n = g_luiAddons[K].api.nameFor ? g_luiAddons[K].api.nameFor(app, buf, 255) : 0;
+    return n ? std::wstring(buf, n < 255 ? n : 255) : std::wstring();
+}
+// GhHostApi::progress / status. Live only inside an acquire() call (the add-on is
+// running on the UI thread, so these draw and present directly, as
+// LauncherDlCallback does); outside one they are ignored, once logged, so an add-on
+// cannot paint over the picker from enumerate() or a stray thread.
+static bool g_luiAddonAcquiring = false;
+static DWORD g_luiAddonAcqTid = 0;              // the UI thread that called acquire()
+static bool LuiAddonUiLive(const char* what)
+{
+    if (g_luiAddonAcquiring && GetCurrentThreadId() == g_luiAddonAcqTid) return true;
+    static bool once = false;
+    if (!once) { once = true; Diag(std::string("ADDON host ") + what + " outside acquire() ignored"); }
+    return false;
+}
+static void LuiAddonProgress(const wchar_t* phase, uint64_t done, uint64_t total)
+{
+    if (!LuiAddonUiLive("progress")) return;
+    g_dlProg.phase = phase ? phase : L"";
+    g_dlProg.bytes = done;
+    g_dlProg.percent = total ? (int)(done >= total ? 100 : done * 100 / total) : 0;
+    if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+    LuiDrawProgress();
+    LuiPresent();
+}
+static void LuiAddonStatus(const wchar_t* text)
+{
+    if (!LuiAddonUiLive("status")) return;
+    if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+    LuiDrawStatus(text ? text : L"");
+    LuiPresent();
+}
+
+template <int K> static bool LuiAddonAcquire(const LauncherItem& it, int mode)
+{
+    if (!g_luiAddons[K].api.acquire) return false;
+    GhAddonRow r = LuiItemToAddonRow(it);
+    const int m = mode == kAcqVerify ? GH_ACQ_VERIFY : mode == kAcqResume ? GH_ACQ_RESUME : GH_ACQ_NEW;
+    g_dlProg = LauncherDlProg{};
+    g_dlProg.name = it.display; g_dlProg.verify = (m == GH_ACQ_VERIFY);
+    g_luiAddonAcqTid = GetCurrentThreadId();
+    g_luiAddonAcquiring = true;
+    const bool ok = g_luiAddons[K].api.acquire(&r, m) != 0;
+    g_luiAddonAcquiring = false;
+    return ok;
+}
+template <int K> static bool LuiAddonCanVerify(const LauncherItem& it)
+{
+    if (!g_luiAddons[K].api.canVerify) return false;
+    GhAddonRow r = LuiItemToAddonRow(it);
+    return g_luiAddons[K].api.canVerify(&r) != 0;
+}
+template <int K> static LibrarySource LuiAddonMakeSource()
+{
+    const GhAddonApi& a = g_luiAddons[K].api;
+    return { a.id, LuiAddonEnum<K>, nullptr, a.nameFor ? LuiAddonName<K> : nullptr,
+             a.acquire ? LuiAddonAcquire<K> : nullptr, a.canVerify ? LuiAddonCanVerify<K> : nullptr, a.service };
+}
+static LibrarySource (*const kLuiAddonMake[kLuiMaxAddons])() = {
+    LuiAddonMakeSource<0>, LuiAddonMakeSource<1>, LuiAddonMakeSource<2>, LuiAddonMakeSource<3> };
+
+// GhAddonInit behind SEH, in a frame with no C++ objects (a fault in the add-on's
+// init refuses the add-on instead of taking the Launcher down).
+static int LuiAddonCallInit(GhAddonInitFn init, const GhHostApi* host, GhAddonApi* api)
+{
+    __try { return init(host, GH_ADDON_ABI, api); } __except (EXCEPTION_EXECUTE_HANDLER) { return -2; }
+}
+
+static ghrepo::Config LuiRepoConfig();   // Packages page, below
+
+// #258: the Valve runtime the console fetched from Valve's own CDN (package
+// steam-runtime; its manifest pins each file by hash and names the byte range of
+// Valve's SteamCMD zip it comes from -- GREENHOUSE.md §38). The loader's engine
+// RVAs (§25.5, §26.10) fit exactly one build, 10.41.26.25, so the hashes are pinned
+// here too: a file on D: that differs is never loaded, whatever installed.json says.
+// steamclient64's hash is AFTER the MapVirtualKeyExA import rename (§19 trick).
+static const struct { const wchar_t* name; const char* sha256; } kSteamRuntimePin[] = {
+    { L"steamclient64.dll", "3bae281da1059a4b71b3540af63df52adaf3256f9fd640af0dfd68b9d8dc671f" },
+    { L"tier0_s64.dll",     "af89cb6e94b20a5660d8f33427460fcd3b5e43e16b13372321d09cebab1288b8" },
+    { L"vstdlib_s64.dll",   "9bb287b195f0a246f68ea462371178d9a2ebc23b03df295606ef189910aee2d2" },
+};
+
+// The folder holding a verified copy of all three, or empty. Hashed once per
+// process (~26 MB); tier0/vstdlib are steamclient64's static imports, which the
+// OS loader resolves from steamclient64's own folder, so all three are checked
+// together or none is used.
+static std::wstring GhSteamRuntimeDir()
+{
+    static std::once_flag once; static std::wstring dir;
+    std::call_once(once, [] {
+        ghrepo::State st = ghrepo::LoadState(std::wstring(kLocalState) + L"gh_packages\\");
+        for (const ghrepo::Installed& p : st.pkgs) {
+            if (p.id != "steam-runtime" || p.files.empty()) continue;
+            std::wstring d = p.files[0]; if (d.empty() || d.back() != L'\\') d += L'\\';
+            for (const auto& pin : kSteamRuntimePin) {
+                std::vector<uint8_t> b;
+                std::string h = ReadWholeFile(d + pin.name, b, true) && !b.empty()
+                              ? ghrepo::Sha256Hex(b.data(), b.size()) : std::string("missing");
+                if (h != pin.sha256) {
+                    Diag("STEAMRT " + p.version + " REFUSED " + ghrepo::Narrow(pin.name) + " sha256=" +
+                         h.substr(0, 16) + " is not the pinned " + std::string(pin.sha256).substr(0, 16));
+                    return;
+                }
+            }
+            dir = d;
+            Diag("STEAMRT " + p.version + " verified (3 files) at " + ghrepo::Narrow(d));
+            return;
+        }
+        Diag("STEAMRT not installed -- the engine loads from the package, if it carries one");
+    });
+    return dir;
+}
+
+// Full path of the fetched copy of `base` if it is one of the three and verified, else empty.
+static std::wstring GhSteamRuntimeFor(const std::wstring& base)
+{
+    for (const auto& pin : kSteamRuntimePin)
+        if (_wcsicmp(base.c_str(), pin.name) == 0) {
+            std::wstring d = GhSteamRuntimeDir();
+            return d.empty() ? std::wstring() : d + pin.name;
+        }
+    return std::wstring();
+}
+
+// Load every installed add-on. `taken` holds the built-in source ids.
+static void LuiAddonsLoad(const std::vector<std::string>& taken)
+{
+    const ghrepo::Config cfg = LuiRepoConfig();
+    ghrepo::CleanOrphans(cfg);   // folders a remove/update left while their addon.dll was loaded
+    ghrepo::State st = ghrepo::LoadState(cfg.stateDir);
+    for (const ghrepo::Installed& p : st.pkgs) {
+        if (p.type != "addon") continue;
+        auto refuse = [&](const std::string& why) { Diag("ADDON " + p.id + " " + p.version + " REFUSED " + why); };
+        if (p.files.empty()) { refuse("no install folder recorded"); continue; }
+        if (p.entrySha256.empty()) {   // e.g. steam-runtime (#258): files for the loader, no code to call
+            Diag("ADDON " + p.id + " " + p.version + " data-only (no addon.dll) -- nothing to load");
+            continue;
+        }
+        if (g_luiAddonN >= kLuiMaxAddons) { refuse("too many add-ons (max " + std::to_string(kLuiMaxAddons) + ")"); continue; }
+        LuiAddon& a = g_luiAddons[g_luiAddonN];
+        a = LuiAddon{};
+        a.pkg = p.id;
+        a.dir = p.files[0]; if (a.dir.empty() || a.dir.back() != L'\\') a.dir += L'\\';
+        const std::wstring dll = a.dir + L"addon.dll";
+        std::vector<uint8_t> b;
+        if (!ReadWholeFile(dll, b, true) || b.empty()) { refuse("addon.dll is missing"); continue; }
+        const std::string h = ghrepo::Sha256Hex(b.data(), b.size());
+        if (h != p.entrySha256) { refuse("addon.dll sha256 " + h.substr(0, 16) + " is not the installed " + p.entrySha256.substr(0, 16)); continue; }
+        a.mod = LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (!a.mod) { refuse("LoadLibrary error " + std::to_string(GetLastError())); continue; }
+        auto init = (GhAddonInitFn)GetProcAddress(a.mod, "GhAddonInit");
+        if (!init) { refuse("no GhAddonInit export"); FreeLibrary(a.mod); continue; }
+        a.host.size = sizeof(GhHostApi);
+        a.host.abi = GH_ADDON_ABI;
+        a.host.loaderVersion = GhOwnPackageVersion();
+        a.host.localState = kLocalState;
+        a.host.devRoot = kDevRoot;
+        a.host.addonDir = a.dir.c_str();
+        a.host.log = LuiAddonLog;
+        a.host.progress = LuiAddonProgress;
+        a.host.status = LuiAddonStatus;
+        a.api.size = sizeof(GhAddonApi);
+        const int rc = LuiAddonCallInit(init, &a.host, &a.api);
+        if (rc != 0 || a.api.abi != GH_ADDON_ABI || !a.api.id || !*a.api.id) {
+            refuse("GhAddonInit rc=" + std::to_string(rc) + " abi=" + std::to_string(a.api.abi));
+            FreeLibrary(a.mod); continue;   // nothing it handed back is used
+        }
+        bool dup = false;
+        for (const auto& t : taken) if (t == a.api.id) dup = true;
+        for (int k = 0; k < g_luiAddonN; ++k) if (!strcmp(g_luiAddons[k].api.id, a.api.id)) dup = true;
+        if (dup) { refuse(std::string("source id \"") + a.api.id + "\" is already present"); continue; }  // stays loaded, unused
+        Diag("ADDON " + p.id + " " + p.version + " loaded source=" + a.api.id +
+             " service=" + (a.api.service ? a.api.service : "-") + " sha256=" + h.substr(0, 16));
+        ++g_luiAddonN;
+    }
+}
+
+// The source table: the built-ins above, then one entry per loaded add-on. Built
+// once, on first use (the Launcher's UI thread), and fixed for the process.
+static const LibrarySource* LuiSources(size_t& n)
+{
+    static std::vector<LibrarySource> s;
+    static bool built = false;
+    if (!built) {
+        built = true;
+        s.assign(std::begin(kLuiSources), std::end(kLuiSources));
+        std::vector<std::string> taken;
+        for (const LibrarySource& b : s) taken.push_back(b.id);
+        LuiAddonsLoad(taken);
+        for (int k = 0; k < g_luiAddonN; ++k) s.push_back(kLuiAddonMake[k]());
+    }
+    n = s.size();
+    return s.data();
+}
+static const LibrarySource* LuiAddonSource(int k)
+{
+    size_t n = 0; const LibrarySource* s = LuiSources(n);
+    return &s[n - g_luiAddonN + k];
+}
+#ifndef GH_NO_STEAM
+static const LibrarySource* LuiSteamSource()
+{
+    size_t n = 0; const LibrarySource* s = LuiSources(n);
+    for (size_t k = 0; k < n; ++k) if (!strcmp(s[k].id, "steam")) return &s[k];
+    return nullptr;
+}
+#endif
+
+static bool LuiServiceProvided(const std::string& service)
+{
+    size_t n = 0; const LibrarySource* s = LuiSources(n);
+    for (size_t k = 0; k < n; ++k) if (s[k].service && service == s[k].service) return true;
+    return false;
+}
+
+static std::wstring LuiServiceLabel(const std::string& service)
+{
+    if (service == "steam-runtime") return L"Steam";
+    return std::wstring(service.begin(), service.end());
+}
+
+// Verify needs the row's acquiring source to offer it (Steam, today).
+static bool LuiCanVerify(const LauncherItem& it)
+{
+    return it.acq && it.acq->canVerify && it.acq->canVerify(it);
+}
+
+static std::vector<LauncherItem> LuiEnumerate()
+{
+    std::vector<LauncherItem> out;
+    size_t n = 0; const LibrarySource* src = LuiSources(n);
+    for (size_t k = 0; k < n; ++k) src[k].enumerate(out);
+    for (size_t k = 0; k < n; ++k) if (src[k].enrich) src[k].enrich(out);
+
+    // A title config can say the game needs a runtime service ("steam-runtime"):
+    // with no source providing it the row stays visible but does not launch.
+    for (auto& it : out) {
+        if (it.kind != LauncherItem::kLaunch) continue;
+        const GhTitle* t = LuiTitleFor(it);
+        if (!t) continue;
+        for (const std::string& svc : t->services) {
+            if (LuiServiceProvided(svc)) continue;
+            it.blocked = L"needs the " + LuiServiceLabel(svc) + L" add-on";
+            it.sub = L"needs " + LuiServiceLabel(svc) + L" add-on";
+            Diag("LAUNCHER blocked '" + LuiNarrow(it.display) + "' title=" + t->id +
+                 " service=" + svc + " (no source provides it)");
+            break;
+        }
+    }
+
+    // No "Continue"/default-guest fallback here: an empty guest makes RunGuest launch the
+    // dev default (7za.exe), which prints help and exits immediately -> the guest-wait loop
+    // ends and CoreApplication::Exit() closes the whole app (looked like "pressing A on the
+    // launch button closes the launcher"). The caller adds a non-launchable "No games
+    // installed" placeholder instead when the library is empty.
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Packages (Step 3): install / update / remove packages from a signed
+// repository (gh_repo.h). The repository is LocalState\gh_repo_url.txt (the
+// URL of its index.json); with no such file there is no repository and the
+// page says so. Title packages land in LocalState\titles\ and take effect the
+// next time the Launcher starts (title configs are read once, at startup);
+// add-ons land in D:\DevelopmentFiles\gh_packages\<id>\<version>\.
+// Network work runs on a worker thread so the page keeps drawing.
+// ---------------------------------------------------------------------------
+static std::string LuiRepoUrl()
+{
+    std::vector<uint8_t> b;
+    if (!ReadWholeFile(std::wstring(kLocalState) + L"gh_repo_url.txt", b) || b.empty()) return {};
+    std::string s(b.begin(), b.end());
+    size_t e = s.find_first_of("\r\n"); if (e != std::string::npos) s.resize(e);
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+    size_t f = 0; while (f < s.size() && (s[f] == ' ' || s[f] == '\t' || (unsigned char)s[f] >= 0x80)) ++f;  // BOM
+    return s.substr(f);
+}
+
+static void LuiRepoLog(const std::string& s) { Diag(s); }
+
+// A title package's file must be a title config this loader accepts, for the
+// package's own id -- the same check GhTitles() applies when it loads it.
+static bool LuiRepoCheckTitle(const std::vector<uint8_t>& b, const std::string& id, std::string& why)
+{
+    ghjson::Value j; std::string err;
+    if (!ghjson::Parse((const char*)b.data(), b.size(), j, err)) { why = err; return false; }
+    GhTitle t; std::string notes;
+    if (!GhTitleFromJson(j, t, why, notes)) return false;
+    if (t.id != id) { why = "title id " + t.id + " is not the package id " + id; return false; }
+    return true;
+}
+
+static ghrepo::Config LuiRepoConfig()
+{
+    ghrepo::Config c;
+    c.indexUrl  = LuiRepoUrl();
+    c.stateDir  = std::wstring(kLocalState) + L"gh_packages\\";
+    c.titleDir  = std::wstring(kLocalState) + L"titles\\";
+    c.addonRoot = std::wstring(kDevRoot) + L"gh_packages\\";
+    c.loaderVersion = GhOwnPackageVersion();
+    c.log = LuiRepoLog;
+    c.checkTitle = LuiRepoCheckTitle;
+    return c;
+}
+
+
+static void LuiRepoStartupCheck()
+{
+    static std::atomic<bool> started{false};
+    if (started.exchange(true)) return;
+    std::thread([] {
+        ghrepo::Config c = LuiRepoConfig();
+        CreateDirectoryW(c.addonRoot.c_str(), nullptr);
+        ghrepo::CleanStaging(c);
+        if (c.indexUrl.empty()) { Diag("REPO check: no repository (gh_repo_url.txt absent)"); g_repoUpdates = -1; return; }
+        ghrepo::Index idx; std::string why, key;
+        if (!ghrepo::FetchIndex(c, idx, why, &key)) { Diag("REPO check FAILED: " + why); g_repoUpdates = -1; return; }
+        int n = ghrepo::CountUpdates(ghrepo::LoadState(c.stateDir), idx);
+        Diag("REPO check: " + std::to_string(n) + " update(s) available");
+        g_repoUpdates = n;
+    }).detach();
+}
+
+struct LuiPkgRow { std::string id, type, name, inst, repo; uint64_t instV = 0, repoV = 0; };
+
+static void LuiDrawPackages(const std::vector<LuiPkgRow>& rows, int sel, const std::wstring& status,
+                            bool statusBad, const std::wstring& busy, double frac,
+                            const std::wstring& askRemove)
+{
+    auto* dc = g_lui.dc.get();
+    const float W = (float)g_lui.w, H = (float)g_lui.h;
+    dc->BeginDraw();
+    dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
+    LuiText(L"PACKAGES", g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
+    LuiText((L"\u25CF  " + status).c_str(), g_lui.fmtSmall.get(), D2D1::RectF(84, 140, W - 80, 182),
+            statusBad ? g_lui.brWarn.get() : g_lui.brAccent.get());
+
+    const float x0 = 80, x1 = W - 80, rowH = 76, top = 228;
+    const int nfit = (int)((H - 90 - top) / rowH);
+    int total = (int)rows.size(), first = 0;
+    if (nfit > 0 && total > nfit) {
+        first = sel - nfit / 2; if (first < 0) first = 0; if (first > total - nfit) first = total - nfit;
+    }
+    for (int vi = 0; vi < nfit && first + vi < total; ++vi) {
+        const int i = first + vi; const LuiPkgRow& r = rows[i];
+        const float y = top + (float)vi * rowH; const bool cur = (i == sel);
+        dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x0, y, x1, y + rowH - 12), 10, 10),
+                                 cur ? g_lui.brSel.get() : g_lui.brPanel.get());
+        std::wstring name = ghrepo::Widen(r.name.empty() ? r.id : r.name) +
+                            (r.type == "addon" ? L"   (add-on)" : L"");
+        std::wstring sub;
+        if (r.repo.empty())            sub = L"installed " + ghrepo::Widen(r.inst) + L" \u00B7 not in repository";
+        else if (r.inst.empty())       sub = L"available " + ghrepo::Widen(r.repo);
+        else if (r.repoV > r.instV)    sub = L"update " + ghrepo::Widen(r.inst) + L" \u2192 " + ghrepo::Widen(r.repo);
+        else                           sub = L"installed " + ghrepo::Widen(r.inst);
+        LuiText(name.c_str(), g_lui.fmtItem.get(), D2D1::RectF(x0 + 28, y, x1 - 420, y + rowH - 12), g_lui.brFg.get());
+        LuiText(sub.c_str(), g_lui.fmtSmall.get(), D2D1::RectF(x1 - 460, y, x1 - 24, y + rowH - 12),
+                cur ? g_lui.brFg.get() : g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
+    if (rows.empty() && busy.empty())
+        LuiText(L"No packages", g_lui.fmtItem.get(), D2D1::RectF(x0, top, x1, top + 60), g_lui.brDim.get(),
+                DWRITE_TEXT_ALIGNMENT_CENTER);
+    LuiText(L"A  Install / update      X  Remove      Y  Refresh      B  Back", g_lui.fmtSmall.get(),
+            D2D1::RectF(84, H - 70, W - 80, H - 30), g_lui.brDim.get());
+
+    if (!busy.empty() || !askRemove.empty()) {
+        dc->FillRectangle(D2D1::RectF(0, 0, W, H), g_lui.brBg.get());
+        const float cx = W * 0.5f, cy = H * 0.5f;
+        dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 460, cy - 160, cx + 460, cy + 160), 16, 16),
+                                 g_lui.brPanel.get());
+        if (!askRemove.empty()) {
+            LuiText(L"REMOVE", g_lui.fmtTitle.get(), D2D1::RectF(cx - 430, cy - 140, cx + 430, cy - 60),
+                    g_lui.brWarn.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            LuiText(askRemove.c_str(), g_lui.fmtItem.get(), D2D1::RectF(cx - 430, cy - 40, cx + 430, cy + 20),
+                    g_lui.brAccent.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            LuiText(L"A  Yes, remove            B  Cancel", g_lui.fmtSmall.get(),
+                    D2D1::RectF(cx - 430, cy + 70, cx + 430, cy + 130), g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+        } else {
+            LuiText(busy.c_str(), g_lui.fmtItem.get(), D2D1::RectF(cx - 430, cy - 110, cx + 430, cy - 40),
+                    g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            if (frac >= 0) {
+                const float bx0 = cx - 400, bx1 = cx + 400, by = cy, bh = 32;
+                dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(bx0, by, bx1, by + bh), 8, 8), g_lui.brBg.get());
+                if (frac > 0.001)
+                    dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(bx0, by, bx0 + (bx1 - bx0) * (float)(frac > 1 ? 1 : frac),
+                                                                           by + bh), 8, 8), g_lui.brAccent.get());
+            }
+            LuiText(L"B  Cancel", g_lui.fmtSmall.get(), D2D1::RectF(cx - 430, cy + 80, cx + 430, cy + 130),
+                    g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
+    }
+    dc->EndDraw();
+}
+
+// The Packages page. Returns when the user presses B.
+static void LauncherPackages()
+{
+    if (!LuiInit()) return;
+    struct Job {
+        std::atomic<bool> done{true};
+        volatile LONG cancel = 0; volatile LONG64 pd = 0, pt = 0;
+        bool ok = false; std::string why, key;
+        ghrepo::Index idx;
+    };
+    auto job = std::make_shared<Job>();
+    ghrepo::Config cfg = LuiRepoConfig();
+    bool haveIdx = false;
+    ghrepo::Index idx;
+    std::wstring status, busy, ask;
+    bool bad = false;
+    std::vector<LuiPkgRow> rows;
+    int sel = 0;
+    WORD prev = 0xFFFF;
+    enum { kNone, kFetch, kInstall, kRemove } running = kNone;
+    std::string target;
+    LuiPkgRow askRow;
+
+    auto buildRows = [&] {
+        rows.clear();
+        ghrepo::State st = ghrepo::LoadState(cfg.stateDir);
+        if (haveIdx) for (const auto& e : idx.packages) {
+            LuiPkgRow r; r.id = e.id; r.type = e.type; r.name = e.name; r.repo = e.version; r.repoV = e.ver;
+            if (const ghrepo::Installed* p = ghrepo::FindInstalled(st, e.id)) { r.inst = p->version; r.instV = p->ver; }
+            rows.push_back(r);
+        }
+        for (const auto& p : st.pkgs) {
+            bool listed = false; for (const auto& r : rows) if (r.id == p.id) listed = true;
+            if (listed) continue;
+            LuiPkgRow r; r.id = p.id; r.type = p.type; r.inst = p.version; r.instV = p.ver;
+            rows.push_back(r);
+        }
+        if (sel >= (int)rows.size()) sel = (int)rows.size() - 1;
+        if (sel < 0) sel = 0;
+    };
+    auto start = [&](int what, const std::string& id) {
+        job = std::make_shared<Job>(); job->done = false; running = (decltype(running))what; target = id;
+        ghrepo::Config c = cfg; c.cancel = &job->cancel; c.progDone = &job->pd; c.progTotal = &job->pt;
+        ghrepo::Index cur = idx;
+        std::thread([job, c, cur, what, id] {
+            if (what == kFetch) job->ok = ghrepo::FetchIndex(c, job->idx, job->why, &job->key);
+            else if (what == kInstall) job->ok = ghrepo::Install(c, cur, id, job->why);
+            else job->ok = ghrepo::Remove(c, id, job->why);
+            job->done = true;
+        }).detach();
+    };
+    auto fetch = [&] {
+        if (cfg.indexUrl.empty()) {
+            status = L"No repository: put the URL of its index.json in gh_repo_url.txt"; bad = true;
+            Diag("REPO page: no repository (gh_repo_url.txt absent)");
+            buildRows(); return;
+        }
+        busy = L"Checking " + ghrepo::Widen(cfg.indexUrl) + L"\u2026";
+        start(kFetch, "");
+    };
+    Diag("REPO page open url='" + cfg.indexUrl + "'");
+    fetch();
+    for (;;) {
+        if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+        PollGamepadOnUi();
+        PollSyntheticPad();
+        WORD b; { std::lock_guard<std::mutex> lk(g_padMutex); b = g_padState.wButtons; }
+        WORD pressed = b & ~prev; prev = b;
+
+        if (running != kNone) {
+            if (job->done) {
+                const auto was = running; running = kNone; busy.clear();
+                if (was == kFetch) {
+                    haveIdx = job->ok;
+                    if (job->ok) {
+                        idx = job->idx; bad = false;
+                        status = L"Signed index OK \u00B7 serial " + std::to_wstring(idx.serial) + L" \u00B7 key " +
+                                 ghrepo::Widen(job->key);
+                        g_repoUpdates = ghrepo::CountUpdates(ghrepo::LoadState(cfg.stateDir), idx);
+                    } else {
+                        bad = true; status = L"Repository refused: " + ghrepo::Widen(job->why);
+                        Diag("REPO page fetch FAILED: " + job->why);
+                    }
+                } else {
+                    bad = !job->ok;
+                    if (!job->ok) {
+                        status = (was == kInstall ? L"Install failed: " : L"Remove failed: ") + ghrepo::Widen(job->why);
+                        Diag(std::string("REPO page ") + (was == kInstall ? "install " : "remove ") + target + " FAILED: " + job->why);
+                    } else {
+                        bool title = false; for (const auto& r : rows) if (r.id == target && r.type == "title") title = true;
+                        status = (was == kInstall ? L"Installed " : L"Removed ") + ghrepo::Widen(target) +
+                                 (title ? L" \u00B7 applies the next time Greenhouse starts" : L"");
+                        if (haveIdx) g_repoUpdates = ghrepo::CountUpdates(ghrepo::LoadState(cfg.stateDir), idx);
+                    }
+                }
+                buildRows();
+            } else if (pressed & XINPUT_GAMEPAD_B) {
+                InterlockedExchange(&job->cancel, 1);
+            }
+            double frac = -1;
+            if (running == kInstall && job->pt > 0) frac = (double)job->pd / (double)job->pt;
+            LuiDrawPackages(rows, sel, status, bad, busy.empty() ? L" " : busy, frac, L"");
+            LuiPresent(); Sleep(16);
+            continue;
+        }
+        if (!ask.empty()) {
+            if (pressed & XINPUT_GAMEPAD_A) {
+                Diag("REPO page remove " + askRow.id);
+                ask.clear(); busy = L"Removing " + ghrepo::Widen(askRow.id) + L"\u2026";
+                start(kRemove, askRow.id);
+            } else if (pressed & XINPUT_GAMEPAD_B) { ask.clear(); Diag("REPO page remove cancelled"); }
+            LuiDrawPackages(rows, sel, status, bad, L"", -1, ask);
+            LuiPresent(); Sleep(16);
+            continue;
+        }
+        const int n = (int)rows.size();
+        if ((pressed & XINPUT_GAMEPAD_DPAD_UP) && sel > 0) --sel;
+        if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) && sel < n - 1) ++sel;
+        if (pressed & XINPUT_GAMEPAD_B) { Diag("REPO page closed"); return; }
+        if (pressed & XINPUT_GAMEPAD_Y) { cfg = LuiRepoConfig(); fetch(); }
+        if ((pressed & XINPUT_GAMEPAD_A) && n > 0 && !rows[sel].repo.empty()) {
+            const LuiPkgRow& r = rows[sel];
+            Diag("REPO page install " + r.id + " " + r.repo + (r.inst.empty() ? "" : " (installed " + r.inst + ")"));
+            busy = L"Installing " + ghrepo::Widen(r.name.empty() ? r.id : r.name) + L" " + ghrepo::Widen(r.repo) + L"\u2026";
+            start(kInstall, r.id);
+        }
+        if ((pressed & XINPUT_GAMEPAD_X) && n > 0 && !rows[sel].inst.empty()) {
+            askRow = rows[sel];
+            ask = ghrepo::Widen(askRow.name.empty() ? askRow.id : askRow.name) + L" " + ghrepo::Widen(askRow.inst);
+            Diag("REPO page remove prompt " + askRow.id);
+        }
+        LuiDrawPackages(rows, sel, status, bad, L"", -1, L"");
+        LuiPresent(); Sleep(16);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1831,11 +2559,17 @@ static void OverlayTick()
     // menu
     if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) {
         if (g_ovlSel > 0) g_ovlSel--;
+#ifdef GH_NO_STEAM
+        if (g_ovlSel == 2) g_ovlSel = 1;   // no friends row in this build
+#endif
         g_ovlLastNav = now;
         g_ovlDirty = true;
     }
     if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) {
         if (g_ovlSel < 3) g_ovlSel++;
+#ifdef GH_NO_STEAM
+        if (g_ovlSel == 2) g_ovlSel = 3;
+#endif
         g_ovlLastNav = now;
         g_ovlDirty = true;
     }
@@ -1907,8 +2641,12 @@ static void OverlayPaintMenu(int sel, bool remapOn)
     };
     row(140.f, sel == 0, L"Controller remap", remapOn ? L"ON" : L"OFF", remapOn);
     row(208.f, sel == 1, L"Input settings", nullptr, false);
+#ifdef GH_NO_STEAM
+    row(276.f, sel == 3, L"Return to Greenhouse", nullptr, false);
+#else
     row(276.f, sel == 2, L"Invite friends", nullptr, false);
     row(344.f, sel == 3, L"Return to Greenhouse", nullptr, false);
+#endif
     LuiText(L"A  Select      B  Close",
             g_lui.fmtSmall.get(),
             D2D1::RectF(40, H - 64, W - 40, H - 20), g_lui.brDim.get());
@@ -2813,7 +3551,6 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
     OverlayBakeFriendsNow();
 
     std::vector<LauncherItem> all, items;
-    LauncherDlReq dlreq;
     int sel = 0;
     WORD prev = 0xFFFF;                 // ignore buttons already held on entry
     DWORD lastNav = 0;
@@ -2836,33 +3573,39 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
         matchN = (int)items.size();
         if (items.empty()) {
             LauncherItem it; it.display = L"No matches";
-            it.guest = L"@@none"; it.sub = L"Y search \u00B7 B clear"; items.push_back(it);
+            it.guest = L"@@none"; it.sub = L"Y search \u00B7 B clear";
+            it.kind = LauncherItem::kPlaceholder; items.push_back(it);
         }
         if (sel >= (int)items.size()) sel = (int)items.size() - 1;
         if (sel < 0) sel = 0;
     };
 
-    // (Re)build the item list: the installed/owned library plus any staged gh_download.txt
-    // request as the first item; never empty (an empty list would index items[sel] out of
-    // bounds) -- a non-launchable placeholder keeps the launcher open instead of running the
-    // default guest and exiting. Resets selection + the edge detector. Used at entry and
-    // after a download completes so the freshly-installed game appears.
+    // (Re)build the item list from every library source (LuiEnumerate; the Steam source
+    // puts a staged gh_download.txt request first). Never empty (an empty list would index
+    // items[sel] out of bounds) -- a non-launchable placeholder keeps the launcher open
+    // instead of running the default guest and exiting. Resets selection + the edge
+    // detector. Used at entry and after a download completes so the new game appears.
     auto rebuild = [&]() {
         all = LuiEnumerate();
-        dlreq = LauncherReadDlReq();
-        if (dlreq.ok) {
-            LauncherItem it; it.display = L"⤓  Download: " + std::wstring(dlreq.name.begin(), dlreq.name.end());
-            it.guest = L"@@download"; it.sub = L"from Steam"; all.insert(all.begin(), it);
-        }
         if (all.empty()) {
             LauncherItem it; it.display = L"No games installed";
+            it.kind = LauncherItem::kPlaceholder;
+#ifdef GH_NO_STEAM
+            it.guest = L"@@none"; it.sub = L"add a game on USB"; all.push_back(it);
+#else
             it.guest = L"@@none"; it.sub = L"download or add a game on USB"; all.push_back(it);
+#endif
         }
         sel = 0; prev = 0xFFFF;
         applyFilter();
     };
+    // A short full-screen message, then back to the picker (about 2 s).
+    auto notice = [&](const std::wstring& msg) {
+        for (int i = 0; i < 120; ++i) { LuiDrawStatus(msg); LuiPresent(); Sleep(16); }
+    };
     rebuild();
     Diag("LAUNCHER picker items=" + std::to_string(all.size()));
+    LuiRepoStartupCheck();              // background index check -> "Packages · N update(s)" badge
     for (;;) {
         if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
         PollGamepadOnUi();
@@ -2940,7 +3683,7 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
                 } else {
                     Diag("LAUNCHER verify '" + LuiNarrow(verifyIt.display) +
                          "' app=" + std::to_string(verifyIt.app));
-                    if (verifyIt.app) LauncherRunAppDownload(verifyIt.app, verifyIt.display, true);
+                    if (verifyIt.acq && verifyIt.acq->acquire) verifyIt.acq->acquire(verifyIt, kAcqVerify);
                     verifyAsk = false;
                     rebuild();
                 }
@@ -2984,20 +3727,27 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
                      "' app=" + std::to_string(verifyIt.app));
             }
         }
+        if ((pressed & XINPUT_GAMEPAD_START) && !g_pickOskOpen) {
+            Diag("LAUNCHER packages");
+            LauncherPackages();
+            rebuild();                  // a removed/installed title config changes nothing until restart,
+            continue;                   // but rows are rebuilt so the picker state is fresh
+        }
         if (pressed & XINPUT_GAMEPAD_A) {
             const LauncherItem& it = items[sel];
             Diag("LAUNCHER selected [" + std::to_string(sel) + "] '" + LuiNarrow(it.display) +
                  "' guest='" + LuiNarrow(it.guest) + "' app=" + std::to_string(it.app));
-            if (it.guest == L"@@none") continue;      // placeholder -> stay in the picker
-            if (it.guest == L"@@lib") {
-                // Owned-but-not-installed title: resolve its depots via PICS and download it
-                // straight from the appid, then refresh so it shows as installed & launchable.
-                if (it.app) { LauncherRunAppDownload(it.app, it.display); rebuild(); }
+            if (it.kind == LauncherItem::kPlaceholder) continue;   // stay in the picker
+            if (it.kind == LauncherItem::kAcquire) {
+                // A library source's row for a game not on the console yet (Steam: an
+                // owned title, or a staged gh_download.txt request). Acquire it, then
+                // refresh so it shows as installed and launchable.
+                if (it.acq && it.acq->acquire) { it.acq->acquire(it, kAcqNew); rebuild(); }
                 continue;
             }
-            if (it.guest == L"@@download") {
-                LauncherRunDownload(dlreq);           // pre-staged request; blocks with progress UI
-                rebuild();                            // refresh library (new game appears)
+            if (!it.blocked.empty()) {
+                Diag("LAUNCHER refused '" + LuiNarrow(it.display) + "': " + LuiNarrow(it.blocked));
+                notice(it.display + L" " + it.blocked + L", which this build does not have.");
                 continue;
             }
             // Incomplete install (marker or <64-byte PE): resume instead of launching
@@ -3013,7 +3763,13 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
                     Diag("LAUNCHER resume guest='" + LuiNarrow(it.guest) +
                          "' app=" + std::to_string(it.app) + " incomplete=" +
                          std::to_string((int)it.incomplete) + " sz=" + std::to_string(sz));
-                    if (it.app) { LauncherRunAppDownload(it.app, it.display, false); rebuild(); }
+                    if (it.acq && it.acq->acquire) { it.acq->acquire(it, kAcqResume); rebuild(); }
+                    else {
+                        // No library source can repair this tree (a USB copy, or a build
+                        // with no Steam): say so instead of silently doing nothing.
+                        Diag("LAUNCHER resume: no library source can repair '" + LuiNarrow(it.display) + "'");
+                        notice(it.display + L" is not completely installed. Copy the whole game folder again.");
+                    }
                     continue;
                 }
             }

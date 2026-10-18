@@ -1,0 +1,7 @@
+{
+  "schema": "greenhouse.title/1",
+  "id": "cheeserolling",
+  "name": "Cheese Rolling",
+  "match": { "exe": "CheeseRolling.exe", "steamAppId": 3809440 },
+  "requires": { "loader": "0.0.670.0", "services": ["steam-runtime"] }
+}

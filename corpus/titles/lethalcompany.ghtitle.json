@@ -1,0 +1,7 @@
+{
+  "schema": "greenhouse.title/1",
+  "id": "lethalcompany",
+  "name": "Lethal Company",
+  "match": { "exe": "Lethal Company.exe", "steamAppId": 1966720 },
+  "requires": { "loader": "0.0.670.0", "services": ["steam-runtime"] }
+}

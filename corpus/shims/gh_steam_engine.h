@@ -45,6 +45,8 @@ typedef void* (__cdecl *GhCreateInterfaceFn)(const char* pName, int* pReturnCode
 
 // Well-known anonymous SteamID (Public universe, AnonUser type).
 static const uint64_t kGhAnonSteamID = 0x01A0000000000000ULL;
+// Account type is bits 52-55 of a SteamID64; 10 = k_EAccountTypeAnonUser.
+static inline bool gh_sid_is_anon(uint64_t sid) { return ((sid >> 52) & 0xF) == 10; }
 
 // ---- Bring-up result (published state) -------------------------------------
 static HMODULE     g_gh_engine_dll   = nullptr;
@@ -1870,6 +1872,14 @@ static int gh_steam_engine_login(int waitMs = 60000)
 // waitMs bounds the whole EConnect + LogOn loop.
 static int gh_steam_engine_init(int waitMs = 10000)
 {
+#ifdef GH_NO_STEAM
+    // v1 product build: steamclient64.dll is never loaded. Every caller already
+    // handles -1 (the shim answers offline), exactly as when the DLL is absent.
+    (void)waitMs;
+    if (g_gh_engine_state != -1) GH_ENGINE_LOG("GHENG GH_NO_STEAM build: engine disabled\n");
+    g_gh_engine_state = -1;
+    return -1;
+#endif
     if (g_gh_engine_state == 2) return 0;
     if (g_gh_engine_state == -1) return -1;
     g_gh_engine_state = 1;

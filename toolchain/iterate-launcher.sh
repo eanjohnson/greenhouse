@@ -11,6 +11,14 @@
 #
 # Usage: iterate-launcher.sh <newversion> <oldversion> [loader.cpp]
 #   e.g. iterate-launcher.sh 0.0.1.0 0.0.1.0
+#
+# GH_NO_STEAM=1  v1 product build (design/package-audit.md): no Steam sign-in,
+#                library or downloader in the loader, the shim built engine-less, and
+#                no Valve DLLs or 7za/zstd staged. Own stage dir and MSIX name, so the
+#                dev package is untouched.
+# GH_PACK_ONLY=1 stop after pack + sign: nothing is installed or launched.
+# GH_REPO_DEV_KEY=0  leave the dev repository key (src/loader/gh_repo_devkey.inc) out,
+#                so only release keys verify a package index (default 1 = trust it).
 set -euo pipefail
 NEW="$1"; OLD="$2"
 GH=$HOME/greenhouse
@@ -18,6 +26,17 @@ TMP=$HOME/.claude/jobs/49fb5998/tmp
 SDK="$GH/toolchain/xwin-sdk"; SDKVER=10.0.26100
 FAM="Greenhouse.Launcher_mgw46vk3ppz9w"
 STAGE="$GH/artifacts/msix_stage_launcher"
+NOSTEAM="${GH_NO_STEAM:-0}"
+MSIX="GreenhouseLauncher"
+if [ "$NOSTEAM" = "1" ]; then
+  STAGE="$GH/artifacts/msix_stage_launcher_nosteam"; MSIX="GreenhouseLauncher.nosteam"
+  mkdir -p "$STAGE"
+  # Assets + resources.pri are not built here; take them from the dev stage.
+  [ -d "$STAGE/Assets" ] || cp -r "$GH/artifacts/msix_stage_launcher/Assets" "$STAGE/"
+  [ -f "$STAGE/resources.pri" ] || cp "$GH/artifacts/msix_stage_launcher/resources.pri" "$STAGE/"
+  # Never inherit Steam files from an earlier stage.
+  rm -f "$STAGE/guest/"{steam_api64,steamclient64,tier0_s64,vstdlib_s64}.dll "$STAGE/guest/"{zstd,7za}.exe
+fi
 SRC="${3:-$GH/src/loader/guest_loader.cpp}"
 # downloader (cm_downloader.h) needs winhttp/bcrypt + a zlib inflate subset.
 EXTRALIBS="${EXTRALIBS:-d3d11.lib d3d12.lib dxgi.lib ws2_32.lib d2d1.lib dwrite.lib gdi32.lib user32.lib windowscodecs.lib winhttp.lib bcrypt.lib}"
@@ -30,17 +49,25 @@ if [ ! -f "$ZBUILD/zconf.h" ]; then          # Windows-target zconf.h (drop the 
   cp "$GH/toolchain/msix-packaging-src/.vs/lib/zlib/zconf.h" "$ZBUILD/zconf.h"; sed -i '11d' "$ZBUILD/zconf.h"
 fi
 
-echo "== build launcher loader ($SRC) =="
+# The downloader's decompressors (zlib, zstd, LZMA) and the QR encoder are only
+# linked when Steam is in the build.
+if [ "$NOSTEAM" = "1" ]; then
+  NSDEF="/DGH_NO_STEAM"; DLSRC=()
+else
+  NSDEF=""
+  DLSRC=("$ZLIB/adler32.c" "$ZLIB/crc32.c" "$ZLIB/inflate.c" "$ZLIB/inftrees.c" "$ZLIB/inffast.c" "$ZLIB/zutil.c"
+         "$GH/corpus/downloader/vendor/zstddeclib.c" "$GH/corpus/downloader/vendor/LzmaDec.c"
+         "$GH/corpus/vendor/qrcodegen/qrcodegen.c")
+fi
+[ "${GH_REPO_DEV_KEY:-1}" = "1" ] && NSDEF="$NSDEF /DGH_REPO_DEV_KEY"
+echo "== build launcher loader ($SRC)${NSDEF:+ $NSDEF} =="
 clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \
-  /std:c++20 /EHsc /MT /O2 "/DGH_PKG_FAMILY=\"$FAM\"" /DGH_LAUNCHER $EXTRACL \
+  /std:c++20 /EHsc /MT /O2 "/DGH_PKG_FAMILY=\"$FAM\"" /DGH_LAUNCHER $NSDEF $EXTRACL \
   /I "$GH/corpus/downloader" /I "$GH/corpus/downloader/vendor" /I "$GH/corpus/vendor/qrcodegen" /I "$ZLIB" /I "$ZBUILD" \
   /imsvc "$SDK/crt/include" /imsvc "$SDK/sdk/include/$SDKVER/ucrt" \
   /imsvc "$SDK/sdk/include/$SDKVER/um" /imsvc "$SDK/sdk/include/$SDKVER/shared" \
   /imsvc "$SDK/sdk/include/cppwinrt" \
-  "$SRC" \
-  "$ZLIB/adler32.c" "$ZLIB/crc32.c" "$ZLIB/inflate.c" "$ZLIB/inftrees.c" "$ZLIB/inffast.c" "$ZLIB/zutil.c" \
-  "$GH/corpus/downloader/vendor/zstddeclib.c" "$GH/corpus/downloader/vendor/LzmaDec.c" \
-  "$GH/corpus/vendor/qrcodegen/qrcodegen.c" \
+  "$SRC" "${DLSRC[@]}" \
   -o "$STAGE/p0_spike_host.exe" \
   /link /libpath:"$SDK/crt/lib/x86_64" /libpath:"$SDK/sdk/lib/um/x86_64" /libpath:"$SDK/sdk/lib/ucrt/x86_64" \
         WindowsApp.lib $EXTRALIBS /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup /APPCONTAINER
@@ -60,7 +87,7 @@ cp "$GH/src/host/AppxManifest.launcher.xml" "$STAGE/AppxManifest.xml"
 # Stage decompression tools the in-process downloader shells (zstd VSZa, 7za VZ),
 # resolved by the CreateProcess surrogate from the package guest\ dir.
 mkdir -p "$STAGE/guest"
-cp "$GH/corpus/bin/zstd.exe" "$GH/corpus/bin/7za.exe" "$STAGE/guest/"
+[ "$NOSTEAM" = "1" ] || cp "$GH/corpus/bin/zstd.exe" "$GH/corpus/bin/7za.exe" "$STAGE/guest/"
 
 # Phase C: stage the Steam shim + real steamclient64 engine into the launcher's
 # guest\ dir so the pre-guest on-screen QR login can bring the session up. The
@@ -70,7 +97,7 @@ cp "$GH/corpus/bin/zstd.exe" "$GH/corpus/bin/7za.exe" "$STAGE/guest/"
 echo "== build launcher steam shim ($FAM) =="
 python3 "$TMP/gen_steamdef.py"
 clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \
-  /std:c++20 /EHsc /MT /O2 /LD "/DGH_PKG_FAMILY=\"$FAM\"" \
+  /std:c++20 /EHsc /MT /O2 /LD "/DGH_PKG_FAMILY=\"$FAM\"" $NSDEF \
   /imsvc "$SDK/crt/include" /imsvc "$SDK/sdk/include/$SDKVER/ucrt" \
   /imsvc "$SDK/sdk/include/$SDKVER/um" /imsvc "$SDK/sdk/include/$SDKVER/shared" \
   "$GH/corpus/shims/steam_api64.cpp" \
@@ -83,9 +110,18 @@ rm -f "$STAGE/guest/steam_api64.lib" "$STAGE/guest/steam_api64.exp"   # /LD impo
 # The engine steamclient64.dll imports tier0_s64.dll + vstdlib_s64.dll — stage all three,
 # else LoadLibrary(steamclient64) fails ERROR_MOD_NOT_FOUND (0x7E) on the missing deps.
 ESRC="$GH/artifacts/msix_stage_cheesemp/guest"
+# GH_STEAM_RUNTIME_FETCH=1 (#258): stage none of the three; the console fetches them
+# from Valve's own CDN as the steam-runtime package (GREENHOUSE.md §38).
+RTFETCH="${GH_STEAM_RUNTIME_FETCH:-0}"
+if [ "$RTFETCH" = "1" ]; then
+  echo "== Valve runtime NOT packaged (GH_STEAM_RUNTIME_FETCH=1): the console fetches it =="
+  rm -f "$STAGE/guest/steamclient64.dll" "$STAGE/guest/tier0_s64.dll" "$STAGE/guest/vstdlib_s64.dll"
+fi
+if [ "$NOSTEAM" != "1" ] && [ "$RTFETCH" != "1" ]; then
 for d in steamclient64.dll tier0_s64.dll vstdlib_s64.dll; do
   [ -f "$ESRC/$d" ] && cp "$ESRC/$d" "$STAGE/guest/$d" || echo "WARN: missing engine dep $d"
 done
+fi
 # Unity support stubs. Steam-downloaded games do not ship these; dedicated
 # slots (LethalCo) bake them next to the exe. The launcher is thin, so they
 # live in package guest\ and the loader preloads them from there.
@@ -136,6 +172,22 @@ clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link /MT /O2 /LD \
   || { echo "FATAL: tbs_stub build failed"; exit 1; }
 rm -f "$PSPC/tbs.lib" "$PSPC/tbs.exp"
 cp "$GH/corpus/seed/GhostOfTsushima/hive.txt" "$TSEED/hive.txt" || { echo "FATAL: missing Tsushima hive seed"; exit 1; }
+# Per-title configs (greenhouse.title/1): the loader reads guest\titles\*.ghtitle.json
+# at startup (GhTitles); LocalState\titles\ overrides by id. Checked here so a
+# malformed file fails the build instead of a launch.
+rm -rf "$STAGE/guest/titles"; mkdir -p "$STAGE/guest/titles"
+python3 - "$GH"/corpus/titles/*.ghtitle.json <<'PYEOF' || { echo "FATAL: bad title config"; exit 1; }
+import json, sys
+def nodup(pairs):
+    keys = [k for k, _ in pairs]
+    if len(keys) != len(set(keys)): raise ValueError("duplicate key")
+    return dict(pairs)
+for f in sys.argv[1:]:
+    d = json.load(open(f, encoding="utf-8"), object_pairs_hook=nodup)
+    assert d.get("schema") == "greenhouse.title/1", f + ": schema"
+    print("  title %-18s %s" % (d["id"], f.rsplit("/", 1)[-1]))
+PYEOF
+cp "$GH"/corpus/titles/*.ghtitle.json "$STAGE/guest/titles/"
 # Tsushima's shader corpus (2026-10-06): the reference console's
 # D:\DevelopmentFiles\ghlo, pulled byte-for-byte into corpus/redist/ghlo, with its
 # LocalState gh_tl_ blobs (the lane-solo NonUniform fixes, which win over ghlo
@@ -175,10 +227,21 @@ ls -la "$STAGE/guest/steam_api64.dll" "$STAGE/guest/steamclient64.dll" "$STAGE/g
 
 echo "== pack + sign =="
 LIBDIR="$GH/toolchain/msix-packaging-src/.vs/lib"
-rm -f "$GH/artifacts/GreenhouseLauncher.msix" "$GH/artifacts/GreenhouseLauncher.signed.msix"
-LD_LIBRARY_PATH="$LIBDIR" "$GH/toolchain/bin/makemsix" pack -d "$STAGE" -p "$GH/artifacts/GreenhouseLauncher.msix" >/dev/null
+if [ "$NOSTEAM" = "1" ]; then   # nothing Steam may have slipped into the stage
+  LEAK=$(find "$STAGE" -type f \( -iname 'steamclient64.dll' -o -iname 'tier0_s64.dll' -o -iname 'vstdlib_s64.dll' -o -iname '7za.exe' -o -iname 'zstd.exe' \))
+  [ -z "$LEAK" ] || { echo "FATAL: Steam files in the no-Steam stage: $LEAK"; exit 1; }
+fi
+if [ "$RTFETCH" = "1" ]; then   # the stage is reused between builds: a leftover copy would mask the test
+  LEAK=$(find "$STAGE" -type f \( -iname 'steamclient64.dll' -o -iname 'tier0_s64.dll' -o -iname 'vstdlib_s64.dll' \))
+  [ -z "$LEAK" ] || { echo "FATAL: Valve runtime in a GH_STEAM_RUNTIME_FETCH stage: $LEAK"; exit 1; }
+fi
+rm -f "$GH/artifacts/$MSIX.msix" "$GH/artifacts/$MSIX.signed.msix"
+LD_LIBRARY_PATH="$LIBDIR" "$GH/toolchain/bin/makemsix" pack -d "$STAGE" -p "$GH/artifacts/$MSIX.msix" >/dev/null
 osslsigncode sign -pkcs12 "$GH/toolchain/signing/greenhouse.pfx" -pass "$GH_PFX_PASS" -h sha256 \
-  -in "$GH/artifacts/GreenhouseLauncher.msix" -out "$GH/artifacts/GreenhouseLauncher.signed.msix" 2>&1 | grep -E "Succeeded|Failed"
+  -in "$GH/artifacts/$MSIX.msix" -out "$GH/artifacts/$MSIX.signed.msix" 2>&1 | grep -E "Succeeded|Failed"
+if [ "${GH_PACK_ONLY:-0}" = "1" ]; then
+  ls -l "$GH/artifacts/$MSIX.signed.msix"; echo "GH_PACK_ONLY=1 -- not deploying"; exit 0
+fi
 
 echo "== deploy (separate slot; leaves other slots untouched) =="
 # In-place UPDATE by default (higher version, same identity) so the app's LocalState
@@ -190,7 +253,25 @@ if [ "${GH_CLEAN:-0}" = "1" ]; then
   python3 "$TMP/wdp.py" uninstall "Greenhouse.Launcher_${OLD}_x64__mgw46vk3ppz9w" || true
   sleep 2
 fi
-python3 "$TMP/wdp.py" install "$GH/artifacts/GreenhouseLauncher.signed.msix"
+# A RUNNING Launcher blocks the update: INSTALL still answers 202, nothing ever
+# registers, and the poll below times out (seen twice on 0.0.667/668.0). Stop it
+# first. The stop takes base64 of the PackageFullName -- the family name answers 400.
+python3 - <<PYEOF || true
+import sys, time, base64; sys.path.insert(0, "$TMP")
+import wdp
+st, d = wdp.req('GET', '/api/app/packagemanager/packages')
+cur = [p['PackageFullName'] for p in (d or {}).get('InstalledPackages', []) if p['PackageFullName'].startswith('Greenhouse.Launcher_')]
+for pfn in cur:
+    print("  stop", pfn, "->", wdp.req('DELETE', '/api/taskmanager/app?package=' + base64.b64encode(pfn.encode()).decode())[0])
+for i in range(20):
+    st, d = wdp.req('GET', '/api/resourcemanager/processes')
+    live = [p for p in (d or {}).get('Processes', []) if str(p.get('PackageFullName', '')).startswith('Greenhouse.Launcher_')]
+    if not live: print("  launcher not running"); break
+    time.sleep(2)
+else:
+    print("  WARN: launcher still running after stop:", [p.get('ImageName') for p in live])
+PYEOF
+python3 "$TMP/wdp.py" install "$GH/artifacts/$MSIX.signed.msix"
 PFN="Greenhouse.Launcher_${NEW}_x64__mgw46vk3ppz9w"
 # INSTALL answers 202 "accepted and being processed", never "installed", and a
 # fixed sleep cannot tell a slow registration from a failed one. Poll for the new
@@ -198,7 +279,7 @@ PFN="Greenhouse.Launcher_${NEW}_x64__mgw46vk3ppz9w"
 # whatever version IS registered, so without this a failed update runs the OLD
 # loader and reports success.
 REGISTERED=""
-for i in $(seq 1 100); do   # 300 s: the package carries the 270 MB shader corpus since 0.0.661.0
+for i in $(seq 1 200); do   # 600 s: the package carries the 289 MB shader corpus (0.0.669.0 took >300 s)
   sleep 3
   python3 - <<PYEOF && REGISTERED=1 && break
 import sys; sys.path.insert(0, "$TMP")
@@ -208,7 +289,7 @@ names = [p.get('PackageFullName','') for p in (d or {}).get('InstalledPackages',
 sys.exit(0 if "$PFN" in names else 1)
 PYEOF
 done
-[ -n "$REGISTERED" ] || { echo "FATAL: $PFN never registered after 300s"; exit 1; }
+[ -n "$REGISTERED" ] || { echo "FATAL: $PFN never registered after 600s"; exit 1; }
 CSRF=$(python3 "$TMP/wdp.py" csrf | awk '{print $2}')
 curl -sk -b "$TMP/wdp_cookies.txt" -H "X-CSRF-Token: $CSRF" -H "Content-Length: 0" -X POST \
   "https://${XBOX}/api/debug/dump/usermode/crashcontrol?packageFullName=$PFN" >/dev/null 2>&1 || true

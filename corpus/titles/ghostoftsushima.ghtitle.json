@@ -1,0 +1,35 @@
+{
+  "schema": "greenhouse.title/1",
+  "id": "ghostoftsushima",
+  "name": "Ghost of Tsushima",
+  "match": {
+    "exe": "GhostOfTsushima.exe",
+    "installProbe": "app_2215430\\GhostOfTsushima.exe",
+    "steamAppId": 2215430
+  },
+  "requires": { "loader": "0.0.669.0", "services": [] },
+  "early": {
+    "gh_ddi_sm": 66, "gh_ddi_probe": 1, "gh_scache": 3,
+    "gh_scache_x": 128, "gh_rip_ms": 15000, "gh_pso_cache_hide": 1,
+    "gh_lazy_mb": 1, "gh_lazy_spill_mb": 256, "gh_spill_ring_mb": 256,
+    "gh_spill_stat": 1, "gh_guest_stack_mb": 64, "gh_rawinput": 111,
+    "gh_keepalive": 1, "gh_blackbox": 3
+  },
+  "knobs": {
+    "gh_pspc_trust": 2, "gh_pspc_init": 1, "gh_dxil_maxsm": 65,
+    "gh_fake_sm": 102, "gh_scdxil": 2, "gh_shader_sub": 1,
+    "gh_ds_nogpu": 3, "gh_texlod0": 1, "gh_bufdims": 6,
+    "gh_tbdims": 1, "gh_srvbuf_stride": 52, "gh_rs_bindless": 1,
+    "gh_pso_desc": 1, "gh_pso_faults": 1000, "gh_pso_guard": 2,
+    "gh_pso_log": 16, "gh_pso_standin": 2, "gh_copy_as_direct": 2,
+    "gh_prog_fence": 5, "gh_arena_cap_mb": 2048, "gh_arena_chunk_mb": 64,
+    "gh_arena_lru": 1, "gh_arena_site": 5172690, "gh_drv_commit": 100000,
+    "gh_gpu_page_mb": 256, "gh_gpu_chunk_mb": 64, "gh_gpu_evict_ms": 60000,
+    "gh_gpu_evict_dummy": 1, "gh_gp_defer_free": 2, "gh_gp_keep_uncomp": 1,
+    "gh_wgi_inject": 5, "gh_veh_max": 12, "gh_cl_trace_quiet": 1,
+    "gh_cl_trace_span": 1000, "gh_disp_log": 3000, "gh_disp_log_at": 31000
+  },
+  "psoDeny": ["44c53d006f299116f79ffbbf00f818d3"],
+  "args": " -nolauncher",
+  "seed": "GhostOfTsushima"
+}

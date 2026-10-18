@@ -59,6 +59,9 @@
 #include <map>
 #include <cstdint>
 #include <cstring>
+#include <appmodel.h>   // GetCurrentPackageId: a title config's requires.loader
+#include <algorithm>
+#include "gh_json.h"     // greenhouse.title/1 configs (GhTitles)
 #include <cstdlib>
 #include <cmath>
 #include <cctype>
@@ -831,51 +834,30 @@ static std::wstring g_lastGameDir;  // last launched game dir (survives ResetGue
 // gh_engine_off is deliberately absent. In the Launcher the engine comes up at
 // sign-in, before the picker, so a per-title value cannot reach it; Tsushima
 // runs with the engine up (the #217 cost, 67 MB) unless the file says otherwise.
-struct GhTitleKnob { const wchar_t* file; unsigned value; bool early; };
+// Since Step 1 of the library-source plan (2026-10-18) the tables are DATA, not
+// code: one greenhouse.title/1 JSON file per title, packaged from corpus/titles/
+// into <install>\guest\titles\ and overridable by id from LocalState\titles\
+// (GhTitles(), with the config helpers). The semantics above are unchanged.
+struct GhTitleKnob { std::wstring file; unsigned value; bool early; };
 struct GhTitle {
-    const wchar_t* exe;           // guest exe basename
-    const wchar_t* installProbe;  // under kDevGames: proves the title is installed
-    const GhTitleKnob* knobs; size_t nKnobs;
-    const char* psoDeny;          // gh_pso_deny.txt when that file is absent, or null
-};
-static const GhTitleKnob kTsushimaKnobs[] = {
-    // device-time: read while the Launcher builds its D3D12 device
-    { L"gh_ddi_sm.txt", 66, true },           { L"gh_ddi_probe.txt", 1, true },
-    { L"gh_scache.txt", 3, true },            { L"gh_scache_x.txt", 128, true },
-    { L"gh_rip_ms.txt", 15000, true },
-    // PS PC SDK: trust + init patches (pspc-sdk-in-container)
-    { L"gh_pspc_trust.txt", 2, false },       { L"gh_pspc_init.txt", 1, false },
-    // shaders and pipelines
-    { L"gh_dxil_maxsm.txt", 65, false },      { L"gh_fake_sm.txt", 102, false },
-    { L"gh_scdxil.txt", 2, false },           { L"gh_shader_sub.txt", 1, false },
-    { L"gh_ds_nogpu.txt", 3, false },         { L"gh_texlod0.txt", 1, false },
-    { L"gh_bufdims.txt", 6, false },          { L"gh_tbdims.txt", 1, false },
-    { L"gh_srvbuf_stride.txt", 52, false },   { L"gh_rs_bindless.txt", 1, false },
-    { L"gh_pso_cache_hide.txt", 1, true },   { L"gh_pso_desc.txt", 1, false },
-    { L"gh_pso_faults.txt", 1000, false },    { L"gh_pso_guard.txt", 2, false },
-    { L"gh_pso_log.txt", 16, false },         { L"gh_pso_standin.txt", 2, false },
-    { L"gh_copy_as_direct.txt", 2, false },   { L"gh_prog_fence.txt", 5, false },
-    // memory: arena, demand-commit pager + spill, GPU heap pagefile
-    { L"gh_arena_cap_mb.txt", 2048, false },  { L"gh_arena_chunk_mb.txt", 64, false },
-    { L"gh_arena_lru.txt", 1, false },        { L"gh_arena_site.txt", 5172690, false },
-    { L"gh_lazy_mb.txt", 1, true },           { L"gh_lazy_spill_mb.txt", 256, true },
-    { L"gh_spill_ring_mb.txt", 256, true },  { L"gh_spill_stat.txt", 1, true },
-    { L"gh_drv_commit.txt", 100000, false },  { L"gh_guest_stack_mb.txt", 64, true },
-    { L"gh_gpu_page_mb.txt", 256, false },    { L"gh_gpu_chunk_mb.txt", 64, false },
-    { L"gh_gpu_evict_ms.txt", 60000, false }, { L"gh_gpu_evict_dummy.txt", 1, false },
-    { L"gh_gp_defer_free.txt", 2, false },    { L"gh_gp_keep_uncomp.txt", 1, false },
-    // input
-    { L"gh_rawinput.txt", 111, true },        { L"gh_wgi_inject.txt", 5, false },
-    // crash record and diagnostics the reference console runs with
-    { L"gh_veh_max.txt", 12, false },         { L"gh_keepalive.txt", 1, true },
-    { L"gh_blackbox.txt", 3, true },         { L"gh_cl_trace_quiet.txt", 1, false },
-    { L"gh_cl_trace_span.txt", 1000, false }, { L"gh_disp_log.txt", 3000, false },
-    { L"gh_disp_log_at.txt", 31000, false },
-};
-static const GhTitle kTitles[] = {
-    { L"GhostOfTsushima.exe", L"app_2215430\\GhostOfTsushima.exe",
-      kTsushimaKnobs, sizeof kTsushimaKnobs / sizeof kTsushimaKnobs[0],
-      "44c53d006f299116f79ffbbf00f818d3" },   // tsushima-44c53d00-stays-denied
+    std::string id, name;         // schema id ("ghostoftsushima") and display name
+    std::string from;             // the file it was loaded from, for the log
+    std::wstring exe;             // guest exe basename
+    std::wstring installProbe;    // under kDevGames: proves the title is installed (may be empty)
+    std::wstring seed;            // guest\seed\<seed>\ in the package (default: exe base)
+    std::wstring args;            // appended to the guest command line
+    std::vector<GhTitleKnob> knobs;
+    bool hasPsoDeny = false;      // gh_pso_deny.txt stand-in when that file is absent
+    std::string psoDeny;          // 32-hex keys, one per line
+    unsigned steamAppId = 0;
+    std::vector<std::string> services;   // runtime services the title needs ("steam-runtime")
+    std::wstring SeedName() const
+    {
+        if (!seed.empty()) return seed;
+        std::wstring b = exe;
+        if (b.size() > 4 && _wcsicmp(b.c_str() + b.size() - 4, L".exe") == 0) b.resize(b.size() - 4);
+        return b;
+    }
 };
 static const GhTitle* g_title = nullptr;      // set by GhTitleBegin for each guest, before it runs
 static bool StartsWithNoCase(const std::wstring& s, const std::wstring& pre)
@@ -2093,8 +2075,7 @@ static void RegHiveLoad()
         // Low). The seed is only read; RegHiveSave writes the real file as usual.
         std::wstring seed;
         if (g_title){
-            std::wstring base = g_title->exe;
-            if (base.size() > 4) base.resize(base.size() - 4);
+            const std::wstring base = g_title->SeedName();
             EnsureInstallDir();
             seed = g_installDir + L"guest\\seed\\" + base + L"\\hive.txt";
         }
@@ -8138,9 +8119,9 @@ static bool GhPsoDenied(const void* code, SIZE_T n)
         loaded = true;
         std::vector<uint8_t> f;
         bool have = ReadWholeFile(std::wstring(kLocalState) + L"gh_pso_deny.txt", f, true) && !f.empty();
-        if (!have && g_title && g_title->psoDeny){
+        if (!have && g_title && g_title->hasPsoDeny){
             // The title's play-config list stands in for the absent file.
-            f.assign(g_title->psoDeny, g_title->psoDeny + strlen(g_title->psoDeny));
+            f.assign(g_title->psoDeny.begin(), g_title->psoDeny.end());
             have = true;
             Diag("PSODENY gh_pso_deny.txt absent -- using the title default list");
         }
@@ -36013,22 +35994,229 @@ static bool Bed_crs_start_handler()
 // Deduplicated by file name so a knob read on a hot path cannot flood the log,
 // and Diag is safe to call from here: it reads its own cap inline and never
 // calls back into GhCfgNum.
-// Per-title defaults (see kTitles). Consulted only when the knob's file is absent.
+// Per-title defaults (see GhTitle). Consulted only when the knob's file is absent.
 static SRWLOCK g_titleLk = SRWLOCK_INIT;
 static std::vector<std::wstring>* g_titleEarly = nullptr;   // title knobs read before any title was chosen
 
+static std::wstring GhUtf8ToW(const std::string& s)
+{
+    if (s.empty()) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring w(n > 0 ? (size_t)n : 0, L'\0');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
+    return w;
+}
+
+// "a.b.c.d" -> one comparable number; false if it is not four 16-bit parts.
+static bool GhParseVersion(const std::string& v, uint64_t* out)
+{
+    uint64_t r = 0; int parts = 0; size_t i = 0;
+    while (parts < 4){
+        if (i >= v.size() || v[i] < '0' || v[i] > '9') return false;
+        unsigned long x = 0;
+        while (i < v.size() && v[i] >= '0' && v[i] <= '9'){ x = x * 10 + (unsigned)(v[i] - '0'); if (x > 0xFFFF) return false; ++i; }
+        r = (r << 16) | x; ++parts;
+        if (parts < 4){ if (i >= v.size() || v[i] != '.') return false; ++i; }
+    }
+    if (i != v.size()) return false;
+    *out = r; return true;
+}
+
+// Our own package version, or 0 when the process has no package identity.
+static uint64_t GhOwnPackageVersion()
+{
+    UINT32 len = 0;
+    if (GetCurrentPackageId(&len, nullptr) != ERROR_INSUFFICIENT_BUFFER || !len) return 0;
+    std::vector<BYTE> buf(len);
+    if (GetCurrentPackageId(&len, buf.data()) != ERROR_SUCCESS) return 0;
+    const PACKAGE_VERSION& v = ((const PACKAGE_ID*)buf.data())->version;
+    return ((uint64_t)v.Major << 48) | ((uint64_t)v.Minor << 32) | ((uint64_t)v.Build << 16) | v.Revision;
+}
+
+static bool GhSafeName(const std::string& s, bool allowUpper)
+{
+    if (s.empty() || s.size() > 64 || s == "." || s == "..") return false;
+    for (char c : s)
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.' ||
+              (allowUpper && c >= 'A' && c <= 'Z'))) return false;
+    return true;
+}
+
+// An exe's bare file name: GhSafeName's set plus space, parentheses, '+' and '&'
+// ("Lethal Company.exe"), with no separators, ':' or edge spaces.
+static bool GhSafeFileName(const std::string& s)
+{
+    if (s.empty() || s.size() > 128 || s == "." || s == ".." || s.front() == ' ' || s.back() == ' ') return false;
+    for (char c : s)
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+              c == '-' || c == '.' || c == ' ' || c == '(' || c == ')' || c == '+' || c == '&')) return false;
+    return true;
+}
+
+// One greenhouse.title/1 file -> GhTitle. Returns false with `why` on anything
+// it does not understand in a field it uses; unknown top-level keys are only
+// noted, so a newer file still loads on an older loader where it can.
+static bool GhTitleFromJson(const ghjson::Value& j, GhTitle& t, std::string& why, std::string& notes)
+{
+    using ghjson::Value;
+    if (!j.isObj()){ why = "top level is not an object"; return false; }
+    const Value* v = j.get("schema");
+    if (!v || !v->isStr() || v->s != "greenhouse.title/1"){ why = "schema is not \"greenhouse.title/1\""; return false; }
+    v = j.get("id");
+    if (!v || !v->isStr() || !GhSafeName(v->s, false)){ why = "id missing or not [a-z0-9._-]{1,64}"; return false; }
+    t.id = v->s;
+    if ((v = j.get("name"))){ if (!v->isStr()){ why = "name is not a string"; return false; } t.name = v->s; }
+
+    const Value* m = j.get("match");
+    if (!m || !m->isObj()){ why = "match missing or not an object"; return false; }
+    v = m->get("exe");
+    if (!v || !v->isStr() || !GhSafeFileName(v->s)){ why = "match.exe missing or not a bare file name"; return false; }
+    t.exe = GhUtf8ToW(v->s);
+    if ((v = m->get("installProbe"))){
+        if (!v->isStr() || v->s.empty() || v->s.find("..") != std::string::npos || v->s.find(':') != std::string::npos ||
+            v->s[0] == '\\' || v->s[0] == '/'){ why = "match.installProbe is not a relative path"; return false; }
+        t.installProbe = GhUtf8ToW(v->s);
+    }
+    if ((v = m->get("steamAppId"))){
+        if (!v->isNum() || !v->isInt || v->i < 0 || v->i > 0xFFFFFFFFLL){ why = "match.steamAppId is not a uint32"; return false; }
+        t.steamAppId = (unsigned)v->i;
+    }
+
+    if ((m = j.get("requires"))){
+        if (!m->isObj()){ why = "requires is not an object"; return false; }
+        if ((v = m->get("loader"))){
+            uint64_t need = 0;
+            if (!v->isStr() || !GhParseVersion(v->s, &need)){ why = "requires.loader is not a.b.c.d"; return false; }
+            const uint64_t have = GhOwnPackageVersion();
+            if (have && have < need){ why = "requires loader " + v->s + " (this one is older)"; return false; }
+        }
+        if ((v = m->get("services"))){
+            if (!v->isArr()){ why = "requires.services is not an array"; return false; }
+            for (const Value& e : v->arr){
+                if (!e.isStr() || !GhSafeName(e.s, false)){ why = "requires.services holds a non-name"; return false; }
+                t.services.push_back(e.s);
+            }
+        }
+    }
+
+    for (int pass = 0; pass < 2; ++pass){
+        const char* key = pass ? "knobs" : "early";
+        const Value* o = j.get(key);
+        if (!o) continue;
+        if (!o->isObj()){ why = std::string(key) + " is not an object"; return false; }
+        for (const auto& kv : o->obj){
+            if (!GhSafeName(kv.first, false) || kv.first.rfind("gh_", 0) != 0){ why = std::string(key) + "." + kv.first + ": not a gh_ knob name"; return false; }
+            const Value& x = kv.second;
+            if (!x.isNum() || !x.isInt || x.i < 0 || x.i > 0xFFFFFFFFLL){ why = std::string(key) + "." + kv.first + ": not a uint32"; return false; }
+            std::wstring file = GhUtf8ToW(kv.first);
+            if (file.size() < 4 || _wcsicmp(file.c_str() + file.size() - 4, L".txt") != 0) file += L".txt";
+            for (const GhTitleKnob& k : t.knobs)
+                if (_wcsicmp(k.file.c_str(), file.c_str()) == 0){ why = kv.first + " is listed twice"; return false; }
+            t.knobs.push_back({ file, (unsigned)x.i, pass == 0 });
+        }
+    }
+
+    if ((v = j.get("psoDeny"))){
+        if (!v->isArr()){ why = "psoDeny is not an array"; return false; }
+        t.hasPsoDeny = true;
+        for (const Value& e : v->arr){
+            bool hex = e.isStr() && e.s.size() == 32;
+            if (hex) for (char c : e.s) if (!std::isxdigit((unsigned char)c)) hex = false;
+            if (!hex){ why = "psoDeny holds a non-key (want 32 hex digits)"; return false; }
+            t.psoDeny += e.s; t.psoDeny += '\n';
+        }
+    }
+    if ((v = j.get("args"))){ if (!v->isStr()){ why = "args is not a string"; return false; } t.args = GhUtf8ToW(v->s); }
+    if ((v = j.get("seed"))){
+        if (!v->isStr() || !GhSafeName(v->s, true)){ why = "seed is not a bare folder name"; return false; }
+        t.seed = GhUtf8ToW(v->s);
+    }
+
+    static const char* kKnown[] = { "schema", "id", "name", "match", "requires", "early", "knobs",
+                                    "psoDeny", "args", "seed" };
+    for (const auto& kv : j.obj){
+        bool known = false;
+        for (const char* k : kKnown) if (kv.first == k){ known = true; break; }
+        if (!known) notes += " ignored-key=" + kv.first;
+    }
+    return true;
+}
+
+static void GhTitlesLoadDir(const std::wstring& dir, const char* where, std::vector<GhTitle>& out)
+{
+    WIN32_FIND_DATAW fd;
+    HANDLE f = FindFirstFileW((dir + L"*.ghtitle.json").c_str(), &fd);
+    if (f == INVALID_HANDLE_VALUE){
+        Diag(std::string("TITLE dir ") + where + " " + RegNarrow(dir) + ": no title files");
+        return;
+    }
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        const std::wstring path = dir + fd.cFileName;
+        const std::string pn = std::string(where) + ":" + RegNarrow(fd.cFileName);
+        std::vector<uint8_t> b;
+        if (!ReadWholeFile(path, b, true) || b.empty()){ Diag("TITLE file " + pn + " REJECTED unreadable or empty"); continue; }
+        if (b.size() > (1u << 20)){ Diag("TITLE file " + pn + " REJECTED larger than 1 MiB"); continue; }
+        ghjson::Value j; std::string err;
+        if (!ghjson::Parse((const char*)b.data(), b.size(), j, err)){ Diag("TITLE file " + pn + " REJECTED " + err); continue; }
+        GhTitle t; std::string why, notes;
+        if (!GhTitleFromJson(j, t, why, notes)){ Diag("TITLE file " + pn + " REJECTED " + why); continue; }
+        t.from = pn;
+        size_t nEarly = 0; for (const GhTitleKnob& k : t.knobs) if (k.early) ++nEarly;
+        GhTitle* same = nullptr;
+        for (GhTitle& e : out) if (e.id == t.id){ same = &e; break; }
+        if (!same){
+            for (const GhTitle& e : out)
+                if (_wcsicmp(e.exe.c_str(), t.exe.c_str()) == 0){ why = "exe already claimed by id=" + e.id; break; }
+            if (!why.empty()){ Diag("TITLE file " + pn + " REJECTED " + why); continue; }
+        }
+        Diag("TITLE file " + pn + " id=" + t.id + " exe=" + RegNarrow(t.exe) + " knobs=" +
+             std::to_string(t.knobs.size() - nEarly) + " early=" + std::to_string(nEarly) +
+             " psoDeny=" + (t.hasPsoDeny ? std::to_string(std::count(t.psoDeny.begin(), t.psoDeny.end(), '\n')) : std::string("-")) +
+             (same ? " (overrides " + same->from + ")" : std::string()) + notes);
+        if (same) *same = std::move(t); else out.push_back(std::move(t));
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+}
+
+// The loaded titles, read once on first use -- which is the first early knob
+// read, at Launcher startup, on whatever thread that is. Nothing in here may
+// read a knob (Diag does not), or the first reader would deadlock on itself.
+// The vector is never changed after it is published, so g_title can point into it.
+static const std::vector<GhTitle>& GhTitles()
+{
+    static SRWLOCK lk = SRWLOCK_INIT;
+    static std::vector<GhTitle>* titles = nullptr;
+    AcquireSRWLockShared(&lk);
+    std::vector<GhTitle>* t = titles;
+    ReleaseSRWLockShared(&lk);
+    if (t) return *t;
+    AcquireSRWLockExclusive(&lk);
+    if (!titles){
+        auto* v = new std::vector<GhTitle>();
+        EnsureInstallDir();
+        GhTitlesLoadDir(g_installDir + L"guest\\titles\\", "package", *v);
+        GhTitlesLoadDir(std::wstring(kLocalState) + L"titles\\", "LocalState", *v);
+        Diag("TITLE loaded " + std::to_string(v->size()) + " title config(s)");
+        titles = v;
+    }
+    t = titles;
+    ReleaseSRWLockExclusive(&lk);
+    return *t;
+}
+
 static bool GhTitleInstalled(const GhTitle& t)
 {
+    if (t.installProbe.empty()) return false;
     return GetFileAttributesW((std::wstring(kDevGames) + t.installProbe).c_str()) != INVALID_FILE_ATTRIBUTES;
 }
 
 static bool GhTitleKnobDefault(const wchar_t* file, unsigned* out, const char** src)
 {
     const GhTitle* cur = g_title;
-    for (const GhTitle& t : kTitles){
-        for (size_t i = 0; i < t.nKnobs; ++i){
-            const GhTitleKnob& k = t.knobs[i];
-            if (_wcsicmp(k.file, file) != 0) continue;
+    for (const GhTitle& t : GhTitles()){
+        for (const GhTitleKnob& k : t.knobs){
+            if (_wcsicmp(k.file.c_str(), file) != 0) continue;
             if (cur == &t){ *out = k.value; *src = "title"; return true; }
             if (!cur && k.early && GhTitleInstalled(t)){ *out = k.value; *src = "title/installed"; return true; }
             if (!cur){
@@ -36166,23 +36354,22 @@ static void GhTitleBegin(const std::wstring& exePath)
     size_t s = exePath.find_last_of(L"\\/");
     const std::wstring exe = (s == std::wstring::npos) ? exePath : exePath.substr(s + 1);
     g_title = nullptr;
-    for (const GhTitle& t : kTitles)
-        if (_wcsicmp(t.exe, exe.c_str()) == 0){ g_title = &t; break; }
+    for (const GhTitle& t : GhTitles())
+        if (_wcsicmp(t.exe.c_str(), exe.c_str()) == 0){ g_title = &t; break; }
     if (!g_title){ Diag("TITLE none for " + RegNarrow(exe) + " -- no per-title defaults"); return; }
-    Diag("TITLE " + RegNarrow(exe) + ": " + std::to_string(g_title->nKnobs) +
-         " knob defaults (a LocalState file still wins)");
+    Diag("TITLE " + RegNarrow(exe) + ": " + std::to_string(g_title->knobs.size()) +
+         " knob defaults (a LocalState file still wins) id=" + g_title->id + " from " + g_title->from);
     AcquireSRWLockExclusive(&g_titleLk);
     std::vector<std::wstring> early = g_titleEarly ? *g_titleEarly : std::vector<std::wstring>();
     ReleaseSRWLockExclusive(&g_titleLk);
-    for (size_t i = 0; i < g_title->nKnobs; ++i)
+    for (const GhTitleKnob& k : g_title->knobs)
         for (const std::wstring& e : early)
-            if (_wcsicmp(e.c_str(), g_title->knobs[i].file) == 0)
+            if (_wcsicmp(e.c_str(), k.file.c_str()) == 0)
                 Diag("TITLE late " + RegNarrow(e) + ": read before the game was chosen, so its title default " +
-                     std::to_string(g_title->knobs[i].value) + " does NOT apply this run");
+                     std::to_string(k.value) + " does NOT apply this run");
 
     EnsureInstallDir();
-    std::wstring base = exe;
-    if (base.size() > 4 && _wcsicmp(base.c_str() + base.size() - 4, L".exe") == 0) base.resize(base.size() - 4);
+    const std::wstring base = g_title->SeedName();
     const std::wstring seed = g_installDir + L"guest\\seed\\" + base + L"\\localstate\\";
     if (GetFileAttributesW(seed.c_str()) == INVALID_FILE_ATTRIBUTES){
         Diag("SEED none in the package for " + RegNarrow(base));
@@ -38410,6 +38597,9 @@ static LONG64   g_lazyT0  = 0;
 // never set it: the engine-before-Mono ordering is the whole #134/#139 fix.
 static unsigned GhEngineOff()
 {
+#ifdef GH_NO_STEAM
+    return 1;   // v1 product build: the Valve engine is not shipped and never loaded
+#endif
     static const unsigned v = GhCfgNumZ(L"gh_engine_off.txt", "GH_ENGINE_OFF", 0);
     return v;
 }
@@ -41424,6 +41614,9 @@ static void ReportWhyDllFailed(const char* dll, const std::wstring& full)
     }
 }
 
+#ifdef GH_LAUNCHER
+static std::wstring GhSteamRuntimeFor(const std::wstring& base);   // launcher_ui.h (#258)
+#endif
 static HMODULE LoadGuestDll(const char* dll)
 {
     if (GuestDllDenied(dll)){ SetLastError(ERROR_MOD_NOT_FOUND); return nullptr; }
@@ -41457,6 +41650,20 @@ static HMODULE LoadGuestDll(const char* dll)
     // masks the real load error.
     bool isAbs = (req.size()>=2 && req[1]==L':') || req.rfind(L"\\\\",0)==0;
     std::wstring full = isAbs ? req : (g_guestDir.empty() ? req : g_guestDir + req);
+#ifdef GH_LAUNCHER
+    // #258: the Valve runtime the console fetched from Valve's CDN, once verified,
+    // wins over any copy the package or the game folder carries.
+    {
+        std::wstring base = req;
+        size_t s = base.find_last_of(L"\\/");
+        if (s != std::wstring::npos) base = base.substr(s + 1);
+        std::wstring rt = GhSteamRuntimeFor(base);
+        if (!rt.empty()) {
+            full = rt;
+            Diag("STEAMRT " + RegNarrow(base) + " -> " + RegNarrow(rt));
+        }
+    }
+#endif
     // Honour the \LocalState\ovl\<basename> flat overlay, then the package
     // install root: if the physical guest file is missing, look for the same
     // basename under LocalState first (WDP-writable), then under g_installDir
@@ -45836,21 +46043,18 @@ static BOOL WINAPI Bed_GetExitCodeProcess(HANDLE h, LPDWORD ec)
 //
 // Ghost of Tsushima Director's Cut is the same Nixxes PC port frontend -- it ships
 // the same crs-* crash/video helpers beside the exe -- so it takes the same flag
-// for the same reason. Listed here rather than set through ghcmd.txt because
+// for the same reason. Both flags are the "args" of the title configs
+// (corpus/titles/*.ghtitle.json) rather than set through ghcmd.txt because
 // ghcmd.txt replaces the WHOLE command line, which pins the launcher slot to one
 // title and hands the next game the previous one's argv[0].
 static std::wstring GuestExtraArgs(const std::wstring& exePath)
 {
-    static const struct { const wchar_t* exe; const wchar_t* args; } kExtra[] = {
-        { L"spider-man.exe",       L" -nolauncher" },
-        { L"ghostoftsushima.exe",  L" -nolauncher" },
-    };
     size_t sl = exePath.find_last_of(L"\\/");
     std::wstring base = (sl == std::wstring::npos) ? exePath : exePath.substr(sl + 1);
     for (auto& c : base) if (c >= L'A' && c <= L'Z') c = (wchar_t)(c + 32);
-    for (const auto& e : kExtra){
-        if (base != e.exe) continue;
-        std::wstring args(e.args);
+    for (const GhTitle& t : GhTitles()){
+        if (_wcsicmp(base.c_str(), t.exe.c_str()) != 0 || t.args.empty()) continue;
+        std::wstring args(t.args);
         // #231 (plan Phase 2b): the Nixxes EXE parses "-job-threads N"
         // ("Overriding number of worker threads to %d"). Knob-gated, 0 = absent,
         // so no existing runargs can change the command line by accident.
@@ -47338,16 +47542,20 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
         //    package's guest\ dir where zstd.exe/7za.exe are staged;
         //  - scratch files go in a writable absolute dir (LocalState).
         {
+#ifndef GH_NO_STEAM
             ghdl::g_createProcessW = &Bed_CreateProcessW;
             ghdl::g_createFileW = &Bed_CreateFileW;    // scratch files share the child's VFS view
             ghdl::g_logFn = [](const char* m){ Diag(m); };
             ghdl::g_logBudget = 256;                   // decode failures + library-enumeration diagnostics
+#endif
             wchar_t mb[MAX_PATH]; DWORD mn = GetModuleFileNameW(nullptr, mb, MAX_PATH);
             std::wstring ip(mb, mn); size_t sl = ip.find_last_of(L"\\/");
             if (sl != std::wstring::npos) ip.resize(sl + 1);
             g_guestDir = ip + L"guest\\";              // tools dir for the surrogate
             g_launcherPkgGuest = g_guestDir;
+#ifndef GH_NO_STEAM
             ghdl::g_tempDir = kLocalState;             // writable scratch (absolute)
+#endif
         }
         // Phase C: on-screen Steam QR login BEFORE the picker. Preload the shim from the
         // package guest\ dir (g_guestDir, set above); its LoadLibraryA("steamclient64.dll")
@@ -47382,9 +47590,17 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
                     // the gate that matters; the other one is never reached by a
                     // title the Launcher preloads the shim for.
                     if (GhEngineOff()) {
+#ifdef GH_NO_STEAM
+                        Diag("LAUNCHER steam login SKIPPED (GH_NO_STEAM build) -- "
+                             "this package has no Steam engine");
+                        // The shim stays preloaded: it is what a Steam-bought game's
+                        // steam_api64 import resolves to (offline answers, no engine).
+                        loginStatus = L"offline";
+#else
                         Diag("LAUNCHER steam login SKIPPED (gh_engine_off=1) -- "
                              "the Steam engine is not brought up in this run");
                         loginStatus = L"not signed in · engine off";
+#endif
                     } else if (startQr && g_ghLoginSteamID) {
                         LauncherClearQrUrl();
                         startQr();
