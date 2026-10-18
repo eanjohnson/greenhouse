@@ -52,6 +52,24 @@ typedef struct GhHostApi {
     void (*progress)(const wchar_t* phase, uint64_t done, uint64_t total);
     /* One centered status line, e.g. an error left on screen before returning. */
     void (*status)(const wchar_t* text);
+
+    /* Appended in loader 0.0.677.0 (still ABI 1). The drawing calls below follow the
+     * same rule as progress/status, and are also live inside signIn(). */
+    /* Download screen with a file count, the shape a depot downloader reports:
+     * phase, 0..100, files done/total (ftot 0 = no count), bytes written so far. */
+    void (*progressFiles)(const wchar_t* phase, int percent, int fdone, int ftot, uint64_t bytes);
+    /* The sign-in screen: title (e.g. "Sign in to Steam"), a QR code as a size x size
+     * row-major module matrix (nonzero = dark; NULL = an empty panel while the code
+     * is not ready), a status line and a hint line. The host draws the code itself,
+     * so the add-on needs no graphics. Returns 1 once the user has pressed B to skip
+     * since the previous call, else 0. Call it every few hundred ms while waiting. */
+    int (*signInScreen)(const wchar_t* title, const uint8_t* modules, int size,
+                        const wchar_t* status, const wchar_t* hint);
+    /* Where a title the add-on downloads lives: the folder already holding this app
+     * id, else a new D:\DevelopmentFiles\gh_games\app_<id> (created). Writes the
+     * folder (no trailing backslash) and returns its length, 0 on failure. The
+     * installed-games source finds the folder again by its steam_appid.txt. */
+    uint32_t (*installDir)(uint32_t app, wchar_t* buf, uint32_t cap);
 } GhHostApi;
 
 /* True when the host's struct carries field f (an older host leaves it out). */
@@ -93,7 +111,24 @@ typedef struct GhAddonApi {
     int (*canVerify)(const GhAddonRow* row);
 
     void (*shutdown)(void);           /* optional: process exit */
+
+    /* Appended in loader 0.0.677.0 (still ABI 1): read only when size covers them. */
+    /* Optional. Called once on the UI thread before the picker first shows (in load
+     * order, before any runtime service starts), so an account can be set up while
+     * nothing else holds its session. May block; draws through host->signInScreen,
+     * host->status and host->progress. Writes a short line for the picker header
+     * ("signed in · name", "not signed in") into label and returns nonzero when an
+     * account is signed in. */
+    int (*signIn)(wchar_t* label, uint32_t cap);
+    /* Optional. A row ANOTHER source reported (e.g. a game found on the console) that
+     * this add-on can resume / verify / repair; nonzero = the row's acquire and
+     * canVerify go to this add-on. Asked only for rows no source has claimed yet. */
+    int (*claims)(const GhAddonRow* row);
 } GhAddonApi;
+
+/* True when the add-on's struct carries field f. */
+#define GH_ADDON_HAS(api, f) \
+    ((api)->size >= offsetof(GhAddonApi, f) + sizeof((api)->f) && (api)->f)
 
 /* Return 0 on success. A nonzero return, or out->abi != hostAbi, leaves the add-on unused. */
 typedef int (*GhAddonInitFn)(const GhHostApi* host, uint32_t hostAbi, GhAddonApi* out);

@@ -12,10 +12,11 @@
 # Usage: iterate-launcher.sh <newversion> <oldversion> [loader.cpp]
 #   e.g. iterate-launcher.sh 0.0.1.0 0.0.1.0
 #
-# GH_NO_STEAM=1  v1 product build (design/package-audit.md): no Steam sign-in,
-#                library or downloader in the loader, the shim built engine-less, and
-#                no Valve DLLs or 7za/zstd staged. Own stage dir and MSIX name, so the
-#                dev package is untouched.
+# Steam sign-in, the owned library and the downloader are NOT in the loader in any
+# build (§40): they are the Steam add-on, corpus/addons/steam (build-addon.sh --steam).
+# GH_NO_STEAM=1  v1 product build (design/package-audit.md): the shim built
+#                engine-less and no Valve DLLs staged. Own stage dir and MSIX name, so
+#                the dev package is untouched.
 # GH_PACK_ONLY=1 stop after pack + sign: nothing is installed or launched.
 # GH_REPO_DEV_KEY=0  leave the dev repository key (src/loader/gh_repo_devkey.inc) out,
 #                so only release keys verify a package index (default 1 = trust it).
@@ -38,36 +39,19 @@ if [ "$NOSTEAM" = "1" ]; then
   rm -f "$STAGE/guest/"{steam_api64,steamclient64,tier0_s64,vstdlib_s64}.dll "$STAGE/guest/"{zstd,7za}.exe
 fi
 SRC="${3:-$GH/src/loader/guest_loader.cpp}"
-# downloader (cm_downloader.h) needs winhttp/bcrypt + a zlib inflate subset.
+# winhttp/bcrypt: the package repository client (gh_repo.h).
 EXTRALIBS="${EXTRALIBS:-d3d11.lib d3d12.lib dxgi.lib ws2_32.lib d2d1.lib dwrite.lib gdi32.lib user32.lib windowscodecs.lib winhttp.lib bcrypt.lib}"
 EXTRACL="${EXTRACL:-}"
 XBOX="${GH_XBOX:-192.0.2.12:11443}"
-ZLIB="$GH/toolchain/msix-packaging-src/lib/zlib"
-ZBUILD="$GH/artifacts/zlib_build"
-mkdir -p "$ZBUILD"
-if [ ! -f "$ZBUILD/zconf.h" ]; then          # Windows-target zconf.h (drop the Linux unistd define)
-  cp "$GH/toolchain/msix-packaging-src/.vs/lib/zlib/zconf.h" "$ZBUILD/zconf.h"; sed -i '11d' "$ZBUILD/zconf.h"
-fi
-
-# The downloader's decompressors (zlib, zstd, LZMA) and the QR encoder are only
-# linked when Steam is in the build.
-if [ "$NOSTEAM" = "1" ]; then
-  NSDEF="/DGH_NO_STEAM"; DLSRC=()
-else
-  NSDEF=""
-  DLSRC=("$ZLIB/adler32.c" "$ZLIB/crc32.c" "$ZLIB/inflate.c" "$ZLIB/inftrees.c" "$ZLIB/inffast.c" "$ZLIB/zutil.c"
-         "$GH/corpus/downloader/vendor/zstddeclib.c" "$GH/corpus/downloader/vendor/LzmaDec.c"
-         "$GH/corpus/vendor/qrcodegen/qrcodegen.c")
-fi
+if [ "$NOSTEAM" = "1" ]; then NSDEF="/DGH_NO_STEAM"; else NSDEF=""; fi
 [ "${GH_REPO_DEV_KEY:-1}" = "1" ] && NSDEF="$NSDEF /DGH_REPO_DEV_KEY"
 echo "== build launcher loader ($SRC)${NSDEF:+ $NSDEF} =="
 clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \
   /std:c++20 /EHsc /MT /O2 "/DGH_PKG_FAMILY=\"$FAM\"" /DGH_LAUNCHER $NSDEF $EXTRACL \
-  /I "$GH/corpus/downloader" /I "$GH/corpus/downloader/vendor" /I "$GH/corpus/vendor/qrcodegen" /I "$ZLIB" /I "$ZBUILD" \
   /imsvc "$SDK/crt/include" /imsvc "$SDK/sdk/include/$SDKVER/ucrt" \
   /imsvc "$SDK/sdk/include/$SDKVER/um" /imsvc "$SDK/sdk/include/$SDKVER/shared" \
   /imsvc "$SDK/sdk/include/cppwinrt" \
-  "$SRC" "${DLSRC[@]}" \
+  "$SRC" \
   -o "$STAGE/p0_spike_host.exe" \
   /link /libpath:"$SDK/crt/lib/x86_64" /libpath:"$SDK/sdk/lib/um/x86_64" /libpath:"$SDK/sdk/lib/ucrt/x86_64" \
         WindowsApp.lib $EXTRALIBS /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup /APPCONTAINER
@@ -84,10 +68,9 @@ sed -i "s/Version=\"$MANOLD\"/Version=\"$NEW\"/" "$MANL"
 grep -q "Version=\"$NEW\"" "$MANL" || { echo "FATAL: manifest bump to $NEW did not take"; exit 1; }
 cp "$GH/src/host/AppxManifest.launcher.xml" "$STAGE/AppxManifest.xml"
 
-# Stage decompression tools the in-process downloader shells (zstd VSZa, 7za VZ),
-# resolved by the CreateProcess surrogate from the package guest\ dir.
+# The downloader decodes in-process inside the Steam add-on; no zstd/7za are staged.
 mkdir -p "$STAGE/guest"
-[ "$NOSTEAM" = "1" ] || cp "$GH/corpus/bin/zstd.exe" "$GH/corpus/bin/7za.exe" "$STAGE/guest/"
+rm -f "$STAGE/guest/zstd.exe" "$STAGE/guest/7za.exe"
 
 # Phase C: stage the Steam shim + real steamclient64 engine into the launcher's
 # guest\ dir so the pre-guest on-screen QR login can bring the session up. The

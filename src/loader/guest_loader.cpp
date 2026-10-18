@@ -47535,37 +47535,25 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
         // the ghguest.txt read in RunGuest. If the bridge/D2D can't init, the picker
         // returns empty and we fall through to the default guest.
         try { BuildBridgeOnUi(); } catch (...) { Diag("LAUNCHER bridge build threw"); }
-        // Wire the in-process downloader (cm_downloader.h) to the loader's world:
-        //  - decompress children (zstd/7za) run via the in-process CreateProcess
-        //    surrogate, not the container-blocked real API;
-        //  - the surrogate resolves child exes from g_guestDir, so point it at the
-        //    package's guest\ dir where zstd.exe/7za.exe are staged;
-        //  - scratch files go in a writable absolute dir (LocalState).
+        // The package's guest\ dir: where the shim is staged and where the in-process
+        // CreateProcess surrogate resolves child exes from.
         {
-#ifndef GH_NO_STEAM
-            ghdl::g_createProcessW = &Bed_CreateProcessW;
-            ghdl::g_createFileW = &Bed_CreateFileW;    // scratch files share the child's VFS view
-            ghdl::g_logFn = [](const char* m){ Diag(m); };
-            ghdl::g_logBudget = 256;                   // decode failures + library-enumeration diagnostics
-#endif
             wchar_t mb[MAX_PATH]; DWORD mn = GetModuleFileNameW(nullptr, mb, MAX_PATH);
             std::wstring ip(mb, mn); size_t sl = ip.find_last_of(L"\\/");
             if (sl != std::wstring::npos) ip.resize(sl + 1);
-            g_guestDir = ip + L"guest\\";              // tools dir for the surrogate
+            g_guestDir = ip + L"guest\\";
             g_launcherPkgGuest = g_guestDir;
-#ifndef GH_NO_STEAM
-            ghdl::g_tempDir = kLocalState;             // writable scratch (absolute)
-#endif
         }
-        // Phase C: on-screen Steam QR login BEFORE the picker. Preload the shim from the
-        // package guest\ dir (g_guestDir, set above); its LoadLibraryA("steamclient64.dll")
-        // routes through LoadGuestDll -> g_guestDir, so staging steam_api64.dll +
-        // steamclient64.dll there is all that's needed. If the shim/engine isn't staged in
-        // this slot the preload fails gracefully, the login hooks stay null, LauncherSteamLogin
-        // is a no-op, and the launched game logs in itself exactly as before Phase C.
-        std::wstring loginStatus = L"not signed in · guest login";
+        // §40: sign-in BEFORE the picker belongs to the add-ons. The Steam add-on shows
+        // its QR (over its own CM connection, no engine), writes gh_cred.txt and caches
+        // the owned library while it holds the account's only session. Then the shim is
+        // preloaded from the package guest\ dir (g_guestDir, set above); its
+        // LoadLibraryA("steamclient64.dll") routes through LoadGuestDll. The engine is
+        // started only when an installed source provides the "steam-runtime" service
+        // and a sign-in is saved, and it signs in from that file with no scan of its own.
         Diag(std::string("LOCALSTATE ") + (g_localStateFromEnv ? "env " : "FALLBACK ") +
              std::string(kLocalState, kLocalState + wcslen(kLocalState)));
+        std::wstring loginStatus = LauncherAddonsSignIn();
         {
             std::wstring lsh = g_guestDir + L"steam_api64.dll";
             std::wstring ov  = std::wstring(kLocalState) + L"ovl\\steam_api64.dll";
@@ -47579,10 +47567,6 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
                     g_ghLoginDone    = (bool(*)())GetProcAddress(lstm, "GhLoginDone");
                     auto startQr     = (void(*)())GetProcAddress(lstm, "GhStartQrLoginAsync");
                     GhResolveOverlayExports(lstm);
-                    // Enumerate the owned library from the cached token FIRST, BEFORE the engine
-                    // logs in — so our CM connection is the account's SOLE session (a second
-                    // concurrent session for the same account is not serviced for Player.* calls).
-                    LauncherFetchLibrary();
                     // #217: the engine comes up HERE for Tsushima, not at the
                     // GH_LOADER_ENGINE_FIRST site -- the login path is what pulls
                     // steamclient64 (and with it tier0_s64/vstdlib_s64) into the
@@ -47601,12 +47585,18 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
                              "the Steam engine is not brought up in this run");
                         loginStatus = L"not signed in · engine off";
 #endif
+                    } else if (!LuiServiceProvided("steam-runtime")) {
+                        Diag("LAUNCHER steam engine not started -- no installed source provides "
+                             "steam-runtime (install the Steam add-on)");
+                    } else if (GetFileAttributesW((std::wstring(kLocalState) + L"gh_cred.txt").c_str())
+                               == INVALID_FILE_ATTRIBUTES) {
+                        Diag("LAUNCHER steam engine login skipped -- not signed in");
                     } else if (startQr && g_ghLoginSteamID) {
-                        LauncherClearQrUrl();
+                        DeleteFileW((std::wstring(kLocalState) + L"gh_qr_url.txt").c_str());
                         startQr();
-                        uint64_t sid = LauncherSteamLogin(/*timeoutSec=*/600);   // up to 10 min to scan
-                        loginStatus = sid ? (L"signed in · " + std::to_wstring(sid)) : L"not signed in · skipped";
-                    } else Diag("LAUNCHER steam login exports missing — skipping screen");
+                        if (!LauncherEngineWait(/*timeoutSec=*/90))
+                            loginStatus += L" · Steam offline";
+                    } else Diag("LAUNCHER steam login exports missing — engine not started");
                 }
             } else Diag("LAUNCHER steam shim not staged — skipping on-screen login");
         }
