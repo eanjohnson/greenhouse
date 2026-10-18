@@ -38595,12 +38595,20 @@ static LONG64   g_lazyT0  = 0;
 // disable the engine for every older runargs in the tree (the gh_lazy_shim_lie
 // lesson). Titles that DO need Steam -- Cheese, Lethal Company, REPO -- must
 // never set it: the engine-before-Mono ordering is the whole #134/#139 fix.
+//
+// #261: in the Launcher the engine is also off -- returned as 2 -- whenever no
+// installed source provides "steam-runtime" (the Steam add-on). That replaced the
+// compile-time GH_NO_STEAM build: one Launcher binary, Steam present only when the
+// add-on is. Default-deny: the flag is set true only after the sources are loaded.
+#ifdef GH_LAUNCHER
+static std::atomic<bool> g_ghSteamRuntimeProvided{false};
+#endif
 static unsigned GhEngineOff()
 {
-#ifdef GH_NO_STEAM
-    return 1;   // v1 product build: the Valve engine is not shipped and never loaded
-#endif
     static const unsigned v = GhCfgNumZ(L"gh_engine_off.txt", "GH_ENGINE_OFF", 0);
+#ifdef GH_LAUNCHER
+    if (!v && !g_ghSteamRuntimeProvided.load()) return 2;
+#endif
     return v;
 }
 
@@ -41500,10 +41508,12 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
 // name, so denying the one module keeps all three out of the process.
 static bool GhEngineDenied(const char* base)
 {
-    if (!GhEngineOff()) return false;
+    const unsigned off = GhEngineOff();
+    if (!off) return false;
     if (0 != _stricmp(base, "steamclient64.dll")) return false;
-    Diag("ENGINEOFF refusing steamclient64.dll (gh_engine_off=1) -- "
-         "the Steam client engine is not brought up in this run");
+    Diag(off == 2 ? "ENGINEOFF refusing steamclient64.dll -- no installed source provides steam-runtime"
+                  : "ENGINEOFF refusing steamclient64.dll (gh_engine_off=1) -- "
+                    "the Steam client engine is not brought up in this run");
     return true;
 }
 
@@ -47547,17 +47557,25 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
         // §40: sign-in BEFORE the picker belongs to the add-ons. The Steam add-on shows
         // its QR (over its own CM connection, no engine), writes gh_cred.txt and caches
         // the owned library while it holds the account's only session. Then the shim is
-        // preloaded from the package guest\ dir (g_guestDir, set above); its
-        // LoadLibraryA("steamclient64.dll") routes through LoadGuestDll. The engine is
-        // started only when an installed source provides the "steam-runtime" service
-        // and a sign-in is saved, and it signs in from that file with no scan of its own.
+        // preloaded; its LoadLibraryA("steamclient64.dll") routes through LoadGuestDll.
+        // #261: the package's guest\ dir (g_guestDir, set above) carries only the INERT
+        // shim (offline answers, no engine); the engine-enabled one is a file of the add-on
+        // that provides "steam-runtime", hash-checked like its addon.dll. The engine is
+        // started only when that service is provided and a sign-in is saved, and it signs
+        // in from that file with no scan of its own.
         Diag(std::string("LOCALSTATE ") + (g_localStateFromEnv ? "env " : "FALLBACK ") +
              std::string(kLocalState, kLocalState + wcslen(kLocalState)));
         std::wstring loginStatus = LauncherAddonsSignIn();
+        g_ghSteamRuntimeProvided = LuiServiceProvided("steam-runtime");
         {
             std::wstring lsh = g_guestDir + L"steam_api64.dll";
+            if (g_ghSteamRuntimeProvided) {
+                std::wstring as = LuiServiceFile("steam-runtime", L"steam_api64.dll");
+                if (!as.empty()) lsh = as;
+            }
             std::wstring ov  = std::wstring(kLocalState) + L"ovl\\steam_api64.dll";
             if (GetFileAttributesW(ov.c_str()) != INVALID_FILE_ATTRIBUTES) lsh = ov;   // overlay iteration
+            Diag("LAUNCHER steam shim " + ghrepo::Narrow(lsh));
             if (GetFileAttributesW(lsh.c_str()) != INVALID_FILE_ATTRIBUTES) {
                 HMODULE lstm = LoadLibraryExW(lsh.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
                 Diag(std::string("LAUNCHER steam shim preload stm=") + Hex((uintptr_t)lstm));
@@ -47573,21 +47591,16 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
                     // process, before the picker and long before the guest. This is
                     // the gate that matters; the other one is never reached by a
                     // title the Launcher preloads the shim for.
-                    if (GhEngineOff()) {
-#ifdef GH_NO_STEAM
-                        Diag("LAUNCHER steam login SKIPPED (GH_NO_STEAM build) -- "
-                             "this package has no Steam engine");
+                    if (!g_ghSteamRuntimeProvided) {
                         // The shim stays preloaded: it is what a Steam-bought game's
                         // steam_api64 import resolves to (offline answers, no engine).
-                        loginStatus = L"offline";
-#else
+                        Diag("LAUNCHER steam engine not started -- no installed source provides "
+                             "steam-runtime (install the Steam add-on)");
+                        if (g_luiAddonN == 0) loginStatus = L"offline";
+                    } else if (GhEngineOff()) {
                         Diag("LAUNCHER steam login SKIPPED (gh_engine_off=1) -- "
                              "the Steam engine is not brought up in this run");
                         loginStatus = L"not signed in · engine off";
-#endif
-                    } else if (!LuiServiceProvided("steam-runtime")) {
-                        Diag("LAUNCHER steam engine not started -- no installed source provides "
-                             "steam-runtime (install the Steam add-on)");
                     } else if (GetFileAttributesW((std::wstring(kLocalState) + L"gh_cred.txt").c_str())
                                == INVALID_FILE_ATTRIBUTES) {
                         Diag("LAUNCHER steam engine login skipped -- not signed in");

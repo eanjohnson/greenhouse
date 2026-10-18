@@ -218,7 +218,7 @@ static const char* gh_cred_path() {
 }
 
 void gh_shim_save_credentials(const char* account, unsigned long long steamid, const char* token) {
-#ifdef GH_NO_STEAM
+#ifdef GH_SHIM_INERT
     (void)account; (void)steamid; (void)token; return;   // no Steam login in this build
 #endif
     if (!account || !*account || !token || !*token || !steamid) return;
@@ -240,7 +240,7 @@ void gh_shim_save_credentials(const char* account, unsigned long long steamid, c
 // straight into the caller's buffer for immediate hand-off to SetLoginToken; the caller must scrub it.
 bool gh_shim_load_credentials(char* acctOut, size_t acctSz, unsigned long long* sidOut,
                               char* tokOut, size_t tokSz) {
-#ifdef GH_NO_STEAM
+#ifdef GH_SHIM_INERT
     (void)acctSz; (void)tokSz; return false;
 #endif
     if (!acctOut || !sidOut || !tokOut) return false;
@@ -278,7 +278,7 @@ bool gh_shim_load_credentials(char* acctOut, size_t acctSz, unsigned long long* 
 }
 
 void gh_shim_clear_credentials() {
-#ifdef GH_NO_STEAM
+#ifdef GH_SHIM_INERT
     return;
 #endif
     DeleteFileA(gh_cred_path());

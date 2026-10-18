@@ -368,6 +368,31 @@ static int CanVerify(const GhAddonRow* row) { return row && row->app && row->kin
 // verifies through Steam.
 static int Claims(const GhAddonRow* row) { return row && row->app; }
 
+// The Packages page's Sign out (the user chose it and confirmed). Forgets the
+// saved sign-in and the owned-library cache; the next start shows the QR screen.
+static uint32_t Account(wchar_t* buf, uint32_t cap)
+{
+    if (!buf || !cap) return 0;
+    Cred c;
+    if (!CredRead(c)) return 0;
+    Scrub(c.token);
+    int n = MultiByteToWideChar(CP_UTF8, 0, c.account.c_str(), (int)c.account.size(), buf, (int)cap - 1);
+    if (n < 0) n = 0;
+    buf[n] = 0;
+    return (uint32_t)n;
+}
+
+static int SignOut()
+{
+    const bool cred = DeleteFileW((g_ls + L"gh_cred.txt").c_str()) != 0;
+    const DWORD ce = cred ? 0 : GetLastError();
+    const bool owned = DeleteFileW((g_ls + L"gh_owned.txt").c_str()) != 0;
+    { std::lock_guard<std::mutex> lk(g_ownedLk); g_owned.clear(); }
+    Log(std::string("sign-out (user): gh_cred.txt ") + (cred ? "deleted" : "not deleted err=" + std::to_string(ce)) +
+        ", gh_owned.txt " + (owned ? "deleted" : "absent"));
+    return cred || ce == ERROR_FILE_NOT_FOUND;
+}
+
 static void Shutdown() {}
 
 extern "C" __declspec(dllexport) int GhAddonInit(const GhHostApi* host, uint32_t hostAbi, GhAddonApi* out)
@@ -393,6 +418,10 @@ extern "C" __declspec(dllexport) int GhAddonInit(const GhHostApi* host, uint32_t
     if (out->size >= offsetof(GhAddonApi, claims) + sizeof(out->claims)) {
         out->signIn = SignIn;
         out->claims = Claims;
+    }
+    if (out->size >= offsetof(GhAddonApi, signOut) + sizeof(out->signOut)) {
+        out->account = Account;
+        out->signOut = SignOut;
     }
     Log(std::string("GhAddonInit ok (host ") + (GH_HOST_HAS(host, signInScreen) ? "has" : "LACKS") + " signInScreen)");
     return 0;

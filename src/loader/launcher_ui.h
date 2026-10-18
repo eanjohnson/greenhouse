@@ -32,8 +32,9 @@
 #include <winrt/windows.ui.viewmanagement.core.h>
 // Steam sign-in, the owned library and the depot downloader live in the Steam
 // add-on (corpus/addons/steam, GREENHOUSE.md §40), not here: this file carries no
-// Steam client code in any build. GH_NO_STEAM (v1 product build) still drops the
-// engine side -- the shim's friends/invites in the overlay -- below.
+// Steam client code. Whether the engine side exists at all -- the shim's friends and
+// invites in the overlay, Verify -- is decided at run time by whether an installed
+// source provides "steam-runtime" (#261; it replaced the GH_NO_STEAM build).
 #include "gh_repo.h"         // package repository client (Step 3): Packages page, update check
 #include "gh_addon_abi.h"    // add-on DLL ABI (Step 4): an installed add-on is one more library source
 // Packages startup check (LuiRepoStartupCheck): -2 not started, -1 no repository /
@@ -87,14 +88,15 @@ static int      (*g_ghAcceptInvite)() = nullptr;
 static int      (*g_ghDeclineInvite)() = nullptr;
 static int      (*g_ghConsumeOpenInviteDialog)(unsigned long long*) = nullptr;
 
+// False until the sources are loaded and one provides "steam-runtime" (the flag
+// lives beside GhEngineOff in guest_loader.cpp). No engine, no friends or invites.
+static bool GhSteamRuntimeProvided() { return g_ghSteamRuntimeProvided.load(); }
+
 static void GhResolveOverlayExports(HMODULE stm)
 {
-#ifdef GH_NO_STEAM
     // No engine, so no friends or invites: leave every hook null and the overlay
-    // says "Friends list unavailable".
-    (void)stm; return;
-#endif
-    if (!stm) return;
+    // drops its "Invite friends" row.
+    if (!stm || !GhSteamRuntimeProvided()) return;
     g_ghFriendCount = (int(*)())GetProcAddress(stm, "GhFriendCount");
     g_ghFriendAt    = (int(*)(int, unsigned long long*, char*, int, int*))GetProcAddress(stm, "GhFriendAt");
     g_ghPrimeFriends = (int(*)())GetProcAddress(stm, "GhPrimeFriends");
@@ -685,19 +687,14 @@ static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const s
         IDWriteTextFormat* fs = g_lui.fmtSmall.get();
         ID2D1Brush* dim = g_lui.brDim.get();
         const wchar_t* left = L"\u25B2 \u25BC  Move      \u25C0 \u25B6  Jump 5      A  Launch      X  Uninstall      ";
-#ifdef GH_NO_STEAM
-        (void)cy;   // no Verify (it re-downloads from Steam), so no View glyph
-        const wchar_t* right = L"Y  Search      B  Back";
+        // Verify re-downloads through a source that offers it (the Steam add-on), so
+        // the View glyph is shown only when one does.
+        const bool verify = GhSteamRuntimeProvided();
+        const wchar_t* right = verify ? L"  Verify      Y  Search      B  Back" : L"Y  Search      B  Back";
         float wl = LuiMeasure(left, fs);
         LuiText(left, fs, D2D1::RectF(x, y0, x + wl + 2.f, y1), dim);
         x += wl;
-#else
-        const wchar_t* right = L"  Verify      Y  Search      B  Back";
-        float wl = LuiMeasure(left, fs);
-        LuiText(left, fs, D2D1::RectF(x, y0, x + wl + 2.f, y1), dim);
-        x += wl;
-        x += LuiDrawViewBtn(x, cy, dim);
-#endif
+        if (verify) x += LuiDrawViewBtn(x, cy, dim);
         LuiText(right, fs, D2D1::RectF(x, y0, W - 80.f, y1), dim);
     }
 
@@ -942,7 +939,7 @@ static void LuiSrcInstalledScan(std::vector<LauncherItem>& out, const std::wstri
         it.guest = gameDir + sub + L"\\" + exe;   // absolute
         it.app   = app;
         it.source = "installed";
-        // No library name (signed out, or GH_NO_STEAM) and no title config: the exe's
+        // No library name (signed out, or no Steam add-on) and no title config: the exe's
         // own name ("GhostOfTsushima") reads better than the scratch folder ("app_2215430").
         it.display = LuiRowName(it);
         if (it.display.empty()) it.display = sub;
@@ -1345,6 +1342,37 @@ static bool LuiServiceProvided(const std::string& service)
     return false;
 }
 
+// #261: a file of the add-on that provides `service` (the Steam add-on's engine-
+// enabled steam_api64.dll), checked against the sha256 installed.json recorded at
+// install, as addon.dll is. Empty when there is none, it does not match, or the
+// record predates per-file hashes (loader 0.0.679.0): the caller keeps the
+// package's inert copy and the engine stays down.
+static std::wstring LuiServiceFile(const std::string& service, const wchar_t* file)
+{
+    size_t n = 0; LuiSources(n);
+    for (int k = 0; k < g_luiAddonN; ++k) {
+        const LuiAddon& a = g_luiAddons[k];
+        if (!a.api.service || service != a.api.service) continue;
+        const std::string name = ghrepo::Narrow(file);
+        ghrepo::State st = ghrepo::LoadState(LuiRepoConfig().stateDir);
+        const ghrepo::Installed* p = ghrepo::FindInstalled(st, a.pkg);
+        const std::string want = p ? ghrepo::InstalledSha(*p, name) : std::string();
+        if (want.empty()) { Diag("ADDON " + a.pkg + " has no recorded " + name + " -- not used"); return std::wstring(); }
+        std::vector<uint8_t> b;
+        const std::wstring path = a.dir + file;
+        const std::string h = ReadWholeFile(path, b, true) && !b.empty()
+                            ? ghrepo::Sha256Hex(b.data(), b.size()) : std::string("missing");
+        if (h != want) {
+            Diag("ADDON " + a.pkg + " " + name + " REFUSED sha256=" + h.substr(0, 16) +
+                 " is not the installed " + want.substr(0, 16));
+            return std::wstring();
+        }
+        Diag("ADDON " + a.pkg + " " + name + " verified sha256=" + h.substr(0, 16));
+        return path;
+    }
+    return std::wstring();
+}
+
 static std::wstring LuiServiceLabel(const std::string& service)
 {
     if (service == "steam-runtime") return L"Steam";
@@ -1520,11 +1548,24 @@ static void LuiRepoStartupCheck()
     }).detach();
 }
 
-struct LuiPkgRow { std::string id, type, name, inst, repo; uint64_t instV = 0, repoV = 0; };
+struct LuiPkgRow {
+    std::string id, type, name, inst, repo; uint64_t instV = 0, repoV = 0;
+    int addon = -1;          // g_luiAddons index of this package's loaded add-on when it can sign out
+    std::wstring account;    // the account its saved sign-in belongs to (empty = none saved)
+};
+
+// #262: the add-on loaded from package `id` that offers Sign out, or -1.
+static int LuiAddonSignOutFor(const std::string& id)
+{
+    for (int k = 0; k < g_luiAddonN; ++k)
+        if (g_luiAddons[k].pkg == id && GH_ADDON_HAS(&g_luiAddons[k].api, signOut) &&
+            GH_ADDON_HAS(&g_luiAddons[k].api, account)) return k;
+    return -1;
+}
 
 static void LuiDrawPackages(const std::vector<LuiPkgRow>& rows, int sel, const std::wstring& status,
                             bool statusBad, const std::wstring& busy, double frac,
-                            const std::wstring& askRemove)
+                            const std::wstring& ask, bool askSignOut = false)
 {
     auto* dc = g_lui.dc.get();
     const float W = (float)g_lui.w, H = (float)g_lui.h;
@@ -1552,6 +1593,7 @@ static void LuiDrawPackages(const std::vector<LuiPkgRow>& rows, int sel, const s
         else if (r.inst.empty())       sub = L"available " + ghrepo::Widen(r.repo);
         else if (r.repoV > r.instV)    sub = L"update " + ghrepo::Widen(r.inst) + L" \u2192 " + ghrepo::Widen(r.repo);
         else                           sub = L"installed " + ghrepo::Widen(r.inst);
+        if (!r.account.empty()) sub = L"signed in \u00B7 " + r.account + L"   " + sub;
         LuiText(name.c_str(), g_lui.fmtItem.get(), D2D1::RectF(x0 + 28, y, x1 - 420, y + rowH - 12), g_lui.brFg.get());
         LuiText(sub.c_str(), g_lui.fmtSmall.get(), D2D1::RectF(x1 - 460, y, x1 - 24, y + rowH - 12),
                 cur ? g_lui.brFg.get() : g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
@@ -1559,21 +1601,28 @@ static void LuiDrawPackages(const std::vector<LuiPkgRow>& rows, int sel, const s
     if (rows.empty() && busy.empty())
         LuiText(L"No packages", g_lui.fmtItem.get(), D2D1::RectF(x0, top, x1, top + 60), g_lui.brDim.get(),
                 DWRITE_TEXT_ALIGNMENT_CENTER);
-    LuiText(L"A  Install / update      X  Remove      Y  Refresh      B  Back", g_lui.fmtSmall.get(),
+    const bool canSignOut = sel >= 0 && sel < total && rows[sel].addon >= 0 && !rows[sel].account.empty();
+    LuiText(canSignOut ? L"A  Install / update      X  Remove      Y  Refresh      \u2261  Sign out      B  Back"
+                       : L"A  Install / update      X  Remove      Y  Refresh      B  Back", g_lui.fmtSmall.get(),
             D2D1::RectF(84, H - 70, W - 80, H - 30), g_lui.brDim.get());
 
-    if (!busy.empty() || !askRemove.empty()) {
+    if (!busy.empty() || !ask.empty()) {
         dc->FillRectangle(D2D1::RectF(0, 0, W, H), g_lui.brBg.get());
         const float cx = W * 0.5f, cy = H * 0.5f;
         dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 460, cy - 160, cx + 460, cy + 160), 16, 16),
                                  g_lui.brPanel.get());
-        if (!askRemove.empty()) {
-            LuiText(L"REMOVE", g_lui.fmtTitle.get(), D2D1::RectF(cx - 430, cy - 140, cx + 430, cy - 60),
-                    g_lui.brWarn.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-            LuiText(askRemove.c_str(), g_lui.fmtItem.get(), D2D1::RectF(cx - 430, cy - 40, cx + 430, cy + 20),
+        if (!ask.empty()) {
+            LuiText(askSignOut ? L"SIGN OUT" : L"REMOVE", g_lui.fmtTitle.get(),
+                    D2D1::RectF(cx - 430, cy - 140, cx + 430, cy - 60), g_lui.brWarn.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            LuiText(ask.c_str(), g_lui.fmtItem.get(), D2D1::RectF(cx - 430, cy - 40, cx + 430, cy + 20),
                     g_lui.brAccent.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-            LuiText(L"A  Yes, remove            B  Cancel", g_lui.fmtSmall.get(),
-                    D2D1::RectF(cx - 430, cy + 70, cx + 430, cy + 130), g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            if (askSignOut)
+                LuiText(L"Greenhouse forgets this sign-in. The next time it starts, scan a QR code to sign in again.",
+                        g_lui.fmtSmall.get(), D2D1::RectF(cx - 430, cy + 20, cx + 430, cy + 64), g_lui.brDim.get(),
+                        DWRITE_TEXT_ALIGNMENT_CENTER);
+            LuiText(askSignOut ? L"A  Yes, sign out            B  Cancel" : L"A  Yes, remove            B  Cancel",
+                    g_lui.fmtSmall.get(), D2D1::RectF(cx - 430, cy + 70, cx + 430, cy + 130), g_lui.brFg.get(),
+                    DWRITE_TEXT_ALIGNMENT_CENTER);
         } else {
             LuiText(busy.c_str(), g_lui.fmtItem.get(), D2D1::RectF(cx - 430, cy - 110, cx + 430, cy - 40),
                     g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -1606,7 +1655,7 @@ static void LauncherPackages()
     bool haveIdx = false;
     ghrepo::Index idx;
     std::wstring status, busy, ask;
-    bool bad = false;
+    bool bad = false, askSignOut = false;
     std::vector<LuiPkgRow> rows;
     int sel = 0;
     WORD prev = 0xFFFF;
@@ -1627,6 +1676,13 @@ static void LauncherPackages()
             if (listed) continue;
             LuiPkgRow r; r.id = p.id; r.type = p.type; r.inst = p.version; r.instV = p.ver;
             rows.push_back(r);
+        }
+        for (auto& r : rows) {   // #262: who is signed in, for the row and the Sign out button
+            r.addon = r.inst.empty() ? -1 : LuiAddonSignOutFor(r.id);
+            if (r.addon < 0) continue;
+            wchar_t acct[128] = {};
+            const uint32_t n = g_luiAddons[r.addon].api.account(acct, 128);
+            if (n && n < 128) r.account.assign(acct, n);
         }
         if (sel >= (int)rows.size()) sel = (int)rows.size() - 1;
         if (sel < 0) sel = 0;
@@ -1699,6 +1755,24 @@ static void LauncherPackages()
             LuiPresent(); Sleep(16);
             continue;
         }
+        if (!ask.empty() && askSignOut) {
+            // #262: the only place gh_cred.txt is ever deleted on purpose -- the user
+            // pressed Menu on the add-on's row and then A on this prompt.
+            if (pressed & XINPUT_GAMEPAD_A) {
+                const int k = LuiAddonSignOutFor(askRow.id);
+                const int rc = k >= 0 ? g_luiAddons[k].api.signOut() : 0;
+                Diag("REPO page sign-out " + askRow.id + " (user confirmed) -> " + std::to_string(rc));
+                bad = !rc;
+                status = rc ? L"Signed out of " + ghrepo::Widen(askRow.name.empty() ? askRow.id : askRow.name) +
+                                  L" \u00B7 sign in again the next time Greenhouse starts"
+                            : L"Sign out failed (see the log)";
+                ask.clear(); askSignOut = false;
+                buildRows();
+            } else if (pressed & XINPUT_GAMEPAD_B) { ask.clear(); askSignOut = false; Diag("REPO page sign-out cancelled"); }
+            LuiDrawPackages(rows, sel, status, bad, L"", -1, ask, true);
+            LuiPresent(); Sleep(16);
+            continue;
+        }
         if (!ask.empty()) {
             if (pressed & XINPUT_GAMEPAD_A) {
                 Diag("REPO page remove " + askRow.id);
@@ -1724,6 +1798,11 @@ static void LauncherPackages()
             askRow = rows[sel];
             ask = ghrepo::Widen(askRow.name.empty() ? askRow.id : askRow.name) + L" " + ghrepo::Widen(askRow.inst);
             Diag("REPO page remove prompt " + askRow.id);
+        }
+        if ((pressed & XINPUT_GAMEPAD_START) && n > 0 && rows[sel].addon >= 0 && !rows[sel].account.empty()) {
+            askRow = rows[sel]; askSignOut = true;
+            ask = (askRow.name.empty() ? ghrepo::Widen(askRow.id) : ghrepo::Widen(askRow.name)) + L" \u00B7 " + askRow.account;
+            Diag("REPO page sign-out prompt " + askRow.id);
         }
         LuiDrawPackages(rows, sel, status, bad, L"", -1, L"");
         LuiPresent(); Sleep(16);
@@ -2331,17 +2410,13 @@ static void OverlayTick()
     // menu
     if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) {
         if (g_ovlSel > 0) g_ovlSel--;
-#ifdef GH_NO_STEAM
-        if (g_ovlSel == 2) g_ovlSel = 1;   // no friends row in this build
-#endif
+        if (g_ovlSel == 2 && !GhSteamRuntimeProvided()) g_ovlSel = 1;   // no friends row without Steam
         g_ovlLastNav = now;
         g_ovlDirty = true;
     }
     if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) {
         if (g_ovlSel < 3) g_ovlSel++;
-#ifdef GH_NO_STEAM
-        if (g_ovlSel == 2) g_ovlSel = 3;
-#endif
+        if (g_ovlSel == 2 && !GhSteamRuntimeProvided()) g_ovlSel = 3;
         g_ovlLastNav = now;
         g_ovlDirty = true;
     }
@@ -2413,12 +2488,10 @@ static void OverlayPaintMenu(int sel, bool remapOn)
     };
     row(140.f, sel == 0, L"Controller remap", remapOn ? L"ON" : L"OFF", remapOn);
     row(208.f, sel == 1, L"Input settings", nullptr, false);
-#ifdef GH_NO_STEAM
-    row(276.f, sel == 3, L"Return to Greenhouse", nullptr, false);
-#else
-    row(276.f, sel == 2, L"Invite friends", nullptr, false);
-    row(344.f, sel == 3, L"Return to Greenhouse", nullptr, false);
-#endif
+    if (GhSteamRuntimeProvided()) {
+        row(276.f, sel == 2, L"Invite friends", nullptr, false);
+        row(344.f, sel == 3, L"Return to Greenhouse", nullptr, false);
+    } else row(276.f, sel == 3, L"Return to Greenhouse", nullptr, false);
     LuiText(L"A  Select      B  Close",
             g_lui.fmtSmall.get(),
             D2D1::RectF(40, H - 64, W - 40, H - 20), g_lui.brDim.get());
@@ -3362,11 +3435,9 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
         if (all.empty()) {
             LauncherItem it; it.display = L"No games installed";
             it.kind = LauncherItem::kPlaceholder;
-#ifdef GH_NO_STEAM
-            it.guest = L"@@none"; it.sub = L"add a game on USB"; all.push_back(it);
-#else
-            it.guest = L"@@none"; it.sub = L"download or add a game on USB"; all.push_back(it);
-#endif
+            it.guest = L"@@none";
+            it.sub = GhSteamRuntimeProvided() ? L"download or add a game on USB" : L"add a game on USB";
+            all.push_back(it);
         }
         sel = 0; prev = 0xFFFF;
         applyFilter();

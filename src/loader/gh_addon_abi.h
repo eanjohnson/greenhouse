@@ -124,6 +124,15 @@ typedef struct GhAddonApi {
      * this add-on can resume / verify / repair; nonzero = the row's acquire and
      * canVerify go to this add-on. Asked only for rows no source has claimed yet. */
     int (*claims)(const GhAddonRow* row);
+
+    /* Appended in loader 0.0.679.0 (still ABI 1): read only when size covers them. */
+    /* Optional. The account a saved sign-in belongs to, for the Sign out prompt:
+     * writes its display name into buf and returns the length; 0 = nothing saved. */
+    uint32_t (*account)(wchar_t* buf, uint32_t cap);
+    /* Optional. Forget the saved sign-in. The host calls it ONLY after the user chose
+     * Sign out and confirmed it; whatever is already running keeps this session, and
+     * the next start asks the user to sign in again. Nonzero = forgotten. */
+    int (*signOut)(void);
 } GhAddonApi;
 
 /* True when the add-on's struct carries field f. */

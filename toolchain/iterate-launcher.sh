@@ -14,9 +14,13 @@
 #
 # Steam sign-in, the owned library and the downloader are NOT in the loader in any
 # build (§40): they are the Steam add-on, corpus/addons/steam (build-addon.sh --steam).
-# GH_NO_STEAM=1  v1 product build (design/package-audit.md): the shim built
-#                engine-less and no Valve DLLs staged. Own stage dir and MSIX name, so
-#                the dev package is untouched.
+# One package for everyone (#261, replaced the GH_NO_STEAM build): it carries the INERT
+# steam_api64 shim only (offline answers, no engine). The engine-enabled shim is built
+# here too, into artifacts/addon_steam/, and ships as a file of the Steam add-on package
+# (ghpkg.py add ... addon.dll steam_api64.dll); the Launcher uses it only while that
+# add-on is installed.
+# GH_STEAM_RUNTIME_FETCH=0  dev only: also stage the three Valve DLLs in the package
+#                (default 1: none are packaged; the console fetches them, §38).
 # GH_PACK_ONLY=1 stop after pack + sign: nothing is installed or launched.
 # GH_REPO_DEV_KEY=0  leave the dev repository key (src/loader/gh_repo_devkey.inc) out,
 #                so only release keys verify a package index (default 1 = trust it).
@@ -27,24 +31,15 @@ TMP=$HOME/.claude/jobs/49fb5998/tmp
 SDK="$GH/toolchain/xwin-sdk"; SDKVER=10.0.26100
 FAM="Greenhouse.Launcher_mgw46vk3ppz9w"
 STAGE="$GH/artifacts/msix_stage_launcher"
-NOSTEAM="${GH_NO_STEAM:-0}"
+[ -z "${GH_NO_STEAM:-}" ] || { echo "GH_NO_STEAM is retired (#261): every build is the no-Steam package; Steam is the add-on"; exit 1; }
 MSIX="GreenhouseLauncher"
-if [ "$NOSTEAM" = "1" ]; then
-  STAGE="$GH/artifacts/msix_stage_launcher_nosteam"; MSIX="GreenhouseLauncher.nosteam"
-  mkdir -p "$STAGE"
-  # Assets + resources.pri are not built here; take them from the dev stage.
-  [ -d "$STAGE/Assets" ] || cp -r "$GH/artifacts/msix_stage_launcher/Assets" "$STAGE/"
-  [ -f "$STAGE/resources.pri" ] || cp "$GH/artifacts/msix_stage_launcher/resources.pri" "$STAGE/"
-  # Never inherit Steam files from an earlier stage.
-  rm -f "$STAGE/guest/"{steam_api64,steamclient64,tier0_s64,vstdlib_s64}.dll "$STAGE/guest/"{zstd,7za}.exe
-fi
 SRC="${3:-$GH/src/loader/guest_loader.cpp}"
 # winhttp/bcrypt: the package repository client (gh_repo.h).
 EXTRALIBS="${EXTRALIBS:-d3d11.lib d3d12.lib dxgi.lib ws2_32.lib d2d1.lib dwrite.lib gdi32.lib user32.lib windowscodecs.lib winhttp.lib bcrypt.lib}"
 EXTRACL="${EXTRACL:-}"
 XBOX="${GH_XBOX:-192.0.2.12:11443}"
-if [ "$NOSTEAM" = "1" ]; then NSDEF="/DGH_NO_STEAM"; else NSDEF=""; fi
-[ "${GH_REPO_DEV_KEY:-1}" = "1" ] && NSDEF="$NSDEF /DGH_REPO_DEV_KEY"
+NSDEF=""
+[ "${GH_REPO_DEV_KEY:-1}" = "1" ] && NSDEF="/DGH_REPO_DEV_KEY"
 echo "== build launcher loader ($SRC)${NSDEF:+ $NSDEF} =="
 clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \
   /std:c++20 /EHsc /MT /O2 "/DGH_PKG_FAMILY=\"$FAM\"" /DGH_LAUNCHER $NSDEF $EXTRACL \
@@ -72,35 +67,42 @@ cp "$GH/src/host/AppxManifest.launcher.xml" "$STAGE/AppxManifest.xml"
 mkdir -p "$STAGE/guest"
 rm -f "$STAGE/guest/zstd.exe" "$STAGE/guest/7za.exe"
 
-# Phase C: stage the Steam shim + real steamclient64 engine into the launcher's
-# guest\ dir so the pre-guest on-screen QR login can bring the session up. The
-# shim resolves its LocalState paths from GH_PKG_FAMILY, so build it with THIS
-# slot's family (else it writes gh_qr_url.txt into another package's LocalState
-# and the launcher never sees the challenge URL). Engine copied from a game slot.
-echo "== build launcher steam shim ($FAM) =="
+# The steam_api64 shim, twice. Both resolve their LocalState paths from
+# GH_PKG_FAMILY, so both are built with THIS slot's family. The package's guest\
+# copy is INERT (GH_SHIM_INERT): it is what a Steam-bought game's import resolves
+# to when the Steam add-on is not installed. The engine-enabled copy goes to
+# artifacts/addon_steam/ for the Steam add-on package (#261).
 python3 "$TMP/gen_steamdef.py"
-clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \
-  /std:c++20 /EHsc /MT /O2 /LD "/DGH_PKG_FAMILY=\"$FAM\"" $NSDEF \
-  /imsvc "$SDK/crt/include" /imsvc "$SDK/sdk/include/$SDKVER/ucrt" \
-  /imsvc "$SDK/sdk/include/$SDKVER/um" /imsvc "$SDK/sdk/include/$SDKVER/shared" \
-  "$GH/corpus/shims/steam_api64.cpp" \
-  -o "$STAGE/guest/steam_api64.dll" \
-  /link /libpath:"$SDK/crt/lib/x86_64" /libpath:"$SDK/sdk/lib/um/x86_64" /libpath:"$SDK/sdk/lib/ucrt/x86_64" \
-        "/DEF:$GH/corpus/shims/steam_api64.def" \
-        kernel32.lib libcmt.lib libvcruntime.lib libucrt.lib \
-        /DLL /ENTRY:_DllMainCRTStartup
-rm -f "$STAGE/guest/steam_api64.lib" "$STAGE/guest/steam_api64.exp"   # /LD import-lib byproducts
+mkdir -p "$GH/artifacts/addon_steam"
+build_shim() {   # $1 = output dll, $2 = extra define (or empty)
+  clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \
+    /std:c++20 /EHsc /MT /O2 /LD "/DGH_PKG_FAMILY=\"$FAM\"" $2 \
+    /imsvc "$SDK/crt/include" /imsvc "$SDK/sdk/include/$SDKVER/ucrt" \
+    /imsvc "$SDK/sdk/include/$SDKVER/um" /imsvc "$SDK/sdk/include/$SDKVER/shared" \
+    "$GH/corpus/shims/steam_api64.cpp" \
+    -o "$1" \
+    /link /libpath:"$SDK/crt/lib/x86_64" /libpath:"$SDK/sdk/lib/um/x86_64" /libpath:"$SDK/sdk/lib/ucrt/x86_64" \
+          "/DEF:$GH/corpus/shims/steam_api64.def" \
+          kernel32.lib libcmt.lib libvcruntime.lib libucrt.lib \
+          /DLL /ENTRY:_DllMainCRTStartup
+  rm -f "${1%.dll}.lib" "${1%.dll}.exp"   # /LD import-lib byproducts
+}
+echo "== build launcher steam shim, inert ($FAM) =="
+build_shim "$STAGE/guest/steam_api64.dll" /DGH_SHIM_INERT
+echo "== build Steam add-on steam shim, engine ($FAM) =="
+build_shim "$GH/artifacts/addon_steam/steam_api64.dll" ""
+sha256sum "$GH/artifacts/addon_steam/steam_api64.dll"
 # The engine steamclient64.dll imports tier0_s64.dll + vstdlib_s64.dll — stage all three,
 # else LoadLibrary(steamclient64) fails ERROR_MOD_NOT_FOUND (0x7E) on the missing deps.
 ESRC="$GH/artifacts/msix_stage_cheesemp/guest"
 # GH_STEAM_RUNTIME_FETCH=1 (#258): stage none of the three; the console fetches them
 # from Valve's own CDN as the steam-runtime package (GREENHOUSE.md §38).
-RTFETCH="${GH_STEAM_RUNTIME_FETCH:-0}"
+RTFETCH="${GH_STEAM_RUNTIME_FETCH:-1}"
 if [ "$RTFETCH" = "1" ]; then
   echo "== Valve runtime NOT packaged (GH_STEAM_RUNTIME_FETCH=1): the console fetches it =="
   rm -f "$STAGE/guest/steamclient64.dll" "$STAGE/guest/tier0_s64.dll" "$STAGE/guest/vstdlib_s64.dll"
 fi
-if [ "$NOSTEAM" != "1" ] && [ "$RTFETCH" != "1" ]; then
+if [ "$RTFETCH" != "1" ]; then
 for d in steamclient64.dll tier0_s64.dll vstdlib_s64.dll; do
   [ -f "$ESRC/$d" ] && cp "$ESRC/$d" "$STAGE/guest/$d" || echo "WARN: missing engine dep $d"
 done
@@ -210,10 +212,6 @@ ls -la "$STAGE/guest/steam_api64.dll" "$STAGE/guest/steamclient64.dll" "$STAGE/g
 
 echo "== pack + sign =="
 LIBDIR="$GH/toolchain/msix-packaging-src/.vs/lib"
-if [ "$NOSTEAM" = "1" ]; then   # nothing Steam may have slipped into the stage
-  LEAK=$(find "$STAGE" -type f \( -iname 'steamclient64.dll' -o -iname 'tier0_s64.dll' -o -iname 'vstdlib_s64.dll' -o -iname '7za.exe' -o -iname 'zstd.exe' \))
-  [ -z "$LEAK" ] || { echo "FATAL: Steam files in the no-Steam stage: $LEAK"; exit 1; }
-fi
 if [ "$RTFETCH" = "1" ]; then   # the stage is reused between builds: a leftover copy would mask the test
   LEAK=$(find "$STAGE" -type f \( -iname 'steamclient64.dll' -o -iname 'tier0_s64.dll' -o -iname 'vstdlib_s64.dll' \))
   [ -z "$LEAK" ] || { echo "FATAL: Valve runtime in a GH_STEAM_RUNTIME_FETCH stage: $LEAK"; exit 1; }

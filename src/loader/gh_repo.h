@@ -472,7 +472,18 @@ struct Installed {
     std::vector<std::wstring> files;   // title: each file; add-on: its version folder
     uint64_t ver = 0;
     std::string entrySha256;           // add-on: sha256 of its addon.dll (gh_addon_abi.h), else empty
+    // add-on: sha256 of every file by package path, so the loader can check one it
+    // loads itself (the Steam add-on's steam_api64.dll) the way it checks addon.dll.
+    // Empty in records written before loader 0.0.679.0.
+    std::vector<std::pair<std::string, std::string>> sha;
 };
+
+// The recorded sha256 of an add-on file, or empty.
+inline std::string InstalledSha(const Installed& p, const std::string& path)
+{
+    for (const auto& e : p.sha) if (_stricmp(e.first.c_str(), path.c_str()) == 0) return e.second;
+    return std::string();
+}
 struct State { int64_t serial = 0; std::vector<Installed> pkgs; };
 
 inline std::string JsonEsc(const std::string& s)
@@ -538,6 +549,8 @@ inline State LoadState(const std::wstring& stateDir)
                 for (const auto& f : fs->arr) if (f.isStr()) in.files.push_back(Widen(f.s));
             std::string es;
             if (StrMember(e, "entrySha256", es, false, why) && IsHex(es, 64)) in.entrySha256 = es;
+            if (const ghjson::Value* hs = e.get("sha256")) if (hs->isObj())
+                for (const auto& m : hs->obj) if (m.second.isStr() && IsHex(m.second.s, 64)) in.sha.push_back({m.first, m.second.s});
             s.pkgs.push_back(std::move(in));
         }
     return s;
@@ -552,7 +565,14 @@ inline bool SaveState(const std::wstring& stateDir, const State& s)
         o += (i ? ",\n    " : "\n    ");
         o += "{\"id\": \"" + JsonEsc(p.id) + "\", \"type\": \"" + JsonEsc(p.type) + "\", \"version\": \"" +
              JsonEsc(p.version) + "\"" +
-             (p.entrySha256.empty() ? std::string() : ", \"entrySha256\": \"" + p.entrySha256 + "\"") + ", \"files\": [";
+             (p.entrySha256.empty() ? std::string() : ", \"entrySha256\": \"" + p.entrySha256 + "\"");
+        if (!p.sha.empty()){
+            o += ", \"sha256\": {";
+            for (size_t k = 0; k < p.sha.size(); ++k)
+                o += (k ? ", \"" : "\"") + JsonEsc(p.sha[k].first) + "\": \"" + p.sha[k].second + "\"";
+            o += "}";
+        }
+        o += ", \"files\": [";
         for (size_t k = 0; k < p.files.size(); ++k) o += (k ? ", \"" : "\"") + JsonEsc(Narrow(p.files[k])) + "\"";
         o += "]}";
     }
@@ -753,7 +773,10 @@ inline bool Install(const Config& c, const Index& idx, const std::string& id, st
     const Installed* old = FindInstalled(st, m.id);   // points into st.pkgs: not valid once st.pkgs is replaced below
     const std::string wasVer = old ? " (was " + old->version + ")" : std::string();
     Installed rec; rec.id = m.id; rec.type = m.type; rec.version = m.version; rec.ver = m.ver;
-    if (!title) for (const auto& f : m.files) if (f.path == "addon.dll") rec.entrySha256 = f.sha256;
+    if (!title) for (const auto& f : m.files){
+        if (f.path == "addon.dll") rec.entrySha256 = f.sha256;
+        rec.sha.push_back({f.path, f.sha256});
+    }
     if (title){
         for (auto& mv : moves){
             if (!MoveFileExW(mv.first.c_str(), mv.second.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)){

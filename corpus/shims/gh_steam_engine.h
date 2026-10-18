@@ -1872,11 +1872,12 @@ static int gh_steam_engine_login(int waitMs = 60000)
 // waitMs bounds the whole EConnect + LogOn loop.
 static int gh_steam_engine_init(int waitMs = 10000)
 {
-#ifdef GH_NO_STEAM
-    // v1 product build: steamclient64.dll is never loaded. Every caller already
-    // handles -1 (the shim answers offline), exactly as when the DLL is absent.
+#ifdef GH_SHIM_INERT
+    // The inert shim the Launcher package carries (#261): steamclient64.dll is never
+    // loaded. Every caller already handles -1 (the shim answers offline), exactly as
+    // when the DLL is absent. The engine-enabled build ships in the Steam add-on.
     (void)waitMs;
-    if (g_gh_engine_state != -1) GH_ENGINE_LOG("GHENG GH_NO_STEAM build: engine disabled\n");
+    if (g_gh_engine_state != -1) GH_ENGINE_LOG("GHENG inert shim: engine disabled\n");
     g_gh_engine_state = -1;
     return -1;
 #endif
