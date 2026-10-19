@@ -2297,7 +2297,20 @@ static int __cdecl Bed_GetBootstrapperVersion()
 static bool __cdecl Bed_IsCheckingForUpdates()   { return false; }
 static void __cdecl Bed_StartCheckingForUpdates(){}
 static void __cdecl Bed_ForceUpdateNextRestart() {}
-static void* __cdecl Bed_GetClientBootstrapMetrics(){ return nullptr; }
+// #267: steamclient (99f840 in 10.41) calls this as fn(NULL, 0, &cb), then allocates cb bytes
+// and calls fn(buf, cb, &cb) again. The old zero-arg stub never wrote cb, so the size was an
+// uninitialised stack slot: usually small, but once a CUser pointer's low dword (1.6-1.9 GB),
+// and with the container nearly full tier0 died "OUT OF MEMORY!" -> _ExitOnFatalAssert.
+// Report no metrics: cb = 0 takes steamclient's own skip branch.
+static bool __cdecl Bed_GetClientBootstrapMetrics(void* buf, uint32_t cb, uint32_t* pcbRequired)
+{
+    static volatile LONG once = 0;
+    if (pcbRequired) *pcbRequired = 0;
+    if (!InterlockedExchange(&once, 1))
+        Diag("BOOTSTRAP GetClientBootstrapMetrics buf=" + Hex((uintptr_t)buf) + " cb=" +
+             std::to_string(cb) + " -> 0 bytes");
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // Self-mapped guest DLLs (#146).
