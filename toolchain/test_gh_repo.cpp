@@ -67,6 +67,14 @@ static void Unit(const std::string& url)
         "{\"schema\":\"greenhouse.package/1\",\"id\":\"a\",\"type\":\"addon\",\"version\":\"1.0.0.0\",\"files\":[{\"path\":\"x\",\"size\":-1,\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}]}",
     };
     for (const char* s : badMan){ CHECK(!ParseManifest(s, strlen(s), m, why)); printf("  refused manifest: %s\n", why.c_str()); }
+    const char* badMan2[] = {
+        // §44: keyed needs a members-only add-on; a title's files are configs or seed/<Name>/...
+        "{\"schema\":\"greenhouse.package/1\",\"id\":\"a\",\"type\":\"addon\",\"version\":\"1.0.0.0\",\"keyed\":true,\"files\":[{\"path\":\"p.ghpak\",\"size\":1,\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}]}",
+        "{\"schema\":\"greenhouse.package/1\",\"id\":\"a\",\"type\":\"title\",\"version\":\"1.0.0.0\",\"entitlement\":\"member\",\"keyed\":true,\"files\":[{\"path\":\"a.ghtitle.json\",\"size\":1,\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}]}",
+        "{\"schema\":\"greenhouse.package/1\",\"id\":\"a\",\"type\":\"title\",\"version\":\"1.0.0.0\",\"files\":[{\"path\":\"seed/hive.txt\",\"size\":1,\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}]}",
+        "{\"schema\":\"greenhouse.package/1\",\"id\":\"a\",\"type\":\"title\",\"version\":\"1.0.0.0\",\"files\":[{\"path\":\"seed/X/../../a.dll\",\"size\":1,\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}]}",
+    };
+    for (const char* s : badMan2){ CHECK(!ParseManifest(s, strlen(s), m, why)); printf("  refused manifest: %s\n", why.c_str()); }
 
     // Signature over the live test index: good, one flipped byte, unknown key, garbage.
     std::vector<uint8_t> ib, sb; std::string sigUrl;
@@ -83,6 +91,8 @@ static void Unit(const std::string& url)
     CHECK(!VerifyIndexSig(ib, s3, why)); printf("  unknown key: %s\n", why.c_str());
     CHECK(!VerifyIndexSig(ib, "nonsense", why));
 }
+
+static int g_keyCalls = 0;
 
 int main(int argc, char** argv)
 {
@@ -165,6 +175,26 @@ int main(int argc, char** argv)
             CHECK(!Exists(dir + L".part"));
             if (ok) CHECK(done == total);
         }
+    }
+    else if (mode == "keyed"){
+        // §44: a keyed corpus add-on and a title package with a seed.
+        ghrepo::Index idx;
+        CHECK(ghrepo::FetchIndex(c, idx, why));
+        bool autoSeen = false;
+        for (const auto& p : idx.packages) if (p.id == "corpus-t") autoSeen = p.autoInstall;
+        CHECK(autoSeen);
+        const std::wstring dir = c.addonRoot + L"corpus-t\\1.0.0.0";
+        CHECK(!ghrepo::Install(c, idx, "corpus-t", why)); printf("  no key hook: %s\n", why.c_str());
+        CHECK(!Exists(dir) && !Exists(dir + L".part"));
+        c.packageKey = [](const std::string& pkg, const std::string& v, std::string& w){ ++g_keyCalls; w = "membership locked"; return false; };
+        CHECK(!ghrepo::Install(c, idx, "corpus-t", why)); printf("  key refused: %s\n", why.c_str());
+        CHECK(g_keyCalls == 1 && !Exists(dir) && !Exists(dir + L".part"));
+        c.packageKey = [](const std::string& pkg, const std::string& v, std::string& w){ ++g_keyCalls; return pkg == "corpus-t" && v == "1.0.0.0"; };
+        CHECK(ghrepo::Install(c, idx, "corpus-t", why));
+        CHECK(g_keyCalls == 2 && Exists(dir + L"\\pack00.ghpak"));
+        CHECK(ghrepo::Install(c, idx, "ghostoftsushima", why));
+        CHECK(Exists(c.titleDir + L"ghostoftsushima.ghtitle.json"));
+        CHECK(Exists(c.titleDir + L"seed\\GhostOfTsushima\\hive.txt"));
     }
     else if (mode == "rollback"){
         ghrepo::Index idx;

@@ -46,7 +46,9 @@ def explicit_names(text):
         tag = 'f%d_' % (k // 2)
         blocks = set(re.findall(r'^;\s*<label>:(\d+)', body, re.M))
         blocks |= set(re.findall(r'\blabel %(\d+)\b', body))
-        for phi in re.findall(r'^\s*%\w+ = phi [^\n]*$', body, re.M):
+        # A phi's own name may carry '.', '$' or '-' (loopguard's %ghlg_p0.0):
+        # \w+ alone missed it and left the entry block named as a value.
+        for phi in re.findall(r'^\s*%[-\w.$]+ = phi [^\n]*$', body, re.M):
             blocks |= set(re.findall(r'\[[^\]]*,\s*%(\d+)\s*\]', phi))
 
         def ren(m, blocks=blocks, tag=tag):

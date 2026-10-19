@@ -56,6 +56,7 @@
 #include <setjmp.h>
 #include <thread>
 #include <mutex>
+#include <shared_mutex>
 #include <map>
 #include <cstdint>
 #include <cstring>
@@ -145,7 +146,8 @@ static const wchar_t* kDevGames = L"D:\\DevelopmentFiles\\gh_games\\";
 static const wchar_t* kDevRoot   = L"D:\\DevelopmentFiles\\";
 static const wchar_t* kDevCorpus = L"D:\\DevelopmentFiles\\ghlo\\";
 static const wchar_t* kDevDumps  = L"D:\\DevelopmentFiles\\ghmiss\\";
-static const wchar_t* kDevBlobs  = L"D:\\DevelopmentFiles\\ghblob\\";  // #202: spilled PSO shader bytes
+static const wchar_t* kDevBlobs  = L"D:\\DevelopmentFiles\\ghblob\\";
+static const wchar_t* kDevBake   = L"D:\\DevelopmentFiles\\ghbake\\";  // §47: the on-device bake's output  // #202: spilled PSO shader bytes
 
 #ifdef GH_LAUNCHER
 // Launcher's on-screen picker writes the chosen guest here; RunGuest reads it as
@@ -153,6 +155,7 @@ static const wchar_t* kDevBlobs  = L"D:\\DevelopmentFiles\\ghblob\\";  // #202: 
 // RunGuest and the launcher_ui.h include in App::Run.
 static std::wstring g_launcherSelectedGuest;
 static uint32_t     g_launcherSelectedApp = 0;   // Steam appid of the picked row
+static bool LuiEntAllowsLaunch();                 // launcher_ui.h (§43 membership gate)
 #endif
 
 // ---------------------------------------------------------------------------
@@ -1809,6 +1812,7 @@ static uintptr_t g_regNextHandle = 0x5A5A0000;
 
 static std::wstring RegLower(const std::wstring& s){ std::wstring o=s; for(auto&c:o) if(c>=L'A'&&c<=L'Z') c=(wchar_t)(c+32); return o; }
 static std::string  RegNarrow(const std::wstring& s){ return std::string(s.begin(), s.end()); }
+static bool GhLicenseGate(std::vector<uint8_t>& b, const std::string& path, std::string& note, std::string& why);   // launcher_ui.h (§46)
 static std::wstring RegWiden(const char* s){ if(!s) return L""; int n=MultiByteToWideChar(CP_ACP,0,s,-1,nullptr,0); if(n<=0) return L""; std::wstring w(n-1,0); MultiByteToWideChar(CP_ACP,0,s,-1,&w[0],n); return w; }
 static std::wstring RegRootName(HKEY h){
     if(h==HKEY_CLASSES_ROOT)   return L"hkcr";
@@ -2073,13 +2077,23 @@ static void RegHiveLoad()
         // No hive yet: start from the title's settings seed in the package, if it
         // has one (Tsushima: the reference console's graphics settings, Texture
         // Low). The seed is only read; RegHiveSave writes the real file as usual.
+        // §44: the title package's seed (LocalState\titles\seed\<base>\) first,
+        // then a bundled dev build's copy in the Launcher package.
         std::wstring seed;
         if (g_title){
             const std::wstring base = g_title->SeedName();
             EnsureInstallDir();
-            seed = g_installDir + L"guest\\seed\\" + base + L"\\hive.txt";
+            seed = std::wstring(kLocalState) + L"titles\\seed\\" + base + L"\\hive.txt";
+            std::string lnote, why;
+            if (ReadWholeFile(seed, b, true) && !b.empty() &&
+                !GhLicenseGate(b, "seed/" + RegNarrow(base) + "/hive.txt", lnote, why)){
+                Diag("REG seed " + RegNarrow(seed) + " REJECTED " + why);
+                b.clear();
+            } else if (!b.empty() && !lnote.empty()) Diag("REG seed" + lnote);
+            if (b.empty())
+                seed = g_installDir + L"guest\\seed\\" + base + L"\\hive.txt";
         }
-        if (seed.empty() || !ReadWholeFile(seed, b, true) || b.empty()){
+        if (seed.empty() || (b.empty() && !ReadWholeFile(seed, b, true)) || b.empty()){
             Diag("REG hive none (" + RegNarrow(GhRegHivePath()) + ")");
             return;
         }
@@ -2304,7 +2318,8 @@ static void* __cdecl Bed_GetClientBootstrapMetrics(){ return nullptr; }
 struct GhSelfMod { uint8_t* base; std::string name; };
 static std::vector<GhSelfMod> g_selfMods;
 static SRWLOCK                g_selfModLock = SRWLOCK_INIT;
-static HMODULE GhSelfMapDll(const std::wstring& full, const char* dll);   // fwd (needs MapChildImage)
+static HMODULE GhSelfMapDll(const std::wstring& full, const char* dll,
+                            bool (*preMain)(uint8_t* base) = nullptr);   // fwd (needs MapChildImage)
 
 static std::string GhDllBaseName(const char* p)
 {
@@ -7701,12 +7716,18 @@ static const std::wstring& GhPkgCorpusDir()
 // exactly what a fresh console sees. 0 (default) = normal lookup.
 static bool GhCorpusPkgOnly()
 { static const bool v = GhCfgNumZ(L"gh_corpus_pkg_only.txt", "GH_CORPUS_PKG_ONLY", 0) != 0; return v; }
+// gh_corpus_bake_only = 1 (§47): the console's own bake is the ONLY source, the
+// test that a console with no shipped corpus runs on what it baked itself.
+static bool GhCorpusBakeOnly()
+{ static const bool v = GhCfgNumZ(L"gh_corpus_bake_only.txt", "GH_CORPUS_BAKE_ONLY", 0) != 0; return v; }
+static bool GhReadPackBlob(const std::wstring& name, std::vector<uint8_t>& out, bool probe = false);   // launcher_ui.h (§44)
+// The package's corpus: its plaintext guest\ghlo\ (a bundled dev build), then the
+// encrypted packs of the installed corpus add-on (§44, members only).
 static bool GhReadPkgBlob(const wchar_t* prefix, const std::wstring& wkey, std::vector<uint8_t>& out)
 {
     const std::wstring& d = GhPkgCorpusDir();
-    if (d.empty()) return false;
-    ReadWholeFile(d + prefix + wkey + L".bin", out, true);
-    if (out.empty()) return false;
+    if (!d.empty()) ReadWholeFile(d + prefix + wkey + L".bin", out, true);
+    if (out.empty()) return GhReadPackBlob(prefix + wkey, out);
     static LONG n = 0;
     if (InterlockedIncrement(&n) <= 3)
         Diag("SHADERSUB served from the package corpus: " + std::string(wkey.begin(), wkey.end()));
@@ -7926,12 +7947,20 @@ static GhBlobPtr GhLoweredBlob(const void* code, SIZE_T n)
     // own gh_tl_ prefix so the gh_lo_ corpus is never touched. Knob off = not even
     // probed, i.e. exactly the old lookup; rollback is deleting the knob file.
     bool tl = false;
-    const bool own = !GhCorpusPkgOnly();
+    const bool bakeOnly = GhCorpusBakeOnly();
+    const bool own = !GhCorpusPkgOnly() && !bakeOnly;
+    // §47: what this console baked itself, after the hand-staged corpora and before
+    // the package's: the bytes are the same wherever they come from.
+    auto baked = [&](const wchar_t* prefix){
+        if (!GhCorpusPkgOnly() && bytes->empty())
+            ReadWholeFile(std::wstring(kDevBake) + prefix + wkey + L".bin", *bytes, true);
+    };
     if (GhTexLod0On()){
         if (own) ReadWholeFile(std::wstring(kLocalState) + L"gh_tl_" + wkey + L".bin", *bytes, true);
         if (own && bytes->empty())
             ReadWholeFile(GhCorpusDir() + L"gh_tl_" + wkey + L".bin", *bytes, true);
-        if (bytes->empty())
+        baked(L"gh_tl_");
+        if (bytes->empty() && !bakeOnly)
             GhReadPkgBlob(L"gh_tl_", wkey, *bytes);
         tl = !bytes->empty();
     }
@@ -7942,7 +7971,8 @@ static GhBlobPtr GhLoweredBlob(const void* code, SIZE_T n)
     // #188: and D:, where a corpus too big for the quota is staged.
     if (own && bytes->empty())
         ReadWholeFile(GhCorpusDir() + L"gh_lo_" + wkey + L".bin", *bytes, true);
-    if (bytes->empty())
+    baked(L"gh_lo_");
+    if (bytes->empty() && !bakeOnly)
         GhReadPkgBlob(L"gh_lo_", wkey, *bytes);
 
     const bool firstLook = (e.state == kUnknown);
@@ -8228,9 +8258,12 @@ static void GhPsoRecStash(const void* code, SIZE_T n, char keyOut[40])
             != INVALID_FILE_ATTRIBUTES ||
         GetFileAttributesW((GhCorpusDir() + L"gh_lo_" + wkey + L".bin").c_str())
             != INVALID_FILE_ATTRIBUTES ||
+        GetFileAttributesW((std::wstring(kDevBake) + L"gh_lo_" + wkey + L".bin").c_str())
+            != INVALID_FILE_ATTRIBUTES ||
         (!GhPkgCorpusDir().empty() &&
          GetFileAttributesW((GhPkgCorpusDir() + L"gh_lo_" + wkey + L".bin").c_str())
-            != INVALID_FILE_ATTRIBUTES))
+            != INVALID_FILE_ATTRIBUTES) ||
+        [&]{ std::vector<uint8_t> none; return GhReadPackBlob(L"gh_lo_" + wkey, none, true); }())
         return;                                  // the lowered blob is already staged
     HANDLE h = CreateFileW((std::wstring(kLocalState) + L"gh_ps_" + wkey + L".bin").c_str(),
                            GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
@@ -36157,6 +36190,11 @@ static void GhTitlesLoadDir(const std::wstring& dir, const char* where, std::vec
         std::vector<uint8_t> b;
         if (!ReadWholeFile(path, b, true) || b.empty()){ Diag("TITLE file " + pn + " REJECTED unreadable or empty"); continue; }
         if (b.size() > (1u << 20)){ Diag("TITLE file " + pn + " REJECTED larger than 1 MiB"); continue; }
+        std::string lnote;
+        if (strcmp(where, "LocalState") == 0){
+            std::string why;
+            if (!GhLicenseGate(b, RegNarrow(fd.cFileName), lnote, why)){ Diag("TITLE file " + pn + " REJECTED " + why); continue; }
+        }
         ghjson::Value j; std::string err;
         if (!ghjson::Parse((const char*)b.data(), b.size(), j, err)){ Diag("TITLE file " + pn + " REJECTED " + err); continue; }
         GhTitle t; std::string why, notes;
@@ -36173,7 +36211,7 @@ static void GhTitlesLoadDir(const std::wstring& dir, const char* where, std::vec
         Diag("TITLE file " + pn + " id=" + t.id + " exe=" + RegNarrow(t.exe) + " knobs=" +
              std::to_string(t.knobs.size() - nEarly) + " early=" + std::to_string(nEarly) +
              " psoDeny=" + (t.hasPsoDeny ? std::to_string(std::count(t.psoDeny.begin(), t.psoDeny.end(), '\n')) : std::string("-")) +
-             (same ? " (overrides " + same->from + ")" : std::string()) + notes);
+             (same ? " (overrides " + same->from + ")" : std::string()) + notes + lnote);
         if (same) *same = std::move(t); else out.push_back(std::move(t));
     } while (FindNextFileW(f, &fd));
     FindClose(f);
@@ -45854,7 +45892,41 @@ static BOOL GhCallDllMainSeh(void* entry, uint8_t* base, DWORD* outCode)
     __except (EXCEPTION_EXECUTE_HANDLER) { *outCode = GetExceptionCode(); ok = FALSE; }
     return ok;
 }
-static HMODULE GhSelfMapDll(const std::wstring& full, const char* dll)
+// MapChildImage does no TLS, so a self-mapped DLL with __declspec(thread) data
+// (MSVC magic statics count: _Init_thread_epoch lives there) would index slot 0
+// of every thread's TLS array -- someone else's block. Give it a real OS index
+// from donor ghtls<slot>.dll instead, exactly as the guest's main image gets
+// one: the donor seeds the template into every thread created after it loads,
+// and GhTlsSetTemplate seeds the calling thread. Threads that predate the donor
+// are NOT seeded, so only call into such a module from new threads or this one.
+// TLS callbacks are not run; a module that has them is refused.
+static bool GhSelfMapTls(uint8_t* base, unsigned slot)
+{
+    auto* nt  = (IMAGE_NT_HEADERS64*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
+    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (!dir.Size) return true;
+    auto* tls = (IMAGE_TLS_DIRECTORY64*)(base + dir.VirtualAddress);
+    if (tls->AddressOfCallBacks && *(ULONGLONG*)tls->AddressOfCallBacks) {
+        Diag("SELFMAP TLS: module has TLS callbacks -- refusing"); return false;
+    }
+    const unsigned raw = (unsigned)(tls->EndAddressOfRawData - tls->StartAddressOfRawData);
+    const unsigned total = raw + tls->SizeOfZeroFill;
+    const std::wstring name = L"ghtls" + std::to_wstring(slot) + L".dll";
+    const std::wstring path = FindGuestSupportDll(name.c_str());
+    HMODULE h = path.empty() ? nullptr : LoadLibraryW(path.c_str());
+    auto idxFn = h ? (ULONG (*)(void))GetProcAddress(h, "GhTlsIndex") : nullptr;
+    auto setFn = h ? (BOOL (*)(const void*, unsigned, unsigned))GetProcAddress(h, "GhTlsSetTemplate") : nullptr;
+    if (!idxFn || !setFn) { Diag("SELFMAP TLS: donor " + std::string(name.begin(), name.end()) + " unavailable"); return false; }
+    if (!setFn((const void*)tls->StartAddressOfRawData, raw, total)) {
+        Diag("SELFMAP TLS: donor refused template total=" + Hex((uint32_t)total)); return false;
+    }
+    *(DWORD*)tls->AddressOfIndex = idxFn();
+    Diag("SELFMAP TLS: donor slot=" + std::to_string(slot) + " index=" + std::to_string(idxFn()) +
+         " template=" + Hex((uint32_t)total));
+    return true;
+}
+
+static HMODULE GhSelfMapDll(const std::wstring& full, const char* dll, bool (*preMain)(uint8_t* base))
 {
     std::string nm = GhDllBaseName(dll);
     std::vector<uint8_t> bytes;
@@ -45873,6 +45945,13 @@ static HMODULE GhSelfMapDll(const std::wstring& full, const char* dll)
     Diag("SELFMAP " + nm + " mapped base=" + Hex((uintptr_t)base) +
          " entry=" + Hex((uintptr_t)entry) + " size=" + Hex((uint64_t)bytes.size()));
 
+    if (preMain && !preMain(base)){
+        AcquireSRWLockExclusive(&g_selfModLock);
+        g_selfMods.pop_back();
+        ReleaseSRWLockExclusive(&g_selfModLock);
+        SetLastError(ERROR_DLL_INIT_FAILED);
+        return nullptr;
+    }
     auto* dos = (IMAGE_DOS_HEADER*)base;
     auto* nt  = (IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
     if (nt->OptionalHeader.AddressOfEntryPoint){
@@ -46760,6 +46839,14 @@ static void PatchGuestTreeForContainer()
 static void RunGuest()
 {
     Diag("=== Greenhouse P1 loader ===");
+#ifdef GH_LAUNCHER
+    // §43: App::Run's LuiEntGate already ran; this catches any other way in.
+    if (!LuiEntAllowsLaunch()) {
+        Diag("ENT gate REFUSED in RunGuest");
+        g_guestFailWhy = "This console's membership is not active (Packages > Membership)";
+        return;
+    }
+#endif
 
     InitStdHandles();
 
@@ -47341,6 +47428,10 @@ static void ResetGuestForRelaunch()
 // g_padState/g_padMutex, kLocalState, g_dispatcher, ReadWholeFile, Diag/Hex),
 // all declared above. Only compiled into the Greenhouse.Launcher slot.
 // (g_launcherSelectedGuest is declared far above, before RunGuest, which reads it.)
+#ifndef GH_LAUNCHER
+static bool GhReadPackBlob(const std::wstring&, std::vector<uint8_t>&, bool) { return false; }   // §44: Launcher only
+static bool GhLicenseGate(std::vector<uint8_t>&, const std::string&, std::string&, std::string&) { return true; }   // §46: Launcher only
+#endif
 #ifdef GH_LAUNCHER
 #include "gh_input.h"
 #include "launcher_ui.h"
@@ -47576,6 +47667,10 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
         // in from that file with no scan of its own.
         Diag(std::string("LOCALSTATE ") + (g_localStateFromEnv ? "env " : "FALLBACK ") +
              std::string(kLocalState, kLocalState + wcslen(kLocalState)));
+        // §43: membership before anything else. Locked at boot shows the QR link;
+        // B goes on to the picker (the library is browsable, launches are gated).
+        LuiEntStart();
+        if (ghent::Current().st == ghent::St::Locked) LuiMembershipScreen("boot");
         std::wstring loginStatus = LauncherAddonsSignIn();
         g_ghSteamRuntimeProvided = LuiServiceProvided("steam-runtime");
         {
@@ -47637,6 +47732,9 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
                     Sleep(50);
                 }
             }
+            if (!LuiEntGate(picked)) continue;   // §43: no live membership, no launch
+            if (!LuiShaderBakeGate(picked)) continue;   // §47: its title waits for the bake
+            LuiShaderBakeStop();                // §47: the game gets the cores back
             g_launcherSelectedGuest = picked;
             Diag("LAUNCHER handoff guest='" + std::string(g_launcherSelectedGuest.begin(), g_launcherSelectedGuest.end()) + "'");
             SnapshotHostThreads();

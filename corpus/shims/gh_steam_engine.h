@@ -1204,8 +1204,12 @@ static bool gh_probe_read(const void* addr, void* out, size_t n)
     if (!((mbi.Protect & 0xFF) & rd)) return false;
     uintptr_t regEnd = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
     if ((uintptr_t)addr + n > regEnd) return false;   // don't straddle into an unmapped page
-    memcpy(out, addr, n);
-    return true;
+    // The query is only a hint: another thread can decommit the region before the copy
+    // (0.0.691.0: the CCM scan's memcpy hit a heap page steamclient had just released, and
+    // the crash observer took the Launcher down). ReadProcessMemory takes the fault in the
+    // kernel and fails instead of raising one.
+    SIZE_T got = 0;
+    return ReadProcessMemory(GetCurrentProcess(), addr, out, n, &got) && got == n;
 }
 static uintptr_t gh_probe_ptr(const void* addr) { uintptr_t v = 0; return gh_probe_read(addr, &v, sizeof(v)) ? v : 0; }
 static uint32_t  gh_probe_u32(const void* addr) { uint32_t  v = 0; gh_probe_read(addr, &v, sizeof(v)); return v; }

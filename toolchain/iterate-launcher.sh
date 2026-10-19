@@ -24,6 +24,17 @@
 # GH_PACK_ONLY=1 stop after pack + sign: nothing is installed or launched.
 # GH_REPO_DEV_KEY=0  leave the dev repository key (src/loader/gh_repo_devkey.inc) out,
 #                so only release keys verify a package index (default 1 = trust it).
+# GH_ENT_DEV=0   leave the dev entitlement key (src/loader/gh_ent_devkey.inc) and plain-http
+#                gh_ent_url.txt out (gh_ent.h, §43). Default 1: dev tokens from
+#                toolchain/ghent.py mint and the LAN mock site are trusted. With neither
+#                that key nor gh_ent_keys.inc the build has no membership gate at all.
+# GH_BUNDLE_FIRSTPARTY=0  stage none of OUR value in the package (§44): no title configs,
+#                no Tsushima hive seed, no shader corpus. A member's console gets them
+#                from the repository instead (sealed title packages + the keyed corpus
+#                add-on, auto-installed). Default 1 = bundled, for dev builds.
+# GH_RELEASE=1   a distribution build: refuses the dev keys and any bundling, so a
+#                release can only be the thin package (GH_REPO_DEV_KEY=0 GH_ENT_DEV=0
+#                GH_BUNDLE_FIRSTPARTY=0 GH_STEAM_RUNTIME_FETCH=1).
 set -euo pipefail
 NEW="$1"; OLD="$2"
 GH=$HOME/greenhouse
@@ -38,15 +49,26 @@ SRC="${3:-$GH/src/loader/guest_loader.cpp}"
 EXTRALIBS="${EXTRALIBS:-d3d11.lib d3d12.lib dxgi.lib ws2_32.lib d2d1.lib dwrite.lib gdi32.lib user32.lib windowscodecs.lib winhttp.lib bcrypt.lib}"
 EXTRACL="${EXTRACL:-}"
 XBOX="${GH_XBOX:-192.0.2.12:11443}"
+BUNDLE="${GH_BUNDLE_FIRSTPARTY:-1}"
+if [ "${GH_RELEASE:-0}" = "1" ]; then
+  bad=""
+  [ "${GH_REPO_DEV_KEY:-1}" = "0" ] || bad="$bad GH_REPO_DEV_KEY"
+  [ "${GH_ENT_DEV:-1}" = "0" ] || bad="$bad GH_ENT_DEV"
+  [ "$BUNDLE" = "0" ] || bad="$bad GH_BUNDLE_FIRSTPARTY"
+  [ "${GH_STEAM_RUNTIME_FETCH:-1}" = "1" ] || bad="$bad GH_STEAM_RUNTIME_FETCH"
+  [ -z "$bad" ] || { echo "GH_RELEASE=1 refuses a dev build: set${bad} (dev keys off, nothing bundled)"; exit 1; }
+  [ -s "$GH/src/loader/gh_ent_keys.inc" ] || { echo "GH_RELEASE=1 needs the production gh_ent_keys.inc"; exit 1; }
+fi
 NSDEF=""
 [ "${GH_REPO_DEV_KEY:-1}" = "1" ] && NSDEF="/DGH_REPO_DEV_KEY"
+[ "${GH_ENT_DEV:-1}" = "1" ] && NSDEF="$NSDEF /DGH_ENT_DEV"
 echo "== build launcher loader ($SRC)${NSDEF:+ $NSDEF} =="
 clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \
   /std:c++20 /EHsc /MT /O2 "/DGH_PKG_FAMILY=\"$FAM\"" /DGH_LAUNCHER $NSDEF $EXTRACL \
   /imsvc "$SDK/crt/include" /imsvc "$SDK/sdk/include/$SDKVER/ucrt" \
   /imsvc "$SDK/sdk/include/$SDKVER/um" /imsvc "$SDK/sdk/include/$SDKVER/shared" \
-  /imsvc "$SDK/sdk/include/cppwinrt" \
-  "$SRC" \
+  /imsvc "$SDK/sdk/include/cppwinrt" /I "$GH/corpus/vendor/qrcodegen" \
+  "$SRC" "$GH/corpus/vendor/qrcodegen/qrcodegen.c" \
   -o "$STAGE/p0_spike_host.exe" \
   /link /libpath:"$SDK/crt/lib/x86_64" /libpath:"$SDK/sdk/lib/um/x86_64" /libpath:"$SDK/sdk/lib/ucrt/x86_64" \
         WindowsApp.lib $EXTRALIBS /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup /APPCONTAINER
@@ -140,6 +162,19 @@ mkdir -p "$STAGE/guest/vcrt"
 for d in MSVCP140.dll VCRUNTIME140.dll VCRUNTIME140_1.dll; do
   cp "$RED/vcrt/$d" "$STAGE/guest/vcrt/$d" || { echo "FATAL: missing $RED/vcrt/$d"; exit 1; }
 done
+# §47: the on-device shader bake's toolchain. dxcompiler.dll (DXC 1.9.2607, the
+# same release as the host's Linux build, so its disassembly and assembly match
+# the recipe byte for byte) with the C++ runtime it imports beside it, because
+# LoadLibraryEx searches the DLL's own directory for its imports.
+mkdir -p "$STAGE/guest/dxc"
+cp "$RED/dxc/dxcompiler.dll" "$RED/dxc/LICENSE-LLVM.txt" "$RED/dxc/LICENCE-MIT.txt" "$STAGE/guest/dxc/" \
+  || { echo "FATAL: missing $RED/dxc/dxcompiler.dll (DXC v1.9.2607 x64)"; exit 1; }
+# Its own C++ runtime, NOT guest/vcrt's: DXC 1.9 is built with VS 17.10+, whose
+# constexpr std::mutex needs MSVCP140 >= 14.40; guest/vcrt's 14.27 AVs in _Mtx_lock
+# during dxcompiler's static init (0.0.688/689). 14.51.36247, Microsoft-signed.
+rm -f "$STAGE/guest/dxc/"*.dll
+cp "$RED/dxc/dxcompiler.dll" "$RED/dxc/msvcp140.dll" "$RED/dxc/vcruntime140.dll" "$RED/dxc/vcruntime140_1.dll" "$STAGE/guest/dxc/" \
+  || { echo "FATAL: missing the 14.40+ C++ runtime in $RED/dxc/"; exit 1; }
 TSEED="$STAGE/guest/seed/GhostOfTsushima"
 PSPC="$TSEED/localstate/ghprogramdata/Sony Interactive Entertainment Inc/PSPC_SDK/S22/2.50.00.10"
 mkdir -p "$PSPC"
@@ -156,6 +191,8 @@ clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link /MT /O2 /LD \
         kernel32.lib libcmt.lib libvcruntime.lib libucrt.lib /DLL \
   || { echo "FATAL: tbs_stub build failed"; exit 1; }
 rm -f "$PSPC/tbs.lib" "$PSPC/tbs.exp"
+rm -rf "$STAGE/guest/titles" "$STAGE/guest/ghlo" "$TSEED/hive.txt"
+if [ "$BUNDLE" = "1" ]; then
 cp "$GH/corpus/seed/GhostOfTsushima/hive.txt" "$TSEED/hive.txt" || { echo "FATAL: missing Tsushima hive seed"; exit 1; }
 # Per-title configs (greenhouse.title/1): the loader reads guest\titles\*.ghtitle.json
 # at startup (GhTitles); LocalState\titles\ overrides by id. Checked here so a
@@ -186,6 +223,9 @@ cp "$GHLO"/gh_*.bin "$STAGE/guest/ghlo/"
 NTL=0
 for f in "$RED/ghlo_localstate"/gh_tl_*.bin; do [ -e "$f" ] || continue; cp "$f" "$STAGE/guest/ghlo/"; NTL=$((NTL+1)); done
 echo "  corpus: $NLO blobs + $NTL LocalState gh_tl_ overlays, $(du -sm "$STAGE/guest/ghlo" | cut -f1) MB"
+else
+  echo "  first-party value NOT bundled (GH_BUNDLE_FIRSTPARTY=0): title configs, hive seed and corpus come from the repository"
+fi
 find "$STAGE/guest/vcrt" "$TSEED" -type f -printf '  %8s %P\n'
 
 # #126: real per-module TLS. Each ghtlsN.dll is an identical DLL whose only job

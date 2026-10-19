@@ -30,16 +30,25 @@
 #include <winrt/windows.ui.text.core.h>
 #include <winrt/windows.ui.viewmanagement.h>
 #include <winrt/windows.ui.viewmanagement.core.h>
+#include "gh_shbake.h"
 // Steam sign-in, the owned library and the depot downloader live in the Steam
 // add-on (corpus/addons/steam, GREENHOUSE.md §40), not here: this file carries no
 // Steam client code. Whether the engine side exists at all -- the shim's friends and
 // invites in the overlay, Verify -- is decided at run time by whether an installed
 // source provides "steam-runtime" (#261; it replaced the GH_NO_STEAM build).
 #include "gh_repo.h"         // package repository client (Step 3): Packages page, update check
+#include "gh_ent.h"          // membership entitlement (§43): token, heartbeat, QR link, sealed files
+#include "gh_pak.h"          // keyed packages' encrypted packs (§44): the shader corpus
+#include "qrcodegen.h"       // the membership QR (corpus/vendor/qrcodegen, MIT)
+static std::wstring LuiEntBadge();   // membership section, below
 #include "gh_addon_abi.h"    // add-on DLL ABI (Step 4): an installed add-on is one more library source
 // Packages startup check (LuiRepoStartupCheck): -2 not started, -1 no repository /
 // failed, else the number of updates available. Read by the picker's header badge.
 static std::atomic<int> g_repoUpdates{-2};
+// Bumped by every package install/remove: GhReadPackBlob reopens the keyed stores, so a
+// recipe or corpus add-on installed this session is read without a restart (§47).
+static std::atomic<uint32_t> g_packGen{0};
+static ghbake::Progress g_bake;                // §47: the on-device shader bake (LuiShaderBakeStart)
 
 // ---------------------------------------------------------------------------
 // D2D/DWrite state, built once over the existing bridge device (g_gfx.d11).
@@ -628,8 +637,12 @@ static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const s
 
     // Header
     LuiText(L"GREENHOUSE", g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
-    LuiText((L"\u25CF  " + status).c_str(), g_lui.fmtSmall.get(),
-            D2D1::RectF(84, 140, W - 80, 182), g_lui.brAccent.get());
+    {   // status, then the membership badge (§43) when this build has a gate
+        std::wstring st = L"\u25CF  " + status;
+        const std::wstring eb = LuiEntBadge();
+        if (!eb.empty()) st += L"   \u00B7   " + eb;
+        LuiText(st.c_str(), g_lui.fmtSmall.get(), D2D1::RectF(84, 140, W - 780, 182), g_lui.brAccent.get());
+    }
     {   // Packages badge (START). The count comes from LuiRepoStartupCheck's background fetch.
         const int up = g_repoUpdates.load();
         std::wstring pk = L"\u2261  START  Packages";
@@ -638,6 +651,14 @@ static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const s
                 up > 0 ? g_lui.brAccent.get() : g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
 
+    if (g_bake.phase == 1 && g_bake.pending.load()) {   // §47: the shader bake, while it has work
+        const uint64_t tot = g_bake.scanTotal.load(), got = g_bake.scanBytes.load();
+        const int pct = tot ? (int)(got * 100 / tot) : 0;
+        const std::wstring bl = L"Preparing shaders  " + std::to_wstring(pct) + L"%  \u00B7  " +
+                                std::to_wstring(g_bake.baked.load()) + L" built";
+        LuiText(bl.c_str(), g_lui.fmtSmall.get(), D2D1::RectF(W - 760, 182, W - 80, 218), g_lui.brAccent.get(),
+                DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
     std::wstring sline = query.empty()
         ? (g_pickOskOpen ? L"Search:  _" : L"Search:  Y for on-screen keyboard")
         : (L"Search:  " + query + L"_");
@@ -824,7 +845,7 @@ static void LuiDrawStatus(const std::wstring& msg)
 
 // Progress state shared with the download callback and the add-on host API
 // (same UI thread). Outside the Steam block: add-ons draw it in every build.
-struct LauncherDlProg { std::wstring name, phase; int percent=0, fdone=0, ftot=0; unsigned long long bytes=0; bool verify=false; };
+struct LauncherDlProg { std::wstring name, phase, head; int percent=0, fdone=0, ftot=0; unsigned long long bytes=0; bool verify=false; };   // head: replaces "Downloading <name>"
 static LauncherDlProg g_dlProg;
 
 static void LuiDrawProgress()
@@ -834,7 +855,8 @@ static void LuiDrawProgress()
     dc->BeginDraw();
     dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
     LuiText(L"GREENHOUSE", g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
-    LuiText((std::wstring(g_dlProg.verify ? L"●  Verifying " : L"●  Downloading ") + g_dlProg.name).c_str(), g_lui.fmtSmall.get(),
+    LuiText((!g_dlProg.head.empty() ? L"●  " + g_dlProg.head
+             : std::wstring(g_dlProg.verify ? L"●  Verifying " : L"●  Downloading ") + g_dlProg.name).c_str(), g_lui.fmtSmall.get(),
             D2D1::RectF(84, 140, W - 80, 182), g_lui.brAccent.get());
     // progress bar
     const float x0 = 84, x1 = W - 84, y = H * 0.5f - 20, hgt = 40;
@@ -1245,6 +1267,74 @@ static std::wstring GhSteamRuntimeDir()
     return dir;
 }
 
+// §46: an installed title config or settings seed from LocalState\titles is honoured
+// only with a license naming this console (ghent::CheckLicense). `path` is the manifest
+// path it came from. On success `b` is cut back to the file's own bytes.
+static bool GhLicenseGate(std::vector<uint8_t>& b, const std::string& path, std::string& note, std::string& why)
+{
+    // Read here, not through ghent::DeviceId(): titles load at the first knob read,
+    // which can come before ghent::Boot.
+    static const std::string dev = ghent::ReadLine(std::wstring(kLocalState) + L"gh_device.txt", 64);
+    return ghent::CheckLicense(b, path, dev, note, why);
+}
+
+// §44: records of the installed keyed packages (the shader corpus add-on), read
+// last by the corpus lookup (GhReadPkgBlob's caller). Opened once per process,
+// at the first lookup -- after the entitlement gate let the launch through; a
+// package whose key will not load (LOCKED, another console's key file) is
+// skipped and logged, never fatal: a shader without its lowered copy takes the
+// same path as any other miss.
+static bool GhReadPackBlob(const std::wstring& wname, std::vector<uint8_t>& out, bool probe)
+{
+    static std::shared_mutex mu;
+    static std::vector<std::unique_ptr<ghpak::Store>> stores;
+    static uint32_t openGen = ~0u;
+    auto load = [] {
+        stores.clear();   // closes the old packs: a replaced version's files can then be removed
+        ghrepo::State st = ghrepo::LoadState(std::wstring(kLocalState) + L"gh_packages\\");
+        for (const ghrepo::Installed& p : st.pkgs) {
+            if (p.type != "addon" || p.files.empty()) continue;
+            std::wstring d = p.files[0]; if (d.empty() || d.back() != L'\\') d += L'\\';
+            WIN32_FIND_DATAW fd;
+            HANDLE f = FindFirstFileExW((d + L"*.ghpak").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
+            if (f == INVALID_HANDLE_VALUE) continue;
+            FindClose(f);
+            uint8_t key[32]; std::string why;
+            if (!ghent::LoadPackageKey(p.id, p.version, key, why)) { Diag("PACK " + p.id + " " + p.version + " REFUSED: " + why); continue; }
+            auto s = std::make_unique<ghpak::Store>();
+            const bool ok = s->Open(d, p.id, p.version, key, why);
+            SecureZeroMemory(key, sizeof key);
+            if (!ok) { Diag("PACK " + p.id + " " + p.version + " FAILED: " + why); continue; }
+            Diag("PACK " + p.id + " " + p.version + " open: " + std::to_string(s->Count()) + " records in " +
+                 std::to_string(s->Packs()) + " pack(s)");
+            stores.push_back(std::move(s));
+        }
+    };
+    const uint32_t gen = g_packGen.load();
+    std::shared_lock<std::shared_mutex> rd(mu);
+    if (openGen != gen) {
+        rd.unlock();
+        {
+            std::unique_lock<std::shared_mutex> wr(mu);
+            if (openGen != gen) { load(); openGen = gen; }
+        }
+        rd.lock();
+    }
+    if (stores.empty()) return false;
+    const std::string name = ghrepo::Narrow(wname);
+    for (const auto& s : stores) {
+        if (probe) { if (s->Has(name)) return true; continue; }
+        std::string why;
+        if (s->Read(name, out, why)) {
+            static LONG n = 0;
+            if (InterlockedIncrement(&n) <= 3) Diag("PACK served " + name);
+            return true;
+        }
+        if (!why.empty()) { Diag("PACK " + name + " " + why); return false; }
+    }
+    return false;
+}
+
 // Full path of the fetched copy of `base` if it is one of the three and verified, else empty.
 static std::wstring GhSteamRuntimeFor(const std::wstring& base)
 {
@@ -1516,10 +1606,16 @@ static uint64_t LauncherEngineWait(int timeoutSec)
 // add-ons land in D:\DevelopmentFiles\gh_packages\<id>\<version>\.
 // Network work runs on a worker thread so the page keeps drawing.
 // ---------------------------------------------------------------------------
+// §44: with no gh_repo_url.txt, the membership server's own /repo/index.json (the
+// site redirects it to the static repository host), so a member's console finds
+// its packages with no file to place.
 static std::string LuiRepoUrl()
 {
     std::vector<uint8_t> b;
-    if (!ReadWholeFile(std::wstring(kLocalState) + L"gh_repo_url.txt", b) || b.empty()) return {};
+    if (!ReadWholeFile(std::wstring(kLocalState) + L"gh_repo_url.txt", b) || b.empty()) {
+        const std::string srv = ghent::Enabled() ? ghent::Server() : std::string();
+        return srv.empty() ? std::string() : srv + "/repo/index.json";
+    }
     std::string s(b.begin(), b.end());
     size_t e = s.find_first_of("\r\n"); if (e != std::string::npos) s.resize(e);
     while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
@@ -1527,14 +1623,19 @@ static std::string LuiRepoUrl()
     return s.substr(f);
 }
 
+// One install/remove at a time: the Packages page and the startup auto-sync.
+static std::mutex g_repoInstallMu;
+
 static void LuiRepoLog(const std::string& s) { Diag(s); }
 
 // A title package's file must be a title config this loader accepts, for the
 // package's own id -- the same check GhTitles() applies when it loads it.
 static bool LuiRepoCheckTitle(const std::vector<uint8_t>& b, const std::string& id, std::string& why)
 {
+    size_t n = b.size(); std::string lic;   // an unsealed file ends in its license (§46)
+    ghent::SplitLicense(b.data(), b.size(), n, lic);
     ghjson::Value j; std::string err;
-    if (!ghjson::Parse((const char*)b.data(), b.size(), j, err)) { why = err; return false; }
+    if (!ghjson::Parse((const char*)b.data(), n, j, err)) { why = err; return false; }
     GhTitle t; std::string notes;
     if (!GhTitleFromJson(j, t, why, notes)) return false;
     if (t.id != id) { why = "title id " + t.id + " is not the package id " + id; return false; }
@@ -1551,7 +1652,43 @@ static ghrepo::Config LuiRepoConfig()
     c.loaderVersion = GhOwnPackageVersion();
     c.log = LuiRepoLog;
     c.checkTitle = LuiRepoCheckTitle;
+    // Members-only files: a loader with no entitlement keys cannot open them (Install refuses).
+    if (ghent::Enabled()) { c.unseal = ghent::Unseal; c.packageKey = ghent::StorePackageKey; }
     return c;
+}
+
+// §44: drop the stored key of every keyed package that is no longer installed.
+static void LuiKeepInstalledKeys(const ghrepo::Config& c)
+{
+    std::vector<std::string> keep;
+    for (const ghrepo::Installed& p : ghrepo::LoadState(c.stateDir).pkgs) keep.push_back(p.id + "@" + p.version);
+    ghent::KeepKeys(keep);
+}
+
+// §44: "auto" packages (the first-party title configs and the shader corpus) are
+// installed and kept current by the Launcher itself, for a member only. They are
+// no longer in the Launcher package; a title package takes effect at the next start.
+static void LuiRepoAutoSync(const ghrepo::Config& c, const ghrepo::Index& idx)
+{
+    const ghent::St st = ghent::Evaluate().st;
+    if (st != ghent::St::Entitled && st != ghent::St::Grace) {
+        Diag(std::string("REPO auto: skipped, membership ") + ghent::StName(st));
+        return;
+    }
+    int done = 0, failed = 0;
+    for (const ghrepo::IndexEntry& e : idx.packages) {
+        if (!e.autoInstall) continue;
+        const ghrepo::Installed* p = ghrepo::FindInstalled(ghrepo::LoadState(c.stateDir), e.id);
+        if (p && p->ver >= e.ver) continue;
+        std::string why;
+        bool ok;
+        { std::lock_guard<std::mutex> lk(g_repoInstallMu); ok = ghrepo::Install(c, idx, e.id, why); }
+        if (ok) ++g_packGen;
+        Diag("REPO auto: " + e.id + " " + e.version + (ok ? " installed" : " FAILED: " + why));
+        (ok ? done : failed)++;
+    }
+    if (done || failed) Diag("REPO auto: " + std::to_string(done) + " installed, " + std::to_string(failed) + " failed");
+    LuiKeepInstalledKeys(c);
 }
 
 
@@ -1563,18 +1700,137 @@ static void LuiRepoStartupCheck()
         ghrepo::Config c = LuiRepoConfig();
         CreateDirectoryW(c.addonRoot.c_str(), nullptr);
         ghrepo::CleanStaging(c);
+        if (ghent::Enabled()) LuiKeepInstalledKeys(c);
         if (c.indexUrl.empty()) { Diag("REPO check: no repository (gh_repo_url.txt absent)"); g_repoUpdates = -1; return; }
         ghrepo::Index idx; std::string why, key;
         if (!ghrepo::FetchIndex(c, idx, why, &key)) { Diag("REPO check FAILED: " + why); g_repoUpdates = -1; return; }
+        if (ghent::Enabled()) LuiRepoAutoSync(c, idx);
         int n = ghrepo::CountUpdates(ghrepo::LoadState(c.stateDir), idx);
         Diag("REPO check: " + std::to_string(n) + " update(s) available");
         g_repoUpdates = n;
     }).detach();
 }
 
+// §47 (#268): the on-device shader bake. Tsushima's lowered corpus is made here,
+// from the player's own install, by the recipe -- the bake writes the same bytes
+// the host validated into D:\DevelopmentFiles\ghbake\, which GhLoweredBlob reads.
+// It starts in the background at picker boot; the recipe is the corpus add-on's
+// gh_rcp_ shards (or a dev drop, D:\DevelopmentFiles\ghbake_recipe.txt). Only
+// missing outputs are baked and the scan stops once each is found, so after the
+// first bake a boot costs the recipe parse. Launching the title waits for the
+// bake (LuiShaderBakeGate); any launch stops it first: the game needs the cores
+// and the commit.
+static std::thread g_bakeThread;
+
+// The one title the bake serves (its recipe is Tsushima's corpus).
+static const wchar_t* kBakeApp = L"app_2215430";
+
+// gh_shbake: 1 (default) bake whenever the title is installed, 2 also dump the
+// originals named in ghbake_dump.txt (recipe authoring), 0 off.
+static void LuiShaderBakeStart()
+{
+    const unsigned mode = GhCfgNumZ(L"gh_shbake.txt", "GH_SHBAKE", 1);
+    if (!mode || g_bakeThread.joinable()) return;
+    const std::wstring arcDir = std::wstring(kDevGames) + kBakeApp + L"\\cache_pc\\psarc\\";
+    if (GetFileAttributesW(arcDir.c_str()) == INVALID_FILE_ATTRIBUTES) return;   // not installed: nothing to bake
+    EnsureInstallDir();
+    g_bake.phase = 1;   // from now: the recipe parse is part of the bake, so the gate waits through it
+    g_bakeThread = std::thread([mode, arcDir] {
+        ghbake::Config c;
+        c.archiveDir = arcDir;
+        c.rootDir = std::wstring(kDevGames) + kBakeApp + L"\\";
+        c.outDir = std::wstring(kDevRoot) + L"ghbake\\";
+        c.dumpDir = c.outDir;
+        c.dxcPath = g_installDir + L"guest\\dxc\\dxcompiler.dll";
+        c.threads = GhCfgNumZ(L"gh_shbake_threads.txt", "GH_SHBAKE_THREADS", 0);
+        c.scanners = GhCfgNumZ(L"gh_shbake_scanners.txt", "GH_SHBAKE_SCANNERS", 2);
+        c.log = [](const std::string& s) { Diag(s); };
+        // dxcompiler loads normally beside its own 14.51 C++ runtime (guest\dxc);
+        // should the container's loader still refuse it, map it ourselves
+        // (imports through our beds), its TLS on donor ghtls3.
+        if (GhCfgNumZ(L"gh_shbake_selfmap.txt", "GH_SHBAKE_SELFMAP", 1))
+            c.dxcFallback = [](const std::wstring& path, std::string& why) -> FARPROC {
+                HMODULE h = GhSelfMapDll(path, "dxcompiler.dll", [](uint8_t* b) { return GhSelfMapTls(b, 3); });
+                if (!h) { why = "GhSelfMapDll failed (" + std::to_string(GetLastError()) + ")"; return nullptr; }
+                FARPROC f = GhSelfMapExport(h, "DxcCreateInstance");
+                if (!f) why = "no DxcCreateInstance export";
+                return f;
+            };
+        CreateDirectoryW(std::wstring(kDevRoot).append(L"ghbake").c_str(), nullptr);
+        // The recipe: a dev drop on D: (ghbake_recipe.txt, plain ghbake/1 text) wins;
+        // otherwise the 256 gh_rcp_<xx> shards of the installed keyed corpus add-on.
+        std::vector<ghbake::Entry> recipe; std::string why;
+        const DWORD t0 = GetTickCount();
+        std::vector<uint8_t> raw;
+        const char* from = "D:\\DevelopmentFiles\\ghbake_recipe.txt";
+        if (ReadWholeFile(std::wstring(kDevRoot) + L"ghbake_recipe.txt", raw, true) && !raw.empty()) {
+            const bool ok = ghbake::ParseRecipe(std::string(raw.begin(), raw.end()), recipe, why);
+            std::vector<uint8_t>().swap(raw);
+            if (!ok) { Diag("SHBAKE recipe: " + why); g_bake.phase = 3; return; }
+        } else {
+            from = "the corpus add-on";
+            // The boot's package check may be installing it right now (a first-time
+            // member, or a recipe update): read the add-on after the sync, not before.
+            const DWORD w0 = GetTickCount();
+            while (g_repoUpdates.load() == -2 && !g_bake.stop.load() && GetTickCount() - w0 < 600000) Sleep(250);
+            if (GetTickCount() - w0 > 1000)
+                Diag("SHBAKE waited " + std::to_string((GetTickCount() - w0) / 1000) + "s for the package check");
+            if (g_bake.stop.load()) { g_bake.phase = 0; return; }   // a launch came first; the next boot bakes
+            int shards = 0;
+            for (int i = 0; i < 256; ++i) {
+                wchar_t nm[16]; swprintf(nm, 16, L"gh_rcp_%02x", i);
+                std::vector<uint8_t> rec; std::string text;
+                if (!GhReadPackBlob(nm, rec)) continue;
+                if (!ghbake::UnpackShard(rec, text, why) || !ghbake::ParseRecipe(text, recipe, why)) {
+                    Diag("SHBAKE shard " + ghrepo::Narrow(nm) + ": " + why); g_bake.phase = 3; return;
+                }
+                ++shards;
+            }
+            if (!shards) { Diag("SHBAKE no recipe (no dev drop, no gh_rcp_ records installed)"); g_bake.phase = 3; return; }
+        }
+        Diag("SHBAKE recipe: " + std::to_string(recipe.size()) + " entries from " + from + " in " +
+             std::to_string(GetTickCount() - t0) + "ms");
+        if (mode >= 2) {
+            std::vector<uint8_t> k;
+            ReadWholeFile(std::wstring(kDevRoot) + L"ghbake_dump.txt", k, true);
+            const std::string ks(k.begin(), k.end());
+            for (size_t p = 0; p + 32 <= ks.size(); ) {
+                c.dumpKeys.insert(ks.substr(p, 32));
+                const size_t q = ks.find('\n', p);
+                if (q == std::string::npos) break;
+                p = q + 1;
+            }
+        }
+        ghbake::Run(c, recipe, g_bake);
+    });
+}
+
+// After the Packages page installed or removed something: a bake that already
+// finished (or found no recipe) runs again over the new packages. One still
+// running keeps its recipe; the stamp settles the rest at the next boot.
+static void LuiShaderBakeRestart()
+{
+    if (g_bake.phase == 1) return;
+    if (g_bakeThread.joinable()) g_bakeThread.join();
+    g_bake.phase = 0; g_bake.stop = false;
+    g_bake.scanBytes = 0; g_bake.scanTotal = 0;
+    g_bake.pending = 0; g_bake.found = 0; g_bake.baked = 0; g_bake.failed = 0; g_bake.dumped = 0;
+    Diag("SHBAKE restart: packages changed");
+    LuiShaderBakeStart();
+}
+
+static void LuiShaderBakeStop()
+{
+    if (!g_bakeThread.joinable()) return;
+    if (g_bake.phase == 1) Diag("SHBAKE stopping for a launch (baked=" + std::to_string(g_bake.baked.load()) + ")");
+    g_bake.stop = true;
+    g_bakeThread.join();
+}
+
 struct LuiPkgRow {
     std::string id, type, name, inst, repo; uint64_t instV = 0, repoV = 0;
     int addon = -1;          // g_luiAddons index of this package's loaded add-on when it can sign out
+    bool member = false;     // §43: the Membership row (not a package), first when the build has a gate
     std::wstring account;    // the account its saved sign-in belongs to (empty = none saved)
 };
 
@@ -1613,7 +1869,8 @@ static void LuiDrawPackages(const std::vector<LuiPkgRow>& rows, int sel, const s
         std::wstring name = ghrepo::Widen(r.name.empty() ? r.id : r.name) +
                             (r.type == "addon" ? L"   (add-on)" : L"");
         std::wstring sub;
-        if (r.repo.empty())            sub = L"installed " + ghrepo::Widen(r.inst) + L" \u00B7 not in repository";
+        if (r.member)                  { name = L"Membership"; sub = LuiEntBadge(); }
+        else if (r.repo.empty())       sub = L"installed " + ghrepo::Widen(r.inst) + L" \u00B7 not in repository";
         else if (r.inst.empty())       sub = L"available " + ghrepo::Widen(r.repo);
         else if (r.repoV > r.instV)    sub = L"update " + ghrepo::Widen(r.inst) + L" \u2192 " + ghrepo::Widen(r.repo);
         else                           sub = L"installed " + ghrepo::Widen(r.inst);
@@ -1626,6 +1883,10 @@ static void LuiDrawPackages(const std::vector<LuiPkgRow>& rows, int sel, const s
         LuiText(L"No packages", g_lui.fmtItem.get(), D2D1::RectF(x0, top, x1, top + 60), g_lui.brDim.get(),
                 DWRITE_TEXT_ALIGNMENT_CENTER);
     const bool canSignOut = sel >= 0 && sel < total && rows[sel].addon >= 0 && !rows[sel].account.empty();
+    if (sel >= 0 && sel < total && rows[sel].member)
+        LuiText(L"A  Open      Y  Refresh      B  Back", g_lui.fmtSmall.get(),
+                D2D1::RectF(84, H - 70, W - 80, H - 30), g_lui.brDim.get());
+    else
     LuiText(canSignOut ? L"A  Install / update      X  Remove      Y  Refresh      \u2261  Sign out      B  Back"
                        : L"A  Install / update      X  Remove      Y  Refresh      B  Back", g_lui.fmtSmall.get(),
             D2D1::RectF(84, H - 70, W - 80, H - 30), g_lui.brDim.get());
@@ -1664,6 +1925,298 @@ static void LuiDrawPackages(const std::vector<LuiPkgRow>& rows, int sel, const s
     dc->EndDraw();
 }
 
+// ---------------------------------------------------------------------------
+// Membership (§43, gh_ent.h). Every launch needs a live membership: the site
+// signs a 7-day token for this console, a heartbeat renews it every 12 h, and
+// with no network the console keeps playing until the token runs out. Linking
+// is a QR code: the phone opens <site>/link?c=CODE, signs in with Patreon, and
+// the console's poll picks the token up. Network calls run on worker threads;
+// the screens keep presenting. B always leaves (the library stays browsable).
+// ---------------------------------------------------------------------------
+static std::string LuiVersionStr(uint64_t v)
+{
+    return std::to_string((v >> 48) & 0xffff) + "." + std::to_string((v >> 32) & 0xffff) + "." +
+           std::to_string((v >> 16) & 0xffff) + "." + std::to_string(v & 0xffff);
+}
+
+// Header badge text ("" = this build has no membership gate).
+static std::wstring LuiEntBadge()
+{
+    const ghent::Status s = ghent::Current();
+    switch (s.st) {
+    case ghent::St::Off:      return L"";
+    case ghent::St::Entitled: return L"Member \u2713";
+    case ghent::St::Grace: {
+        const int d = s.DaysLeft();
+        return L"Member \u00B7 offline, " + std::to_wstring(d) + (d == 1 ? L" day left" : L" days left");
+    }
+    default: return s.why == "not linked" ? L"Not linked" : L"Membership inactive";
+    }
+}
+
+static bool LuiQrMatrix(const std::string& text, std::vector<uint8_t>& m, int& size)
+{
+    static uint8_t qr[qrcodegen_BUFFER_LEN_MAX], tmp[qrcodegen_BUFFER_LEN_MAX];
+    if (!qrcodegen_encodeText(text.c_str(), tmp, qr, qrcodegen_Ecc_MEDIUM, qrcodegen_VERSION_MIN,
+                              qrcodegen_VERSION_MAX, qrcodegen_Mask_AUTO, true)) return false;
+    size = qrcodegen_getSize(qr);
+    m.assign((size_t)size * size, 0);
+    for (int y = 0; y < size; ++y)
+        for (int x = 0; x < size; ++x) m[(size_t)y * size + x] = qrcodegen_getModule(qr, x, y) ? 1 : 0;
+    return true;
+}
+
+// Boot: load the state, then heartbeat now and every 12 h (sooner after a miss).
+static void LuiEntStart()
+{
+    ghent::Config c;
+    c.dir = kLocalState;
+    c.loaderVersion = LuiVersionStr(GhOwnPackageVersion());
+    c.log = LuiRepoLog;
+    ghent::Boot(c);
+    if (!ghent::Enabled()) return;
+    std::thread([] {
+        for (;;) {
+            const ghent::Hb r = ghent::Heartbeat();
+            const DWORD ms = (r == ghent::Hb::Renewed || r == ghent::Hb::Skipped || r == ghent::Hb::Revoked)
+                           ? (DWORD)ghent::kHeartbeatS * 1000u : 30u * 60u * 1000u;
+            Sleep(ms);
+        }
+    }).detach();
+}
+
+// LuiDrawLogin's layout with a second, smaller line; with no QR the two lines sit
+// in the middle of the screen instead of under an empty panel.
+static void LuiDrawEnt(const wchar_t* title, const uint8_t* m, int n,
+                       const std::wstring& line1, const std::wstring& line2, const wchar_t* hint)
+{
+    auto* dc = g_lui.dc.get();
+    const float W = (float)g_lui.w, H = (float)g_lui.h;
+    dc->BeginDraw();
+    dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
+    LuiText(L"GREENHOUSE", g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
+    LuiText(title, g_lui.fmtItem.get(), D2D1::RectF(84, 150, W - 80, 206), g_lui.brAccent.get(),
+            DWRITE_TEXT_ALIGNMENT_CENTER);
+    float y = H * 0.5f - 60.f;
+    if (m && n > 0 && n <= 177) {
+        const float cy = H * 0.50f, boxHalf = 280.f;
+        LuiBlitQr(m, n, W * 0.5f, cy, 2 * boxHalf);
+        y = cy + boxHalf + 24.f;
+    }
+    LuiText(line1.c_str(), g_lui.fmtItem.get(), D2D1::RectF(80, y, W - 80, y + 60), g_lui.brFg.get(),
+            DWRITE_TEXT_ALIGNMENT_CENTER);
+    LuiText(line2.c_str(), g_lui.fmtSmall.get(), D2D1::RectF(80, y + 60, W - 80, y + 100), g_lui.brDim.get(),
+            DWRITE_TEXT_ALIGNMENT_CENTER);
+    LuiText(hint ? hint : L"", g_lui.fmtSmall.get(), D2D1::RectF(80, H - 70, W - 80, H - 30),
+            g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+    dc->EndDraw();
+}
+
+// The pad's newly pressed buttons this frame (B/A/X), with the events pumped.
+static WORD LuiEntPressed(WORD& prev)
+{
+    if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+    PollGamepadOnUi();
+    PollSyntheticPad();
+    WORD b; { std::lock_guard<std::mutex> lk(g_padMutex); b = g_padState.wButtons; }
+    const WORD p = b & ~prev; prev = b;
+    return p;
+}
+
+// Run fn on a worker thread while the screen keeps drawing `msg`. B abandons the
+// wait (the thread finishes on its own and its result is dropped). True = done.
+template <class F>
+static bool LuiEntWork(const std::wstring& msg, WORD& prev, F fn)
+{
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    std::thread([done, fn]() mutable { fn(); done->store(true); }).detach();
+    while (!done->load()) {
+        if (LuiEntPressed(prev) & XINPUT_GAMEPAD_B) return false;
+        LuiDrawEnt(L"Membership", nullptr, 0, msg, L"", L"B  Back");
+        LuiPresent(); Sleep(30);
+    }
+    return true;
+}
+
+static std::wstring LuiEntDenied(const std::string& reason)
+{
+    if (reason == "not_member")   return L"That Patreon account has no active membership \u2014 join, then scan again";
+    if (reason == "device_limit") return L"This membership is on too many consoles \u2014 unlink one on your phone";
+    if (reason == "declined")     return L"Patreon declined the last payment \u2014 fix it, then scan again";
+    return L"Sign-in was not completed \u2014 scan again to retry";
+}
+
+// The QR link. True = this console is now entitled.
+static bool LuiEntLink(WORD& prev)
+{
+    std::vector<uint8_t> m; int size = 0;
+    if (ghent::Server().empty()) {   // dev build without gh_ent_url.txt: only a minted token links it
+        Diag("ENT link: no membership server configured");
+        for (;;) {
+            if (LuiEntPressed(prev) & XINPUT_GAMEPAD_B) return false;
+            LuiDrawEnt(L"Membership", nullptr, 0, L"No membership server is configured in this build",
+                       L"", L"B  Back");
+            LuiPresent(); Sleep(30);
+        }
+    }
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        auto link = std::make_shared<ghent::Link>();
+        auto err = std::make_shared<std::string>();
+        auto ok = std::make_shared<bool>(false);
+        if (!LuiEntWork(L"Connecting\u2026", prev, [link, err, ok] { *ok = ghent::StartLink(*link, *err); })) return false;
+        if (!*ok) {
+            Diag("ENT link start failed: " + *err);
+            for (int i = 0; i < 150; ++i) {   // ~5 s, then retry
+                if (LuiEntPressed(prev) & XINPUT_GAMEPAD_B) return false;
+                LuiDrawEnt(L"Membership", nullptr, 0, L"Can't reach the Greenhouse server \u2014 retrying\u2026", L"", L"B  Back");
+                LuiPresent(); Sleep(30);
+            }
+            continue;
+        }
+        if (!LuiQrMatrix(link->verifyUrl, m, size)) { Diag("ENT link: QR encode failed"); return false; }
+        std::string host = link->verifyUrl.substr(link->verifyUrl.find("//") + 2);
+        host = host.substr(0, host.find('/'));
+        const std::wstring codeLine = L"Code  " + ghrepo::Widen(link->userCode) + L"   \u00B7   " + ghrepo::Widen(host) + L"/link";
+        std::wstring note;                          // second line: why the last try did not link
+        const wchar_t* hint = L"Scan with your phone and sign in with Patreon   \u00B7   B  Back";
+        int interval = link->interval;
+        DWORD nextPoll = GetTickCount() + (DWORD)interval * 1000;
+        bool waiting = false;                       // a poll is on its worker thread
+        auto busy = std::make_shared<std::atomic<bool>>(false);
+        auto res = std::make_shared<ghent::Pr>(ghent::Pr::Pending);
+        auto detail = std::make_shared<std::string>();
+        bool renew = false;
+        while (!renew) {
+            if (LuiEntPressed(prev) & XINPUT_GAMEPAD_B) { Diag("ENT link: left by the user"); return false; }
+            if ((int64_t)time(nullptr) > link->expiresAt) { Diag("ENT link: code expired, new code"); break; }
+            if (!waiting && (int)(GetTickCount() - nextPoll) >= 0) {
+                waiting = true; busy->store(true);
+                std::thread([link, busy, res, detail] { *res = ghent::Poll(*link, *detail); busy->store(false); }).detach();
+            }
+            if (waiting && !busy->load()) {
+                waiting = false;
+                switch (*res) {
+                case ghent::Pr::Entitled:
+                    for (int i = 0; i < 45; ++i) {
+                        LuiDrawEnt(L"Membership", nullptr, 0, L"Linked \u2713  Member", L"", L"");
+                        LuiPresent(); Sleep(30);
+                    }
+                    return true;
+                case ghent::Pr::Expired:  Diag("ENT link: session expired, new code"); renew = true; break;
+                case ghent::Pr::SlowDown: if (interval < 10) ++interval; break;
+                case ghent::Pr::Denied:   note = LuiEntDenied(*detail); break;
+                case ghent::Pr::Error:
+                    Diag("ENT link poll: " + *detail);
+                    note = L"Can't reach the Greenhouse server \u2014 still trying";
+                    break;
+                default:
+                    if (note.find(L"Can't reach") == 0) note.clear();
+                    break;
+                }
+                nextPoll = GetTickCount() + (DWORD)interval * 1000;
+            }
+            LuiDrawEnt(L"Link this console to your membership", m.data(), size, codeLine, note, hint);
+            LuiPresent(); Sleep(30);
+        }
+    }
+    Diag("ENT link: gave up after 20 sessions");
+    return false;
+}
+
+// The membership screen (Packages row, a refused launch, or boot while locked).
+// Linked: shows the state; X then A unlinks (a user action, never a harness key).
+// Not linked: the QR link. True = entitled when it returns.
+static bool LuiMembershipScreen(const char* why)
+{
+    if (!ghent::Enabled() || !LuiInit()) return true;
+    Diag(std::string("ENT screen open (") + why + ") " + ghent::Describe(ghent::Evaluate()));
+    WORD prev = 0xFFFF;
+    bool askUnlink = false;
+    std::wstring note;
+    for (;;) {
+        const ghent::Status s = ghent::Current();
+        if (s.st == ghent::St::Locked) {
+            const bool ok = LuiEntLink(prev);
+            ghent::Evaluate();
+            Diag(std::string("ENT screen closed ") + ghent::Describe(ghent::Current()));
+            return ok;
+        }
+        const WORD p = LuiEntPressed(prev);
+        if (askUnlink) {
+            if (p & XINPUT_GAMEPAD_A) {
+                askUnlink = false;
+                auto ok = std::make_shared<bool>(false); auto err = std::make_shared<std::string>();
+                Diag("ENT unlink (user confirmed)");
+                if (LuiEntWork(L"Unlinking\u2026", prev, [ok, err] { *ok = ghent::Unlink(*err); }) && !*ok) {
+                    note = L"Unlink failed: " + ghrepo::Widen(*err);
+                    Diag("ENT unlink failed: " + *err);
+                }
+                if (ghent::Current().st == ghent::St::Locked) {   // unlinked: back to the picker
+                    Diag("ENT screen closed after unlink");
+                    return false;
+                }
+                continue;
+            }
+            if (p & XINPUT_GAMEPAD_B) { askUnlink = false; Diag("ENT unlink cancelled"); continue; }
+            LuiDrawEnt(L"Unlink this console?", nullptr, 0, L"Its slot on your membership is freed.",
+                       L"Linking it again needs the QR code and your phone.", L"A  Yes, unlink            B  Cancel");
+            LuiPresent(); Sleep(30);
+            continue;
+        }
+        if (p & XINPUT_GAMEPAD_B) { Diag("ENT screen closed"); return true; }
+        if (p & XINPUT_GAMEPAD_X) { askUnlink = true; note.clear(); Diag("ENT unlink prompt"); continue; }
+        std::wstring l2 = !note.empty() ? note
+                        : s.st == ghent::St::Grace ? L"Greenhouse could not reach its server. Games keep working until the days run out."
+                        : L"Renews automatically while this console is online.";
+        LuiDrawEnt(L"Membership", nullptr, 0, LuiEntBadge(), l2, L"X  Unlink this console      B  Back");
+        LuiPresent(); Sleep(30);
+    }
+}
+
+// Every launch passes here (App::Run, before the hand-off). A refused launch
+// opens the link screen; linking there lets the launch go ahead.
+static bool LuiEntGate(const std::wstring& guest)
+{
+    const ghent::Status s = ghent::Evaluate();
+    if (s.st != ghent::St::Locked) {
+        if (s.st != ghent::St::Off) Diag("ENT gate ok " + ghent::Describe(s));
+        return true;
+    }
+    Diag("ENT gate REFUSED " + ghent::Describe(s) + " guest='" + ghrepo::Narrow(guest) + "'");
+    return LuiMembershipScreen("launch") && ghent::Evaluate().st != ghent::St::Locked;
+}
+
+// RunGuest's own check (any path that reaches it without App::Run's gate).
+static bool LuiEntAllowsLaunch()
+{
+    return ghent::Evaluate().st != ghent::St::Locked;
+}
+
+// §47: the title the bake serves waits for it instead of stopping it -- the
+// game runs on what the bake writes. A progress screen until it finishes; B goes
+// back to the picker with the bake still running. True = launch.
+static bool LuiShaderBakeGate(const std::wstring& guest)
+{
+    if (g_bake.phase != 1 || guest.find(kBakeApp) == std::wstring::npos) return true;
+    Diag("SHBAKE launch waits for the bake (baked=" + std::to_string(g_bake.baked.load()) + ")");
+    WORD prev = 0xFFFF;
+    while (g_bake.phase == 1) {
+        if (LuiEntPressed(prev) & XINPUT_GAMEPAD_B) { Diag("SHBAKE wait left (B)"); return false; }
+        const uint64_t tot = g_bake.scanTotal.load(), got = g_bake.scanBytes.load();
+        g_dlProg.head = L"Preparing shaders for this console (once per game update)";
+        g_dlProg.phase = g_bake.pending.load() == 0 ? std::wstring(L"Checking this install  ·  B to go back")
+                       : std::to_wstring(g_bake.baked.load()) + L" of " + std::to_wstring(g_bake.pending.load()) +
+                         L" built  ·  B to go back";
+        g_dlProg.percent = tot ? (int)(got * 100 / tot) : 0;
+        g_dlProg.fdone = g_dlProg.ftot = 0; g_dlProg.bytes = got; g_dlProg.verify = false;
+        LuiDrawProgress(); LuiPresent(); Sleep(30);
+    }
+    g_dlProg.head.clear();
+    Diag("SHBAKE wait over: phase=" + std::to_string(g_bake.phase.load()) + " baked=" + std::to_string(g_bake.baked.load()) +
+         " failed=" + std::to_string(g_bake.failed.load()));
+    return true;
+}
+
 // The Packages page. Returns when the user presses B.
 static void LauncherPackages()
 {
@@ -1689,6 +2242,7 @@ static void LauncherPackages()
 
     auto buildRows = [&] {
         rows.clear();
+        if (ghent::Enabled()) { LuiPkgRow r; r.member = true; r.id = "@membership"; rows.push_back(r); }
         ghrepo::State st = ghrepo::LoadState(cfg.stateDir);
         if (haveIdx) for (const auto& e : idx.packages) {
             LuiPkgRow r; r.id = e.id; r.type = e.type; r.name = e.name; r.repo = e.version; r.repoV = e.ver;
@@ -1717,15 +2271,19 @@ static void LauncherPackages()
         ghrepo::Index cur = idx;
         std::thread([job, c, cur, what, id] {
             if (what == kFetch) job->ok = ghrepo::FetchIndex(c, job->idx, job->why, &job->key);
-            else if (what == kInstall) job->ok = ghrepo::Install(c, cur, id, job->why);
-            else job->ok = ghrepo::Remove(c, id, job->why);
+            else {
+                std::lock_guard<std::mutex> lk(g_repoInstallMu);
+                job->ok = what == kInstall ? ghrepo::Install(c, cur, id, job->why) : ghrepo::Remove(c, id, job->why);
+                if (job->ok) ++g_packGen;
+                if (ghent::Enabled()) LuiKeepInstalledKeys(c);
+            }
             job->done = true;
         }).detach();
     };
     auto fetch = [&] {
         if (cfg.indexUrl.empty()) {
-            status = L"No repository: put the URL of its index.json in gh_repo_url.txt"; bad = true;
-            Diag("REPO page: no repository (gh_repo_url.txt absent)");
+            status = L"No repository: link a membership, or put the URL of its index.json in gh_repo_url.txt"; bad = true;
+            Diag("REPO page: no repository (gh_repo_url.txt absent, no membership server)");
             buildRows(); return;
         }
         busy = L"Checking " + ghrepo::Widen(cfg.indexUrl) + L"\u2026";
@@ -1812,6 +2370,11 @@ static void LauncherPackages()
         if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) && sel < n - 1) ++sel;
         if (pressed & XINPUT_GAMEPAD_B) { Diag("REPO page closed"); return; }
         if (pressed & XINPUT_GAMEPAD_Y) { cfg = LuiRepoConfig(); fetch(); }
+        if ((pressed & XINPUT_GAMEPAD_A) && n > 0 && rows[sel].member) {
+            LuiMembershipScreen("packages");
+            prev = 0xFFFF; buildRows();
+            continue;
+        }
         if ((pressed & XINPUT_GAMEPAD_A) && n > 0 && !rows[sel].repo.empty()) {
             const LuiPkgRow& r = rows[sel];
             Diag("REPO page install " + r.id + " " + r.repo + (r.inst.empty() ? "" : " (installed " + r.inst + ")"));
@@ -3473,6 +4036,7 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
     rebuild();
     Diag("LAUNCHER picker items=" + std::to_string(all.size()));
     LuiRepoStartupCheck();              // background index check -> "Packages · N update(s)" badge
+    LuiShaderBakeStart();               // §47: gh_shbake knob
     for (;;) {
         if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
         PollGamepadOnUi();
@@ -3596,7 +4160,9 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
         }
         if ((pressed & XINPUT_GAMEPAD_START) && !g_pickOskOpen) {
             Diag("LAUNCHER packages");
+            const uint32_t gen0 = g_packGen.load();
             LauncherPackages();
+            if (g_packGen.load() != gen0) LuiShaderBakeRestart();
             rebuild();                  // a removed/installed title config changes nothing until restart,
             continue;                   // but rows are rebuilt so the picker state is fresh
         }

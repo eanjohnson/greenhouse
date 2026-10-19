@@ -168,16 +168,19 @@ struct FromSource {                 // "from": a range of a third-party file (se
     uint64_t offset = 0, length = 0;    // byte range of the compressed member
     std::vector<Patch> patches;
 };
-struct FileEntry { std::string path, sha256, url; uint64_t size = 0; bool hasFrom = false; FromSource from; };
+struct FileEntry { std::string path, sha256, url; uint64_t size = 0; bool hasFrom = false, sealed = false; FromSource from; };
 
 struct Manifest {
     std::string id, type, version, name, publisher, minLoader;
+    std::string entitlement;                    // "" (free) | "member" (needs a live membership)
+    bool keyed = false;         // the files are *.ghpak packs under ONE package key (gh_pak.h), kept encrypted
+    bool autoInstall = false;   // "auto": the Launcher installs/updates it by itself for a member
     std::vector<std::string> provides, needs;   // "provides" / "requires"
     std::vector<FileEntry> files;
     uint64_t ver = 0, minLoaderV = 0;
 };
 
-struct IndexEntry { std::string id, type, version, name, manifest, manifestSha256; uint64_t ver = 0; };
+struct IndexEntry { std::string id, type, version, name, manifest, manifestSha256; uint64_t ver = 0; bool autoInstall = false; };
 
 struct Index { int64_t serial = 0; std::vector<IndexEntry> packages; };
 
@@ -192,6 +195,31 @@ inline bool StrMember(const ghjson::Value& o, const char* k, std::string& out, b
     if (!v || v->isNull()){ if (required){ why = std::string("missing \"") + k + "\""; return false; } out.clear(); return true; }
     if (!v->isStr()){ why = std::string("\"") + k + "\" is not a string"; return false; }
     out = v->s; return true;
+}
+
+// An optional boolean member: absent = false.
+inline bool BoolMember(const ghjson::Value& o, const char* k, bool& out, std::string& why)
+{
+    out = false;
+    const ghjson::Value* v = o.get(k);
+    if (!v || v->isNull()) return true;
+    if (!v->isBool()){ why = std::string(k) + " is not a boolean"; return false; }
+    out = v->b; return true;
+}
+
+// A title package holds flat *.ghtitle.json files, and the title's settings seed
+// under seed/<Name>/... (installed to LocalState\titles\seed\<Name>\).
+inline bool IsTitleConfigPath(const std::string& p)
+{
+    const std::string sfx = ".ghtitle.json";
+    return p.find('/') == std::string::npos && p.size() > sfx.size() &&
+           p.compare(p.size() - sfx.size(), sfx.size(), sfx) == 0;
+}
+inline bool IsTitleSeedPath(const std::string& p)
+{
+    if (p.compare(0, 5, "seed/") != 0) return false;
+    const size_t a = p.find('/', 5);
+    return a != std::string::npos && a > 5 && a + 1 < p.size();
 }
 
 inline bool StrList(const ghjson::Value& o, const char* k, std::vector<std::string>& out, std::string& why)
@@ -238,6 +266,7 @@ inline bool ParseIndex(const char* p, size_t n, Index& out, std::string& why)
         if (!CheckType(ie.type, why)) return false;
         if (!ParseVersion(ie.version, &ie.ver)){ why = ie.id + ": version is not a.b.c.d"; return false; }
         if (!IsHex(ie.manifestSha256, 64)){ why = ie.id + ": manifestSha256 is not 64 lower-case hex"; return false; }
+        if (!BoolMember(e, "auto", ie.autoInstall, why)){ why = ie.id + ": " + why; return false; }
         for (const auto& o : out.packages)
             if (o.id == ie.id){ why = "index lists \"" + ie.id + "\" twice"; return false; }
         out.packages.push_back(std::move(ie));
@@ -290,7 +319,11 @@ inline bool ParseManifest(const char* p, size_t n, Manifest& m, std::string& why
     if (!StrMember(j, "id", m.id, true, why) || !StrMember(j, "type", m.type, true, why) ||
         !StrMember(j, "version", m.version, true, why) || !StrMember(j, "name", m.name, false, why) ||
         !StrMember(j, "publisher", m.publisher, false, why) ||
-        !StrMember(j, "minLoader", m.minLoader, false, why)) return false;
+        !StrMember(j, "minLoader", m.minLoader, false, why) ||
+        !StrMember(j, "entitlement", m.entitlement, false, why)) return false;
+    if (!m.entitlement.empty() && m.entitlement != "member"){ why = "entitlement \"" + m.entitlement + "\" is not \"member\""; return false; }
+    if (!BoolMember(j, "keyed", m.keyed, why) || !BoolMember(j, "auto", m.autoInstall, why)) return false;
+    if (m.keyed && (m.entitlement.empty() || m.type != "addon")){ why = "a keyed package must be a members-only add-on"; return false; }
     if (!SafeId(m.id)){ why = "manifest id is not a safe id"; return false; }
     if (!CheckType(m.type, why)) return false;
     if (!ParseVersion(m.version, &m.ver)){ why = "manifest version is not a.b.c.d"; return false; }
@@ -311,18 +344,25 @@ inline bool ParseManifest(const char* p, size_t n, Manifest& m, std::string& why
         if (!sz || !sz->isNum() || !sz->isInt || sz->i < 0 || (uint64_t)sz->i > kMaxFile){ why = f.path + ": bad size"; return false; }
         f.size = (uint64_t)sz->i;
         if (f.url.empty()) f.url = f.path;
+        if (const ghjson::Value* se = e.get("sealed")){
+            // Ciphertext iv(12)||ct||tag(16); the key comes from /api/payload (gh_ent.h).
+            if (!se->isBool()){ why = f.path + ": sealed is not a boolean"; return false; }
+            f.sealed = se->b;
+            if (f.sealed && m.entitlement.empty()){ why = f.path + ": sealed file in a package with no entitlement"; return false; }
+            if (f.sealed && f.size < 28){ why = f.path + ": sealed file is too small"; return false; }
+        }
         if (const ghjson::Value* fr = e.get("from")){
             if (!ParseFrom(*fr, f, why)){ why = f.path + ": " + why; return false; }
             if (m.type != "addon"){ why = f.path + ": only an add-on file can come from a third party"; return false; }
+            if (f.sealed){ why = f.path + ": a third-party file cannot be sealed"; return false; }
         }
         for (const auto& o : m.files)
             if (_stricmp(o.path.c_str(), f.path.c_str()) == 0){ why = "file \"" + f.path + "\" listed twice"; return false; }
+        if (m.keyed && (f.sealed || f.hasFrom)){ why = f.path + ": a keyed package's files are packs, not sealed or third-party files"; return false; }
         if (m.type == "title"){
-            // A title package is config only: *.ghtitle.json, flat, small.
-            const std::string sfx = ".ghtitle.json";
-            if (f.path.find('/') != std::string::npos || f.path.size() <= sfx.size() ||
-                f.path.compare(f.path.size() - sfx.size(), sfx.size(), sfx) != 0){
-                why = "title package file \"" + f.path + "\" is not a flat *.ghtitle.json"; return false; }
+            // A title package is config only: flat *.ghtitle.json + its seed/<Name>/ files, small.
+            if (!IsTitleConfigPath(f.path) && !IsTitleSeedPath(f.path)){
+                why = "title package file \"" + f.path + "\" is not a flat *.ghtitle.json or seed/<Name>/..."; return false; }
             if (f.size > kMaxDoc){ why = f.path + ": a title file is larger than 1 MiB"; return false; }
         }
         m.files.push_back(std::move(f));
@@ -354,6 +394,29 @@ inline const Key* FindKey(const std::string& id)
     return nullptr;
 }
 
+// ECDSA P-256 over a SHA-256 digest, signature as raw r||s (what ghpkg.py, JOSE
+// ES256 and BCryptVerifySignature all use). Shared by index.sig and gh_ent.h tokens.
+inline bool VerifyP256(const uint8_t xy[64], const uint8_t digest[32], const uint8_t sig[64], std::string& why)
+{
+    BCRYPT_ALG_HANDLE alg = nullptr; BCRYPT_KEY_HANDLE key = nullptr;
+    NTSTATUS st = BCryptOpenAlgorithmProvider(&alg, BCRYPT_ECDSA_P256_ALGORITHM, nullptr, 0);
+    if (st != 0){ char b[64]; snprintf(b, sizeof b, "ECDSA P-256 unavailable (0x%08lx)", (unsigned long)st); why = b; return false; }
+    uint8_t blob[sizeof(BCRYPT_ECCKEY_BLOB) + 64];
+    BCRYPT_ECCKEY_BLOB* hdr = (BCRYPT_ECCKEY_BLOB*)blob;
+    hdr->dwMagic = BCRYPT_ECDSA_PUBLIC_P256_MAGIC; hdr->cbKey = 32;
+    memcpy(blob + sizeof(*hdr), xy, 64);
+    st = BCryptImportKeyPair(alg, nullptr, BCRYPT_ECCPUBLIC_BLOB, &key, blob, (ULONG)sizeof(blob), 0);
+    bool ok = false;
+    if (st == 0){
+        st = BCryptVerifySignature(key, nullptr, (PUCHAR)digest, 32, (PUCHAR)sig, 64, 0);
+        ok = (st == 0);
+        if (!ok) why = "signature does not verify";
+        BCryptDestroyKey(key);
+    } else { char b[64]; snprintf(b, sizeof b, "key import failed (0x%08lx)", (unsigned long)st); why = b; }
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+}
+
 // Check index.sig over the index bytes. why names what failed.
 inline bool VerifyIndexSig(const std::vector<uint8_t>& index, const std::string& sigText,
                            std::string& why, std::string* keyLabel = nullptr)
@@ -373,23 +436,8 @@ inline bool VerifyIndexSig(const std::vector<uint8_t>& index, const std::string&
 
     uint8_t digest[32];
     { Sha256 s; s.add(index.data(), index.size()); if (!s.finish(digest)){ why = "sha256 failed"; return false; } }
-
-    BCRYPT_ALG_HANDLE alg = nullptr; BCRYPT_KEY_HANDLE key = nullptr;
-    NTSTATUS st = BCryptOpenAlgorithmProvider(&alg, BCRYPT_ECDSA_P256_ALGORITHM, nullptr, 0);
-    if (st != 0){ char b[64]; snprintf(b, sizeof b, "ECDSA P-256 unavailable (0x%08lx)", (unsigned long)st); why = b; return false; }
-    uint8_t blob[sizeof(BCRYPT_ECCKEY_BLOB) + 64];
-    BCRYPT_ECCKEY_BLOB* hdr = (BCRYPT_ECCKEY_BLOB*)blob;
-    hdr->dwMagic = BCRYPT_ECDSA_PUBLIC_P256_MAGIC; hdr->cbKey = 32;
-    memcpy(blob + sizeof(*hdr), k->xy, 64);
-    st = BCryptImportKeyPair(alg, nullptr, BCRYPT_ECCPUBLIC_BLOB, &key, blob, (ULONG)sizeof(blob), 0);
-    bool ok = false;
-    if (st == 0){
-        st = BCryptVerifySignature(key, nullptr, digest, 32, sig.data(), 64, 0);
-        ok = (st == 0);
-        if (!ok){ char b[96]; snprintf(b, sizeof b, "signature does not verify (key %s, 0x%08lx)", kid.c_str(), (unsigned long)st); why = b; }
-        BCryptDestroyKey(key);
-    } else { char b[64]; snprintf(b, sizeof b, "key import failed (0x%08lx)", (unsigned long)st); why = b; }
-    BCryptCloseAlgorithmProvider(alg, 0);
+    bool ok = VerifyP256(k->xy, digest, sig.data(), why);
+    if (!ok && why == "signature does not verify") why += " (key " + kid + ")";
     if (ok && keyLabel) *keyLabel = std::string(k->label) + " (" + kid + ")";
     return ok;
 }
@@ -457,6 +505,65 @@ inline bool HttpGet(const std::string& url, uint64_t maxBytes, std::vector<uint8
     ok = true;
     if (sha256Out){ uint8_t d[32]; *sha256Out = sh.finish(d) ? Hex(d, 32) : std::string(); }
     if (gotBytes) *gotBytes = total;
+done:
+    if (req) WinHttpCloseHandle(req);
+    if (con) WinHttpCloseHandle(con);
+    if (ses) WinHttpCloseHandle(ses);
+    return ok;
+}
+
+// One request with any method, small body in and out. Unlike HttpGet, any HTTP
+// status counts as an answer: true means the server replied (status says what),
+// false means no reply at all (DNS, connect, TLS, timeout). gh_ent.h needs the
+// difference: a 401 locks the console, no answer keeps the offline grace.
+// extraHeaders is CRLF-separated. The body and the response are never logged.
+inline bool HttpRequest(const wchar_t* method, const std::string& url, const std::wstring& extraHeaders,
+                        const std::string& reqBody, uint64_t maxBytes, std::string* respBody,
+                        DWORD* status, std::string& why)
+{
+    if (status) *status = 0;
+    std::wstring wurl = Widen(url);
+    URL_COMPONENTS uc{}; uc.dwStructSize = sizeof(uc);
+    wchar_t host[256] = {}, path[2048] = {};
+    uc.lpszHostName = host; uc.dwHostNameLength = 255;
+    uc.lpszUrlPath = path;  uc.dwUrlPathLength = 2047;
+    wchar_t extra[1024] = {}; uc.lpszExtraInfo = extra; uc.dwExtraInfoLength = 1023;
+    if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &uc)){ why = "bad URL " + url; return false; }
+    if (uc.nScheme != INTERNET_SCHEME_HTTP && uc.nScheme != INTERNET_SCHEME_HTTPS){ why = "not http(s): " + url; return false; }
+    std::wstring obj = std::wstring(path) + extra;
+    if (obj.empty()) obj = L"/";
+
+    bool ok = false; uint64_t total = 0;
+    HINTERNET ses = WinHttpOpen(L"Greenhouse/1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET con = nullptr, req = nullptr;
+    if (!ses){ why = "WinHttpOpen failed"; goto done; }
+    WinHttpSetTimeouts(ses, 10000, 10000, 15000, 30000);
+    con = WinHttpConnect(ses, host, uc.nPort, 0);
+    if (!con){ why = "connect failed (" + std::to_string(GetLastError()) + ")"; goto done; }
+    req = WinHttpOpenRequest(con, method, obj.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                             uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+    if (!req){ why = "open request failed"; goto done; }
+    if (!WinHttpSendRequest(req, extraHeaders.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : extraHeaders.c_str(),
+                            extraHeaders.empty() ? 0 : (DWORD)-1L,
+                            reqBody.empty() ? WINHTTP_NO_REQUEST_DATA : (LPVOID)reqBody.data(),
+                            (DWORD)reqBody.size(), (DWORD)reqBody.size(), 0) ||
+        !WinHttpReceiveResponse(req, nullptr)){ why = "request failed (" + std::to_string(GetLastError()) + ")"; goto done; }
+    {
+        DWORD st = 0, sl = sizeof(st);
+        WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
+                            &st, &sl, WINHTTP_NO_HEADER_INDEX);
+        if (status) *status = st;
+    }
+    for (;;){
+        uint8_t buf[16384]; DWORD got = 0;
+        if (!WinHttpReadData(req, buf, sizeof(buf), &got)){ why = "read failed (" + std::to_string(GetLastError()) + ")"; goto done; }
+        if (!got) break;
+        total += got;
+        if (total > maxBytes){ why = "response larger than expected"; goto done; }
+        if (respBody) respBody->append((const char*)buf, got);
+    }
+    ok = true;
 done:
     if (req) WinHttpCloseHandle(req);
     if (con) WinHttpCloseHandle(con);
@@ -601,6 +708,14 @@ struct Config {
     // Progress for the UI: bytes done / total of the package being installed.
     volatile LONG64* progDone = nullptr; volatile LONG64* progTotal = nullptr;
     volatile LONG* cancel = nullptr;
+    // Decrypts a "sealed" file in place once its ciphertext matched the manifest
+    // (gh_ent.h: key from /api/payload). Not set = members-only packages are refused.
+    bool (*unseal)(const std::string& pkg, const std::string& version, const std::string& path,
+                   const std::wstring& part, std::string& why) = nullptr;
+    // Fetches and stores a keyed package's one key (gh_ent.h StorePackageKey). Asked
+    // BEFORE the download, so a console that may not have it never pulls the packs.
+    // Not set = keyed packages are refused.
+    bool (*packageKey)(const std::string& pkg, const std::string& version, std::string& why) = nullptr;
 };
 
 inline void Log(const Config& c, const std::string& s){ if (c.log) c.log(s); }
@@ -712,6 +827,13 @@ inline bool Install(const Config& c, const Index& idx, const std::string& id, st
     if (!ParseManifest((const char*)mb.data(), mb.size(), m, why)) return false;
     if (m.id != e->id || m.type != e->type || m.version != e->version){ why = id + ": manifest id/type/version differ from the index"; return false; }
     if (m.minLoaderV && c.loaderVersion && c.loaderVersion < m.minLoaderV){ why = id + " needs loader " + m.minLoader; return false; }
+    for (const auto& f : m.files)
+        if (f.sealed && !c.unseal){ why = id + " is members-only and this loader cannot open it"; return false; }
+    if (m.keyed){
+        if (!c.packageKey){ why = id + " is members-only and this loader cannot open it"; return false; }
+        if (!c.packageKey(m.id, m.version, why)){ why = id + ": " + why; return false; }
+        Log(c, "REPO package key ok " + m.id + " " + m.version);
+    }
 
     uint64_t total = 0; for (const auto& f : m.files) total += f.hasFrom ? f.from.length : f.size;   // bytes on the wire
     if (c.progTotal) *c.progTotal = (LONG64)total;
@@ -736,8 +858,11 @@ inline bool Install(const Config& c, const Index& idx, const std::string& id, st
     for (const auto& f : m.files){
         std::wstring rel = Widen(f.path); for (auto& ch : rel) if (ch == L'/') ch = L'\\';
         std::wstring part;
-        if (title) part = c.titleDir + rel + L".part";
-        else {
+        if (title){
+            part = c.titleDir + rel + L".part";
+            size_t bs = part.rfind(L'\\');
+            if (!MakeDirs(part.substr(0, bs + 1))){ why = "cannot create a folder for " + f.path; cleanup(); return false; }
+        } else {
             part = stageDir + L"\\" + rel;
             size_t bs = part.rfind(L'\\');
             if (!MakeDirs(part.substr(0, bs + 1))){ why = "cannot create a folder for " + f.path; cleanup(); return false; }
@@ -760,12 +885,14 @@ inline bool Install(const Config& c, const Index& idx, const std::string& id, st
         CloseHandle(h);
         if (!ok){ cleanup(); return false; }
         if (n != f.size || got != f.sha256){ why = f.path + ": size/sha256 do not match the manifest"; cleanup(); return false; }
-        if (title && c.checkTitle){
+        if (f.sealed && !c.unseal(m.id, m.version, f.path, part, why)){ why = f.path + ": " + why; cleanup(); return false; }
+        if (title && c.checkTitle && IsTitleConfigPath(f.path)){
             std::vector<uint8_t> tb;
             if (!ReadFileAll(part, tb, kMaxDoc) || !c.checkTitle(tb, m.id, why)){ why = f.path + ": " + why; cleanup(); return false; }
         }
         done += n; if (c.progDone) *c.progDone = (LONG64)done;
-        Log(c, "REPO file ok " + m.id + "/" + f.path + " " + std::to_string(n) + " B sha256=" + got.substr(0, 16));
+        Log(c, "REPO file ok " + m.id + "/" + f.path + " " + std::to_string(n) + " B sha256=" + got.substr(0, 16) +
+               (f.sealed ? " (sealed, opened)" : ""));
     }
 
     // Commit. Everything is on disk and verified.
