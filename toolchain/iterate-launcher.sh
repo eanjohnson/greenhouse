@@ -340,6 +340,10 @@ import wdp
 st,_ = wdp.req('DELETE','/api/filesystem/apps/file?knownfolderid=LocalAppData&packagefullname='
     + "$PFN" + '&path=' + urllib.parse.quote('\\LocalState') + '&filename=loader_diag.txt')
 print("  cleared loader_diag.txt ->", st)
+# §56: the diag now lives in D:\\DevelopmentFiles\\gh_diag (out of the LocalState quota).
+st,_ = wdp.req('DELETE','/api/filesystem/apps/file?knownfolderid=DevelopmentFiles&path='
+    + urllib.parse.quote('\\gh_diag') + '&filename=loader_diag.txt')
+print("  cleared gh_diag\\loader_diag.txt ->", st)
 PYEOF
 
 echo "== launch =="

@@ -186,9 +186,29 @@ static std::deque<std::string> g_diagRing;   // last N Diag lines for the launch
 // the budget is read once at init rather than through GhCfgNum inside Diag, because
 // GhCfgNum is declared further down the file than Diag, so read the knob here with
 // the same three Win32 calls it uses.
+// §56: where the diag lives. LocalState is one ~35 MB quota shared with the GAME's
+// own log, and Tsushima's log alone fills it: the diag latched DISK_FULL about
+// 2,000 lines in, so every FRAME counter read zero. D:\DevelopmentFiles has
+// gigabytes and no quota (WDP reads it as knownfolderid=DevelopmentFiles), so the
+// diag goes to D:\DevelopmentFiles\gh_diag\ and leaves the quota to the game.
+// LocalState is the fallback, and gh_diag_local.txt in LocalState forces it.
+static const std::wstring& GhDiagDir()
+{
+    static const std::wstring d = []{
+        const std::wstring local(kLocalState);
+        if (GetFileAttributesW((local + L"gh_diag_local.txt").c_str()) != INVALID_FILE_ATTRIBUTES)
+            return local;
+        const std::wstring dev = std::wstring(kDevRoot) + L"gh_diag\\";
+        if (CreateDirectoryW(dev.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS)
+            return dev;
+        return local;
+    }();
+    return d;
+}
+static bool GhDiagOnDev() { return GhDiagDir() != std::wstring(kLocalState); }
 static uint64_t GhDiagCapBytes()
 {
-    unsigned mb = 16;
+    unsigned mb = GhDiagOnDev() ? 64 : 16;
     char env[32] = {};
     if (GetEnvironmentVariableA("GH_DIAG_CAP_MB", env, sizeof env) > 0 && env[0])
         mb = (unsigned)strtoul(env, nullptr, 10);
@@ -251,15 +271,15 @@ static void Diag(const std::string& s)
     static const uint64_t kCap  = GhDiagCapBytes();
     static const uint64_t kSeg  = (kCap / 4 < (256ull << 10)) ? (256ull << 10) : kCap / 4;
     static const uint64_t kHead = kCap > 2 * kSeg ? kCap - 2 * kSeg : kCap / 2;
-    static const std::wstring kTail[2] = { std::wstring(kLocalState) + L"loader_diag_tail0.txt",
-                                           std::wstring(kLocalState) + L"loader_diag_tail1.txt" };
+    static const std::wstring kTail[2] = { GhDiagDir() + L"loader_diag_tail0.txt",
+                                           GhDiagDir() + L"loader_diag_tail1.txt" };
     // A fresh log (the harness deletes loader_diag.txt before every launch) must
     // not sit beside the previous run's tail segments. A launch that APPENDS to an
     // existing head (a player relaunching, no harness) leaves them: they may hold
     // the previous run's death, and every segment header names its pid, which the
     // head's own lines can be matched against.
     static const bool kTailCleared = [](){
-        const std::wstring head = std::wstring(kLocalState) + L"loader_diag.txt";
+        const std::wstring head = GhDiagDir() + L"loader_diag.txt";
         if (GetFileAttributesW(head.c_str()) == INVALID_FILE_ATTRIBUTES){
             DeleteFileW(kTail[0].c_str()); DeleteFileW(kTail[1].c_str());
         }
@@ -317,7 +337,7 @@ static void Diag(const std::string& s)
     // (and delete, so clearing the log still works) removes the collision, and the
     // retry covers anyone outside this process holding it briefly. Drops are now
     // counted and reported rather than invisible.
-    static const std::wstring kPath = std::wstring(kLocalState) + L"loader_diag.txt";
+    static const std::wstring kPath = GhDiagDir() + L"loader_diag.txt";
     static std::atomic<uint64_t> dropped{0};
     static std::atomic<uint64_t> wfailed{0};
     static std::atomic<uint32_t> lastWriteErr{0};
@@ -340,6 +360,13 @@ static void Diag(const std::string& s)
             : (s + "\r\n");
         // Report accumulated drops on the next line that does get through, so a
         // gap in the log is visible instead of silent.
+        static std::atomic<bool> sinkSaid{false};
+        if (!sinkSaid.exchange(true, std::memory_order_relaxed)){
+            const std::wstring& dd = GhDiagDir();
+            line = "DIAG SINK " + std::string(dd.begin(), dd.end()) + " cap=" +
+                   std::to_string(kCap >> 20) + "MB pid=" +
+                   std::to_string((unsigned long)GetCurrentProcessId()) + "\r\n" + line;
+        }
         uint64_t d = dropped.exchange(0, std::memory_order_relaxed);
         if (d) line = "DIAG DROPPED " + std::to_string(d) +
                       " line(s) -- log was locked\r\n" + line;
@@ -690,6 +717,7 @@ static void GhCoreHeapBigDump(const char* when);               // #158 large-req
 static void GhSecStats(const char* when);                      // #158 section/mapping traffic (mode 4)
 static void GhSecBigDump(const char* when);                    // #158 section ring (mode 4)
 extern volatile bool g_guestDone;
+static void GhRunGuestAtexit();     // §56: the exe's atexit table; exit() runs it, nothing else does
 
 // A guest's exit() terminates the guest WORKER THREAD rather than longjmp-ing
 // back to the loader frame.
@@ -701,7 +729,7 @@ extern volatile bool g_guestDone;
 // assembly frames faults (0xc00000ff), which Go's own vectored handler then
 // reports as a crash. ExitThread does not unwind at all, so it is safe from any
 // stack context; we just have to finish the session's bookkeeping first.
-[[noreturn]] static void __cdecl Bed_exit(int code)
+[[noreturn]] static void GhGuestExit(int code, bool crtExit)
 {
     if (t_child){                       // a child exits ONLY its own thread; the
         FlushGuestCrt();                // thread's exit code becomes the child's
@@ -718,15 +746,24 @@ extern volatile bool g_guestDone;
     // as much a decision as a failing one, and the decision site is the only datum
     // that matters either way.
     DiagGuestBacktrace("exit");
+    // §56. exit() runs the exe's static destructors before the process goes, and
+    // they are how a game takes back what it lent the OS: Unreal's audio device
+    // notification client unregisters there. Skipped, AUDIOSES kept a pointer into
+    // RV's .data and called it from an MMDevAPI thread once the next game opened a
+    // stream -- a fault in the freed image that took the whole app down.
+    if (crtExit){ GhRunGuestAtexit(); FlushGuestCrt(); }
     FinishGuestSession();
     g_guestDone = true;             // set last: the host may exit once it sees this
     ExitThread((DWORD)code);
 }
-[[noreturn]] static void __cdecl Bed_abort(){ Bed_exit(134); }
-[[noreturn]] static void __cdecl Bed_cexit(){ Bed_exit(0); }
-[[noreturn]] static BOOL WINAPI Bed_TerminateProcess(HANDLE, UINT code){ Bed_exit((int)code); }
+// _exit, abort, ExitProcess and TerminateProcess skip the atexit table, as they do natively.
+[[noreturn]] static void __cdecl Bed_exit(int code){ GhGuestExit(code, true); }
+[[noreturn]] static void __cdecl Bed__exit(int code){ GhGuestExit(code, false); }
+[[noreturn]] static void __cdecl Bed_abort(){ GhGuestExit(134, false); }
+[[noreturn]] static void __cdecl Bed_cexit(){ GhGuestExit(0, false); }
+[[noreturn]] static BOOL WINAPI Bed_TerminateProcess(HANDLE, UINT code){ GhGuestExit((int)code, false); }
 // A statically-linked-CRT guest (sqlite3) calls ExitProcess directly.
-[[noreturn]] static void WINAPI Bed_ExitProcess(UINT code){ Bed_exit((int)code); }
+[[noreturn]] static void WINAPI Bed_ExitProcess(UINT code){ GhGuestExit((int)code, false); }
 
 
 // ===========================================================================
@@ -1105,6 +1142,9 @@ static bool GhVfsTraceOn(){
 }
 static void VfsTrace(const char* api, const wchar_t* g, const std::wstring& r){
     if(!g_vfsTrace || !GhVfsTraceOn()) return;
+    // Our own Steam shim reopens gh_shim.log for every line it writes: ~7% of a
+    // whole run's diag was that one path (§56). It is ours, not the guest's.
+    if (r.size() >= 12 && _wcsicmp(r.c_str() + r.size() - 12, L"\\gh_shim.log") == 0) return;
     std::wstring gw(g ? g : L"");
     std::string gg(gw.begin(), gw.end());
     std::string rr(r.begin(), r.end());
@@ -2923,6 +2963,75 @@ static std::wstring GhModBaseFor(const std::wstring& exeDir, std::wstring& projR
     return exeDir;
 }
 
+// §56. Unreal's XInput backend asks all four slots once at startup and afterwards
+// only re-polls a slot it already believes is connected; "a pad appeared" is meant
+// to arrive as a device-change notification, which this container never produces
+// (WM_DEVICECHANGE injected by us is dispatched but does not trigger the re-poll).
+// The launcher starts a fresh host per game, so at that startup poll the synthetic
+// pad does not exist yet and the game ignores the controller for the whole run.
+// The engine's own switch for this is the CVar XInput.ForceControllerStateUpdate:
+// poll every slot every frame. Merge it into the user's Saved\Config Engine.ini
+// (UE5 "Windows", UE4 "WindowsNoEditor") under [SystemSettings], never overwriting
+// a value the user or the game wrote there.
+static void GhUeForceXInputPoll(const std::wstring& exePath)
+{
+    const size_t slash = exePath.find_last_of(L'\\');
+    if (slash == std::wstring::npos) return;
+    static const wchar_t kShip[] = L"-Win64-Shipping.exe";
+    const std::wstring leaf = exePath.substr(slash + 1);
+    const size_t ks = wcslen(kShip);
+    if (leaf.size() <= ks || _wcsicmp(leaf.c_str() + leaf.size() - ks, kShip) != 0) return;
+    std::wstring projRel;
+    const std::wstring root = GhModBaseFor(exePath.substr(0, slash + 1), projRel);
+    if (projRel.size() < 2) return;
+    const DWORD ea = GetFileAttributesW((root + L"Engine").c_str());
+    if (ea == INVALID_FILE_ATTRIBUTES || !(ea & FILE_ATTRIBUTE_DIRECTORY)) return;
+    // The same answer the guest gets for FOLDERID_LocalAppData (UE's UserSettingsDir).
+    static const GUID kLocalAppData = { 0xF1B32785, 0x6FBA, 0x4FCF, { 0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91 } };
+    PWSTR ladp = nullptr;
+    if (FAILED(Bed_SHGetKnownFolderPath(kLocalAppData, 0, nullptr, &ladp)) || !ladp) return;
+    const std::wstring lad(ladp);
+    CoTaskMemFree(ladp);
+    const std::wstring proj = projRel.substr(0, projRel.size() - 1);
+    static const char kKey[] = "XInput.ForceControllerStateUpdate";
+    for (const wchar_t* plat : { L"Windows", L"WindowsNoEditor" }){
+        const std::wstring guest = lad + L"\\" + proj + L"\\Saved\\Config\\" + plat + L"\\Engine.ini";
+        const std::wstring real = MapToReal(guest.c_str());
+        if (real.empty()) continue;
+        std::string ini;
+        if (FILE* f = _wfopen(real.c_str(), L"rb")){
+            char buf[4096]; size_t r;
+            while ((r = fread(buf, 1, sizeof buf, f)) > 0) ini.append(buf, r);
+            fclose(f);
+        }
+        std::string low = ini;
+        for (auto& c : low) c = (char)std::tolower((unsigned char)c);
+        std::string lowKey = kKey;
+        for (auto& c : lowKey) c = (char)std::tolower((unsigned char)c);
+        const char* what;
+        if (low.find(lowKey) != std::string::npos){
+            what = "already set";
+        } else {
+            const size_t sec = low.find("[systemsettings]");
+            if (sec == std::string::npos){
+                if (!ini.empty() && ini.back() != '\n') ini += "\r\n";
+                ini += "[SystemSettings]\r\n" + std::string(kKey) + "=1\r\n";
+            } else {
+                size_t eol = ini.find('\n', sec);
+                const std::string line = std::string(kKey) + "=1\r\n";
+                if (eol == std::string::npos){ ini += "\r\n" + line; }
+                else ini.insert(eol + 1, line);
+            }
+            EnsureParentOf(real);
+            FILE* f = _wfopen(real.c_str(), L"wb");
+            bool ok = f && fwrite(ini.data(), 1, ini.size(), f) == ini.size();
+            if (f) fclose(f);
+            what = ok ? "merged" : "WRITE FAILED";
+        }
+        Diag(std::string("UE xinput poll CVar ") + what + " -> " + std::string(real.begin(), real.end()));
+    }
+}
+
 static void GhModsBegin()
 {
     g_modTarget.clear();
@@ -3567,6 +3676,20 @@ static DWORD WINAPI GuestThreadStub(LPVOID p)
 // asked for eight workers and got one, or a CreateThread that failed, both show
 // up here -- and both look identical from the outside otherwise.
 static volatile LONG g_guestThreadN = 0;
+// §56: every thread the guest asked for, by id, so a guest exit can freeze exactly
+// these before its image is freed. The heuristics in SuspendLeftoverGuestThreads
+// only knew OS-loaded modules; an Unreal game's threads start in the exe we map
+// ourselves and were never found (RV: guest_threads_suspend skipped, then four
+// threads faulting in the freed image).
+static std::vector<DWORD> g_guestTids;
+static SRWLOCK            g_guestTidLock = SRWLOCK_INIT;
+static void GhNoteGuestTid(DWORD tid)
+{
+    if (!tid) return;
+    AcquireSRWLockExclusive(&g_guestTidLock);
+    g_guestTids.push_back(tid);
+    ReleaseSRWLockExclusive(&g_guestTidLock);
+}
 static HANDLE WINAPI Bed_CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stack,
                                       LPTHREAD_START_ROUTINE fn, LPVOID arg,
                                       DWORD flags, LPDWORD tid)
@@ -3583,10 +3706,48 @@ static HANDLE WINAPI Bed_CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stack,
     }
     DWORD e = h ? 0 : GetLastError();
     if (tid) *tid = id;
+    if (h) GhNoteGuestTid(id);
     Diag("GUESTTHREAD #" + std::to_string(n) + " fn=" + NameForCodeAddr((uintptr_t)fn) +
          " stack=" + Hex((uint64_t)stack) + " flags=" + Hex((uint32_t)flags) +
          (h ? " -> tid=" + std::to_string(id)
             : " -> FAILED err=" + Hex(e)));
+    return h;
+}
+// The CRT's thread starts (std::thread, _beginthread) call CreateThread from inside
+// ucrtbase, whose imports are not ours, so they never reach Bed_CreateThread. Record
+// them here; the thread itself is created exactly as before.
+typedef uintptr_t (__cdecl *GhBeginThreadExFn)(void*, unsigned, unsigned (__stdcall*)(void*), void*, unsigned, unsigned*);
+typedef uintptr_t (__cdecl *GhBeginThreadFn)(void (__cdecl*)(void*), unsigned, void*);
+static FARPROC GhUcrtProc(const char* name)
+{
+    HMODULE uc = GetModuleHandleA("ucrtbase.dll");
+    if (!uc) uc = LoadLibraryA("ucrtbase.dll");
+    return uc ? GetProcAddress(uc, name) : nullptr;
+}
+static uintptr_t __cdecl Bed_beginthreadex(void* sa, unsigned stack, unsigned (__stdcall* fn)(void*),
+                                           void* arg, unsigned flags, unsigned* tid)
+{
+    static auto real = (GhBeginThreadExFn)GhUcrtProc("_beginthreadex");
+    if (!real){ errno = EINVAL; return 0; }
+    unsigned id = 0;
+    const uintptr_t h = real(sa, stack, fn, arg, flags, &id);
+    if (tid) *tid = id;
+    if (h){
+        GhNoteGuestTid(id);
+        const LONG n = InterlockedIncrement(&g_guestThreadN);
+        Diag("GUESTTHREAD #" + std::to_string(n) + " crt fn=" + NameForCodeAddr((uintptr_t)fn) +
+             " -> tid=" + std::to_string(id));
+    }
+    return h;
+}
+static uintptr_t __cdecl Bed_beginthread(void (__cdecl* fn)(void*), unsigned stack, void* arg)
+{
+    static auto real = (GhBeginThreadFn)GhUcrtProc("_beginthread");
+    if (!real){ errno = EINVAL; return (uintptr_t)-1; }
+    const uintptr_t h = real(fn, stack, arg);
+    // _beginthread's handle closes itself when the thread ends, so the id may
+    // already be gone; a thread that has ended needs no freezing.
+    if (h && h != (uintptr_t)-1) GhNoteGuestTid(GetThreadId((HANDLE)h));
     return h;
 }
 
@@ -6755,7 +6916,7 @@ static HRESULT GfxPresent(UINT sync)
     if (g_overlayQuitNow) {
         g_overlayQuitNow = false;
         Diag("OVERLAY quit: Bed_exit after Present unlock");
-        Bed_exit(0);
+        GhGuestExit(0, false);   // the player quit: no static destructors on the render thread
     }
 #endif
 
@@ -6967,6 +7128,7 @@ static volatile LONG g_vramPressN   = 0;       // QVMI calls with the knob on
 static volatile LONG g_vramPressWon = 0;       //   ... where CONTAINER pressure was worse
 static unsigned g_cpuCount   = 0;              // #150: 0 = report the container's real count
 static const HWND kFakeHwnd = (HWND)0x00477A01;
+static volatile DWORD g_guestWndTid = 0;     // thread that created the guest's window
 
 // ------------------------------------------------------------------
 // Minimal IDXGISwapChain{,1} proxy handed to the guest. Only the members a normal
@@ -33659,9 +33821,14 @@ static void GhUmdVaDump(int want)
 // Scoring: `SCACHE install`, then `SCACHE intercept <fn>` x9, then the census counters.  A run
 // with the knob on and no `SCACHE install` line is VOID, not a negative -- grep `CFG gh_scache`
 // first ([[loader-knob-reads-are-logged]]).
+// §56: 3 for every title, not only the one whose config asks. The driver's cache is one
+// process-global store that every game after the first shares, so a process that boots
+// without the guard leaves the next game unguarded too: RV booted with gh_scache=0, and
+// Gang Beasts, launched after it in the same process, died at scache+0x5855 in the
+// default store on U:, which nothing quarantines. GhCfgNum, so an uploaded 0 keeps 3.
 static unsigned GhScacheMode()
 {
-    static const unsigned m = GhCfgNum(L"gh_scache.txt", "GH_SCACHE", 0);
+    static const unsigned m = GhCfgNum(L"gh_scache.txt", "GH_SCACHE", 3);
     return m;
 }
 
@@ -33716,7 +33883,9 @@ static void GhScacheCensus(const char* why)
 // ([[localstate-quota-starves-diag]]); that is exactly what the cell measures.
 static unsigned GhScacheX()
 {
-    static const unsigned m = GhCfgNum(L"gh_scache_x.txt", "GH_SCACHE_X", 64);
+    // §56: 128 for everyone, Tsushima's value: every title opens the same store, so it
+    // must open it with the same geometry.
+    static const unsigned m = GhCfgNum(L"gh_scache_x.txt", "GH_SCACHE_X", 128);
     return m;
 }
 
@@ -33759,6 +33928,57 @@ static uint64_t GhScResizeDesc(uint64_t desc, GhScDescCopy* tmp)
     return (uint64_t)(uintptr_t)tmp->b;
 }
 
+static volatile LONG g_scPoisoned = 0;
+static thread_local int t_ghHostSehGuard = 0;   // >0: this thread is inside a guarded host call
+
+// §56. An exe linked against the UCRT DLL registers its static destructors with
+// _crt_atexit, into ONE process-wide table inside ucrtbase that only exit() ever
+// runs. Every game that ever lived in this process would leave its entries there,
+// pointing into an image we have since freed. The guest's go to a table of ours,
+// for this session only, and Bed_exit runs them last-registered first.
+typedef void (__cdecl* GhPvfv)();
+static std::vector<GhPvfv> g_guestAtexit;
+static SRWLOCK             g_guestAtexitLock = SRWLOCK_INIT;
+static int __cdecl Bed_crt_atexit(GhPvfv fn)
+{
+    if (!fn) return -1;
+    AcquireSRWLockExclusive(&g_guestAtexitLock);
+    g_guestAtexit.push_back(fn);
+    ReleaseSRWLockExclusive(&g_guestAtexitLock);
+    return 0;
+}
+static void GhClearGuestAtexit()
+{
+    AcquireSRWLockExclusive(&g_guestAtexitLock);
+    g_guestAtexit.clear();
+    ReleaseSRWLockExclusive(&g_guestAtexitLock);
+}
+static void GhRunGuestAtexit()
+{
+    const ULONGLONG t0 = GetTickCount64();
+    size_t ran = 0; int faults = 0;
+    // A destructor may register more (a function-local static first touched during
+    // shutdown); those run in the next round, as the UCRT's loop would run them.
+    for (int round = 0; round < 4; ++round){
+        std::vector<GhPvfv> v;
+        AcquireSRWLockExclusive(&g_guestAtexitLock);
+        v.swap(g_guestAtexit);
+        ReleaseSRWLockExclusive(&g_guestAtexitLock);
+        if (v.empty()) break;
+        if (round == 0) Diag("STAGE=guest_atexit_begin n=" + std::to_string(v.size()));
+        for (size_t i = v.size(); i-- > 0; ){
+            const GhPvfv f = v[i];
+            ++t_ghHostSehGuard;
+            const bool ok = GhSehCall([&]{ f(); });
+            --t_ghHostSehGuard;
+            ++ran;
+            if (!ok && ++faults <= 4) Diag("guest_atexit fault fn=" + Hex((uint64_t)(uintptr_t)f));
+        }
+    }
+    Diag("STAGE=guest_atexit ran=" + std::to_string(ran) + " faults=" + std::to_string(faults) +
+         " ms=" + std::to_string(GetTickCount64() - t0));
+}
+static const wchar_t kScStoreDir[] = L"D:\\DevelopmentFiles\\ghsc";
 static uint64_t GhScDispatch(int i, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e)
 {
     LONG n = InterlockedIncrement(&g_scCalls[i]);
@@ -33767,7 +33987,28 @@ static uint64_t GhScDispatch(int i, uint64_t a, uint64_t b, uint64_t c, uint64_t
     GhScDescCopy tmp;
     uint64_t orig = a;
     if (i == 0 && n == 1) a = GhScResizeDesc(a, &tmp);   // index 0 is ShaderCache_Create
-    uint64_t r = f ? f(a, b, c, d, e) : 0;
+    // §56. A damaged store (a run killed mid-write) makes scache dereference garbage
+    // out of its own index: RV died twice at scache+0x5855 with the 1.39 GB store
+    // Tsushima filled. So every store call is guarded; the first fault turns the
+    // cache off for the rest of the run (a miss is always a correct answer: the
+    // driver compiles) and leaves a marker, and the next launch moves the store
+    // aside before ShaderCache_Create so the driver builds a fresh one. Create,
+    // Destroy and ComputeLocalHashKey still pass through.
+    if (g_scPoisoned && i != 0 && i != 2) return 0;
+    uint64_t r = 0;
+    bool ok = true;
+    if (f){ ++t_ghHostSehGuard; ok = GhSehCall([&]{ r = f(a, b, c, d, e); }); --t_ghHostSehGuard; }
+    if (!ok){
+        r = 0;
+        if (InterlockedExchange(&g_scPoisoned, 1) == 0){
+            const std::wstring mk = std::wstring(kScStoreDir) + L"\\gh_scache_bad.txt";
+            HANDLE h = CreateFileW(mk.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                   FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h != INVALID_HANDLE_VALUE){ DWORD w; WriteFile(h, kScNames[i], (DWORD)strlen(kScNames[i]), &w, nullptr); CloseHandle(h); }
+            Diag(std::string("SCACHE FAULT in ") + (kScNames[i] + 12) +
+                 " -- driver shader cache OFF for this run; the store is quarantined at the next launch");
+        }
+    }
     // ShaderCache_Create returns an HRESULT (0x8007000E is its own OOM path at scache+0x2a13).
     // If OUR resize is what made it fail -- the app-container folder has a quota we have not
     // measured -- fall back to the driver's own descriptor rather than leaving the driver with
@@ -33844,7 +34085,6 @@ static bool GhScNameIs(const wchar_t* w, const char* a)
 // CoTaskMemAlloc'd string and everything downstream is unchanged.  We patch it on
 // scache's own IAT, not process-wide, so nothing else in the process is affected.
 // ---------------------------------------------------------------------------
-static const wchar_t kScStoreDir[] = L"D:\\DevelopmentFiles\\ghsc";
 
 static HRESULT (WINAPI *g_scAcfpOrig)(PCWSTR, PWSTR*) = nullptr;
 
@@ -33878,6 +34118,20 @@ static void GhScInstallRedirect(HMODULE sc)
     // there, so the loader makes this one -- same idiom as ghlo/ghmiss above.
     DWORD mk = CreateDirectoryW(kScStoreDir, nullptr) ? 0 : GetLastError();
     if (mk == ERROR_ALREADY_EXISTS) mk = 0;
+    // §56: the last run faulted inside scache -> set the store aside (kept as *.bad
+    // for inspection, one generation) so this run's Create starts an empty one.
+    {
+        const std::wstring dir(kScStoreDir), bad = dir + L"\\gh_scache_bad.txt";
+        if (GetFileAttributesW(bad.c_str()) != INVALID_FILE_ATTRIBUTES){
+            int moved = 0;
+            for (const wchar_t* ext : { L".idx", L".val", L".lock" }){
+                const std::wstring from = dir + L"\\SCacheS" + ext, to = from + L".bad";
+                if (MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING)) ++moved;
+            }
+            DeleteFileW(bad.c_str());
+            Diag("SCACHE store quarantined after last run's fault: moved=" + std::to_string(moved) + " -> SCacheS.*.bad");
+        }
+    }
     bool ok = GhPatchHostImport(sc, "GetAppContainerFolderPath",
                                 (void*)&Hook_ScAppContainerFolderPath, (void**)&g_scAcfpOrig);
     Diag(std::string("SCACHE redirect install dir=") + (mk ? "err " + Hex(mk) : std::string("ok")) +
@@ -34282,6 +34536,7 @@ static void GhClassRegister(const wchar_t* name, WNDPROC proc, const char* which
     Diag(std::string("BED ") + which + " captured WndProc cls=" +
          std::string(n.begin(), n.end()) + " proc=" + Hex((uint64_t)(uintptr_t)proc));
 }
+static int g_injectIdx = 0;   // next message of the activation burst (FillInjectedMsg)
 static void GhClassSelect(const std::wstring& n)
 {
     WNDPROC p = nullptr;
@@ -34297,6 +34552,16 @@ static void GhClassSelect(const std::wstring& n)
     }
     const bool changed = (p != g_guestWndProc);
     g_guestWndProc = p;
+    g_guestWndTid  = GetCurrentThreadId();      // its messages belong to this thread
+    // §56. The activation burst goes to whichever proc is current at the guest's
+    // first pump. Unreal pumps before its UnrealWindow exists (the proc was Steam's
+    // winsock helper), so the game window never saw WM_ACTIVATE / WM_SETFOCUS, Slate
+    // never focused its viewport, and the pad and clicks went nowhere. A new window
+    // gets the burst again; a burst held by gh_rawinput bit 16 stays held.
+    if (changed && g_injectIdx > 0){
+        g_injectIdx = 0;
+        Diag("BED activation burst re-armed for the new window");
+    }
     Diag("BED WndProc now " + Hex((uint64_t)(uintptr_t)p) + " from cls=" +
          std::string(n.begin(), n.end()) + (changed ? "  *** CHANGED ***" : "  (unchanged)"));
 }
@@ -34627,9 +34892,25 @@ static LRESULT WINAPI Bed_DefWindowProcW(HWND, UINT, WPARAM, LPARAM){ return 0; 
 // padding some versions also look at. Delivered once, one per Peek call, then
 // the queue reports empty forever (Unity keeps rendering because it is active).
 static const UINT g_injectMsgs[] = { WM_ACTIVATEAPP, WM_ACTIVATE, WM_SETFOCUS, WM_NCACTIVATE };
-static int g_injectIdx = 0;
-static bool FillInjectedMsg(LPMSG m){
+// §56. Real Peek/GetMessage semantics. A window's messages go only to the thread
+// that created it, only when the caller's hwnd and range filters admit them, and a
+// PM_NOREMOVE peek leaves them queued. Unreal has several threads polling
+// PeekMessage (~900k calls by the menu); our queue used to hand the activation burst
+// and every click to whichever thread asked first, and that thread never dispatched
+// them, so RV There Yet? saw no input at all. Before the guest has a window there is
+// no owner yet and any thread is served, as before.
+static bool InjectAdmits(HWND h, UINT mn, UINT mx, UINT msg){
+    if (h && h != kFakeHwnd) return false;                  // another window, or (HWND)-1 = thread-only
+    if ((mn || mx) && (msg < mn || msg > mx)) return false;
+    return true;
+}
+static bool FillInjectedMsg(LPMSG m, HWND h = nullptr, UINT mn = 0, UINT mx = 0, UINT flags = PM_REMOVE){
     if (!g_guestWndProc || !m) return false;
+    {
+        const DWORD owner = g_guestWndTid;
+        if (owner && owner != GetCurrentThreadId()) return false;
+    }
+    const bool remove = (flags & PM_REMOVE) != 0;
     const int kNInject = (int)(sizeof(g_injectMsgs)/sizeof(g_injectMsgs[0]));
     // #199 bit 16. Activation is Unity's, and cell B measured what it costs
     // Tsushima: fired at the first pump call it takes appused 4.59 -> 4.97 GiB
@@ -34662,26 +34943,31 @@ static bool FillInjectedMsg(LPMSG m){
         }
     }
     if (g_injectIdx < kNInject){
-        UINT msg = g_injectMsgs[g_injectIdx++];
+        UINT msg = g_injectMsgs[g_injectIdx];
+        if (!InjectAdmits(h, mn, mx, msg)) return false;
+        if (remove) ++g_injectIdx;
         m->hwnd    = kFakeHwnd;
         m->message = msg;
         m->wParam  = (msg == WM_ACTIVATE) ? WA_ACTIVE : (WPARAM)TRUE;   // ACTIVATEAPP/NCACTIVATE: TRUE
         m->lParam  = 0; m->time = 0; m->pt = { 0, 0 };
-        if (g_injectIdx == 1) Diag("BED inject activation -> Unity WndProc");
+        if (g_injectIdx == 1) Diag("BED inject activation -> Unity WndProc tid=" + std::to_string(GetCurrentThreadId()));
         return true;
     }
     // Then forwarded keyboard/mouse messages (real USB devices on the Xbox).
     std::lock_guard<std::mutex> lk(g_kmMutex);
     if (!g_kmQueue.empty()){
-        *m = g_kmQueue.front(); g_kmQueue.pop_front(); m->time = 0; m->pt = { g_kmCurX, g_kmCurY };
-        static int drained = 0; if (++drained <= 12) Diag("RECON guest drained injected msg=" + Hex(m->message));
-        if (GhRawInput() & 32) RECON_COUNT("drained");
+        if (!InjectAdmits(h, mn, mx, g_kmQueue.front().message)) return false;
+        *m = g_kmQueue.front(); if (remove) g_kmQueue.pop_front(); m->time = 0; m->pt = { g_kmCurX, g_kmCurY };
+        if (remove){
+            static int drained = 0; if (++drained <= 12) Diag("RECON guest drained injected msg=" + Hex(m->message) + " tid=" + std::to_string(GetCurrentThreadId()));
+            if (GhRawInput() & 32) RECON_COUNT("drained");
+        }
         return true;
     }
     return false;
 }
-static BOOL   WINAPI Bed_PeekMessageW(LPMSG m, HWND, UINT, UINT, UINT){ RECON_COUNT("PeekMessageW"); return FillInjectedMsg(m) ? TRUE : FALSE; }
-static BOOL   WINAPI Bed_PeekMessageA(LPMSG m, HWND, UINT, UINT, UINT){ RECON_ONCE("PeekMessageA"); return FillInjectedMsg(m) ? TRUE : FALSE; }
+static BOOL   WINAPI Bed_PeekMessageW(LPMSG m, HWND h, UINT mn, UINT mx, UINT fl){ RECON_COUNT("PeekMessageW"); return FillInjectedMsg(m, h, mn, mx, fl) ? TRUE : FALSE; }
+static BOOL   WINAPI Bed_PeekMessageA(LPMSG m, HWND h, UINT mn, UINT mx, UINT fl){ RECON_ONCE("PeekMessageA"); return FillInjectedMsg(m, h, mn, mx, fl) ? TRUE : FALSE; }
 // #199 bit 1. This was `if(m) m->message = WM_QUIT; return 0;` -- a stub that
 // told every caller the app was closing and never once looked at the queue the
 // CoreWindow handlers fill. Nothing else drains that queue either: the guest has
@@ -34690,12 +34976,12 @@ static BOOL   WINAPI Bed_PeekMessageA(LPMSG m, HWND, UINT, UINT, UINT){ RECON_ON
 // GetMessage is defined to BLOCK until a message arrives; we bound the block and
 // answer WM_NULL instead, which is a legal GetMessage return and cannot wedge a
 // guest thread that turns out to need to do something else.
-static BOOL   WINAPI Bed_GetMessageW(LPMSG m, HWND, UINT, UINT){
+static BOOL   WINAPI Bed_GetMessageW(LPMSG m, HWND h, UINT mn, UINT mx){
     RECON_COUNT("GetMessageW");
     if (!(GhRawInput() & 1)){ if(m) m->message = WM_QUIT; return 0; }
     if (!m) return 0;
     for (int i = 0; i < 50; ++i){                 // ~100 ms
-        if (FillInjectedMsg(m)) return (m->message == WM_QUIT) ? 0 : TRUE;
+        if (FillInjectedMsg(m, h, mn, mx)) return (m->message == WM_QUIT) ? 0 : TRUE;
         Sleep(2);
     }
     m->hwnd = kFakeHwnd; m->message = WM_NULL; m->wParam = 0; m->lParam = 0;
@@ -34861,6 +35147,156 @@ static HWND   WINAPI Bed_GetActiveWindow(){ if (GhRawInput() & 32) RECON_COUNT("
 static HWND   WINAPI Bed_GetFocus(){ if (GhRawInput() & 32) RECON_COUNT("GetFocus"); return kFakeHwnd; }
 static BOOL   WINAPI Bed_IsWindowVisible(HWND){ return TRUE; }
 static BOOL   WINAPI Bed_IsIconic(HWND){ return FALSE; }
+// §56. Unreal decides "am I the foreground app?" as
+//   GetWindowThreadProcessId(GetForegroundWindow(), &pid); pid == GetCurrentProcessId()
+// and the real slim user32 knows nothing of kFakeHwnd, so pid was never written and
+// FApp::HasFocus() was false for the whole run: RV There Yet? ignored every pad press
+// and every click while its menu animated normally. Slate's click path asks
+// WindowFromPoint(cursor) and drops the click when the answer is not one of its windows;
+// IsWindowEnabled is how it tells a window under a modal from a live one.
+static DWORD  WINAPI Bed_GetWindowThreadProcessId(HWND h, LPDWORD pid){
+    if (h != kFakeHwnd) return GetWindowThreadProcessId(h, pid);
+    if (pid) *pid = GetCurrentProcessId();
+    const DWORD t = g_guestWndTid;
+    return t ? t : GetCurrentThreadId();
+}
+static HWND   WINAPI Bed_WindowFromPoint(POINT){ return kFakeHwnd; }
+static BOOL   WINAPI Bed_IsWindowEnabled(HWND h){ return h == kFakeHwnd ? TRUE : IsWindowEnabled(h); }
+
+// §56. Slate hit-tests every click against a GDI region: FWindowsWindow::IsPointInWindow
+// is CreateRectRgn/CreateRoundRectRgn + PtInRegion + DeleteObject. Regions are win32k
+// objects, and a click that misses drops out of LocateWindowUnderMouse with no widget
+// under it. CommonUI turns the pad's Accept into a simulated click at the focused
+// widget, so the pad dies the same way. Guest regions are therefore ours: a rect or a
+// round rect, held in a table and told apart from real GDI handles by membership.
+struct GhRgn { RECT rc; int ew, eh; };          // ew/eh: corner ellipse size, 0 = plain rect
+static SRWLOCK g_rgnLock = SRWLOCK_INIT;
+// The real ones are looked up, never imported: the container's slim gdi32/user32
+// may not export them all, and a missing static import would stop the host loading.
+template <class F> static F GhGdiFn(const wchar_t* dll, const char* name){
+    HMODULE m = GetModuleHandleW(dll);
+    if (!m) m = LoadLibraryExW(dll, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    return m ? (F)(void*)GetProcAddress(m, name) : nullptr;
+}
+#define GH_REAL_GDI(dll, fn, def) static const auto r_##fn = GhGdiFn<decltype(&fn)>(dll, #fn); if (!r_##fn) return def
+static std::unordered_map<HRGN, GhRgn>* g_rgns = nullptr;
+static uintptr_t g_rgnNext = 0x00006E6700000000ull;   // real GDI handles are sign-extended 32-bit values
+static void GhRgnProbeOnce(){
+    static LONG once = 0;
+    if (InterlockedExchange(&once, 1)) return;
+    const auto cr = GhGdiFn<decltype(&CreateRectRgn)>(L"gdi32.dll", "CreateRectRgn");
+    const auto pt = GhGdiFn<decltype(&PtInRegion)>(L"gdi32.dll", "PtInRegion");
+    const auto del = GhGdiFn<decltype(&DeleteObject)>(L"gdi32.dll", "DeleteObject");
+    SetLastError(0);
+    HRGN r = cr ? cr(0, 0, 8, 8) : nullptr;
+    const BOOL in = (r && pt) ? pt(r, 4, 4) : FALSE;
+    Diag("BED region: real CreateRectRgn=" + Hex((uint64_t)(uintptr_t)r) + " err=" + Hex((uint32_t)GetLastError()) +
+         " PtInRegion=" + std::to_string(in) + " exports=" + std::to_string(!!cr) + std::to_string(!!pt) + std::to_string(!!del) +
+         " (guest regions are served by the loader)");
+    if (r && del) del(r);
+}
+static HRGN GhRgnNew(const RECT& rc, int ew, int eh){
+    GhRgnProbeOnce();
+    AcquireSRWLockExclusive(&g_rgnLock);
+    if (!g_rgns) g_rgns = new std::unordered_map<HRGN, GhRgn>();
+    g_rgnNext += 4;
+    HRGN h = (HRGN)g_rgnNext;
+    (*g_rgns)[h] = GhRgn{ rc, ew, eh };
+    ReleaseSRWLockExclusive(&g_rgnLock);
+    return h;
+}
+static bool GhRgnGet(HGDIOBJ h, GhRgn* out){
+    AcquireSRWLockShared(&g_rgnLock);
+    bool ok = false;
+    if (g_rgns){ auto it = g_rgns->find((HRGN)h); if (it != g_rgns->end()){ if (out) *out = it->second; ok = true; } }
+    ReleaseSRWLockShared(&g_rgnLock);
+    return ok;
+}
+static bool GhRgnDrop(HGDIOBJ h){
+    AcquireSRWLockExclusive(&g_rgnLock);
+    const bool ok = g_rgns && g_rgns->erase((HRGN)h) != 0;
+    ReleaseSRWLockExclusive(&g_rgnLock);
+    return ok;
+}
+static bool GhRgnHit(const GhRgn& g, int x, int y){
+    const RECT& r = g.rc;
+    if (x < r.left || x >= r.right || y < r.top || y >= r.bottom) return false;
+    const int ax = g.ew / 2, ay = g.eh / 2;
+    if (ax <= 0 || ay <= 0) return true;
+    // Inside a corner square, the point must also be inside that corner's ellipse.
+    const int cx = x < r.left + ax ? r.left + ax : (x >= r.right - ax ? r.right - ax : x);
+    const int cy = y < r.top + ay ? r.top + ay : (y >= r.bottom - ay ? r.bottom - ay : y);
+    if (cx == x || cy == y) return true;
+    const double dx = double(x - cx) / ax, dy = double(y - cy) / ay;
+    return dx * dx + dy * dy <= 1.0;
+}
+static bool GhRcEmpty(const RECT& r){ return r.right <= r.left || r.bottom <= r.top; }
+static RECT GhRc(int l, int t, int r, int b){
+    RECT rc{ l < r ? l : r, t < b ? t : b, l < r ? r : l, t < b ? b : t };
+    return rc;
+}
+static HRGN WINAPI Bed_CreateRectRgn(int l, int t, int r, int b){ return GhRgnNew(GhRc(l, t, r, b), 0, 0); }
+static HRGN WINAPI Bed_CreateRectRgnIndirect(const RECT* p){ return p ? GhRgnNew(GhRc(p->left, p->top, p->right, p->bottom), 0, 0) : nullptr; }
+static HRGN WINAPI Bed_CreateRoundRectRgn(int l, int t, int r, int b, int w, int h){ return GhRgnNew(GhRc(l, t, r, b), w < 0 ? -w : w, h < 0 ? -h : h); }
+static HRGN WINAPI Bed_CreateEllipticRgn(int l, int t, int r, int b){ const RECT rc = GhRc(l, t, r, b); return GhRgnNew(rc, rc.right - rc.left, rc.bottom - rc.top); }
+static BOOL WINAPI Bed_PtInRegion(HRGN h, int x, int y){
+    GhRgn g; if (!GhRgnGet(h, &g)){ GH_REAL_GDI(L"gdi32.dll", PtInRegion, FALSE); return r_PtInRegion(h, x, y); }
+    return GhRgnHit(g, x, y) ? TRUE : FALSE;
+}
+static BOOL WINAPI Bed_RectInRegion(HRGN h, const RECT* p){
+    GhRgn g; if (!GhRgnGet(h, &g)){ GH_REAL_GDI(L"gdi32.dll", RectInRegion, FALSE); return r_RectInRegion(h, p); }
+    if (!p) return FALSE;
+    return (p->left < g.rc.right && p->right > g.rc.left && p->top < g.rc.bottom && p->bottom > g.rc.top) ? TRUE : FALSE;
+}
+static int WINAPI Bed_GetRgnBox(HRGN h, LPRECT p){
+    GhRgn g; if (!GhRgnGet(h, &g)){ GH_REAL_GDI(L"gdi32.dll", GetRgnBox, ERROR); return r_GetRgnBox(h, p); }
+    if (p) *p = g.rc;
+    return GhRcEmpty(g.rc) ? NULLREGION : (g.ew ? COMPLEXREGION : SIMPLEREGION);
+}
+static int WINAPI Bed_OffsetRgn(HRGN h, int dx, int dy){
+    if (!GhRgnGet(h, nullptr)){ GH_REAL_GDI(L"gdi32.dll", OffsetRgn, ERROR); return r_OffsetRgn(h, dx, dy); }
+    AcquireSRWLockExclusive(&g_rgnLock);
+    GhRgn& g = (*g_rgns)[h]; g.rc.left += dx; g.rc.right += dx; g.rc.top += dy; g.rc.bottom += dy; const GhRgn c = g;
+    ReleaseSRWLockExclusive(&g_rgnLock);
+    return GhRcEmpty(c.rc) ? NULLREGION : (c.ew ? COMPLEXREGION : SIMPLEREGION);
+}
+// Two shapes do not combine into one rect in general; the bounding box of the
+// union / the overlap of the intersection is what a hit test needs from us.
+static int WINAPI Bed_CombineRgn(HRGN dst, HRGN a, HRGN b, int mode){
+    GhRgn ga, gb, gd;
+    const bool fa = GhRgnGet(a, &ga), fb = b ? GhRgnGet(b, &gb) : false, fd = GhRgnGet(dst, &gd);
+    if (!fa && !fb && !fd){ GH_REAL_GDI(L"gdi32.dll", CombineRgn, ERROR); return r_CombineRgn(dst, a, b, mode); }
+    if (!fd || !fa) return ERROR;
+    RECT out = ga.rc; int ew = ga.ew, eh = ga.eh;
+    if (mode != RGN_COPY){
+        if (!fb) return ERROR;
+        if (mode == RGN_AND){
+            out.left = (std::max)(ga.rc.left, gb.rc.left);   out.top = (std::max)(ga.rc.top, gb.rc.top);
+            out.right = (std::min)(ga.rc.right, gb.rc.right); out.bottom = (std::min)(ga.rc.bottom, gb.rc.bottom);
+            if (GhRcEmpty(out)) out = RECT{};
+        } else if (mode == RGN_OR || mode == RGN_XOR){
+            out.left = (std::min)(ga.rc.left, gb.rc.left);   out.top = (std::min)(ga.rc.top, gb.rc.top);
+            out.right = (std::max)(ga.rc.right, gb.rc.right); out.bottom = (std::max)(ga.rc.bottom, gb.rc.bottom);
+        }
+        ew = eh = 0;                              // RGN_DIFF keeps a's box
+        static LONG once = 0;
+        if (!InterlockedExchange(&once, 1)) Diag("BED region: CombineRgn mode=" + std::to_string(mode) + " approximated by boxes");
+    }
+    AcquireSRWLockExclusive(&g_rgnLock);
+    (*g_rgns)[dst] = GhRgn{ out, ew, eh };
+    ReleaseSRWLockExclusive(&g_rgnLock);
+    return GhRcEmpty(out) ? NULLREGION : (ew ? COMPLEXREGION : SIMPLEREGION);
+}
+static BOOL WINAPI Bed_DeleteObject(HGDIOBJ h){
+    if (GhRgnDrop(h)) return TRUE;
+    GH_REAL_GDI(L"gdi32.dll", DeleteObject, FALSE); return r_DeleteObject(h);
+}
+// SetWindowRgn takes ownership of the region on success.
+static int WINAPI Bed_SetWindowRgn(HWND w, HRGN h, BOOL redraw){
+    if (w != kFakeHwnd && !GhRgnGet(h, nullptr)){ GH_REAL_GDI(L"user32.dll", SetWindowRgn, 0); return r_SetWindowRgn(w, h, redraw); }
+    if (h) GhRgnDrop(h);
+    return 1;
+}
 
 extern std::wstring g_guestExePath;   // defined near the PE mapper, below
 // Where the guest image is mapped. Declared here rather than beside the PE
@@ -43388,11 +43824,13 @@ static HRESULT WINAPI Bed_DStorageGetFactory(REFIID riid, void** ppv)
 
 // #236 LG1: defined after CrashObserverVeh; keeps our pager ahead of guest VEHs.
 static PVOID WINAPI Bed_AddVectoredExceptionHandler(ULONG first, PVECTORED_EXCEPTION_HANDLER h);
+static BOOL WINAPI Bed_RemoveVectoredExceptionHandler(PVOID reg);
 static const std::unordered_map<std::string, void*>& ShimTable()
 {
     static const std::unordered_map<std::string, void*> t = {
         {"GetCommandLineW",            (void*)&Bed_GetCommandLineW},
         {"AddVectoredExceptionHandler", (void*)&Bed_AddVectoredExceptionHandler},
+        {"RemoveVectoredExceptionHandler", (void*)&Bed_RemoveVectoredExceptionHandler},
         {"GetCommandLineA",            (void*)&Bed_GetCommandLineA},
         {"GetStdHandle",               (void*)&Bed_GetStdHandle},
         {"WriteFile",                  (void*)&Bed_WriteFile},
@@ -43409,7 +43847,8 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"fputc",                      (void*)&Bed_fputc},
         {"fflush",                     (void*)&Bed_fflush},
         {"exit",                       (void*)&Bed_exit},
-        {"_exit",                      (void*)&Bed_exit},
+        {"_exit",                      (void*)&Bed__exit},
+        {"_crt_atexit",                (void*)&Bed_crt_atexit},
         {"_cexit",                     (void*)&Bed_cexit},
         {"abort",                      (void*)&Bed_abort},
         {"TerminateProcess",           (void*)&Bed_TerminateProcess},
@@ -43463,6 +43902,20 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"GetFocus",           (void*)&Bed_GetFocus},
         {"IsWindowVisible",    (void*)&Bed_IsWindowVisible},
         {"IsIconic",           (void*)&Bed_IsIconic},
+        {"GetWindowThreadProcessId", (void*)&Bed_GetWindowThreadProcessId},
+        {"WindowFromPoint",    (void*)&Bed_WindowFromPoint},
+        {"IsWindowEnabled",    (void*)&Bed_IsWindowEnabled},
+        {"CreateRectRgn",      (void*)&Bed_CreateRectRgn},
+        {"CreateRectRgnIndirect", (void*)&Bed_CreateRectRgnIndirect},
+        {"CreateRoundRectRgn", (void*)&Bed_CreateRoundRectRgn},
+        {"CreateEllipticRgn",  (void*)&Bed_CreateEllipticRgn},
+        {"PtInRegion",         (void*)&Bed_PtInRegion},
+        {"RectInRegion",       (void*)&Bed_RectInRegion},
+        {"GetRgnBox",          (void*)&Bed_GetRgnBox},
+        {"OffsetRgn",          (void*)&Bed_OffsetRgn},
+        {"CombineRgn",         (void*)&Bed_CombineRgn},
+        {"DeleteObject",       (void*)&Bed_DeleteObject},
+        {"SetWindowRgn",       (void*)&Bed_SetWindowRgn},
         {"GetModuleFileNameW", (void*)&Bed_GetModuleFileNameW},
         {"GetModuleFileNameA", (void*)&Bed_GetModuleFileNameA},
         {"GetModuleFileNameExW", (void*)&Bed_GetModuleFileNameExW}, {"K32GetModuleFileNameExW", (void*)&Bed_GetModuleFileNameExW},
@@ -43691,6 +44144,7 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
     if (!h) return 0;
     static const struct { const char* fn; void* bed; } redirs[] = {
         {"AddVectoredExceptionHandler", (void*)&Bed_AddVectoredExceptionHandler},
+        {"RemoveVectoredExceptionHandler", (void*)&Bed_RemoveVectoredExceptionHandler},
         {"GetCommandLineW", (void*)&Bed_GetCommandLineW}, {"GetCommandLineA", (void*)&Bed_GetCommandLineA},
         {"CreateFileW", (void*)&Bed_CreateFileW}, {"CreateFileA", (void*)&Bed_CreateFileA},
         {"CreateFile2", (void*)&Bed_CreateFile2},
@@ -43794,6 +44248,20 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"GetFocus",           (void*)&Bed_GetFocus},
         {"IsWindowVisible",    (void*)&Bed_IsWindowVisible},
         {"IsIconic",           (void*)&Bed_IsIconic},
+        {"GetWindowThreadProcessId", (void*)&Bed_GetWindowThreadProcessId},
+        {"WindowFromPoint",    (void*)&Bed_WindowFromPoint},
+        {"IsWindowEnabled",    (void*)&Bed_IsWindowEnabled},
+        {"CreateRectRgn",      (void*)&Bed_CreateRectRgn},
+        {"CreateRectRgnIndirect", (void*)&Bed_CreateRectRgnIndirect},
+        {"CreateRoundRectRgn", (void*)&Bed_CreateRoundRectRgn},
+        {"CreateEllipticRgn",  (void*)&Bed_CreateEllipticRgn},
+        {"PtInRegion",         (void*)&Bed_PtInRegion},
+        {"RectInRegion",       (void*)&Bed_RectInRegion},
+        {"GetRgnBox",          (void*)&Bed_GetRgnBox},
+        {"OffsetRgn",          (void*)&Bed_OffsetRgn},
+        {"CombineRgn",         (void*)&Bed_CombineRgn},
+        {"DeleteObject",       (void*)&Bed_DeleteObject},
+        {"SetWindowRgn",       (void*)&Bed_SetWindowRgn},
         {"MoveWindow",         (void*)&Bed_MoveWindow},
         {"SetWindowPos",       (void*)&Bed_SetWindowPos},
         {"MessageBoxW",        (void*)&Bed_MessageBoxW},
@@ -44805,6 +45273,12 @@ static void* ResolveImport(const char* dll, const char* fn)
     auto& tbl = ShimTable();
     auto it = tbl.find(fn);
     if (it != tbl.end()) return it->second;
+    // §56: the UCRT's thread starts, recorded for the exit freeze. Only for the
+    // UCRT itself: an msvcrt import must keep msvcrt's own per-thread data.
+    if (fn[0] == '_' && (0 == _strnicmp(dll, "ucrtbase", 8) || 0 == _strnicmp(dll, "api-ms-win-crt-", 15))){
+        if (0 == strcmp(fn, "_beginthreadex")) return (void*)&Bed_beginthreadex;
+        if (0 == strcmp(fn, "_beginthread"))   return (void*)&Bed_beginthread;
+    }
     HMODULE m = LoadGuestDll(dll);
     if (!m) return nullptr;
     PinGuestModule(m, dll);
@@ -45494,10 +45968,29 @@ static int GhGsCollect(const CONTEXT* start, GhGsRec* out, int cap)
     return n;
 }
 
+// §56: what a fault inside the freed image is checked against. A fixed POD copy,
+// because the crash observer reads it from any thread with no lock.
+struct GhFormerRange { uintptr_t lo, hi; };
+static GhFormerRange g_formerGuest[64];
+static volatile LONG g_formerGuestN = 0;
+// The rip test is for the exited game's own threads and stops when the next image
+// is allocated (that range is live code again). The ranges themselves stay: an OS
+// thread can still be holding a pointer into them well into the next game.
+static volatile LONG g_formerRipArmed = 0;
+static void GhParkThread()
+{
+    for (;;) SleepEx(INFINITE, FALSE);
+}
+
 static LONG GhCrashObserverVehBody(EXCEPTION_POINTERS* ep);
 
 static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
 {
+    // §56. A host call that brought its own __except (the scache guard) is not a
+    // crash: stand aside before any analysis, or the observer ends the guest from
+    // the worker thread first, or faults in its own dump (RV: REENTRY on scache).
+    if (t_ghHostSehGuard && ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
     // #202. This handler reads memory the faulting code chose -- stack slots,
     // sixteen bytes at RIP, unwind data -- so it can fault itself, and a fault
     // raised inside a VEH handler is dispatched through the whole VEH chain
@@ -45507,6 +46000,58 @@ static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
     // later. The bounds bug is fixed above; this is the blast radius. One line
     // of evidence on re-entry -- which says the walker faulted again and where
     // -- then out of the way, so the inner __try can do its job.
+    // §56. A thread of a game that has already exited, faulting in its freed
+    // image: nothing here can help it and nothing should be read on its behalf.
+    // Park it for good on a host function. Only between sessions -- the rip test
+    // is disarmed the moment the next game's image is allocated.
+    if (const LONG fn = g_formerGuestN){
+        const DWORD code = ep->ExceptionRecord->ExceptionCode;
+        const uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+        if (g_formerRipArmed && (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_ILLEGAL_INSTRUCTION)){
+            for (LONG i = 0; i < fn && i < 64; ++i){
+                if (rip < g_formerGuest[i].lo || rip >= g_formerGuest[i].hi) continue;
+                static volatile LONG s_parked = 0;
+                if (InterlockedIncrement(&s_parked) <= 8)
+                    Diag("PARKED tid=" + std::to_string((unsigned long)GetCurrentThreadId()) +
+                         " at=" + Hex((uint64_t)rip) + " (a thread of the exited game)");
+                ep->ContextRecord->Rsp = (ep->ContextRecord->Rsp & ~(DWORD64)0xF) - 8;
+                ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&GhParkThread;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+        // An OS thread reading through a pointer the exited game left with it
+        // (AUDIOSES calling RV's audio-session client from an MMDevAPI worker). It
+        // cannot be resumed and its caller cannot be told; parking one OS worker
+        // costs that component a thread, letting it fault costs the app. Never the
+        // UI thread and never our own code: those must be seen as the bugs they are.
+        const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+        if (code == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2){
+            const uintptr_t tgt = (uintptr_t)er->ExceptionInformation[1];
+            const DWORD me = GetCurrentThreadId();
+            static uintptr_t s_hostLo = 0, s_hostHi = 0;
+            if (!s_hostLo){
+                const uint8_t* hb = (const uint8_t*)GetModuleHandleW(nullptr);
+                const auto* nt = (const IMAGE_NT_HEADERS*)(hb + ((const IMAGE_DOS_HEADER*)hb)->e_lfanew);
+                s_hostHi = (uintptr_t)hb + nt->OptionalHeader.SizeOfImage;
+                s_hostLo = (uintptr_t)hb;
+            }
+            const bool ours = rip >= s_hostLo && rip < s_hostHi;
+            if (!ours && me != g_uiTid && me != g_uiThreadId){
+                MEMORY_BASIC_INFORMATION tm{};
+                const bool gone = VirtualQuery((const void*)tgt, &tm, sizeof tm) == sizeof tm && tm.State != MEM_COMMIT;
+                for (LONG i = 0; gone && i < fn && i < 64; ++i){
+                    if (tgt < g_formerGuest[i].lo || tgt >= g_formerGuest[i].hi) continue;
+                    static volatile LONG s_parkedOs = 0;
+                    if (InterlockedIncrement(&s_parkedOs) <= 8)
+                        Diag("PARKED os tid=" + std::to_string((unsigned long)me) + " at=" + Hex((uint64_t)rip) +
+                             " read=" + Hex((uint64_t)tgt) + " (a pointer into the exited game)");
+                    ep->ContextRecord->Rsp = (ep->ContextRecord->Rsp & ~(DWORD64)0xF) - 8;
+                    ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&GhParkThread;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+        }
+    }
     static thread_local int s_depth = 0;
     if (s_depth > 0){
         static long s_said = 0;
@@ -45536,9 +46081,25 @@ static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
 // before removing the old, so there is no instant with no pager in the chain).
 // Guest handlers keep their order among themselves. gh_veh_front=0 turns it off;
 // it only acts while the demand-commit pager is configured.
+// §56: a guest handler left registered after its image is freed is called by the
+// dispatcher on the NEXT exception anywhere in the process -- host code included --
+// and faults at once. Remember the registrations so the exit can remove them.
+struct GhGuestVeh { PVOID reg; uintptr_t fn; };
+static GhGuestVeh    g_guestVehs[32];
+static volatile LONG g_guestVehN = 0;
+static BOOL WINAPI Bed_RemoveVectoredExceptionHandler(PVOID reg)
+{
+    const LONG n = g_guestVehN < 32 ? g_guestVehN : 32;
+    for (LONG i = 0; i < n; ++i) if (g_guestVehs[i].reg == reg) g_guestVehs[i].reg = nullptr;
+    return RemoveVectoredExceptionHandler(reg);
+}
 static PVOID WINAPI Bed_AddVectoredExceptionHandler(ULONG first, PVECTORED_EXCEPTION_HANDLER h)
 {
     PVOID r = AddVectoredExceptionHandler(first, h);
+    if (r){
+        const LONG i = InterlockedIncrement(&g_guestVehN) - 1;
+        if (i < 32) g_guestVehs[i] = { r, (uintptr_t)h };
+    }
     static const unsigned front = GhCfgNumZ(L"gh_veh_front.txt", "GH_VEH_FRONT", 1);
     static SRWLOCK lk = SRWLOCK_INIT;
     static volatile LONG n = 0;
@@ -46499,7 +47060,7 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
     if (!jit && g_guestWorkerTid && GetCurrentThreadId() == g_guestWorkerTid) {
         g_guestCrashed = true;
         if (g_guestFailWhy.empty()) g_guestFailWhy = line;
-        Bed_exit((int)code);            // noreturn: FinishGuestSession + ExitThread
+        GhGuestExit((int)code, false);           // noreturn: FinishGuestSession + ExitThread
     }
 #endif
     return EXCEPTION_CONTINUE_SEARCH;   // observe only; let the game's handler run
@@ -47744,31 +48305,96 @@ static bool PathIsLastGame(const std::wstring& p)
 }
 
 static std::vector<GhModRange> g_lastGameRanges;   // GhModRange is declared with the RIP census, above
+static std::vector<GhModRange> g_lastGameExec;     // §56: the executable sections of those images
 
+// The executable sections of a mapped image, read from its own headers. POD only:
+// the __try must not share a frame with C++ objects (clang 23).
+static int GhExecSections(uintptr_t base, GhModRange* out, int max)
+{
+    int n = 0;
+    __try {
+        auto* dos = (IMAGE_DOS_HEADER*)base;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+        auto* nt = (IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+        auto* sec = IMAGE_FIRST_SECTION(nt);
+        for (int i = 0; i < nt->FileHeader.NumberOfSections && n < max; ++i)
+            if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)
+                out[n++] = { base + sec[i].VirtualAddress,
+                             base + sec[i].VirtualAddress + (sec[i].Misc.VirtualSize ? sec[i].Misc.VirtualSize
+                                                                                     : sec[i].SizeOfRawData) };
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
+    return n;
+}
+static DWORD GhImageSize(uintptr_t base)
+{
+    DWORD sz = 0;
+    __try {
+        auto* dos = (IMAGE_DOS_HEADER*)base;
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE){
+            auto* nt = (IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
+            if (nt->Signature == IMAGE_NT_SIGNATURE) sz = nt->OptionalHeader.SizeOfImage;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { sz = 0; }
+    return sz;
+}
+static void GhAddLastGameImage(uintptr_t lo, uintptr_t hi)
+{
+    g_lastGameRanges.push_back({ lo, hi });
+    GhModRange ex[16];
+    const int n = GhExecSections(lo, ex, 16);
+    for (int i = 0; i < n; ++i) g_lastGameExec.push_back(ex[i]);
+}
+
+// Every image the last game ran code from: the exe we mapped ourselves, the DLLs we
+// self-mapped for it, and its OS-loaded modules. Called BEFORE the exe is freed, so
+// every header is still readable. Only the OS-loaded list existed before §56, and
+// an Unreal game lives entirely in the first two.
 static void CollectLastGameRanges()
 {
     g_lastGameRanges.clear();
+    g_lastGameExec.clear();
+    if (g_guestImageBase && g_guestImageSize)
+        GhAddLastGameImage((uintptr_t)g_guestImageBase, (uintptr_t)g_guestImageBase + g_guestImageSize);
+    size_t self = 0;
+    {
+        std::vector<uintptr_t> bases;
+        AcquireSRWLockShared(&g_selfModLock);
+        for (auto& m : g_selfMods) bases.push_back((uintptr_t)m.base);
+        ReleaseSRWLockShared(&g_selfModLock);
+        for (uintptr_t b : bases)
+            if (const DWORD sz = GhImageSize(b)){ GhAddLastGameImage(b, b + sz); ++self; }
+    }
     BYTE* teb = (BYTE*)NtCurrentTeb();
     BYTE* peb = *(BYTE**)(teb + 0x60);
-    if (!peb) return;
-    BYTE* ldr = *(BYTE**)(peb + 0x18);
-    if (!ldr) return;
-    auto* head = (LIST_ENTRY*)(ldr + 0x10);   // InLoadOrderModuleList
-    int n = 0;
-    for (LIST_ENTRY* e = head->Flink; e && e != head && n < 512; e = e->Flink, ++n) {
-        auto* ent = CONTAINING_RECORD(e, GhLdrEntry, InLoadOrder);
-        if (!ent->DllBase || !ent->FullDllName.Buffer || !ent->FullDllName.Length) continue;
-        std::wstring p(ent->FullDllName.Buffer, ent->FullDllName.Length / sizeof(wchar_t));
-        if (!PathIsLastGame(p) || KeepGuestModuleName(p.c_str())) continue;
-        g_lastGameRanges.push_back({ (uintptr_t)ent->DllBase,
-                                     (uintptr_t)ent->DllBase + ent->SizeOfImage });
+    BYTE* ldr = peb ? *(BYTE**)(peb + 0x18) : nullptr;
+    size_t os = 0;
+    if (ldr){
+        auto* head = (LIST_ENTRY*)(ldr + 0x10);   // InLoadOrderModuleList
+        int n = 0;
+        for (LIST_ENTRY* e = head->Flink; e && e != head && n < 512; e = e->Flink, ++n) {
+            auto* ent = CONTAINING_RECORD(e, GhLdrEntry, InLoadOrder);
+            if (!ent->DllBase || !ent->FullDllName.Buffer || !ent->FullDllName.Length) continue;
+            std::wstring p(ent->FullDllName.Buffer, ent->FullDllName.Length / sizeof(wchar_t));
+            if (!PathIsLastGame(p) || KeepGuestModuleName(p.c_str())) continue;
+            GhAddLastGameImage((uintptr_t)ent->DllBase, (uintptr_t)ent->DllBase + ent->SizeOfImage);
+            ++os;
+        }
     }
-    Diag("STAGE=guest_mod_ranges n=" + std::to_string(g_lastGameRanges.size()));
+    Diag("STAGE=guest_mod_ranges n=" + std::to_string(g_lastGameRanges.size()) +
+         " exe=" + std::to_string(g_guestImageBase ? 1 : 0) + " selfmap=" + std::to_string(self) +
+         " ldr=" + std::to_string(os) + " exec=" + std::to_string(g_lastGameExec.size()));
 }
 
 static bool PtrInLastGame(uintptr_t p)
 {
     for (const auto& r : g_lastGameRanges)
+        if (p >= r.lo && p < r.hi) return true;
+    return false;
+}
+static bool PtrInLastGameCode(uintptr_t p)
+{
+    for (const auto& r : g_lastGameExec)
         if (p >= r.lo && p < r.hi) return true;
     return false;
 }
@@ -48161,7 +48787,16 @@ static bool StackWord(uintptr_t addr, uintptr_t* out)
     return true;
 }
 
-static bool ThreadTouchesLastGame(HANDLE h)
+// Why a leftover thread is the last game's, or nullptr. A raw read of its LIVE
+// stack, [RSP, StackBase), counting only words that point into the game's code:
+// return addresses, not data. The dead area below RSP holds stale values from
+// calls long finished, and a host thread that once ran a guest callback would be
+// frozen for them. No unwinder and no locks, so a frozen thread cannot hold
+// anything this needs. (Before §56 the THREAD_BASIC_INFORMATION here was 16 bytes,
+// the call always failed, and the scan never ran.)
+struct GhThreadBasicInfo { LONG ExitStatus; PVOID TebBaseAddress; PVOID UniqueProcess; PVOID UniqueThread;
+                           ULONG_PTR AffinityMask; LONG Priority; LONG BasePriority; };
+static const char* ThreadTouchesLastGame(HANDLE h)
 {
     typedef LONG (WINAPI *NtQIT)(HANDLE, int, void*, ULONG, ULONG*);
     static NtQIT ntqit = nullptr;
@@ -48169,65 +48804,138 @@ static bool ThreadTouchesLastGame(HANDLE h)
         HMODULE ntdll = GetModuleHandleA("ntdll.dll");
         ntqit = ntdll ? (NtQIT)GetProcAddress(ntdll, "NtQueryInformationThread") : nullptr;
     }
-    if (ntqit) {
-        void* start = nullptr;
-        if (ntqit(h, 9 /*ThreadQuerySetWin32StartAddress*/, &start, sizeof(start), nullptr) == 0
-            && start && PtrInLastGame((uintptr_t)start))
-            return true;
-        struct { LONG ExitStatus; void* Teb; } tbi{};
-        if (ntqit(h, 0 /*ThreadBasicInformation*/, &tbi, sizeof(tbi), nullptr) == 0 && tbi.Teb) {
-            uintptr_t stackBase = 0, stackLimit = 0;
-            if (ReadTebStack(tbi.Teb, &stackBase, &stackLimit)
-                && stackBase > stackLimit && (stackBase - stackLimit) < 0x400000) {
-                for (uintptr_t s = stackLimit; s + sizeof(uintptr_t) <= stackBase; s += sizeof(uintptr_t)) {
-                    uintptr_t v = 0;
-                    if (!StackWord(s, &v)) break;
-                    if (PtrInLastGame(v)) return true;
-                }
-            }
-        }
-    }
     CONTEXT ctx{}; ctx.ContextFlags = CONTEXT_CONTROL;
-    if (GetThreadContext(h, &ctx) && PtrInLastGame((uintptr_t)ctx.Rip))
-        return true;
-    return false;
+    const bool haveCtx = GetThreadContext(h, &ctx) != 0;
+    if (haveCtx && PtrInLastGame((uintptr_t)ctx.Rip)) return "rip";
+    if (!ntqit) return nullptr;
+    void* start = nullptr;
+    if (ntqit(h, 9 /*ThreadQuerySetWin32StartAddress*/, &start, sizeof(start), nullptr) == 0
+        && start && PtrInLastGame((uintptr_t)start))
+        return "start";
+    GhThreadBasicInfo tbi{};
+    static_assert(sizeof(GhThreadBasicInfo) == 48, "THREAD_BASIC_INFORMATION is 48 bytes on x64");
+    if (!haveCtx || ntqit(h, 0 /*ThreadBasicInformation*/, &tbi, sizeof(tbi), nullptr) != 0 || !tbi.TebBaseAddress)
+        return nullptr;
+    uintptr_t stackBase = 0, stackLimit = 0;
+    if (!ReadTebStack(tbi.TebBaseAddress, &stackBase, &stackLimit)) return nullptr;
+    uintptr_t lo = (uintptr_t)ctx.Rsp & ~(uintptr_t)7;
+    if (lo < stackLimit || lo >= stackBase) return nullptr;
+    const uintptr_t hi = (stackBase - lo > 0x10000) ? lo + 0x10000 : stackBase;   // 64 KB of frames
+    for (uintptr_t a = lo; a + sizeof(uintptr_t) <= hi; a += sizeof(uintptr_t)) {
+        uintptr_t v = 0;
+        if (!StackWord(a, &v)) break;
+        if (PtrInLastGameCode(v)) return "stack";
+    }
+    return nullptr;
 }
 
-// Freeze leftover Unity/Mono threads. Do NOT TerminateThread — that deadlocked
-// 0.0.56 (from Present) and 0.0.57 (from the UI handoff).
+// The freeze must not catch a thread inside a lock this process still needs: the
+// process heap, the loader lock, the diag's own locks. Nothing can ask a frozen
+// thread what it holds, so ask the locks instead: a fresh thread takes all of them
+// (its start takes the loader lock, then the heap, then a Diag line). If it cannot
+// finish, a frozen thread holds one; thaw everything and try again a moment later.
+static DWORD WINAPI GhFreezeProbe(LPVOID)
+{
+    void* p = HeapAlloc(GetProcessHeap(), 0, 256);
+    if (p) HeapFree(GetProcessHeap(), 0, p);
+    free(malloc(256));
+    // The UI's next frame (SESSION ENDED, the picker) draws through D2D -> d3d11 ->
+    // d3d11on12, the same device the guest rendered on. RV froze its render thread
+    // inside d3d11on12's device mutex and the UI then waited on it forever, so the
+    // probe walks that path too: our Present lock, then a Flush.
+    if (g_gfx.d11ctx){
+        std::lock_guard<std::mutex> lk(g_d11Mutex);
+        g_gfx.d11ctx->Flush();
+    }
+    Diag("STAGE=guest_freeze_probe ok");
+    return 0;
+}
+
+// Freeze leftover guest threads. Do NOT TerminateThread — that deadlocked
+// 0.0.56 (from Present) and 0.0.57 (from the UI handoff). The threads the guest
+// created are frozen by id (§56); any other thread born during the session is
+// tested by ThreadTouchesLastGame. Nothing between the first SuspendThread and the
+// probe allocates or logs: a frozen thread may own the heap or the diag.
 static void SuspendLeftoverGuestThreads()
 {
-    if (g_hostThreadSnap.empty() || g_lastGameRanges.empty()) {
+    std::vector<DWORD> tids;
+    AcquireSRWLockShared(&g_guestTidLock);
+    tids = g_guestTids;
+    ReleaseSRWLockShared(&g_guestTidLock);
+    if (g_guestWorkerTid) tids.push_back(g_guestWorkerTid);   // an overlay quit leaves it in guest code
+    if (g_hostThreadSnap.empty() || (g_lastGameRanges.empty() && tids.empty())) {
         Diag("STAGE=guest_threads_suspend skipped");
         return;
     }
-    DWORD self = GetCurrentThreadId();
+    const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    struct Cand { DWORD tid; HANDLE h; const char* why; };
+    std::vector<Cand> cands;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap == INVALID_HANDLE_VALUE) {
         Diag("STAGE=guest_threads_suspend snap fail err=" + Hex(GetLastError()));
         return;
     }
     THREADENTRY32 te{}; te.dwSize = sizeof(te);
-    DWORD pid = GetCurrentProcessId();
-    int froze = 0, skipped = 0;
+    int skipped = 0;
     if (Thread32First(snap, &te)) {
         do {
             if (te.th32OwnerProcessID != pid) continue;
-            if (te.th32ThreadID == self) { ++skipped; continue; }
-            if (g_uiThreadId && te.th32ThreadID == g_uiThreadId) { ++skipped; continue; }
-            if (IsSnapshottedHostThread(te.th32ThreadID)) { ++skipped; continue; }
+            if (te.th32ThreadID == self || (g_uiThreadId && te.th32ThreadID == g_uiThreadId) ||
+                IsSnapshottedHostThread(te.th32ThreadID)) { ++skipped; continue; }
             HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT,
                                   FALSE, te.th32ThreadID);
-            if (!h) continue;
-            if (SuspendThread(h) == (DWORD)-1) { CloseHandle(h); continue; }
-            if (!ThreadTouchesLastGame(h)) { ResumeThread(h); ++skipped; CloseHandle(h); continue; }
-            ++froze;
-            CloseHandle(h);
+            if (h) cands.push_back({ te.th32ThreadID, h, nullptr });
         } while (Thread32Next(snap, &te));
     }
     CloseHandle(snap);
+
+    int froze = 0, attempt = 0;
+    for (; attempt < 12; ++attempt){
+        froze = 0;
+        for (auto& c : cands){
+            c.why = nullptr;
+            if (SuspendThread(c.h) == (DWORD)-1) continue;
+            bool mine = false;
+            for (DWORD t : tids) if (t == c.tid){ mine = true; break; }
+            c.why = mine ? "created" : ThreadTouchesLastGame(c.h);
+            if (c.why) ++froze; else ResumeThread(c.h);
+        }
+        if (!froze) break;
+        HANDLE pr = CreateThread(nullptr, 0, &GhFreezeProbe, nullptr, 0, nullptr);
+        const bool clear = pr && WaitForSingleObject(pr, 300) == WAIT_OBJECT_0;
+        if (pr) CloseHandle(pr);           // a stuck probe finishes once its lock is thawed
+        if (clear) break;
+        for (auto& c : cands) if (c.why) ResumeThread(c.h);
+        Sleep(15 + 10 * attempt);
+    }
+    const bool ok = attempt < 12;
+    int said = 0;
+    for (auto& c : cands){
+        if (ok && c.why && ++said <= 64)
+            Diag("STAGE=guest_thread_frozen tid=" + std::to_string((unsigned long)c.tid) + " why=" + c.why);
+        CloseHandle(c.h);
+    }
+    if (!ok) froze = 0;
     Diag("STAGE=guest_threads_suspended n=" + std::to_string(froze) +
-         " skipped=" + std::to_string(skipped));
+         " skipped=" + std::to_string(skipped + (int)cands.size() - froze) +
+         " tries=" + std::to_string(ok ? attempt + 1 : attempt) + (ok ? "" : " GAVE_UP (all thawed)"));
+}
+
+// The guest's own vectored handlers, removed once its threads are frozen and
+// before its exe is freed (§56). Handlers in DLLs that stay mapped are kept.
+static void RemoveLastGameVehs()
+{
+    const LONG n = g_guestVehN < 32 ? g_guestVehN : 32;
+    int removed = 0;
+    for (LONG i = 0; i < n; ++i){
+        PVOID reg = g_guestVehs[i].reg;
+        const uintptr_t fn = g_guestVehs[i].fn;
+        if (!reg || !g_guestImageBase) continue;
+        if (fn < (uintptr_t)g_guestImageBase || fn >= (uintptr_t)g_guestImageBase + g_guestImageSize) continue;
+        if (RemoveVectoredExceptionHandler(reg)) ++removed;
+        g_guestVehs[i].reg = nullptr;
+    }
+    Diag("STAGE=guest_vehs_removed n=" + std::to_string(removed));
 }
 
 static void MangleDllUstr(UNICODE_STRING* us)
@@ -48272,15 +48980,25 @@ static void HideLastGameModules()
     Diag("STAGE=guest_modules_hidden n=" + std::to_string(hid));
 }
 
-// After overlay-quit: stop leftover Unity touching D3D, freeze its threads, hide
-// its modules. Never TerminateThread / FreeLibrary — both freeze this process.
+static void FlushGuestImageOnly();   // fwd: below, with UnmapGuestImage
+
+// After any guest session: stop leftover guest code touching D3D, freeze its
+// threads, drop its handlers, hide its modules, and only THEN free its exe.
+// Never TerminateThread / FreeLibrary — both freeze this process.
+//
+// §56: the free used to happen first, on the exiting guest thread
+// (FinishGuestSession), while every other thread of the game was still running.
+// An Unreal game's threads then faulted in the freed image (RV There Yet?: four
+// at one address, and the crash observer faulting inside itself, VEH REENTRY).
 static void NeutralizePreviousGuest()
 {
     g_guestSessionLive = false;
     Diag("STAGE=guest_neutralize_begin");
     CollectLastGameRanges();
     SuspendLeftoverGuestThreads();
+    RemoveLastGameVehs();
     HideLastGameModules();
+    FlushGuestImageOnly();
     Diag("STAGE=guest_neutralized");
 }
 #endif
@@ -48315,6 +49033,19 @@ static void UnmapGuestImage()
         if (g_tlsDonor)
             if (auto setFn = (BOOL (*)(const void*, unsigned, unsigned))GetProcAddress(g_tlsDonor, "GhTlsSetTemplate"))
                 setFn(nullptr, 0, 0);
+#ifdef GH_LAUNCHER
+        // Keep what was here for the crash observer: a straggler that wakes up
+        // inside the freed image is parked, not allowed to fault (§56).
+        {
+            LONG n = 0;
+            for (const auto& r : g_lastGameExec)
+                if (n < 64){ g_formerGuest[n].lo = r.lo; g_formerGuest[n].hi = r.hi; ++n; }
+            if (n < 64) g_formerGuest[n++] = { (uintptr_t)g_guestImageBase,
+                                               (uintptr_t)g_guestImageBase + g_guestImageSize };
+            InterlockedExchange(&g_formerGuestN, n);
+            InterlockedExchange(&g_formerRipArmed, 1);
+        }
+#endif
         uint64_t was = (uint64_t)g_guestImageBase;
         BOOL ok = SafeVirtualFree(g_guestImageBase);
         Diag(std::string("STAGE=guest_image_freed base=") + Hex(was) +
@@ -48680,6 +49411,7 @@ static bool MapAndRun(std::vector<uint8_t>& file)
     uint8_t* base = (uint8_t*)VirtualAlloc((void*)preferred, imageSize, MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
     if (!base) base = (uint8_t*)VirtualAlloc(nullptr, imageSize, MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
     if (!base){ Diag("VirtualAlloc image fail err=" + Hex(GetLastError())); return false; }
+    InterlockedExchange(&g_formerRipArmed, 0);   // §56: this range is live code again
     g_guestImageBase = base;
     g_guestImageSize = imageSize;
     Diag("STAGE=image_alloc base=" + Hex((uint64_t)base) + " size=" + Hex(imageSize) +
@@ -49407,6 +50139,22 @@ static void PollSyntheticPad()
     } else if (g_synUntil){
         g_synUntil = 0;                              // window elapsed -> release
     }
+    // §56. Unreal polls XInput only for pads it already thinks are connected: it
+    // asks all four slots once at startup, and asks again only after a
+    // WM_DEVICECHANGE. A pad that turns on after the game started (or the first
+    // synthetic press) was never seen by RV There Yet? at all. So every flip of
+    // the connected state the guest's XInputGetState reports is announced the way
+    // Windows announces a plugged-in pad. Unity polls every frame and is unaffected.
+    static bool s_padWasUp = false;
+    bool up;
+    { std::lock_guard<std::mutex> lk(g_padMutex); up = g_padConnected || g_synSticky; }
+    if (up != s_padWasUp){
+        s_padWasUp = up;
+        if (g_guestRunning){
+            KM_Push(WM_DEVICECHANGE, 0x0007 /*DBT_DEVNODES_CHANGED*/, 0);
+            Diag(std::string("INPUT pad ") + (up ? "connected" : "gone") + " -> WM_DEVICECHANGE to guest");
+        }
+    }
 }
 
 static std::wstring GuestPath(const std::wstring& name)
@@ -49644,9 +50392,9 @@ static void FinishGuestSession()
     RestorePebCommandLine();
     RestoreCrtArgv();
     RestoreThreadTls(g_tlsMainThreadSaved);
-#ifdef GH_LAUNCHER
-    FlushGuestImageOnly();
-#endif
+    // The Launcher frees the exe in NeutralizePreviousGuest, on the UI thread, once
+    // every other thread of the game is frozen (§56). Freeing it here, on the
+    // exiting thread, left the rest of the game running in freed pages.
 
     // Keep whatever the guest wrote to the registry. A crash is exactly when this
     // matters most: the settings a game chose on the way to dying are the record
@@ -50082,6 +50830,7 @@ static void RunGuest()
     g_gpuVendor = GhCfgNum(L"gh_gpu_vendor.txt", "GH_GPU_VENDOR", 0) & 0xFFFF;
     if (g_gpuVendor) Diag("DISPLAY console GPU reported as vendor " + Hex((uint32_t)g_gpuVendor));
     GhModsBegin();                              // §51: arm ghdoorstop when the title has a mod profile
+    GhUeForceXInputPoll(gp);                    // §56: Unreal re-polls the pad only with this CVar
     {   // guest\ -- where a guest's own shipped DLLs live
         size_t slash = gp.find_last_of(L"\\/");
         if (slash != std::wstring::npos) g_guestDir = gp.substr(0, slash + 1);
@@ -50547,6 +51296,13 @@ static void ResetGuestForRelaunch()
     g_guestCrashed = false;
     g_guestFailWhy.clear();
     g_guestWorkerTid = 0;
+    // §56: the last game's threads are frozen and its handlers gone; the next
+    // session starts its own lists. (g_formerGuest stays until the next image.)
+    AcquireSRWLockExclusive(&g_guestTidLock);
+    g_guestTids.clear();
+    ReleaseSRWLockExclusive(&g_guestTidLock);
+    GhClearGuestAtexit();     // a session that ended any other way must not hand its list on
+    InterlockedExchange(&g_guestVehN, 0);
     g_sessionFinished = false;
     g_capturedOut.clear();
     g_overlayOpen = false;
@@ -50592,6 +51348,7 @@ static bool GhLicenseGate(std::vector<uint8_t>&, const std::string&, std::string
 // because our own VEH cannot survive it: it allocates and locks before it writes.
 // gh_guest_stack_mb reserves a bigger stack so the theory can be tested; 0 keeps
 // std::thread's default, so the knob is a probe and not a silent change.
+static HANDLE g_guestWorkerH = nullptr;   // §56: the UI waits for this thread's exit before freeing
 static DWORD WINAPI GhGuestWorkerProc(LPVOID)
 {
     g_guestWorkerTid = GetCurrentThreadId();
@@ -50616,7 +51373,7 @@ static void GhStartGuestWorker()
         // demand. A 64 MB reservation costs nothing until the compiler goes deep.
         HANDLE h = CreateThread(nullptr, (SIZE_T)mb << 20, &GhGuestWorkerProc, nullptr,
                                 STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
-        if (h){ CloseHandle(h); return; }
+        if (h){ g_guestWorkerH = h; return; }
         Diag("GUESTSTACK CreateThread(" + std::to_string(mb) +
              "MB) failed err=" + std::to_string((unsigned long)GetLastError()) +
              " -- falling back to the default stack");
@@ -50629,7 +51386,7 @@ static void GhStartGuestWorker()
     // top of the worker). Only the gh_guest_stack_mb path used CreateThread, so
     // RV ran exactly while Tsushima's early knobs were leaking into it.
     if (HANDLE h = CreateThread(nullptr, 0, &GhGuestWorkerProc, nullptr, 0, nullptr)){
-        CloseHandle(h); return;
+        g_guestWorkerH = h; return;
     }
     Diag("GUESTSTACK CreateThread failed err=" + std::to_string((unsigned long)GetLastError()) +
          " -- falling back to std::thread (an MTA thread)");
@@ -50975,6 +51732,17 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
 #ifdef GH_LAUNCHER
             GhAudioStopCapture();
 #endif
+            // The worker sets g_guestDone and then calls ExitThread, whose
+            // DLL_THREAD_DETACH still runs the game's TLS callbacks: let it finish
+            // before anything is frozen or freed (§56). An overlay quit leaves it
+            // running guest code, so the wait is bounded.
+            if (g_guestWorkerH){
+                const DWORD w = WaitForSingleObject(g_guestWorkerH, 3000);
+                Diag(std::string("STAGE=guest_worker_") + (w == WAIT_OBJECT_0 ? "exited" : "still_running"));
+                if (w == WAIT_OBJECT_0) g_guestWorkerTid = 0;     // nothing left to freeze
+                CloseHandle(g_guestWorkerH);
+                g_guestWorkerH = nullptr;
+            }
             NeutralizePreviousGuest();
             const bool modRun = g_modsArmedRun;
             const bool modBad = modRun && !g_guestUserQuit &&
