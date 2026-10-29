@@ -175,6 +175,13 @@ cp "$RED/dxc/dxcompiler.dll" "$RED/dxc/LICENSE-LLVM.txt" "$RED/dxc/LICENCE-MIT.t
 rm -f "$STAGE/guest/dxc/"*.dll
 cp "$RED/dxc/dxcompiler.dll" "$RED/dxc/msvcp140.dll" "$RED/dxc/vcruntime140.dll" "$RED/dxc/vcruntime140_1.dll" "$STAGE/guest/dxc/" \
   || { echo "FATAL: missing the 14.40+ C++ runtime in $RED/dxc/"; exit 1; }
+# M4.4: the same 14.51.36247 runtime for UE4SS (§55), which imports msvcp140 14.4x
+# plus msvcp140_atomic_wait / _codecvt_ids that guest/vcrt lacks. LoadGuestDll uses
+# it in place of guest/vcrt only while a UE4SS profile is armed.
+mkdir -p "$STAGE/guest/vcrt14"
+for d in msvcp140 msvcp140_1 msvcp140_2 msvcp140_atomic_wait msvcp140_codecvt_ids vcruntime140 vcruntime140_1; do
+  cp "$RED/vcrt14/$d.dll" "$STAGE/guest/vcrt14/$d.dll" || { echo "FATAL: missing $RED/vcrt14/$d.dll"; exit 1; }
+done
 TSEED="$STAGE/guest/seed/GhostOfTsushima"
 PSPC="$TSEED/localstate/ghprogramdata/Sony Interactive Entertainment Inc/PSPC_SDK/S22/2.50.00.10"
 mkdir -p "$PSPC"
@@ -291,6 +298,11 @@ for i in range(20):
     time.sleep(2)
 else:
     print("  WARN: launcher still running after stop:", [p.get('ImageName') for p in live])
+# Both "Not ready yet" (0x80270300) updates, 0.0.719.0 and 0.0.726.0, installed
+# right after stopping a RUNNING Launcher; the process list empties before the
+# package is released. Give the app model time to let go.
+if cur and not live:
+    time.sleep(15)
 PYEOF
 python3 "$TMP/wdp.py" install "$GH/artifacts/$MSIX.signed.msix"
 PFN="Greenhouse.Launcher_${NEW}_x64__mgw46vk3ppz9w"
@@ -306,8 +318,12 @@ for i in $(seq 1 200); do   # 600 s: the package carries the 289 MB shader corpu
 import sys; sys.path.insert(0, "$TMP")
 import wdp
 st, d = wdp.req('GET', '/api/app/packagemanager/packages')
-names = [p.get('PackageFullName','') for p in (d or {}).get('InstalledPackages', [])]
-sys.exit(0 if "$PFN" in names else 1)
+# 0.0.741.0 (§55) was listed while registered ONLY to DefaultAccount: the
+# deployment never finished, the user's profile kept the old version, and every
+# launch timed out (0x800705B4). Registered means registered to a real user.
+users = [u.get('UserDisplayName','') for p in (d or {}).get('InstalledPackages', [])
+         if p.get('PackageFullName','') == "$PFN" for u in (p.get('RegisteredUsers') or [])]
+sys.exit(0 if any(not u.endswith('DefaultAccount') for u in users) else 1)
 PYEOF
 done
 [ -n "$REGISTERED" ] || { echo "FATAL: $PFN never registered after 600s"; exit 1; }

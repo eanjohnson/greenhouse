@@ -36,6 +36,7 @@
 #pragma once
 #include <windows.h>
 #include <winhttp.h>
+#include <appmodel.h>   // GetCurrentPackageId: the version in our User-Agent
 #include <bcrypt.h>
 #include <algorithm>
 #include <cstdint>
@@ -442,6 +443,25 @@ inline bool VerifyIndexSig(const std::vector<uint8_t>& index, const std::string&
     return ok;
 }
 
+// "Greenhouse/<package version>", or "Greenhouse/dev" with no package identity
+// (the host tests). Thunderstore and every other server see who is asking.
+inline const wchar_t* GhUserAgent()
+{
+    static const std::wstring ua = []{
+        UINT32 len = 0;
+        if (GetCurrentPackageId(&len, nullptr) == ERROR_INSUFFICIENT_BUFFER && len){
+            std::vector<BYTE> buf(len);
+            if (GetCurrentPackageId(&len, buf.data()) == ERROR_SUCCESS){
+                const PACKAGE_VERSION& v = ((const PACKAGE_ID*)buf.data())->version;
+                return L"Greenhouse/" + std::to_wstring(v.Major) + L"." + std::to_wstring(v.Minor) + L"." +
+                       std::to_wstring(v.Build) + L"." + std::to_wstring(v.Revision);
+            }
+        }
+        return std::wstring(L"Greenhouse/dev");
+    }();
+    return ua.c_str();
+}
+
 // ---- HTTP (WinHTTP) ---------------------------------------------------------------
 // GET url. With file set, the body streams to it and is hashed on the way
 // (sha256Out); otherwise it lands in body. Either way, more than maxBytes fails.
@@ -463,7 +483,7 @@ inline bool HttpGet(const std::string& url, uint64_t maxBytes, std::vector<uint8
 
     bool ok = false; uint64_t total = 0;
     Sha256 sh;
-    HINTERNET ses = WinHttpOpen(L"Greenhouse/1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+    HINTERNET ses = WinHttpOpen(GhUserAgent(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     HINTERNET con = nullptr, req = nullptr;
     if (!ses){ why = "WinHttpOpen failed"; goto done; }
@@ -534,7 +554,7 @@ inline bool HttpRequest(const wchar_t* method, const std::string& url, const std
     if (obj.empty()) obj = L"/";
 
     bool ok = false; uint64_t total = 0;
-    HINTERNET ses = WinHttpOpen(L"Greenhouse/1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+    HINTERNET ses = WinHttpOpen(GhUserAgent(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     HINTERNET con = nullptr, req = nullptr;
     if (!ses){ why = "WinHttpOpen failed"; goto done; }
@@ -959,6 +979,13 @@ inline bool Remove(const Config& c, const std::string& id, std::string& why)
 // update while the old addon.dll was loaded. Run before any add-on is loaded.
 inline void CleanOrphans(const Config& c)
 {
+    // No installed.json at all is a lost LocalState (a wiped package), not an
+    // empty install: every folder would look orphaned. Keep them so restoring
+    // the record brings the add-ons back (0.0.727.0 swept steam this way).
+    if (GetFileAttributesW((c.stateDir + L"installed.json").c_str()) == INVALID_FILE_ATTRIBUTES){
+        Log(c, "REPO no installed.json: orphan sweep skipped");
+        return;
+    }
     State st = LoadState(c.stateDir);
     WIN32_FIND_DATAW fd;
     HANDLE d = FindFirstFileW((c.addonRoot + L"*").c_str(), &fd);

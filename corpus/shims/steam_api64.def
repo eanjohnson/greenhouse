@@ -67,7 +67,7 @@ EXPORTS
     SteamAPI_ISteamClient_CreateLocalUser
     SteamAPI_ISteamClient_CreateSteamPipe
     SteamAPI_ISteamClient_GetIPCCallCount
-    SteamAPI_ISteamClient_GetISteamAppList=steam_stub
+    SteamAPI_ISteamClient_GetISteamAppList
     SteamAPI_ISteamClient_GetISteamApps
     SteamAPI_ISteamClient_GetISteamController
     SteamAPI_ISteamClient_GetISteamFriends

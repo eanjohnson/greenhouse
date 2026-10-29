@@ -2047,6 +2047,10 @@ __declspec(dllexport) void* SteamAPI_ISteamClient_GetISteamTimeline(void*, HStea
 // never calls their methods; only the non-null pointer matters so context init succeeds.
 __declspec(dllexport) void* SteamAPI_ISteamClient_GetISteamGameSearch(void*, HSteamUser, HSteamPipe, const char*) { return &g_iface_client; }
 __declspec(dllexport) void* SteamAPI_ISteamClient_GetISteamMusicRemote(void*, HSteamUser, HSteamPipe, const char*) { return &g_iface_client; }
+// Gang Beasts' older Steamworks.NET still fetches ISteamAppList in CSteamAPIContext.Init(), so a
+// NULL here failed its whole Steam init ("[STEAM:CORE] Failed Init | Running: True") and the game
+// quit behind its loading screen. Its methods stay steam_stub (0 apps).
+__declspec(dllexport) void* SteamAPI_ISteamClient_GetISteamAppList(void*, HSteamUser, HSteamPipe, const char*) { return &g_iface_client; }
 __declspec(dllexport) uint32_t SteamAPI_ISteamClient_GetIPCCallCount(void*) { return 0; }
 __declspec(dllexport) void SteamAPI_ISteamClient_SetWarningMessageHook(void*, void*) {}
 __declspec(dllexport) bool SteamAPI_ISteamClient_BShutdownIfAllPipesClosed(void*) { return true; }

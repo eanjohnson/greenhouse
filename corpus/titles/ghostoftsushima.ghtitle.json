@@ -11,7 +11,7 @@
   "early": {
     "gh_ddi_sm": 66, "gh_ddi_probe": 1, "gh_scache": 3,
     "gh_scache_x": 128, "gh_rip_ms": 15000, "gh_pso_cache_hide": 1,
-    "gh_lazy_mb": 1, "gh_lazy_spill_mb": 256, "gh_spill_ring_mb": 256,
+    "gh_lazy_mb": 1, "gh_lazy_spill_mb": 256, "gh_spill_ring_mb": 512, "gh_spill_seq": 1,
     "gh_spill_stat": 1, "gh_guest_stack_mb": 64, "gh_rawinput": 111,
     "gh_keepalive": 1, "gh_blackbox": 3
   },

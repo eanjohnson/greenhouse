@@ -39,6 +39,7 @@
 #include "gh_repo.h"         // package repository client (Step 3): Packages page, update check
 #include "gh_ent.h"          // membership entitlement (§43): token, heartbeat, QR link, sealed files
 #include "gh_pak.h"          // keyed packages' encrypted packs (§44): the shader corpus
+#include "gh_mods.h"         // §51 M1: Thunderstore mods into r2modman-layout profiles
 #include "qrcodegen.h"       // the membership QR (corpus/vendor/qrcodegen, MIT)
 static std::wstring LuiEntBadge();   // membership section, below
 #include "gh_addon_abi.h"    // add-on DLL ABI (Step 4): an installed add-on is one more library source
@@ -415,8 +416,43 @@ static bool LuiIsHelperExe(const std::wstring& name)
 
 // Pick the game exe in a folder: prefer <folder>.exe, skip crash-reporter
 // helpers, ignore 0-byte leftovers from a failed chunk decode.
+// M4.4: an Unreal game's root <Proj>.exe is a small bootstrap that starts
+// <Proj>\Binaries\Win64\<Proj>-Win64-Shipping.exe as a CHILD process, which would
+// run outside the loader. The row launches the shipping exe itself (relative path).
+static std::wstring LuiPickUnrealExe(const std::wstring& dir)
+{
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((dir + L"*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return L"";
+    std::wstring best;
+    DWORD bestSz = 0;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        std::wstring proj = fd.cFileName;
+        if (proj == L"." || proj == L".." || _wcsicmp(proj.c_str(), L"Engine") == 0) continue;
+        const std::wstring bin = proj + L"\\Binaries\\Win64\\";
+        WIN32_FIND_DATAW ef{};
+        HANDLE eh = FindFirstFileW((dir + bin + L"*-Shipping.exe").c_str(), &ef);
+        if (eh == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (ef.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            DWORD sz = LuiFileSize(dir + bin + ef.cFileName);
+            if (sz >= 64 && sz > bestSz){ best = bin + ef.cFileName; bestSz = sz; }
+        } while (FindNextFileW(eh, &ef));
+        FindClose(eh);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    if (!best.empty())
+        Diag("LAUNCHER exe picked '" + LuiNarrow(best) + "' (Unreal shipping exe, " + std::to_string(bestSz) + " bytes)");
+    return best;
+}
+
 static std::wstring LuiPickExe(const std::wstring& dir, const std::wstring& folder)
 {
+    {
+        std::wstring ue = LuiPickUnrealExe(dir);
+        if (!ue.empty()) return ue;
+    }
     std::wstring prefer = folder + L".exe";
     std::wstring first, match, any;
     DWORD bestSz = 0, anySz = 0;
@@ -626,6 +662,15 @@ static bool LuiContainsI(const std::wstring& hay, const std::wstring& needle)
     return false;
 }
 
+// §51 M2: the Mods screen (below) and the picker's view of it.
+static std::mutex g_modsMapMu;                            // guards the three below
+static std::map<std::string, ghmods::Game> g_modsGames;   // title id -> its Thunderstore game (BepInEx titles only)
+static std::map<std::string, std::string> g_modsArmed;    // title id -> the profile its next launch uses
+static std::string g_modsUiLine;                          // the mod engine's last log line, for the busy panel
+static std::atomic<bool> g_modsArmedDirty{true};          // gh_mod_profile.txt changed: re-read it
+static bool LuiModsOffered(const LauncherItem& it);       // RB opens Mods for this row
+static std::wstring LuiModsBadge(const LauncherItem& it); // "Mods: <profile>", or empty
+
 static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const std::wstring& status,
                         const std::wstring& query, int matchN, int allN,
                         int promptKind, const wchar_t* promptName)
@@ -684,8 +729,12 @@ static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const s
         bool cur = (i == sel);
         D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(D2D1::RectF(x0, y, x1, y + rowH - 12), 10, 10);
         dc->FillRoundedRectangle(rr, cur ? g_lui.brSel.get() : g_lui.brPanel.get());
+        const std::wstring mods = LuiModsBadge(items[i]);
         LuiText(items[i].display.c_str(), g_lui.fmtItem.get(),
-                D2D1::RectF(x0 + 28, y, x1 - 220, y + rowH - 12), g_lui.brFg.get());
+                D2D1::RectF(x0 + 28, y, x1 - (mods.empty() ? 220 : 600), y + rowH - 12), g_lui.brFg.get());
+        if (!mods.empty())
+            LuiText(mods.c_str(), g_lui.fmtSmall.get(), D2D1::RectF(x1 - 580, y, x1 - 260, y + rowH - 12),
+                    cur ? g_lui.brFg.get() : g_lui.brAccent.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
         LuiText(items[i].sub.c_str(), g_lui.fmtSmall.get(),
                 D2D1::RectF(x1 - 240, y, x1 - 24, y + rowH - 12),
                 cur ? g_lui.brFg.get() : g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
@@ -711,12 +760,14 @@ static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const s
         // Verify re-downloads through a source that offers it (the Steam add-on), so
         // the View glyph is shown only when one does.
         const bool verify = GhSteamRuntimeProvided();
-        const wchar_t* right = verify ? L"  Verify      Y  Search      B  Back" : L"Y  Search      B  Back";
+        const bool mods = sel >= 0 && sel < total && LuiModsOffered(items[sel]);
+        const std::wstring right = std::wstring(verify ? L"  Verify      " : L"") + (mods ? L"RB  Mods      " : L"") +
+                                   L"Y  Search      B  Back";
         float wl = LuiMeasure(left, fs);
         LuiText(left, fs, D2D1::RectF(x, y0, x + wl + 2.f, y1), dim);
         x += wl;
         if (verify) x += LuiDrawViewBtn(x, cy, dim);
-        LuiText(right, fs, D2D1::RectF(x, y0, W - 80.f, y1), dim);
+        LuiText(right.c_str(), fs, D2D1::RectF(x, y0, W - 80.f, y1), dim);
     }
 
     if (promptName && promptName[0] && promptKind != 0) {
@@ -1711,6 +1762,1020 @@ static void LuiRepoStartupCheck()
     }).detach();
 }
 
+// §51 M1: the mod engine's command file. Until the Mods screens exist (M2), every
+// mod operation is driven by LocalState\gh_mods_cmd.txt, one command per line:
+//   index   <title> [refresh]               fetch the schema + community index
+//   search  <title> <text...>               top 10 by downloads
+//   install <title> <profile> <Owner-Name> [version]
+//   remove | enable | disable <title> <profile> <Owner-Name>
+//   update  <title> <profile>
+//   import  <title> <profile> <profile-code>
+//   importfile <title> <profile> <file.r2z>  (in the DevelopmentFiles root)
+//   list    <title> <profile>
+//   arm     <title> <profile>               gh_mod_profile.txt: launch with this profile
+//   vanilla <title>                         ...and back to no mods
+//   delprofile <title> <profile>            delete a profile folder (falls back to no mods if active)
+//   dotnet6                                 fetch + unpack the pinned portable .NET 6 runtime (§54)
+//   clrprobe                                host CoreCLR and run DevelopmentFiles\GhClrProbe.dll (§54 test)
+// It is read only while the picker is up (a game shares this process), renamed
+// *.done, and every result line goes to the diag and to LocalState\gh_mods_out.txt.
+static std::atomic<bool> g_modsPickerUp{false};
+static std::string g_modsOut;
+
+static void LuiModsLog(const std::string& s) { Diag(s); g_modsOut += s + "\n"; }
+
+static bool LuiModsGame(const ghmods::Env& env, const std::string& titleId, ghmods::Game& g, std::string& why,
+                        const std::string& community = "")
+{
+    for (const auto& t : GhTitles())
+        if (t.id == titleId) {
+            if (!t.steamAppId) { why = titleId + " has no Steam app id"; return false; }
+            return ghmods::LoadGame(env, t.steamAppId, community, g, why);
+        }
+    why = "no title \"" + titleId + "\"";
+    return false;
+}
+
+// §54: declared in guest_loader.cpp; GhModsBegin asks for it when a MelonLoader
+// profile is armed on an IL2CPP game (the first such launch downloads ~33 MB).
+static bool GhModsDotnet6(std::wstring& dir, std::string& why)
+{
+    ghmods::Env env;
+    env.root = std::wstring(kDevRoot) + L"gh_mods\\";
+    env.log = [](const std::string& s) { Diag(s); };
+    CreateDirectoryW(env.root.c_str(), nullptr);
+    return ghmods::EnsureDotnet6(env, dir, why);
+}
+
+static void LuiModsRun(const std::string& line)
+{
+    auto a = ghmods::Split(line, ' ');
+    a.erase(std::remove(a.begin(), a.end(), std::string()), a.end());
+    if (a.empty() || a[0][0] == '#') return;
+    ghmods::Env env;
+    env.root = std::wstring(kDevRoot) + L"gh_mods\\";
+    env.log = LuiModsLog;
+    CreateDirectoryW(env.root.c_str(), nullptr);
+    const std::string& cmd = a[0];
+    std::string why;
+    bool ok = false;
+    ghmods::Game g;
+    LuiModsLog("MODS > " + line);
+    DWORD t0 = GetTickCount();
+    auto need = [&](size_t n) { if (a.size() >= n) return true; why = "usage: see launcher_ui.h (LuiModsRun)"; return false; };
+    // "<title>@<community>" takes another community's install rules and loaders,
+    // e.g. BepInEx 6 on a game whose own community only lists MelonLoader.
+    std::string community;
+    if (a.size() >= 2 && a[1].find('@') != std::string::npos) {
+        community = a[1].substr(a[1].find('@') + 1);
+        a[1].resize(a[1].find('@'));
+        if (!ghmods::PlainToken(community, 64)) a[1].clear();
+    }
+    if (a.size() >= 2 && !ghmods::PlainToken(a[1], 64)) { why = "bad title"; }
+    else if (cmd == "dotnet6") {
+        std::wstring dn;
+        ok = ghmods::EnsureDotnet6(env, dn, why);
+    } else if (cmd == "clrprobe") {
+        // §54 M4.3 test: host CoreCLR here and run DevelopmentFiles\GhClrProbe.dll (WDP
+        // cannot make folders there), which writes GhClrProbe_out.txt. The runtime stays
+        // loaded: stop the app after.
+        std::wstring dn;
+        const std::wstring dir = kDevRoot;
+        ghmods::ClrFn f;
+        if (ghmods::EnsureDotnet6(env, dn, why) &&
+            ghmods::ClrResolve(dn, dir + L"GhClrProbe.dll", L"GhClrProbe", L"Run", f, why)) {
+            static std::wstring outPath;
+            outPath = dir + L"GhClrProbe_out.txt";
+            DeleteFileW(outPath.c_str());
+            static int rc;
+            rc = -1;
+            HANDLE th = CreateThread(nullptr, 0, [](LPVOID p) -> DWORD {
+                rc = ((ghmods::ClrFn*)p)->fn((void*)outPath.c_str(), (int)(outPath.size() * 2));
+                return 0; }, &f, 0, nullptr);
+            const DWORD wr = th ? WaitForSingleObject(th, 300000) : WAIT_FAILED;
+            if (th && wr == WAIT_OBJECT_0) CloseHandle(th);
+            ok = wr == WAIT_OBJECT_0 && rc == 42;
+            if (!ok) why = wr == WAIT_TIMEOUT ? "probe still running after 300 s (hung?)" : "probe returned " + std::to_string(rc);
+            std::string o;
+            ghmods::ReadAll(outPath, o, 1 << 20);
+            for (const auto& l : ghmods::Split(o, '\n')) if (!l.empty()) LuiModsLog("CLRPROBE " + l);
+        }
+    } else if (cmd == "vanilla" && need(2)) {
+        ok = ghmods::SetActiveProfile(std::wstring(kLocalState) + L"gh_mod_profile.txt", a[1], "");
+    } else if (cmd == "arm" && need(3)) {
+        ok = ghmods::ValidProfileName(a[2]) &&
+             ghmods::SetActiveProfile(std::wstring(kLocalState) + L"gh_mod_profile.txt", a[1], a[2]);
+    } else if (cmd == "delprofile" && need(3)) {
+        ok = ghmods::ValidProfileName(a[2]);
+        if (ok){
+            std::wstring dir = ghmods::ProfileDir(env, a[1], a[2]);
+            dir.pop_back();
+            ok = LuiDeleteTree(dir);
+            if (!ok) why = "could not delete all of it";
+            if (_wcsicmp(GhModProfileFor(a[1]).c_str(), ghrepo::Widen(a[2]).c_str()) == 0)
+                ghmods::SetActiveProfile(std::wstring(kLocalState) + L"gh_mod_profile.txt", a[1], "");
+            g_modsArmedDirty = true;
+        } else why = "bad profile name";
+    } else if (cmd == "list" && need(3)) {
+        ok = ghmods::ValidProfileName(a[2]);
+        for (const auto& m : ghmods::LoadProfile(ghmods::ProfileDir(env, a[1], a[2])))
+            LuiModsLog("MODS   " + m.fullName + " " + m.ver + (m.enabled ? "" : " (disabled)"));
+    } else if (need(2) && LuiModsGame(env, a[1], g, why, community)) {
+        if (cmd == "index") {
+            env.say(a[1] + " -> " + g.label + " (community " + g.community + ", loader " + g.loader + ")");
+            ok = ghmods::EnsureIndex(env, g, why, a.size() >= 3 && a[2] == "refresh");
+        } else if (!ghmods::EnsureIndex(env, g, why)) {
+        } else if (cmd == "search" && need(3)) {
+            ghmods::TopN t;
+            t.q.limit = 10;
+            for (size_t i = 2; i < a.size(); i++) t.q.text += (i > 2 ? " " : "") + a[i];
+            ghmods::ScanIndex(env, g.community, [&](const ghmods::Pkg& p) { t.offer(p); });
+            for (const auto& p : t.best)
+                LuiModsLog("MODS   " + p.fullName + " " + p.latest + "  dl=" + std::to_string(p.downloads) +
+                           " rating=" + std::to_string(p.rating) + "  " + p.desc.substr(0, 80));
+            env.say(std::to_string(t.seen) + " match(es)");
+            ok = true;
+        } else if (cmd == "install" && need(4)) {
+            ok = ghmods::Install(env, g, a[1], a[2], a[3], a.size() >= 5 ? a[4] : "", why);
+        } else if (cmd == "remove" && need(4)) {
+            ok = ghmods::Remove(env, a[1], a[2], a[3], why);
+        } else if ((cmd == "enable" || cmd == "disable") && need(4)) {
+            ok = ghmods::SetEnabled(env, g, a[1], a[2], a[3], cmd == "enable", why);
+        } else if (cmd == "update" && need(3)) {
+            ok = ghmods::UpdateAll(env, g, a[1], a[2], why);
+        } else if (cmd == "import" && need(4)) {
+            ok = ghmods::ImportCode(env, g, a[1], a[2], a[3], why);
+        } else if (cmd == "addfile" && need(4)) {
+            // a mod zip in the DevelopmentFiles root, installed by the title's rules
+            std::string bytes;
+            const std::string stem = a[3].size() > 4 && ghmods::EndsWithI(a[3], ".zip") ? a[3].substr(0, a[3].size() - 4) : a[3];
+            if (!ghmods::PlainToken(a[3])) why = "bad file name";
+            else if (!ghmods::ReadAll(std::wstring(kDevRoot) + ghrepo::Widen(a[3]), bytes, 1u << 30)) why = "cannot read " + a[3];
+            else ok = ghmods::AddLocalZip(env, g, a[1], a[2], stem, bytes, why);
+        } else if (cmd == "importfile" && need(4)) {
+            // a .r2z in the DevelopmentFiles root (where WDP can upload)
+            std::string bytes;
+            if (!ghmods::PlainToken(a[3])) why = "bad file name";
+            else if (!ghmods::ReadAll(std::wstring(kDevRoot) + ghrepo::Widen(a[3]), bytes, 256u << 20)) why = "cannot read " + a[3];
+            else ok = ghmods::ImportZip(env, g, a[1], a[2], std::vector<uint8_t>(bytes.begin(), bytes.end()), why);
+        } else if (why.empty()) why = "unknown command";
+    }
+    LuiModsLog(std::string("MODS < ") + (ok ? "ok" : "FAILED: " + why) + " (" +
+               std::to_string((GetTickCount() - t0) / 1000) + " s)");
+}
+
+static void LuiModsCmdStart()
+{
+    static std::atomic<bool> started{false};
+    if (started.exchange(true)) return;
+    std::thread([] {
+        const std::wstring cmdPath = std::wstring(kLocalState) + L"gh_mods_cmd.txt";
+        for (;;) {
+            Sleep(2000);
+            if (!g_modsPickerUp || GetFileAttributesW(cmdPath.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+            std::string text;
+            ghmods::ReadAll(cmdPath, text, 1 << 20);
+            MoveFileExW(cmdPath.c_str(), (cmdPath + L".done").c_str(), MOVEFILE_REPLACE_EXISTING);
+            std::lock_guard<std::mutex> lk(g_modsJobLock);
+            g_modsOut.clear();
+            for (auto line : ghmods::Split(text, '\n')) {
+                while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+                LuiModsRun(line);
+            }
+            ghmods::WriteAll(std::wstring(kLocalState) + L"gh_mods_out.txt", g_modsOut);
+            g_modsArmedDirty = true;
+        }
+    }).detach();
+}
+
+// ---------------------------------------------------------------------------
+// §51 M2: the Mods screen. RB on a game whose Thunderstore community uses BepInEx
+// opens it. Three tabs, LB / RB between them:
+//   Installed  the active profile's mods: A on/off, X remove, Y update all
+//   Browse     the community's index: Y search, View sort, A install (with dependencies)
+//   Profiles   A use one (No mods = vanilla), X delete, new, import an r2modman code
+// The profile shown is the one the next launch uses (gh_mod_profile.txt). Installing
+// with none active makes "Default" and turns it on. Network and disk jobs run on a
+// worker holding g_modsJobLock (GhModsBegin takes it at launch); B cancels one.
+// Mods download from thunderstore.io on the console; each one shows its author,
+// downloads and page address.
+// ---------------------------------------------------------------------------
+static std::wstring LuiModsRoot() { return std::wstring(kDevRoot) + L"gh_mods\\"; }
+
+static void LuiModsUiLog(const std::string& s)
+{
+    Diag(s);
+    std::lock_guard<std::mutex> lk(g_modsMapMu);
+    g_modsUiLine = s.compare(0, 5, "MODS ") == 0 ? s.substr(5) : s;
+}
+
+static const GhTitle* LuiModsTitle(const LauncherItem& it)
+{
+    if (it.kind != LauncherItem::kLaunch || it.guest.empty()) return nullptr;
+    const std::wstring exe = LuiExeBase(it.guest) + L".exe";
+    for (const GhTitle& t : GhTitles())
+        if (t.steamAppId && _wcsicmp(t.exe.c_str(), exe.c_str()) == 0) return &t;
+    return nullptr;
+}
+
+static bool LuiModsOffered(const LauncherItem& it)
+{
+    const GhTitle* t = LuiModsTitle(it);
+    if (!t) return false;
+    std::lock_guard<std::mutex> lk(g_modsMapMu);
+    return g_modsGames.count(t->id) != 0;
+}
+
+// The profile title `id` launches with ("" = vanilla). Caller holds g_modsMapMu.
+static std::string LuiModsArmedLocked(const std::string& id)
+{
+    if (g_modsArmedDirty.exchange(false)) {
+        g_modsArmed.clear();
+        std::string s;
+        ghmods::ReadAll(std::wstring(kLocalState) + L"gh_mod_profile.txt", s, 1 << 20);
+        for (auto line : ghmods::Split(s, '\n')) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            const size_t eq = line.find('=');
+            if (eq != std::string::npos && eq + 1 < line.size()) g_modsArmed[line.substr(0, eq)] = line.substr(eq + 1);
+        }
+    }
+    auto f = g_modsArmed.find(id);
+    return f == g_modsArmed.end() ? std::string() : f->second;
+}
+
+static std::string LuiModsArmed(const std::string& id)
+{
+    std::lock_guard<std::mutex> lk(g_modsMapMu);
+    return LuiModsArmedLocked(id);
+}
+
+static std::wstring LuiModsBadge(const LauncherItem& it)
+{
+    const GhTitle* t = LuiModsTitle(it);
+    if (!t) return L"";
+    const std::string p = LuiModsArmed(t->id);
+    return p.empty() ? L"" : L"Mods: " + ghrepo::Widen(p);
+}
+
+// Which titles have mods: every title with a Steam app id whose Thunderstore game
+// uses BepInEx (the one loader ghdoorstop starts). Reads the cached schema, or
+// fetches it when it is a week old.
+static void LuiModsMapStart()
+{
+    static std::atomic<bool> started{false};
+    if (started.exchange(true)) return;
+    std::thread([] {
+        ghmods::Env env;
+        env.root = LuiModsRoot();
+        env.log = LuiModsUiLog;
+        CreateDirectoryW(env.root.c_str(), nullptr);
+        std::lock_guard<std::mutex> job(g_modsJobLock);
+        for (const GhTitle& t : GhTitles()) {
+            if (!t.steamAppId) continue;
+            ghmods::Game g;
+            std::string why;
+            if (!ghmods::LoadGame(env, t.steamAppId, "", g, why)) { Diag("MODS " + t.id + ": " + why); continue; }
+            if (g.loader != "bepinex" && g.loader != "recursive-melonloader" && g.loader != "shimloader") { Diag("MODS " + t.id + ": loader " + g.loader + " is not supported yet"); continue; }
+            Diag("MODS " + t.id + " -> " + g.label + " (mods offered)");
+            std::lock_guard<std::mutex> lk(g_modsMapMu);
+            g_modsGames[t.id] = g;
+        }
+    }).detach();
+}
+
+static std::vector<std::string> LuiModsProfiles(const std::string& titleId)
+{
+    std::vector<std::string> v;
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((LuiModsRoot() + ghrepo::Widen(titleId) + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return v;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        const std::wstring w = fd.cFileName;
+        bool ascii = true;
+        for (wchar_t c : w) if (c >= 128) ascii = false;
+        const std::string n = LuiNarrow(w);
+        if (ascii && n != "." && n != ".." && ghmods::ValidProfileName(n)) v.push_back(n);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    std::sort(v.begin(), v.end(), [](const std::string& a, const std::string& b) { return ghmods::Lower(a) < ghmods::Lower(b); });
+    return v;
+}
+
+static std::wstring LuiModsCount(int64_t n)
+{
+    wchar_t b[32];
+    if (n >= 1000000) swprintf(b, 32, L"%.1fM", (double)n / 1e6);
+    else if (n >= 1000) swprintf(b, 32, L"%.1fK", (double)n / 1e3);
+    else swprintf(b, 32, L"%lld", (long long)n);
+    return b;
+}
+
+static std::wstring LuiModsThousands(size_t n)          // 39469 -> "39,469"
+{
+    std::wstring s = std::to_wstring(n);
+    for (int i = (int)s.size() - 3; i > 0; i -= 3) s.insert((size_t)i, 1, L',');
+    return s;
+}
+
+static std::wstring LuiModsName(const std::string& name)   // Thunderstore names spell spaces as _
+{
+    std::wstring w = ghrepo::Widen(name);
+    for (auto& c : w) if (c == L'_') c = L' ';
+    return w;
+}
+
+static void LauncherMods(const GhTitle& title)
+{
+    if (!LuiInit()) return;
+    struct Job {
+        std::atomic<bool> done{true};
+        volatile LONG cancel = 0; volatile LONG64 prog = 0;
+        bool ok = false; std::string why;
+        ghmods::Game game; bool haveGame = false;
+        std::map<std::string, ghmods::Pkg> latest;
+        std::vector<ghmods::Pkg> found; size_t seen = 0;
+        unsigned n = 0;
+    };
+    using Work = std::function<bool(const ghmods::Env&, Job&)>;
+    auto job = std::make_shared<Job>();
+    std::function<void(Job&)> onDone;
+    std::function<void()> onAsk;
+
+    const std::string tid = title.id;
+    const unsigned appId = title.steamAppId;
+    const std::wstring tname = ghrepo::Widen(title.name.empty() ? title.id : title.name);
+    const std::wstring armFile = std::wstring(kLocalState) + L"gh_mod_profile.txt";
+    ghmods::Env uiEnv;
+    uiEnv.root = LuiModsRoot();
+    ghmods::Game game;
+    bool haveGame = false, haveIndex = false;
+    std::map<std::string, ghmods::Pkg> latest;     // lower-case full name -> its index entry
+    std::vector<ghmods::Installed> inst;
+    std::vector<ghmods::Pkg> found;
+    size_t seen = 0;
+    std::vector<std::string> profs;
+    std::vector<size_t> profN;
+    std::string profile;                           // what the next launch uses; empty = vanilla
+    std::wstring status, busy, ask, askTitle, query;
+    bool bad = false;
+    enum { kInstalled, kBrowse, kProfiles, kSettings, kTabs };
+    enum { kTxtNone, kTxtSearch, kTxtProfile, kTxtCode, kTxtValue };
+    int tab = kInstalled, txt = kTxtNone;
+    int sel[kTabs] = {0, 0, 0, 0};
+    struct CfgFile { std::wstring path, name; std::string file; size_t n; };
+    std::vector<CfgFile> cfgs;                     // the profile's BepInEx\config\*.cfg
+    int cfgOpen = -1, cfgFileSel = 0;              // the file being edited (index into cfgs), and its row
+    std::string cfgText;                           // that file as read, then as last saved
+    std::vector<ghmods::CfgEntry> cfgEs;
+    ghmods::Sort sort = ghmods::Sort::Downloads;
+    static const wchar_t* kSortName[] = {L"Most downloaded", L"Top rated", L"Recently updated", L"Name"};
+    WORD prev = 0xFFFF;
+    DWORD lastNav = 0;
+    const std::wstring pickQuery = g_pickQuery;    // the picker's search, given back on the way out
+
+    auto count = [&](int t) {
+        return t == kInstalled ? (int)inst.size() : t == kBrowse ? (int)found.size() : t == kProfiles ? (int)profs.size() + 3
+             : cfgOpen >= 0 ? (int)cfgEs.size() : (int)cfgs.size();
+    };
+    auto utf8 = [](const std::wstring& w) {
+        int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+        std::string o(n > 0 ? (size_t)n : 0, '\0');
+        if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), &o[0], n, nullptr, nullptr);
+        return o;
+    };
+    // Each mod's settings file appears in the profile the first time the game runs with it.
+    auto loadCfgs = [&] {
+        cfgs.clear();
+        if (profile.empty()) return;
+        const std::wstring dir = ghmods::ProfileDir(uiEnv, tid, profile) + L"BepInEx\\config\\";
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW((dir + L"*.cfg").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do {
+            const std::wstring f = fd.cFileName;
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || f.size() < 5 || _wcsicmp(f.c_str() + f.size() - 4, L".cfg")) continue;
+            std::string text;
+            if (!ghmods::ReadAll(dir + f, text, 1u << 20)) continue;
+            const size_t n = ghmods::ParseCfg(text).size();
+            if (!n) continue;
+            const std::string plugin = ghmods::CfgPluginName(text);
+            cfgs.push_back({dir + f, plugin.empty() ? f.substr(0, f.size() - 4) : ghrepo::Widen(plugin), utf8(f), n});
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+        std::sort(cfgs.begin(), cfgs.end(), [](const CfgFile& a, const CfgFile& b) { return _wcsicmp(a.name.c_str(), b.name.c_str()) < 0; });
+    };
+    auto reload = [&] {
+        profile = LuiModsArmed(tid);
+        if (!ghmods::ValidProfileName(profile)) profile.clear();
+        inst = profile.empty() ? std::vector<ghmods::Installed>() : ghmods::LoadProfile(ghmods::ProfileDir(uiEnv, tid, profile));
+        profs = LuiModsProfiles(tid);
+        profN.clear();
+        for (const auto& p : profs) profN.push_back(ghmods::LoadProfile(ghmods::ProfileDir(uiEnv, tid, p)).size());
+        if (cfgOpen < 0) loadCfgs();
+        for (int t = 0; t < kTabs; ++t) {
+            if (sel[t] >= count(t)) sel[t] = count(t) - 1;
+            if (sel[t] < 0) sel[t] = 0;
+        }
+    };
+    auto start = [&](const std::wstring& what, Work work, std::function<void(Job&)> done) {
+        job = std::make_shared<Job>();
+        job->done = false;
+        busy = what;
+        onDone = std::move(done);
+        { std::lock_guard<std::mutex> lk(g_modsMapMu); g_modsUiLine.clear(); }
+        std::thread([job = job, work = std::move(work)] {
+            ghmods::Env e;
+            e.root = LuiModsRoot();
+            e.log = LuiModsUiLog;
+            e.cancel = &job->cancel;
+            e.progress = &job->prog;
+            {
+                std::lock_guard<std::mutex> lk(g_modsJobLock);
+                try { job->ok = work(e, *job); } catch (...) { job->ok = false; job->why = "internal error"; }
+            }
+            job->done = true;
+        }).detach();
+    };
+    auto finish = [&](Job& j, const std::wstring& okText, const std::wstring& failText) {
+        bad = !j.ok;
+        status = j.ok ? okText : failText + L": " + ghrepo::Widen(j.why);
+        g_modsArmedDirty = true;
+        reload();
+    };
+    // UI-thread profile edits are quick, but never run under a worker's job.
+    auto locked = [&](const std::function<void()>& fn) {
+        std::unique_lock<std::mutex> lk(g_modsJobLock, std::try_to_lock);
+        if (!lk.owns_lock()) { bad = true; status = L"Another mod job is running; try again in a moment"; return; }
+        fn();
+    };
+    auto use = [&](std::string p) {           // by value: reload() replaces profs, which callers pass from
+        locked([&] {
+            const bool ok = ghmods::SetActiveProfile(armFile, tid, p);
+            Diag("MODS UI " + tid + " next launch: " + (p.empty() ? std::string("no mods") : p) + (ok ? "" : " (write FAILED)"));
+            g_modsArmedDirty = true;
+            reload();
+            bad = !ok;
+            status = !ok ? L"Could not save the choice" : p.empty() ? L"The next launch has no mods"
+                                                                     : L"The next launch uses " + ghrepo::Widen(p);
+        });
+    };
+    auto cfgClose = [&] {
+        if (cfgOpen < 0) return;
+        cfgOpen = -1;
+        cfgEs.clear();
+        loadCfgs();
+        sel[kSettings] = cfgFileSel < (int)cfgs.size() ? cfgFileSel : 0;
+    };
+    auto cfgSet = [&](const ghmods::CfgEntry& e, const std::string& v) {
+        const std::wstring key = ghrepo::Widen(e.key);
+        std::string why, t = cfgText;
+        if (!ghmods::CfgValueOk(e, v, why)) { bad = true; status = key + L" " + ghrepo::Widen(why); return; }
+        if (v == e.value) return;
+        if (!ghmods::SetCfgValue(t, e, v)) { bad = true; status = L"Could not change " + key; return; }
+        bool ok = false;
+        locked([&] { ok = ghmods::WriteAll(cfgs[cfgOpen].path, t); });
+        if (!ok) { if (!bad) { bad = true; status = L"Could not save " + cfgs[cfgOpen].name; } return; }
+        Diag("MODS UI set " + tid + "/" + profile + " " + cfgs[cfgOpen].file + " [" + e.section + "] " + e.key + " = " + v);
+        cfgText = t;
+        cfgEs = ghmods::ParseCfg(cfgText);
+        bad = false;
+        status = key + L" = " + ghrepo::Widen(v) + L"  (saved; the next launch uses it)";
+    };
+    auto search = [&] {
+        if (!haveIndex) { bad = true; status = L"The mod index is not loaded"; return; }
+        ghmods::Query q;
+        q.text = LuiNarrow(query);
+        q.sort = sort;
+        q.limit = 100;
+        const std::string community = game.community;
+        Diag("MODS UI search '" + q.text + "' sort " + std::to_string((int)sort));
+        start(L"Searching…",
+              [q, community](const ghmods::Env& e, Job& j) {
+                  ghmods::TopN t;
+                  t.q = q;
+                  if (!ghmods::ScanIndex(e, community, [&](const ghmods::Pkg& p) { t.offer(p); }))
+                      return (j.why = "the index is missing", false);
+                  j.found = std::move(t.best);
+                  j.seen = t.seen;
+                  return true;
+              },
+              [&](Job& j) {
+                  if (j.ok) { found = j.found; seen = j.seen; sel[kBrowse] = 0; }
+                  bad = !j.ok;
+                  status = j.ok ? LuiModsThousands(seen) + L" mods" + (query.empty() ? L"" : L" match “" + query + L"”")
+                                : L"Search failed: " + ghrepo::Widen(j.why);
+              });
+    };
+    auto install = [&](const ghmods::Pkg& p) {
+        const std::string prof = profile.empty() ? std::string("Default") : profile;
+        const bool arm = profile.empty();
+        const std::string full = p.fullName;
+        const ghmods::Game g = game;
+        latest[ghmods::Lower(full)] = p;
+        Diag("MODS UI install " + full + " " + p.latest + " into " + tid + "/" + prof);
+        start(L"Installing " + LuiModsName(p.name) + L" " + ghrepo::Widen(p.latest) + L"…",
+              [g, tid, prof, full, arm, armFile](const ghmods::Env& e, Job& j) {
+                  if (!ghmods::Install(e, g, tid, prof, full, "", j.why)) return false;
+                  return !arm || ghmods::SetActiveProfile(armFile, tid, prof) || (j.why = "cannot write gh_mod_profile.txt", false);
+              },
+              [&, name = LuiModsName(p.name), prof](Job& j) {
+                  finish(j, L"Installed " + name + L" in profile " + ghrepo::Widen(prof), L"Install failed");
+              });
+    };
+    auto begin = [&](int mode, const std::wstring& init) {
+        txt = mode;
+        g_pickQuery = init;
+        g_pickQueryChanged = false;
+        { std::lock_guard<std::mutex> lk(g_pickKbMu); g_pickKbChars.clear(); g_pickKbBack = 0; g_pickKbClear = false; }
+        PickerOskShow();
+    };
+    auto commit = [&] {
+        const int mode = txt;
+        txt = kTxtNone;
+        bad = false;
+        PickerOskHide();
+        std::wstring s = g_pickQuery;
+        while (!s.empty() && s.back() == L' ') s.pop_back();
+        while (!s.empty() && s.front() == L' ') s.erase(s.begin());
+        if (mode == kTxtSearch) { query = s; search(); return; }
+        if (mode == kTxtValue) {
+            if (cfgOpen >= 0 && sel[kSettings] < (int)cfgEs.size()) cfgSet(cfgEs[sel[kSettings]], utf8(s));
+            return;
+        }
+        if (s.empty()) return;
+        if (mode == kTxtProfile) {
+            std::string n;
+            for (wchar_t c : s) n += c == L' ' ? '-' : (c < 128 ? (char)c : '_');
+            if (!ghmods::ValidProfileName(n)) { bad = true; status = L"Use letters, digits, - _ or . (not starting with _)"; return; }
+            for (const auto& p : profs)
+                if (ghmods::EqI(p, n)) { bad = true; status = L"There is already a profile called " + ghrepo::Widen(p); return; }
+            locked([&] {
+                const std::wstring dir = ghmods::ProfileDir(uiEnv, tid, n);
+                ghmods::Mkdirs(dir + L"gh_profile.txt");
+                if (!ghmods::SaveProfile(dir, {})) { bad = true; status = L"Could not make the profile folder"; return; }
+                Diag("MODS UI new profile " + tid + "/" + n);
+            });
+            if (!bad) use(n);
+            return;
+        }
+        std::string code;                        // kTxtCode: r2modman / Gale codes are lower-case UUIDs
+        for (wchar_t c : s) code += c < 128 ? (char)tolower((int)c) : '?';
+        if (!ghmods::ValidCode(code)) { bad = true; status = L"That is not a profile code (it looks like 0a1b2c3d-…)"; return; }
+        if (!haveGame) { bad = true; status = L"Importing needs Thunderstore (no network?)"; return; }
+        std::string prof = "Imported";
+        for (int k = 2; std::any_of(profs.begin(), profs.end(), [&](const std::string& p) { return ghmods::EqI(p, prof); }); ++k)
+            prof = "Imported-" + std::to_string(k);
+        const ghmods::Game g = game;
+        Diag("MODS UI import code into " + tid + "/" + prof);
+        start(L"Importing profile " + ghrepo::Widen(code) + L"…",
+              [g, tid, prof, code, armFile](const ghmods::Env& e, Job& j) {
+                  if (!ghmods::ImportCode(e, g, tid, prof, code, j.why)) return false;
+                  return ghmods::SetActiveProfile(armFile, tid, prof) || (j.why = "cannot write gh_mod_profile.txt", false);
+              },
+              [&, prof](Job& j) {
+                  finish(j, L"Imported as profile " + ghrepo::Widen(prof) + L", which the next launch uses", L"Import failed");
+                  if (j.ok) tab = kInstalled;
+              });
+    };
+
+    auto draw = [&] {
+        auto* dc = g_lui.dc.get();
+        const float W = (float)g_lui.w, H = (float)g_lui.h;
+        IDWriteTextFormat* fs = g_lui.fmtSmall.get();
+        dc->BeginDraw();
+        dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
+        LuiText((L"MODS  ·  " + tname).c_str(), g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
+        LuiText((L"●  " + status).c_str(), fs, D2D1::RectF(84, 140, W - 80, 182), bad ? g_lui.brWarn.get() : g_lui.brAccent.get());
+
+        float x = 84;
+        for (int t = 0; t < kTabs; ++t) {
+            std::wstring s = t == kInstalled ? L"Installed (" + std::to_wstring(inst.size()) + L")"
+                           : t == kBrowse    ? std::wstring(L"Browse") : t == kProfiles ? std::wstring(L"Profiles") : std::wstring(L"Settings");
+            const float w = LuiMeasure(s.c_str(), g_lui.fmtItem.get());
+            LuiText(s.c_str(), g_lui.fmtItem.get(), D2D1::RectF(x, 186, x + w + 4, 236), t == tab ? g_lui.brFg.get() : g_lui.brDim.get());
+            if (t == tab) dc->FillRectangle(D2D1::RectF(x, 238, x + w, 242), g_lui.brAccent.get());
+            x += w + 56;
+        }
+        LuiText((L"Next launch:  " + (profile.empty() ? std::wstring(L"no mods") : ghrepo::Widen(profile))).c_str(), fs,
+                D2D1::RectF(W - 760, 186, W - 80, 236), profile.empty() ? g_lui.brDim.get() : g_lui.brAccent.get(),
+                DWRITE_TEXT_ALIGNMENT_TRAILING);
+
+        std::wstring line;
+        if (tab == kBrowse)
+            line = L"Search:  " + (txt == kTxtSearch ? g_pickQuery + L"_" : query.empty() ? std::wstring(L"Y to search") : query) +
+                   L"      Sort:  " + kSortName[(int)sort] + (haveIndex ? L"      " + LuiModsThousands(seen) + L" mods" : L"");
+        else if (tab == kInstalled)
+            line = profile.empty() ? L"Mods are off for this game. Install one from Browse, or pick a profile."
+                                   : L"Profile " + ghrepo::Widen(profile) + L"  ·  turned-off mods stay installed";
+        else if (tab == kProfiles)
+            line = L"The profile you pick is the one the next launch uses.";
+        else if (profile.empty())
+            line = L"Settings belong to a profile: pick one in Profiles.";
+        else if (cfgOpen >= 0)
+            line = cfgs[cfgOpen].name + L"  ·  " + ghrepo::Widen(cfgs[cfgOpen].file) + L"  ·  saved as you change them, used at the next launch";
+        else
+            line = L"Profile " + ghrepo::Widen(profile) + L"  ·  a mod's settings appear here after the game has run once with it";
+        LuiText(line.c_str(), fs, D2D1::RectF(84, 252, W - 80, 290), txt == kTxtSearch ? g_lui.brFg.get() : g_lui.brDim.get());
+
+        const float x0 = 80, x1 = W - 80, rowH = 70, top = 300, detail = H - 160;
+        const int nfit = (int)((detail - top) / rowH), total = count(tab), cur = sel[tab];
+        int first = 0;
+        if (nfit > 0 && total > nfit) {
+            first = cur - nfit / 2;
+            if (first < 0) first = 0;
+            if (first > total - nfit) first = total - nfit;
+        }
+        std::string dOwner, dName, dDesc;              // the detail strip: the selected mod's author and page
+        std::wstring dSet1, dSet2;                     // ...or the selected setting's description and allowed values
+        for (int vi = 0; vi < nfit && first + vi < total; ++vi) {
+            const int i = first + vi;
+            const float y = top + (float)vi * rowH;
+            const bool on = i == cur;
+            dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x0, y, x1, y + rowH - 10), 10, 10),
+                                     on ? g_lui.brSel.get() : g_lui.brPanel.get());
+            std::wstring name, sub;
+            bool dim = false;
+            if (tab == kInstalled) {
+                const ghmods::Installed& m = inst[i];
+                std::string owner, nm;
+                ghmods::SplitFull(m.fullName, owner, nm);
+                auto f = latest.find(ghmods::Lower(m.fullName));
+                name = LuiModsName(nm);
+                sub = ghrepo::Widen(m.ver);
+                if (f != latest.end() && ghmods::CmpVer(f->second.latest, m.ver) > 0) sub += L" → " + ghrepo::Widen(f->second.latest);
+                if (haveGame && ghmods::LoaderFor(game, m.fullName)) sub += L"  ·  mod loader";
+                if (!m.enabled) { sub += L"  ·  off"; dim = true; }
+                sub += L"  ·  " + ghrepo::Widen(owner);
+                if (on) { dOwner = owner; dName = nm; if (f != latest.end()) dDesc = f->second.desc; }
+            } else if (tab == kBrowse) {
+                const ghmods::Pkg& p = found[i];
+                name = LuiModsName(p.name);
+                sub = ghrepo::Widen(p.latest) + L"  ·  " + ghrepo::Widen(p.owner) + L"  ·  ↓ " + LuiModsCount(p.downloads);
+                for (const auto& m : inst)
+                    if (ghmods::EqI(m.fullName, p.fullName)) sub += m.ver == p.latest ? L"  ·  installed" : L"  ·  update";
+                if (on) { dOwner = p.owner; dName = p.name; dDesc = p.desc; }
+            } else if (tab == kSettings && cfgOpen < 0) {
+                name = cfgs[i].name;
+                sub = std::to_wstring(cfgs[i].n) + (cfgs[i].n == 1 ? L" setting" : L" settings") + L"  ·  " + ghrepo::Widen(cfgs[i].file);
+            } else if (tab == kSettings) {
+                const ghmods::CfgEntry& e = cfgEs[i];
+                name = ghrepo::Widen(e.key);
+                sub = (e.value.empty() ? std::wstring(L"(empty)") : ghrepo::Widen(e.value.substr(0, 60))) + L"  ·  " + ghrepo::Widen(e.section);
+                if (!e.def.empty() && e.value != e.def) sub = L"changed  ·  " + sub;
+                if (on) {
+                    dSet1 = ghrepo::Widen(e.desc.substr(0, 200));
+                    dSet2 = L"Default: " + (e.def.empty() ? std::wstring(L"(empty)") : ghrepo::Widen(e.def));
+                    if (e.isBool()) dSet2 += L"  ·  true or false";
+                    else if (e.hasRange) {
+                        wchar_t r[96];
+                        swprintf(r, 96, L"  ·  from %g to %g", e.lo, e.hi);
+                        dSet2 += r;
+                    } else if (!e.values.empty()) {
+                        std::string all;
+                        for (const auto& v : e.values) all += (all.empty() ? "" : ", ") + v;
+                        dSet2 += (e.flags ? L"  ·  any of: " : L"  ·  one of: ") + ghrepo::Widen(all.substr(0, 140));
+                    } else if (!e.type.empty()) dSet2 += L"  ·  " + ghrepo::Widen(e.type);
+                }
+            } else {
+                const int np = (int)profs.size();
+                if (i == 0) { name = L"No mods"; sub = L"plays the game as it is"; }
+                else if (i <= np) {
+                    name = ghrepo::Widen(profs[i - 1]);
+                    sub = std::to_wstring(profN[i - 1]) + (profN[i - 1] == 1 ? L" mod" : L" mods");
+                } else if (i == np + 1) { name = L"New profile"; sub = L"an empty one, named with the keyboard"; }
+                else { name = L"Import a profile code"; sub = L"from r2modman or Gale"; }
+                if ((i == 0 && profile.empty()) || (i >= 1 && i <= np && profs[i - 1] == profile)) sub = L"in use  ·  " + sub;
+            }
+            LuiText(name.c_str(), g_lui.fmtItem.get(), D2D1::RectF(x0 + 28, y, x1 - 640, y + rowH - 10),
+                    dim && !on ? g_lui.brDim.get() : g_lui.brFg.get());
+            LuiText(sub.c_str(), fs, D2D1::RectF(x1 - 680, y, x1 - 24, y + rowH - 10), on ? g_lui.brFg.get() : g_lui.brDim.get(),
+                    DWRITE_TEXT_ALIGNMENT_TRAILING);
+        }
+        if (total == 0) {
+            const wchar_t* e = tab == kInstalled ? (profile.empty() ? L"No mods" : L"This profile is empty")
+                             : tab == kSettings ? (profile.empty() ? L"No profile in use" : L"No settings files yet")
+                             : haveIndex ? L"No mods match" : L"The mod index is not loaded";
+            LuiText(e, g_lui.fmtItem.get(), D2D1::RectF(x0, top, x1, top + 60), g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
+        if (!dSet2.empty()) {
+            LuiText(dSet1.c_str(), fs, D2D1::RectF(84, detail + 6, W - 80, detail + 44), g_lui.brFg.get());
+            LuiText(dSet2.c_str(), fs, D2D1::RectF(84, detail + 44, W - 80, detail + 82), g_lui.brDim.get());
+        }
+        if (!dName.empty()) {
+            std::wstring d = ghrepo::Widen(dDesc.substr(0, 180));
+            LuiText(d.c_str(), fs, D2D1::RectF(84, detail + 6, W - 80, detail + 44), g_lui.brFg.get());
+            std::string page = haveGame ? ghmods::PackagePage(game.community, dOwner, dName) : std::string();
+            if (page.compare(0, 8, "https://") == 0) page.erase(0, 8);
+            LuiText((L"by " + ghrepo::Widen(dOwner) + (page.empty() ? L"" : L"  ·  " + ghrepo::Widen(page))).c_str(), fs,
+                    D2D1::RectF(84, detail + 44, W - 80, detail + 82), g_lui.brDim.get());
+        }
+
+        {   // footer
+            const float y0 = H - 70.f, y1 = H - 30.f;
+            float fx = 84.f;
+            std::wstring l, r;
+            if (tab == kInstalled) l = L"A  Turn on / off      X  Remove      Y  Update all      LB RB  Tabs      B  Back";
+            else if (tab == kProfiles) l = L"A  Use      X  Delete      LB RB  Tabs      B  Back";
+            else if (tab == kSettings && cfgOpen >= 0) l = L"A  Change      ◀ ▶  Step      Y  Default      B  Done";
+            else if (tab == kSettings) l = L"A  Open      LB RB  Tabs      B  Back";
+            else { l = L"A  Install      Y  Search      "; r = L"  Sort      LB RB  Tabs      B  Back"; }
+            const float wl = LuiMeasure(l.c_str(), fs);
+            LuiText(l.c_str(), fs, D2D1::RectF(fx, y0, fx + wl + 2.f, y1), g_lui.brDim.get());
+            if (!r.empty()) {
+                fx += wl;
+                fx += LuiDrawViewBtn(fx, (y0 + y1) * 0.5f, g_lui.brDim.get());
+                LuiText(r.c_str(), fs, D2D1::RectF(fx, y0, W - 80.f, y1), g_lui.brDim.get());
+            }
+        }
+
+        const float cx = W * 0.5f;
+        if (txt == kTxtProfile || txt == kTxtCode || txt == kTxtValue) {   // above the on-screen keyboard
+            const float cy = H * 0.3f;
+            dc->FillRectangle(D2D1::RectF(0, 0, W, H), g_lui.brBg.get());
+            dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 560, cy - 150, cx + 560, cy + 150), 16, 16), g_lui.brPanel.get());
+            const std::wstring head = txt == kTxtProfile ? std::wstring(L"NEW PROFILE") : txt == kTxtCode ? std::wstring(L"PROFILE CODE")
+                                    : cfgOpen >= 0 && sel[kSettings] < (int)cfgEs.size() ? ghrepo::Widen(cfgEs[sel[kSettings]].key)
+                                                                                          : std::wstring(L"SETTING");
+            LuiText(head.c_str(), g_lui.fmtTitle.get(),
+                    D2D1::RectF(cx - 530, cy - 140, cx + 530, cy - 60), g_lui.brAccent.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            LuiText((g_pickQuery + L"_").c_str(), g_lui.fmtItem.get(), D2D1::RectF(cx - 530, cy - 40, cx + 530, cy + 20),
+                    g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            LuiText(txt == kTxtCode ? L"The code a friend shared from r2modman or Gale.      ≡  Done      B  Cancel"
+                    : txt == kTxtValue ? (dSet2 + L"      ≡  Done      B  Cancel").c_str()
+                                       : L"≡  Done      B  Cancel",
+                    fs, D2D1::RectF(cx - 530, cy + 50, cx + 530, cy + 110), g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+        } else if (!ask.empty() || !busy.empty()) {
+            const float cy = H * 0.5f;
+            dc->FillRectangle(D2D1::RectF(0, 0, W, H), g_lui.brBg.get());
+            dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 560, cy - 160, cx + 560, cy + 160), 16, 16), g_lui.brPanel.get());
+            if (!ask.empty()) {
+                LuiText(askTitle.c_str(), g_lui.fmtTitle.get(), D2D1::RectF(cx - 530, cy - 140, cx + 530, cy - 60), g_lui.brWarn.get(),
+                        DWRITE_TEXT_ALIGNMENT_CENTER);
+                LuiText(ask.c_str(), g_lui.fmtItem.get(), D2D1::RectF(cx - 530, cy - 40, cx + 530, cy + 20), g_lui.brAccent.get(),
+                        DWRITE_TEXT_ALIGNMENT_CENTER);
+                LuiText(L"A  Yes            B  Cancel", fs, D2D1::RectF(cx - 530, cy + 70, cx + 530, cy + 130), g_lui.brFg.get(),
+                        DWRITE_TEXT_ALIGNMENT_CENTER);
+            } else {
+                std::wstring ln;
+                { std::lock_guard<std::mutex> lk(g_modsMapMu); ln = ghrepo::Widen(g_modsUiLine.substr(0, 120)); }
+                const LONG64 got = job->prog;
+                if (got > 0) {
+                    wchar_t mb[48];
+                    swprintf(mb, 48, L"   %.1f MB", (double)got / 1048576.0);
+                    ln += mb;
+                }
+                LuiText(busy.c_str(), g_lui.fmtItem.get(), D2D1::RectF(cx - 530, cy - 110, cx + 530, cy - 40), g_lui.brFg.get(),
+                        DWRITE_TEXT_ALIGNMENT_CENTER);
+                LuiText(ln.c_str(), fs, D2D1::RectF(cx - 530, cy - 20, cx + 530, cy + 40), g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+                LuiText(L"B  Cancel", fs, D2D1::RectF(cx - 530, cy + 80, cx + 530, cy + 130), g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            }
+        }
+        dc->EndDraw();
+        LuiPresent();
+    };
+
+    reload();
+    Diag("MODS UI open " + tid + " next launch '" + profile + "'");
+    {
+        std::set<std::string> names;                  // every profile's mods, for "update" marks
+        for (const auto& p : profs)
+            for (const auto& m : ghmods::LoadProfile(ghmods::ProfileDir(uiEnv, tid, p))) names.insert(ghmods::Lower(m.fullName));
+        start(L"Loading the mod list for " + tname + L"…",
+              [appId, names](const ghmods::Env& e, Job& j) {
+                  if (!ghmods::LoadGame(e, appId, "", j.game, j.why)) return false;
+                  j.haveGame = true;
+                  if (!ghmods::EnsureIndex(e, j.game, j.why)) return false;
+                  ghmods::TopN t;
+                  t.q.limit = 100;
+                  ghmods::ScanIndex(e, j.game.community, [&](const ghmods::Pkg& p) {
+                      t.offer(p);
+                      if (names.count(ghmods::Lower(p.fullName))) j.latest[ghmods::Lower(p.fullName)] = p;
+                  });
+                  j.found = std::move(t.best);
+                  j.seen = t.seen;
+                  return true;
+              },
+              [&](Job& j) {
+                  game = j.game; haveGame = j.haveGame; haveIndex = j.ok;
+                  latest = j.latest; found = j.found; seen = j.seen;
+                  bad = !j.ok;
+                  status = j.ok ? LuiModsThousands(seen) + L" mods on Thunderstore for " + tname
+                         : haveGame ? L"The mod index could not be loaded: " + ghrepo::Widen(j.why)
+                                    : L"Thunderstore could not be reached: " + ghrepo::Widen(j.why);
+                  Diag("MODS UI loaded game=" + std::to_string(haveGame) + " index=" + std::to_string(haveIndex) +
+                       " mods=" + std::to_string(seen) + (j.ok ? "" : " why=" + j.why));
+              });
+    }
+
+    for (;;) {
+        if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+        PollGamepadOnUi();
+        PollSyntheticPad();
+        WORD b, ly_hi = 0, ly_lo = 0;
+        { std::lock_guard<std::mutex> lk(g_padMutex);
+          b = g_padState.wButtons;
+          if (g_padState.sThumbLY >  16000) ly_hi = 1;
+          if (g_padState.sThumbLY < -16000) ly_lo = 1; }
+        const DWORD now = GetTickCount();
+        const bool navGate = (now - lastNav) > 160;
+        WORD synth = b;
+        if (ly_hi && navGate) synth |= XINPUT_GAMEPAD_DPAD_UP;
+        if (ly_lo && navGate) synth |= XINPUT_GAMEPAD_DPAD_DOWN;
+        const WORD pressed = synth & ~prev;
+        prev = b;
+
+        if (txt != kTxtNone) {
+            bool changed = false;
+            {
+                std::lock_guard<std::mutex> lk(g_pickKbMu);
+                if (g_pickOskOpen && g_pickQueryChanged) { g_pickKbBack = 0; g_pickKbChars.clear(); }
+                g_pickQueryChanged = false;
+                if (g_pickKbClear) { g_pickQuery.clear(); g_pickKbClear = false; changed = true; }
+                for (; g_pickKbBack > 0; --g_pickKbBack)
+                    if (!g_pickQuery.empty()) { g_pickQuery.pop_back(); changed = true; }
+                if (!g_pickKbChars.empty()) { g_pickQuery += g_pickKbChars; g_pickKbChars.clear(); changed = true; }
+            }
+            if (changed && g_pickOskOpen) {
+                g_pickSelStart = g_pickSelEnd = (int)g_pickQuery.size();
+                PickerOskNotifyText();
+            }
+            if (pressed & XINPUT_GAMEPAD_B) { PickerOskHide(); txt = kTxtNone; Diag("MODS UI typing cancelled"); }
+            else if ((pressed & XINPUT_GAMEPAD_START) || !g_pickOskOpen) commit();
+            draw();
+            Sleep(16);
+            continue;
+        }
+        if (!busy.empty()) {
+            if (job->done) {
+                busy.clear();
+                if (auto done = std::move(onDone)) { onDone = nullptr; done(*job); }
+            } else if (pressed & XINPUT_GAMEPAD_B) {
+                InterlockedExchange(&job->cancel, 1);
+            }
+            draw();
+            Sleep(16);
+            continue;
+        }
+        if (!ask.empty()) {
+            if (pressed & XINPUT_GAMEPAD_A) { ask.clear(); if (auto f = std::move(onAsk)) { onAsk = nullptr; f(); } }
+            else if (pressed & XINPUT_GAMEPAD_B) { ask.clear(); onAsk = nullptr; Diag("MODS UI cancelled"); }
+            draw();
+            Sleep(16);
+            continue;
+        }
+
+        const int n = count(tab);
+        int& s = sel[tab];
+        auto jump = [&](int d) {
+            int ns = s + d;
+            if (ns > n - 1) ns = n - 1;
+            if (ns < 0) ns = 0;
+            if (ns != s) { s = ns; lastNav = now; }
+        };
+        if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) jump(-1);
+        if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) jump(+1);
+        const bool editing = tab == kSettings && cfgOpen >= 0 && n > 0;
+        if ((pressed & XINPUT_GAMEPAD_DPAD_LEFT) && !editing) jump(-5);
+        if ((pressed & XINPUT_GAMEPAD_DPAD_RIGHT) && !editing) jump(+5);
+        if (pressed & (XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER)) {
+            cfgClose();
+            tab = (tab + ((pressed & XINPUT_GAMEPAD_LEFT_SHOULDER) ? kTabs - 1 : 1)) % kTabs;
+            if (tab == kSettings) { loadCfgs(); if (sel[kSettings] >= (int)cfgs.size()) sel[kSettings] = 0; }
+            draw();
+            Sleep(16);
+            continue;
+        }
+        if ((pressed & XINPUT_GAMEPAD_B) && tab == kSettings && cfgOpen >= 0) {
+            Diag("MODS UI settings closed " + cfgs[cfgOpen].file);
+            cfgClose();
+            draw();
+            Sleep(16);
+            continue;
+        } else if (pressed & XINPUT_GAMEPAD_B) {
+            Diag("MODS UI closed " + tid + " next launch '" + profile + "'");
+            g_pickQuery = pickQuery;
+            g_pickSelStart = g_pickSelEnd = (int)g_pickQuery.size();
+            return;
+        }
+
+        if (tab == kInstalled && n > 0) {
+            const ghmods::Installed m = inst[s];
+            const bool loader = haveGame && ghmods::LoaderFor(game, m.fullName);
+            const std::wstring name = LuiModsName(m.fullName.substr(m.fullName.rfind('-') + 1));
+            if (pressed & XINPUT_GAMEPAD_A) {
+                if (!haveGame) { bad = true; status = L"Turning mods on and off needs Thunderstore's game list (no network?)"; }
+                else if (loader) { bad = true; status = L"BepInEx starts the other mods; pick No mods in Profiles to play without it"; }
+                else {
+                    const bool to = !m.enabled;
+                    const ghmods::Game g = game;
+                    const std::string prof = profile, full = m.fullName;
+                    Diag("MODS UI " + std::string(to ? "enable " : "disable ") + full);
+                    start((to ? L"Turning on " : L"Turning off ") + name + L"…",
+                          [g, tid, prof, full, to](const ghmods::Env& e, Job& j) {
+                              return ghmods::SetEnabled(e, g, tid, prof, full, to, j.why);
+                          },
+                          [&, name, to](Job& j) { finish(j, name + (to ? L" is on" : L" is off"), L"Could not change it"); });
+                }
+            }
+            if (pressed & XINPUT_GAMEPAD_X) {
+                if (loader && inst.size() > 1) { bad = true; status = L"The other mods need BepInEx; remove them first"; }
+                else {
+                    askTitle = L"REMOVE";
+                    ask = name + L" " + ghrepo::Widen(m.ver);
+                    const std::string prof = profile, full = m.fullName;
+                    onAsk = [&, prof, full, name] {
+                        Diag("MODS UI remove " + full);
+                        start(L"Removing " + name + L"…",
+                              [tid, prof, full](const ghmods::Env& e, Job& j) { return ghmods::Remove(e, tid, prof, full, j.why); },
+                              [&, name](Job& j) { finish(j, L"Removed " + name, L"Remove failed"); });
+                    };
+                }
+            }
+        }
+        if (tab == kInstalled && (pressed & XINPUT_GAMEPAD_Y)) {
+            if (profile.empty() || inst.empty()) { bad = true; status = L"Nothing to update"; }
+            else if (!haveIndex) { bad = true; status = L"Updating needs the mod index (no network?)"; }
+            else {
+                const ghmods::Game g = game;
+                const std::string prof = profile;
+                Diag("MODS UI update all " + tid + "/" + prof);
+                start(L"Updating " + ghrepo::Widen(prof) + L"…",
+                      [g, tid, prof](const ghmods::Env& e, Job& j) { return ghmods::UpdateAll(e, g, tid, prof, j.why, &j.n); },
+                      [&](Job& j) {
+                          finish(j, j.n ? std::to_wstring(j.n) + (j.n == 1 ? L" mod updated" : L" mods updated") : L"Everything is up to date",
+                                 L"Update failed");
+                      });
+            }
+        }
+        if (tab == kBrowse) {
+            if (pressed & XINPUT_GAMEPAD_Y) begin(kTxtSearch, query);
+            if (pressed & XINPUT_GAMEPAD_BACK) { sort = (ghmods::Sort)(((int)sort + 1) % 4); search(); }
+            if ((pressed & XINPUT_GAMEPAD_A) && n > 0) {
+                const ghmods::Pkg p = found[s];
+                bool same = false;
+                for (const auto& m : inst) if (ghmods::EqI(m.fullName, p.fullName) && m.ver == p.latest) same = true;
+                if (same) { bad = false; status = LuiModsName(p.name) + L" " + ghrepo::Widen(p.latest) + L" is already installed"; }
+                else install(p);
+            }
+        }
+        if (tab == kSettings && cfgOpen < 0 && n > 0 && (pressed & XINPUT_GAMEPAD_A)) {
+            std::string text;
+            if (!ghmods::ReadAll(cfgs[s].path, text, 1u << 20)) { bad = true; status = L"Could not read " + cfgs[s].name; }
+            else {
+                cfgText = text;
+                cfgEs = ghmods::ParseCfg(cfgText);
+                cfgOpen = s;
+                cfgFileSel = s;
+                sel[kSettings] = 0;
+                Diag("MODS UI settings open " + tid + "/" + profile + " " + cfgs[cfgOpen].file + " (" + std::to_string(cfgEs.size()) + " entries)");
+            }
+        } else if (editing) {
+            const ghmods::CfgEntry e = cfgEs[s];
+            const bool cycles = e.isBool() || (!e.values.empty() && !e.flags);
+            if (pressed & XINPUT_GAMEPAD_A) {
+                if (cycles) cfgSet(e, ghmods::CfgStep(e, 1));
+                else begin(kTxtValue, ghrepo::Widen(e.value));
+            }
+            if (pressed & (XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_RIGHT)) {
+                const std::string v = ghmods::CfgStep(e, (pressed & XINPUT_GAMEPAD_DPAD_LEFT) ? -1 : 1);
+                if (!v.empty()) cfgSet(e, v);
+                else { bad = false; status = L"Press A to type a value for " + ghrepo::Widen(e.key); }
+            }
+            if ((pressed & XINPUT_GAMEPAD_Y) && !e.def.empty()) cfgSet(e, e.def);
+        }
+        if (tab == kProfiles) {
+            const int np = (int)profs.size();
+            if (pressed & XINPUT_GAMEPAD_A) {
+                if (s == 0) use("");
+                else if (s <= np) use(profs[s - 1]);
+                else if (s == np + 1) begin(kTxtProfile, L"");
+                else begin(kTxtCode, L"");
+            }
+            if ((pressed & XINPUT_GAMEPAD_X) && s >= 1 && s <= np) {
+                const std::string p = profs[s - 1];
+                askTitle = L"DELETE PROFILE";
+                ask = ghrepo::Widen(p) + L" and its " + std::to_wstring(profN[s - 1]) + (profN[s - 1] == 1 ? L" mod" : L" mods") + L", settings included";
+                onAsk = [&, p] {
+                    locked([&] {
+                        std::wstring dir = ghmods::ProfileDir(uiEnv, tid, p);
+                        dir.pop_back();
+                        const bool ok = LuiDeleteTree(dir);
+                        if (p == profile) ghmods::SetActiveProfile(armFile, tid, "");
+                        Diag("MODS UI delete profile " + tid + "/" + p + (ok ? "" : " (FAILED)"));
+                        g_modsArmedDirty = true;
+                        reload();
+                        bad = !ok;
+                        status = ok ? L"Deleted " + ghrepo::Widen(p) : L"Could not delete all of " + ghrepo::Widen(p);
+                    });
+                };
+            }
+        }
+        draw();
+        Sleep(16);
+    }
+}
+
 // §47 (#268): the on-device shader bake. Tsushima's lowered corpus is made here,
 // from the player's own install, by the recipe -- the bake writes the same bytes
 // the host validated into D:\DevelopmentFiles\ghbake\, which GhLoweredBlob reads.
@@ -2398,12 +3463,27 @@ static void LauncherPackages()
 
 // ---------------------------------------------------------------------------
 // Post-guest crash / session-ended screen. The launcher stays up: A or B
-// dismisses back to the picker. D-pad scrolls the last Diag lines.
+// dismisses back to the picker. D-pad scrolls the last Diag lines. With `alt`
+// (§52: "Start without mods"), A takes that action instead and returns true.
 // ---------------------------------------------------------------------------
-static void LauncherShowCrash(const std::wstring& title, const std::wstring& reason,
-                              const std::vector<std::string>& lines)
+static bool LauncherShowCrash(const std::wstring& title, const std::wstring& reason,
+                              const std::vector<std::string>& entries, const wchar_t* alt = nullptr,
+                              const wchar_t* logLabel = nullptr)
 {
-    if (!LuiInit()) return;
+    // One Diag entry can hold a whole stack dump; each drawn row is one line.
+    std::vector<std::string> lines;
+    for (const auto& e : entries){
+        size_t a = 0;
+        for (;;){
+            const size_t b = e.find('\n', a);
+            std::string ln = e.substr(a, b == std::string::npos ? std::string::npos : b - a);
+            if (!ln.empty() && ln.back() == '\r') ln.pop_back();
+            lines.push_back(std::move(ln));
+            if (b == std::string::npos) break;
+            a = b + 1;
+        }
+    }
+    if (!LuiInit()) return false;
     const float W = (float)g_lui.w, H = (float)g_lui.h;
     const float lineH = 20.f, top = 220.f, bot = H - 80.f;
     const int nfit = (int)((bot - top) / lineH);
@@ -2412,12 +3492,59 @@ static void LauncherShowCrash(const std::wstring& title, const std::wstring& rea
     if (n > nfit) scroll = n - nfit;          // start at the tail (the crash)
     WORD prev = 0xFFFF;
     DWORD lastNav = 0;
+    // Log text is arbitrary bytes (stack dumps run to kilobytes; game logs
+    // carry escapes and UTF-8). Draw printable ASCII only, one screen width.
     auto widen = [](const std::string& s) {
-        std::wstring w; w.reserve(s.size());
-        for (unsigned char c : s) w.push_back((wchar_t)c);
+        std::wstring w; w.reserve(s.size() < 200 ? s.size() : 200);
+        for (unsigned char c : s){
+            if (w.size() >= 200){ w += L"\u2026"; break; }
+            w.push_back(c == '\t' ? L' ' : (c < 0x20 || c > 0x7E) ? L'?' : (wchar_t)c);
+        }
         return w;
     };
+    // §52: this screen follows a dead guest whose threads may still hold locks.
+    // A frame that stalls is named by the UI thread's live stack, once per stall.
+    struct Beat { std::atomic<ULONGLONG> t{0}, worst{0}; std::atomic<bool> live{true}; };
+    auto beat = std::make_shared<Beat>();
+    beat->t = GetTickCount64();
+    std::thread([beat, tid = GetCurrentThreadId()]{
+        // The UI stack every 5 s while stalled (one sample cannot tell a wait
+        // from a spin): m3t4 wedged after a 75 s hold while m3t2's immediate A
+        // went through, and the shell then suspended and killed the app. No
+        // all-thread dump here: walking a frozen Mono thread's JIT frames
+        // deadlocked the watchdog with the UI thread still suspended (m3t5).
+        // appused and private commit every 2 s rule the memory cap in or out.
+        ULONGLONG told = 0, lastMem = 0;
+        const ULONGLONG t0 = GetTickCount64();
+        while (beat->live){
+            Sleep(500);
+            const ULONGLONG nowT = GetTickCount64();
+            if (nowT - lastMem >= 2000 && nowT - t0 < 180000){
+                lastMem = nowT;
+                GhBillSnap m; GhBillTake(&m);
+                auto mb = [](uint64_t v){ return std::to_string((unsigned long long)(v >> 20)); };
+                Diag("CRASHSCREEN mem t=" + std::to_string((unsigned long long)(nowT - t0)) + "ms appused=" +
+                     mb(m.appused) + "MB limit=" + mb(GhBillAppLimitRaw()) + "MB priv=" + mb(m.priv) +
+                     "MB viduse=" + mb(m.viduse) + "MB ws=" + mb(m.ws) + "MB worstframe=" +
+                     std::to_string((unsigned long long)beat->worst.exchange(0)) + "ms");
+            }
+            const ULONGLONG bt = beat->t.load();
+            const ULONGLONG age = nowT > bt ? nowT - bt : 0;   // the UI may stamp after nowT was read
+            if (age < 2000){ told = 0; continue; }
+            if (told && age - told < 5000) continue;
+            told = age;
+            Diag("CRASHSCREEN frame stalled " + std::to_string((unsigned long long)age) + "ms ui tid=" +
+                 std::to_string(tid) + GhLiveStack(tid));
+        }
+    }).detach();
+    struct BeatEnd { std::shared_ptr<Beat> b; ~BeatEnd(){ b->live = false; } } beatEnd{beat};
+    Diag("CRASHSCREEN up: " + LuiNarrow(title) + (alt ? " (alt action)" : ""));
     for (;;) {
+        {
+            const ULONGLONG nb = GetTickCount64(), d = nb - beat->t.load();
+            if (d > beat->worst.load()) beat->worst = d;
+            beat->t = nb;
+        }
         if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
         PollGamepadOnUi();
         PollSyntheticPad();
@@ -2440,7 +3567,8 @@ static void LauncherShowCrash(const std::wstring& title, const std::wstring& rea
             int maxs = (n > nfit) ? n - nfit : 0;
             if (scroll < maxs) { scroll++; lastNav = now; }
         }
-        if (pressed & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B)) return;
+        if (alt && (pressed & XINPUT_GAMEPAD_A)) return true;
+        if (pressed & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B)) return false;
 
         auto* dc = g_lui.dc.get();
         dc->BeginDraw();
@@ -2452,9 +3580,9 @@ static void LauncherShowCrash(const std::wstring& title, const std::wstring& rea
         LuiText(reason.c_str(), g_lui.fmtSmall.get(), D2D1::RectF(84, 124, W - 80, 172),
                 g_lui.brAccent.get());
 #ifdef GH_RELEASE
-        LuiText(L"recent log  (last lines)", g_lui.fmtSmall.get(),
+        LuiText(logLabel ? logLabel : L"recent log  (last lines)", g_lui.fmtSmall.get(),
 #else
-        LuiText(L"loader_diag.txt  (last lines)", g_lui.fmtSmall.get(),
+        LuiText(logLabel ? logLabel : L"loader_diag.txt  (last lines)", g_lui.fmtSmall.get(),
 #endif
                 D2D1::RectF(84, 176, W - 80, 212), g_lui.brDim.get());
 
@@ -2474,11 +3602,197 @@ static void LauncherShowCrash(const std::wstring& title, const std::wstring& rea
             LuiText(pos, g_lui.fmtSmall.get(), D2D1::RectF(80, 176, W - 80, 212),
                     g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
         }
-        LuiText(L"A / B  Back to library      \u25B2 \u25BC  Scroll log",
-                g_lui.fmtSmall.get(), D2D1::RectF(84, H - 70, W - 80, H - 30), g_lui.brDim.get());
+        const std::wstring foot = alt ? std::wstring(L"A  ") + alt + L"      B  Back to library      \u25B2 \u25BC  Scroll log"
+                                      : std::wstring(L"A / B  Back to library      \u25B2 \u25BC  Scroll log");
+        LuiText(foot.c_str(), g_lui.fmtSmall.get(), D2D1::RectF(84, H - 70, W - 80, H - 30), g_lui.brDim.get());
         dc->EndDraw();
         LuiPresent();
         Sleep(16);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §52 (M3) mod safety. A modded launch that crashes offers the same game
+// without its mods, with the tail of BepInEx's LogOutput.log on screen. Two
+// failed starts in a row with one profile make the next launch suggest Vanilla.
+// "Without mods" is one launch only: the profile stays selected. The run record
+// itself (GhModRun*) lives in guest_loader.cpp beside ghdoorstop.
+// ---------------------------------------------------------------------------
+static std::wstring LuiModsLaunchOncePath() { return std::wstring(kLocalState) + L"gh_launch_once.txt"; }
+
+static std::wstring LuiModsProfileLabel()
+{
+    GhModRun r;
+    if (!GhModRunRead(r)) return L"profile";
+    return std::wstring(r.profile.begin(), r.profile.end());
+}
+
+// Asks the restarted host to launch the run record's game once, without mods.
+static void LuiModsLaunchOnceWrite()
+{
+    HANDLE f = CreateFileW(LuiModsLaunchOncePath().c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE){ Diag("MODS launch-once write failed err=" + Hex(GetLastError())); return; }
+    DWORD wr = 0;
+    WriteFile(f, "vanilla\r\n", 9, &wr, nullptr);
+    CloseHandle(f);
+}
+
+// The modded crash screen is drawn by the NEXT process. The one the guest died
+// in can stall whole (m3t6: UI and watchdog threads both frozen ~15 s, with
+// appused 275 MB) until the shell suspends and kills it -- frozen guest threads
+// hold whatever they held. So the host saves the screen here and restarts.
+static std::wstring LuiModsCrashPath() { return std::wstring(kLocalState) + L"gh_mod_crash.txt"; }
+
+static void LuiModsCrashSave(const std::wstring& title, const std::wstring& reason, const std::vector<std::string>& lines)
+{
+    auto u8 = [](const std::wstring& w){
+        std::string o; if (w.empty()) return o;
+        const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+        o.resize(n > 0 ? n : 0);
+        if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), &o[0], n, nullptr, nullptr);
+        return o;
+    };
+    std::string body = u8(title) + "\n" + u8(reason) + "\n";
+    // The tail of the ring: LocalState has ~50 MiB of headroom to share.
+    std::string rest;
+    for (auto it = lines.rbegin(); it != lines.rend() && rest.size() < 256 * 1024; ++it) rest.insert(0, *it + "\n");
+    body += rest;
+    HANDLE f = CreateFileW(LuiModsCrashPath().c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE){ Diag("MODS crash save failed err=" + Hex(GetLastError())); return; }
+    DWORD wr = 0;
+    WriteFile(f, body.data(), (DWORD)body.size(), &wr, nullptr);
+    FlushFileBuffers(f);
+    CloseHandle(f);
+}
+
+// Reads and deletes the saved screen. False = none.
+static bool LuiModsCrashLoad(std::wstring& title, std::wstring& reason, std::vector<std::string>& lines)
+{
+    HANDLE f = CreateFileW(LuiModsCrashPath().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz{}; GetFileSizeEx(f, &sz);
+    std::string s((size_t)(sz.QuadPart < (1 << 20) ? sz.QuadPart : (1 << 20)), '\0');
+    DWORD got = 0;
+    if (!s.empty()) ReadFile(f, &s[0], (DWORD)s.size(), &got, nullptr);
+    CloseHandle(f);
+    DeleteFileW(LuiModsCrashPath().c_str());
+    s.resize(got);
+    auto w16 = [](const std::string& a){
+        std::wstring o; if (a.empty()) return o;
+        const int n = MultiByteToWideChar(CP_UTF8, 0, a.data(), (int)a.size(), nullptr, 0);
+        o.resize(n > 0 ? n : 0);
+        if (n > 0) MultiByteToWideChar(CP_UTF8, 0, a.data(), (int)a.size(), &o[0], n);
+        return o;
+    };
+    size_t a = 0; int k = 0;
+    while (a < s.size()){
+        size_t b = s.find('\n', a);
+        std::string ln = s.substr(a, b == std::string::npos ? std::string::npos : b - a);
+        a = b == std::string::npos ? s.size() : b + 1;
+        if (k == 0) title = w16(ln); else if (k == 1) reason = w16(ln); else lines.push_back(std::move(ln));
+        k++;
+    }
+    return k >= 2;
+}
+
+// The crash screen for a modded launch. True = Start without mods.
+static bool LuiModsCrashScreen(const std::wstring& title, const std::wstring& reason,
+                               std::vector<std::string> lines, const std::wstring& root)
+{
+    std::vector<std::string> tail = GhModLogTail(root, 120);
+    const std::wstring rel = GhModLogRel(root);
+    const std::string rel8 = RegNarrow(rel);
+    lines.push_back("");
+    lines.push_back(tail.empty() ? "---- " + rel8 + ": none written ----"
+                                 : "---- " + rel8 + " (last " + std::to_string(tail.size()) + " lines) ----");
+    lines.insert(lines.end(), tail.begin(), tail.end());
+    const std::wstring label = L"loader log, then " + rel;
+    const bool v = LauncherShowCrash(title, reason, lines, L"Start without mods", label.c_str());
+    Diag(std::string("MODS crash screen: ") + (v ? "Start without mods" : "back to library"));
+    return v;
+}
+
+// Before the first picker. A Start-without-mods relaunch, or a modded launch
+// that took the whole process down while starting, is handled here. Returns the
+// guest to launch now (vanilla), or empty for the picker.
+static std::wstring LuiModsRecoverAtStart()
+{
+    GhModRun r;
+    const bool have = GhModRunRead(r);
+    {
+        std::wstring title, reason;
+        std::vector<std::string> lines;
+        if (LuiModsCrashLoad(title, reason, lines)){
+            Diag("MODS crash screen from the previous process (" + std::to_string(lines.size()) + " lines)");
+            if (!have) return L"";
+            if (!g_gfx.ready) { try { BuildBridgeOnUi(); } catch (...) {} }
+            if (!LuiInit()) return L"";
+            const std::wstring root = std::wstring(kDevRoot) + L"gh_mods\\" +
+                                      std::wstring(r.title.begin(), r.title.end()) + L"\\" +
+                                      std::wstring(r.profile.begin(), r.profile.end()) + L"\\";
+            if (!LuiModsCrashScreen(title, reason, lines, root)) return L"";
+            Diag("MODS launch-once: " + LuiNarrow(r.guest) + " without mods");
+            g_modsSkipOnce = true;
+            g_launcherSelectedApp = r.app;
+            return r.guest;
+        }
+    }
+    if (GetFileAttributesW(LuiModsLaunchOncePath().c_str()) != INVALID_FILE_ATTRIBUTES){
+        DeleteFileW(LuiModsLaunchOncePath().c_str());
+        if (!have){ Diag("MODS launch-once without a run record -- picker"); return L""; }
+        Diag("MODS launch-once: " + LuiNarrow(r.guest) + " without mods");
+        g_modsSkipOnce = true;
+        g_launcherSelectedApp = r.app;
+        return r.guest;
+    }
+    if (!have) return L"";
+    if (r.state == "started"){
+        // It ran past the start window and the process ended outside any exit
+        // path we see (closed from the Home screen, most often): not a failure.
+        r.state = "ended";
+        GhModRunWrite(r);
+        return L"";
+    }
+    if (r.state != "running") return L"";
+    r.fails++;
+    r.state = "failed";
+    GhModRunWrite(r);
+    if (!g_gfx.ready) { try { BuildBridgeOnUi(); } catch (...) {} }
+    if (!LuiInit()) return L"";
+    const std::wstring prof(r.profile.begin(), r.profile.end());
+    std::vector<std::string> lines;
+    lines.push_back("The previous launch of " + LuiNarrow(r.guest) + " with mods closed Greenhouse while it was starting.");
+    lines.push_back("Failed starts in a row with this profile: " + std::to_string(r.fails));
+    const std::wstring root = std::wstring(kDevRoot) + L"gh_mods\\" +
+                              std::wstring(r.title.begin(), r.title.end()) + L"\\" + prof + L"\\";
+    if (!LuiModsCrashScreen(L"LAUNCH FAILED", L"with mods (" + prof + L") · the app closed during startup", lines, root))
+        return L"";
+    g_modsSkipOnce = true;
+    g_launcherSelectedApp = r.app;
+    return r.guest;
+}
+
+// After the picker: the game has failed to start with this profile twice or
+// more in a row. True = launch (g_modsSkipOnce says how); false = back.
+static bool LuiModsStreakGate(const std::wstring& guest)
+{
+    GhModRun r;
+    if (!GhModRunRead(r) || r.fails < 2 || _wcsicmp(r.guest.c_str(), guest.c_str()) != 0) return true;
+    const std::wstring prof(r.profile.begin(), r.profile.end());
+    if (_wcsicmp(GhModProfileFor(r.title).c_str(), prof.c_str()) != 0) return true;   // profile changed since
+    Diag("MODS streak prompt: " + r.title + "/" + r.profile + " fails=" + std::to_string(r.fails));
+    WORD prev = 0xFFFF;
+    for (;;) {
+        const WORD p = LuiEntPressed(prev);
+        if (p & XINPUT_GAMEPAD_A){ Diag("MODS streak prompt: Start without mods"); g_modsSkipOnce = true; return true; }
+        if (p & XINPUT_GAMEPAD_Y){ Diag("MODS streak prompt: start with mods anyway"); return true; }
+        if (p & XINPUT_GAMEPAD_B){ Diag("MODS streak prompt: cancelled"); return false; }
+        LuiDrawEnt(L"Mods", nullptr, 0,
+                   L"This game failed to start with the mod profile \u201C" + prof + L"\u201D " +
+                   std::to_wstring(r.fails) + L" times in a row.",
+                   L"Starting without mods leaves the profile selected for next time.",
+                   L"A  Start without mods      Y  Start with mods anyway      B  Back");
+        LuiPresent(); Sleep(30);
     }
 }
 
@@ -4037,6 +5351,9 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
     Diag("LAUNCHER picker items=" + std::to_string(all.size()));
     LuiRepoStartupCheck();              // background index check -> "Packages · N update(s)" badge
     LuiShaderBakeStart();               // §47: gh_shbake knob
+    LuiModsCmdStart();                  // §51 M1: LocalState\gh_mods_cmd.txt jobs
+    LuiModsMapStart();                  // §51 M2: which titles offer Mods (RB)
+    struct PickerUp { PickerUp() { g_modsPickerUp = true; } ~PickerUp() { g_modsPickerUp = false; } } pickerUp;
     for (;;) {
         if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
         PollGamepadOnUi();
@@ -4157,6 +5474,13 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
                 Diag("LAUNCHER verify prompt '" + LuiNarrow(verifyIt.display) +
                      "' app=" + std::to_string(verifyIt.app));
             }
+        }
+        if ((pressed & XINPUT_GAMEPAD_RIGHT_SHOULDER) && !g_pickOskOpen && LuiModsOffered(items[sel])) {
+            const GhTitle* t = LuiModsTitle(items[sel]);
+            Diag("LAUNCHER mods '" + LuiNarrow(items[sel].display) + "' title=" + t->id);
+            LauncherMods(*t);
+            prev = 0xFFFF;              // buttons held when the Mods screen closed
+            continue;
         }
         if ((pressed & XINPUT_GAMEPAD_START) && !g_pickOskOpen) {
             Diag("LAUNCHER packages");

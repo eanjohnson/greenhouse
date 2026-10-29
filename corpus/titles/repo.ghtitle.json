@@ -2,6 +2,6 @@
   "schema": "greenhouse.title/1",
   "id": "repo",
   "name": "R.E.P.O.",
-  "match": { "exe": "REPO.exe" },
+  "match": { "exe": "REPO.exe", "steamAppId": 3241660 },
   "requires": { "loader": "0.0.670.0", "services": ["steam-runtime"] }
 }

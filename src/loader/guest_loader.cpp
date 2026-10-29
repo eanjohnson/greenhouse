@@ -42,6 +42,7 @@
 #endif
 #include <windows.h>
 #include <tlhelp32.h>
+#include <psapi.h>      // MODULEINFO: UE4SS's main-module query (M4.4)
 #include <xmmintrin.h>   // _mm_getcsr/_mm_setcsr, for the #154 invalid-op trap
 #include <functional>
 #include <unordered_set>
@@ -63,6 +64,8 @@
 #include <appmodel.h>   // GetCurrentPackageId: a title config's requires.loader
 #include <algorithm>
 #include "gh_json.h"     // greenhouse.title/1 configs (GhTitles)
+#include "gh_zip.h"      // §51: mod profile zips (ghdoorstop)
+#include "gh_ovl.h"      // §53: a profile's game\ folder shadows the game's files
 #include <cstdlib>
 #include <cmath>
 #include <cctype>
@@ -646,6 +649,8 @@ static bool        GhLazySpillOn();                            // #233 true when
 // how full the adapter says it is.
 static void GhAppBudget(uint64_t* used, uint64_t* lim);
 static void        GhLazyWhoDump(const char* where);          // #213 who promised it, who touched it
+static std::string GhGuestStackTrail(void* from);            // #275 guest return addresses above a frame
+static void        GhFrameDtTick();                            // #272 frame-interval histogram + pager attribution
 static void        GhResLiveDump(const char* where);           // #202 the LIVE resource set, by site
 static std::string GhResLiveFrameLine();                       // #202 livresMB on every FRAME line
 static std::string GhGpFrameLine();                            // #235 gpupage= on every FRAME line
@@ -768,8 +773,11 @@ static std::wstring CanonVirtual(const wchar_t* inpath)
         drive = cc.empty()? L"C" : cc[0].substr(0, cc[0].find(L':'));
         body = p;
     } else {
-        // relative -> join with vCwd
+        // relative -> join with vCwd; a cwd that is not itself absolute would
+        // recurse forever, so it is taken as rooted on C: instead
         std::wstring joined = g_vCwd + L"\\" + p;
+        const bool cwdAbs = (g_vCwd.size() >= 2 && g_vCwd[1] == L':') || g_vCwd.rfind(L"\\", 0) == 0;
+        if (!cwdAbs) joined = L"C:\\" + joined;
         return CanonVirtual(joined.c_str());
     }
     // collapse . and ..
@@ -807,6 +815,32 @@ static std::wstring CanonToWin(const std::wstring& canon)
 static std::wstring g_installDir;   // set in RunGuest: package install root
 static std::wstring g_guestDir;     // set in RunGuest: the guest's own directory
 static std::wstring g_guestDataDir; // set in RunGuest: the Unity _Data folder
+static ghovl::Index g_modOvl;       // §53: the armed profile's game\ folder and mounts (GhModsBegin); off = none
+static std::wstring g_modOvlBase;    // the game's install folder g_modOvl's paths are relative to (trailing '\')
+static volatile LONG g_modOvlHits = 0;
+static bool StartsWithNoCase(const std::wstring& s, const std::wstring& pre);
+// The overlay path for a game path p, or empty. p is taken relative to
+// g_modOvlBase (".." allowed while it stays inside); a folder the game has
+// itself wins over an overlay folder of the same name, a redirected subtree
+// (M4.4) never yields to the game.
+static const std::wstring kGhModMasked = L"\\\\.\\GhMasked\\";
+static std::wstring GhModOvlFor(const std::wstring& p)
+{
+    if (g_modOvlBase.empty() || !StartsWithNoCase(p, g_modOvlBase)) return L"";
+    const std::wstring rel = p.substr(g_modOvlBase.size());
+    std::wstring out;
+    ghovl::Hit h = ghovl::Lookup(g_modOvl, rel, out);
+    if (h == ghovl::None) return L"";
+    // A tombstoned path: a device-namespace name that does not exist, so opens,
+    // attribute probes and listings fail and nothing can create it.
+    if (h == ghovl::Gone) out = kGhModMasked + rel;
+    if (h == ghovl::Dir && GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return L"";
+    if (InterlockedIncrement(&g_modOvlHits) <= 40){
+        auto n8 = [](const std::wstring& w){ std::string r; for (wchar_t c : w) r += (c < 128) ? (char)c : '?'; return r; };
+        Diag("MODS file " + n8(rel) + " -> " + n8(out));   // first 40 only
+    }
+    return out;
+}
 #ifdef GH_LAUNCHER
 static std::wstring g_lastGameDir;  // last launched game dir (survives ResetGuestForRelaunch)
 #endif
@@ -952,7 +986,39 @@ static std::wstring MapToReal(const wchar_t* guestPath)
                 if (GetFileAttributesW(flat.c_str()) != INVALID_FILE_ATTRIBUTES)
                     return flat;
             }
+            // §53: a mod profile's game\ folder, after our own compatibility
+            // patches above (a mod cannot replace a file Greenhouse patched).
+            if (g_modOvl.on()){
+                std::wstring m = GhModOvlFor(p);
+                if (!m.empty()) return m;
+            }
             return p;
+        }
+        // M4.4: the overlay's base is the install folder, above the exe's own for
+        // Unreal (<Root>\<Proj>\Binaries\Win64\): Content\Paks\LogicMods, Config.
+        if (g_modOvl.on()){
+            std::wstring m = GhModOvlFor(p);
+            if (!m.empty()) return m;
+        }
+        // §53: the OS font folder, read-only, when the container has one. Unity's
+        // IMGUI default font (LegacyRuntime) is dynamic and renders its glyphs from
+        // OS fonts; with C:\Windows\Fonts mapped to an empty vfs mirror a MelonLoader
+        // mod's GUI.Label drew nothing while GUI.DrawTexture showed (m4t10mod2).
+        if (StartsWithNoCase(p, L"C:\\Windows\\Fonts") &&
+            (p.size() == 16 || p[16] == L'\\')){
+            static const bool real = []{
+                const DWORD a = GetFileAttributesW(L"C:\\Windows\\Fonts");
+                const bool ok = a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+                int n = 0;
+                WIN32_FIND_DATAW fd;
+                HANDLE h = ok ? FindFirstFileExW(L"C:\\Windows\\Fonts\\*", FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0)
+                              : INVALID_HANDLE_VALUE;
+                if (h != INVALID_HANDLE_VALUE){ do ++n; while (FindNextFileW(h, &fd)); FindClose(h); }
+                Diag("VFS fonts: real C:\\Windows\\Fonts " + std::string(ok ? "present" : "absent") +
+                     " entries=" + std::to_string(n));
+                return ok && n > 2;
+            }();
+            if (real) return p;
         }
         // D: is the Dev Mode DevelopmentFiles volume (games, gh_saves). It is a
         // real writable drive. Do not dump D:\... into LocalState\vfs\D\ — ES3's
@@ -979,6 +1045,10 @@ static std::wstring MapToReal(const wchar_t* guestPath)
             for (const std::wstring* base : { &g_guestDataDir, &g_guestDir }){
                 if (base->empty()) continue;
                 std::wstring cand = *base + rel;
+                if (g_modOvl.on()){
+                    std::wstring m = GhModOvlFor(cand);
+                    if (!m.empty()) return m;
+                }
                 if (GetFileAttributesW(cand.c_str()) != INVALID_FILE_ATTRIBUTES)
                     return cand;
             }
@@ -1093,12 +1163,36 @@ static bool GhHidePsoCache(const std::wstring& real, DWORD acc)
     return true;
 }
 
+// Sentry's crashpad backend (RV There Yet?, §55) checks crashpad_handler.exe
+// with GetFileAttributesW and, finding it, starts crashpad's client -- which hits
+// a LOG(FATAL) (`int3; ud2`) in this container before it ever reaches
+// CreateProcess, and the game dies as a breakpoint. Like Nixxes' crs (see
+// Bed_crs_start_handler) it only exists to stand up an out-of-process reporter
+// we cannot host. Answering "not there" makes sentry-native skip the backend
+// ("invalid handler_path") and the game runs on without crash upload.
+// gh_hide_crashpad=0 shows the file again.
+static bool GhHideCrashpad(const std::wstring& real)
+{
+    // leaf test first: the knob read below opens a file, and this also runs
+    // inside the NtCreateFile hook
+    const size_t cut = real.find_last_of(L"\\/");
+    const wchar_t* leaf = real.c_str() + (cut == std::wstring::npos ? 0 : cut + 1);
+    if (_wcsicmp(leaf, L"crashpad_handler.exe") != 0) return false;
+    static const unsigned on = GhCfgNumZ(L"gh_hide_crashpad.txt", "GH_HIDE_CRASHPAD", 1);
+    if (!on) return false;
+    static volatile LONG n = 0;
+    if (InterlockedIncrement(&n) <= 4)
+        Diag("CRASHPADHIDE refusing " + std::string(real.begin(), real.end()) +
+             " -- the crash reporter backend will not start");
+    return true;
+}
+
 static HANDLE WINAPI Bed_CreateFileW(LPCWSTR name, DWORD acc, DWORD share, LPSECURITY_ATTRIBUTES sa,
                                      DWORD disp, DWORD flags, HANDLE tmpl){
     std::wstring mapped = name ? RedirectDriveRootSave(name) : L"";
     const wchar_t* use = mapped.empty() ? name : mapped.c_str();
     std::wstring real = MapToReal(use);
-    if (GhHidePsoCache(real, acc)){
+    if (GhHidePsoCache(real, acc) || GhHideCrashpad(real)){
         VfsTrace("CreateFileW[HIDDEN]", name, real);
         SetLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_HANDLE_VALUE;
@@ -1136,7 +1230,7 @@ static HANDLE WINAPI Bed_CreateFileA(LPCSTR name, DWORD acc, DWORD share, LPSECU
 }
 static HANDLE WINAPI Bed_CreateFile2(LPCWSTR name, DWORD acc, DWORD share, DWORD disp, LPCREATEFILE2_EXTENDED_PARAMETERS params){
     std::wstring real = MapToReal(name);
-    if (GhHidePsoCache(real, acc)){
+    if (GhHidePsoCache(real, acc) || GhHideCrashpad(real)){
         VfsTrace("CreateFile2[HIDDEN]", name, real);
         SetLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_HANDLE_VALUE;
@@ -1227,6 +1321,7 @@ static HANDLE WINAPI Hook_CreateFileW(LPCWSTR name, DWORD acc, DWORD share, LPSE
                                       DWORD disp, DWORD flags, HANDLE tmpl){
     if (name){
         std::wstring p(name);
+        if (GhHideCrashpad(p)){ SetLastError(ERROR_FILE_NOT_FOUND); return INVALID_HANDLE_VALUE; }
         { static int dn=0; if (dn<80 && (p.find(L"LCGeneral")!=std::wstring::npos || p.find(L"SaveData")!=std::wstring::npos)){ ++dn; Diag("HOOK CFW saw " + std::string(p.begin(),p.end())); } }
         std::wstring real = RedirectDriveRootSave(p);
         if (!real.empty()){
@@ -1302,6 +1397,7 @@ static CreateFile2_t g_realCreateFile2 = nullptr;
 static HANDLE WINAPI Hook_CreateFile2(LPCWSTR name, DWORD acc, DWORD share, DWORD disp, LPCREATEFILE2_EXTENDED_PARAMETERS ex){
     if (name){
         std::wstring p(name);
+        if (GhHideCrashpad(p)){ SetLastError(ERROR_FILE_NOT_FOUND); return INVALID_HANDLE_VALUE; }
         { static int dn=0; if (dn<80 && (p.find(L"LCGeneral")!=std::wstring::npos || p.find(L"SaveData")!=std::wstring::npos)){ ++dn; Diag("HOOK CF2 saw " + std::string(p.begin(),p.end())); } }
         std::wstring real = RedirectDriveRootSave(p);
         if (!real.empty()){
@@ -1352,6 +1448,7 @@ static LONG NTAPI Hook_NtCreateFile(PHANDLE fh, ACCESS_MASK acc, GH_OBJECT_ATTRI
     if (oa && oa->ObjectName && oa->ObjectName->Buffer && oa->ObjectName->Length){
         std::wstring nt(oa->ObjectName->Buffer, oa->ObjectName->Length/2);
         std::wstring dos = GhNormDosPath(nt);
+        if (GhHideCrashpad(dos)) return (LONG)0xC0000034;   // STATUS_OBJECT_NAME_NOT_FOUND
         { static int dn=0; if (dn<80 && (dos.find(L"LCGeneral")!=std::wstring::npos || dos.find(L"SaveData")!=std::wstring::npos)){ ++dn; Diag("HOOK NtCF saw " + std::string(dos.begin(),dos.end()) + (oa->RootDirectory? " (rel)" : "")); } }
         // Absolute drive-root / ES3 name, or a relative open (RootDirectory set)
         // of an ES3 leaf — Mono FileStream often does the latter against U:\.
@@ -1385,6 +1482,7 @@ static LONG NTAPI Hook_NtOpenFile(PHANDLE fh, ACCESS_MASK acc, GH_OBJECT_ATTRIBU
     if (oa && oa->ObjectName && oa->ObjectName->Buffer && oa->ObjectName->Length){
         std::wstring nt(oa->ObjectName->Buffer, oa->ObjectName->Length/2);
         std::wstring dos = GhNormDosPath(nt);
+        if (GhHideCrashpad(dos)) return (LONG)0xC0000034;   // STATUS_OBJECT_NAME_NOT_FOUND
         { static int dn=0; if (dn<40 && (dos.find(L"LCGeneral")!=std::wstring::npos || dos.find(L"SaveData")!=std::wstring::npos)){ ++dn; Diag("HOOK NtOF saw " + std::string(dos.begin(),dos.end())); } }
         std::wstring real;
         if (!oa->RootDirectory) real = RedirectDriveRootSave(dos);
@@ -1579,10 +1677,20 @@ static DWORD WINAPI Bed_GetFileAttributesW(LPCWSTR path){
     std::wstring real = MapToReal(path);
     // A probe must agree with the open, or the game sees the file exist and then
     // fail to open, which is a different (and usually fatal) path from "absent".
-    if (GhHidePsoCache(real, 0)){ SetLastError(ERROR_FILE_NOT_FOUND); return INVALID_FILE_ATTRIBUTES; }
+    if (GhHidePsoCache(real, 0) || GhHideCrashpad(real)){ SetLastError(ERROR_FILE_NOT_FOUND); return INVALID_FILE_ATTRIBUTES; }
     DWORD a = GetFileAttributesW(real.c_str());
     if (path && GhVfsTraceOn()){ std::wstring g(path); Diag("GetFileAttributesW " + std::string(g.begin(),g.end()) + (a==INVALID_FILE_ATTRIBUTES?" MISSING":" ok")); }
     return a; }
+// M4.4: MSVC's std::filesystem (exists, is_directory, file_size) and UE4SS's
+// Mods\ check ask through the Ex form. Only a modded launch maps it, so the
+// probes of every vanilla title stay exactly as they were.
+static BOOL WINAPI Bed_GetFileAttributesExW(LPCWSTR path, GET_FILEEX_INFO_LEVELS lvl, LPVOID info){
+    if (path && GhHideCrashpad(path)){ SetLastError(ERROR_FILE_NOT_FOUND); return FALSE; }
+    if (!g_modOvl.on() || !path) return GetFileAttributesExW(path, lvl, info);
+    std::wstring real = MapToReal(path);
+    BOOL ok = GetFileAttributesExW(real.c_str(), lvl, info);
+    if (GhVfsTraceOn()){ std::wstring g(path); Diag("GetFileAttributesExW " + std::string(g.begin(),g.end()) + (ok?" ok":" MISSING")); }
+    return ok; }
 static BOOL WINAPI Bed_SetFileAttributesW(LPCWSTR path, DWORD a){ return SetFileAttributesW(MapToReal(path).c_str(), a); }
 static BOOL WINAPI Bed_CreateHardLinkW(LPCWSTR link, LPCWSTR target, LPSECURITY_ATTRIBUTES sa){
     std::wstring rl=MapToReal(link); EnsureParentOf(rl); return CreateHardLinkW(rl.c_str(), MapToReal(target).c_str(), sa); }
@@ -1603,7 +1711,45 @@ static std::wstring MapFindPattern(LPCWSTR pattern){
 // none. It costs nothing in practice: the VFS trace shows Tsushima opens
 // `default.pso` by name (`VFS CreateFileW default.pso -> ...`), it never
 // enumerates the game folder looking for it.
+// §53: a listing of a game folder the mod profile's game\ folder touches is
+// merged (ghovl::Merge) and served from a handle of ours; nullptr = not merged.
+static HANDLE GhModOvlFind(LPCWSTR pattern, FINDEX_INFO_LEVELS lvl, LPWIN32_FIND_DATAW fd)
+{
+    if (!g_modOvl.on() || !pattern || g_modOvlBase.empty()) return nullptr;
+    std::wstring p(pattern); for (auto& c : p) if (c == L'/') c = L'\\';
+    size_t s = p.find_last_of(L'\\');
+    std::wstring dir = (s == std::wstring::npos) ? g_vCwd : p.substr(0, s);
+    std::wstring pat = (s == std::wstring::npos) ? p : p.substr(s + 1);
+    if (pat.empty()) return nullptr;
+    std::wstring full = CanonToWin(CanonVirtual(dir.c_str()));
+    if (!full.empty() && full.back() != L'\\') full += L'\\';
+    if (!StartsWithNoCase(full, g_modOvlBase)) return nullptr;
+    std::wstring rel = full.substr(g_modOvlBase.size());
+    if (!ghovl::Touches(g_modOvl, rel)) return nullptr;
+    std::wstring nrel; ghovl::Norm(rel, nrel);
+    std::vector<WIN32_FIND_DATAW> v;
+    if (!ghovl::List(g_modOvl, g_modOvlBase, nrel, pat, lvl, v)){
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    VfsTrace("FindFirstFile(mods-merged)", pattern, g_modOvlBase + nrel);
+    WIN32_FIND_DATAW first{};
+    HANDLE h = ghovl::Open(std::move(v), &first);
+    if (fd) *fd = first;
+    return h;
+}
+static BOOL WINAPI Bed_FindNextFileW(HANDLE h, LPWIN32_FIND_DATAW fd){
+    bool ours = false;
+    BOOL r = ghovl::Next(h, fd, ours);
+    return ours ? r : FindNextFileW(h, fd);
+}
+static BOOL WINAPI Bed_FindClose(HANDLE h){
+    bool ours = false;
+    BOOL r = ghovl::Close(h, ours);
+    return ours ? r : FindClose(h);
+}
 static HANDLE WINAPI Bed_FindFirstFileW(LPCWSTR pattern, LPWIN32_FIND_DATAW fd){
+    if (HANDLE m = GhModOvlFind(pattern, FindExInfoStandard, fd)) return m;
     std::wstring realPat = MapFindPattern(pattern);
     HANDLE h = FindFirstFileW(realPat.c_str(), fd);           // returns filenames only; no translation needed
     VfsTrace("FindFirstFileW", pattern, realPat);
@@ -1611,6 +1757,8 @@ static HANDLE WINAPI Bed_FindFirstFileW(LPCWSTR pattern, LPWIN32_FIND_DATAW fd){
 }
 static HANDLE WINAPI Bed_FindFirstFileExW(LPCWSTR pattern, FINDEX_INFO_LEVELS level, LPVOID fd,
                                           FINDEX_SEARCH_OPS op, LPVOID filter, DWORD flags){
+    if (level == FindExInfoStandard || level == FindExInfoBasic)
+        if (HANDLE m = GhModOvlFind(pattern, level, (LPWIN32_FIND_DATAW)fd)) return m;
     std::wstring realPat = MapFindPattern(pattern);
     HANDLE h = FindFirstFileExW(realPat.c_str(), level, fd, op, filter, flags);
     VfsTrace("FindFirstFileExW", pattern, realPat);
@@ -1654,12 +1802,28 @@ static HANDLE WINAPI Bed_FindFirstFileExA(LPCSTR pattern, FINDEX_INFO_LEVELS lev
     if (h != INVALID_HANDLE_VALUE) FindDataWtoA(wd, (LPWIN32_FIND_DATAA)fd);
     return h;
 }
+static BOOL WINAPI Bed_FindNextFileA(HANDLE h, LPWIN32_FIND_DATAA fd){
+    bool ours = false;
+    WIN32_FIND_DATAW wd{};
+    BOOL r = ghovl::Next(h, &wd, ours);
+    if (!ours) return FindNextFileA(h, fd);
+    if (r) FindDataWtoA(wd, fd);
+    return r;
+}
 static DWORD WINAPI Bed_GetCurrentDirectoryW(DWORD len, LPWSTR buf){
     DWORD need = (DWORD)g_vCwd.size();
     if (buf && len>need){ wcscpy_s(buf, len, g_vCwd.c_str()); return need; }
     return need+1;
 }
-static BOOL WINAPI Bed_SetCurrentDirectoryW(LPCWSTR path){ g_vCwd = CanonVirtual(path); return TRUE; }
+// g_vCwd holds a Windows path ("C:\\work"), never CanonVirtual's internal
+// "C\\work": a colon-less cwd made every later relative path relative again,
+// and CanonVirtual recursed until the thread's stack overflowed (§55, RV There Yet?).
+static BOOL WINAPI Bed_SetCurrentDirectoryW(LPCWSTR path){
+    std::wstring w = CanonToWin(CanonVirtual(path));
+    if (w.size() > 3 && w.back() == L'\\') w.pop_back();
+    g_vCwd = w;
+    return TRUE;
+}
 static DWORD WINAPI Bed_GetTempPathW(DWORD len, LPWSTR buf){
     static const wchar_t* t = L"C:\\Temp\\";
     DWORD need=(DWORD)wcslen(t);
@@ -2186,6 +2350,41 @@ static void    RepublishGuestTls(const char* why);                  // fwd (see 
 static void    RunGuestTlsCallbacksForThread();                     // fwd (see TLS section)
 static std::wstring FindGuestSupportDll(const wchar_t* name);       // fwd (see support DLLs)
 
+// SetDllDirectory: a packaged app's DLL search order leaves the DLL directory out,
+// so the real call succeeds and changes nothing. Unity sets <Data>\Plugins\x86_64
+// with it and then loads its native plugins by bare name (opus.dll,
+// AudioPluginDissonance.dll): every one failed, and Lethal Company had no voice
+// chat. Record it; LoadGuestDll tries it for bare names after the game folder.
+static SRWLOCK      g_guestDllDirLk = SRWLOCK_INIT;
+static std::wstring g_guestDllDir;
+static BOOL WINAPI Bed_SetDllDirectoryW(LPCWSTR p)
+{
+    std::wstring d = p ? p : L"";
+    for (auto& c : d) if (c == L'/') c = L'\\';
+    if (!d.empty() && d.back() != L'\\') d += L'\\';
+    AcquireSRWLockExclusive(&g_guestDllDirLk);
+    const bool changed = d != g_guestDllDir;
+    g_guestDllDir = d;
+    ReleaseSRWLockExclusive(&g_guestDllDirLk);
+    if (changed) Diag("BED SetDllDirectoryW " + (d.empty() ? std::string("(cleared)") : RegNarrow(d)));
+    SetDllDirectoryW(p);
+    return TRUE;
+}
+static BOOL WINAPI Bed_SetDllDirectoryA(LPCSTR p)
+{
+    if (!p) return Bed_SetDllDirectoryW(nullptr);
+    wchar_t w[MAX_PATH];
+    if (!MultiByteToWideChar(CP_ACP, 0, p, -1, w, MAX_PATH)) return SetDllDirectoryA(p);
+    return Bed_SetDllDirectoryW(w);
+}
+static std::wstring GhGuestDllDir()
+{
+    AcquireSRWLockShared(&g_guestDllDirLk);
+    std::wstring d = g_guestDllDir;
+    ReleaseSRWLockShared(&g_guestDllDirLk);
+    return d;
+}
+
 // Runtime library loads get the same guest-directory fallback as the IAT ones.
 // DIAG (2026-08-03): trace steam* loads — hunting who resolves "steam_api64" for Mono.
 static HMODULE WINAPI Bed_LoadLibraryA(LPCSTR n){
@@ -2198,8 +2397,12 @@ static HMODULE WINAPI Bed_LoadLibraryW(LPCWSTR n)
     if (!n) return nullptr;
     char a[MAX_PATH];
     if (!WideCharToMultiByte(CP_ACP, 0, n, -1, a, MAX_PATH, nullptr, nullptr)) return LoadLibraryW(n);
-    if (strstr(a, "steam")) Diag(std::string("BED LoadLibraryW(") + a + ")");
-    return LoadGuestDll(a);
+    if (!strstr(a, "steam")) return LoadGuestDll(a);
+    HMODULE m = LoadGuestDll(a);
+    char mp[MAX_PATH] = {0};
+    if (m) GetModuleFileNameA(m, mp, MAX_PATH);
+    Diag(std::string("BED LoadLibraryW(") + a + ") -> " + Hex((uintptr_t)m) + " " + mp);
+    return m;
 }
 // MSVC's delay-load helper (__delayLoadHelper2, linked into every module built
 // with /DELAYLOAD) resolves the DLL with LoadLibraryExA -- the ONE variant that
@@ -2217,9 +2420,23 @@ static HMODULE WINAPI Bed_LoadLibraryExA(LPCSTR n, HANDLE, DWORD){
 }
 static bool IsGuestOwnedModule(LPCWSTR path);                       // fwd
 static int  PatchModuleForGuest(HMODULE h, const char* tag);        // fwd
+static void PinGuestModule(HMODULE m, const char* dll);              // fwd
 
 static HMODULE WINAPI Bed_LoadLibraryExW(LPCWSTR n, HANDLE f, DWORD flags)
 {
+    // M4.4: a mod's DLL by its in-game path (UE4SS: <exe dir>\Mods\<mod>\dlls\main.dll).
+    // Mod code is guest code: it gets the beds.
+    if (n && g_modOvl.on()){
+        const std::wstring m = GhModOvlFor(n);
+        if (StartsWithNoCase(m, kGhModMasked)){ SetLastError(ERROR_MOD_NOT_FOUND); return nullptr; }
+        if (!m.empty() && GetFileAttributesW(m.c_str()) != INVALID_FILE_ATTRIBUTES){
+            if (HMODULE h = LoadLibraryExW(m.c_str(), f, flags | LOAD_WITH_ALTERED_SEARCH_PATH)){
+                PatchModuleForGuest(h, "mod dll");
+                RepublishGuestTls("LoadLibraryExW(mod)");
+                return h;
+            }
+        }
+    }
     if (n){
         char a[MAX_PATH];
         if (WideCharToMultiByte(CP_ACP, 0, n, -1, a, MAX_PATH, nullptr, nullptr)){
@@ -2237,6 +2454,7 @@ static HMODULE WINAPI Bed_LoadLibraryExW(LPCWSTR n, HANDLE f, DWORD flags)
             if (0 == _stricmp(base, "steam_api64.dll") || 0 == _stricmp(base, "steam_api64")){
                 if (HMODULE pre = GetModuleHandleA("steam_api64.dll")){
                     Diag(std::string("BED LoadLibraryExW(") + a + ") -> PRELOADED singleton " + Hex((uintptr_t)pre));
+                    PinGuestModule(pre, "steam_api64.dll");
                     return pre;
                 }
             }
@@ -2395,8 +2613,675 @@ static FARPROC GhSelfMapExport(HMODULE h, LPCSTR name)
     return (FARPROC)(base + rva);
 }
 
+// ---------------------------------------------------------------------------
+// §51 ghdoorstop: BepInEx without a proxy DLL.
+//
+// On a PC, BepInEx starts through UnityDoorstop: a winhttp.dll proxy in the game
+// folder that IAT-hooks UnityPlayer's GetProcAddress, wraps mono_jit_init_version,
+// and once the root domain exists, loads the target assembly and invokes
+// Doorstop.Entrypoint:Start(). A proxy cannot work here -- LoadGuestDll answers
+// winhttp.dll with the host's own copy -- but UnityPlayer's GetProcAddress is
+// already ours (Bed_GetProcAddress), so the same contract is kept from inside.
+//
+// The target lives in a PROFILE folder outside the game, the way r2modman runs
+// with --doorstop-target: BepInEx derives every path it uses (plugins, config,
+// cache, LogOutput.log) from the preloader's own location, so the game tree is
+// never touched. LocalState\gh_mod_profile.txt holds `<titleId>=<profile>` lines
+// naming the active profile, D:\DevelopmentFiles\gh_mods\<titleId>\<profile>\;
+// a title with no line, or a profile without BepInEx\core\BepInEx.Preloader.dll,
+// runs vanilla.
+//
+// Until the Launcher installs mods itself (M1), a profile arrives as a zip:
+// D:\DevelopmentFiles\ghmod_<titleId>_<profile>.zip (WDP can upload into the
+// DevelopmentFiles root but cannot create folders under it) is unpacked into the
+// profile at launch and renamed *.zip.done.
+// ---------------------------------------------------------------------------
+extern std::wstring g_guestExePath;   // defined near the PE mapper, below
+static std::wstring g_modTarget;      // the preloader to invoke; empty = vanilla
+static std::wstring g_melonBoot;      // M4: MelonLoader's bootstrap (the profile's version.dll); empty = not MelonLoader
+static std::wstring g_ue4ssDll;       // M4.4: the profile's ue4ss.dll; empty = no UE4SS
+static bool g_ue4ssBooted = false;
+static std::wstring g_modArgs;        // appended to the guest command line (MelonLoader reads its options there)
+static bool         g_melonBooted = false;
+static HMODULE      g_melonBootMod = nullptr;   // the loaded bootstrap (GhMelonThreadStoreScan)
+static void*        g_monoJitInitReal = nullptr;
+static std::wstring g_modClrDir;      // M4.3: BepInEx 6 on IL2CPP -- the profile's dotnet\ (CoreCLR); empty = the Mono path
+static void*        g_il2cppInitReal = nullptr;
+static HMODULE      g_monoModule = nullptr;
+static std::mutex   g_modsJobLock;    // held by the Launcher's mods worker (launcher_ui.h) while it writes a profile
+
+static std::wstring GhModProfileFor(const std::string& titleId)
+{
+    if (titleId.empty()) return L"";
+    HANDLE f = CreateFileW((std::wstring(kLocalState) + L"gh_mod_profile.txt").c_str(), GENERIC_READ,
+                           FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return L"";
+    std::string s(8192, '\0');
+    DWORD got = 0;
+    ReadFile(f, &s[0], (DWORD)s.size(), &got, nullptr);
+    CloseHandle(f);
+    s.resize(got);
+    size_t at = 0;
+    while (at < s.size()){
+        size_t nl = s.find('\n', at);
+        std::string line = s.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
+        at = nl == std::string::npos ? s.size() : nl + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        size_t eq = line.find('=');
+        if (line.empty() || line[0] == '#' || eq == std::string::npos) continue;
+        if (_stricmp(line.substr(0, eq).c_str(), titleId.c_str()) != 0) continue;
+        std::string prof = line.substr(eq + 1), safe;
+        if (!ghzip::SafeName(prof, safe) || safe.find('/') != std::string::npos){
+            Diag("MODS bad profile name for " + titleId + " -- vanilla");
+            return L"";
+        }
+        int n = MultiByteToWideChar(CP_UTF8, 0, safe.c_str(), (int)safe.size(), nullptr, 0);
+        std::wstring w(n, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, safe.c_str(), (int)safe.size(), &w[0], n);
+        return w;
+    }
+    return L"";
+}
+
+// §52 (M3) the mod run record. LocalState\gh_mod_run.txt describes the last
+// modded launch: title, profile, guest exe, state and the count of launches in
+// a row that failed to start. state is running from arming until the game has
+// lived kModRunStartedMs (then started), and ended or failed once it exits. A
+// record still saying running when the Launcher starts means the process died
+// during startup -- the one failure no exit path can record.
+struct GhModRun {
+    std::string  title, profile, state;
+    std::wstring guest;
+    uint32_t     app = 0;      // the picker row's Steam appid
+    int          fails = 0;
+};
+static const ULONGLONG kModRunStartedMs = 60000;
+static volatile bool g_modsSkipOnce = false;   // the next launch runs vanilla (Start without mods)
+static volatile bool g_modsArmedRun = false;   // this launch armed ghdoorstop
+static std::wstring  g_modRunRoot;             // the armed profile's folder
+
+static std::wstring GhModRunPath() { return std::wstring(kLocalState) + L"gh_mod_run.txt"; }
+
+static bool GhModRunRead(GhModRun& r)
+{
+    HANDLE f = CreateFileW(GhModRunPath().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    std::string s(4096, '\0');
+    DWORD got = 0;
+    ReadFile(f, &s[0], (DWORD)s.size(), &got, nullptr);
+    CloseHandle(f);
+    s.resize(got);
+    size_t at = 0;
+    while (at < s.size()){
+        size_t e = s.find('\n', at);
+        std::string line = s.substr(at, e == std::string::npos ? std::string::npos : e - at);
+        at = e == std::string::npos ? s.size() : e + 1;
+        while (!line.empty() && line.back() == '\r') line.pop_back();
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = line.substr(0, eq), v = line.substr(eq + 1);
+        if (k == "title") r.title = v;
+        else if (k == "profile") r.profile = v;
+        else if (k == "state") r.state = v;
+        else if (k == "fails") r.fails = atoi(v.c_str());
+        else if (k == "app") r.app = (uint32_t)strtoul(v.c_str(), nullptr, 10);
+        else if (k == "guest"){
+            int n = MultiByteToWideChar(CP_UTF8, 0, v.c_str(), (int)v.size(), nullptr, 0);
+            r.guest.assign(n, L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, v.c_str(), (int)v.size(), &r.guest[0], n);
+        }
+    }
+    return !r.title.empty() && !r.guest.empty();
+}
+
+static void GhModRunWrite(const GhModRun& r)
+{
+    int n = WideCharToMultiByte(CP_UTF8, 0, r.guest.c_str(), (int)r.guest.size(), nullptr, 0, nullptr, nullptr);
+    std::string g(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, r.guest.c_str(), (int)r.guest.size(), &g[0], n, nullptr, nullptr);
+    std::string s = "title=" + r.title + "\r\nprofile=" + r.profile + "\r\nguest=" + g +
+                    "\r\napp=" + std::to_string(r.app) +
+                    "\r\nstate=" + r.state + "\r\nfails=" + std::to_string(r.fails) + "\r\n";
+    HANDLE f = CreateFileW(GhModRunPath().c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE){ Diag("MODS run record write failed err=" + Hex(GetLastError())); return; }
+    DWORD wr = 0;
+    WriteFile(f, s.data(), (DWORD)s.size(), &wr, nullptr);
+    CloseHandle(f);
+    Diag("MODS run " + r.title + "/" + r.profile + " state=" + r.state + " fails=" + std::to_string(r.fails));
+}
+
+// The game has lived long enough to call this launch a start: the failure streak ends.
+static void GhModRunStarted()
+{
+    GhModRun r;
+    if (!g_modsArmedRun || !GhModRunRead(r) || r.state != "running") return;
+    r.state = "started"; r.fails = 0;
+    GhModRunWrite(r);
+}
+
+// The armed launch is over. `bad` = it crashed or exited nonzero. A failure
+// before the game counted as started extends the streak.
+static void GhModRunEnd(bool bad)
+{
+    GhModRun r;
+    if (!g_modsArmedRun || !GhModRunRead(r)) return;
+    if (bad && r.state == "running") r.fails++;
+    r.state = bad ? "failed" : "ended";
+    GhModRunWrite(r);
+}
+
+// The profile's mod-loader log, relative to its root: MelonLoader's when the
+// profile carries MelonLoader, else BepInEx's.
+static std::wstring GhModLogRel(const std::wstring& root)
+{
+    return GetFileAttributesW((root + L"MelonLoader\\net35\\MelonLoader.dll").c_str()) != INVALID_FILE_ATTRIBUTES
+         ? L"MelonLoader\\Latest.log" : L"BepInEx\\LogOutput.log";
+}
+
+// The last lines of the profile's mod-loader log, for the crash screen.
+static std::vector<std::string> GhModLogTail(const std::wstring& root, size_t maxLines)
+{
+    std::vector<std::string> out;
+    HANDLE f = CreateFileW((root + GhModLogRel(root)).c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return out;
+    LARGE_INTEGER sz{}; GetFileSizeEx(f, &sz);
+    const LONGLONG want = sz.QuadPart < 32768 ? sz.QuadPart : 32768;
+    LARGE_INTEGER at; at.QuadPart = sz.QuadPart - want;
+    SetFilePointerEx(f, at, nullptr, FILE_BEGIN);
+    std::string s((size_t)want, '\0');
+    DWORD got = 0;
+    ReadFile(f, &s[0], (DWORD)s.size(), &got, nullptr);
+    CloseHandle(f);
+    s.resize(got);
+    size_t p = 0;
+    if (at.QuadPart > 0){ p = s.find('\n'); p = p == std::string::npos ? s.size() : p + 1; }   // drop the cut line
+    while (p < s.size()){
+        size_t e = s.find('\n', p);
+        std::string line = s.substr(p, e == std::string::npos ? std::string::npos : e - p);
+        p = e == std::string::npos ? s.size() : e + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        for (auto& c : line) if ((unsigned char)c < 0x20 && c != '\t') c = ' ';
+        out.push_back(line);
+    }
+    if (out.size() > maxLines) out.erase(out.begin(), out.end() - maxLines);
+    return out;
+}
+
+// A mod's native DLLs run as ordinary guest code: no loader of ours vets them,
+// and their window calls land on the usual stubs. Name each one in the log so a
+// crash inside one can be told apart from the game's own.
+static void GhModsLogNative(const std::wstring& dir, const std::wstring& rel, int depth)
+{
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileExW((dir + L"*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        std::wstring n = fd.cFileName;
+        if (n == L"." || n == L"..") continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY){
+            if (depth < 6) GhModsLogNative(dir + n + L"\\", rel + n + L"\\", depth + 1);
+            continue;
+        }
+        if (n.size() < 4 || _wcsicmp(n.c_str() + n.size() - 4, L".dll") != 0) continue;
+        HANDLE f = CreateFileW((dir + n).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        uint8_t b[4096] = {};
+        DWORD got = 0;
+        ReadFile(f, b, sizeof b, &got, nullptr);
+        CloseHandle(f);
+        if (got < 0x40 || b[0] != 'M' || b[1] != 'Z') continue;
+        const uint32_t pe = *(const uint32_t*)(b + 0x3C);
+        if (pe > got - 0x18 - 2 || memcmp(b + pe, "PE\0\0", 4) != 0) continue;
+        const uint16_t machine = *(const uint16_t*)(b + pe + 4);
+        const uint16_t magic = *(const uint16_t*)(b + pe + 0x18);
+        // The CLI header is data directory 14: 0xE0 into a PE32 optional header, 0xF0 into PE32+.
+        const uint32_t clr = pe + 0x18 + (magic == 0x20B ? 0xF0 : 0xE0);
+        if (clr + 8 <= got && *(const uint32_t*)(b + clr) != 0) continue;   // managed: Mono loads it
+        std::string r8;
+        for (wchar_t c : rel + n) r8.push_back(c < 0x80 ? (char)c : '?');
+        Diag("MODS native DLL " + r8 + " machine=" + Hex(machine) +
+             (machine == 0x8664 ? "" : " (not x64: cannot load)"));
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+// Called by GhTitleBegin's caller once g_title is known: arms or disarms the hook.
+// Creates every missing folder on the way to `path` (a file path).
+static void GhModsMkdirs(const std::wstring& path)
+{
+    for (size_t i = 3; i < path.size(); i++)
+        if (path[i] == L'\\') CreateDirectoryW(path.substr(0, i).c_str(), nullptr);
+}
+
+// Unpacks the profile zip into `root`. Entry names go through ghzip::SafeName, so
+// nothing lands outside the profile. Existing files are overwritten.
+static void GhModsUnpack(const std::wstring& zip, const std::wstring& root)
+{
+    HANDLE f = CreateFileW(zip.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER sz{}; GetFileSizeEx(f, &sz);
+    if (sz.QuadPart <= 0 || sz.QuadPart > (1ll << 30)){ CloseHandle(f); Diag("MODS profile zip size refused"); return; }
+    std::vector<uint8_t> z((size_t)sz.QuadPart);
+    DWORD got = 0;
+    BOOL ok = ReadFile(f, z.data(), (DWORD)z.size(), &got, nullptr);
+    CloseHandle(f);
+    if (!ok || got != z.size()){ Diag("MODS short read of profile zip"); return; }
+    std::vector<ghzip::Entry> es; std::string why;
+    if (!ghzip::ReadDir(z.data(), z.size(), es, &why)){ Diag("MODS profile zip refused: " + why); return; }
+    unsigned files = 0, bad = 0;
+    uint64_t bytes = 0;
+    std::vector<uint8_t> out;
+    for (auto& e : es){
+        std::string rel;
+        if (!ghzip::SafeName(e.name, rel)){ bad++; Diag("MODS refused zip entry " + e.name.substr(0, 200)); continue; }
+        if (e.dir) continue;
+        if (!ghzip::Extract(z.data(), z.size(), e, out, &why)){ bad++; Diag("MODS " + rel + ": " + why); continue; }
+        int n = MultiByteToWideChar(CP_UTF8, 0, rel.c_str(), (int)rel.size(), nullptr, 0);
+        std::wstring w(n, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, rel.c_str(), (int)rel.size(), &w[0], n);
+        for (auto& c : w) if (c == L'/') c = L'\\';
+        std::wstring dst = root + w;
+        GhModsMkdirs(dst);
+        HANDLE o = CreateFileW(dst.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        DWORD wr = 0;
+        if (o == INVALID_HANDLE_VALUE || !WriteFile(o, out.data(), (DWORD)out.size(), &wr, nullptr) || wr != out.size()){
+            bad++; Diag("MODS write failed " + rel + " err=" + Hex(GetLastError()));
+        } else { files++; bytes += out.size(); }
+        if (o != INVALID_HANDLE_VALUE) CloseHandle(o);
+    }
+    Diag("MODS unpacked " + std::to_string(files) + " files (" + std::to_string(bytes >> 10) + " KiB), " +
+         std::to_string(bad) + " refused");
+    MoveFileExW(zip.c_str(), (zip + L".done").c_str(), MOVEFILE_REPLACE_EXISTING);
+}
+
+// §54: the pinned portable .NET 6 runtime that MelonLoader's bootstrap hosts on
+// IL2CPP games (gh_mods.h EnsureDotnet6: fetched once, hash-checked). Launcher only.
+static bool GhModsDotnet6(std::wstring& dir, std::string& why);
+#ifndef GH_LAUNCHER
+static bool GhModsDotnet6(std::wstring&, std::string& why){ why = "Launcher only"; return false; }
+#endif
+static bool g_melonIl2cpp = false;    // the armed MelonLoader profile is on an IL2CPP game
+
+// M4.4: an Unreal game's exe is <Root>\<Proj>\Binaries\Win64\<Proj>-Win64-Shipping.exe,
+// and its mods also live in <Proj>\Content\Paks and <Proj>\Config. For that layout
+// the overlay is based at <Root> and projRel is "<Proj>\"; otherwise it is the
+// exe's own folder and projRel is empty.
+static std::wstring GhModBaseFor(const std::wstring& exeDir, std::wstring& projRel)
+{
+    projRel.clear();
+    static const wchar_t kTail[] = L"\\Binaries\\Win64\\";
+    const size_t t = wcslen(kTail);
+    if (exeDir.size() > t && _wcsicmp(exeDir.c_str() + exeDir.size() - t, kTail) == 0){
+        const std::wstring proj = exeDir.substr(0, exeDir.size() - t + 1);   // <Root>\<Proj>\ (with the slash)
+        const size_t s = proj.size() >= 2 ? proj.find_last_of(L'\\', proj.size() - 2) : std::wstring::npos;
+        if (s != std::wstring::npos){
+            projRel = proj.substr(s + 1);
+            return proj.substr(0, s + 1);
+        }
+    }
+    return exeDir;
+}
+
+static void GhModsBegin()
+{
+    g_modTarget.clear();
+    g_melonBoot.clear();
+    g_melonIl2cpp = false;
+    g_modClrDir.clear();
+    g_modArgs.clear();
+    g_melonBooted = false;
+    g_melonBootMod = nullptr;
+    g_modsArmedRun = false;
+    g_modRunRoot.clear();
+    g_modOvl = ghovl::Index{};
+    g_modOvlBase.clear();
+    g_modOvlHits = 0;
+    g_ue4ssDll.clear();
+    g_ue4ssBooted = false;
+    for (const wchar_t* v : { L"SHIMLOADER_MOD_DIR", L"SHIMLOADER_PAK_DIR", L"SHIMLOADER_CFG_DIR", L"SHIMLOADER_OVERLAY_DIR" })
+        SetEnvironmentVariableW(v, nullptr);
+    const bool skip = g_modsSkipOnce;
+    g_modsSkipOnce = false;
+    std::lock_guard<std::mutex> lk(g_modsJobLock);   // never read a profile mid-install
+    const std::string id = g_title ? g_title->id : std::string();
+    std::wstring prof = GhModProfileFor(id);
+    if (prof.empty()) return;
+    if (skip){
+        Diag("MODS skipped for this launch (Start without mods); profile stays selected");
+        return;
+    }
+    std::wstring wid(id.begin(), id.end());
+    std::wstring root = std::wstring(kDevRoot) + L"gh_mods\\" + wid + L"\\" + prof + L"\\";
+    std::wstring zip = std::wstring(kDevRoot) + L"ghmod_" + wid + L"_" + prof + L".zip";
+    if (GetFileAttributesW(zip.c_str()) != INVALID_FILE_ATTRIBUTES){
+        GhModsMkdirs(root);
+        GhModsUnpack(zip, root);
+    }
+    std::wstring pre = root + L"BepInEx\\core\\BepInEx.Preloader.dll";
+    std::string r8(root.begin(), root.end());
+    // §53: loose files. Independent of the code loaders below; a profile may be
+    // files only (no BepInEx, no MelonLoader). game\ mirrors the install folder:
+    // the exe's own, or <Root> for an Unreal game (M4.4).
+    std::wstring gexe = g_guestExePath.empty() ? g_launcherSelectedGuest : g_guestExePath;
+    for (auto& c : gexe) if (c == L'/') c = L'\\';
+    const std::wstring exeDir = gexe.substr(0, gexe.find_last_of(L'\\') + 1);
+    std::wstring projRel;
+    const std::wstring base = GhModBaseFor(exeDir, projRel);
+    g_modOvlBase = base;
+    ghovl::Build(g_modOvl, root + L"game\\");
+    if (g_modOvl.on())
+        Diag("MODS files: " + std::to_string(g_modOvl.files.size()) + " file(s), " +
+             std::to_string(g_modOvl.bytes / 1024) + " KiB in game\\ shadow the game folder" +
+             (g_modOvl.truncated ? " (index capped)" : ""));
+    // M4: a MelonLoader 0.7 profile (r2modman's layout) has the bootstrap at its
+    // root and the managed loader under MelonLoader\. The bootstrap does what
+    // ghdoorstop does for BepInEx, so it is loaded in place of the hook.
+    const bool melon = GetFileAttributesW((root + L"version.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
+                       GetFileAttributesW((root + L"MelonLoader\\net35\\MelonLoader.dll").c_str()) != INVALID_FILE_ATTRIBUTES;
+    // M4.4: r2modman's shimloader layout for Unreal games: ue4ss.dll and
+    // UE4SS-settings.ini at the root, shimloader\{mod,pak,cfg,overlay}. We stand in
+    // for the shimloader (its dwmapi.dll proxy is not loaded): the same folders
+    // are mounted where the game and UE4SS look, and GhUe4ssBoot loads UE4SS.
+    const bool ue = GetFileAttributesW((root + L"ue4ss.dll").c_str()) != INVALID_FILE_ATTRIBUTES ||
+                    GetFileAttributesW((root + L"shimloader").c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (ue){
+        if (projRel.empty()){
+            Diag("MODS profile " + r8 + " is a shimloader (Unreal) profile and the game exe is not in "
+                 "<Proj>\\Binaries\\Win64 -- vanilla");
+            g_modOvl = ghovl::Index{};
+            g_modOvlBase.clear();
+            return;
+        }
+        const std::wstring sl = root + L"shimloader\\";
+        for (const wchar_t* d : { L"mod\\", L"pak\\", L"cfg\\" }) GhModsMkdirs(sl + d);
+        const std::wstring bin = exeDir.substr(base.size());   // <Proj>\Binaries\Win64\ (with the slash)
+        ghovl::MountFile(g_modOvl, bin + L"ue4ss.dll", root + L"ue4ss.dll", false);
+        ghovl::MountFile(g_modOvl, bin + L"UE4SS-settings.ini", root + L"UE4SS-settings.ini", false);
+        ghovl::MountFile(g_modOvl, bin + L"UE4SS.log", root + L"UE4SS.log", true);
+        ghovl::Mount(g_modOvl, bin + L"Mods", sl + L"mod", true);
+        ghovl::Mount(g_modOvl, projRel + L"Content\\Paks\\LogicMods", sl + L"pak", true);
+        ghovl::Mount(g_modOvl, projRel + L"Config", sl + L"cfg", true);
+        // shimloader\overlay\<package>\ files appear beside the exe; packages in
+        // name order, the first to supply a name keeps it (as the shimloader does).
+        std::vector<std::wstring> pk;
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileExW((sl + L"overlay\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
+        if (h != INVALID_HANDLE_VALUE){
+            do {
+                if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && wcscmp(fd.cFileName, L".") && wcscmp(fd.cFileName, L".."))
+                    pk.push_back(fd.cFileName);
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+        std::sort(pk.begin(), pk.end(), [](const std::wstring& a, const std::wstring& b){ return _wcsicmp(a.c_str(), b.c_str()) < 0; });
+        for (const auto& n : pk) ghovl::Mount(g_modOvl, bin.substr(0, bin.size() - 1), sl + L"overlay\\" + n, false, 200000, true);
+        SetEnvironmentVariableW(L"SHIMLOADER_MOD_DIR", (sl + L"mod").c_str());
+        SetEnvironmentVariableW(L"SHIMLOADER_PAK_DIR", (sl + L"pak").c_str());
+        SetEnvironmentVariableW(L"SHIMLOADER_CFG_DIR", (sl + L"cfg").c_str());
+        SetEnvironmentVariableW(L"SHIMLOADER_OVERLAY_DIR", (sl + L"overlay").c_str());
+        if (GetFileAttributesW((root + L"ue4ss.dll").c_str()) != INVALID_FILE_ATTRIBUTES) g_ue4ssDll = root + L"ue4ss.dll";
+        Diag(std::string("MODS armed (") + (g_ue4ssDll.empty() ? "shimloader layout, no UE4SS" : "UE4SS, shimloader layout") +
+             "): profile " + r8 + " overlay packages=" + std::to_string(pk.size()) +
+             " tombstones=" + std::to_string(g_modOvl.masks.size()));
+        GhModsLogNative(sl + L"mod\\", L"Mods\\", 0);
+    } else if (melon){
+        const std::wstring exe = g_launcherSelectedGuest.empty() ? g_guestExePath : g_launcherSelectedGuest;
+        const std::wstring exeDir = exe.substr(0, exe.find_last_of(L'\\') + 1);
+        std::wstring hostfxr;
+        if (GetFileAttributesW((exeDir + L"GameAssembly.dll").c_str()) != INVALID_FILE_ATTRIBUTES){
+            // On IL2CPP the bootstrap hosts CoreCLR through hostfxr. Its own fallbacks
+            // run an installer exe or fetch an unpinned zip; it gets ours instead.
+            std::wstring dn; std::string why;
+            if (!GhModsDotnet6(dn, why)){
+                Diag("MODS profile " + r8 + " is MelonLoader on an IL2CPP game and the .NET 6 runtime is unavailable (" +
+                     why + ") -- vanilla");
+                return;
+            }
+            if (!dn.empty() && dn.back() == L'\\') dn.pop_back();   // a trailing '\' would escape the closing quote
+            hostfxr = L" \"--melonloader.hostfxr=" + dn + L"\"";
+            g_melonIl2cpp = true;
+        }
+        g_melonBoot = root + L"version.dll";
+        g_modArgs = L" \"--melonloader.basedir=" + root.substr(0, root.size() - 1) +
+                    L"\" --melonloader.hideconsole --melonloader.disablestartscreen" + hostfxr;
+        Diag(std::string("MODS armed (MelonLoader") + (g_melonIl2cpp ? ", IL2CPP" : "") + "): profile " + r8);
+        GhModsLogNative(root + L"Mods\\", L"Mods\\", 0);
+        GhModsLogNative(root + L"Plugins\\", L"Plugins\\", 0);
+        GhModsLogNative(root + L"UserLibs\\", L"UserLibs\\", 0);
+    } else {
+        // M4.3: BepInEx 6 for IL2CPP (BepInExPack_IL2CPP) brings its own .NET 6
+        // runtime in dotnet\ and starts from BepInEx.Unity.IL2CPP.dll, which
+        // runs Cpp2IL and Il2CppInterop in process on first start.
+        const std::wstring il2 = root + L"BepInEx\\core\\BepInEx.Unity.IL2CPP.dll";
+        if (GetFileAttributesW(il2.c_str()) != INVALID_FILE_ATTRIBUTES &&
+            GetFileAttributesW((root + L"dotnet\\coreclr.dll").c_str()) != INVALID_FILE_ATTRIBUTES){
+            g_modTarget = il2;
+            g_modClrDir = root + L"dotnet\\";
+            Diag("MODS armed (BepInEx IL2CPP): profile " + r8);
+            GhModsLogNative(root + L"BepInEx\\plugins\\", L"plugins\\", 0);
+        } else if (GetFileAttributesW(pre.c_str()) != INVALID_FILE_ATTRIBUTES){
+            g_modTarget = pre;
+            Diag("MODS armed: profile " + r8);
+            GhModsLogNative(root + L"BepInEx\\plugins\\", L"plugins\\", 0);
+            GhModsLogNative(root + L"BepInEx\\patchers\\", L"patchers\\", 0);
+        } else if (g_modOvl.on()){
+            Diag("MODS armed (files only): profile " + r8);
+        } else {
+            Diag("MODS profile " + r8 + " has no BepInEx\\core\\BepInEx.Preloader.dll and no game\\ files -- vanilla");
+            return;
+        }
+    }
+    // The run record: a streak of failed starts carries over only while the
+    // same title runs the same profile.
+    GhModRun old, r;
+    const bool had = GhModRunRead(old);
+    r.title = id;
+    r.profile.assign(prof.begin(), prof.end());
+    r.guest = g_launcherSelectedGuest.empty() ? g_guestExePath : g_launcherSelectedGuest;   // the picker's own string
+    r.app = g_launcherSelectedApp;
+    r.state = "running";
+    r.fails = (had && old.title == r.title && old.profile == r.profile) ? old.fails : 0;
+    GhModRunWrite(r);
+    g_modRunRoot = root;
+    g_modsArmedRun = true;
+}
+
+static void* GhMonoFn(const char* n)
+{
+    if (!g_monoModule) return nullptr;
+    if (FARPROC f = GhSelfMapExport(g_monoModule, n)) return (void*)f;
+    return (void*)GetProcAddress(g_monoModule, n);
+}
+
+static void GhModsInvoke(void* domain)
+{
+    typedef void* (*PV)();
+    typedef void  (*SetMain)(void*);
+    typedef void  (*DomCfg)(void*, const char*, const char*);
+    typedef char* (*RootDir)();
+    typedef void  (*CfgParse)(const char*);
+    typedef void* (*ImgOpen)(char*, uint32_t, int, int*, int, const char*);
+    typedef void* (*AsmLoad)(void*, const char*, int*, int);
+    typedef void* (*DescNew)(const char*, int);
+    typedef void* (*DescSearch)(void*, void*);
+    typedef void  (*DescFree)(void*);
+    typedef void* (*Invoke)(void*, void*, void**, void**);
+    typedef void* (*ObjStr)(void*, void**);
+    typedef char* (*StrUtf8)(void*);
+    typedef void  (*MFree)(void*);
+
+    auto toU8 = [](const std::wstring& w){
+        int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        std::string s(n > 0 ? n - 1 : 0, '\0');
+        if (n > 1) WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &s[0], n, nullptr, nullptr);
+        return s;
+    };
+
+    if (auto cur = (PV)GhMonoFn("mono_thread_current"))
+        if (auto sm = (SetMain)GhMonoFn("mono_thread_set_main")) sm(cur());
+
+    std::wstring exe = g_guestExePath;
+    std::wstring exeDir = exe.substr(0, exe.find_last_of(L'\\'));
+    if (auto dc = (DomCfg)GhMonoFn("mono_domain_set_config"))
+        dc(domain, toU8(exeDir).c_str(), toU8(exe + L".config").c_str());
+
+    SetEnvironmentVariableW(L"DOORSTOP_INITIALIZED", L"TRUE");
+    SetEnvironmentVariableW(L"DOORSTOP_INVOKE_DLL_PATH", g_modTarget.c_str());
+    SetEnvironmentVariableW(L"DOORSTOP_PROCESS_PATH", exe.c_str());
+    SetEnvironmentVariableW(L"DOORSTOP_MONO_LIB_PATH", L"");
+    if (auto rd = (RootDir)GhMonoFn("mono_assembly_getrootdir")){
+        std::string r = rd();
+        SetEnvironmentVariableW(L"DOORSTOP_MANAGED_FOLDER_DIR", std::wstring(r.begin(), r.end()).c_str());
+    }
+    if (auto cp = (CfgParse)GhMonoFn("mono_config_parse")) cp(nullptr);
+
+    HANDLE f = CreateFileW(g_modTarget.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE){ Diag("MODS cannot open preloader err=" + Hex(GetLastError())); return; }
+    LARGE_INTEGER sz{}; GetFileSizeEx(f, &sz);
+    std::vector<char> data((size_t)sz.QuadPart);
+    DWORD got = 0;
+    BOOL ok = ReadFile(f, data.data(), (DWORD)data.size(), &got, nullptr);
+    CloseHandle(f);
+    if (!ok || got != data.size()){ Diag("MODS short read of preloader"); return; }
+
+    auto imgOpen = (ImgOpen)GhMonoFn("mono_image_open_from_data_with_name");
+    auto asmLoad = (AsmLoad)GhMonoFn("mono_assembly_load_from_full");
+    auto dNew    = (DescNew)GhMonoFn("mono_method_desc_new");
+    auto dSearch = (DescSearch)GhMonoFn("mono_method_desc_search_in_image");
+    auto dFree   = (DescFree)GhMonoFn("mono_method_desc_free");
+    auto invoke  = (Invoke)GhMonoFn("mono_runtime_invoke");
+    if (!imgOpen || !asmLoad || !dNew || !dSearch || !invoke){ Diag("MODS mono exports missing"); return; }
+
+    std::string path8 = toU8(g_modTarget);
+    int st = 0;
+    void* image = imgOpen(data.data(), (uint32_t)data.size(), 1, &st, 0, path8.c_str());
+    if (!image || st){ Diag("MODS image open failed st=" + std::to_string(st)); return; }
+    st = 0;
+    asmLoad(image, path8.c_str(), &st, 0);
+    if (st){ Diag("MODS assembly load failed st=" + std::to_string(st)); return; }
+    void* desc = dNew("Doorstop.Entrypoint:Start", 1);
+    void* method = dSearch(desc, image);
+    if (dFree) dFree(desc);
+    if (!method){ Diag("MODS no Doorstop.Entrypoint:Start in the preloader"); return; }
+
+    Diag("MODS invoking Doorstop.Entrypoint:Start");
+    void* exc = nullptr;
+    invoke(method, nullptr, nullptr, &exc);
+    if (exc){
+        std::string msg = "?";
+        auto os = (ObjStr)GhMonoFn("mono_object_to_string");
+        auto u8 = (StrUtf8)GhMonoFn("mono_string_to_utf8");
+        auto mf = (MFree)GhMonoFn("mono_free");
+        if (os && u8)
+            if (void* s = os(exc, nullptr))
+                if (char* c = u8(s)){ msg = c; if (mf) mf(c); }
+        Diag("MODS entrypoint threw: " + msg.substr(0, 1500));
+        return;
+    }
+    Diag("MODS entrypoint returned");
+}
+
+static void* Bed_mono_jit_init_version(const char* rootDomain, const char* runtimeVersion)
+{
+    typedef char* (*RootDir)();
+    typedef void  (*SetPath)(const char*);
+    typedef void* (*JitInit)(const char*, const char*);
+    // Doorstop prepends its override dirs to Mono's search path and publishes the
+    // result; BepInEx's preloader reads it back. There are no override dirs here.
+    if (auto rd = (RootDir)GhMonoFn("mono_assembly_getrootdir")){
+        std::string r = rd();
+        if (auto sp = (SetPath)GhMonoFn("mono_set_assemblies_path")) sp(r.c_str());
+        SetEnvironmentVariableW(L"DOORSTOP_DLL_SEARCH_DIRS", std::wstring(r.begin(), r.end()).c_str());
+    }
+    void* domain = ((JitInit)g_monoJitInitReal)(rootDomain, runtimeVersion);
+    Diag(std::string("MODS mono_jit_init_version(") + (rootDomain ? rootDomain : "") + ", " +
+         (runtimeVersion ? runtimeVersion : "") + ") domain=" + Hex((uintptr_t)domain));
+    if (domain) GhModsInvoke(domain);
+    return domain;
+}
+
+static void GhMelonWatchClr();
+
+// M4.3: Doorstop's IL2CPP contract. il2cpp_init runs first; then CoreCLR is
+// started from the profile's dotnet\ with APP_PATHS = <dotnet>;<target dir>, and
+// the target's Doorstop.Entrypoint.Start() is called through create_delegate.
+static void GhModsClrBoot()
+{
+    typedef int (*ClrInit)(const char*, const char*, int, const char**, const char**, void**, unsigned*);
+    typedef int (*ClrDelegate)(void*, unsigned, const char*, const char*, const char*, void**);
+    auto toU8 = [](const std::wstring& w){
+        int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        std::string s(n > 0 ? n - 1 : 0, '\0');
+        if (n > 1) WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &s[0], n, nullptr, nullptr);
+        return s;
+    };
+    const ULONGLONG t0 = GetTickCount64();
+    GhMelonWatchClr();       // the same P/Invoke gaps as MelonLoader's CoreCLR (§54)
+    HMODULE clr = LoadLibraryExW((g_modClrDir + L"coreclr.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!clr){ Diag("MODS coreclr.dll load FAILED err=" + Hex(GetLastError())); return; }
+    auto init = (ClrInit)GetProcAddress(clr, "coreclr_initialize");
+    auto mkdel = (ClrDelegate)GetProcAddress(clr, "coreclr_create_delegate");
+    if (!init || !mkdel){ Diag("MODS coreclr exports missing"); return; }
+
+    const std::wstring exe = g_guestExePath;
+    const std::wstring clrDir = g_modClrDir.substr(0, g_modClrDir.size() - 1);
+    const size_t sl = g_modTarget.find_last_of(L'\\');
+    const std::wstring tdir = g_modTarget.substr(0, sl);
+    std::wstring tname = g_modTarget.substr(sl + 1);
+    if (tname.size() > 4 && 0 == _wcsicmp(tname.c_str() + tname.size() - 4, L".dll")) tname.resize(tname.size() - 4);
+    const std::wstring appPaths = clrDir + L";" + tdir;
+    SetEnvironmentVariableW(L"DOORSTOP_INITIALIZED", L"TRUE");
+    SetEnvironmentVariableW(L"DOORSTOP_INVOKE_DLL_PATH", g_modTarget.c_str());
+    SetEnvironmentVariableW(L"DOORSTOP_MANAGED_FOLDER_DIR", clrDir.c_str());
+    SetEnvironmentVariableW(L"DOORSTOP_PROCESS_PATH", exe.c_str());
+    SetEnvironmentVariableW(L"DOORSTOP_DLL_SEARCH_DIRS", appPaths.c_str());
+
+    const std::string exe8 = toU8(exe), paths8 = toU8(appPaths), name8 = toU8(tname);
+    const char* keys[] = {"APP_PATHS"};
+    const char* vals[] = {paths8.c_str()};
+    void* host = nullptr; unsigned dom = 0;
+    int hr = init(exe8.c_str(), "Doorstop Domain", 1, keys, vals, &host, &dom);
+    Diag("MODS coreclr_initialize hr=" + Hex((uint32_t)hr) + " ms=" + std::to_string((unsigned long long)(GetTickCount64() - t0)));
+    if (hr < 0) return;
+    void* start = nullptr;
+    hr = mkdel(host, dom, name8.c_str(), "Doorstop.Entrypoint", "Start", &start);
+    if (hr < 0 || !start){ Diag("MODS create_delegate(" + name8 + ") hr=" + Hex((uint32_t)hr)); return; }
+    Diag("MODS invoking Doorstop.Entrypoint.Start (CoreCLR)");
+    ((void (*)())start)();
+    Diag("MODS entrypoint returned ms=" + std::to_string((unsigned long long)(GetTickCount64() - t0)));
+}
+
+static int Bed_il2cpp_init(const char* domain)
+{
+    const int r = ((int (*)(const char*))g_il2cppInitReal)(domain);
+    Diag(std::string("MODS il2cpp_init(") + (domain ? domain : "") + ") = " + std::to_string(r));
+    static bool once = false;
+    if (!once){ once = true; GhModsClrBoot(); }
+    return r;
+}
+
 static FARPROC WINAPI Bed_GetProcAddress(HMODULE mod, LPCSTR name)
 {
+    if (name && HIWORD(name) && !g_modClrDir.empty() && 0 == strcmp(name, "il2cpp_init")){
+        FARPROC real = GhSelfMapExport(mod, name);
+        if (!real) real = GetProcAddress(mod, name);
+        if (real){
+            g_il2cppInitReal = (void*)real;
+            Diag("MODS hooked il2cpp_init");
+            return (FARPROC)&Bed_il2cpp_init;
+        }
+    }
+    if (name && HIWORD(name) && !g_modTarget.empty() && g_modClrDir.empty() && 0 == strcmp(name, "mono_jit_init_version")){
+        FARPROC real = GhSelfMapExport(mod, name);
+        if (!real) real = GetProcAddress(mod, name);
+        if (real){
+            g_monoModule = mod;
+            g_monoJitInitReal = (void*)real;
+            Diag("MODS hooked mono_jit_init_version");
+            return (FARPROC)&Bed_mono_jit_init_version;
+        }
+    }
     if (name && HIWORD(name)){                 // by name, not ordinal
         // Bootstrapper callbacks the steamclient engine looks up on the main
         // module. These take precedence over the shim table and are returned
@@ -2737,6 +3622,39 @@ static HMODULE                                       g_tlsDonor = nullptr;
 static BOOL (*g_tlsSeedBlock)(void*)                = nullptr;
 static LONG (*g_tlsSeedCount)(void)                 = nullptr;
 
+// Seed every other thread's block at a donor's real TLS index (TryRealGuestTls,
+// GhSelfMapTls): those threads predate the donor and never get its callback.
+static void GhSeedExistingThreads(ULONG index, BOOL (*seed)(void*), int& seeded, int& missed)
+{
+    typedef LONG (WINAPI *NtQIT)(HANDLE, int, void*, ULONG, ULONG*);
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    auto ntqit = ntdll ? (NtQIT)GetProcAddress(ntdll, "NtQueryInformationThread") : nullptr;
+    if (!ntqit) return;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te{}; te.dwSize = sizeof(te);
+    const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+    if (Thread32First(snap, &te)) do {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+        HANDLE t = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+        if (!t) { ++missed; continue; }
+        // the whole THREAD_BASIC_INFORMATION (48 bytes): a shorter buffer is
+        // STATUS_INFO_LENGTH_MISMATCH and the query never succeeds
+        struct { LONG ExitStatus; void* Teb; void* ClientId[2]; ULONG_PTR Affinity; LONG Priority, BasePriority; } tbi{};
+        void* blk = nullptr;
+        if (ntqit(t, 0 /*ThreadBasicInformation*/, &tbi, sizeof(tbi), nullptr) == 0 && tbi.Teb) {
+            // Bounds-check before indexing: a thread whose array is shorter than
+            // the index would otherwise hand back adjacent heap, and we would
+            // memcpy the template onto it.
+            void** arr = *(void***)((char*)tbi.Teb + 0x58);
+            if (ReadableEntries(arr, index + 1) > index) blk = arr[index];
+        }
+        if (blk && seed(blk)) ++seeded; else ++missed;
+        CloseHandle(t);
+    } while (Thread32Next(snap, &te));
+    CloseHandle(snap);
+}
+
 static bool TryRealGuestTls(unsigned slot)
 {
     if (GhCfgNum(L"gh_no_real_tls.txt", "GH_NO_REAL_TLS", 0)) {
@@ -2786,34 +3704,8 @@ static bool TryRealGuestTls(unsigned slot)
     // Threads that already exist never get a DLL_THREAD_ATTACH for a DLL loaded
     // after them, but ntdll HAS given them a block -- that is what a real index
     // buys. Seed them by hand, once.
-    typedef LONG (WINAPI *NtQIT)(HANDLE, int, void*, ULONG, ULONG*);
-    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
-    auto ntqit = ntdll ? (NtQIT)GetProcAddress(ntdll, "NtQueryInformationThread") : nullptr;
     int seeded = 0, missed = 0;
-    if (ntqit) {
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if (snap != INVALID_HANDLE_VALUE) {
-            THREADENTRY32 te{}; te.dwSize = sizeof(te);
-            const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
-            if (Thread32First(snap, &te)) do {
-                if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
-                HANDLE t = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
-                if (!t) { ++missed; continue; }
-                struct { LONG ExitStatus; void* Teb; } tbi{};
-                void* blk = nullptr;
-                if (ntqit(t, 0 /*ThreadBasicInformation*/, &tbi, sizeof(tbi), nullptr) == 0 && tbi.Teb) {
-                    // Bounds-check before indexing: a thread whose array is
-                    // shorter than our index would otherwise hand back adjacent
-                    // heap, and we would memcpy the guest template onto it.
-                    void** arr = *(void***)((char*)tbi.Teb + 0x58);
-                    if (ReadableEntries(arr, g_tlsIndex + 1) > g_tlsIndex) blk = arr[g_tlsIndex];
-                }
-                if (blk && g_tlsSeedBlock(blk)) ++seeded; else ++missed;
-                CloseHandle(t);
-            } while (Thread32Next(snap, &te));
-            CloseHandle(snap);
-        }
-    }
+    GhSeedExistingThreads(g_tlsIndex, g_tlsSeedBlock, seeded, missed);
     Diag("STAGE=tls_real_seed existing_seeded=" + std::to_string(seeded) +
          " no_block=" + std::to_string(missed) +
          " total_seeds=" + std::to_string((long)g_tlsSeedCount()));
@@ -2924,6 +3816,9 @@ struct Gfx
     // without this, but Unity does not.)
     com_ptr<ID3D11Texture2D>        guestRT;
     com_ptr<ID3D11RenderTargetView> guestRTV;   // debug clear of guestRT
+    // Set only when guestRT was reborn in a family Present cannot CopyResource
+    // into the RGBA8 back buffer (GhMatchGuestRTFormat); Present then draws it.
+    com_ptr<ID3D11ShaderResourceView> guestRTSrv;
     UINT                            rtW = 0, rtH = 0;
     D3D_FEATURE_LEVEL               level = (D3D_FEATURE_LEVEL)0;
     UINT                            cur = 0;      // currently-acquired buffer index
@@ -3015,6 +3910,75 @@ static Gfx g_gfx;
 // glyphs (rectangles commit, DrawText does not).
 static std::mutex g_d11Mutex;
 static CoreDispatcher g_dispatcher{ nullptr };   // set on the UI thread in App::Run
+
+// guestRT is TYPELESS (see BuildBridgeOnUi) so a guest may view it as UNORM or
+// UNORM_SRGB, like a real flip-model back buffer. A real back buffer is TYPED,
+// though, so a guest may also pass no view format at all: Unreal's back-buffer
+// RTV and SRV are Format=UNKNOWN, which on a typeless texture is E_INVALIDARG and a fatal
+// error (§55). For guestRT only, an absent or UNKNOWN format becomes the family's
+// plain typed format -- what the real back buffer would have answered.
+static bool GhPatchVtblSlot(void* obj, int slot, void* hook, void** origOut);
+static void* g_realD11CreateRTV = nullptr;
+static void* g_realD11CreateSRV = nullptr;
+// The plain typed format of guestRT's family, or UNKNOWN when `res` is not guestRT.
+static DXGI_FORMAT GhGuestRTTypedFor(ID3D11Resource* res)
+{
+    ID3D11Texture2D* rt = g_gfx.guestRT.get();
+    if (!res || !rt || res != static_cast<ID3D11Resource*>(rt)) return DXGI_FORMAT_UNKNOWN;
+    D3D11_TEXTURE2D_DESC td{};
+    rt->GetDesc(&td);
+    switch (td.Format){
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:     return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:     return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:  return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    default:                                return DXGI_FORMAT_UNKNOWN;
+    }
+}
+static void GhGuestRTViewSaid(const char* kind, bool absent, DXGI_FORMAT typed)
+{
+    static LONG said = 0;   // one line per view kind (bit 0 RTV, bit 1 SRV)
+    const LONG bit = kind[0] == 'R' ? 1 : 2;
+    if (InterlockedOr(&said, bit) & bit) return;
+    Diag(std::string("GFX guest RT ") + kind + " format " + (absent ? "absent" : "UNKNOWN") +
+         " -> " + std::to_string((int)typed));
+}
+static HRESULT __stdcall Hook_D11CreateRTV(ID3D11Device* self, ID3D11Resource* res,
+    const D3D11_RENDER_TARGET_VIEW_DESC* d, ID3D11RenderTargetView** out)
+{
+    using Fn = HRESULT (__stdcall*)(ID3D11Device*, ID3D11Resource*,
+                                    const D3D11_RENDER_TARGET_VIEW_DESC*, ID3D11RenderTargetView**);
+    D3D11_RENDER_TARGET_VIEW_DESC fix{};
+    if (!d || d->Format == DXGI_FORMAT_UNKNOWN){
+        const DXGI_FORMAT typed = GhGuestRTTypedFor(res);
+        if (typed != DXGI_FORMAT_UNKNOWN){
+            if (d) fix = *d;
+            else   fix.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+            fix.Format = typed;
+            GhGuestRTViewSaid("RTV", !d, typed);
+            d = &fix;
+        }
+    }
+    return ((Fn)g_realD11CreateRTV)(self, res, d, out);
+}
+static HRESULT __stdcall Hook_D11CreateSRV(ID3D11Device* self, ID3D11Resource* res,
+    const D3D11_SHADER_RESOURCE_VIEW_DESC* d, ID3D11ShaderResourceView** out)
+{
+    using Fn = HRESULT (__stdcall*)(ID3D11Device*, ID3D11Resource*,
+                                    const D3D11_SHADER_RESOURCE_VIEW_DESC*, ID3D11ShaderResourceView**);
+    D3D11_SHADER_RESOURCE_VIEW_DESC fix{};
+    if (!d || d->Format == DXGI_FORMAT_UNKNOWN){
+        const DXGI_FORMAT typed = GhGuestRTTypedFor(res);
+        if (typed != DXGI_FORMAT_UNKNOWN){
+            if (d) fix = *d;
+            else { fix.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; fix.Texture2D.MipLevels = 1; }
+            fix.Format = typed;
+            GhGuestRTViewSaid("SRV", !d, typed);
+            d = &fix;
+        }
+    }
+    return ((Fn)g_realD11CreateSRV)(self, res, d, out);
+}
 
 // Runs ON THE UI THREAD (via the dispatcher). Builds the whole bridge against the
 // live CoreWindow. Mirrors src/spikes/d3d11on12_spike.cpp, which is the proven
@@ -3254,6 +4218,10 @@ static void BuildBridgeOnUi()
                                levels, ARRAYSIZE(levels), queues, ARRAYSIZE(queues), 0,
                                g_gfx.d11.put(), g_gfx.d11ctx.put(), &g_gfx.level);
     if (FAILED(hr)) return fail("D3D11On12CreateDevice", hr);
+    if (!GhPatchVtblSlot(g_gfx.d11.get(), 9, (void*)&Hook_D11CreateRTV, &g_realD11CreateRTV))
+        Diag("GFX CreateRenderTargetView hook FAILED");
+    if (!GhPatchVtblSlot(g_gfx.d11.get(), 7, (void*)&Hook_D11CreateSRV, &g_realD11CreateSRV))
+        Diag("GFX CreateShaderResourceView hook FAILED");
     g_gfx.on12 = g_gfx.d11.as<ID3D11On12Device>();
     if (!g_gfx.on12) return fail("no_ID3D11On12Device", E_NOINTERFACE);
 
@@ -5426,12 +6394,174 @@ static void GhSnapMaybe(ID3D11Resource* bb)
          " mapms=" + std::to_string((unsigned long long)(GetTickCount64() - t0)) + " ok=" + std::to_string(mv ? 1 : 0));
 }
 
+// A D3D11 guest renders into guestRT and Present copies that into the RGBA8 back
+// buffer, so guestRT was born R8G8B8A8_TYPELESS -- what Unity asks for. Unreal asks
+// for R10G10B10A2 (r.DefaultBackBufferPixelFormat's default) or B8G8R8A8, and its
+// back-buffer RTV over an RGBA8 texture is E_INVALIDARG, a fatal error (§55).
+// CopyResource cannot cross format families, so for those guestRT is reborn in the
+// family the guest asked for and Present converts it with one full-screen draw.
+static DXGI_FORMAT GhGuestRTFamily(DXGI_FORMAT f, DXGI_FORMAT* srv)
+{
+    switch (f){
+    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+        *srv = DXGI_FORMAT_B8G8R8A8_UNORM;     return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+        *srv = DXGI_FORMAT_R10G10B10A2_UNORM;  return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+        *srv = DXGI_FORMAT_R16G16B16A16_FLOAT; return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+    default:
+        *srv = DXGI_FORMAT_UNKNOWN;            return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    }
+}
+
+static void GhMatchGuestRTFormat(DXGI_FORMAT want)
+{
+    if (!g_gfx.ready || g_gfx.guest12 || !g_gfx.guestRT || want == DXGI_FORMAT_UNKNOWN) return;
+    DXGI_FORMAT srv = DXGI_FORMAT_UNKNOWN;
+    const DXGI_FORMAT fam = GhGuestRTFamily(want, &srv);
+    std::lock_guard<std::mutex> lk(g_d11Mutex);
+    D3D11_TEXTURE2D_DESC td{};
+    g_gfx.guestRT->GetDesc(&td);
+    if (td.Format == fam) return;
+    td.Format = fam;
+    com_ptr<ID3D11Texture2D> t;
+    com_ptr<ID3D11ShaderResourceView> sv;
+    HRESULT hr = g_gfx.d11->CreateTexture2D(&td, nullptr, t.put());
+    if (SUCCEEDED(hr) && srv != DXGI_FORMAT_UNKNOWN){
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.Format = srv;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sd.Texture2D.MipLevels = 1;
+        hr = g_gfx.d11->CreateShaderResourceView(t.get(), &sd, sv.put());
+    }
+    Diag("GFX guest RT format " + std::to_string((int)want) + " -> family " +
+         std::to_string((int)fam) + (sv ? " (converted at present)" : "") + " hr=" + Hex((uint32_t)hr));
+    if (FAILED(hr)) return;
+    g_gfx.guestRT = t;
+    g_gfx.guestRTSrv = sv;
+    g_gfx.guestRTV = nullptr;
+}
+
+// The conversion draw runs on the guest's own immediate context, so every piece of
+// pipeline state it touches is saved and put back exactly as the guest left it.
+// Caller holds g_d11Mutex and has acquired dst.
+static bool GhConvertGuestRT(ID3D11Resource* dst)
+{
+    static com_ptr<ID3D11VertexShader> vs;
+    static com_ptr<ID3D11PixelShader>  ps;
+    static bool tried = false;
+    if (!tried){
+        tried = true;
+        HMODULE dc = GetModuleHandleA("d3dcompiler_47.dll");
+        if (!dc) dc = LoadLibraryA("d3dcompiler_47.dll");
+        using CompileFn = HRESULT (WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const void*, void*,
+                                            LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+        auto compile = dc ? (CompileFn)GetProcAddress(dc, "D3DCompile") : nullptr;
+        static const char kSrc[] =
+            "Texture2D t : register(t0);\n"
+            "float4 vsmain(uint id : SV_VertexID) : SV_Position {\n"
+            "  float2 uv = float2((id << 1) & 2, id & 2);\n"
+            "  return float4(uv * float2(2,-2) + float2(-1,1), 0, 1);\n"
+            "}\n"
+            "float4 psmain(float4 p : SV_Position) : SV_Target {\n"
+            "  return float4(t.Load(int3(p.xy, 0)).rgb, 1);\n"
+            "}\n";
+        com_ptr<ID3DBlob> vsb, psb, err;
+        HRESULT hv = compile ? compile(kSrc, sizeof kSrc - 1, "ghconv", nullptr, nullptr, "vsmain",
+                                       "vs_5_0", 0, 0, vsb.put(), err.put()) : E_NOTIMPL;
+        HRESULT hp = compile ? compile(kSrc, sizeof kSrc - 1, "ghconv", nullptr, nullptr, "psmain",
+                                       "ps_5_0", 0, 0, psb.put(), err.put()) : E_NOTIMPL;
+        if (SUCCEEDED(hv)) hv = g_gfx.d11->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, vs.put());
+        if (SUCCEEDED(hp)) hp = g_gfx.d11->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, ps.put());
+        Diag("GFX guest RT converter vs=" + Hex((uint32_t)hv) + " ps=" + Hex((uint32_t)hp));
+    }
+    if (!vs || !ps) return false;
+
+    // One RTV per wrapped back buffer; the wrapped resources live as long as the bridge.
+    static ID3D11Resource* rtvFor[kGfxFrames] = {};
+    static com_ptr<ID3D11RenderTargetView> rtvs[kGfxFrames];
+    ID3D11RenderTargetView* rtv = nullptr;
+    for (unsigned i = 0; i < kGfxFrames && !rtv; ++i){
+        if (rtvFor[i] == dst) rtv = rtvs[i].get();
+        else if (!rtvFor[i]){
+            D3D11_RENDER_TARGET_VIEW_DESC rd{};
+            rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+            if (FAILED(g_gfx.d11->CreateRenderTargetView(dst, &rd, rtvs[i].put()))) return false;
+            rtvFor[i] = dst;
+            rtv = rtvs[i].get();
+        }
+    }
+    if (!rtv) return false;
+
+    ID3D11DeviceContext* c = g_gfx.d11ctx.get();
+    D3D11_PRIMITIVE_TOPOLOGY topo; c->IAGetPrimitiveTopology(&topo);
+    com_ptr<ID3D11InputLayout> il;          c->IAGetInputLayout(il.put());
+    com_ptr<ID3D11VertexShader> oVs;        c->VSGetShader(oVs.put(), nullptr, nullptr);
+    com_ptr<ID3D11HullShader> oHs;          c->HSGetShader(oHs.put(), nullptr, nullptr);
+    com_ptr<ID3D11DomainShader> oDs;        c->DSGetShader(oDs.put(), nullptr, nullptr);
+    com_ptr<ID3D11GeometryShader> oGs;      c->GSGetShader(oGs.put(), nullptr, nullptr);
+    com_ptr<ID3D11PixelShader> oPs;         c->PSGetShader(oPs.put(), nullptr, nullptr);
+    ID3D11ShaderResourceView* oSrv = nullptr; c->PSGetShaderResources(0, 1, &oSrv);
+    ID3D11RenderTargetView* oRtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    ID3D11DepthStencilView* oDsv = nullptr;
+    c->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, oRtv, &oDsv);
+    com_ptr<ID3D11BlendState> oBs; FLOAT oBf[4]; UINT oMask;
+    c->OMGetBlendState(oBs.put(), oBf, &oMask);
+    com_ptr<ID3D11DepthStencilState> oDss; UINT oRef;
+    c->OMGetDepthStencilState(oDss.put(), &oRef);
+    com_ptr<ID3D11RasterizerState> oRs;     c->RSGetState(oRs.put());
+    D3D11_VIEWPORT oVp[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    UINT nVp = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    c->RSGetViewports(&nVp, oVp);
+
+    // Output first: binding our RTV unbinds guestRT as a target, so the SRV sticks.
+    c->OMSetRenderTargets(1, &rtv, nullptr);
+    c->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    c->OMSetDepthStencilState(nullptr, 0);
+    c->RSSetState(nullptr);
+    D3D11_VIEWPORT vp{ 0, 0, (FLOAT)g_gfx.rtW, (FLOAT)g_gfx.rtH, 0, 1 };
+    c->RSSetViewports(1, &vp);
+    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    c->IASetInputLayout(nullptr);
+    c->VSSetShader(vs.get(), nullptr, 0);
+    c->HSSetShader(nullptr, nullptr, 0);
+    c->DSSetShader(nullptr, nullptr, 0);
+    c->GSSetShader(nullptr, nullptr, 0);
+    c->PSSetShader(ps.get(), nullptr, 0);
+    ID3D11ShaderResourceView* srv = g_gfx.guestRTSrv.get();
+    c->PSSetShaderResources(0, 1, &srv);
+    c->Draw(3, 0);
+
+    ID3D11ShaderResourceView* none = nullptr;
+    c->PSSetShaderResources(0, 1, &none);
+    c->IASetPrimitiveTopology(topo);
+    c->IASetInputLayout(il.get());
+    c->VSSetShader(oVs.get(), nullptr, 0);
+    c->HSSetShader(oHs.get(), nullptr, 0);
+    c->DSSetShader(oDs.get(), nullptr, 0);
+    c->GSSetShader(oGs.get(), nullptr, 0);
+    c->PSSetShader(oPs.get(), nullptr, 0);
+    c->RSSetState(oRs.get());
+    c->RSSetViewports(nVp, oVp);
+    c->OMSetBlendState(oBs.get(), oBf, oMask);
+    c->OMSetDepthStencilState(oDss.get(), oRef);
+    c->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, oRtv, oDsv);
+    c->PSSetShaderResources(0, 1, &oSrv);
+    for (auto* r : oRtv) if (r) r->Release();
+    if (oDsv) oDsv->Release();
+    if (oSrv) oSrv->Release();
+    return true;
+}
+
 static HRESULT GfxPresent(UINT sync)
 {
     GhWatchTick("GfxPresent");
     InterlockedExchange(&g_presentTid, (LONG)GetCurrentThreadId());
     InterlockedIncrement(&g_presentN);
     InterlockedExchange64(&g_presentTick, (LONG64)GetTickCount64());
+    GhFrameDtTick();                             // #272
     if (!g_gfx.ready) return DXGI_ERROR_DEVICE_REMOVED;
 #ifdef GH_LAUNCHER
     if (!g_guestSessionLive) return S_OK;
@@ -5599,6 +6729,11 @@ static HRESULT GfxPresent(UINT sync)
             g_gfx.d11ctx->CopyResource(cur[0], src[0]);
             g_gfx.on12->ReleaseWrappedResources(src, 1);
             GhSnapMaybe(cur[0]);             // #202 DoD: our own frame grab
+        } else if (g_gfx.guestRT && g_gfx.guestRTSrv){
+            if (!GhConvertGuestRT(cur[0])){
+                static bool said = false;
+                if (!said){ said = true; Diag("GFX guest RT conversion unavailable -- frame not shown"); }
+            }
         } else if (g_gfx.guestRT){
             g_gfx.d11ctx->CopyResource(cur[0], g_gfx.guestRT.get());
         }
@@ -5788,6 +6923,11 @@ static UINT g_winW = 1920, g_winH = 1080;
 // LocalState just before the guest starts (GhInitGuestDisplay), because
 // AdapterProxy::VramCap is defined long before GhCfgNum is.
 static unsigned g_vramCapMb = 0;               // 0 = keep the built-in 2048
+// gh_gpu_vendor: the PCI vendor id AdapterProxy reports for the console GPU. The
+// console's own answer is Microsoft's 0x1414, and Unreal takes every 0x1414 adapter
+// for WARP and skips it ("Failed to choose a D3D11 Adapter", §55). The Basic Render
+// Driver (device 0x8C) keeps 0x1414, so it is still skipped. 0 = report the truth.
+static unsigned g_gpuVendor = 0;
 
 // #202. THE GUEST IS GIVEN A VRAM HEADROOM NUMBER FOR THE WRONG RESOURCE.
 //
@@ -6012,7 +7152,8 @@ struct SwapProxy : IDXGISwapChain4
     { if (fs) *fs = FALSE; if (o) *o = nullptr; return S_OK; }
     HRESULT __stdcall GetDesc(DXGI_SWAP_CHAIN_DESC* d) noexcept override
     { if (!d) return E_INVALIDARG; *d = desc; return S_OK; }
-    HRESULT __stdcall ResizeBuffers(UINT, UINT, UINT, DXGI_FORMAT, UINT) noexcept override { return S_OK; }
+    HRESULT __stdcall ResizeBuffers(UINT, UINT, UINT, DXGI_FORMAT f, UINT) noexcept override
+    { GhMatchGuestRTFormat(f); return S_OK; }
     HRESULT __stdcall ResizeTarget(const DXGI_MODE_DESC*) noexcept override { return S_OK; }
     HRESULT __stdcall GetContainingOutput(IDXGIOutput** o) noexcept override
     {
@@ -6619,6 +7760,11 @@ struct AdapterProxy : IDXGIAdapter4
     // support" once CreateHeap returns E_OUTOFMEMORY. Advertising a budget that
     // matches the memory the app can actually get is what a compat layer is for:
     // the guest then sizes itself to fit. GH_VRAM_MB overrides the number.
+    template <class D> static void Vendor(HRESULT hr, D* d)
+    {
+        if (SUCCEEDED(hr) && d && g_gpuVendor && d->VendorId == 0x1414 && d->DeviceId != 0x8C)
+            d->VendorId = g_gpuVendor;
+    }
     static UINT64 VramCap()
     {
         // Re-resolve whenever the override changes. The launcher's OWN graphics
@@ -6675,6 +7821,7 @@ struct AdapterProxy : IDXGIAdapter4
         HRESULT hr = real->GetDesc(d);
         if (SUCCEEDED(hr) && d && d->DedicatedVideoMemory > VramCap())
             d->DedicatedVideoMemory = (SIZE_T)VramCap();
+        Vendor(hr, d);
         return hr;
     }
     HRESULT __stdcall CheckInterfaceSupport(REFGUID n, LARGE_INTEGER* u) noexcept override
@@ -6686,6 +7833,7 @@ struct AdapterProxy : IDXGIAdapter4
         HRESULT hr = real1->GetDesc1(d);
         if (SUCCEEDED(hr) && d && d->DedicatedVideoMemory > VramCap())
             d->DedicatedVideoMemory = (SIZE_T)VramCap();
+        Vendor(hr, d);
         return hr;
     }
     HRESULT __stdcall GetDesc2(DXGI_ADAPTER_DESC2* d) noexcept override
@@ -6694,6 +7842,7 @@ struct AdapterProxy : IDXGIAdapter4
         HRESULT hr = real2->GetDesc2(d);
         if (SUCCEEDED(hr) && d && d->DedicatedVideoMemory > VramCap())
             d->DedicatedVideoMemory = (SIZE_T)VramCap();
+        Vendor(hr, d);
         return hr;
     }
 
@@ -6789,6 +7938,7 @@ struct AdapterProxy : IDXGIAdapter4
         HRESULT hr = real4->GetDesc3(d);
         if (SUCCEEDED(hr) && d && d->DedicatedVideoMemory > VramCap())
             d->DedicatedVideoMemory = (SIZE_T)VramCap();
+        Vendor(hr, d);
         return hr;
     }
 };
@@ -6938,6 +8088,7 @@ struct FactoryProxy : IDXGIFactory7
         if (!EnsureBridge()) return E_FAIL;
         SwapProxy* proxy = new SwapProxy();
         if (d) proxy->desc = *d;
+        if (d) GhMatchGuestRTFormat(d->BufferDesc.Format);
         proxy->fsDesc.Windowed = d ? d->Windowed : TRUE;
         *out = static_cast<IDXGISwapChain*>(proxy);   // born with the guest's +1 ref
         return S_OK;
@@ -6984,6 +8135,7 @@ struct FactoryProxy : IDXGIFactory7
         if (!EnsureBridge()) return E_FAIL;
         SwapProxy* proxy = new SwapProxy();
         FillSwapProxyDescs(proxy, d, fs);
+        if (d) GhMatchGuestRTFormat(d->Format);
         *out = static_cast<IDXGISwapChain1*>(proxy);   // born with the guest's +1 ref
         return S_OK;
     }
@@ -6996,6 +8148,7 @@ struct FactoryProxy : IDXGIFactory7
         if (!EnsureBridge()) return E_FAIL;
         SwapProxy* proxy = new SwapProxy();
         FillSwapProxyDescs(proxy, d, nullptr);
+        if (d) GhMatchGuestRTFormat(d->Format);
         *out = static_cast<IDXGISwapChain1*>(proxy);   // born with the guest's +1 ref
         return S_OK;
     }
@@ -7322,12 +8475,53 @@ static BOOL WINAPI Bed_SetupDiDestroyDeviceInfoList(HDEVINFO h)
 
 // Build a FactoryProxy backed by a real IDXGIFactory2. Used by all three
 // Bed_CreateDXGIFactory* variants.
+// Unreal's D3D11 RHI does not keep the factory it enumerated adapters with: once
+// the device exists it walks IDXGIDevice -> GetAdapter -> GetParent, which is the
+// REAL factory behind the bridged device, and that factory's CreateSwapChainForHwnd
+// hands dxgi our fake HWND and throws E_HANDLE (0x80070006, §55). Every HWND in this
+// process is ours, so the real factory's HWND swap-chain slots are patched once to
+// build the same SwapProxy the proxy factory does, whichever factory the guest found.
+// The host's own swap chain is a CoreWindow one and never comes through here.
+static bool GhPatchVtblSlot(void* obj, int slot, void* hook, void** origOut);
+static FactoryProxy* g_scFactory = nullptr;   // never released; only its swap-chain methods run
+static void* g_realFacCreateSC = nullptr;
+static void* g_realFacCreateSCHwnd = nullptr;
+static void* g_realFacMakeWndAssoc = nullptr;
+static HRESULT __stdcall Hook_RealFacCreateSC(IDXGIFactory*, IUnknown* dev,
+                                              DXGI_SWAP_CHAIN_DESC* d, IDXGISwapChain** out)
+{
+    Diag("REALFAC CreateSwapChain -> bed");
+    return g_scFactory->CreateSwapChain(dev, d, out);
+}
+static HRESULT __stdcall Hook_RealFacCreateSCHwnd(IDXGIFactory2*, IUnknown* dev, HWND h,
+    const DXGI_SWAP_CHAIN_DESC1* d, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs,
+    IDXGIOutput* o, IDXGISwapChain1** out)
+{
+    Diag("REALFAC CreateSwapChainForHwnd -> bed");
+    return g_scFactory->CreateSwapChainForHwnd(dev, h, d, fs, o, out);
+}
+static HRESULT __stdcall Hook_RealFacMakeWndAssoc(IDXGIFactory*, HWND, UINT) { return S_OK; }
+
+static void GhPatchRealFactorySwapChains(IDXGIFactory2* real)
+{
+    static LONG once = 0;
+    if (InterlockedExchange(&once, 1)) return;
+    g_scFactory = new FactoryProxy();
+    g_scFactory->real.copy_from(real);   // the proxy owns one reference for the process
+    bool a = GhPatchVtblSlot(real, 10, (void*)&Hook_RealFacCreateSC, &g_realFacCreateSC);
+    bool b = GhPatchVtblSlot(real, 15, (void*)&Hook_RealFacCreateSCHwnd, &g_realFacCreateSCHwnd);
+    bool c = GhPatchVtblSlot(real, 8, (void*)&Hook_RealFacMakeWndAssoc, &g_realFacMakeWndAssoc);
+    Diag(std::string("REALFAC swap-chain slots patched: legacy=") + (a ? "1" : "0") +
+         " hwnd=" + (b ? "1" : "0") + " mwa=" + (c ? "1" : "0"));
+}
+
 static HRESULT MakeFactoryProxy(REFIID riid, void** out)
 {
     if (!out) return E_POINTER;
     com_ptr<IDXGIFactory2> real;
     HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory2), real.put_void());
     if (FAILED(hr)) return hr;
+    GhPatchRealFactorySwapChains(real.get());
     FactoryProxy* proxy = new FactoryProxy();   // rc = 1, released after the QI below
     proxy->real = real;
     // Best-effort: whichever of these the console's dxgi actually has, the proxy
@@ -11806,6 +13000,46 @@ static void GhPatchPsPcInit(uint8_t* base, DWORD imageSize)
     FlushInstructionCache(GetCurrentProcess(), p, n);
     Diag("PSPCINIT patched GUEST+" + Hex((uint32_t)rva) +
          " je -> jmp -- scePsPcInitialize's return code is now ignored");
+}
+
+// #273. Tsushima plans its memory for an 8 GB machine no matter what we report.
+// GUEST+0x1404EF200 caches max(ullAvailPhys, 8 GB) once, and the boot-time budget
+// pass (GUEST+0x4F0D47..0x4F0F04) subtracts its fixed reserves from that figure
+// and hands the remainder to the class pools: 40% to the CPU-side budgets (the
+// 0x4EEDD2 chunk allocator) and 60% to the "B" budgets. On a 5,120 MB container
+// that plan is ~1.8 GB larger than the box, and the pager pays for the excess.
+// gh_tsu_memfloor_mb lowers the clamp itself, so the engine budgets for the
+// machine it is actually on. Reporting less RAM can never do this (section 32.108):
+// anything under the clamp is raised back to 8 GB.
+static void GhPatchTsuMemFloor(uint8_t* base, DWORD imageSize)
+{
+    const unsigned mb = GhCfgNumZ(L"gh_tsu_memfloor_mb.txt", "GH_TSU_MEMFLOOR_MB", 0);
+    if (!mb) return;
+    const DWORD rva = 0x4EF249u;
+    static const BYTE kWant[] = { 0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00 }; // movabs rcx, 8 GB
+    const size_t n = sizeof kWant;
+    if (rva + n > imageSize){
+        Diag("MEMFLOOR rva " + Hex((uint32_t)rva) + " outside the image -- not patching");
+        return;
+    }
+    BYTE* p = base + rva;
+    if (std::memcmp(p, kWant, n) != 0){
+        std::string got;
+        for (size_t i = 0; i < n; ++i) got += Hex((uint32_t)p[i]) + " ";
+        Diag("MEMFLOOR signature mismatch at GUEST+" + Hex((uint32_t)rva) + ", got " + got + "-- not patching");
+        return;
+    }
+    const uint64_t floor = (uint64_t)mb << 20;
+    DWORD old = 0;
+    if (!VirtualProtect(p, n, PAGE_EXECUTE_READWRITE, &old)){
+        Diag("MEMFLOOR VirtualProtect failed err=" + Hex(GetLastError()));
+        return;
+    }
+    std::memcpy(p + 2, &floor, sizeof floor);
+    VirtualProtect(p, n, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, n);
+    Diag("MEMFLOOR patched GUEST+" + Hex((uint32_t)rva) + " 8 GB -> " + std::to_string(mb) +
+         " MB -- the engine's budget is now max(availPhys, " + std::to_string(mb) + " MB)");
 }
 
 // #165. WHICH load costs seventeen seconds.
@@ -31615,17 +32849,28 @@ static void GhVaCensus(const char* when, uint64_t appused, uint64_t applimit)
     ReleaseSRWLockExclusive(&g_vaCensusLock);
 }
 
+// Runs f under SEH and says whether it finished. clang 23 refuses __try in any
+// function that also owns a C++ object with a destructor, so the guarded work
+// goes in a lambda: this frame owns nothing, and a fault inside f unwinds the
+// lambda's frame without running its destructors -- as the inline __try did.
+template <class F> static bool GhSehCall(F&& f)
+{
+    __try { f(); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 static void GhLogMemoryBudget(const char* where)
 {
     GhCheckDeviceRemoved(where);
     std::string ln = std::string("MEMORY ") + where;
     // Kept as values too: #189's census needs the ratio to decide its cadence.
     uint64_t appLimit = 0, appUsed = 0;
-    __try {
-        appLimit = (uint64_t)winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
-        appUsed  = (uint64_t)winrt::Windows::System::MemoryManager::AppMemoryUsage();
+    if (GhSehCall([&]{
+            appLimit = (uint64_t)winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
+            appUsed  = (uint64_t)winrt::Windows::System::MemoryManager::AppMemoryUsage();
+        }))
         ln += " applimit=" + Hex(appLimit) + " appused=" + Hex(appUsed);
-    } __except (EXCEPTION_EXECUTE_HANDLER) { ln += " applimit=?"; }
+    else ln += " applimit=?";
     MEMORYSTATUSEX ms{}; ms.dwLength = sizeof ms;
     if (GlobalMemoryStatusEx(&ms))
         ln += " availphys=" + Hex((uint64_t)ms.ullAvailPhys) +
@@ -32982,6 +34227,7 @@ static HRESULT WINAPI Bed_D3D11CreateDeviceAndSwapChain(
     if (swap){
         SwapProxy* proxy = new SwapProxy();
         if (scDesc) proxy->desc = *scDesc;
+        if (scDesc) GhMatchGuestRTFormat(scDesc->BufferDesc.Format);
         *swap = static_cast<IDXGISwapChain*>(proxy);   // hand the guest a +1 ref
     }
     return S_OK;
@@ -34370,6 +35616,66 @@ static DWORD WINAPI Bed_GetModuleFileNameA(HMODULE h, LPSTR buf, DWORD cch)
     return n2;
 }
 
+// ...and a FOURTH way: psapi, asking about our own process. Mono's
+// Process.GetCurrentProcess().MainModule is EnumProcessModules + these two, and
+// MelonLoader's managed side takes the game's folder from it (MelonEnvironment:
+// GameExecutablePath). Answered by the OS, it named the host package: Game::BasePath
+// under WindowsApps, "Unity Version: 0.0.0a0", and the support module crashed Mono.
+static bool IsOwnProcess(HANDLE p)
+{
+    return p == GetCurrentProcess() || GetProcessId(p) == GetCurrentProcessId();
+}
+typedef DWORD (WINAPI *PsapiNameW)(HANDLE, HMODULE, LPWSTR, DWORD);
+typedef DWORD (WINAPI *PsapiNameA)(HANDLE, HMODULE, LPSTR, DWORD);
+static FARPROC PsapiReal(const char* fn)
+{
+    static HMODULE k = GetModuleHandleW(L"kernel32.dll");
+    return k ? GetProcAddress(k, fn) : nullptr;     // the K32 exports psapi forwards to
+}
+static DWORD GhGuestNameW(bool base, LPWSTR buf, DWORD cch)
+{
+    std::wstring v = g_guestExePath;
+    if (base) v = v.substr(v.find_last_of(L"\\/") + 1);
+    if (!buf || !cch) return 0;
+    DWORD n = (DWORD)v.size();
+    if (n + 1 > cch){ std::memcpy(buf, v.c_str(), cch * sizeof(wchar_t)); buf[cch - 1] = 0; SetLastError(ERROR_INSUFFICIENT_BUFFER); return cch; }
+    std::memcpy(buf, v.c_str(), (n + 1) * sizeof(wchar_t));
+    return n;
+}
+static DWORD GhGuestNameA(bool base, LPSTR buf, DWORD cch)
+{
+    wchar_t w[MAX_PATH * 2];
+    DWORD n = GhGuestNameW(base, w, MAX_PATH * 2);
+    if (!n || !buf || !cch) return 0;
+    int k = WideCharToMultiByte(CP_ACP, 0, w, -1, buf, (int)cch, nullptr, nullptr);
+    if (k <= 0){ buf[cch - 1] = 0; SetLastError(ERROR_INSUFFICIENT_BUFFER); return cch; }
+    return (DWORD)(k - 1);
+}
+static DWORD WINAPI Bed_GetModuleFileNameExW(HANDLE p, HMODULE h, LPWSTR buf, DWORD cch)
+{
+    if (IsOwnProcess(p) && IsMainModule(h) && !g_guestExePath.empty()) return GhGuestNameW(false, buf, cch);
+    auto f = (PsapiNameW)PsapiReal("K32GetModuleFileNameExW");
+    return f ? f(p, h, buf, cch) : 0;
+}
+static DWORD WINAPI Bed_GetModuleBaseNameW(HANDLE p, HMODULE h, LPWSTR buf, DWORD cch)
+{
+    if (IsOwnProcess(p) && IsMainModule(h) && !g_guestExePath.empty()) return GhGuestNameW(true, buf, cch);
+    auto f = (PsapiNameW)PsapiReal("K32GetModuleBaseNameW");
+    return f ? f(p, h, buf, cch) : 0;
+}
+static DWORD WINAPI Bed_GetModuleFileNameExA(HANDLE p, HMODULE h, LPSTR buf, DWORD cch)
+{
+    if (IsOwnProcess(p) && IsMainModule(h) && !g_guestExePath.empty()) return GhGuestNameA(false, buf, cch);
+    auto f = (PsapiNameA)PsapiReal("K32GetModuleFileNameExA");
+    return f ? f(p, h, buf, cch) : 0;
+}
+static DWORD WINAPI Bed_GetModuleBaseNameA(HANDLE p, HMODULE h, LPSTR buf, DWORD cch)
+{
+    if (IsOwnProcess(p) && IsMainModule(h) && !g_guestExePath.empty()) return GhGuestNameA(true, buf, cch);
+    auto f = (PsapiNameA)PsapiReal("K32GetModuleBaseNameA");
+    return f ? f(p, h, buf, cch) : 0;
+}
+
 // ===========================================================================
 // Input bed: the gamepad, via Windows.Gaming.Input.
 //
@@ -34427,6 +35733,12 @@ static SHORT StickToShort(double v)
 static std::mutex        g_padMutex;
 static XINPUT_GAMEPAD    g_padState{};
 static bool              g_padConnected = false;
+// Set by the first ghpad.txt pulse. Unity's XInput backends (Gang Beasts'
+// "Using XInput") look for pads only every few seconds, so a pad that reports
+// connected just for a pulse's hold window was never discovered and every
+// synthetic press at its title screen was lost. Once a harness has driven the
+// synthetic pad, slot 0 stays connected with neutral state between pulses.
+static bool              g_synSticky = false;
 static DWORD             g_padPacket = 0;
 static bool              g_wgiDead = false;      // WGI threw once; stop trying
 static bool              g_padLogged = false;
@@ -35013,7 +36325,7 @@ static DWORD WINAPI Bed_XInputGetState(DWORD idx, XINPUT_STATE* state)
     if (!state) return ERROR_BAD_ARGUMENTS;
     if (idx != 0) { GH_XI_COUNT("XInputGetState.idx!=0"); return ERROR_DEVICE_NOT_CONNECTED; }
     std::lock_guard<std::mutex> lk(g_padMutex);
-    if (!g_padConnected) return ERROR_DEVICE_NOT_CONNECTED;
+    if (!g_padConnected && !g_synSticky) return ERROR_DEVICE_NOT_CONNECTED;
     state->dwPacketNumber = g_padPacket;
     XINPUT_GAMEPAD g = g_padState;
 #ifdef GH_LAUNCHER
@@ -35037,7 +36349,7 @@ static DWORD WINAPI Bed_XInputGetCapabilities(DWORD idx, DWORD, XINPUT_CAPABILIT
     GH_XI_COUNT("XInputGetCapabilities");                                  // #214
     if (idx != 0) return ERROR_DEVICE_NOT_CONNECTED;
     std::lock_guard<std::mutex> lk(g_padMutex);
-    if (!g_padConnected) return ERROR_DEVICE_NOT_CONNECTED;
+    if (!g_padConnected && !g_synSticky) return ERROR_DEVICE_NOT_CONNECTED;
     if (caps){ XINPUT_CAPABILITIES c{}; c.Type = XINPUT_DEVTYPE_GAMEPAD; c.SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
                c.Gamepad.wButtons = 0xF3FF; c.Gamepad.bLeftTrigger = 0xFF; c.Gamepad.bRightTrigger = 0xFF; *caps = c; }
     return ERROR_SUCCESS;
@@ -36043,6 +37355,12 @@ static bool Bed_crs_start_handler()
 // Per-title defaults (see GhTitle). Consulted only when the knob's file is absent.
 static SRWLOCK g_titleLk = SRWLOCK_INIT;
 static std::vector<std::wstring>* g_titleEarly = nullptr;   // title knobs read before any title was chosen
+// §55. Titles whose "early" knobs this process booted with (under g_titleLk).
+static std::vector<const GhTitle*>* g_earlyFrom = nullptr;
+// §55. gh_launch_title.txt: the restarted host launches this game, and takes
+// early knobs from its title alone. Read once, with the titles; id "-" = none.
+struct GhLaunchMarker { bool have = false; std::string id; std::wstring guest; uint32_t app = 0; };
+static GhLaunchMarker g_launchMarker;
 
 static std::wstring GhUtf8ToW(const std::string& s)
 {
@@ -36230,6 +37548,37 @@ static void GhTitlesLoadDir(const std::wstring& dir, const char* where, std::vec
     FindClose(f);
 }
 
+static std::wstring GhLaunchMarkerPath() { return std::wstring(kLocalState) + L"gh_launch_title.txt"; }
+
+// Three lines: title id ("-" for none), guest path (UTF-8), Steam app id.
+static GhLaunchMarker GhLaunchMarkerRead()
+{
+    GhLaunchMarker m;
+    HANDLE f = CreateFileW(GhLaunchMarkerPath().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return m;
+    char buf[2048]; DWORD rd = 0;
+    const BOOL ok = ReadFile(f, buf, sizeof buf - 1, &rd, nullptr);
+    CloseHandle(f);
+    if (!ok) return m;
+    buf[rd] = 0;
+    std::vector<std::string> ln;
+    std::string cur;
+    for (DWORD i = 0; i < rd; ++i){
+        if (buf[i] == '\r') continue;
+        if (buf[i] == '\n'){ ln.push_back(cur); cur.clear(); } else cur += buf[i];
+    }
+    if (!cur.empty()) ln.push_back(cur);
+    if (ln.size() < 3 || ln[0].empty() || ln[1].empty()) return m;
+    m.id = ln[0];
+    const int n = MultiByteToWideChar(CP_UTF8, 0, ln[1].data(), (int)ln[1].size(), nullptr, 0);
+    m.guest.resize(n > 0 ? n : 0);
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, ln[1].data(), (int)ln[1].size(), &m.guest[0], n);
+    m.app = (uint32_t)strtoul(ln[2].c_str(), nullptr, 10);
+    m.have = !m.guest.empty();
+    return m;
+}
+
 // The loaded titles, read once on first use -- which is the first early knob
 // read, at Launcher startup, on whatever thread that is. Nothing in here may
 // read a knob (Diag does not), or the first reader would deadlock on itself.
@@ -36249,6 +37598,7 @@ static const std::vector<GhTitle>& GhTitles()
         GhTitlesLoadDir(g_installDir + L"guest\\titles\\", "package", *v);
         GhTitlesLoadDir(std::wstring(kLocalState) + L"titles\\", "LocalState", *v);
         Diag("TITLE loaded " + std::to_string(v->size()) + " title config(s)");
+        g_launchMarker = GhLaunchMarkerRead();
         titles = v;
     }
     t = titles;
@@ -36269,7 +37619,15 @@ static bool GhTitleKnobDefault(const wchar_t* file, unsigned* out, const char** 
         for (const GhTitleKnob& k : t.knobs){
             if (_wcsicmp(k.file.c_str(), file) != 0) continue;
             if (cur == &t){ *out = k.value; *src = "title"; return true; }
-            if (!cur && k.early && GhTitleInstalled(t)){ *out = k.value; *src = "title/installed"; return true; }
+            if (!cur && k.early && (g_launchMarker.have ? g_launchMarker.id == t.id : GhTitleInstalled(t))){
+                AcquireSRWLockExclusive(&g_titleLk);
+                if (!g_earlyFrom) g_earlyFrom = new std::vector<const GhTitle*>();
+                bool seen = false;
+                for (const GhTitle* e : *g_earlyFrom) if (e == &t){ seen = true; break; }
+                if (!seen) g_earlyFrom->push_back(&t);
+                ReleaseSRWLockExclusive(&g_titleLk);
+                *out = k.value; *src = g_launchMarker.have ? "title/next" : "title/installed"; return true;
+            }
             if (!cur){
                 AcquireSRWLockExclusive(&g_titleLk);
                 if (!g_titleEarly) g_titleEarly = new std::vector<std::wstring>();
@@ -36391,6 +37749,67 @@ static void GhSeedCopyTree(const std::wstring& src, const std::wstring& dst,
         }
     } while (FindNextFileW(f, &fd));
     FindClose(f);
+}
+
+// §55. Should the pick run in a restarted host? Early knobs were fixed when this
+// process started; they are right only if they came from the picked title. A
+// process that a marker started never asks again for that game, so this
+// cannot loop.
+static const GhTitle* GhTitleForGuest(const std::wstring& guest)
+{
+    size_t s = guest.find_last_of(L"\\/");
+    const std::wstring exe = (s == std::wstring::npos) ? guest : guest.substr(s + 1);
+    for (const GhTitle& t : GhTitles())
+        if (_wcsicmp(t.exe.c_str(), exe.c_str()) == 0) return &t;
+    return nullptr;
+}
+
+static bool GhEarlyNeedsRelaunch(const std::wstring& guest, std::string* why)
+{
+    // the marker's own game is what this process was started for
+    if (g_launchMarker.have && _wcsicmp(guest.c_str(), g_launchMarker.guest.c_str()) == 0) return false;
+    const GhTitle* want = GhTitleForGuest(guest);
+    bool wantHasEarly = false;
+    if (want) for (const GhTitleKnob& k : want->knobs) if (k.early){ wantHasEarly = true; break; }
+    bool wantSeen = false;
+    std::string other;
+    AcquireSRWLockShared(&g_titleLk);
+    if (g_earlyFrom) for (const GhTitle* e : *g_earlyFrom){
+        if (e == want) wantSeen = true; else other = e->id;
+    }
+    ReleaseSRWLockShared(&g_titleLk);
+    if (!other.empty()){ *why = "booted with " + other + "'s early knobs"; return true; }
+    if (wantHasEarly && !wantSeen){ *why = "its own early knobs were not applied"; return true; }
+    return false;
+}
+
+static bool GhLaunchMarkerWrite(const std::wstring& guest, uint32_t app)
+{
+    const GhTitle* t = GhTitleForGuest(guest);
+    std::string g;
+    const int n = WideCharToMultiByte(CP_UTF8, 0, guest.data(), (int)guest.size(), nullptr, 0, nullptr, nullptr);
+    g.resize(n > 0 ? n : 0);
+    if (n > 0) WideCharToMultiByte(CP_UTF8, 0, guest.data(), (int)guest.size(), &g[0], n, nullptr, nullptr);
+    const std::string body = (t ? t->id : std::string("-")) + "\r\n" + g + "\r\n" + std::to_string(app) + "\r\n";
+    HANDLE f = CreateFileW(GhLaunchMarkerPath().c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE){ Diag("TITLE relaunch marker write failed err=" + Hex(GetLastError())); return false; }
+    DWORD wr = 0;
+    const BOOL ok = WriteFile(f, body.data(), (DWORD)body.size(), &wr, nullptr) && wr == body.size();
+    CloseHandle(f);
+    if (!ok) DeleteFileW(GhLaunchMarkerPath().c_str());
+    return ok != FALSE;
+}
+
+// The marker's game, once, for the first pick of the process it started.
+static std::wstring GhLaunchMarkerConsume()
+{
+    (void)GhTitles();                       // the marker is read with them
+    DeleteFileW(GhLaunchMarkerPath().c_str());
+    if (!g_launchMarker.have) return L"";
+    Diag("TITLE relaunched for " + RegNarrow(g_launchMarker.guest) + " id=" + g_launchMarker.id +
+         " -- early knobs from that title only");
+    g_launcherSelectedApp = g_launchMarker.app;
+    return g_launchMarker.guest;
 }
 
 // The guest has been chosen: pin its title defaults and stage what the package
@@ -38110,6 +39529,7 @@ struct GhLazyRange {
     LONG*        back;        // patch h: 1 = the granule has been restored at least once
     bool         ph;          // patch i: lives in a placeholder reservation (commit = replace)
     LONG*        view;        // patch i: 1 = the granule is a section view (restored), else private
+    LONG*        kept;        // #275 REUSE: 1 = committed, and slot[bit] still holds the bytes it was restored from
 };
 static SRWLOCK                  g_lazyLock = SRWLOCK_INIT;
 static std::vector<GhLazyRange> g_lazy;              // sorted by base
@@ -38233,6 +39653,283 @@ static DWORD GhSpillCrc(const void* p, ULONG n)
             g_rtlCrc32 = (PFN_GhRtlCrc32)GetProcAddress(nt, "RtlComputeCrc32");
     }
     return g_rtlCrc32 ? g_rtlCrc32(0, p, n) : 0;
+}
+// #272 LZ (gh_spill_lz=1). NB1 showed the D: drive itself is slow (an
+// unbuffered 64 KB write costs 2-8 ms), so the spill file only works while the
+// system cache absorbs it. Compressing each granule with ntdll's XPRESS before
+// it reaches the file multiplies what that cache holds and divides what the
+// cache manager has to throttle and what a miss has to read back. A slot's
+// compressed length lives in g_slotLz (0 = stored raw); it is written before
+// the slot's bytes can be read from the file (eviction, or ring write-back
+// while the ring still owns the slot). Runs inside the VEH: no heap, no Diag.
+static LONG64 GhQpcUs();
+typedef LONG (NTAPI* PFN_GhRtlLzC)(USHORT, PUCHAR, ULONG, PUCHAR, ULONG, ULONG, PULONG, PVOID);
+typedef LONG (NTAPI* PFN_GhRtlLzD)(USHORT, PUCHAR, ULONG, PUCHAR, ULONG, PULONG);
+typedef LONG (NTAPI* PFN_GhRtlLzWs)(USHORT, PULONG, PULONG);
+enum { GH_LZ_FMT = 3 /* COMPRESSION_FORMAT_XPRESS */, GH_LZ_BUF_N = 16 };
+static unsigned                 g_spillLz  = 0;
+static PFN_GhRtlLzC             g_rtlLzC   = nullptr;
+static PFN_GhRtlLzD             g_rtlLzD   = nullptr;
+static uint8_t*                 g_lzBuf    = nullptr;       // GH_LZ_BUF_N x (gran + 4 KB)
+static uint8_t*                 g_lzWs     = nullptr;       // GH_LZ_BUF_N x g_lzWsSize
+static ULONG                    g_lzWsSize = 0;
+static volatile LONG            g_lzMap    = 0;
+static uint32_t                 g_slotLz[GH_SPILL_CRC_N];
+static volatile LONG            g_lzN = 0, g_lzRaw = 0, g_lzBad = 0, g_lzRd = 0;
+static volatile LONG64          g_lzIn = 0, g_lzOut = 0, g_lzCUs = 0, g_lzDUs = 0;
+static void GhSpillLzInit(uint64_t gran)
+{
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    PFN_GhRtlLzWs ws = nt ? (PFN_GhRtlLzWs)GetProcAddress(nt, "RtlGetCompressionWorkSpaceSize") : nullptr;
+    g_rtlLzC = nt ? (PFN_GhRtlLzC)GetProcAddress(nt, "RtlCompressBuffer") : nullptr;
+    g_rtlLzD = nt ? (PFN_GhRtlLzD)GetProcAddress(nt, "RtlDecompressBuffer") : nullptr;
+    ULONG wsz = 0, fws = 0;
+    if (!ws || !g_rtlLzC || !g_rtlLzD || ws(GH_LZ_FMT, &wsz, &fws) != 0 || !wsz){
+        Diag("LAZYSPILL lz OFF: ntdll compression unavailable"); g_spillLz = 0; return;
+    }
+    g_lzWsSize = (wsz + 0xFFF) & ~0xFFFu;
+    g_lzBuf = (uint8_t*)VirtualAlloc(nullptr, (SIZE_T)(gran + 0x1000) * GH_LZ_BUF_N, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    g_lzWs  = (uint8_t*)VirtualAlloc(nullptr, (SIZE_T)g_lzWsSize * GH_LZ_BUF_N, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!g_lzBuf || !g_lzWs){ Diag("LAZYSPILL lz OFF: buffers refused"); g_spillLz = 0; return; }
+    Diag("LAZYSPILL lz on xpress ws=" + std::to_string((unsigned long)wsz) + " bufs=" + std::to_string((int)GH_LZ_BUF_N));
+}
+static int GhLzTake()
+{
+    for (;;){
+        for (int i = 0; i < GH_LZ_BUF_N; ++i) if (!_interlockedbittestandset(&g_lzMap, i)) return i;
+        SwitchToThread();
+    }
+}
+static void GhLzGive(int b) { _interlockedbittestandreset(&g_lzMap, b); }
+// Write one granule to file slot s, compressed when that saves >= 8 KB.
+// #272 SLOWW: a spill write of 32 ms or more either grew the file (end past
+// every earlier write: cluster allocation + EOF/VDL metadata) or landed inside
+// it (the cache manager throttling a writer behind its dirty pages). Ext vs in
+// names the cure: preallocation, or getting FILE_ATTRIBUTE_TEMPORARY out of
+// the way of the lazy writer.
+static volatile LONG64          g_spillHw = 0;
+static volatile LONG            g_slowExt = 0, g_slowIn = 0;
+static volatile LONG64          g_slowExtUs = 0, g_slowInUs = 0;
+static void GhSpillNoteSlow(uint64_t end, LONG64 us)
+{
+    LONG64 hw = InterlockedCompareExchange64(&g_spillHw, 0, 0);
+    const bool ext = (LONG64)end > hw;
+    while ((LONG64)end > hw){
+        const LONG64 was = InterlockedCompareExchange64(&g_spillHw, (LONG64)end, hw);
+        if (was == hw) break;
+        hw = was;
+    }
+    if (us < 32000) return;
+    InterlockedIncrement(ext ? &g_slowExt : &g_slowIn);
+    InterlockedExchangeAdd64(ext ? &g_slowExtUs : &g_slowInUs, us);
+}
+static bool GhSpillFileWrite(uint32_t s, const uint8_t* src, uint64_t g)
+{
+    OVERLAPPED ov{}; const uint64_t fo = (uint64_t)s * g;
+    ov.Offset = (DWORD)fo; ov.OffsetHigh = (DWORD)(fo >> 32);
+    DWORD wrote = 0;
+    if (g_spillLz && s < GH_SPILL_CRC_N){
+        const int b = GhLzTake();
+        uint8_t* out = g_lzBuf + (size_t)b * (size_t)(g + 0x1000);
+        ULONG c = 0; LONG st = -1;
+        const LONG64 c0 = GhQpcUs();
+        __try { st = g_rtlLzC(GH_LZ_FMT, (PUCHAR)src, (ULONG)g, out, (ULONG)g, 4096, &c, g_lzWs + (size_t)b * g_lzWsSize); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { st = -1; }
+        InterlockedExchangeAdd64(&g_lzCUs, GhQpcUs() - c0);
+        if (st == 0 && c && (uint64_t)c + 0x2000 <= g){
+            const ULONG n = (c + 0xFFF) & ~0xFFFu;
+            memset(out + c, 0, n - c);
+            g_slotLz[s] = c;
+            const bool ok = WriteFile(g_spillFile, out, n, &wrote, &ov) && wrote == n;
+            GhLzGive(b);
+            if (!ok){ g_slotLz[s] = 0; return false; }
+            InterlockedIncrement(&g_lzN);
+            InterlockedExchangeAdd64(&g_lzIn, (LONG64)g); InterlockedExchangeAdd64(&g_lzOut, (LONG64)n);
+            return true;
+        }
+        GhLzGive(b);
+        InterlockedIncrement(&g_lzRaw);
+        InterlockedExchangeAdd64(&g_lzIn, (LONG64)g); InterlockedExchangeAdd64(&g_lzOut, (LONG64)g);
+    }
+    if (s < GH_SPILL_CRC_N) g_slotLz[s] = 0;
+    const LONG64 w0 = GhQpcUs();
+    const bool ok = WriteFile(g_spillFile, src, (DWORD)g, &wrote, &ov) && wrote == (DWORD)g;
+    GhSpillNoteSlow(fo + g, GhQpcUs() - w0);
+    return ok;
+}
+static bool GhSpillFileRead(uint32_t s, void* dst, uint64_t g)
+{
+    OVERLAPPED ov{}; const uint64_t fo = (uint64_t)s * g;
+    ov.Offset = (DWORD)fo; ov.OffsetHigh = (DWORD)(fo >> 32);
+    DWORD got = 0;
+    const uint32_t c = (g_spillLz && s < GH_SPILL_CRC_N) ? g_slotLz[s] : 0;
+    if (!c) return ReadFile(g_spillFile, dst, (DWORD)g, &got, &ov) && got == (DWORD)g;
+    const ULONG n = (c + 0xFFF) & ~0xFFFu;
+    const int b = GhLzTake();
+    uint8_t* in = g_lzBuf + (size_t)b * (size_t)(g + 0x1000);
+    bool ok = ReadFile(g_spillFile, in, n, &got, &ov) && got == n;
+    if (ok){
+        ULONG u = 0; LONG st = -1;
+        const LONG64 d0 = GhQpcUs();
+        __try { st = g_rtlLzD(GH_LZ_FMT, (PUCHAR)dst, (ULONG)g, in, c, &u); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { st = -1; }
+        InterlockedExchangeAdd64(&g_lzDUs, GhQpcUs() - d0);
+        ok = st == 0 && u == (ULONG)g;
+        if (!ok) InterlockedIncrement(&g_lzBad);
+        else InterlockedIncrement(&g_lzRd);
+    }
+    GhLzGive(b);
+    return ok;
+}
+// #272 SEQ. Spill-slot allocation. The old free list is LIFO: a slot freed by
+// a restore anywhere in the file is the next one written, so the clock's
+// address-ordered evictions land at random offsets and two granules that are
+// neighbours in memory are never neighbours on the disk. gh_spill_seq=1 keeps
+// a free BITMAP instead and allocates next-fit from a cursor: one room's
+// evictions take ascending slots, the ring writes them back in that order,
+// and a restore can fetch its neighbours with the same seek (gh_spill_ra).
+// The file grows at the tail until holes reach 1/8 of it, then the cursor
+// sweeps the holes. Callers hold g_spillLock.
+static unsigned                 g_spillSeqOn      = 0;      // gh_spill_seq
+static unsigned                 g_spillRa       = 0;      // gh_spill_ra: granules per readahead read (0 = off)
+static uint32_t                 g_slotFree[GH_SPILL_CRC_N / 32];   // 1 = free slot below g_spillNext
+static uint32_t                 g_slotFreeN     = 0;
+static uint32_t                 g_slotCur       = 0;
+static volatile LONG            g_seqWrap = 0, g_seqAppend = 0;
+static bool GhSpillSlotIsFree(uint32_t s)
+{ return g_spillSeqOn && s < GH_SPILL_CRC_N && (g_slotFree[s >> 5] >> (s & 31)) & 1; }
+static bool GhSpillSlotScan(uint32_t from, uint32_t to, uint32_t* out)
+{
+    for (uint32_t s = from; s < to; ){
+        const uint32_t w = g_slotFree[s >> 5] >> (s & 31);
+        if (!w){ s = (s | 31) + 1; continue; }
+        unsigned long b = 0; _BitScanForward(&b, w);
+        const uint32_t f = s + (uint32_t)b;
+        if (f >= to) return false;
+        *out = f; return true;
+    }
+    return false;
+}
+static uint32_t GhSpillSlotAllocLocked()
+{
+    if (!g_spillSeqOn){
+        uint32_t s;
+        if (!g_spillFree.empty()){ s = g_spillFree.back(); g_spillFree.pop_back(); } else s = g_spillNext++;
+        return s;
+    }
+    const uint32_t end = g_spillNext < GH_SPILL_CRC_N ? g_spillNext : GH_SPILL_CRC_N;
+    uint32_t s = 0;
+    bool got = g_slotFreeN && g_slotCur < end && GhSpillSlotScan(g_slotCur, end, &s);
+    if (!got && g_slotFreeN && ((uint64_t)g_slotFreeN * 8 >= end || g_spillNext >= GH_SPILL_CRC_N)){
+        got = GhSpillSlotScan(0, end, &s);
+        if (got) InterlockedIncrement(&g_seqWrap);
+    }
+    if (got){
+        g_slotFree[s >> 5] &= ~(1u << (s & 31)); --g_slotFreeN; g_slotCur = s + 1;
+        return s;
+    }
+    if (!g_spillFree.empty() && g_spillNext >= GH_SPILL_CRC_N){ s = g_spillFree.back(); g_spillFree.pop_back(); return s; }
+    InterlockedIncrement(&g_seqAppend);
+    s = g_spillNext++; g_slotCur = g_spillNext;
+    return s;
+}
+static void GhSpillSlotFreeLocked(uint32_t s)
+{
+    if (g_spillSeqOn && s < GH_SPILL_CRC_N){
+        if (!((g_slotFree[s >> 5] >> (s & 31)) & 1)){ g_slotFree[s >> 5] |= 1u << (s & 31); ++g_slotFreeN; }
+        return;
+    }
+    if (g_spillFree.size() < g_spillFree.capacity()) g_spillFree.push_back(s);
+}
+// #272 RA. Read spill slot s into dst. With gh_spill_ra=K a miss reads K
+// slots around s in ONE request (a quarter behind, the rest ahead) and keeps
+// only s: the neighbours stay in the system file cache, so the restores that
+// follow them in memory (gh_spill_seq makes memory neighbours file neighbours)
+// are cache copies instead of seeks. The file stays the only truth -- nothing
+// is cached by us, so there is nothing to invalidate. Cluster buffers are
+// committed once at init; when all are busy the read is a plain one.
+enum { GH_RA_BUF_N = 4 };
+static uint8_t*                 g_raBuf  = nullptr;
+static volatile LONG            g_raMap  = 0;
+static volatile LONG            g_raReads = 0, g_raShort = 0, g_raBusy = 0;
+static volatile LONG64          g_raBytes = 0;
+static bool GhSpillReadSlot(uint32_t s, void* dst, uint64_t g)
+{
+    const uint64_t G = g_lazyGran;
+    if (g_spillRa >= 2 && g_raBuf && g == G){
+        int b = -1;
+        for (int i = 0; i < GH_RA_BUF_N; ++i) if (!_interlockedbittestandset(&g_raMap, i)){ b = i; break; }
+        if (b < 0) InterlockedIncrement(&g_raBusy);
+        else {
+            const uint32_t K = g_spillRa, end = *(volatile uint32_t*)&g_spillNext;
+            uint32_t lo = s >= K / 4 ? s - K / 4 : 0, hi = lo + K;
+            if (hi > end) hi = end;
+            if (hi <= s) hi = s + 1;
+            if (hi - lo > K) lo = hi - K;
+            uint8_t* buf = g_raBuf + (size_t)b * K * G;
+            OVERLAPPED ov{}; const uint64_t fo = (uint64_t)lo * G;
+            ov.Offset = (DWORD)fo; ov.OffsetHigh = (DWORD)(fo >> 32);
+            DWORD got = 0;
+            const bool rd = ReadFile(g_spillFile, buf, (DWORD)((hi - lo) * G), &got, &ov) &&
+                            (uint64_t)got >= (uint64_t)(s - lo + 1) * G;
+            if (rd){
+                memcpy(dst, buf + (size_t)(s - lo) * G, (size_t)G);
+                InterlockedIncrement(&g_raReads); InterlockedExchangeAdd64(&g_raBytes, (LONG64)got);
+            } else InterlockedIncrement(&g_raShort);
+            _interlockedbittestandreset(&g_raMap, b);
+            if (rd) return true;
+        }
+    }
+    return GhSpillFileRead(s, dst, g);     // #272 LZ
+}
+// #272 FRAMEDT. Read-only counters the pager feeds and GhFrameDtTick reports
+// every 10 s. No heap and no Diag here: they are bumped inside the VEH.
+//   g_fdtRs     per-fault restore wall time: <0.1 <0.5 <2 <8 <32 >=32 ms
+//   g_fdtRing   ring-hit copy time:          <50us <200us <1 <8 >=8 ms
+//   g_fdtTid    restore time by faulting thread (16 slots, first come)
+//   g_loc*      would readahead pay? On each restore, is a neighbour granule
+//               spilled, is its file slot adjacent, and is a neighbour that was
+//               spilled at a restore itself restored soon after (predHit)?
+static volatile LONG            g_fdtRs[6]       = {};
+static volatile LONG            g_fdtRing[5]     = {};
+static volatile LONG64          g_fdtRingUs      = 0;
+struct GhFdtTid { volatile LONG tid; volatile LONG n; volatile LONG64 us; };
+static GhFdtTid                 g_fdtTid[16]     = {};
+static volatile LONG64          g_locRecent[256] = {};
+static volatile LONG            g_locRecentI     = 0;
+static volatile LONG64          g_locPred[512]   = {};
+static volatile LONG            g_locPredI       = 0;
+static volatile LONG            g_locAdj = 0, g_locPredN = 0, g_locPredHit = 0, g_locNbr = 0, g_locSlotAdj = 0;
+static LONG64 GhQpcUs()
+{
+    static LONG64 f = 0;
+    LARGE_INTEGER q{};
+    if (!f){ LARGE_INTEGER qf{}; if (!QueryPerformanceFrequency(&qf) || !qf.QuadPart) return 0; f = qf.QuadPart; }
+    if (!QueryPerformanceCounter(&q)) return 0;
+    return (LONG64)((q.QuadPart / f) * 1000000 + (q.QuadPart % f) * 1000000 / f);
+}
+static volatile LONG g_fdtWb[6] = {};      // #272 write-back / direct spill write time, same bins as g_fdtRs
+static volatile LONG64 g_fdtWbUs = 0;
+// #272 FLUSH. Spill bytes written through the cache since the flusher last ran.
+static volatile LONG64 g_spillDirtyB = 0;
+static volatile LONG   g_flushN = 0, g_flushFail = 0;
+static volatile LONG64 g_flushUs = 0, g_flushMaxUs = 0;
+static void GhFdtNoteWrite(LONG64 us)
+{
+    InterlockedExchangeAdd64(&g_spillDirtyB, 0x10000);   // every caller writes one 64 KB granule
+    InterlockedIncrement(&g_fdtWb[us < 100 ? 0 : us < 500 ? 1 : us < 2000 ? 2 : us < 8000 ? 3 : us < 32000 ? 4 : 5]);
+    InterlockedExchangeAdd64(&g_fdtWbUs, us);
+}
+static void GhFdtNoteRestore(LONG64 us)
+{
+    const int k = us < 100 ? 0 : us < 500 ? 1 : us < 2000 ? 2 : us < 8000 ? 3 : us < 32000 ? 4 : 5;
+    InterlockedIncrement(&g_fdtRs[k]);
+    const LONG tid = (LONG)GetCurrentThreadId();
+    for (int i = 0; i < 16; ++i){
+        LONG t = g_fdtTid[i].tid;
+        if (!t) t = InterlockedCompareExchange(&g_fdtTid[i].tid, tid, 0) == 0 ? tid : g_fdtTid[i].tid;
+        if (t == tid){ InterlockedIncrement(&g_fdtTid[i].n); InterlockedExchangeAdd64(&g_fdtTid[i].us, us); return; }
+    }
 }
 // #236 BD19. SPILLSTAT (gh_spill_stat=1): would a compressed in-RAM tier in
 // front of the spill file absorb the world's thrash? Two numbers, measured
@@ -38361,6 +40058,56 @@ static volatile LONG*           g_ringOwner   = nullptr; // ring slot -> spill s
 static volatile LONG            g_ringOf[GH_SPILL_CRC_N];// spill slot -> ring slot
 static volatile LONG            g_ringPut = 0, g_ringHit = 0, g_ringMiss = 0, g_ringStale = 0,
                                 g_ringFault = 0, g_ringWb = 0, g_ringWbFail = 0;
+// #272 CLEAN. g_ringClean[i] = 1: ring slot i's bytes are ALSO in its owner's
+// file slot (the cleaner wrote them), so recycling it needs no write-back.
+// Cleared whenever the slot changes owner. g_spillInRoom is the room guard:
+// held by the clock (every eviction) and by the cleaner, so the cleaner never
+// sees a spill slot being reallocated under it.
+static volatile LONG            g_spillInRoom = 0;
+static volatile LONG*           g_ringClean   = nullptr;
+static volatile LONG            g_ringWbClean = 0, g_cleanWrites = 0, g_cleanGrans = 0, g_cleanFail = 0;
+static volatile LONG64          g_cleanUs = 0;
+static volatile LONG            g_trickleRuns = 0;       // #272 TRICKLE
+// #272 YIELD (gh_spill_yield). A fault that needs room while another thread's
+// room holds the guard used to wait for that whole room: a watcher chunk is
+// 8 MB = 128 evictions, and at B0's ~38 ms per eviction one fault slept 35 s.
+// With the knob on, the waiter is counted and the room in progress stops as
+// soon as it has freed what a fault needs (4 granules); the waiter leaves on
+// the room generation changing, not on seeing the guard clear (the watcher's
+// next chunk can retake it before a spinning waiter looks).
+static unsigned                 g_spillYield  = 0;
+static unsigned                 g_spillNoBuf  = 0;       // #272 NOBUF, see the spill file's CreateFileW
+static volatile LONG            g_roomWaiters = 0, g_roomGen = 0, g_roomYields = 0;
+static volatile LONG64          g_roomWaitUs  = 0;
+// #272 REFAULT (gh_spill_refault). TR3 refaulted ~55% of what it evicted, all of
+// it lap 0: aged and untouched for one aging pass, then wanted again. With the
+// knob on, a granule restored since its last eviction (the `back` bit) gets one
+// free pass on laps 0 and 1 -- the clock clears the bit and moves on -- so a
+// refaulted granule must stay cold for a further whole rotation before it goes
+// to disk again. Lap 2 still takes anything. The bit's fatal-diag meaning
+// ("restored at least once") becomes "restored since the clock last passed".
+static unsigned                 g_spillRefault = 0;
+static volatile LONG            g_spillRefSkip = 0;
+// #275 REUSE (gh_spill_reuse). The cold pools are read-mostly: the 922 MB one is
+// Wwise's sound media (its restorer parses RIFF/WAVE/XWMA/OggS headers), written
+// once by the streaming decompressor and only read after. A restore from the FILE
+// used to free the slot, so the next eviction of the same unchanged bytes wrote
+// them again (a ring put now, a disk write when the ring recycles). With the knob
+// on, such a restore keeps its slot (the `kept` bit); the next eviction hashes the
+// page (the CRC it already takes plus a second, independent 32-bit hash) and, when
+// both match what the slot holds, just decommits. A ring-hit restore keeps nothing:
+// its bytes may exist only in the ring, and keeping the ring entry alive would turn
+// a free restore into a later write-back.
+static unsigned                 g_spillReuse = 0;
+static uint32_t                 g_spillH2[GH_SPILL_CRC_N];
+static volatile LONG            g_reuseKeep = 0, g_reuseHit = 0, g_reuseMiss = 0, g_reuseDrop = 0;
+static uint32_t GhSpillH2(const void* p, ULONG n)
+{
+    const uint64_t* q = (const uint64_t*)p;
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    for (ULONG i = 0; i < n / 8; ++i){ h ^= q[i] + (uint64_t)i; h *= 0xFF51AFD7ED558CCDull; h ^= h >> 29; }
+    return (uint32_t)(h ^ (h >> 32));
+}
 static void GhSpillRingInit(const std::wstring& path)
 {
     const unsigned mb = GhSpillRingMb();
@@ -38383,6 +40130,7 @@ static void GhSpillRingInit(const std::wstring& path)
     if (!own){ UnmapViewOfFile(v); Diag("SPILLRING OFF: owner table refused"); return; }
     for (uint32_t i = 0; i < n; ++i) own[i] = (LONG)GH_RING_NONE;
     g_ringOwner = own; g_ringN = n; g_ring = (uint8_t*)v;
+    g_ringClean = (LONG*)VirtualAlloc(nullptr, sizeof(LONG) * n, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);   // #272
     Diag("SPILLRING on " + std::to_string(mb) + " MB slots=" + std::to_string(n) +
          " view=" + Hex((uint64_t)(uintptr_t)v) + " file=D:\\DevelopmentFiles\\gh_spillring_<pid>.bin");
 }
@@ -38398,18 +40146,23 @@ static bool GhSpillRingPut(uint32_t s, const uint8_t* p, uint64_t g)
     const uint32_t i = g_ringHead;
     uint8_t* slot = g_ring + (uint64_t)i * g_lazyGran;
     const uint32_t prev = (uint32_t)g_ringOwner[i];
-    if (prev < GH_SPILL_CRC_N && (uint32_t)g_ringOf[prev] == i){
+    if (prev < GH_SPILL_CRC_N && (uint32_t)g_ringOf[prev] == i && g_ringClean && g_ringClean[i])
+        InterlockedIncrement(&g_ringWbClean);         // #272: the cleaner already wrote it
+    else if (prev < GH_SPILL_CRC_N && (uint32_t)g_ringOf[prev] == i){
         // Still out and only here: write it to its own file slot first.
-        OVERLAPPED ov{}; const uint64_t fo = (uint64_t)prev * g_lazyGran;
-        ov.Offset = (DWORD)fo; ov.OffsetHigh = (DWORD)(fo >> 32);
-        DWORD wrote = 0;
-        if (!WriteFile(g_spillFile, slot, (DWORD)g_lazyGran, &wrote, &ov) || wrote != (DWORD)g_lazyGran){
+        const LONG64 w0 = GhQpcUs();
+        bool wok = false;
+        __try { wok = GhSpillFileWrite(prev, slot, g_lazyGran); }     // #272 LZ
+        __except (EXCEPTION_EXECUTE_HANDLER) { wok = false; }
+        GhFdtNoteWrite(GhQpcUs() - w0);               // #272
+        if (!wok){
             InterlockedIncrement(&g_ringWbFail);
             return false;                             // slot i keeps prev; this granule goes to the file
         }
         InterlockedIncrement(&g_ringWb);
     }
     InterlockedExchange(&g_ringOwner[i], (LONG)GH_RING_NONE);
+    if (g_ringClean) g_ringClean[i] = 0;
     if (prev < GH_SPILL_CRC_N) InterlockedCompareExchange(&g_ringOf[prev], (LONG)GH_RING_NONE, (LONG)i);
     g_ringHead = (i + 1) % g_ringN;
     if (!GhRingCopy(slot, p, (SIZE_T)g)){ InterlockedIncrement(&g_ringFault); return false; }
@@ -38424,7 +40177,13 @@ static bool GhSpillRingGet(uint32_t s, void* dst, uint64_t g)
     if (!g_ring || s >= GH_SPILL_CRC_N || g != g_lazyGran) return false;
     const uint32_t i = (uint32_t)g_ringOf[s];
     if (i >= g_ringN || (uint32_t)g_ringOwner[i] != s){ InterlockedIncrement(&g_ringMiss); return false; }
+    const LONG64 c0 = GhQpcUs();
     if (!GhRingCopy(dst, g_ring + (uint64_t)i * g_lazyGran, (SIZE_T)g)){ InterlockedIncrement(&g_ringFault); return false; }
+    {   // #272: a ring hit is a memcpy from a file-backed view the OS may have trimmed
+        const LONG64 us = GhQpcUs() - c0;
+        InterlockedIncrement(&g_fdtRing[us < 50 ? 0 : us < 200 ? 1 : us < 1000 ? 2 : us < 8000 ? 3 : 4]);
+        InterlockedExchangeAdd64(&g_fdtRingUs, us);
+    }
     MemoryBarrier();
     if ((uint32_t)g_ringOwner[i] != s || (uint32_t)g_ringOf[s] != i ||
         (g_rtlCrc32 && GhSpillCrc(dst, (ULONG)g) != g_spillCrc[s])){
@@ -38446,6 +40205,71 @@ static std::string GhSpillRingLine()
     auto L = [](volatile LONG* v){ return std::to_string((long)InterlockedCompareExchange(v, 0, 0)); };
     return " spillring=" + L(&g_ringPut) + "/" + L(&g_ringHit) + "/" + L(&g_ringMiss) + "/" +
            L(&g_ringStale) + "/" + L(&g_ringFault) + "/" + L(&g_ringWb) + "/" + L(&g_ringWbFail);
+}
+// #272 CLEAN. Write back, ahead of need, the ring slots the evictor will
+// recycle next: the `margin` slots after the head whose owners are still out
+// and not yet clean. Runs where both the ring index and the spill slot are
+// consecutive (gh_spill_seq makes that the common case) go out as ONE write of
+// up to 1 MB, straight from the ring view. Called from the watcher only when
+// no room is needed; takes the room guard with a try, never waits for it, and
+// stops after `budget` granules so a fault-path room is never held up long.
+// #272 TRICKLE (gh_spill_trickle = MB/s, 0 = off). FL1/RA1: a room is slow only
+// when its Put lands on a ring slot whose owner is still out and must be
+// written back synchronously, under the guard, into the cache manager's dirty
+// throttle (one 40 MB room took 34 s). A dedicated thread keeps the ring ahead
+// of the head clean at a capped, steady rate instead, taking the guard for one
+// run (<= 1 MB) at a time, so a Put is a memcpy and the disk sees an even
+// stream rather than bursts. Implies a clean margin of 3/4 of the ring.
+static unsigned GhSpillTrickle()
+{ static const unsigned v = GhCfgNumZ(L"gh_spill_trickle.txt", "GH_SPILL_TRICKLE", 0); return v; }
+static unsigned GhSpillCleanMb()
+{
+    static const unsigned v = [] {
+        const unsigned c = GhCfgNumZ(L"gh_spill_clean_mb.txt", "GH_SPILL_CLEAN_MB", 0);
+        return c ? c : (GhSpillTrickle() ? GhSpillRingMb() * 3 / 4 : 0u);
+    }();
+    return v;
+}
+static void GhSpillRingClean(uint32_t budget)
+{
+    const unsigned mb = GhSpillCleanMb();
+    if (!mb || !g_ring || !g_ringClean || g_lazyGran != 0x10000) return;
+    if (g_spillLz) return;                            // #272 LZ: raw run writes would leave g_slotLz stale
+    if (InterlockedCompareExchange(&g_spillInRoom, 1, 0) != 0) return;
+    const uint32_t margin = (uint32_t)(((uint64_t)mb << 20) / g_lazyGran) < g_ringN ?
+                            (uint32_t)(((uint64_t)mb << 20) / g_lazyGran) : g_ringN;
+    const uint32_t head = g_ringHead;
+    uint32_t done = 0;
+    for (uint32_t k = 0; k < margin && done < budget; ){
+        if (g_spillYield && InterlockedCompareExchange(&g_roomWaiters, 0, 0)) break;   // a fault wants the guard
+        const uint32_t i = (head + k) % g_ringN;
+        const uint32_t s = (uint32_t)g_ringOwner[i];
+        if (s >= GH_SPILL_CRC_N || (uint32_t)g_ringOf[s] != i || g_ringClean[i]){ ++k; continue; }
+        uint32_t run = 1;
+        while (run < 16 && k + run < margin && done + run < budget && i + run < g_ringN){
+            const uint32_t s2 = (uint32_t)g_ringOwner[i + run];
+            if (s2 != s + run || s2 >= GH_SPILL_CRC_N || (uint32_t)g_ringOf[s2] != i + run || g_ringClean[i + run]) break;
+            ++run;
+        }
+        OVERLAPPED ov{}; const uint64_t fo = (uint64_t)s * g_lazyGran;
+        ov.Offset = (DWORD)fo; ov.OffsetHigh = (DWORD)(fo >> 32);
+        DWORD wrote = 0;
+        const LONG64 w0 = GhQpcUs();
+        bool ok = false;
+        __try { ok = WriteFile(g_spillFile, g_ring + (uint64_t)i * g_lazyGran, (DWORD)(run * g_lazyGran), &wrote, &ov) &&
+                     wrote == (DWORD)(run * g_lazyGran); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+        InterlockedExchangeAdd64(&g_cleanUs, GhQpcUs() - w0);
+        GhSpillNoteSlow(fo + (uint64_t)run * g_lazyGran, GhQpcUs() - w0);
+        if (!ok){ InterlockedIncrement(&g_cleanFail); break; }
+        InterlockedExchangeAdd64(&g_spillDirtyB, (LONG64)(run * g_lazyGran));
+        // A restore may have taken a slot back meanwhile; marking it clean is
+        // harmless (its owner is gone, the next Put overwrites the flag).
+        for (uint32_t j = 0; j < run; ++j) g_ringClean[i + j] = 1;
+        InterlockedIncrement(&g_cleanWrites); InterlockedExchangeAdd(&g_cleanGrans, (LONG)run);
+        done += run; k += run;
+    }
+    InterlockedExchange(&g_spillInRoom, 0);
 }
 // #233 patch i. Placeholder reservations: the only way a user-mode process can
 // make data appear at an address atomically is to map a pre-filled section
@@ -38772,6 +40596,13 @@ struct GhLazyAcct {
     volatile LONG64 firstMs;
     volatile LONG64 lastMs;
     volatile LONG   faults;
+    // #275: WHICH guest code touches this range first, and which brings it back
+    // from the spill file. Eight distinct faulting RIPs each, with the first three
+    // guest frames behind the first fault at that RIP (the RIP alone is often a
+    // memcpy). Claimed lock-free; a full table just stops recording.
+    struct Rip { volatile LONG64 rip; volatile LONG n; uint64_t c[3]; };
+    Rip touch[8];
+    Rip rest[8];
 };
 static std::vector<GhLazyAcct*> g_lazyAcct;   // append-only, guarded by g_lazyLock
 
@@ -38834,6 +40665,46 @@ static void GhLazyNoteOwner(const CONTEXT* ctx, uint64_t bytes)
     GhLazyNoteInto(g_lazyOwn, 1, bytes);          // no guest frame in 4 KB of stack
 }
 
+// #275. Up to three guest frames behind a faulting context, no allocation.
+static PRUNTIME_FUNCTION GhGuestFnEntry(DWORD64 rip);
+static void GhGuestFrames(const CONTEXT* start, uint64_t* out, int cap)
+{
+    for (int i = 0; i < cap; ++i) out[i] = 0;
+    if (!start || !g_guestImageBase) return;
+    const uint64_t gb = (uint64_t)(uintptr_t)g_guestImageBase, ge = gb + (uint64_t)g_guestImageSize;
+    const NT_TIB* tib = (const NT_TIB*)NtCurrentTeb();
+    const DWORD64 slo = (DWORD64)(uintptr_t)tib->StackLimit, shi = (DWORD64)(uintptr_t)tib->StackBase;
+    CONTEXT ctx = *start;
+    volatile int got = 0;
+    __try {
+        for (int f = 0; f < 24 && got < cap && ctx.Rip; ++f){
+            const DWORD64 prevRsp = ctx.Rsp;
+            DWORD64 imgBase = 0;
+            PRUNTIME_FUNCTION rf = GhGuestFnEntry(ctx.Rip);
+            if (rf) imgBase = gb; else rf = RtlLookupFunctionEntry(ctx.Rip, &imgBase, nullptr);
+            if (!rf){
+                if (ctx.Rsp < slo || ctx.Rsp + 8 > shi) break;
+                ctx.Rip = *(DWORD64*)ctx.Rsp; ctx.Rsp += 8;
+            } else {
+                PVOID hd = nullptr; DWORD64 est = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, imgBase, ctx.Rip, rf, &ctx, &hd, &est, nullptr);
+            }
+            if (!ctx.Rip || ctx.Rsp <= prevRsp) break;
+            if (ctx.Rip >= gb && ctx.Rip < ge){ out[got] = ctx.Rip; got = got + 1; }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+}
+
+static void GhAcctNoteRip(GhLazyAcct::Rip* t, uint64_t rip, const CONTEXT* ctx)
+{
+    if (!rip) return;
+    for (int i = 0; i < 8; ++i){
+        const LONG64 cur = InterlockedCompareExchange64(&t[i].rip, (LONG64)rip, 0);
+        if (cur == 0){ GhGuestFrames(ctx, t[i].c, 3); InterlockedIncrement(&t[i].n); return; }
+        if (cur == (LONG64)rip){ InterlockedIncrement(&t[i].n); return; }
+    }
+}
+
 // Called from the fault path and from the kernel-write rescue, which passes
 // rip=1 so the two channels stay distinguishable in the census.
 static inline void GhLazyNoteCommit(GhLazyAcct* a, uint64_t bytes, uint64_t rip, const CONTEXT* ctx = nullptr)
@@ -38846,6 +40717,7 @@ static inline void GhLazyNoteCommit(GhLazyAcct* a, uint64_t bytes, uint64_t rip,
     InterlockedExchange64(&a->lastMs, ms);
     if (g_lazyWho >= 2) GhLazyNoteRip(rip, bytes);
     if (g_lazyWho >= 3) GhLazyNoteOwner(ctx, bytes);
+    if (ctx) GhAcctNoteRip(a->touch, rip, ctx);   // #275
 }
 
 static void GhLazyLog(const std::string& m)
@@ -38884,14 +40756,76 @@ static bool GhLazyOn()
             if (g_lazySpill){
                 const std::wstring path = std::wstring(kDevRoot) + L"gh_spill_" +
                                           std::to_wstring((unsigned long)GetCurrentProcessId()) + L".bin";
+                // #272 NOBUF: FILE_FLAG_NO_BUFFERING takes the spill file out of the
+                // system cache. Buffered, a room's WriteFile hit the cache manager's
+                // dirty-page throttle (FL1: 98 writes >= 32 ms, one 40 MB room 34 s).
+                // Every spill I/O is a whole 64 KB granule at a granule offset from a
+                // page-aligned buffer (guest page, staging, section view, ring, RA).
+                g_spillNoBuf = GhCfgNumZ(L"gh_spill_nobuf.txt", "GH_SPILL_NOBUF", 0) && !(g_lazyGran & 0xFFF);
+                // #272 NOTEMP (gh_spill_notemp): TEMPORARY tells the cache manager to
+                // hold the file's dirty pages back from the lazy writer, so they
+                // pile up and the writer that crosses the dirty threshold stalls.
+                const bool noTemp = GhCfgNumZ(L"gh_spill_notemp.txt", "GH_SPILL_NOTEMP", 0) != 0;
+                // #272 KEEPFILE (gh_spill_keepfile): CT1/NT1/NT2/PA1 put EVERY spill
+                // write of 32 ms or more at the end of the file (110-145 a run, 25-40
+                // s, all inside the room); preallocating clusters did not help, so
+                // the cost is the EOF/valid-data-length growth itself. One spill file
+                // kept between sessions is already as long as the last session grew
+                // it, so this session's writes land inside it. Its old bytes are never
+                // read: a slot is read only after this session wrote it, and the CRC
+                // check stands behind that. Busy (a second guest) = the per-pid file.
+                g_spillFile = INVALID_HANDLE_VALUE;
+                if (GhCfgNumZ(L"gh_spill_keepfile.txt", "GH_SPILL_KEEPFILE", 0)){
+                    const std::wstring kp = std::wstring(kDevRoot) + L"gh_spill_keep.bin";
+                    g_spillFile = CreateFileW(kp.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
+                                              (noTemp ? FILE_ATTRIBUTE_NORMAL : FILE_ATTRIBUTE_TEMPORARY) |
+                                              (g_spillNoBuf ? FILE_FLAG_NO_BUFFERING : 0), nullptr);
+                    LARGE_INTEGER ksz{};
+                    if (g_spillFile != INVALID_HANDLE_VALUE && GetFileSizeEx(g_spillFile, &ksz)){
+                        InterlockedExchange64(&g_spillHw, ksz.QuadPart);
+                        Diag("LAZYSPILL keepfile D:\\DevelopmentFiles\\gh_spill_keep.bin size=" +
+                             std::to_string((long long)(ksz.QuadPart >> 20)) + " MB");
+                    } else Diag("LAZYSPILL keepfile refused err=" + std::to_string((unsigned long)GetLastError()) +
+                                ", per-pid file instead");
+                }
+                if (g_spillFile == INVALID_HANDLE_VALUE)
                 g_spillFile = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                                           CREATE_ALWAYS,
-                                          FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+                                          (noTemp ? FILE_ATTRIBUTE_NORMAL : FILE_ATTRIBUTE_TEMPORARY) | FILE_FLAG_DELETE_ON_CLOSE |
+                                          (g_spillNoBuf ? FILE_FLAG_NO_BUFFERING : 0), nullptr);
                 if (g_spillFile == INVALID_HANDLE_VALUE){
                     Diag("LAZYSPILL OFF: spill file refused err=" + std::to_string((unsigned long)GetLastError()));
                     g_lazySpill = 0;
                 } else {
+                    // #272 PREALLOC (gh_spill_prealloc_mb): reserve the clusters up
+                    // front. Allocation size only -- EOF and valid data length still
+                    // grow with the writes, so nothing reads back unwritten zeroes.
+                    if (const unsigned pmb = GhCfgNumZ(L"gh_spill_prealloc_mb.txt", "GH_SPILL_PREALLOC_MB", 0)){
+                        FILE_ALLOCATION_INFO ai{}; ai.AllocationSize.QuadPart = (LONGLONG)pmb << 20;
+                        const BOOL pok = SetFileInformationByHandle(g_spillFile, FileAllocationInfo, &ai, sizeof ai);
+                        Diag("LAZYSPILL prealloc " + std::to_string(pmb) + " MB " + (pok ? "ok" : "FAILED err=" +
+                             std::to_string((unsigned long)GetLastError())));
+                    }
+                    if (noTemp) Diag("LAZYSPILL notemp: spill file is FILE_ATTRIBUTE_NORMAL");
                     g_spillFree.reserve(1u << 16);          // 4 GB of 64 KB slots; never grown later
+                    g_spillSeqOn = GhCfgNumZ(L"gh_spill_seq.txt", "GH_SPILL_SEQ", 0);      // #272
+                    g_spillRa  = GhCfgNumZ(L"gh_spill_ra.txt", "GH_SPILL_RA", 0);
+                    if (g_spillRa > 32) g_spillRa = 32;
+                    g_spillYield = GhCfgNumZ(L"gh_spill_yield.txt", "GH_SPILL_YIELD", 0);
+                    g_spillRefault = GhCfgNumZ(L"gh_spill_refault.txt", "GH_SPILL_REFAULT", 0);  // #272 REFAULT
+                    g_spillLz = GhCfgNumZ(L"gh_spill_lz.txt", "GH_SPILL_LZ", 0);            // #272 LZ
+                    g_spillReuse = GhCfgNumZ(L"gh_spill_reuse.txt", "GH_SPILL_REUSE", 0);   // #275 REUSE
+                    GhSpillCrc("", 0);                        // resolves g_rtlCrc32
+                    if (g_spillLz || !g_rtlCrc32) g_spillReuse = 0;
+                    if (g_spillLz){ g_spillRa = 0; GhSpillLzInit(g_lazyGran); }
+                    if (g_spillRa >= 2){
+                        g_raBuf = (uint8_t*)VirtualAlloc(nullptr, (SIZE_T)g_lazyGran * g_spillRa * GH_RA_BUF_N,
+                                                         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                        if (!g_raBuf) Diag("LAZYSPILL readahead buffers refused err=" + std::to_string((unsigned long)GetLastError()));
+                    }
+                    Diag("LAZYSPILL seq=" + std::to_string(g_spillSeqOn) + " ra=" + std::to_string(g_spillRa) +
+                         " yield=" + std::to_string(g_spillYield) + " nobuf=" + std::to_string(g_spillNoBuf) +
+                         " lz=" + std::to_string(g_spillLz) + " trickle=" + std::to_string(GhSpillTrickle()));
                     g_spillStage = (uint8_t*)VirtualAlloc(nullptr, (SIZE_T)g_lazyGran * GH_SPILL_STAGE_N,
                                                           MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
                     if (!g_spillStage) Diag("LAZYSPILL staging refused err=" + std::to_string((unsigned long)GetLastError()));
@@ -38937,6 +40871,7 @@ static bool GhLazyAdd(uint8_t* base, uint64_t size, DWORD prot, uint64_t site, b
     // kernel write into the page, and only ordinary pages are aged and restored).
     LONG *spilled = nullptr, *guard = nullptr, *ref = nullptr, *busy = nullptr; uint32_t* slot = nullptr;
     LONG *ever = nullptr, *back = nullptr;   // patch h
+    LONG *kept = nullptr;                    // #275
     LONG *view = ph ? new LONG[(grans + 31) / 32]() : nullptr;   // patch i
     if (g_lazySpill && (prot ? prot : PAGE_READWRITE) == PAGE_READWRITE){
         spilled = new LONG[(grans + 31) / 32]();
@@ -38946,6 +40881,13 @@ static bool GhLazyAdd(uint8_t* base, uint64_t size, DWORD prot, uint64_t site, b
         slot    = new uint32_t[grans]();
         ever    = new LONG[(grans + 31) / 32]();
         back    = new LONG[(grans + 31) / 32]();
+        if (g_spillReuse) kept = new LONG[(grans + 31) / 32]();
+    }
+    if (g_lazyWho && size >= (64ull << 20)){
+        static volatile LONG trails = 0;
+        if (InterlockedIncrement(&trails) <= 64)
+            Diag("LAZYTRAIL base=" + Hex((uint64_t)(uintptr_t)base) + " size=" + Hex(size) +
+                 " site=" + NameForCodeAddr((uintptr_t)site) + GhGuestStackTrail(_AddressOfReturnAddress()));
     }
     bool     added = false;
     AcquireSRWLockExclusive(&g_lazyLock);
@@ -38959,13 +40901,13 @@ static bool GhLazyAdd(uint8_t* base, uint64_t size, DWORD prot, uint64_t site, b
         auto at = std::lower_bound(g_lazy.begin(), g_lazy.end(), base,
                                    [](const GhLazyRange& x, uint8_t* b){ return x.base < b; });
         g_lazy.insert(at, GhLazyRange{ base, size, prot ? prot : PAGE_READWRITE, bits, acct,
-                                       spilled, guard, ref, busy, slot, ever, back, ph, view });
+                                       spilled, guard, ref, busy, slot, ever, back, ph, view, kept });
         InterlockedExchange(&g_lazyCount, (LONG)g_lazy.size());
         if (acct) g_lazyAcct.push_back(acct);
         added = true;
     }
     ReleaseSRWLockExclusive(&g_lazyLock);
-    if (!added){ delete[] bits; delete acct; delete[] spilled; delete[] guard; delete[] ref; delete[] busy; delete[] slot; delete[] ever; delete[] back; delete[] view; return false; }
+    if (!added){ delete[] bits; delete acct; delete[] spilled; delete[] guard; delete[] ref; delete[] busy; delete[] slot; delete[] ever; delete[] back; delete[] view; delete[] kept; return false; }
     InterlockedExchangeAdd64(&g_lazyPromised, (LONG64)size);
     return true;
 }
@@ -39034,6 +40976,34 @@ static uint64_t GhLazyRetryPad()
 {
     const unsigned n = (t_lazyWaitT0 && t_lazyWaitN < 3) ? t_lazyWaitN : (t_lazyWaitT0 ? 3 : 0);
     return kGhLockedRoomPad << n;
+}
+
+// #272: restore locality (see g_loc*). Caller holds g_lazyLock shared and the
+// granule's busy bit; rr's arrays are stable under the lock.
+static void GhLocNote(GhLazyRange* rr, LONG bit, const uint8_t* base)
+{
+    const LONG64 a = (LONG64)(uintptr_t)base, g = (LONG64)g_lazyGran;
+    for (int i = 0; i < 256; ++i){
+        const LONG64 v = g_locRecent[i];
+        if (v == a - g || v == a + g){ InterlockedIncrement(&g_locAdj); break; }
+    }
+    g_locRecent[(unsigned)InterlockedIncrement(&g_locRecentI) & 255] = a;
+    for (int i = 0; i < 512; ++i)
+        if (g_locPred[i] == a){
+            if (InterlockedCompareExchange64(&g_locPred[i], 0, a) == a) InterlockedIncrement(&g_locPredHit);
+            break;
+        }
+    if (!rr || !rr->spilled || !rr->slot) return;
+    const LONG nb = (LONG)((rr->size + g_lazyGran - 1) / g_lazyGran);
+    for (int d = -1; d <= 1; d += 2){
+        const LONG b = bit + d;
+        if (b < 0 || b >= nb || !(rr->spilled[b / 32] & (1L << (b % 32)))) continue;
+        InterlockedIncrement(&g_locNbr);
+        const uint32_t s0 = rr->slot[bit], s1 = rr->slot[b];
+        if (s1 == s0 + 1 || s0 == s1 + 1) InterlockedIncrement(&g_locSlotAdj);
+        g_locPred[(unsigned)InterlockedIncrement(&g_locPredI) & 511] = a + d * g;
+        InterlockedIncrement(&g_locPredN);
+    }
 }
 
 static bool GhLazyFault(void* addr, const CONTEXT* ctx)
@@ -39145,8 +41115,13 @@ static bool GhLazyFault(void* addr, const CONTEXT* ctx)
             QueryPerformanceCounter(&q0);
             bool shortage = false;
             const bool ok = GhLazyRestoreLocked(base, gsize, prot, bits, spilled, slot, back, bit, true, rr, &shortage);
-            if (QueryPerformanceCounter(&q1) && QueryPerformanceFrequency(&qf) && qf.QuadPart && q1.QuadPart > q0.QuadPart)
-                InterlockedExchangeAdd64(&g_spillRsUs, (LONG64)((q1.QuadPart - q0.QuadPart) * 1000000 / qf.QuadPart));
+            if (QueryPerformanceCounter(&q1) && QueryPerformanceFrequency(&qf) && qf.QuadPart && q1.QuadPart > q0.QuadPart){
+                const LONG64 us = (LONG64)((q1.QuadPart - q0.QuadPart) * 1000000 / qf.QuadPart);
+                InterlockedExchangeAdd64(&g_spillRsUs, us);
+                GhFdtNoteRestore(us);                       // #272
+            }
+            if (ok) GhLocNote(rr, bit, base);               // #272
+            if (ok && acct) GhAcctNoteRip(acct->rest, rip, ctx);   // #275: who reads it back
             _interlockedbittestandreset(busy, bit);
             ReleaseSRWLockShared(&g_lazyLock);
             if (!ok){
@@ -39306,6 +41281,18 @@ static bool GhLazyFind(const void* p, DWORD* prot)
 // slot goes back to the free list and its contents are gone, exactly as the
 // page's would be. Slots are recycled under g_spillLock; the list's capacity
 // was fixed when the file opened, so no push here can allocate.
+// #275 REUSE. The granule's bytes are about to change or vanish: its kept slot
+// is no longer a copy of anything. Caller owns the granule (busy bit or the
+// exclusive lock).
+static void GhSpillKeptRelease(GhLazyRange& r, LONG bit)
+{
+    if (!r.kept || !_interlockedbittestandreset(r.kept, bit)) return;
+    GhSpillRingDrop(r.slot[bit]);
+    AcquireSRWLockExclusive(&g_spillLock);
+    GhSpillSlotFreeLocked(r.slot[bit]);
+    ReleaseSRWLockExclusive(&g_spillLock);
+    InterlockedIncrement(&g_reuseDrop);
+}
 static void GhLazySpillDiscard(GhLazyRange& r, uint64_t from, uint64_t to, bool alsoCommitted)
 {
     if (!r.spilled) return;
@@ -39314,10 +41301,11 @@ static void GhLazySpillDiscard(GhLazyRange& r, uint64_t from, uint64_t to, bool 
         const LONG m   = 1L << (bit % 32);
         const uint64_t g = (r.size - o < g_lazyGran) ? (r.size - o) : g_lazyGran;
         if (r.busy[bit / 32] & m) continue;            // mid-flight elsewhere: leave it to its owner
+        GhSpillKeptRelease(r, bit);                    // #275
         if (r.spilled[bit / 32] & m){
             GhSpillRingDrop(r.slot[bit]);              // BD25: never written back
             AcquireSRWLockExclusive(&g_spillLock);
-            if (g_spillFree.size() < g_spillFree.capacity()) g_spillFree.push_back(r.slot[bit]);
+            GhSpillSlotFreeLocked(r.slot[bit]);
             ReleaseSRWLockExclusive(&g_spillLock);
             _interlockedbittestandreset(r.spilled, bit);
             InterlockedExchangeAdd64(&g_spillBytes, -(LONG64)g);
@@ -39342,6 +41330,7 @@ static void GhLazyDrop(const void* base, SIZE_T size, bool release)
             delete[] g_lazy[i].spilled; delete[] g_lazy[i].guard; delete[] g_lazy[i].ref;
             delete[] g_lazy[i].busy;    delete[] g_lazy[i].slot;
             delete[] g_lazy[i].ever;    delete[] g_lazy[i].back;    delete[] g_lazy[i].view;
+            delete[] g_lazy[i].kept;
             InterlockedExchangeAdd64(&g_lazyPromised, -(LONG64)g_lazy[i].size);
             g_lazy.erase(g_lazy.begin() + i);
             InterlockedExchange(&g_lazyCount, (LONG)g_lazy.size());
@@ -39379,6 +41368,11 @@ static std::string GhLazyStats()
                  " vehfiber=" + std::to_string((long)InterlockedCompareExchange(&g_vehFiber, 0, 0)) +
              " spillaged=" + std::to_string((long)InterlockedCompareExchange(&g_spillGuardHits, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_spillArmed, 0, 0)) +
+             " refskip=" + std::to_string((long)InterlockedCompareExchange(&g_spillRefSkip, 0, 0)) +
+             " reuse=" + std::to_string((long)InterlockedCompareExchange(&g_reuseKeep, 0, 0)) +       // #275
+             "/" + std::to_string((long)InterlockedCompareExchange(&g_reuseHit, 0, 0)) +
+             "/" + std::to_string((long)InterlockedCompareExchange(&g_reuseMiss, 0, 0)) +
+             "/" + std::to_string((long)InterlockedCompareExchange(&g_reuseDrop, 0, 0)) +
              " spillrooms=" + std::to_string((long)InterlockedCompareExchange(&g_spillRooms, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_spillRoomFault, 0, 0)) +
              "/" + std::to_string((long)InterlockedCompareExchange(&g_spillRoomShort, 0, 0)) +
@@ -39511,9 +41505,36 @@ static uint64_t GhLazyEvictOne(GhLazyRange& r, LONG bit)
         _interlockedbittestandreset(r.guard, bit);
         _interlockedbittestandreset(r.busy, bit); return 0;
     }
+    // #275 REUSE. Restored from the file and unchanged since: the slot still has
+    // these bytes, so the eviction is only the decommit.
+    if (r.kept && (r.kept[bit / 32] & m)){
+        const uint32_t ks = r.slot[bit];
+        if (ks < GH_SPILL_CRC_N && GhSpillCrc(p, (ULONG)g) == g_spillCrc[ks] && GhSpillH2(p, (ULONG)g) == g_spillH2[ks]){
+            if (r.ph ? GhPhUncommitGranule(p, r.view, bit) : VirtualFree(p, (SIZE_T)g, MEM_DECOMMIT) != FALSE){
+                _interlockedbittestandreset(r.kept, bit);
+                if (r.ever) _interlockedbittestandset(r.ever, bit);
+                _interlockedbittestandset(r.spilled, bit);
+                _interlockedbittestandreset(r.bits, bit);
+                _interlockedbittestandreset(r.guard, bit);
+                _interlockedbittestandreset(r.ref, bit);
+                InterlockedExchangeAdd64(&g_lazyCommitted, -(LONG64)g);
+                InterlockedExchangeAdd64(&g_spillBytes, (LONG64)g);
+                InterlockedIncrement(&g_spillEvicts);
+                InterlockedIncrement(&g_reuseHit);
+                _interlockedbittestandreset(r.busy, bit);
+                return g;
+            }
+            InterlockedIncrement(&g_spillEvictFail);
+            DWORD o2 = 0; VirtualProtect(p, (SIZE_T)g, r.prot, &o2);
+            _interlockedbittestandreset(r.guard, bit);
+            _interlockedbittestandreset(r.busy, bit); return 0;
+        }
+        InterlockedIncrement(&g_reuseMiss);
+        GhSpillKeptRelease(r, bit);                   // written since: a fresh slot below
+    }
     uint32_t s = 0;
     AcquireSRWLockExclusive(&g_spillLock);
-    if (!g_spillFree.empty()){ s = g_spillFree.back(); g_spillFree.pop_back(); } else s = g_spillNext++;
+    s = GhSpillSlotAllocLocked();                  // #272 SEQ
     ReleaseSRWLockExclusive(&g_spillLock);
     OVERLAPPED ov{}; const uint64_t fo = (uint64_t)s * g_lazyGran;
     ov.Offset = (DWORD)fo; ov.OffsetHigh = (DWORD)(fo >> 32);
@@ -39521,15 +41542,20 @@ static uint64_t GhLazyEvictOne(GhLazyRange& r, LONG bit)
     const DWORD crc = GhSpillCrc(p, (ULONG)g);   // patch h: the page is READONLY here, nobody writes it
     if (GhSpillStat()) GhSpillStatEvict(s, p, (ULONG)g);
     if (s < GH_SPILL_CRC_N) g_spillCrc[s] = crc;   // BD25: before the ring can serve it
+    if (r.kept && s < GH_SPILL_CRC_N) g_spillH2[s] = GhSpillH2(p, (ULONG)g);   // #275
     GhSpillRingDrop(s);
-    const bool ok = GhSpillRingPut(s, p, g) ||
-                    (WriteFile(g_spillFile, p, (DWORD)g, &wrote, &ov) && wrote == (DWORD)g);
+    bool ok = GhSpillRingPut(s, p, g);
+    if (!ok){
+        const LONG64 w0 = GhQpcUs();
+        ok = GhSpillFileWrite(s, p, g);               // #272 LZ
+        GhFdtNoteWrite(GhQpcUs() - w0);               // #272
+    }
     if (!ok || !(r.ph ? GhPhUncommitGranule(p, r.view, bit) : VirtualFree(p, (SIZE_T)g, MEM_DECOMMIT) != FALSE)){
         GhSpillRingDrop(s);
         InterlockedIncrement(ok ? &g_spillEvictFail : &g_spillIoFail);
         DWORD o2 = 0; VirtualProtect(p, (SIZE_T)g, r.prot, &o2);
         AcquireSRWLockExclusive(&g_spillLock);
-        if (g_spillFree.size() < g_spillFree.capacity()) g_spillFree.push_back(s);
+        GhSpillSlotFreeLocked(s);
         ReleaseSRWLockExclusive(&g_spillLock);
         _interlockedbittestandreset(r.guard, bit);
         _interlockedbittestandreset(r.busy, bit); return 0;
@@ -39590,7 +41616,7 @@ static bool GhPhRestore(GhLazyRange* rr, uint8_t* p, uint64_t g, DWORD prot, LON
     LARGE_INTEGER qf{}, q0{}, q1{};
     const bool hit = GhSpillRingGet(s, v, g);       // BD25: verified against the CRC already
     if (!hit && GhSpillStat()){ QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0); }
-    const bool rd = hit || (ReadFile(g_spillFile, v, (DWORD)g, &got, &ov) && got == (DWORD)g);
+    const bool rd = hit || GhSpillReadSlot(s, v, g);   // #272 RA
     if (!hit && GhSpillStat() && qf.QuadPart > 0 && q0.QuadPart > 0 && QueryPerformanceCounter(&q1))
         GhSpillStatReadUs((q1.QuadPart - q0.QuadPart) * 1000000 / qf.QuadPart);
     if (rd && !hit && s < GH_SPILL_CRC_N && g_rtlCrc32){
@@ -39615,10 +41641,16 @@ static bool GhPhRestore(GhLazyRange* rr, uint8_t* p, uint64_t g, DWORD prot, LON
     _interlockedbittestandset(rr->view, bit);
     InterlockedIncrement(&g_phViews);
     InterlockedIncrement(&g_phRestores);
-    GhSpillRingDrop(s);                               // BD25: the slot is free again
-    AcquireSRWLockExclusive(&g_spillLock);
-    if (g_spillFree.size() < g_spillFree.capacity()) g_spillFree.push_back(s);
-    ReleaseSRWLockExclusive(&g_spillLock);
+    if (!hit && rr->kept && s < GH_SPILL_CRC_N){       // #275 REUSE: the file keeps a copy
+        GhSpillRingDrop(s);                           // no ring entry may outlive the keep (a stale one would write back)
+        _interlockedbittestandset(rr->kept, bit);
+        InterlockedIncrement(&g_reuseKeep);
+    } else {
+        GhSpillRingDrop(s);                           // BD25: the slot is free again
+        AcquireSRWLockExclusive(&g_spillLock);
+        GhSpillSlotFreeLocked(s);
+        ReleaseSRWLockExclusive(&g_spillLock);
+    }
     _interlockedbittestandreset(spilled, bit);
     _interlockedbittestandset(bits, bit);
     InterlockedExchangeAdd64(&g_lazyCommitted, (LONG64)g);
@@ -39659,6 +41691,7 @@ static bool GhLazyRestoreLocked(uint8_t* p, uint64_t g, DWORD prot, LONG* bits, 
     OVERLAPPED ov{}; const uint64_t fo = (uint64_t)s * g_lazyGran;
     ov.Offset = (DWORD)fo; ov.OffsetHigh = (DWORD)(fo >> 32);
     DWORD got = 0;
+    bool fromRing = false;                            // #275
     if (stage){
         int sb = -1;
         for (;;){
@@ -39672,7 +41705,8 @@ static bool GhLazyRestoreLocked(uint8_t* p, uint64_t g, DWORD prot, LONG* bits, 
         LARGE_INTEGER qf{}, q0{}, q1{};
         const bool hit = GhSpillRingGet(s, st, g);   // BD25
         if (!hit && GhSpillStat()){ QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0); }
-        const bool rd = hit || (ReadFile(g_spillFile, st, (DWORD)g, &got, &ov) && got == (DWORD)g);
+        const bool rd = hit || GhSpillReadSlot(s, st, g);   // #272 RA
+        fromRing = hit;
         if (!hit && GhSpillStat() && qf.QuadPart > 0 && q0.QuadPart > 0 && QueryPerformanceCounter(&q1))
             GhSpillStatReadUs((q1.QuadPart - q0.QuadPart) * 1000000 / qf.QuadPart);
         if (rd && !hit && s < GH_SPILL_CRC_N && g_rtlCrc32){                 // patch h: the file round trip, checked
@@ -39691,16 +41725,22 @@ static bool GhLazyRestoreLocked(uint8_t* p, uint64_t g, DWORD prot, LONG* bits, 
             return false;
         }
         InterlockedIncrement(&g_spillStaged);
-    } else if (!GhSpillRingGet(s, p, g) && (!ReadFile(g_spillFile, p, (DWORD)g, &got, &ov) || got != (DWORD)g)){
+    } else if (!(fromRing = GhSpillRingGet(s, p, g)) && !GhSpillFileRead(s, p, g)){      // #272 LZ
         // The page is committed but blank. Report the fault rather than hand the
         // guest silent zeroes; the counter names the cause.
         InterlockedIncrement(&g_spillIoFail);
         return false;
     }
-    GhSpillRingDrop(s);                               // BD25
-    AcquireSRWLockExclusive(&g_spillLock);
-    if (g_spillFree.size() < g_spillFree.capacity()) g_spillFree.push_back(s);
-    ReleaseSRWLockExclusive(&g_spillLock);
+    if (!fromRing && rr && rr->kept && s < GH_SPILL_CRC_N){   // #275 REUSE
+        GhSpillRingDrop(s);                           // no ring entry may outlive the keep (a stale one would write back)
+        _interlockedbittestandset(rr->kept, bit);
+        InterlockedIncrement(&g_reuseKeep);
+    } else {
+        GhSpillRingDrop(s);                           // BD25
+        AcquireSRWLockExclusive(&g_spillLock);
+        GhSpillSlotFreeLocked(s);
+        ReleaseSRWLockExclusive(&g_spillLock);
+    }
     _interlockedbittestandreset(spilled, bit);
     _interlockedbittestandset(bits, bit);
     InterlockedExchangeAdd64(&g_lazyCommitted, (LONG64)g);
@@ -39720,9 +41760,15 @@ static bool GhLazySpillRoomLocked(uint64_t need, const char* why, bool count)
     (void)why;
     if (!GhLazySpillOn() || g_lazy.empty()) return false;
     if (need > (1ull << 30)) need = 1ull << 30;
-    static volatile LONG inRoom = 0;
+    volatile LONG& inRoom = g_spillInRoom;            // #272: shared with the ring cleaner
     if (InterlockedCompareExchange(&inRoom, 1, 0) != 0){
-        while (InterlockedCompareExchange(&inRoom, 0, 0)){ YieldProcessor(); SwitchToThread(); }
+        const LONG gen = InterlockedCompareExchange(&g_roomGen, 0, 0);
+        const LONG64 w0 = GhQpcUs();
+        if (g_spillYield) InterlockedIncrement(&g_roomWaiters);
+        while (InterlockedCompareExchange(&inRoom, 0, 0) &&
+               InterlockedCompareExchange(&g_roomGen, 0, 0) == gen){ YieldProcessor(); SwitchToThread(); }
+        if (g_spillYield) InterlockedDecrement(&g_roomWaiters);
+        InterlockedExchangeAdd64(&g_roomWaitUs, GhQpcUs() - w0);
         return true;
     }
     const uint64_t t0 = GetTickCount64();
@@ -39752,6 +41798,12 @@ static bool GhLazySpillRoomLocked(uint64_t need, const char* why, bool count)
         if (r.spilled && (r.bits[bit / 32] & m) && !(r.spilled[bit / 32] & m)){
             const bool aged = (r.guard[bit / 32] & m) != 0;
             bool take = lap >= 2 || (lap == 1 && aged);
+            if (g_spillRefault && lap < 2 && r.back && (r.back[bit / 32] & m)){
+                _interlockedbittestandreset(r.back, bit);     // #272 REFAULT: one free pass
+                InterlockedIncrement(&g_spillRefSkip);
+                off += g_lazyGran;
+                continue;
+            }
             if (!take && lap == 0 && aged){
                 const uint64_t g = (r.size - off < g_lazyGran) ? (r.size - off) : g_lazyGran;
                 take = !GhLazyTouched(r.base + off, g);
@@ -39767,12 +41819,17 @@ static bool GhLazySpillRoomLocked(uint64_t need, const char* why, bool count)
             }
         }
         off += g_lazyGran;
+        if (g_spillYield && grans >= 4 && InterlockedCompareExchange(&g_roomWaiters, 0, 0)){
+            InterlockedIncrement(&g_roomYields);          // #272 YIELD: a fault is waiting on us
+            break;
+        }
     }
     AcquireSRWLockExclusive(&g_spillLock);
     g_spillHandBase = g_lazy[ri].base; g_spillHandOff = off;
     ReleaseSRWLockExclusive(&g_spillLock);
     if (count && freed < need) InterlockedIncrement(&g_spillRoomShort);
     InterlockedExchangeAdd64(&g_spillMs, (LONG64)(GetTickCount64() - t0));
+    InterlockedIncrement(&g_roomGen);
     InterlockedExchange(&inRoom, 0);
     (void)grans; (void)lap;
     return freed > 0;
@@ -39972,9 +42029,10 @@ static uint64_t GhPhDropGranule(GhLazyRange& r, LONG bit)
     const uint64_t o = (uint64_t)bit * g_lazyGran;
     const uint64_t g = (r.size - o < g_lazyGran) ? (r.size - o) : g_lazyGran;
     uint64_t freed = 0;
+    GhSpillKeptRelease(r, bit);                       // #275
     if (r.spilled && (r.spilled[bit / 32] & m)){
         AcquireSRWLockExclusive(&g_spillLock);
-        if (g_spillFree.size() < g_spillFree.capacity()) g_spillFree.push_back(r.slot[bit]);
+        GhSpillSlotFreeLocked(r.slot[bit]);
         ReleaseSRWLockExclusive(&g_spillLock);
         _interlockedbittestandreset(r.spilled, bit);
         InterlockedExchangeAdd64(&g_spillBytes, -(LONG64)g);
@@ -40045,7 +42103,7 @@ static bool GhPhRelease(void* addr)
         const uint64_t grans = (r.size + g_lazyGran - 1) / g_lazyGran;
         for (uint64_t k = 0; k < grans; ++k) GhPhDropGranule(r, (LONG)k);
         delete[] r.bits; delete[] r.spilled; delete[] r.guard; delete[] r.ref;
-        delete[] r.busy; delete[] r.slot; delete[] r.ever; delete[] r.back; delete[] r.view;
+        delete[] r.busy; delete[] r.slot; delete[] r.ever; delete[] r.back; delete[] r.view; delete[] r.kept;
         InterlockedExchangeAdd64(&g_lazyPromised, -(LONG64)r.size);
         g_lazy.erase(g_lazy.begin() + i);
         InterlockedExchange(&g_lazyCount, (LONG)g_lazy.size());
@@ -40327,6 +42385,114 @@ static void GhBlackBoxTick(uint64_t used)
     InterlockedExchange(&g_bb->idx, i + 1);   // written last: idx-1 is always a whole record
 }
 
+// #272 FRAMEDT. Called at the top of every REAL present (GfxPresent; the
+// DXGI_PRESENT_TEST questions never get here). Every 10 s one line: the
+// present-to-present interval histogram, the time lost above 50/100/200 ms,
+// and what the pager did in the same window, with the three worst frames and
+// the restores that landed inside each. Every 60 s a second line with the
+// cumulative restore/ring-hit latency bins, restore time by thread, and the
+// readahead probe. Read-only; one thread presents, a re-entrant call skips.
+static void GhFrameDtTick()
+{
+    static volatile LONG busy = 0;
+    if (InterlockedExchange(&busy, 1)) return;
+    static LONG64 last = 0, win0 = 0, t0 = 0, long0 = 0;
+    static LONG   hist[15] = {};
+    static LONG64 n = 0, sumUs = 0, maxUs = 0, j50 = 0, j100 = 0, j200 = 0;
+    static LONG   lastRs = 0;  static LONG64 lastRsUs = 0;
+    static LONG   wRs = 0, wEv = 0, wRooms = 0, wPso = 0, wHit = 0, wMiss = 0;
+    static LONG64 wRsUs = 0, wRoomMs = 0, wRlUs = 0;
+    static LONG   wRsN[6] = {};
+    struct Worst { LONG64 dt; LONG rs; LONG64 rsUs; };
+    static Worst  worst[3] = {};
+    auto L  = [](volatile LONG* v){ return InterlockedCompareExchange(v, 0, 0); };
+    auto Q  = [](volatile LONG64* v){ return InterlockedCompareExchange64(v, 0, 0); };
+    const LONG64 now = GhQpcUs();
+    const LONG   rs = L(&g_spillRestores); const LONG64 rsUs = Q(&g_spillRsUs);
+    if (!last || !now){
+        last = win0 = t0 = long0 = now; lastRs = rs; lastRsUs = rsUs;
+        wRs = rs; wRsUs = rsUs; wEv = L(&g_spillEvicts); wRooms = L(&g_spillRooms); wRoomMs = Q(&g_spillMs);
+        wPso = L(&g_psoCalls); wHit = L(&g_ringHit); wMiss = L(&g_ringMiss); wRlUs = Q(&g_spillRlUs);
+        for (int i = 0; i < 6; ++i) wRsN[i] = L(&g_fdtRs[i]);
+        InterlockedExchange(&busy, 0); return;
+    }
+    const LONG64 dt = now - last;
+    static const LONG64 kEdge[14] = { 17000, 20000, 25000, 33500, 40000, 50000, 67000, 83500,
+                                      100000, 133500, 167000, 250000, 500000, 1000000 };
+    int k = 0; while (k < 14 && dt >= kEdge[k]) ++k;
+    ++hist[k]; ++n; sumUs += dt; if (dt > maxUs) maxUs = dt;
+    if (dt > 50000) j50 += dt - 50000;
+    if (dt > 100000) j100 += dt - 100000;
+    if (dt > 200000) j200 += dt - 200000;
+    const Worst w{ dt, rs - lastRs, rsUs - lastRsUs };
+    for (int i = 0; i < 3; ++i) if (w.dt > worst[i].dt){ for (int j = 2; j > i; --j) worst[j] = worst[j - 1]; worst[i] = w; break; }
+    last = now; lastRs = rs; lastRsUs = rsUs;
+    if (now - win0 >= 10000000){
+        const LONG ev = L(&g_spillEvicts), rooms = L(&g_spillRooms), pso = L(&g_psoCalls);
+        const LONG hit = L(&g_ringHit), miss = L(&g_ringMiss);
+        const LONG64 roomMs = Q(&g_spillMs), rlUs = Q(&g_spillRlUs);
+        std::string h, rb, ws;
+        for (int i = 0; i < 15; ++i) h += (i ? "/" : "") + std::to_string((long)hist[i]);
+        for (int i = 0; i < 6; ++i){ const LONG c = L(&g_fdtRs[i]); rb += (i ? "/" : "") + std::to_string((long)(c - wRsN[i])); wRsN[i] = c; }
+        for (int i = 0; i < 3; ++i) if (worst[i].dt)
+            ws += (i ? "," : "") + std::to_string((long long)(worst[i].dt / 1000)) + ":" +
+                  std::to_string((long)worst[i].rs) + ":" + std::to_string((long long)(worst[i].rsUs / 1000));
+        Diag("FRAMEDT t=" + std::to_string((long long)((now - t0) / 1000000)) +
+             " win=" + std::to_string((long long)((now - win0) / 1000)) +
+             " n=" + std::to_string((long long)n) + " fps=" + std::to_string((long long)(n * 10000000 / (now - win0))) +
+             " meanms=" + std::to_string((long long)(n ? sumUs / n / 1000 : 0)) +
+             " maxms=" + std::to_string((long long)(maxUs / 1000)) +
+             " j50=" + std::to_string((long long)(j50 / 1000)) + " j100=" + std::to_string((long long)(j100 / 1000)) +
+             " j200=" + std::to_string((long long)(j200 / 1000)) + " h=" + h +
+             " rs=" + std::to_string((long)(rs - wRs)) + " rsms=" + std::to_string((long long)((rsUs - wRsUs) / 1000)) +
+             " rsh=" + rb + " ring=" + std::to_string((long)(hit - wHit)) + "/" + std::to_string((long)(miss - wMiss)) +
+             " rlms=" + std::to_string((long long)((rlUs - wRlUs) / 1000)) +
+             " ev=" + std::to_string((long)(ev - wEv)) + " rooms=" + std::to_string((long)(rooms - wRooms)) +
+             " roomms=" + std::to_string((long long)(roomMs - wRoomMs)) + " pso=" + std::to_string((long)(pso - wPso)) +
+             " worst=" + ws);
+        memset(hist, 0, sizeof hist); n = sumUs = maxUs = j50 = j100 = j200 = 0; memset(worst, 0, sizeof worst);
+        win0 = now; wRs = rs; wRsUs = rsUs; wEv = ev; wRooms = rooms; wRoomMs = roomMs; wPso = pso;
+        wHit = hit; wMiss = miss; wRlUs = rlUs;
+        if (now - long0 >= 60000000){
+            long0 = now;
+            std::string tids, rg;
+            for (int i = 0; i < 16; ++i) if (g_fdtTid[i].tid)
+                tids += (tids.empty() ? "" : ",") + std::to_string((long)g_fdtTid[i].tid) + ":" +
+                        std::to_string((long)L(&g_fdtTid[i].n)) + ":" + std::to_string((long long)(Q(&g_fdtTid[i].us) / 1000));
+            for (int i = 0; i < 5; ++i) rg += (i ? "/" : "") + std::to_string((long)L(&g_fdtRing[i]));
+            std::string ra;
+            for (int i = 0; i < 6; ++i) ra += (i ? "/" : "") + std::to_string((long)L(&g_fdtRs[i]));
+            Diag("FRAMEDT-T presentTid=" + std::to_string((long)L(&g_presentTid)) + " rsh=" + ra +
+                 " ringus=" + rg + "/" + std::to_string((long long)(Q(&g_fdtRingUs) / 1000)) + "ms tids=" + tids +
+                 " loc=adj:" + std::to_string((long)L(&g_locAdj)) + " nbr:" + std::to_string((long)L(&g_locNbr)) +
+                 " slotadj:" + std::to_string((long)L(&g_locSlotAdj)) + " pred:" + std::to_string((long)L(&g_locPredN)) +
+                 " predhit:" + std::to_string((long)L(&g_locPredHit)) +
+                 " clean=" + std::to_string((long)L(&g_cleanWrites)) + "/" + std::to_string((long)L(&g_cleanGrans)) + "/" +
+                 std::to_string((long long)(Q(&g_cleanUs) / 1000)) + "ms/" + std::to_string((long)L(&g_ringWbClean)) + "/" +
+                 std::to_string((long)L(&g_cleanFail)) + "/t" + std::to_string((long)L(&g_trickleRuns)) + " wb=" + std::to_string((long)L(&g_ringWb)) +
+                 " wbh=" + [&]{ std::string s; for (int i = 0; i < 6; ++i) s += (i ? "/" : "") + std::to_string((long)L(&g_fdtWb[i])); return s; }() +
+                 "/" + std::to_string((long long)(Q(&g_fdtWbUs) / 1000)) + "ms" +
+                 " ra=" + std::to_string((long)L(&g_raReads)) + "/" + std::to_string((long long)(Q(&g_raBytes) >> 20)) + "MB/" +
+                 std::to_string((long)L(&g_raShort)) + "/" + std::to_string((long)L(&g_raBusy)) +
+                 " seq=" + std::to_string((long)L(&g_seqAppend)) + "/" + std::to_string((long)L(&g_seqWrap)) +
+                 "/" + std::to_string((unsigned long)g_slotFreeN) + "/" + std::to_string((unsigned long)g_spillNext) +
+                 " sloww=" + std::to_string((long)L(&g_slowExt)) + "/" + std::to_string((long long)(Q(&g_slowExtUs) / 1000)) +
+                 "ms/" + std::to_string((long)L(&g_slowIn)) + "/" + std::to_string((long long)(Q(&g_slowInUs) / 1000)) + "ms" +
+                 " yield=" + std::to_string((long)L(&g_roomYields)) + "/" +
+                 std::to_string((long long)(Q(&g_roomWaitUs) / 1000)) + "ms" +
+                 " flush=" + std::to_string((long)L(&g_flushN)) + "/" +
+                 std::to_string((long long)(Q(&g_flushUs) / 1000)) + "ms/max" +
+                 std::to_string((long long)(Q(&g_flushMaxUs) / 1000)) + "ms/fail" +
+                 std::to_string((long)L(&g_flushFail)) +
+                 " lz=" + std::to_string((long)L(&g_lzN)) + "/" + std::to_string((long)L(&g_lzRaw)) + "/" +
+                 std::to_string((long long)(Q(&g_lzIn) >> 20)) + "MB>" + std::to_string((long long)(Q(&g_lzOut) >> 20)) + "MB/c" +
+                 std::to_string((long long)(Q(&g_lzCUs) / 1000)) + "ms/d" + std::to_string((long long)(Q(&g_lzDUs) / 1000)) +
+                 "ms/rd" + std::to_string((long)L(&g_lzRd)) + "/bad" + std::to_string((long)L(&g_lzBad)));
+        }
+    }
+    InterlockedExchange(&busy, 0);
+}
+
 static void GhLazySpillWatchStart()
 {
     static volatile LONG started = 0;
@@ -40334,6 +42500,52 @@ static void GhLazySpillWatchStart()
     const unsigned ms = GhCfgNumZ(L"gh_spill_poll_ms.txt", "GH_SPILL_POLL_MS", 100);
     if (!ms) return;
     GhBlackBoxInit();
+    // #272 FLUSH (gh_spill_flush_mb, 0 = off). RA1: 129 of 31,107 spill
+    // write-backs took >= 32 ms (~260 ms each, 33 of the 43 s spent writing) --
+    // the cache manager throttling a writer once too many of its pages are
+    // dirty, and every one of them inside a room, i.e. inside a frame. This
+    // thread pushes the spill file's dirty pages to disk every N MB written,
+    // off every lock, so the evictor's buffered writes never meet the throttle.
+    if (const unsigned fmb = GhCfgNumZ(L"gh_spill_flush_mb.txt", "GH_SPILL_FLUSH_MB", 0)){
+        Diag("LAZYSPILL flusher every " + std::to_string(fmb) + " MB");
+        std::thread([fmb]{
+            const LONG64 lim = (LONG64)fmb << 20;
+            while (!g_guestDone){
+                Sleep(25);
+                if (InterlockedCompareExchange64(&g_spillDirtyB, 0, 0) < lim) continue;
+                InterlockedExchange64(&g_spillDirtyB, 0);
+                const LONG64 t0 = GhQpcUs();
+                if (!FlushFileBuffers(g_spillFile)) InterlockedIncrement(&g_flushFail);
+                const LONG64 us = GhQpcUs() - t0;
+                InterlockedIncrement(&g_flushN); InterlockedExchangeAdd64(&g_flushUs, us);
+                LONG64 m = InterlockedCompareExchange64(&g_flushMaxUs, 0, 0);
+                while (us > m && InterlockedCompareExchange64(&g_flushMaxUs, us, m) != m)
+                    m = InterlockedCompareExchange64(&g_flushMaxUs, 0, 0);
+            }
+        }).detach();
+    }
+    if (const unsigned tmb = GhSpillTrickle()){
+        if (g_ring && g_ringClean && GhSpillCleanMb() && !g_spillLz){
+            Diag("LAZYSPILL trickle " + std::to_string(tmb) + " MB/s margin=" + std::to_string(GhSpillCleanMb()) + " MB");
+            std::thread([tmb]{
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                const LONG64 rate = (LONG64)tmb << 20;           // bytes per second
+                while (!g_guestDone){
+                    const LONG g0 = InterlockedCompareExchange(&g_cleanGrans, 0, 0);
+                    const LONG64 t0 = GhQpcUs();
+                    GhSpillRingClean(16);                         // one run, guard held for it alone
+                    const LONG d = InterlockedCompareExchange(&g_cleanGrans, 0, 0) - g0;
+                    if (d <= 0){ Sleep(5); continue; }            // ring clean, or a room holds the guard
+                    const LONG64 dueUs = (LONG64)d * (LONG64)g_lazyGran * 1000000 / rate;
+                    const LONG64 left = dueUs - (GhQpcUs() - t0);
+                    InterlockedIncrement(&g_trickleRuns);
+                    if (left >= 1000) Sleep((DWORD)(left / 1000));
+                }
+            }).detach();
+        } else {
+            Diag("LAZYSPILL trickle OFF: needs the spill ring (gh_spill_ring_mb) and lz off");
+        }
+    }
     std::thread([ms]{
         while (!g_guestDone){
             Sleep(ms);
@@ -40349,7 +42561,7 @@ static void GhLazySpillWatchStart()
             while ((cur < 0 || remMB < cur) &&
                    InterlockedCompareExchange64(&g_spillFastMinMB, remMB, cur) != cur)
                 cur = InterlockedCompareExchange64(&g_spillFastMinMB, 0, 0);
-            if (rem >= g_lazySpill) continue;
+            if (rem >= g_lazySpill){ if (!GhSpillTrickle()) GhSpillRingClean(64); continue; }   // #272: 4 MB per idle tick
             const LONG n = InterlockedIncrement(&g_spillFast);
             const uint64_t b0 = (uint64_t)InterlockedCompareExchange64(&g_spillBytes, 0, 0);
             const uint64_t t0 = GetTickCount64();
@@ -40445,11 +42657,93 @@ static void GhLazySpillReserve()
 
 // #213. One line per promised range, largest committed first, plus the top
 // touching RIPs. Capped: LocalState's quota is shared with the game's own log.
+// #275: who is BEHIND a promise. The engine reserves every pool through one
+// allocator (GUEST+0x4EEDD2), so its return address names nothing; the frames
+// above it do. A raw stack scan (0.0.711.0) was useless -- stale return
+// addresses left by earlier calls outnumbered the live ones and the allocator's
+// own caller never showed. So unwind for real. The OS has no unwind data for the
+// self-mapped guest image (#219), so guest frames are looked up in the guest's
+// own exception directory; host frames go through RtlLookupFunctionEntry; a frame
+// with neither is a leaf.
+static PRUNTIME_FUNCTION GhGuestFnEntry(DWORD64 rip)
+{
+    if (!g_guestImageBase || !g_guestImageSize) return nullptr;
+    const uintptr_t lo = (uintptr_t)g_guestImageBase;
+    if (rip < lo || rip >= lo + g_guestImageSize) return nullptr;
+    static PRUNTIME_FUNCTION tbl = nullptr; static DWORD cnt = 0; static bool tried = false;
+    if (!tried){
+        tried = true;
+        __try {
+            const IMAGE_DOS_HEADER* dh = (const IMAGE_DOS_HEADER*)lo;
+            const IMAGE_NT_HEADERS64* nh = (const IMAGE_NT_HEADERS64*)(lo + dh->e_lfanew);
+            const IMAGE_DATA_DIRECTORY& ed = nh->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+            if (ed.VirtualAddress && ed.Size){ tbl = (PRUNTIME_FUNCTION)(lo + ed.VirtualAddress); cnt = ed.Size / sizeof(RUNTIME_FUNCTION); }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { tbl = nullptr; cnt = 0; }
+    }
+    if (!tbl) return nullptr;
+    const DWORD rva = (DWORD)(rip - lo);
+    DWORD a = 0, b = cnt;
+    while (a < b){
+        const DWORD m = (a + b) / 2;
+        if (rva < tbl[m].BeginAddress) b = m;
+        else if (rva >= tbl[m].EndAddress) a = m + 1;
+        else return &tbl[m];
+    }
+    return nullptr;
+}
+
+static std::string GhGuestStackTrail(void* /*from*/)
+{
+    std::string out;
+    if (!g_guestImageBase || !g_guestImageSize) return out;
+    const uintptr_t lo = (uintptr_t)g_guestImageBase, hi = lo + (uintptr_t)g_guestImageSize;
+    CONTEXT ctx{}; RtlCaptureContext(&ctx);
+    const NT_TIB* tib = (const NT_TIB*)NtCurrentTeb();
+    DWORD64 slo = (DWORD64)(uintptr_t)tib->StackLimit, shi = (DWORD64)(uintptr_t)tib->StackBase;
+    {   // the guest may run on its own stack (gh_guest_stack_mb); bound by what Rsp is in
+        MEMORY_BASIC_INFORMATION sb{};
+        if (VirtualQuery((LPCVOID)(uintptr_t)ctx.Rsp, &sb, sizeof sb) == sizeof sb && sb.AllocationBase){
+            DWORD64 p = (DWORD64)(uintptr_t)sb.AllocationBase; MEMORY_BASIC_INFORMATION q{};
+            while (VirtualQuery((LPCVOID)(uintptr_t)p, &q, sizeof q) == sizeof q &&
+                   q.AllocationBase == sb.AllocationBase)
+                p = (DWORD64)(uintptr_t)q.BaseAddress + (DWORD64)q.RegionSize;
+            slo = (DWORD64)(uintptr_t)sb.AllocationBase; shi = p;
+        }
+    }
+    volatile int frames = 0, guest = 0;
+    if (!GhSehCall([&]{
+        while (frames < 64 && guest < 14 && ctx.Rip){
+            frames = frames + 1;
+            if (ctx.Rip >= lo && ctx.Rip < hi){
+                out += " " + NameForCodeAddr((uintptr_t)ctx.Rip);
+                guest = guest + 1;
+            }
+            const DWORD64 prevRsp = ctx.Rsp;
+            DWORD64 imgBase = 0;
+            PRUNTIME_FUNCTION rf = GhGuestFnEntry(ctx.Rip);
+            if (rf) imgBase = (DWORD64)lo;
+            else    rf = RtlLookupFunctionEntry(ctx.Rip, &imgBase, nullptr);
+            if (!rf){
+                if (ctx.Rsp < slo || ctx.Rsp + 8 > shi) break;
+                ctx.Rip = *(DWORD64*)ctx.Rsp; ctx.Rsp += 8;
+            } else {
+                PVOID hd = nullptr; DWORD64 est = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, imgBase, ctx.Rip, rf, &ctx, &hd, &est, nullptr);
+            }
+            if (!ctx.Rip || ctx.Rsp <= prevRsp || ctx.Rsp >= shi) break;
+        }
+    })) out += " <fault>";
+    out += " (frames=" + std::to_string((int)frames) + ")";
+    return out;
+}
+
 static volatile LONG g_lazyWhoDumps = 0;
 static void GhLazyWhoDump(const char* where)
 {
     if (!g_lazyWho) return;
-    if (InterlockedIncrement(&g_lazyWhoDumps) > 80) return;
+    // #275: the spilled phase is late (a run is ~270 MEMORY samples), so past
+    // the first 40 dumps keep one in eight rather than going quiet.
+    { const LONG k = InterlockedIncrement(&g_lazyWhoDumps); if (k > 40 && (k % 8)) return; }
     std::vector<GhLazyAcct*> v;
     AcquireSRWLockShared(&g_lazyLock);
     v = g_lazyAcct;
@@ -40476,6 +42770,87 @@ static void GhLazyWhoDump(const char* where)
              " firstMs=" + std::to_string((long long)InterlockedCompareExchange64(&a->firstMs, 0, 0)) +
              " lastMs=" + std::to_string((long long)InterlockedCompareExchange64(&a->lastMs, 0, 0)) +
              " by=" + NameForCodeAddr((uintptr_t)a->site));
+    }
+    // #275: what is IN the spill file, by who promised it. The acct counters
+    // above only ever grow; this walks the LIVE ranges' granule bitmaps, so a
+    // freed range drops out and a spilled granule is counted where it sits.
+    // Grouped by promising call site, sorted by spilled bytes.
+    if (g_lazySpill){
+        struct GhSiteE { uint64_t site; uint64_t ranges, prom, comm, spil, ever, back; };
+        std::vector<GhSiteE> st;
+        auto pc = [](const LONG* b, uint64_t grans) -> uint64_t {
+            if (!b) return 0;
+            uint64_t n = 0;
+            for (uint64_t w = 0; w < (grans + 31) / 32; ++w) n += (uint64_t)__popcnt((unsigned)b[w]);
+            return n;
+        };
+        uint64_t tSpil = 0, tUnacct = 0;
+        // One engine call site reserves a whole class at once (count x chunk), so
+        // the range SIZE names the class; keep the biggest spillers individually too.
+        struct GhRngE { uint64_t base, size, site, comm, spil, ever, back; GhLazyAcct* a; };
+        std::vector<GhRngE> rg;
+        AcquireSRWLockShared(&g_lazyLock);
+        for (auto& r : g_lazy){
+            const uint64_t grans = (r.size + g_lazyGran - 1) / g_lazyGran;
+            const uint64_t site  = r.acct ? r.acct->site : 0;
+            const uint64_t sp = pc(r.spilled, grans);
+            if (sp || r.size >= (64ull << 20))
+                rg.push_back(GhRngE{ (uint64_t)(uintptr_t)r.base, r.size, site, pc(r.bits, grans), sp,
+                                     pc(r.ever, grans), pc(r.back, grans), r.acct });
+            tSpil += sp; if (!r.acct) tUnacct += sp;
+            GhSiteE* e = nullptr;
+            for (auto& x : st) if (x.site == site){ e = &x; break; }
+            if (!e){ st.push_back(GhSiteE{ site, 0, 0, 0, 0, 0, 0 }); e = &st.back(); }
+            e->ranges++; e->prom += r.size;
+            e->comm += pc(r.bits, grans); e->spil += sp;
+            e->ever += pc(r.ever, grans); e->back += pc(r.back, grans);
+        }
+        ReleaseSRWLockShared(&g_lazyLock);
+        std::sort(st.begin(), st.end(), [](const GhSiteE& a, const GhSiteE& b){
+            return a.spil != b.spil ? a.spil > b.spil : a.comm > b.comm; });
+        const uint64_t gk = g_lazyGran >> 10;
+        Diag("  LAZYSPILLWHO sites=" + std::to_string((unsigned long)st.size()) +
+             " spilledMB=" + std::to_string((unsigned long)((tSpil * gk) >> 10)) +
+             " unacctMB=" + std::to_string((unsigned long)((tUnacct * gk) >> 10)));
+        const size_t ns = st.size() < 12 ? st.size() : 12;
+        for (size_t i = 0; i < ns; ++i)
+            Diag("  LAZYSPILLWHO #" + std::to_string((unsigned long)i) +
+                 " ranges=" + std::to_string((unsigned long)st[i].ranges) +
+                 " promMB=" + std::to_string((unsigned long)(st[i].prom >> 20)) +
+                 " commMB=" + std::to_string((unsigned long)((st[i].comm * gk) >> 10)) +
+                 " spilMB=" + std::to_string((unsigned long)((st[i].spil * gk) >> 10)) +
+                 " everMB=" + std::to_string((unsigned long)((st[i].ever * gk) >> 10)) +
+                 " backMB=" + std::to_string((unsigned long)((st[i].back * gk) >> 10)) +
+                 " by=" + (st[i].site ? NameForCodeAddr((uintptr_t)st[i].site) : std::string("unaccounted")));
+        std::sort(rg.begin(), rg.end(), [](const GhRngE& a, const GhRngE& b){
+            return a.spil != b.spil ? a.spil > b.spil : a.comm > b.comm; });
+        const size_t nr = rg.size() < 16 ? rg.size() : 16;
+        for (size_t i = 0; i < nr; ++i)
+            Diag("  LAZYSPILLRNG #" + std::to_string((unsigned long)i) +
+                 " base=" + Hex(rg[i].base) + " size=" + Hex(rg[i].size) +
+                 " commMB=" + std::to_string((unsigned long)((rg[i].comm * gk) >> 10)) +
+                 " spilMB=" + std::to_string((unsigned long)((rg[i].spil * gk) >> 10)) +
+                 " everMB=" + std::to_string((unsigned long)((rg[i].ever * gk) >> 10)) +
+                 " backMB=" + std::to_string((unsigned long)((rg[i].back * gk) >> 10)) +
+                 " by=" + (rg[i].site ? NameForCodeAddr((uintptr_t)rg[i].site) : std::string("unaccounted")));
+        // The per-range touchers, for the biggest spillers, once per dump that is
+        // past the first (the first dump comes before anything is spilled).
+        auto ripTbl = [](const char* label, size_t i, GhLazyAcct::Rip* t){
+            for (int k = 0; k < 8; ++k){
+                const LONG64 r = InterlockedCompareExchange64(&t[k].rip, 0, 0);
+                if (!r) break;
+                std::string ln = std::string("  ") + label + " #" + std::to_string((unsigned long)i) +
+                                 " n=" + std::to_string((long)InterlockedCompareExchange(&t[k].n, 0, 0)) +
+                                 " at=" + NameForCodeAddr((uintptr_t)r);
+                for (int c = 0; c < 3; ++c) if (t[k].c[c]) ln += " <" + NameForCodeAddr((uintptr_t)t[k].c[c]);
+                Diag(ln);
+            }
+        };
+        for (size_t i = 0; i < nr && i < 6; ++i){
+            if (!rg[i].a || !rg[i].spil) continue;
+            ripTbl("LAZYTOUCH", i, rg[i].a->touch);
+            ripTbl("LAZYBACK", i, rg[i].a->rest);
+        }
     }
     if (g_lazyWho < 2) return;
     struct GhRipE { uint64_t rip; uint64_t bytes; long n; };
@@ -41090,6 +43465,10 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"IsIconic",           (void*)&Bed_IsIconic},
         {"GetModuleFileNameW", (void*)&Bed_GetModuleFileNameW},
         {"GetModuleFileNameA", (void*)&Bed_GetModuleFileNameA},
+        {"GetModuleFileNameExW", (void*)&Bed_GetModuleFileNameExW}, {"K32GetModuleFileNameExW", (void*)&Bed_GetModuleFileNameExW},
+        {"GetModuleBaseNameW", (void*)&Bed_GetModuleBaseNameW}, {"K32GetModuleBaseNameW", (void*)&Bed_GetModuleBaseNameW},
+        {"GetModuleFileNameExA", (void*)&Bed_GetModuleFileNameExA}, {"K32GetModuleFileNameExA", (void*)&Bed_GetModuleFileNameExA},
+        {"GetModuleBaseNameA", (void*)&Bed_GetModuleBaseNameA}, {"K32GetModuleBaseNameA", (void*)&Bed_GetModuleBaseNameA},
         {"MoveWindow",         (void*)&Bed_MoveWindow},
         {"SetWindowPos",       (void*)&Bed_SetWindowPos},
         {"MessageBoxW",        (void*)&Bed_MessageBoxW},
@@ -41180,6 +43559,8 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"LoadLibraryW",               (void*)&Bed_LoadLibraryW},
         {"LoadLibraryExW",             (void*)&Bed_LoadLibraryExW},
         {"LoadLibraryExA",             (void*)&Bed_LoadLibraryExA},
+        {"SetDllDirectoryW",           (void*)&Bed_SetDllDirectoryW},
+        {"SetDllDirectoryA",           (void*)&Bed_SetDllDirectoryA},
         {"SetupDiGetClassDevsW",              (void*)&Bed_SetupDiGetClassDevsW},
         {"SetupDiEnumDeviceInfo",             (void*)&Bed_SetupDiEnumDeviceInfo},
         {"SetupDiGetDeviceRegistryPropertyW", (void*)&Bed_SetupDiGetDeviceRegistryPropertyW},
@@ -41198,12 +43579,16 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"MoveFileExW",                (void*)&Bed_MoveFileExW},
         {"ReplaceFileW",               (void*)&Bed_ReplaceFileW},
         {"GetFileAttributesW",         (void*)&Bed_GetFileAttributesW},
+        {"GetFileAttributesExW",       (void*)&Bed_GetFileAttributesExW},
         {"SetFileAttributesW",         (void*)&Bed_SetFileAttributesW},
         {"CreateHardLinkW",            (void*)&Bed_CreateHardLinkW},
         {"FindFirstFileW",             (void*)&Bed_FindFirstFileW},
         {"FindFirstFileExW",           (void*)&Bed_FindFirstFileExW},
         {"FindFirstFileA",             (void*)&Bed_FindFirstFileA},
         {"FindFirstFileExA",           (void*)&Bed_FindFirstFileExA},
+        {"FindNextFileW",              (void*)&Bed_FindNextFileW},
+        {"FindNextFileA",              (void*)&Bed_FindNextFileA},
+        {"FindClose",                  (void*)&Bed_FindClose},
         {"GetCurrentDirectoryW",       (void*)&Bed_GetCurrentDirectoryW},
         {"SetCurrentDirectoryW",       (void*)&Bed_SetCurrentDirectoryW},
         {"GetTempPathW",               (void*)&Bed_GetTempPathW},
@@ -41310,6 +43695,7 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"CreateFileW", (void*)&Bed_CreateFileW}, {"CreateFileA", (void*)&Bed_CreateFileA},
         {"CreateFile2", (void*)&Bed_CreateFile2},
         {"GetFileAttributesW", (void*)&Bed_GetFileAttributesW}, {"SetFileAttributesW", (void*)&Bed_SetFileAttributesW},
+        {"GetFileAttributesExW", (void*)&Bed_GetFileAttributesExW},
         // Virtual registry (Path X cold-client): steamclient reads/writes the
         // Valve\Steam ActiveProcess keys, mostly via the ANSI variants.
         {"RegOpenKeyExW", (void*)&Bed_RegOpenKeyExW}, {"RegOpenKeyExA", (void*)&Bed_RegOpenKeyExA},
@@ -41332,11 +43718,14 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"FindFirstFileW", (void*)&Bed_FindFirstFileW}, {"GetFullPathNameW", (void*)&Bed_GetFullPathNameW},
         {"FindFirstFileExW", (void*)&Bed_FindFirstFileExW},
         {"FindFirstFileA", (void*)&Bed_FindFirstFileA}, {"FindFirstFileExA", (void*)&Bed_FindFirstFileExA},
+        {"FindNextFileW", (void*)&Bed_FindNextFileW}, {"FindNextFileA", (void*)&Bed_FindNextFileA},
+        {"FindClose", (void*)&Bed_FindClose},
         {"GetStdHandle", (void*)&Bed_GetStdHandle}, {"WriteFile", (void*)&Bed_WriteFile},
         {"GetProcAddress", (void*)&Bed_GetProcAddress},
         {"LoadLibraryA", (void*)&Bed_LoadLibraryA},
         {"LoadLibraryW", (void*)&Bed_LoadLibraryW}, {"LoadLibraryExW", (void*)&Bed_LoadLibraryExW},
         {"LoadLibraryExA", (void*)&Bed_LoadLibraryExA},
+        {"SetDllDirectoryW", (void*)&Bed_SetDllDirectoryW}, {"SetDllDirectoryA", (void*)&Bed_SetDllDirectoryA},
         {"SetupDiGetClassDevsW", (void*)&Bed_SetupDiGetClassDevsW},
         {"SetupDiEnumDeviceInfo", (void*)&Bed_SetupDiEnumDeviceInfo},
         {"SetupDiGetDeviceRegistryPropertyW", (void*)&Bed_SetupDiGetDeviceRegistryPropertyW},
@@ -41360,6 +43749,10 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         // gets the host's path and can't locate its assets.
         {"GetModuleFileNameW", (void*)&Bed_GetModuleFileNameW},
         {"GetModuleFileNameA", (void*)&Bed_GetModuleFileNameA},
+        {"GetModuleFileNameExW", (void*)&Bed_GetModuleFileNameExW}, {"K32GetModuleFileNameExW", (void*)&Bed_GetModuleFileNameExW},
+        {"GetModuleBaseNameW", (void*)&Bed_GetModuleBaseNameW}, {"K32GetModuleBaseNameW", (void*)&Bed_GetModuleBaseNameW},
+        {"GetModuleFileNameExA", (void*)&Bed_GetModuleFileNameExA}, {"K32GetModuleFileNameExA", (void*)&Bed_GetModuleFileNameExA},
+        {"GetModuleBaseNameA", (void*)&Bed_GetModuleBaseNameA}, {"K32GetModuleBaseNameA", (void*)&Bed_GetModuleBaseNameA},
         // Windowing surrogate: a real game (UnityPlayer.dll) creates its own
         // window through USER32. The container's real USER32 cannot register a
         // window class ("not supported on this system"), so these must route to
@@ -41529,6 +43922,45 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
     return n;
 }
 
+// A guest module's STATIC imports that ship beside it are mapped by the OS
+// loader, so no bed ever patched them. IL2CPP's GameAssembly.dll imports
+// Unity's baselib.dll from the game dir, and baselib is what opens native
+// plugins: its full-path LoadLibraryExW took Valve's Plugins\x86_64\
+// steam_api64.dll past the singleton, and Gang Beasts stuck on its loading
+// screen with SteamAPI_Init failing. Every import that maps from the same
+// directory as its importer gets the beds too, once.
+static void GhPatchSiblingImports(HMODULE m, int depth)
+{
+    static std::set<HMODULE> done;
+    if (!m || depth > 4 || !done.insert(m).second) return;
+    wchar_t mp[MAX_PATH] = {0};
+    if (!GetModuleFileNameW(m, mp, MAX_PATH)) return;
+    std::wstring dir(mp);
+    const size_t sl = dir.find_last_of(L"\\/");
+    if (sl == std::wstring::npos) return;
+    dir.resize(sl + 1);
+    if (StartsWithNoCase(dir, L"C:\\Windows\\")) return;
+    auto* base = (BYTE*)m;
+    auto* dos = (IMAGE_DOS_HEADER*)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    auto* nt = (IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
+    const auto& d = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!d.VirtualAddress || !d.Size) return;
+    for (auto* imp = (IMAGE_IMPORT_DESCRIPTOR*)(base + d.VirtualAddress); imp->Name; ++imp) {
+        const char* name = (const char*)(base + imp->Name);
+        HMODULE dep = GetModuleHandleA(name);
+        if (!dep || done.count(dep)) continue;
+        wchar_t dp[MAX_PATH] = {0};
+        if (!GetModuleFileNameW(dep, dp, MAX_PATH)) continue;
+        std::wstring p(dp);
+        if (p.rfind(L"\\\\?\\", 0) == 0) p = p.substr(4);
+        if (!StartsWithNoCase(p, dir) || p.find_first_of(L"\\/", dir.size()) != std::wstring::npos) continue;
+        Diag(std::string("SIBLING import ") + name + " of " + RegNarrow(mp));
+        PatchModuleForGuest(dep, name);
+        GhPatchSiblingImports(dep, depth + 1);
+    }
+}
+
 // Load a DLL the guest depends on. The app container's default search path does
 // NOT include our `guest\` subdirectory, so a guest that ships its own libraries
 // -- python.exe is a 103 KB launcher for python311.dll, which in turn needs
@@ -41678,10 +44110,353 @@ static void ReportWhyDllFailed(const char* dll, const std::wstring& full)
 #ifdef GH_LAUNCHER
 static std::wstring GhSteamRuntimeFor(const std::wstring& base);   // launcher_ui.h (#258)
 #endif
+// The IAT slot `m` binds `fn` through, or null. M4 logs UnityPlayer's
+// GetProcAddress slot around MelonLoader's plthook.
+static void** GhIatSlot(HMODULE m, const char* fn)
+{
+    auto* base = (uint8_t*)m;
+    auto* nt = (IMAGE_NT_HEADERS64*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
+    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.Size) return nullptr;
+    for (auto* imp = (IMAGE_IMPORT_DESCRIPTOR*)(base + dir.VirtualAddress); imp->Name; ++imp){
+        if (!imp->OriginalFirstThunk) continue;
+        auto* oft = (IMAGE_THUNK_DATA64*)(base + imp->OriginalFirstThunk);
+        auto* ft  = (IMAGE_THUNK_DATA64*)(base + imp->FirstThunk);
+        for (; oft->u1.AddressOfData; ++oft, ++ft){
+            if (IMAGE_SNAP_BY_ORDINAL64(oft->u1.Ordinal)) continue;
+            if (0 == strcmp((const char*)((IMAGE_IMPORT_BY_NAME*)(base + oft->u1.AddressOfData))->Name, fn))
+                return (void**)&ft->u1.Function;
+        }
+    }
+    return nullptr;
+}
+
+// §53 M4.1: the MelonLoader freeze. NativeAOT detaches an exiting thread only
+// from its FLS callback (FiberDetachCallback -> RuntimeThreadShutdown ->
+// DetachCurrentThread), and in this process FLS callbacks never run at thread
+// exit (MEASURED, 0.0.736.0 m4t9: a plain thread that set an FLS slot of ours and
+// returned never reached its callback; neither did any of the ~50 threads the
+// bootstrap attached). ntdll still frees the thread's TLS blocks, so the dead
+// thread's node (TLS block + 0x30) stays linked in the thread list inside freed
+// memory; once that is reused the list closes into a cycle that the next
+// detaching thread walks forever under the thread-store lock -- the whole
+// process stalls and the shell kills it.
+// Our exe's TLS callback does get DLL_THREAD_DETACH (LdrShutdownThread, before
+// the TLS blocks are freed), so the detach NativeAOT expected from FLS happens
+// there instead, for a thread still attached: the bootstrap's FLS slot holds its
+// own node, state bit 1 (attached) set, bit 2 (detached) clear. It runs under the
+// loader lock, which the FLS path avoids; NativeAOT takes only its thread-store
+// lock inside. Disproved on the way: "ntdll clears the slot before the callback"
+// (0.0.734.0, a FlsGetValue rescue fired 0 times).
+// RVAs are the 0.7.3 bootstrap's and their bytes are checked before arming.
+static uintptr_t g_mlBase = 0;
+static volatile LONG g_mlTlsDetachRuns = 0, g_mlTlsDetached = 0;
+static void NTAPI GhTlsCallback(PVOID, DWORD reason, PVOID)
+{
+    if (reason != DLL_THREAD_DETACH || !g_mlBase) return;
+    const uintptr_t base = g_mlBase;
+    InterlockedIncrement(&g_mlTlsDetachRuns);
+    const PVOID v = FlsGetValue(*(volatile DWORD*)(base + 0x9FFFC0));
+    if (!v) return;
+    const DWORD tlsIdx = *(volatile DWORD*)(base + 0xA1CBF8);
+    const uintptr_t blk = ((const uintptr_t*)__readgsqword(0x58))[tlsIdx];
+    const DWORD state = blk ? *(volatile DWORD*)(blk + 0x30 + 0x38) : 0;
+    if (!blk || blk + 0x30 != (uintptr_t)v || !(state & 1) || (state & 2)) return;
+    const LONG n = InterlockedIncrement(&g_mlTlsDetached);
+    ((void (*)(void*))(base + 0x5F5610))(v);              // RuntimeThreadShutdown
+    if (n <= 5)
+        Diag("MLEXIT tls-detach tid=" + std::to_string(GetCurrentThreadId()) + " node=" + Hex((uint64_t)(uintptr_t)v) +
+             " state-after=" + Hex(*(volatile DWORD*)(blk + 0x30 + 0x38)));
+}
+#pragma section(".CRT$XLM", long, read)
+extern "C" __declspec(allocate(".CRT$XLM")) const PIMAGE_TLS_CALLBACK g_ghTlsCallback = GhTlsCallback;
+#pragma comment(linker, "/INCLUDE:_tls_used")
+#pragma comment(linker, "/INCLUDE:g_ghTlsCallback")
+
+static void GhMelonDetachArm(HMODULE m)
+{
+    const auto* b = (const BYTE*)m;
+    // PalDetachThread: mov ecx,[rip->+0x9FFFC0]; call [FlsGetValue]. RuntimeThreadShutdown:
+    // call DetachCurrentThread. DetachCurrentThread: a gs: TLS read.
+    int32_t d1 = 0; std::memcpy(&d1, b + 0x5FA3BB, 4);
+    if (!(b[0x5FA3B9] == 0x8B && b[0x5FA3BA] == 0x0D && 0x5FA3BF + d1 == 0x9FFFC0 &&
+          b[0x5FA3BF] == 0xFF && b[0x5FA3C0] == 0x15 && b[0x5F561E] == 0xE8 &&
+          b[0x5F524C] == 0x65)){
+        Diag("MODS MelonLoader thread-detach fix skipped (not the 0.7.3 bootstrap)");
+        return;
+    }
+    g_mlBase = (uintptr_t)m;
+    Diag("MODS MelonLoader thread-detach fix on (flsidx=" + std::to_string(*(volatile DWORD*)(b + 0x9FFFC0)) + ")");
+}
+
+// M4: MelonLoader 0.7's bootstrap is a NativeAOT DLL that a PC loads as a
+// version.dll proxy. Its DllMain reads the process path (to find <game>_Data)
+// and the command line (--melonloader.basedir), then plthooks UnityPlayer's
+// GetProcAddress to catch mono_jit_init_version -- the seam ghdoorstop uses for
+// BepInEx. It is loaded here, right after UnityPlayer and before Mono starts.
+// The command line is already the guest's (HookCommandLine); the process path
+// is not, so the host exe's loader entry names the game while DllMain runs.
+// The OS loader maps it: it has TLS callbacks, which the self-mapper refuses.
+// §54: MelonLoader's Il2CppAssemblyGenerator runs Cpp2IL as a child process (the
+// container allows one) with `--exe-name <Process.GetCurrentProcess().ProcessName>`
+// -- our host's name, not the game's, so Cpp2IL would look for p0_spike_host_Data.
+// CoreCLR binds P/Invokes with its own GetProcAddress import; when coreclr.dll
+// loads, that one IAT slot is pointed at a wrapper which hands back a
+// CreateProcessW that puts the game's exe name in that argument.
+static BOOL WINAPI Bed_MelonCreateProcessW(LPCWSTR app, LPWSTR cmd, LPSECURITY_ATTRIBUTES pa, LPSECURITY_ATTRIBUTES ta,
+                                           BOOL inherit, DWORD flags, LPVOID env, LPCWSTR cwd,
+                                           LPSTARTUPINFOW si, LPPROCESS_INFORMATION pi)
+{
+    std::wstring c = cmd ? cmd : L"";
+    const size_t k = c.find(L"--exe-name ");
+    if (k != std::wstring::npos){
+        size_t v = k + 11, e;
+        if (v < c.size() && c[v] == L'"'){ e = c.find(L'"', v + 1); e = (e == std::wstring::npos) ? c.size() : e + 1; }
+        else { e = c.find(L' ', v); if (e == std::wstring::npos) e = c.size(); }
+        std::wstring exe = g_guestExePath.substr(g_guestExePath.find_last_of(L'\\') + 1);
+        if (exe.size() > 4 && 0 == _wcsicmp(exe.c_str() + exe.size() - 4, L".exe")) exe.resize(exe.size() - 4);
+        c.replace(v, e - v, L"\"" + exe + L"\"");
+    }
+    // The child does not start in lpCurrentDirectory: Cpp2IL ran in the
+    // package root (read-only), so its default output, "cpp2il_out" relative to
+    // the cwd, died with UnauthorizedAccessException after the whole 1.6 GB
+    // analysis. MelonLoader reads <WorkingDirectory>\cpp2il_out afterwards, so
+    // that is the folder Cpp2IL is told to write.
+    if (cwd && *cwd && c.find(L"Cpp2IL.exe") != std::wstring::npos && c.find(L"--output-to") == std::wstring::npos){
+        std::wstring out = cwd;
+        if (out.back() != L'\\') out += L'\\';
+        c += L" --output-to \"" + out + L"cpp2il_out\"";
+    }
+    std::vector<wchar_t> buf(c.begin(), c.end());
+    buf.push_back(0);
+    // .NET hands the child our STD_INPUT_HANDLE when stdin is not redirected.
+    // That is InitStdHandles' .sink_in file, opened non-inheritable, so in the
+    // child the value names nothing, and the container's strict handle checks
+    // raise STATUS_INVALID_HANDLE from ucrtbase's stdio init (GetFileType):
+    // Cpp2IL.exe died before main, and the shell closed the whole app with it.
+    // Our sink handles are never passed on; NULL is what the CRT skips.
+    if (si && (si->dwFlags & STARTF_USESTDHANDLES)){
+        for (HANDLE* h : { &si->hStdInput, &si->hStdOutput, &si->hStdError })
+            if (*h && (*h == g_hIn || *h == g_hOut || *h == g_hErr)) *h = nullptr;
+    }
+    const BOOL r = CreateProcessW(app, buf.data(), pa, ta, inherit, flags, env, cwd, si, pi);
+    const DWORD err = r ? 0 : GetLastError();
+    Diag("MODS child process " + RegNarrow(c.substr(0, 600)) + " cwd=" + (cwd ? RegNarrow(cwd) : std::string("(null)"))
+         + (r ? " pid=" + std::to_string(pi->dwProcessId)
+                                                                    : " FAILED err=" + Hex(err)));
+    SetLastError(err);
+    return r;
+}
+// Every managed NativeHook.Attach in MelonLoader 0.7 first runs
+// CoreClrDelegateFixer.SanityCheckDetour, which opens a ClrMD
+// DataTarget.CreateSnapshotAndAttach on its own process. PssCaptureSnapshot
+// (a VA clone) answers ERROR_NOT_SUPPORTED (50) in the container, the attach
+// throws, and the hook is never placed (Il2CppICallInjector first). The
+// snapshot of THIS process becomes a tag; its "clone" is a fake pid that
+// OpenProcess(VM_READ|QUERY_INFORMATION) maps back to this process, so ClrMD
+// reads live memory. Only that one access mask is mapped: ClrMD's Dispose ends
+// with Process.GetProcessById(clone).Kill(), and that lookup and the kill must
+// fail on the fake pid, never reach us.
+static const HANDLE kGhPssSnap  = (HANDLE)(uintptr_t)0x47480F01;
+static const HANDLE kGhPssClone = (HANDLE)(uintptr_t)0x47480F05;
+static const DWORD  kGhPssPid   = 0x3FFFFFF8;
+static DWORD WINAPI Bed_ClrPssCaptureSnapshot(HANDLE p, DWORD flags, DWORD ctx, HANDLE* snap)
+{
+    if (snap && IsOwnProcess(p)){
+        static volatile LONG n = 0;
+        if (InterlockedIncrement(&n) <= 3) Diag("MODS ClrMD snapshot of self -> live reads");
+        *snap = kGhPssSnap;
+        return ERROR_SUCCESS;
+    }
+    typedef DWORD (WINAPI* Fn)(HANDLE, DWORD, DWORD, HANDLE*);
+    static Fn real = (Fn)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PssCaptureSnapshot");
+    return real ? real(p, flags, ctx, snap) : ERROR_NOT_SUPPORTED;
+}
+static DWORD WINAPI Bed_ClrPssQuerySnapshot(HANDLE snap, DWORD cls, void* buf, DWORD len)
+{
+    if (snap == kGhPssSnap){
+        if (cls != 1 /* PSS_QUERY_VA_CLONE_INFORMATION */ || !buf || len < sizeof(HANDLE)) return ERROR_NOT_SUPPORTED;
+        *(HANDLE*)buf = kGhPssClone;
+        return ERROR_SUCCESS;
+    }
+    typedef DWORD (WINAPI* Fn)(HANDLE, DWORD, void*, DWORD);
+    static Fn real = (Fn)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PssQuerySnapshot");
+    return real ? real(snap, cls, buf, len) : ERROR_NOT_SUPPORTED;
+}
+static DWORD WINAPI Bed_ClrPssFreeSnapshot(HANDLE p, HANDLE snap)
+{
+    if (snap == kGhPssSnap) return ERROR_SUCCESS;
+    typedef DWORD (WINAPI* Fn)(HANDLE, HANDLE);
+    static Fn real = (Fn)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PssFreeSnapshot");
+    return real ? real(p, snap) : ERROR_NOT_SUPPORTED;
+}
+static DWORD WINAPI Bed_ClrGetProcessId(HANDLE h)
+{
+    return h == kGhPssClone ? kGhPssPid : GetProcessId(h);
+}
+static HANDLE WINAPI Bed_ClrOpenProcess(DWORD access, BOOL inherit, DWORD pid)
+{
+    if (pid == kGhPssPid){
+        if (access == (PROCESS_VM_READ | PROCESS_QUERY_INFORMATION)){
+            HANDLE h = OpenProcess(access, inherit, GetCurrentProcessId());
+            if (!h && !DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(), &h, access, inherit, 0))
+                h = nullptr;
+            return h;
+        }
+        SetLastError(ERROR_INVALID_PARAMETER);       // "no such process": GetProcessById throws, Kill never runs
+        return nullptr;
+    }
+    return OpenProcess(access, inherit, pid);
+}
+static FARPROC WINAPI Bed_ClrGetProcAddress(HMODULE m, LPCSTR n)
+{
+    if (n && HIWORD(n)){
+        if (0 == strcmp(n, "CreateProcessW")) return (FARPROC)&Bed_MelonCreateProcessW;
+        if (0 == strcmp(n, "K32GetModuleFileNameExW") || 0 == strcmp(n, "GetModuleFileNameExW"))
+            return (FARPROC)&Bed_GetModuleFileNameExW;      // MainModule: Game::ApplicationPath
+        if (0 == strcmp(n, "K32GetModuleBaseNameW") || 0 == strcmp(n, "GetModuleBaseNameW"))
+            return (FARPROC)&Bed_GetModuleBaseNameW;
+        if (0 == strcmp(n, "PssCaptureSnapshot")) return (FARPROC)&Bed_ClrPssCaptureSnapshot;
+        if (0 == strcmp(n, "PssQuerySnapshot"))   return (FARPROC)&Bed_ClrPssQuerySnapshot;
+        if (0 == strcmp(n, "PssFreeSnapshot"))    return (FARPROC)&Bed_ClrPssFreeSnapshot;
+        if (0 == strcmp(n, "GetProcessId"))       return (FARPROC)&Bed_ClrGetProcessId;
+        if (0 == strcmp(n, "OpenProcess"))        return (FARPROC)&Bed_ClrOpenProcess;
+    }
+    return GetProcAddress(m, n);
+}
+static void* g_melonClrCookie = nullptr;
+static void GhMelonWatchClr()
+{
+    struct UStr { USHORT Length, MaximumLength; PWSTR Buffer; };
+    struct NotifData { ULONG Flags; const UStr* FullDllName; const UStr* BaseDllName; PVOID DllBase; ULONG SizeOfImage; };
+    typedef VOID (CALLBACK* NotifFn)(ULONG, const NotifData*, PVOID);
+    typedef LONG (NTAPI* RegFn)(ULONG, NotifFn, PVOID, PVOID*);
+    if (g_melonClrCookie) return;
+    auto reg = (RegFn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "LdrRegisterDllNotification");
+    if (!reg){ Diag("MODS no LdrRegisterDllNotification: Cpp2IL will get the host's exe name"); return; }
+    NotifFn cb = [](ULONG reason, const NotifData* d, PVOID) {
+        if (reason != 1 || !d || !d->BaseDllName || !d->BaseDllName->Buffer) return;   // 1 = loaded
+        std::wstring b(d->BaseDllName->Buffer, d->BaseDllName->Length / 2);
+        if (_wcsicmp(b.c_str(), L"coreclr.dll") != 0) return;
+        void** slot = GhIatSlot((HMODULE)d->DllBase, "GetProcAddress");
+        DWORD old = 0;
+        if (slot && VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)){
+            *slot = (void*)&Bed_ClrGetProcAddress;
+            VirtualProtect(slot, sizeof(void*), old, &old);
+            Diag("MODS coreclr.dll loaded: P/Invoke binding wrapped (CreateProcessW, psapi names, ClrMD snapshot)");
+        } else Diag("MODS coreclr.dll loaded: no GetProcAddress import to wrap");
+    };
+    const LONG st = reg(0, cb, nullptr, &g_melonClrCookie);
+    if (st < 0) Diag("MODS LdrRegisterDllNotification failed st=" + Hex((uint32_t)st));
+}
+
+// Gang Beasts (IL2CPP) bound its Steam calls to the Valve steam_api64.dll in its
+// Plugins\x86_64 while our shim was loaded, and no bed logged the load. Every
+// steam* module that maps from here on is logged with who asked for it.
+static void* g_steamLoadCookie = nullptr;
+static void GhWatchSteamLoads()
+{
+    struct UStr { USHORT Length, MaximumLength; PWSTR Buffer; };
+    struct NotifData { ULONG Flags; const UStr* FullDllName; const UStr* BaseDllName; PVOID DllBase; ULONG SizeOfImage; };
+    typedef VOID (CALLBACK* NotifFn)(ULONG, const NotifData*, PVOID);
+    typedef LONG (NTAPI* RegFn)(ULONG, NotifFn, PVOID, PVOID*);
+    if (g_steamLoadCookie) return;
+    auto reg = (RegFn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "LdrRegisterDllNotification");
+    if (!reg) return;
+    NotifFn cb = [](ULONG reason, const NotifData* d, PVOID) {
+        if (!d || !d->BaseDllName || !d->BaseDllName->Buffer) return;
+        std::wstring b(d->BaseDllName->Buffer, d->BaseDllName->Length / 2);
+        std::wstring lb = b;
+        for (auto& c : lb) c = towlower(c);
+        if (lb.find(L"steam") == std::wstring::npos) return;
+        std::wstring f = d->FullDllName && d->FullDllName->Buffer
+            ? std::wstring(d->FullDllName->Buffer, d->FullDllName->Length / 2) : b;
+        Diag(std::string(reason == 1 ? "STEAMLOAD mapped " : "STEAMLOAD unmapped ") + RegNarrow(f) +
+             " base=" + Hex((uintptr_t)d->DllBase) + " tid=" + std::to_string(GetCurrentThreadId()));
+        if (reason != 1) return;
+        void* bt[24];
+        const USHORT nb = RtlCaptureStackBackTrace(1, 24, bt, nullptr);
+        for (USHORT i = 0; i < nb; ++i)
+            Diag("  load#" + std::to_string(i) + " " + NameForCodeAddr((uintptr_t)bt[i]));
+    };
+    const LONG st = reg(0, cb, nullptr, &g_steamLoadCookie);
+    Diag(st < 0 ? "STEAMLOAD watch failed st=" + Hex((uint32_t)st) : std::string("STEAMLOAD watch on"));
+}
+
+static void GhMelonBoot(HMODULE unity)
+{
+    g_melonBooted = true;
+    const std::wstring root = g_melonBoot.substr(0, g_melonBoot.find_last_of(L'\\') + 1);
+    // Under its own name: as version.dll its ProxyResolver goes looking for
+    // System32's version.dll to re-export.
+    const std::wstring boot = root + L"MelonLoader\\MelonLoader.Bootstrap.dll";
+    WIN32_FILE_ATTRIBUTE_DATA a{}, b{};
+    if (!GetFileAttributesExW(g_melonBoot.c_str(), GetFileExInfoStandard, &a)){ Diag("MODS MelonLoader bootstrap missing"); return; }
+    if (!GetFileAttributesExW(boot.c_str(), GetFileExInfoStandard, &b) || a.nFileSizeLow != b.nFileSizeLow ||
+        CompareFileTime(&a.ftLastWriteTime, &b.ftLastWriteTime) != 0){
+        if (!CopyFileW(g_melonBoot.c_str(), boot.c_str(), FALSE)){
+            Diag("MODS MelonLoader bootstrap copy failed err=" + Hex(GetLastError()));
+            return;
+        }
+    }
+    // NativeAOT's GC reserves its regions up front; keep that small in the container.
+    SetEnvironmentVariableW(L"DOTNET_GCHeapHardLimit", L"0x10000000");
+    if (g_melonIl2cpp) GhMelonWatchClr();
+
+    void** slot = GhIatSlot(unity, "GetProcAddress");
+    const uintptr_t before = slot ? (uintptr_t)*slot : 0;
+
+    GhSiteLdrEntry* host = nullptr;
+    {
+        BYTE* peb = (BYTE*)__readgsqword(0x60);
+        BYTE* ldr = peb ? *(BYTE**)(peb + 0x18) : nullptr;
+        void* img = peb ? *(void**)(peb + 0x10) : nullptr;     // PEB.ImageBaseAddress
+        auto* head = ldr ? (LIST_ENTRY*)(ldr + 0x10) : nullptr;
+        for (LIST_ENTRY* e = head ? head->Flink : nullptr; e && e != head; e = e->Flink){
+            auto* ent = CONTAINING_RECORD(e, GhSiteLdrEntry, InLoadOrder);
+            if (ent->DllBase == img){ host = ent; break; }
+        }
+    }
+    const std::wstring gameExe = g_guestExePath;
+    UNICODE_STRING saved{};
+    if (host){
+        saved = host->FullDllName;
+        host->FullDllName.Buffer = (PWSTR)gameExe.c_str();
+        host->FullDllName.Length = (USHORT)(gameExe.size() * 2);
+        host->FullDllName.MaximumLength = (USHORT)(gameExe.size() * 2 + 2);
+    }
+    wchar_t seen[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, seen, MAX_PATH);
+    const ULONGLONG t0 = GetTickCount64();
+    HMODULE m = LoadLibraryExW(boot.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    const DWORD err = m ? 0 : GetLastError();
+    if (host) host->FullDllName = saved;
+    // The cap was for the bootstrap's own GC, initialised during the load above. On
+    // IL2CPP, CoreCLR (Il2CppInterop's generation) and the Cpp2IL child would inherit it.
+    if (g_melonIl2cpp) SetEnvironmentVariableW(L"DOTNET_GCHeapHardLimit", nullptr);
+    Diag("MODS MelonLoader bootstrap " + std::string(m ? "loaded " + Hex((uintptr_t)m) : "FAILED err=" + Hex(err)) +
+         " ms=" + std::to_string((unsigned long long)(GetTickCount64() - t0)) +
+         " processpath=" + RegNarrow(seen));
+    if (!m) return;
+    g_melonBootMod = m;
+    RepublishGuestTls("MelonLoader.Bootstrap.dll");
+    // Its SymbolDetour resolves through its own GetProcAddress import; bedded,
+    // UnityPlayer keeps every shim it had before the plthook.
+    PatchModuleForGuest(m, "MelonLoader.Bootstrap.dll");
+    GhMelonDetachArm(m);
+    const uintptr_t after = slot ? (uintptr_t)*slot : 0;
+    Diag("MODS UnityPlayer GetProcAddress slot " + Hex(before) + " -> " + Hex(after) +
+         (after == before ? " (NOT hooked: MelonLoader will not start)" : " (hooked by MelonLoader)"));
+}
+
 static HMODULE LoadGuestDll(const char* dll)
 {
     if (GuestDllDenied(dll)){ SetLastError(ERROR_MOD_NOT_FOUND); return nullptr; }
-    if (HMODULE m = GetModuleHandleA(dll)) return m;
+    // A LoadLibrary of a module that is already loaded takes a reference, as the
+    // real call does: Gang Beasts' baselib loaded steam_api64.dll by bare name
+    // for every lookup and freed it again, and without the reference those
+    // FreeLibrary calls unmapped our shim under its own VEH.
+    { HMODULE m = nullptr; if (GetModuleHandleExA(0, dll, &m) && m) return m; }
     if (HMODULE sm = GhSelfMapFind(dll)) return sm;      // #146: mapped by us, not by the loader
     // SINGLETON FIX (2026-08-03): basename lookup too — a full-path request like
     // "E:\...\Plugins\x86_64\steam_api64.dll" must not bypass the already-loaded
@@ -41693,6 +44468,7 @@ static HMODULE LoadGuestDll(const char* dll)
         if (0 == _stricmp(base, "steam_api64.dll") || 0 == _stricmp(base, "steam_api64")){
             if (HMODULE pre = GetModuleHandleA("steam_api64.dll")){
                 Diag(std::string("LoadGuestDll(") + dll + ") -> PRELOADED singleton " + Hex((uintptr_t)pre));
+                PinGuestModule(pre, "steam_api64.dll");   // ours: no guest FreeLibrary may unmap it
                 return pre;
             }
         }
@@ -41705,12 +44481,25 @@ static HMODULE LoadGuestDll(const char* dll)
         return m;
     }
     std::wstring req(w);
+    if (g_modsArmedRun && !g_modRunRoot.empty() &&
+        _wcsnicmp(req.c_str(), g_modRunRoot.c_str(), g_modRunRoot.size()) == 0 &&
+        GetFileAttributesW(req.c_str()) != INVALID_FILE_ATTRIBUTES)   // not Mono's "X.dll.dll" probes
+        Diag(std::string("MODS native load ") + dll);   // §52: a mod's own native code
     // A guest may request a DLL by bare name (resolve against guest\) OR by a
     // full path into its install tree (Unity loads mono by absolute path). Do
     // NOT prepend guest\ to an already-absolute path -- that yields garbage and
     // masks the real load error.
     bool isAbs = (req.size()>=2 && req[1]==L':') || req.rfind(L"\\\\",0)==0;
     std::wstring full = isAbs ? req : (g_guestDir.empty() ? req : g_guestDir + req);
+    if (!isAbs && GetFileAttributesW(full.c_str()) == INVALID_FILE_ATTRIBUTES){
+        const std::wstring dd = GhGuestDllDir();
+        if (!dd.empty() && GetFileAttributesW((dd + req).c_str()) != INVALID_FILE_ATTRIBUTES) full = dd + req;
+    }
+    // M4.4: a DLL inside the mod overlay (UE4SS C++ mods: Mods\<mod>\dlls\main.dll).
+    if (g_modOvl.on()){
+        std::wstring m = GhModOvlFor(full);
+        if (!m.empty() && GetFileAttributesW(m.c_str()) != INVALID_FILE_ATTRIBUTES) full = m;
+    }
 #ifdef GH_LAUNCHER
     // #258: the Valve runtime the console fetched from Valve's CDN, once verified,
     // wins over any copy the package or the game folder carries.
@@ -41746,6 +44535,19 @@ static HMODULE LoadGuestDll(const char* dll)
                 // becomes a stub returning 0, and Tsushima's Streamline then divided
                 // by a zero QueryPerformanceFrequency forever on a fresh console.
                 std::wstring vcrt = g_installDir + L"guest\\vcrt\\" + base;
+                // M4.4: guest\vcrt14\ is the 14.5x runtime, used only while UE4SS is
+                // armed: UE4SS needs msvcp140 14.4x and msvcp140_atomic_wait /
+                // _codecvt_ids, which vcrt lacks, and the game shares whichever
+                // msvcp140 loads first. Every other launch keeps vcrt as it was.
+                const std::wstring vcrt14 = g_installDir + L"guest\\vcrt14\\" + base;
+                if (!g_ue4ssDll.empty() && GetFileAttributesW(vcrt14.c_str()) != INVALID_FILE_ATTRIBUTES)
+                    vcrt = vcrt14;
+                // The companions vcrt never had (msvcp140_1/_2, _atomic_wait,
+                // _codecvt_ids) come from vcrt14 for every launch: missing, each
+                // import became a stub (UE's onnxruntime needs msvcp140_1, §55).
+                else if (GetFileAttributesW(vcrt.c_str()) == INVALID_FILE_ATTRIBUTES &&
+                         GetFileAttributesW(vcrt14.c_str()) != INVALID_FILE_ATTRIBUTES)
+                    vcrt = vcrt14;
                 if (GetFileAttributesW(inpkg.c_str()) != INVALID_FILE_ATTRIBUTES)
                     full = inpkg;
                 else if (GetFileAttributesW(vcrt.c_str()) != INVALID_FILE_ATTRIBUTES){
@@ -41794,6 +44596,10 @@ static HMODULE LoadGuestDll(const char* dll)
     // the app container. Map it ourselves so DllMain runs against our beds.
     if (!m && GetFileAttributesW(full.c_str()) != INVALID_FILE_ATTRIBUTES &&
         GhCfgNum(L"gh_selfmap.txt", "GH_SELFMAP", 1)){
+        // Self-mapping stubs whatever the system loader could not bind, so say
+        // what that was first: an EOSSDK refused with ERROR_PROC_NOT_FOUND gave
+        // no other hint (§55).
+        if (e1 != ERROR_DLL_INIT_FAILED) ReportWhyDllFailed(dll, full);
         if (HMODULE sm = GhSelfMapDll(full, dll)){
             Diag(std::string("GUESTDLL self-mapped ") + dll + " -> " + Hex((uintptr_t)sm) +
                  " ms=" + std::to_string((unsigned long long)(GetTickCount64() - tLoad0)));
@@ -41813,7 +44619,148 @@ static HMODULE LoadGuestDll(const char* dll)
     if (m) RepublishGuestTls(dll);
     if (!m) ReportWhyDllFailed(dll, full);
     if (m) PatchModuleForGuest(m, dll);      // it acts for the guest: give it the beds
+    if (m) GhPatchSiblingImports(m, 0);
+    if (m && !g_melonBoot.empty() && !g_melonBooted && 0 == _stricmp(GhDllBaseName(dll).c_str(), "UnityPlayer.dll"))
+        GhMelonBoot(m);
     return m;
+}
+
+// M4.4: UE4SS, loaded as the shimloader's dwmapi.dll proxy loads it on a PC:
+// before any game code, as if from beside the game exe. UE4SS takes its root
+// (Mods\, UE4SS-settings.ini, UE4SS.log) from its own module path, so the
+// loader entry's FullDllName says <exe dir>\ue4ss.dll from before DllMain on;
+// those paths reach the profile through the mounts GhModsBegin set up.
+static std::wstring g_ue4ssAs;
+// UE4SS scans the game's main module for the engine's functions and globals.
+// GetModuleHandle(NULL) is our host; for UE4SS (and only it) it is the game image.
+static HMODULE WINAPI Bed_Ue4ssGetModuleHandleW(LPCWSTR n)
+{
+    if (!n && g_guestImageBase) return (HMODULE)g_guestImageBase;
+    return GetModuleHandleW(n);
+}
+static HMODULE WINAPI Bed_Ue4ssGetModuleHandleA(LPCSTR n)
+{
+    if (!n && g_guestImageBase) return (HMODULE)g_guestImageBase;
+    return GetModuleHandleA(n);
+}
+static BOOL WINAPI Bed_Ue4ssGetModuleHandleExW(DWORD flags, LPCWSTR n, HMODULE* out)
+{
+    if (!n && out && g_guestImageBase){ *out = (HMODULE)g_guestImageBase; return TRUE; }
+    return GetModuleHandleExW(flags, n, out);
+}
+static BOOL WINAPI Bed_Ue4ssGetModuleInformation(HANDLE proc, HMODULE m, LPMODULEINFO mi, DWORD cb)
+{
+    if (m && (uint8_t*)m == g_guestImageBase && mi && cb >= sizeof(MODULEINFO)){
+        auto* nt = (IMAGE_NT_HEADERS64*)(g_guestImageBase + ((IMAGE_DOS_HEADER*)g_guestImageBase)->e_lfanew);
+        mi->lpBaseOfDll = g_guestImageBase;
+        mi->SizeOfImage = g_guestImageSize ? g_guestImageSize : nt->OptionalHeader.SizeOfImage;
+        mi->EntryPoint = g_guestImageBase + nt->OptionalHeader.AddressOfEntryPoint;
+        return TRUE;
+    }
+    return K32GetModuleInformation(proc, m, mi, cb);
+}
+static void GhUe4ssRename(void* dllBase)
+{
+    BYTE* peb = *(BYTE**)((BYTE*)NtCurrentTeb() + 0x60);
+    BYTE* ldr = peb ? *(BYTE**)(peb + 0x18) : nullptr;
+    if (!ldr) return;
+    auto* head = (LIST_ENTRY*)(ldr + 0x10);   // InLoadOrderModuleList
+    int n = 0;
+    for (LIST_ENTRY* e = head->Flink; e && e != head && n < 1024; e = e->Flink, ++n){
+        auto* ent = CONTAINING_RECORD(e, GhSiteLdrEntry, InLoadOrder);
+        if (ent->DllBase != dllBase) continue;
+        if (ent->FullDllName.Buffer == g_ue4ssAs.c_str()) return;
+        ent->FullDllName.Buffer = (PWSTR)g_ue4ssAs.c_str();       // lives for the process
+        ent->FullDllName.Length = (USHORT)(g_ue4ssAs.size() * sizeof(wchar_t));
+        ent->FullDllName.MaximumLength = (USHORT)(ent->FullDllName.Length + sizeof(wchar_t));
+        return;
+    }
+}
+// The beds go on from the load notification: it comes after the imports are
+// bound and before DllMain, and UE4SS's DllMain already settles its paths, opens
+// UE4SS.log, reads the settings and looks for Mods\ -- through its own KERNEL32
+// imports, which LoadGuestDll would only bed once DllMain had returned.
+static std::string g_ue4ssTag;
+static int GhUe4ssBed(HMODULE m)
+{
+    static HMODULE done = nullptr;
+    if (!m || m == done) return 0;
+    done = m;
+    PatchModuleForGuest(m, g_ue4ssTag.c_str());
+    int mh = 0;
+    mh += PatchModuleImport(m, "GetModuleHandleW", (void*)&Bed_Ue4ssGetModuleHandleW);
+    mh += PatchModuleImport(m, "GetModuleHandleA", (void*)&Bed_Ue4ssGetModuleHandleA);
+    mh += PatchModuleImport(m, "GetModuleHandleExW", (void*)&Bed_Ue4ssGetModuleHandleExW);
+    mh += PatchModuleImport(m, "K32GetModuleInformation", (void*)&Bed_Ue4ssGetModuleInformation);
+    mh += PatchModuleImport(m, "GetModuleInformation", (void*)&Bed_Ue4ssGetModuleInformation);
+    return mh;
+}
+static int g_ue4ssMainImports = -1;
+static void GhUe4ssBoot()
+{
+    if (g_ue4ssDll.empty() || g_ue4ssBooted || g_guestDir.empty()) return;
+    g_ue4ssBooted = true;
+    g_ue4ssAs = g_guestDir + L"ue4ss.dll";
+    // Its C++ runtime first, through LoadGuestDll: the copies get the beds
+    // (msvcp140's std::filesystem opens Mods\ and the settings file), and the
+    // 14.5x runtime is chosen while UE4SS is armed.
+    for (const char* n : { "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll",
+                           "msvcp140_atomic_wait.dll", "msvcp140_codecvt_ids.dll" })
+        LoadGuestDll(n);
+    struct UStr { USHORT Length, MaximumLength; PWSTR Buffer; };
+    struct NotifData { ULONG Flags; const UStr* FullDllName; const UStr* BaseDllName; PVOID DllBase; ULONG SizeOfImage; };
+    typedef VOID (CALLBACK* NotifFn)(ULONG, const NotifData*, PVOID);
+    typedef LONG (NTAPI* RegFn)(ULONG, NotifFn, PVOID, PVOID*);
+    typedef LONG (NTAPI* UnregFn)(PVOID);
+    typedef LONG (NTAPI* LockFn)(ULONG, ULONG*, ULONG_PTR*);
+    typedef LONG (NTAPI* UnlockFn)(ULONG, ULONG_PTR);
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    auto reg = (RegFn)GetProcAddress(nt, "LdrRegisterDllNotification");
+    auto unreg = (UnregFn)GetProcAddress(nt, "LdrUnregisterDllNotification");
+    auto lock = (LockFn)GetProcAddress(nt, "LdrLockLoaderLock");
+    auto unlock = (UnlockFn)GetProcAddress(nt, "LdrUnlockLoaderLock");
+    NotifFn cb = [](ULONG reason, const NotifData* d, PVOID) {
+        if (reason != 1 || !d || !d->BaseDllName || !d->BaseDllName->Buffer) return;   // 1 = loaded
+        std::wstring b(d->BaseDllName->Buffer, d->BaseDllName->Length / 2);
+        if (_wcsicmp(b.c_str(), L"ue4ss.dll") != 0) return;
+        GhUe4ssRename(d->DllBase);
+        g_ue4ssMainImports = GhUe4ssBed((HMODULE)d->DllBase);
+    };
+    PVOID cookie = nullptr;
+    char a[1024];
+    if (!WideCharToMultiByte(CP_ACP, 0, g_ue4ssDll.c_str(), -1, a, sizeof a, nullptr, nullptr)){
+        Diag("MODS UE4SS path does not convert -- not loaded");
+        return;
+    }
+    g_ue4ssTag = a;
+    if (reg) reg(0, cb, nullptr, &cookie);
+    // UE4SS's DllMain starts its own thread. Holding the loader lock across the
+    // load keeps that thread out of DLL_THREAD_ATTACH, so none of its code runs
+    // before PatchModuleForGuest has given the module the beds.
+    ULONG_PTR lk = 0;
+    const bool locked = lock && unlock && lock(0, nullptr, &lk) >= 0;
+    const ULONGLONG t0 = GetTickCount64();
+    HMODULE m = LoadGuestDll(a);
+    int mh = 0;
+    if (m){
+        GhUe4ssRename(m);
+        // LoadGuestDll's own PatchModuleForGuest ran again after DllMain and does
+        // not know these five; put them back.
+        mh += PatchModuleImport(m, "GetModuleHandleW", (void*)&Bed_Ue4ssGetModuleHandleW);
+        mh += PatchModuleImport(m, "GetModuleHandleA", (void*)&Bed_Ue4ssGetModuleHandleA);
+        mh += PatchModuleImport(m, "GetModuleHandleExW", (void*)&Bed_Ue4ssGetModuleHandleExW);
+        mh += PatchModuleImport(m, "K32GetModuleInformation", (void*)&Bed_Ue4ssGetModuleInformation);
+        mh += PatchModuleImport(m, "GetModuleInformation", (void*)&Bed_Ue4ssGetModuleInformation);
+    }
+    if (locked) unlock(0, lk);
+    if (cookie && unreg) unreg(cookie);
+    wchar_t mp[MAX_PATH] = L"";
+    if (HMODULE cp = GetModuleHandleW(L"msvcp140.dll")) GetModuleFileNameW(cp, mp, MAX_PATH);
+    Diag(std::string("MODS UE4SS ") + (m ? "loaded" : "FAILED") + " as " + RegNarrow(g_ue4ssAs) +
+         " ms=" + std::to_string((unsigned long long)(GetTickCount64() - t0)) +
+         (locked ? "" : " (no loader lock)") + " main-module imports=" + std::to_string(mh) +
+         (g_ue4ssMainImports < 0 ? " NOT bedded before DllMain" : " bedded before DllMain") +
+         " msvcp140=" + RegNarrow(mp));
 }
 
 // #162. Windows pins a statically-imported DLL for the life of the process: the
@@ -41881,12 +44828,21 @@ static uint64_t MissingStubLog(const char* name)
     if (seen[name]++ == 0) Diag(std::string("STUB-CALLED ") + name);
     return 0;
 }
+// FinalizeStubs makes the page executable, and a DLL mapped later (GhSelfMapDll
+// from a guest LoadLibrary, after the exe's entry) still wants stubs: writing
+// into the now read-execute page faulted (§55, RV There Yet?'s onnxruntime). So a
+// finalized or full page is left as it is and the next stub starts a fresh one.
+static SRWLOCK g_tramLock = SRWLOCK_INIT;
+static bool g_tramFinal = false;
 static void* MakeStub(const char* dll, const char* fn)
 {
-    if (!g_tramPage){
+    AcquireSRWLockExclusive(&g_tramLock);
+    if (!g_tramPage || g_tramFinal || g_tramOff + 32 > g_tramCap){
         g_tramCap = 0x10000;
         g_tramPage = (uint8_t*)VirtualAlloc(nullptr, g_tramCap, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
         g_tramOff = 0;
+        g_tramFinal = false;
+        if (!g_tramPage){ ReleaseSRWLockExclusive(&g_tramLock); return nullptr; }
     }
     g_stubNames.push_back(std::string(dll) + "!" + fn);
     uint64_t np = (uint64_t)g_stubNames.back().c_str();
@@ -41899,11 +44855,18 @@ static void* MakeStub(const char* dll, const char* fn)
     uint8_t* stub = g_tramPage + g_tramOff;
     std::memcpy(stub, code, sizeof(code));
     g_tramOff += sizeof(code);
+    ReleaseSRWLockExclusive(&g_tramLock);
     return stub;
 }
 static void FinalizeStubs()   // make trampoline page executable before entry
 {
-    if (g_tramPage){ DWORD old; VirtualProtect(g_tramPage, g_tramCap, PAGE_EXECUTE_READ, &old); }
+    AcquireSRWLockExclusive(&g_tramLock);
+    if (g_tramPage && !g_tramFinal){
+        DWORD old; VirtualProtect(g_tramPage, g_tramCap, PAGE_EXECUTE_READ, &old);
+        FlushInstructionCache(GetCurrentProcess(), g_tramPage, g_tramCap);
+        g_tramFinal = true;
+    }
+    ReleaseSRWLockExclusive(&g_tramLock);
 }
 
 // Redirect a *loaded* module's IAT entry for `target` to `repl`. Needed because
@@ -43419,8 +46382,7 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
         Diag(ib);
     }
     uintptr_t ret = 0;
-    __try { ret = *(uintptr_t*)c->Rsp; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { ret = 0; }
+    if (!SafeQword((uintptr_t)c->Rsp, &ret)) ret = 0;   // clang 23: no __try beside std::string
     Diag("  ret=" + NameForCodeAddr(ret));
     // A register dump names the instruction; only the stack names the CALL. The
     // driver reaches its command-recording code through a DDI function table, so
@@ -44015,6 +46977,105 @@ static bool GhInAnyMod(const std::vector<GhModRange>& m, uintptr_t a)
     return false;
 }
 
+// §53 M4.1: MelonLoader 0.7.3's bootstrap is NativeAOT, and on the console one of
+// its threads spins forever in ThreadStore::DetachCurrentThread (+0x5F52C5): it
+// holds the thread-store lock and walks the thread list looking for itself, and
+// the list has a cycle. Each node is a Thread object embedded in its thread's own
+// implicit-TLS block (block+0x30; state at +0x38, next at +0x58). Walk the list
+// from outside, read-only, and name the live thread that owns each node, so a
+// node whose thread is gone -- the way such a cycle forms -- shows up when it
+// appears. The RVAs are 0.7.3's; GetThreadStore's bytes are checked first, so
+// any other build prints nothing. Printed only when the list changes.
+static std::string g_mltsLast;
+struct GhMltsOwner { DWORD tid; std::string start; unsigned long long seen; };
+static std::vector<std::pair<uintptr_t, GhMltsOwner>> g_mltsOwners;   // last owner per node address
+static void GhMelonThreadStoreScan(const std::vector<DWORD>& tids)
+{
+    if (!g_melonBootMod) return;
+    const uintptr_t base = (uintptr_t)g_melonBootMod;
+    const HANDLE me = GetCurrentProcess();
+    auto rd = [&](uintptr_t a, void* dst, size_t n){
+        SIZE_T got = 0;
+        return ReadProcessMemory(me, (LPCVOID)a, dst, n, &got) && got == n;
+    };
+    BYTE gts[8];      // GetThreadStore: mov rax,[rip+disp32]; ret
+    if (!rd(base + 0x5F0DA0, gts, 8) || gts[0] != 0x48 || gts[1] != 0x8B || gts[2] != 0x05 || gts[7] != 0xC3) return;
+    int32_t disp; std::memcpy(&disp, gts + 3, 4);
+    const uintptr_t storeVar = base + 0x5F0DA7 + disp;
+    auto* nt = (IMAGE_NT_HEADERS64*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
+    const auto& dd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (!dd.VirtualAddress) return;
+    DWORD idx = 0;
+    if (!rd((uintptr_t)((IMAGE_TLS_DIRECTORY64*)(base + dd.VirtualAddress))->AddressOfIndex, &idx, 4)) return;
+
+    typedef LONG (WINAPI *NtQIT)(HANDLE, int, void*, ULONG, ULONG*);
+    static NtQIT ntqit = (NtQIT)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
+    if (!ntqit) return;
+    std::vector<std::pair<uintptr_t, DWORD>> own;     // node -> owning tid
+    for (DWORD tid : tids){
+        HANDLE t = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+        if (!t) continue;
+        struct { LONG ExitStatus; void* Teb; void* Pid; void* Tid; ULONG_PTR Aff; LONG Prio, BasePrio; } tbi{};
+        uintptr_t arr = 0, blk = 0;
+        if (ntqit(t, 0, &tbi, sizeof tbi, nullptr) >= 0 && tbi.Teb &&
+            rd((uintptr_t)tbi.Teb + 0x58, &arr, 8) && arr && rd(arr + idx * 8ull, &blk, 8) && blk){
+            own.push_back({blk + 0x30, tid});
+            // Remember who owned each node, so a node whose thread exits without
+            // detaching can be named afterwards (start routine via class 9).
+            bool known = false;
+            for (auto& o : g_mltsOwners) if (o.first == blk + 0x30 && o.second.tid == tid){ known = true; break; }
+            if (!known){
+                void* start = nullptr;
+                ntqit(t, 9, &start, sizeof start, nullptr);
+                GhMltsOwner w{tid, NameForCodeAddr((uintptr_t)start), GhUpMs()};
+                bool put = false;
+                for (auto& o : g_mltsOwners) if (o.first == blk + 0x30){ o.second = w; put = true; break; }
+                if (!put) g_mltsOwners.push_back({blk + 0x30, w});
+            }
+        }
+        CloseHandle(t);
+    }
+    // GetThreadStore() returns *storeVar; DetachCurrentThread derefs that once more
+    // for the ThreadStore, whose first field is the list head (lock at +0x10).
+    uintptr_t slot = 0, store = 0, cur = 0;
+    if (!rd(storeVar, &slot, 8) || !slot || !rd(slot, &store, 8) || !store || !rd(store, &cur, 8)) return;
+    std::vector<uintptr_t> seen;
+    std::string list, gone;
+    int cycleTo = -1, nGone = 0;
+    while (cur && seen.size() < 512){
+        for (size_t k = 0; k < seen.size(); ++k) if (seen[k] == cur){ cycleTo = (int)k; break; }
+        if (cycleTo >= 0) break;
+        seen.push_back(cur);
+        DWORD state = 0; uintptr_t next = 0;
+        const bool ok = rd(cur + 0x38, &state, 4) && rd(cur + 0x58, &next, 8);
+        DWORD owner = 0;
+        for (auto& o : own) if (o.first == cur){ owner = o.second; break; }
+        list += " " + Hex((uint64_t)cur) + "/" + Hex(state) + "/" + (owner ? std::to_string(owner) : std::string("GONE"));
+        if (!owner){
+            ++nGone;
+            gone += "\n  MLTS gone " + Hex((uint64_t)cur) + " state=" + Hex(state) + " next=" + Hex((uint64_t)next);
+            for (auto& o : g_mltsOwners) if (o.first == cur){
+                bool alive = false;
+                for (DWORD t : tids) if (t == o.second.tid){ alive = true; break; }
+                uintptr_t now = 0;
+                for (auto& w : own) if (w.second == o.second.tid){ now = w.first; break; }
+                gone += " last-owner tid=" + std::to_string(o.second.tid) + (alive ? " ALIVE now-node=" + Hex((uint64_t)now) : std::string(" exited")) +
+                        " first-seen=" + std::to_string(o.second.seen) + "ms";
+                break;
+            }
+        }
+        if (!ok) break;
+        cur = next;
+    }
+    std::string sig = "MLTS n=" + std::to_string(seen.size()) + " gone=" + std::to_string(nGone) +
+                      " tlsdetach=" + std::to_string(g_mlTlsDetachRuns) + "/" + std::to_string(g_mlTlsDetached) +
+                      " cycle=" + (cycleTo >= 0 ? "back-to-#" + std::to_string(cycleTo) : std::string("none")) +
+                      " tlsidx=" + std::to_string(idx) + " :" + list;
+    if (sig == g_mltsLast) return;
+    g_mltsLast = sig;
+    Diag("MLTS t=" + std::to_string(GhUpMs()) + "ms " + sig.substr(5) + gone);
+}
+
 static void GhRipCensus(const char* why, unsigned forceWords = 0)
 {
     // Stamped BEFORE the first suspend. The header used to be built after the
@@ -44111,6 +47172,7 @@ static void GhRipCensus(const char* why, unsigned forceWords = 0)
         if (out.size() >= 12288){ Diag(out); out.clear(); }
     }
     if (!out.empty()) Diag(out);
+    GhMelonThreadStoreScan(tids);
 }
 
 // #236 CPUPROF. BD13 ran the world at 2.2-3.6 game fps with both volume passes stood in,
@@ -45223,6 +48285,21 @@ static void NeutralizePreviousGuest()
 }
 #endif
 
+// The COM apartment of the calling thread, for the guest thread's log. UE's
+// FWindowsPlatformMisc::CommandLineCommands does CoInitializeEx(STA) and quits
+// the engine silently on any failure, so a guest thread that something of ours
+// already made MTA is a clean exit(1) with no reason given (RV v15/v16:
+// 0x80010106 RPC_E_CHANGED_MODE).
+static void GhLogApartment(const char* where)
+{
+    using Fn = HRESULT (WINAPI*)(int*, int*);
+    static Fn fn = (Fn)GetProcAddress(GetModuleHandleW(L"combase.dll"), "CoGetApartmentType");
+    int type = -2, qual = -2;
+    const HRESULT hr = fn ? fn(&type, &qual) : E_NOTIMPL;
+    Diag(std::string("APT ") + where + " tid=" + std::to_string((unsigned long)GetCurrentThreadId()) +
+         " hr=" + Hex((uint32_t)hr) + " type=" + std::to_string(type) + " qual=" + std::to_string(qual));
+}
+
 static void UnmapGuestImage()
 {
     if (g_guestFnTable) {
@@ -45230,6 +48307,14 @@ static void UnmapGuestImage()
         g_guestFnTable = nullptr;
     }
     if (g_guestImageBase) {
+        // The donor's template points INTO this image, and its TLS callback
+        // copies it into every thread that starts from now on -- host threads
+        // included. Disarm it first, or the next thread start after a guest exit
+        // reads freed memory inside DLL_THREAD_ATTACH and takes the process down
+        // (RV There Yet? v15: ghtls0+0xB5FD, then VEH REENTRY, crash screen lost).
+        if (g_tlsDonor)
+            if (auto setFn = (BOOL (*)(const void*, unsigned, unsigned))GetProcAddress(g_tlsDonor, "GhTlsSetTemplate"))
+                setFn(nullptr, 0, 0);
         uint64_t was = (uint64_t)g_guestImageBase;
         BOOL ok = SafeVirtualFree(g_guestImageBase);
         Diag(std::string("STAGE=guest_image_freed base=") + Hex(was) +
@@ -45703,6 +48788,7 @@ static bool MapAndRun(std::vector<uint8_t>& file)
     ArmGuestTracepoints(base, imageSize);
     GhPatchPsPcTrustCheck(base, imageSize);
     GhPatchPsPcInit(base, imageSize);        // #164
+    GhPatchTsuMemFloor(base, imageSize);     // #273
 
     // Register SEH unwind info for the guest's code range.
     auto& excDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
@@ -45721,10 +48807,12 @@ static bool MapAndRun(std::vector<uint8_t>& file)
     // #183. Before the entry point, not after: its own prologue is the first
     // reader of the cookie.
     GhSeedGuestCookie(base, nt);
+    GhUe4ssBoot();                       // M4.4: before any game code, as the shimloader proxy does
 
     // Call the entry point, guarded so guest exit() returns here. SEH lives in
     // CallGuestEntry (no C++ unwind objects) so an AV cannot kill the process.
     void* entry = base + nt->OptionalHeader.AddressOfEntryPoint;
+    GhLogApartment("entry");
     Diag("STAGE=calling_entry entry=" + Hex((uint64_t)entry));
     if (setjmp(g_guestReturn) == 0){
         auto fn = reinterpret_cast<int(*)()>(entry);
@@ -45865,7 +48953,7 @@ static bool MapChildImage(const std::vector<uint8_t>& file, uint8_t** outBase, v
                 }
                 auto* ibn = (IMAGE_IMPORT_BY_NAME*)(base + oft->u1.AddressOfData);
                 void* p = ResolveImport(dll, ibn->Name);
-                if (!p) p = MakeStub(dll, ibn->Name);
+                if (!p){ p = MakeStub(dll, ibn->Name); Diag(std::string("SELFMAP STUB ") + dll + "!" + ibn->Name); }
                 ft->u1.Function = (ULONGLONG)p;
             }
         }
@@ -45910,9 +48998,11 @@ static BOOL GhCallDllMainSeh(void* entry, uint8_t* base, DWORD* outCode)
 // of every thread's TLS array -- someone else's block. Give it a real OS index
 // from donor ghtls<slot>.dll instead, exactly as the guest's main image gets
 // one: the donor seeds the template into every thread created after it loads,
-// and GhTlsSetTemplate seeds the calling thread. Threads that predate the donor
-// are NOT seeded, so only call into such a module from new threads or this one.
-// TLS callbacks are not run; a module that has them is refused.
+// GhTlsSetTemplate seeds the calling thread, and the threads that predate the
+// donor are seeded by TEB. EOSSDK (RV There Yet?, §55) keeps a relocated pointer
+// in its template and crashed in its first static constructor without this.
+// TLS callbacks are not run: MSVC's is __dyn_tls_init, which only matters with
+// thread_local dynamic initializers, and a module that has those is refused.
 static bool GhSelfMapTls(uint8_t* base, unsigned slot)
 {
     auto* nt  = (IMAGE_NT_HEADERS64*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
@@ -45920,22 +49010,41 @@ static bool GhSelfMapTls(uint8_t* base, unsigned slot)
     if (!dir.Size) return true;
     auto* tls = (IMAGE_TLS_DIRECTORY64*)(base + dir.VirtualAddress);
     if (tls->AddressOfCallBacks && *(ULONGLONG*)tls->AddressOfCallBacks) {
-        Diag("SELFMAP TLS: module has TLS callbacks -- refusing"); return false;
+        // __dyn_tls_init walks [__xd_a, __xd_z); its two LEAs name the same
+        // address when the module has no thread_local dynamic initializers.
+        const uint8_t* cb = (const uint8_t*)*(ULONGLONG*)tls->AddressOfCallBacks;
+        const uint8_t* lea1 = nullptr; const uint8_t* lea2 = nullptr;
+        for (int k = 0; k < 0x60 && !lea2; ++k){
+            if (cb[k] == 0x48 && cb[k+1] == 0x8D && (cb[k+2] & 0xC7) == 0x05){
+                const uint8_t* t = cb + k + 7 + *(const int32_t*)(cb + k + 3);
+                if (!lea1) lea1 = t; else lea2 = t;
+                k += 6;
+            }
+        }
+        if (!lea1 || lea1 != lea2){
+            Diag("SELFMAP TLS: module has TLS callbacks with work to do -- refusing"); return false;
+        }
+        Diag("SELFMAP TLS: callback is an empty __dyn_tls_init -- not run");
     }
     const unsigned raw = (unsigned)(tls->EndAddressOfRawData - tls->StartAddressOfRawData);
     const unsigned total = raw + tls->SizeOfZeroFill;
     const std::wstring name = L"ghtls" + std::to_wstring(slot) + L".dll";
     const std::wstring path = FindGuestSupportDll(name.c_str());
     HMODULE h = path.empty() ? nullptr : LoadLibraryW(path.c_str());
-    auto idxFn = h ? (ULONG (*)(void))GetProcAddress(h, "GhTlsIndex") : nullptr;
-    auto setFn = h ? (BOOL (*)(const void*, unsigned, unsigned))GetProcAddress(h, "GhTlsSetTemplate") : nullptr;
-    if (!idxFn || !setFn) { Diag("SELFMAP TLS: donor " + std::string(name.begin(), name.end()) + " unavailable"); return false; }
+    auto idxFn  = h ? (ULONG (*)(void))GetProcAddress(h, "GhTlsIndex") : nullptr;
+    auto setFn  = h ? (BOOL (*)(const void*, unsigned, unsigned))GetProcAddress(h, "GhTlsSetTemplate") : nullptr;
+    auto seedFn = h ? (BOOL (*)(void*))GetProcAddress(h, "GhTlsSeedBlock") : nullptr;
+    if (!idxFn || !setFn || !seedFn) { Diag("SELFMAP TLS: donor " + std::string(name.begin(), name.end()) + " unavailable"); return false; }
     if (!setFn((const void*)tls->StartAddressOfRawData, raw, total)) {
         Diag("SELFMAP TLS: donor refused template total=" + Hex((uint32_t)total)); return false;
     }
-    *(DWORD*)tls->AddressOfIndex = idxFn();
-    Diag("SELFMAP TLS: donor slot=" + std::to_string(slot) + " index=" + std::to_string(idxFn()) +
-         " template=" + Hex((uint32_t)total));
+    const ULONG index = idxFn();
+    *(DWORD*)tls->AddressOfIndex = index;
+    int seeded = 0, missed = 0;
+    GhSeedExistingThreads(index, seedFn, seeded, missed);
+    Diag("SELFMAP TLS: donor slot=" + std::to_string(slot) + " index=" + std::to_string(index) +
+         " template=" + Hex((uint32_t)total) + " existing_seeded=" + std::to_string(seeded) +
+         " no_block=" + std::to_string(missed));
     return true;
 }
 
@@ -45957,6 +49066,17 @@ static HMODULE GhSelfMapDll(const std::wstring& full, const char* dll, bool (*pr
     ReleaseSRWLockExclusive(&g_selfModLock);
     Diag("SELFMAP " + nm + " mapped base=" + Hex((uintptr_t)base) +
          " entry=" + Hex((uintptr_t)entry) + " size=" + Hex((uint64_t)bytes.size()));
+    // Slot 0 is the guest's main image (TryRealGuestTls); the rest are handed
+    // out to self-mapped DLLs that carry TLS, one each, first come first served.
+    {
+        auto* tnt = (IMAGE_NT_HEADERS64*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
+        static volatile LONG s_nextSlot = 0;
+        if (tnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size && !preMain){
+            const LONG slot = InterlockedIncrement(&s_nextSlot);
+            if (slot > 3 || !GhSelfMapTls(base, (unsigned)slot))
+                Diag("SELFMAP " + nm + " has a TLS directory and no index of its own");
+        }
+    }
 
     if (preMain && !preMain(base)){
         AcquireSRWLockExclusive(&g_selfModLock);
@@ -46032,7 +49152,7 @@ static BOOL WINAPI Bed_CreateProcessW(
     {
         std::wstring low; low.reserve(exe.size());
         for (wchar_t c : exe) low += (c >= L'A' && c <= L'Z') ? (wchar_t)(c + 32) : c;
-        if (low.find(L"crashhandler") != std::wstring::npos){
+        if (low.find(L"crashhandler") != std::wstring::npos || low.find(L"crashpad_handler") != std::wstring::npos){
             Diag("CP: refusing crash handler " + std::string(exe.begin(), exe.end()));
             SetLastError(ERROR_FILE_NOT_FOUND); return FALSE;
         }
@@ -46267,6 +49387,7 @@ static void PollSyntheticPad()
             g_synBtn = btn; g_synLX = lx; g_synLY = ly; g_synRX = rx; g_synRY = ry;
             g_synUntil = now + (DWORD)hold;
             if (!g_synLogged){ g_synLogged = true; Diag("INPUT synthpad: hook armed"); }
+            g_synSticky = true;
             char msg[128];
             std::snprintf(msg, sizeof msg, "INPUT synthpad fire btn=0x%04X LX=%d LY=%d RX=%d RY=%d hold=%ldms",
                           btn, lx, ly, rx, ry, hold);
@@ -46956,6 +50077,11 @@ static void RunGuest()
     g_guestExePath = gp;
     g_mainModule = GetModuleHandleW(nullptr);   // real host exe base; GetModuleFileName beds map it to the guest
     GhTitleBegin(gp);                           // per-title knob defaults + package seeds, before any guest code
+    // Read here, not in GhInitGuestDisplay: the launcher handoff runs that before the
+    // title is chosen, so a title config's "knobs" would not reach it.
+    g_gpuVendor = GhCfgNum(L"gh_gpu_vendor.txt", "GH_GPU_VENDOR", 0) & 0xFFFF;
+    if (g_gpuVendor) Diag("DISPLAY console GPU reported as vendor " + Hex((uint32_t)g_gpuVendor));
+    GhModsBegin();                              // §51: arm ghdoorstop when the title has a mod profile
     {   // guest\ -- where a guest's own shipped DLLs live
         size_t slash = gp.find_last_of(L"\\/");
         if (slash != std::wstring::npos) g_guestDir = gp.substr(0, slash + 1);
@@ -47183,6 +50309,7 @@ static void RunGuest()
         // and <_Data>\MonoBleedingEdge\ -- none of which includes Plugins.
         // Preloading here under the bare name registers the module so Mono's
         // LoadLibraryA("steam_api64") finds it in the loader's module list.
+        GhWatchSteamLoads();
         if (HMODULE already = GetModuleHandleA("steam_api64.dll")) {
             // Launcher already preloaded the shim for QR login. Do not also
             // LoadLibrary the Valve copy from the Steam tree (second module).
@@ -47303,6 +50430,7 @@ static void RunGuest()
     if (g_guestCmdLineW == L"7za" || g_guestCmdLineW == L"7za.exe")
         g_guestCmdLineW = gp;
     g_guestCmdLineW += GuestExtraArgs(gp);
+    g_guestCmdLineW += g_modArgs;
 #else
     g_guestCmdLineW = ReadCfgW(L"ghcmd.txt", L"7za");
 #endif
@@ -47473,6 +50601,7 @@ static DWORD WINAPI GhGuestWorkerProc(LPVOID)
     Diag("GUESTSTACK tid=" + std::to_string((unsigned long)g_guestWorkerTid) +
          " low=" + Hex((uint64_t)lo) + " high=" + Hex((uint64_t)hi) +
          " reserve=" + std::to_string((unsigned long long)((hi - lo) >> 20)) + "MB");
+    GhLogApartment("worker");
     GhProbePsPcDeps();          // #165, knob-gated
     RunGuest();
     g_guestDone = true;
@@ -47492,6 +50621,18 @@ static void GhStartGuestWorker()
              "MB) failed err=" + std::to_string((unsigned long)GetLastError()) +
              " -- falling back to the default stack");
     }
+    // NOT std::thread: in a packaged app the UCRT's _beginthreadex makes every
+    // thread it starts MTA (RoInitialize(RO_INIT_MULTITHREADED) before the
+    // thread proc), and the guest's main thread must arrive with no apartment.
+    // UE's CommandLineCommands does CoInitializeEx(STA), gets RPC_E_CHANGED_MODE
+    // and quits with no message (RV There Yet? v15-v17: APT type=1 at the very
+    // top of the worker). Only the gh_guest_stack_mb path used CreateThread, so
+    // RV ran exactly while Tsushima's early knobs were leaking into it.
+    if (HANDLE h = CreateThread(nullptr, 0, &GhGuestWorkerProc, nullptr, 0, nullptr)){
+        CloseHandle(h); return;
+    }
+    Diag("GUESTSTACK CreateThread failed err=" + std::to_string((unsigned long)GetLastError()) +
+         " -- falling back to std::thread (an MTA thread)");
     std::thread([]{ GhGuestWorkerProc(nullptr); }).detach();
 }
 
@@ -47735,9 +50876,22 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
         OverlayLoadRemap();
         SnapshotHostThreads();
         g_guestStarted = true;
+        bool firstPick = true;
         for (;;) {
             ResetGuestForRelaunch();
-            std::wstring picked = LauncherPickGuest(loginStatus);
+            // §52: a Start-without-mods relaunch, or a modded start that took the
+            // process down, comes before the picker.
+            std::wstring picked;
+            if (firstPick){
+                firstPick = false;
+                picked = LuiModsRecoverAtStart();
+                if (picked.empty()) picked = GhLaunchMarkerConsume();
+                else DeleteFileW(GhLaunchMarkerPath().c_str());
+            }
+            if (picked.empty()) {
+                picked = LauncherPickGuest(loginStatus);
+                if (!picked.empty() && !LuiModsStreakGate(picked)) continue;
+            }
             if (picked.empty()) {
                 Diag("LAUNCHER picker empty — staying open");
                 while (true) {
@@ -47748,6 +50902,27 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
             if (!LuiEntGate(picked)) continue;   // §43: no live membership, no launch
             if (!LuiShaderBakeGate(picked)) continue;   // §47: its title waits for the bake
             LuiShaderBakeStop();                // §47: the game gets the cores back
+            {
+                std::string why;
+                // not for a mods "Start without mods" launch: that one-shot lives
+                // in this process and a restart would arm the profile again
+                if (!g_modsSkipOnce && GhEarlyNeedsRelaunch(picked, &why) &&
+                    GhLaunchMarkerWrite(picked, g_launcherSelectedApp)){
+                    Diag("STAGE=title_relaunch " + RegNarrow(picked) + ": " + why + " -- requesting_host_restart");
+                    try {
+                        CoreApplication::RequestRestartAsync(L"");
+                        DWORD t0 = GetTickCount();
+                        while (GetTickCount() - t0 < 8000) {
+                            window.Dispatcher().ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+                            Sleep(50);
+                        }
+                        Diag("STAGE=restart_timeout -- launching here with the early knobs it has");
+                    } catch (...) {
+                        Diag("STAGE=restart_threw -- launching here with the early knobs it has");
+                    }
+                    DeleteFileW(GhLaunchMarkerPath().c_str());
+                }
+            }
             g_launcherSelectedGuest = picked;
             Diag("LAUNCHER handoff guest='" + std::string(g_launcherSelectedGuest.begin(), g_launcherSelectedGuest.end()) + "'");
             SnapshotHostThreads();
@@ -47776,7 +50951,13 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
                 }
             };
             g_uiTid = GetCurrentThreadId();
+            const ULONGLONG guestT0 = GetTickCount64();
+            bool modStarted = false;
             while (!g_guestDone){
+                if (!modStarted && g_modsArmedRun && GetTickCount64() - guestT0 >= kModRunStartedMs){
+                    modStarted = true;
+                    GhModRunStarted();          // §52: the failure streak ends
+                }
                 { UiStep _s("ProcessEvents");
                   window.Dispatcher().ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent); }
                 { UiStep _s("PollGamepadOnUi");  PollGamepadOnUi();  }
@@ -47795,6 +50976,10 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
             GhAudioStopCapture();
 #endif
             NeutralizePreviousGuest();
+            const bool modRun = g_modsArmedRun;
+            const bool modBad = modRun && !g_guestUserQuit &&
+                (g_guestCrashed || g_guestExitCode != 0 || !g_guestFailWhy.empty());
+            GhModRunEnd(modBad);
             if (g_guestUserQuit) {
                 // Unity's allocator is process-global ("Memory manager is already
                 // initialized!" on the 0.0.58 relaunch). TerminateThread/FreeLibrary
@@ -47834,12 +51019,57 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
                 reason = L"exit code " + std::to_wstring(g_guestExitCode);
             if (stubbed && g_guestFailWhy.empty())
                 reason = L"guest called a stubbed import (see log) · exit " + std::to_wstring(g_guestExitCode);
-            LauncherShowCrash(title, reason, lines);
+            if (modBad) {
+                // §52: a modded launch that crashed offers the same game without
+                // its mods. Unity cannot start twice in one process, so the
+                // vanilla launch happens in a restarted host.
+                if (!bad) title = modStarted ? L"GAME CRASHED" : L"LAUNCH FAILED";
+                reason = L"with mods (" + LuiModsProfileLabel() + L") · " + reason;
+                // Drawn by the restarted host (LuiModsRecoverAtStart): this
+                // process can stall whole until the shell kills it.
+                LuiModsCrashSave(title, reason, lines);
+                Diag("STAGE=guest_done mods_crash requesting_host_restart");
+                try {
+                    CoreApplication::RequestRestartAsync(L"");
+                    DWORD t0 = GetTickCount();
+                    while (GetTickCount() - t0 < 8000) {
+                        window.Dispatcher().ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+                        Sleep(50);
+                    }
+                    Diag("STAGE=restart_timeout — crash screen here");
+                } catch (...) {
+                    Diag("STAGE=restart_threw — crash screen here");
+                }
+                std::wstring t2, r2;
+                std::vector<std::string> l2;
+                LuiModsCrashLoad(t2, r2, l2);     // shown here instead: drop the saved copy
+                if (LuiModsCrashScreen(title, reason, lines, g_modRunRoot)) {
+                    LuiModsLaunchOnceWrite();
+                    Diag("STAGE=guest_done mods_vanilla requesting_host_restart");
+                    try {
+                        CoreApplication::RequestRestartAsync(L"");
+                        DWORD t0 = GetTickCount();
+                        while (GetTickCount() - t0 < 8000) {
+                            window.Dispatcher().ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+                            Sleep(50);
+                        }
+                        Diag("STAGE=restart_timeout — staying on picker");
+                    } catch (...) {
+                        Diag("STAGE=restart_threw — staying on picker");
+                    }
+                    DeleteFileW(LuiModsLaunchOncePath().c_str());
+                }
+            } else
+                LauncherShowCrash(title, reason, lines);
             ResetGuestForRelaunch();
         }
 #else
         g_guestStarted = true;
-        std::thread([]{ RunGuest(); g_guestDone = true; }).detach();
+        // CreateThread, not std::thread: see GhStartGuestWorker (UCRT makes
+        // _beginthreadex threads MTA in a packaged app)
+        if (HANDLE h = CreateThread(nullptr, 0, [](LPVOID) -> DWORD { RunGuest(); g_guestDone = true; return 0; },
+                                    nullptr, 0, nullptr)) CloseHandle(h);
+        else std::thread([]{ RunGuest(); g_guestDone = true; }).detach();
         // Pump the view while the guest runs so the app stays responsive; the
         // guest is on its own thread and may never return (fatal teardown).
         while (!g_guestDone){
