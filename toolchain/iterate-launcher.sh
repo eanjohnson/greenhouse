@@ -68,6 +68,7 @@ clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \
   /imsvc "$SDK/crt/include" /imsvc "$SDK/sdk/include/$SDKVER/ucrt" \
   /imsvc "$SDK/sdk/include/$SDKVER/um" /imsvc "$SDK/sdk/include/$SDKVER/shared" \
   /imsvc "$SDK/sdk/include/cppwinrt" /I "$GH/corpus/vendor/qrcodegen" \
+  /imsvc "$GH/toolchain/wdk-inc" \
   "$SRC" "$GH/corpus/vendor/qrcodegen/qrcodegen.c" \
   -o "$STAGE/p0_spike_host.exe" \
   /link /libpath:"$SDK/crt/lib/x86_64" /libpath:"$SDK/sdk/lib/um/x86_64" /libpath:"$SDK/sdk/lib/ucrt/x86_64" \
@@ -240,8 +241,8 @@ find "$STAGE/guest/vcrt" "$TSEED" -type f -printf '  %8s %P\n'
 # TLS index and maintains a block for every thread. The loader points a guest
 # module's _tls_index at one of these instead of faking index 128. One DLL per
 # guest module that needs an index; the loader loads only the ones it uses.
-echo "== build TLS index donors (ghtls0..3) =="
-for n in 0 1 2 3; do
+echo "== build TLS index donors (ghtls0..15) =="
+for n in $(seq 0 15); do
   clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \
     /std:c++20 /EHsc /MT /O2 /LD \
     /imsvc "$SDK/crt/include" /imsvc "$SDK/sdk/include/$SDKVER/ucrt" \

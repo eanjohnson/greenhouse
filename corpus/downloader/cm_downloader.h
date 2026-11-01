@@ -73,6 +73,11 @@ inline int g_logBudget = 0;
 inline void ghlog(const std::string& s){ if(g_logFn && g_logBudget>0){ g_logBudget--; g_logFn(("GHDL "+s).c_str()); } }
 // Unbudgeted sink for the 20XX.exe experiment (plan: never rely on g_logBudget).
 inline void ghlog_always(const std::string& s){ if(g_logFn) g_logFn(("GHDL "+s).c_str()); }
+// Cancel hook: the host's "user pressed B" query. Polled before each CDN request,
+// chunk and workshop item; a request already in flight runs to its timeout.
+typedef int(*CancelFn)();
+inline CancelFn g_cancelFn = nullptr;
+inline bool cancelled(){ return g_cancelFn && g_cancelFn(); }
 inline bool is_20xx_exe(const std::string& rel){
     size_t sl=rel.find_last_of("/\\"); const char* b=(sl==std::string::npos)?rel.c_str():rel.c_str()+sl+1;
     return _stricmp(b,"20XX.exe")==0;
@@ -391,7 +396,7 @@ struct VdfParser {
         ws(); if(p<e&&*p=='{'){ p++; VdfNode c; obj(c); n.kids.emplace_back(std::move(k),std::move(c)); }
         else { std::string v; tok(v); VdfNode c; c.value=std::move(v); n.kids.emplace_back(std::move(k),std::move(c)); } } }
 };
-struct DepotInfo { uint32_t depot=0; uint64_t manifest=0; };
+struct DepotInfo { uint32_t depot=0; uint64_t manifest=0; std::string branch; };   // branch the manifest came from
 inline bool vdf_all_digits(const std::string& s){ if(s.empty())return false; for(char c:s) if(c<'0'||c>'9')return false; return true; }
 // Resolve the downloadable depots (numeric depot id + public-branch manifest gid) from
 // an appinfo VDF. Skips: named sub-sections (branches/baselanguages/...), depots with an
@@ -404,13 +409,16 @@ inline void parse_app_depots_vdf(const Bytes& vdf,const std::string& branch,std:
     const VdfNode* depots=app->find("depots"); if(!depots)return;
     for(auto& kv:depots->kids){ if(!vdf_all_digits(kv.first))continue; const VdfNode& d=kv.second;
         const VdfNode* mans=d.find("manifests"); if(!mans)continue;
-        const VdfNode* pub=mans->find(branch.c_str()); if(!pub)continue;
+        // A beta lists only the depots it changes; the rest come from public.
+        std::string from=branch; const VdfNode* pub=mans->find(branch.c_str());
+        if(!pub&&branch!="public"){ pub=mans->find("public"); from="public"; }
+        if(!pub)continue;
         std::string gid; if(!pub->kids.empty()){ const VdfNode* g=pub->find("gid"); if(g)gid=g->value; } else gid=pub->value;
         if(gid.empty())continue;
         const VdfNode* cfg=d.find("config");
         if(cfg){ const VdfNode* os=cfg->find("oslist"); if(os&&!os->value.empty()&&os->value.find("windows")==std::string::npos) continue; }
         if(d.find("depotfromapp")||d.find("sharedinstall")) continue;
-        DepotInfo di; di.depot=(uint32_t)strtoul(kv.first.c_str(),0,10); di.manifest=strtoull(gid.c_str(),0,10);
+        DepotInfo di; di.depot=(uint32_t)strtoul(kv.first.c_str(),0,10); di.manifest=strtoull(gid.c_str(),0,10); di.branch=from;
         if(di.depot&&di.manifest) out.push_back(di); }
 }
 
@@ -656,25 +664,33 @@ inline int ListOwnedGames(uint64_t sid,const std::string& token,const std::strin
 
 inline Bytes http_fetch(const std::wstring& host,const std::wstring& path){
     Bytes out; HINTERNET hS=WinHttpOpen(L"gh",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,0,0,0); if(!hS)return out;
+    // Bounded: a CDN host that accepts and then stalls must fail over, not hold
+    // the caller for the WinHTTP defaults (GMod workshop item 2 sat 4+ min at 0%).
+    WinHttpSetTimeouts(hS,15000,15000,30000,60000);
     HINTERNET hC=WinHttpConnect(hS,host.c_str(),443,0);
     if(hC){ HINTERNET hR=WinHttpOpenRequest(hC,L"GET",path.c_str(),NULL,WINHTTP_NO_REFERER,WINHTTP_DEFAULT_ACCEPT_TYPES,WINHTTP_FLAG_SECURE);
         if(hR){ DWORD sf=SECURITY_FLAG_IGNORE_UNKNOWN_CA|SECURITY_FLAG_IGNORE_CERT_CN_INVALID|SECURITY_FLAG_IGNORE_CERT_DATE_INVALID|SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE; WinHttpSetOption(hR,WINHTTP_OPTION_SECURITY_FLAGS,&sf,sizeof(sf));
-            DWORD timeout=120000; WinHttpSetOption(hR,WINHTTP_OPTION_RECEIVE_TIMEOUT,&timeout,sizeof(timeout));
-            if(WinHttpSendRequest(hR,0,0,0,0,0,0)&&WinHttpReceiveResponse(hR,NULL)){
+            DWORD st=0,sl=sizeof(st);
+            if(WinHttpSendRequest(hR,0,0,0,0,0,0)&&WinHttpReceiveResponse(hR,NULL)&&
+               WinHttpQueryHeaders(hR,WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,WINHTTP_HEADER_NAME_BY_INDEX,&st,&sl,WINHTTP_NO_HEADER_INDEX)&&
+               st==200){
                 // ReadData-until-0: QueryDataAvailable can return 0 early and truncate big chunks.
                 uint8_t buf[16384]; DWORD got=0;
                 while(WinHttpReadData(hR,buf,sizeof(buf),&got)&&got>0) out.insert(out.end(),buf,buf+got);
             }
             WinHttpCloseHandle(hR);} WinHttpCloseHandle(hC);} WinHttpCloseHandle(hS); return out;
 }
-// 3 tries per CDN host, then the next host. Empty body = timeout / 404 / connect fail.
+// 2 tries per CDN host, then the next host, 8 tries in all. Empty body =
+// timeout / non-200 / connect fail / cancelled.
 inline Bytes http_fetch_retry(const std::vector<std::string>& servers, const char* path){
     if(!path || servers.empty()) return Bytes();
     std::wstring wp=towide(path);
+    int tries=0;
     for(const auto& host: servers){
         if(host.empty()) continue;
         std::wstring wh=towide(host);
-        for(int a=0;a<3;a++){
+        for(int a=0;a<2;a++){
+            if(cancelled() || tries++>=8) return Bytes();
             Bytes b=http_fetch(wh,wp);
             if(!b.empty()) return b;
         }
@@ -876,6 +892,7 @@ inline bool write_or_repair_file(const FileEntry& fe, const std::wstring& full, 
     uint64_t wrote_new=0;
     for(size_t ci=0;ci<fe.chunks.size();ci++){
         if(x.disk_full && *x.disk_full) break;
+        if(cancelled()){ file_fail++; if(x.failures) (*x.failures)++; break; }
         const Chunk& ck=fe.chunks[ci];
         uint32_t orig=ck.cb_original;
         bool on_disk = !missing && orig>0 && have>=ck.offset+(uint64_t)orig;
@@ -936,6 +953,44 @@ inline bool write_or_repair_file(const FileEntry& fe, const std::wstring& full, 
     return file_fail==0;
 }
 
+// One manifest into outdir over an already logged-on connection. The workshop sync
+// fetches every subscribed item this way on a single logon (one logon per item
+// would be dozens of logons a minute). depotkey/servers are the caller's, fetched
+// once per depot. Same return contract as DownloadDepot; never closes c.
+inline int DownloadManifestOn(CmClient& c,const Bytes& depotkey,const std::vector<std::string>& servers,
+                              uint32_t app,uint32_t depot,uint64_t manifest,const std::wstring& outdir,
+                              const std::string& branch,ProgressFn cb,void* ctx){
+    #define GHDL_CB(ph,pc,fd,ft,by) do{ if(cb) cb(ctx,ph,pc,fd,ft,by); }while(0)
+    GHDL_CB("fetching-manifest",2,0,0,0);
+    uint64_t mcode; if(!c.get_manifest_code(app,depot,manifest,branch,mcode)){ GHDL_CB("error-manifest",0,0,0,0); return -5; }
+    char mp[256]; sprintf(mp,"/depot/%u/manifest/%llu/5/%llu",depot,(unsigned long long)manifest,(unsigned long long)mcode);
+    Bytes zip=http_fetch_retry(servers,mp); Bytes man; if(!unzip_first(zip,man)){ GHDL_CB("error-manifest-dl",0,0,0,0); return -6; }
+    std::vector<FileEntry> files; bool fenc=false; if(!parse_manifest(man,files,fenc)){ GHDL_CB("error-parse",0,0,0,0); return -7; }
+    if(fenc){ for(auto& fe:files){ Bytes p; if(sym_decrypt(depotkey.data(),b64decode(fe.name),p)){ fe.name.assign(p.begin(),p.end()); while(!fe.name.empty()&&fe.name.back()=='\0')fe.name.pop_back(); } } }
+    int total_chunks=0; for(auto& fe:files) total_chunks+=(int)fe.chunks.size();
+    GHDL_CB("downloading",2,0,(int)files.size(),0);
+    mkdirs(outdir+L"\\");
+    int nfiles=0,nchunks=0,failures=0; unsigned long long totbytes=0; bool disk_full=false;
+    RepairCtx rx; rx.depot=depot; rx.key=&depotkey; rx.servers=&servers; rx.verify=false;
+    rx.cb=cb; rx.cbctx=ctx; rx.totalChunks=total_chunks; rx.totalFiles=(int)files.size();
+    rx.nchunks=&nchunks; rx.nfiles=&nfiles; rx.failures=&failures; rx.totbytes=&totbytes; rx.disk_full=&disk_full;
+    for(auto& fe:files){
+        std::string rel=fe.name; for(char& ch:rel) if(ch=='/')ch='\\';
+        std::wstring full=outdir+L"\\"+towide(rel);
+        if(fe.flags&FLAG_DIRECTORY){ mkdirs(full+L"\\"); continue; }
+        if(fe.flags&FLAG_SYMLINK) continue;
+        size_t sl=full.find_last_of(L"\\/"); if(sl!=std::wstring::npos) mkdirs(full.substr(0,sl+1));
+        write_or_repair_file(fe,full,rx,false);
+        if(disk_full) break;
+        if(cancelled()){ if(!failures) failures=1; break; }
+    }
+    DeleteFileW(gh_tmp(L"_ghdl_in.zst").c_str()); DeleteFileW(gh_tmp(L"_ghdl_in.lzma").c_str());
+    DeleteFileW(gh_tmp(L"_ghdl_out.bin").c_str());
+    GHDL_CB(disk_full?"storage full":(failures?"error-chunks":"done"), disk_full?99:100, nfiles,(int)files.size(),totbytes);
+    #undef GHDL_CB
+    return disk_full ? (failures?failures:1) : failures;
+}
+
 // ==================== the library entry point ====================
 // outdir = full destination path for the game tree (e.g. <LocalState>\game\<name>).
 // token empty => anonymous logon. cb may be null. Returns 0 on success, >0 chunk
@@ -953,34 +1008,10 @@ inline int DownloadDepot(uint32_t app,uint32_t depot,uint64_t manifest,const std
     if(!ok){ GHDL_CB("error-logon",0,0,0,0); closesocket(c.s); return -2; }
     Bytes depotkey; if(!c.get_depot_key(app,depot,depotkey)||depotkey.size()!=32){ GHDL_CB("error-depotkey",0,0,0,0); closesocket(c.s); return -3; }
     std::vector<std::string> servers; if(!c.get_content_servers(servers)){ GHDL_CB("error-servers",0,0,0,0); closesocket(c.s); return -4; }
-    GHDL_CB("fetching-manifest",2,0,0,0);
-    uint64_t mcode; if(!c.get_manifest_code(app,depot,manifest,branch,mcode)){ GHDL_CB("error-manifest",0,0,0,0); closesocket(c.s); return -5; }
-    char mp[256]; sprintf(mp,"/depot/%u/manifest/%llu/5/%llu",depot,(unsigned long long)manifest,(unsigned long long)mcode);
-    Bytes zip=http_fetch_retry(servers,mp); Bytes man; if(!unzip_first(zip,man)){ GHDL_CB("error-manifest-dl",0,0,0,0); closesocket(c.s); return -6; }
-    std::vector<FileEntry> files; bool fenc=false; if(!parse_manifest(man,files,fenc)){ GHDL_CB("error-parse",0,0,0,0); closesocket(c.s); return -7; }
-    if(fenc){ for(auto& fe:files){ Bytes p; if(sym_decrypt(depotkey.data(),b64decode(fe.name),p)){ fe.name.assign(p.begin(),p.end()); while(!fe.name.empty()&&fe.name.back()=='\0')fe.name.pop_back(); } } }
-    int total_chunks=0; for(auto& fe:files) total_chunks+=(int)fe.chunks.size();
-    GHDL_CB("downloading",2,0,(int)files.size(),0);
-    mkdirs(outdir+L"\\");
-    int nfiles=0,nchunks=0,failures=0; unsigned long long totbytes=0; bool disk_full=false;
-    RepairCtx rx; rx.depot=depot; rx.key=&depotkey; rx.servers=&servers; rx.verify=false;
-    rx.cb=cb; rx.cbctx=ctx; rx.totalChunks=total_chunks; rx.totalFiles=(int)files.size();
-    rx.nchunks=&nchunks; rx.nfiles=&nfiles; rx.failures=&failures; rx.totbytes=&totbytes; rx.disk_full=&disk_full;
-    for(auto& fe:files){
-        std::string rel=fe.name; for(char& ch:rel) if(ch=='/')ch='\\';
-        std::wstring full=outdir+L"\\"+towide(rel);
-        if(fe.flags&FLAG_DIRECTORY){ mkdirs(full+L"\\"); continue; }
-        if(fe.flags&FLAG_SYMLINK) continue;
-        size_t sl=full.find_last_of(L"\\/"); if(sl!=std::wstring::npos) mkdirs(full.substr(0,sl+1));
-        write_or_repair_file(fe,full,rx,false);
-        if(disk_full) break;
-    }
-    DeleteFileW(gh_tmp(L"_ghdl_in.zst").c_str()); DeleteFileW(gh_tmp(L"_ghdl_in.lzma").c_str());
-    DeleteFileW(gh_tmp(L"_ghdl_out.bin").c_str());
-    GHDL_CB(disk_full?"storage full":(failures?"error-chunks":"done"), disk_full?99:100, nfiles,(int)files.size(),totbytes);
-    closesocket(c.s); WSACleanup();
     #undef GHDL_CB
-    return disk_full ? (failures?failures:1) : failures;
+    int rc=DownloadManifestOn(c,depotkey,servers,app,depot,manifest,outdir,branch,cb,ctx);
+    closesocket(c.s); WSACleanup();
+    return rc;
 }
 
 // ==================== whole-app download (appid -> all depots) ====================
@@ -1015,7 +1046,7 @@ inline int DownloadApp(uint32_t app,const std::wstring& outdir,const std::string
     std::vector<DW> work; int totalChunks=0,totalFiles=0;
     for(auto& d:depots){
         Bytes key; if(!c.get_depot_key(app,d.depot,key)||key.size()!=32){ ghlog("skip depot(no key) "+std::to_string(d.depot)); continue; }
-        uint64_t mcode; if(!c.get_manifest_code(app,d.depot,d.manifest,branch,mcode)){ ghlog("skip depot(no mcode) "+std::to_string(d.depot)); continue; }
+        uint64_t mcode; if(!c.get_manifest_code(app,d.depot,d.manifest,d.branch.empty()?branch:d.branch,mcode)){ ghlog("skip depot(no mcode) "+std::to_string(d.depot)); continue; }
         char mp[256]; sprintf(mp,"/depot/%u/manifest/%llu/5/%llu",d.depot,(unsigned long long)d.manifest,(unsigned long long)mcode);
         Bytes zip=http_fetch_retry(servers,mp); Bytes man; if(!unzip_first(zip,man)){ ghlog("skip depot(no manifest) "+std::to_string(d.depot)); continue; }
         std::vector<FileEntry> files; bool fenc=false; if(!parse_manifest(man,files,fenc)) continue;

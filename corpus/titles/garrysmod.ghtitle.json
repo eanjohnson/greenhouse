@@ -1,0 +1,23 @@
+{
+  "schema": "greenhouse.title/1",
+  "id": "garrysmod",
+  "name": "Garry's Mod",
+  "match": {
+    "exe": "gmod.exe",
+    "launch": "bin/win64/gmod.exe",
+    "steamAppId": 4000,
+    "steamBranch": "x86-64",
+    "workshop": true
+  },
+  "requires": {
+    "loader": "0.0.779.0",
+    "services": [
+      "steam-runtime"
+    ]
+  },
+  "args": "-condebug --single-process --no-sandbox",
+  "input": "builtin-wasd",
+  "knobs": {
+    "gh_dsound": 1
+  }
+}

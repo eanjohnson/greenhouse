@@ -60,11 +60,15 @@ typedef UINT MMRESULT;
 #define WAVE_FORMAT_96S08     0x00020000
 #define WAVE_FORMAT_96M16     0x00040000
 #define WAVE_FORMAT_96S16     0x00080000
+#ifndef _WAVEFORMATEX_   // mmreg.h's guard: xaudio2.h (gh_dsound.h) brings the same struct
+#define _WAVEFORMATEX_
 typedef struct tWAVEFORMATEX {
     WORD  wFormatTag, nChannels;
     DWORD nSamplesPerSec, nAvgBytesPerSec;
     WORD  nBlockAlign, wBitsPerSample, cbSize;
 } WAVEFORMATEX;
+typedef WAVEFORMATEX *PWAVEFORMATEX, *NPWAVEFORMATEX, *LPWAVEFORMATEX;
+#endif
 typedef struct wavehdr_tag {
     LPSTR                 lpData;
     DWORD                 dwBufferLength, dwBytesRecorded;

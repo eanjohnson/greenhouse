@@ -23,6 +23,7 @@
 //
 // Build: toolchain/build-addon.sh --steam corpus/addons/steam/steam_addon.cpp OUT.dll
 #include "cm_downloader.h"               // namespace ghdl (WinHTTP + Winsock + BCrypt + zlib)
+#include "cm_workshop.h"                 // ghdl::Workshop* (PublishedFile.* over the same CM session)
 extern "C" {
 #include "qrcodegen.h"
 }
@@ -352,7 +353,11 @@ static int Acquire(const GhAddonRow* row, int mode)
     }
     const bool verify = mode == GH_ACQ_VERIFY;
     DlProgress(nullptr, "starting", 0, 0, 0, 0);
-    int rc = ghdl::DownloadApp(row->app, dir, "public", c.token, c.sid, c.account, DlProgress, nullptr, verify);
+    char br[72] = {};
+    std::string branch = "public";
+    if (GH_HOST_HAS(g_host, steamBranch) && g_host->steamBranch(row->app, br, sizeof br)) branch = br;
+    if (branch != "public") Log("acquire app=" + std::to_string(row->app) + " branch=" + branch);
+    int rc = ghdl::DownloadApp(row->app, dir, branch, c.token, c.sid, c.account, DlProgress, nullptr, verify);
     Scrub(c.token);
     Log(std::string(verify ? "verify" : "download") + " rc=" + std::to_string(rc) + " app=" + std::to_string(row->app));
     if (rc == 0) return 1;
@@ -393,6 +398,101 @@ static int SignOut()
     return cred || ce == ERROR_FILE_NOT_FOUND;
 }
 
+// ---- Steam Workshop --------------------------------------------------------
+// Content lives on DevelopmentFiles (no quota); the per-app state file in
+// LocalState is the contract with the steam_api64 shim, which answers the
+// game's ISteamUGC subscribed/installed queries from it.
+static std::wstring WsContentRoot(uint32_t app)
+{
+    std::wstring root = g_host->devRoot ? g_host->devRoot : g_ls.c_str();
+    if (!root.empty() && root.back() != L'\\') root += L'\\';
+    return root + L"gh_games\\workshop\\content\\" + std::to_wstring(app);
+}
+static std::wstring WsStatePath(uint32_t app) { return g_ls + L"gh_workshop_" + std::to_wstring(app) + L".txt"; }
+
+static int HostCancelled() { return GH_HOST_HAS(g_host, cancelRequested) ? g_host->cancelRequested() : 0; }
+static int WorkshopSync(uint32_t app)
+{
+    if (!app) return -1;
+    Cred c;
+    if (!CredRead(c)) { Log("workshop sync app=" + std::to_string(app) + ": not signed in"); return -10; }
+    DlProgress(nullptr, "workshop: checking subscriptions", 0, 0, 0, 0);
+    ghdl::WsSyncResult r;
+    if (ghdl::g_logBudget < 1200) ghdl::g_logBudget = 1200;   // two lines per item
+    ghdl::g_cancelFn = HostCancelled;     // B on the sync screen: play with what is installed
+    {   // gh_ws_reserve_mb.txt: free MB to leave on the drive (default 4096, floor 512)
+        std::string v; uint64_t mb = 4096;
+        if (ReadFileBytes(g_ls + L"gh_ws_reserve_mb.txt", v) && atoi(v.c_str()) > 0) mb = (uint64_t)atoi(v.c_str());
+        if (mb < 512) mb = 512;
+        ghdl::g_wsReserve = mb << 20;
+        if (mb != 4096) Log("workshop reserve " + std::to_string(mb) + " MB");
+    }
+    int rc = ghdl::WorkshopSync(app, c.sid, c.token, c.account, WsContentRoot(app), WsStatePath(app), DlProgress, nullptr, &r);
+    ghdl::g_cancelFn = nullptr;
+    Scrub(c.token);
+    Log("workshop sync app=" + std::to_string(app) + " rc=" + std::to_string(rc) + " subscribed=" + std::to_string(r.subscribed) +
+        " installed=" + std::to_string(r.installed) + " fetched=" + std::to_string(r.fetched) + " removed=" + std::to_string(r.removed) +
+        (r.cancelled ? " cancelled" : ""));
+    return rc;
+}
+
+static int WorkshopQuery(uint32_t app, uint32_t sort, uint32_t page, const wchar_t* search,
+                         void* ctx, void (*emit)(void*, const GhWorkshopItem*), uint32_t* total)
+{
+    if (!app || !emit) return -1;
+    Cred c;
+    if (!CredRead(c)) return -10;
+    std::string q;
+    if (search && *search) {
+        int n = WideCharToMultiByte(CP_UTF8, 0, search, -1, nullptr, 0, nullptr, nullptr);
+        if (n > 1) { q.resize(n - 1); WideCharToMultiByte(CP_UTF8, 0, search, -1, &q[0], n, nullptr, nullptr); }
+    }
+    std::vector<ghdl::WsItem> items;
+    uint32_t tot = 0;
+    int rc;
+    if (sort == GH_WS_SORT_SUBSCRIBED) {
+        // The account's own list, one page of 20 from GetUserFiles' full walk.
+        ghdl::CmClient cm;
+        rc = -1;
+        if (cm.connect_and_secure() && cm.login_token(c.sid, c.token, c.account)) {
+            std::vector<ghdl::WsItem> all;
+            if (ghdl::ws_subscribed(cm, c.sid, app, all)) {
+                tot = (uint32_t)all.size();
+                const size_t from = (size_t)(page ? page - 1 : 0) * 20;
+                for (size_t i = from; i < all.size() && i < from + 20; ++i) items.push_back(all[i]);
+                rc = 0;
+            } else rc = -3;
+        }
+        if (cm.s != INVALID_SOCKET) closesocket(cm.s);
+    } else rc = ghdl::WorkshopQuery(app, c.sid, c.token, c.account, sort, page ? page : 1, q, items, &tot);
+    Scrub(c.token);
+    if (rc) { Log("workshop query app=" + std::to_string(app) + " sort=" + std::to_string(sort) + " rc=" + std::to_string(rc)); return rc; }
+    const auto st = ghdl::ws_state_read(WsStatePath(app));
+    for (const auto& it : items) {
+        const std::wstring title = W(it.title), desc = W(it.desc);
+        GhWorkshopItem w = {};
+        w.size = (uint32_t)sizeof w;
+        w.flags = (sort == GH_WS_SORT_SUBSCRIBED ? GH_WS_SUBSCRIBED : 0) | (st.count(it.id) ? GH_WS_INSTALLED | GH_WS_SUBSCRIBED : 0);
+        w.id = it.id; w.bytes = it.size; w.updated = it.updated; w.subscriptions = it.subs;
+        w.title = title.c_str(); w.desc = desc.empty() ? nullptr : desc.c_str();
+        emit(ctx, &w);
+    }
+    if (total) *total = tot;
+    return 0;
+}
+
+static int WorkshopSubscribe(uint32_t app, uint64_t id, int subscribe)
+{
+    if (!app || !id) return -1;
+    Cred c;
+    if (!CredRead(c)) return -10;
+    int rc = ghdl::WorkshopSubscribe(app, c.sid, c.token, c.account, id, subscribe != 0);
+    Scrub(c.token);
+    Log(std::string("workshop ") + (subscribe ? "subscribe" : "unsubscribe") + " app=" + std::to_string(app) + " id=" +
+        std::to_string((unsigned long long)id) + " rc=" + std::to_string(rc));
+    return rc;
+}
+
 static void Shutdown() {}
 
 extern "C" __declspec(dllexport) int GhAddonInit(const GhHostApi* host, uint32_t hostAbi, GhAddonApi* out)
@@ -422,6 +522,11 @@ extern "C" __declspec(dllexport) int GhAddonInit(const GhHostApi* host, uint32_t
     if (out->size >= offsetof(GhAddonApi, signOut) + sizeof(out->signOut)) {
         out->account = Account;
         out->signOut = SignOut;
+    }
+    if (out->size >= offsetof(GhAddonApi, workshopSubscribe) + sizeof(out->workshopSubscribe)) {
+        out->workshopSync = WorkshopSync;
+        out->workshopQuery = WorkshopQuery;
+        out->workshopSubscribe = WorkshopSubscribe;
     }
     Log(std::string("GhAddonInit ok (host ") + (GH_HOST_HAS(host, signInScreen) ? "has" : "LACKS") + " signInScreen)");
     return 0;

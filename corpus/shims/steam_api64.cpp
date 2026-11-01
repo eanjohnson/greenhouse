@@ -696,6 +696,13 @@ static void gh_engine_lazy_init() {
     gh_log_truncate();   // clean single-run log
     AddVectoredExceptionHandler(1 /*first*/, gh_veh);
     gh_log("[gh-shim] SteamAPI_Init -> spawning engine bring-up thread (VEH armed)");
+    // Launcher path: bind this game's app context before SteamAPI_Init returns.
+    // Unreal's OnlineSubsystemSteam reads GetAppID once, inside Init; bound later
+    // on the engine thread, RV There Yet? cached the launcher's 3809440 and
+    // dropped every stats callback as "for wrong game". No advertise here.
+    if (g_gh_real_steamid && g_gh_engine && g_gh_engine_dll)
+        gh_logf("[gh-shim] SteamAPI_Init: app-context (sync) -> %d want=%u",
+                (int)gh_fix_app_context(g_gh_engine_dll), gh_target_appid());
 #ifndef GH_DISABLE_ENGINE
     HANDLE h = CreateThread(nullptr, 0, gh_engine_thread, nullptr, 0, nullptr);
     if (h) CloseHandle(h);
@@ -1298,12 +1305,28 @@ __declspec(dllexport) bool SteamAPI_RestartAppIfNecessary(AppId_t /*unOwnAppID*/
     return false; // stay in-process, do not relaunch through Steam
 }
 
+static void gh_native_pump();   // below, beside the CCallback registry
+static bool g_gh_manual_dispatch = false;   // the game drains the queue itself
+// gh_native_cb.txt = 0 turns native dispatch off (the pre-1.0.9.0 behaviour), for A/B.
+static bool gh_native_cb_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        char path[MAX_PATH]; gh_direct_ls_path("gh_native_cb.txt", path);
+        FILE* f = nullptr; int c = -1;
+        if (fopen_s(&f, path, "rb") == 0 && f) { c = fgetc(f); fclose(f); }
+        v = (c == '0') ? 0 : 1;
+        gh_logf("[gh-shim] native callback dispatch %s", v ? "on" : "OFF (gh_native_cb.txt)");
+    }
+    return v != 0;
+}
 __declspec(dllexport) void SteamAPI_RunCallbacks() {
     // DIAG: is the game using the NATIVE RunCallbacks path (not ManualDispatch)? If so, THIS is
     // where the pump must live. Heartbeat throttled.
     static LONG rc = 0; LONG n = InterlockedIncrement(&rc);
     if (n == 1 || (n % 600) == 0) gh_logf("[gh-diag] SteamAPI_RunCallbacks (native) #%ld state=%d", n, g_gh_engine_state);
-    if (g_gh_engine_state == 2) gh_engine_frame_register_hook();
+    if (g_gh_engine_state != 2) return;
+    if (!g_gh_manual_dispatch && gh_native_cb_enabled()) gh_native_pump();
+    gh_engine_frame_register_hook();
 }
 __declspec(dllexport) void SteamAPI_ReleaseCurrentThreadMemory() {}
 __declspec(dllexport) void SteamAPI_SetMiniDumpComment(const char*) {}
@@ -1361,6 +1384,7 @@ static void gh_resolve_dispatch() {
 }
 
 __declspec(dllexport) void SteamAPI_ManualDispatch_Init() {
+    g_gh_manual_dispatch = true;
     gh_log("[gh-diag] SteamAPI_ManualDispatch_Init called (CallbackDispatcher initialized)");
 }
 __declspec(dllexport) void SteamAPI_ManualDispatch_RunFrame(HSteamPipe pipe) {
@@ -1478,10 +1502,120 @@ __declspec(dllexport) bool SteamAPI_ManualDispatch_GetAPICallResult(HSteamPipe p
     return r;
 }
 
-__declspec(dllexport) void SteamAPI_RegisterCallback(void*, int) {}
-__declspec(dllexport) void SteamAPI_UnregisterCallback(void*) {}
-__declspec(dllexport) void SteamAPI_RegisterCallResult(void*, SteamAPICall_t) {}
-__declspec(dllexport) void SteamAPI_UnregisterCallResult(void*, SteamAPICall_t) {}
+// ---- Native C++ dispatch: CCallback / CCallResult (SteamAPI_RunCallbacks) ----
+// C++ games (Source, Unreal's OnlineSubsystemSteam) never touch ManualDispatch:
+// their CCallback/CCallResult objects register here and SteamAPI_RunCallbacks
+// runs them. While these were empty stubs no C++ game ever saw a callback or a
+// call result -- GMod's ISteamUGC details query "never finished", so every
+// Workshop item stayed "No info about this addon from Steam" and none mounted.
+// CCallbackBase (MSVC x64): vptr; uint8 m_nCallbackFlags @8; int m_iCallback @12.
+// MSVC lays overloaded virtuals out in reverse, so vtable[0] is
+// Run(void*, bool bIOFailure, SteamAPICall_t) and vtable[1] is Run(void*).
+struct GhCbReg { void* cb; uint64_t call; int id; };   // call != 0: a call result
+static GhCbReg*         g_cb = nullptr;
+static int              g_cb_n = 0, g_cb_cap = 0;
+static CRITICAL_SECTION g_cb_cs;
+static LONG             g_cb_cs_init = 0;
+static void gh_cb_lock() {
+    if (InterlockedCompareExchange(&g_cb_cs_init, 1, 0) == 0) { InitializeCriticalSection(&g_cb_cs); InterlockedExchange(&g_cb_cs_init, 2); }
+    while (InterlockedCompareExchange(&g_cb_cs_init, 2, 2) != 2) Sleep(0);
+    EnterCriticalSection(&g_cb_cs);   // recursive: a running callback may (un)register
+}
+static void gh_cb_unlock() { LeaveCriticalSection(&g_cb_cs); }
+static void gh_cb_add(void* cb, uint64_t call, int id) {
+    gh_cb_lock();
+    if (g_cb_n == g_cb_cap) {
+        int cap = g_cb_cap ? g_cb_cap * 2 : 64;
+        GhCbReg* v = (GhCbReg*)realloc(g_cb, (size_t)cap * sizeof(GhCbReg));
+        if (!v) { gh_cb_unlock(); return; }
+        g_cb = v; g_cb_cap = cap;
+    }
+    g_cb[g_cb_n++] = GhCbReg{ cb, call, id };
+    gh_cb_unlock();
+}
+// Removes cb's callback entries (call == 0) or its entry for one call result.
+static void gh_cb_remove(void* cb, uint64_t call) {
+    gh_cb_lock();
+    for (int i = 0; i < g_cb_n; )
+        if (g_cb[i].cb == cb && g_cb[i].call == call) g_cb[i] = g_cb[--g_cb_n]; else ++i;
+    gh_cb_unlock();
+}
+static bool gh_cb_has(void* cb, uint64_t call) {
+    for (int i = 0; i < g_cb_n; ++i) if (g_cb[i].cb == cb && g_cb[i].call == call) return true;
+    return false;
+}
+__declspec(dllexport) void SteamAPI_RegisterCallback(void* cb, int id) {
+    if (!cb) return;
+    *((uint8_t*)cb + 8) |= 1;   // k_ECallbackFlagsRegistered
+    *(int*)((char*)cb + 12) = id;
+    gh_cb_add(cb, 0, id);
+}
+__declspec(dllexport) void SteamAPI_UnregisterCallback(void* cb) {
+    if (!cb) return;
+    gh_cb_remove(cb, 0);
+    *((uint8_t*)cb + 8) &= (uint8_t)~1;
+}
+__declspec(dllexport) void SteamAPI_RegisterCallResult(void* cb, SteamAPICall_t call) {
+    if (cb && call) gh_cb_add(cb, call, 0);
+}
+__declspec(dllexport) void SteamAPI_UnregisterCallResult(void* cb, SteamAPICall_t call) {
+    if (cb && call) gh_cb_remove(cb, call);
+}
+// One engine callback: complete the call results it names, then run every
+// client (not game-server) callback registered for its id.
+static void gh_cb_dispatch(HSteamPipe pipe, int id, void* param, int cub) {
+    static LONG logged = 0;
+    gh_cb_lock();
+    if (id == 703 && param && cub >= 16) {
+        // SteamAPICallCompleted_t { uint64 m_hAsyncCall; int m_iCallback; uint32 m_cubParam }
+        const uint64_t call = *(uint64_t*)param;
+        const int inner = *(int*)((char*)param + 8);
+        const uint32_t size = *(uint32_t*)((char*)param + 12);
+        for (int i = 0; i < g_cb_n; ) {
+            if (g_cb[i].call != call) { ++i; continue; }
+            void* cb = g_cb[i].cb;
+            g_cb[i] = g_cb[--g_cb_n];   // one-shot, removed before it runs
+            void* buf = calloc(1, size ? size : 1);
+            bool failed = false, ok = false;
+            if (buf && g_fnGetAPIResult) ok = g_fnGetAPIResult(pipe, call, buf, (int)size, inner, &failed);
+            if (InterlockedIncrement(&logged) <= 40)
+                gh_logf("[gh-shim] call result %llu id=%d cub=%u ok=%d failed=%d", (unsigned long long)call, inner, size, ok, failed);
+            if (buf) ((void (*)(void*, void*, bool, SteamAPICall_t))(*(void***)cb)[0])(cb, buf, !ok || failed, call);
+            free(buf);
+            i = 0;   // the callback may have changed the table
+        }
+    }
+    int n = 0;
+    for (int i = 0; i < g_cb_n; ++i) if (g_cb[i].call == 0 && g_cb[i].id == id) ++n;
+    if (n) {
+        void** snap = (void**)_alloca((size_t)n * sizeof(void*));
+        int k = 0;
+        for (int i = 0; i < g_cb_n && k < n; ++i) if (g_cb[i].call == 0 && g_cb[i].id == id) snap[k++] = g_cb[i].cb;
+        for (int j = 0; j < k; ++j) {
+            void* cb = snap[j];
+            if (!gh_cb_has(cb, 0) || (*((uint8_t*)cb + 8) & 2 /*k_ECallbackFlagsGameServer*/)) continue;
+            ((void (*)(void*, void*))(*(void***)cb)[1])(cb, param);
+        }
+    }
+    gh_cb_unlock();
+}
+static void gh_native_pump() {
+    static thread_local bool busy = false;   // a callback that pumps again gets nothing
+    if (busy) return;
+    busy = true;
+    gh_resolve_dispatch();
+    const HSteamPipe pipe = g_gh_engine_pipe;
+    if (g_fnRunFrame) g_fnRunFrame(pipe);
+    if (g_fnBGetCallback && g_fnFreeLast) {
+        // CallbackMsg_t { int32 user; int32 iCallback; uint8* param; int32 cub }
+        struct { int32_t user, id; void* param; int32_t cub; } msg;
+        for (int guard = 0; guard < 256 && g_fnBGetCallback(pipe, &msg); ++guard) {
+            gh_cb_dispatch(pipe, msg.id, msg.param, msg.cub);
+            g_fnFreeLast(pipe);
+        }
+    }
+    busy = false;
+}
 
 // ---- Interface accessors -----
 // Steamworks.NET 2024 / SDK 1.60 versions. Return a non-null sentinel; the C#
@@ -1540,9 +1674,13 @@ __declspec(dllexport) void* SteamAPI_SteamGameServerUGC_v020()       { return &g
 __declspec(dllexport) void* SteamAPI_SteamGameServerUtils_v010()     { return &g_iface_utils; }
 
 // GameServer flavours of core lifecycle
-__declspec(dllexport) bool SteamGameServer_Init(uint32_t, uint16_t, uint16_t, uint16_t, int, const char*) { return true; }
-__declspec(dllexport) ESteamAPIInitResult SteamInternal_GameServer_Init_V2(uint32_t, uint16_t, uint16_t, uint16_t, int, const char*, void*) { return k_ESteamAPIInitResult_OK; }
-__declspec(dllexport) void SteamGameServer_Shutdown() {}
+// Real steam_api vends no game-server interface until a GameServer_Init: Source
+// (GMod) asks for SteamGameServer at boot from a convar callback and treats
+// NULL as "no server yet"; a sentinel there was a vtable read of 0 (g10).
+static volatile LONG g_gs_inited = 0;
+__declspec(dllexport) bool SteamGameServer_Init(uint32_t, uint16_t, uint16_t, uint16_t, int, const char*) { InterlockedExchange(&g_gs_inited, 1); return true; }
+__declspec(dllexport) ESteamAPIInitResult SteamInternal_GameServer_Init_V2(uint32_t, uint16_t, uint16_t, uint16_t, int, const char*, void*) { InterlockedExchange(&g_gs_inited, 1); return k_ESteamAPIInitResult_OK; }
+__declspec(dllexport) void SteamGameServer_Shutdown() { InterlockedExchange(&g_gs_inited, 0); }
 __declspec(dllexport) bool SteamGameServer_BSecure() { return false; }
 __declspec(dllexport) uint64_t SteamGameServer_GetSteamID() { return kFakeSteamID; }
 __declspec(dllexport) HSteamPipe SteamGameServer_GetHSteamPipe() { return (HSteamPipe)2; }
@@ -1878,6 +2016,148 @@ static void gh_iface_cs_ensure() {
     while (InterlockedCompareExchange(&g_gh_iface_cs_init, 2, 2) != 2) Sleep(0);
 }
 
+// ---- Steam Workshop: ISteamUGC answered from the Launcher's sync ----------
+// Before a "workshop" title launches, the Steam add-on brings the account's
+// subscribed items onto the console and writes LocalState\gh_workshop_<app>.txt,
+// one item per line:  id \t manifest \t size \t time_updated \t folder(utf8) \t title.
+// Our engine never runs Steam's own content system, so the game's subscribed /
+// installed queries are answered from that file; every other ISteamUGC call
+// (queries, votes, uploads) still goes to the engine. The engine object's vptr is
+// pointed at a copy of its vtable with five slots replaced (v021 numbering, from
+// the SDK's steam_api.json; nothing before slot 72 is overloaded, so MSVC's
+// overload reordering cannot shift them).
+static AppId_t gh_resolve_appid();
+struct GhWsEntry { uint64_t id, size; uint32_t updated; char folder[MAX_PATH]; };
+static GhWsEntry* g_ws = nullptr;
+static int        g_ws_n = -1;              // -1 = no state file: forward everything
+static FILETIME   g_ws_mtime = {};
+static SRWLOCK    g_ws_lk = SRWLOCK_INIT;
+static void gh_ws_load() {
+    char path[MAX_PATH];
+    strcpy_s(path, MAX_PATH, gh_log_path());
+    char* sl = strrchr(path, '\\');
+    if (!sl) return;
+    snprintf(sl + 1, MAX_PATH - (size_t)(sl + 1 - path), "gh_workshop_%u.txt", (unsigned)gh_resolve_appid());
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) { AcquireSRWLockExclusive(&g_ws_lk); g_ws_n = -1; ReleaseSRWLockExclusive(&g_ws_lk); return; }
+    if (g_ws_n >= 0 && CompareFileTime(&fa.ftLastWriteTime, &g_ws_mtime) == 0) return;
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD sz = GetFileSize(h, nullptr), rd = 0;
+    char* buf = (sz != INVALID_FILE_SIZE && sz < (16u << 20)) ? (char*)malloc((size_t)sz + 1) : nullptr;
+    if (!buf || !ReadFile(h, buf, sz, &rd, nullptr)) { CloseHandle(h); free(buf); return; }
+    CloseHandle(h);
+    buf[rd] = 0;
+    int lines = 1;
+    for (DWORD i = 0; i < rd; ++i) lines += buf[i] == '\n';
+    GhWsEntry* v = (GhWsEntry*)calloc((size_t)lines, sizeof(GhWsEntry));
+    int n = 0;
+    for (char* line = buf; v && line && *line; ) {
+        char* nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        char* f[6] = {}; int k = 0;
+        for (char* c = line; k < 6; ) { f[k++] = c; char* t = strchr(c, '\t'); if (!t) break; *t = 0; c = t + 1; }
+        if (k >= 5 && f[0][0]) {
+            GhWsEntry& e = v[n];
+            e.id = _strtoui64(f[0], nullptr, 10);
+            e.size = _strtoui64(f[2], nullptr, 10);
+            e.updated = (uint32_t)strtoul(f[3], nullptr, 10);
+            size_t fl = strlen(f[4]); if (fl && f[4][fl - 1] == '\r') f[4][--fl] = 0;
+            strncpy_s(e.folder, MAX_PATH, f[4], _TRUNCATE);
+            if (e.id && e.folder[0]) ++n;
+        }
+        line = nl ? nl + 1 : nullptr;
+    }
+    free(buf);
+    AcquireSRWLockExclusive(&g_ws_lk);
+    free(g_ws); g_ws = v; g_ws_n = v ? n : -1; g_ws_mtime = fa.ftLastWriteTime;
+    ReleaseSRWLockExclusive(&g_ws_lk);
+    gh_logf("[gh-shim] workshop: %d items from %s", n, path);
+}
+static bool gh_ws_find(uint64_t id, GhWsEntry* out) {
+    bool hit = false;
+    AcquireSRWLockShared(&g_ws_lk);
+    for (int i = 0; i < g_ws_n; ++i) if (g_ws[i].id == id) { if (out) *out = g_ws[i]; hit = true; break; }
+    ReleaseSRWLockShared(&g_ws_lk);
+    return hit;
+}
+
+enum { kUgcSubscribe = 72, kUgcNumSubscribed = 74, kUgcGetSubscribed = 75, kUgcItemState = 76,
+       kUgcInstallInfo = 77, kUgcDownloadInfo = 78, kUgcDownload = 79, kUgcSlots = 99 };
+static void* g_ugc_vt[kUgcSlots];
+static void* g_ugc_orig[kUgcSlots];
+typedef uint64_t PublishedFileId_t;
+static uint32_t gh_ugc_num_subscribed(void* self, bool local) {
+    gh_ws_load();
+    if (g_ws_n < 0) return ((uint32_t (*)(void*, bool))g_ugc_orig[kUgcNumSubscribed])(self, local);
+    static LONG once = 0;
+    if (!InterlockedExchange(&once, 1)) gh_logf("[gh-shim] UGC GetNumSubscribedItems -> %d", g_ws_n);
+    return (uint32_t)g_ws_n;
+}
+static uint32_t gh_ugc_get_subscribed(void* self, PublishedFileId_t* ids, uint32_t cap, bool local) {
+    gh_ws_load();
+    if (g_ws_n < 0) return ((uint32_t (*)(void*, PublishedFileId_t*, uint32_t, bool))g_ugc_orig[kUgcGetSubscribed])(self, ids, cap, local);
+    uint32_t n = 0;
+    AcquireSRWLockShared(&g_ws_lk);
+    for (int i = 0; i < g_ws_n && ids && n < cap; ++i) ids[n++] = g_ws[i].id;
+    ReleaseSRWLockShared(&g_ws_lk);
+    return n;
+}
+static uint32_t gh_ugc_item_state(void* self, PublishedFileId_t id) {
+    gh_ws_load();
+    if (gh_ws_find(id, nullptr)) return 1u /*Subscribed*/ | 4u /*Installed*/;
+    return ((uint32_t (*)(void*, PublishedFileId_t))g_ugc_orig[kUgcItemState])(self, id);
+}
+static bool gh_ugc_install_info(void* self, PublishedFileId_t id, uint64_t* size, char* folder, uint32_t cap, uint32_t* ts) {
+    gh_ws_load();
+    GhWsEntry e;
+    if (!gh_ws_find(id, &e))
+        return ((bool (*)(void*, PublishedFileId_t, uint64_t*, char*, uint32_t, uint32_t*))g_ugc_orig[kUgcInstallInfo])(self, id, size, folder, cap, ts);
+    if (size) *size = e.size;
+    if (ts) *ts = e.updated;
+    if (folder && cap) strncpy_s(folder, cap, e.folder, _TRUNCATE);
+    return true;
+}
+static bool gh_ugc_download_info(void* self, PublishedFileId_t id, uint64_t* done, uint64_t* total) {
+    GhWsEntry e;
+    if (!gh_ws_find(id, &e))
+        return ((bool (*)(void*, PublishedFileId_t, uint64_t*, uint64_t*))g_ugc_orig[kUgcDownloadInfo])(self, id, done, total);
+    if (done) *done = e.size;
+    if (total) *total = e.size;
+    return true;
+}
+static bool gh_ugc_download(void* self, PublishedFileId_t id, bool high) {
+    gh_ws_load();
+    if (gh_ws_find(id, nullptr)) return true;   // already on disk: nothing to do, as Steam answers for an installed item
+    gh_logf("[gh-shim] UGC DownloadItem %llu: not synced -> engine", (unsigned long long)id);
+    return ((bool (*)(void*, PublishedFileId_t, bool))g_ugc_orig[kUgcDownload])(self, id, high);
+}
+static void* gh_ugc_wrap(void* real, const char* ver) {
+    if (strcmp(ver, "STEAMUGC_INTERFACE_VERSION021") != 0) {
+        gh_logf("[gh-shim] UGC %s: slot map is v021 only -> left unwrapped", ver);
+        return real;
+    }
+    __try {
+        void** vt = *(void***)real;
+        if (vt == g_ugc_vt) return real;
+        memcpy(g_ugc_orig, vt, sizeof g_ugc_orig);
+        memcpy(g_ugc_vt, vt, sizeof g_ugc_vt);
+        g_ugc_vt[kUgcNumSubscribed] = (void*)gh_ugc_num_subscribed;
+        g_ugc_vt[kUgcGetSubscribed] = (void*)gh_ugc_get_subscribed;
+        g_ugc_vt[kUgcItemState]     = (void*)gh_ugc_item_state;
+        g_ugc_vt[kUgcInstallInfo]   = (void*)gh_ugc_install_info;
+        g_ugc_vt[kUgcDownloadInfo]  = (void*)gh_ugc_download_info;
+        g_ugc_vt[kUgcDownload]      = (void*)gh_ugc_download;
+        *(void***)real = g_ugc_vt;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        gh_logf("[gh-shim] UGC wrap FAULTED on %p -> left unwrapped", real);
+        return real;
+    }
+    gh_ws_load();
+    gh_logf("[gh-shim] UGC %p wrapped (workshop items=%d)", real, g_ws_n);
+    return real;
+}
+
 // The one place that turns a version string into something callable.
 // Returns the real engine interface when we can get one; otherwise the legacy
 // sentinel, so every flat-C consumer (LethalCo, REPO, Cheese) behaves exactly as
@@ -1933,6 +2213,7 @@ static void* gh_iface_for_version(const char* ver) {
     else if (route && (stub = gh_handwritten_iface(route->prefix)) != nullptr) { /* real answers */ }
     else stub = gh_stub_object(route ? route->prefix : "SteamUnknown");
     if (!stub) stub = route ? route->sentinel : (void*)&g_iface_client;
+    if (real && strncmp(ver, "STEAMUGC_INTERFACE_VERSION", 26) == 0) real = gh_ugc_wrap(real, ver);
     void* out = real ? real : stub;
     gh_logf("[gh-shim] iface \"%s\" -> %s %p (slot=%d state=%d)", ver,
             real ? "ENGINE" : "sentinel", out, route ? route->slot : -1, g_gh_engine_state);
@@ -2007,7 +2288,22 @@ __declspec(dllexport) void* SteamInternal_FindOrCreateUserInterface(HSteamUser, 
     // engine's real user/pipe are the ones that can actually vend an interface.
     return gh_iface_for_version(ver);
 }
-__declspec(dllexport) void* SteamInternal_FindOrCreateGameServerInterface(HSteamUser, const char*) { return &g_iface_gameserver; }
+__declspec(dllexport) void* SteamInternal_FindOrCreateGameServerInterface(HSteamUser, const char* ver) {
+    if (!g_gs_inited) return nullptr;
+    // The caller is a C++ consumer (the accessor macro derefs a vtable), so
+    // it gets a stub object; the name outlives the game's own string.
+    static const char* s_names[32]; static int s_n = 0; static SRWLOCK s_lk = SRWLOCK_INIT;
+    const char* nm = nullptr;
+    if (ver) {
+        AcquireSRWLockExclusive(&s_lk);
+        for (int i = 0; i < s_n && !nm; ++i) if (strcmp(s_names[i], ver) == 0) nm = s_names[i];
+        if (!nm && s_n < 32 && (nm = _strdup(ver))) s_names[s_n++] = nm;
+        ReleaseSRWLockExclusive(&s_lk);
+    }
+    if (!nm) nm = "SteamGameServer";
+    void* o = gh_stub_object(nm);
+    return o ? o : (void*)&g_iface_gameserver;
+}
 __declspec(dllexport) SteamAPICall_t SteamAPI_ISteamClient_ConnectToGlobalUser(void*, HSteamPipe) { return 1; }
 __declspec(dllexport) HSteamPipe SteamAPI_ISteamClient_CreateSteamPipe(void*) { return (HSteamPipe)1; }
 __declspec(dllexport) bool SteamAPI_ISteamClient_BReleaseSteamPipe(void*, HSteamPipe) { return true; }

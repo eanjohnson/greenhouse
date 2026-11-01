@@ -70,6 +70,15 @@ typedef struct GhHostApi {
      * folder (no trailing backslash) and returns its length, 0 on failure. The
      * installed-games source finds the folder again by its steam_appid.txt. */
     uint32_t (*installDir)(uint32_t app, wchar_t* buf, uint32_t cap);
+    /* The Steam branch a title's config names for this app id ("x86-64"), as ASCII;
+     * returns the length, 0 = none (download "public"). */
+    uint32_t (*steamBranch)(uint32_t app, char* buf, uint32_t cap);
+
+    /* Appended in loader 0.0.793.0 (still ABI 1). 1 once the user has pressed B on
+     * a cancellable progress screen (workshopSync) since the call began, else 0.
+     * Polls input itself, so a long download can ask between requests; same thread
+     * rule as progress. Outside a cancellable call it always answers 0. */
+    int (*cancelRequested)(void);
 } GhHostApi;
 
 /* True when the host's struct carries field f (an older host leaves it out). */
@@ -133,7 +142,39 @@ typedef struct GhAddonApi {
      * Sign out and confirmed it; whatever is already running keeps this session, and
      * the next start asks the user to sign in again. Nonzero = forgotten. */
     int (*signOut)(void);
+
+    /* Appended in loader 0.0.790.0 (still ABI 1): read only when size covers them.
+     * Steam Workshop for a title whose config says "workshop": true. All three run on
+     * the UI thread and may block; workshopSync draws through host->progressFiles. */
+    /* Bring the account's subscribed items for app onto the console (new, updated and
+     * unsubscribed), into <devRoot>gh_games\workshop\content\<app>\<id>\, and
+     * rewrite LocalState\gh_workshop_<app>.txt -- the list the game's ISteamUGC is
+     * answered from. Returns the number of items that failed (0 = all in place),
+     * negative when the sync could not run (not signed in, offline). */
+    int (*workshopSync)(uint32_t app);
+    /* One page (1-based) of the app's Workshop: sort GH_WS_SORT_*, or a text search
+     * when search is non-empty. emit() copies the item before returning. Returns 0 and
+     * writes *total (may be NULL), negative on failure. */
+    int (*workshopQuery)(uint32_t app, uint32_t sort, uint32_t page, const wchar_t* search,
+                         void* ctx, void (*emit)(void* ctx, const struct GhWorkshopItem* item),
+                         uint32_t* total);
+    /* Subscribe (1) or unsubscribe (0) the signed-in account; 0 = done. The content
+     * arrives (or leaves) on the next workshopSync. */
+    int (*workshopSubscribe)(uint32_t app, uint64_t id, int subscribe);
 } GhAddonApi;
+
+enum { GH_WS_SORT_POPULAR = 0, GH_WS_SORT_NEWEST = 1, GH_WS_SORT_TRENDING = 3, GH_WS_SORT_SUBSCRIBED = 9 };
+enum { GH_WS_SUBSCRIBED = 1, GH_WS_INSTALLED = 2 };
+typedef struct GhWorkshopItem {
+    uint32_t size;                    /* sizeof(GhWorkshopItem) as the add-on built it */
+    uint32_t flags;                   /* GH_WS_* for the signed-in account */
+    uint64_t id;                      /* publishedfileid */
+    uint64_t bytes;                   /* content size */
+    uint32_t updated;                 /* unix time of the last update */
+    uint32_t subscriptions;           /* current subscriber count */
+    const wchar_t* title;
+    const wchar_t* desc;              /* short description, may be NULL */
+} GhWorkshopItem;
 
 /* True when the add-on's struct carries field f. */
 #define GH_ADDON_HAS(api, f) \

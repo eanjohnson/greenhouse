@@ -798,9 +798,14 @@ static std::wstring CanonVirtual(const wchar_t* inpath)
     if (p.size()>=2 && ((p[0]>=L'A'&&p[0]<=L'Z')||(p[0]>=L'a'&&p[0]<=L'z')) && p[1]==L':'){
         drive.push_back((wchar_t)towupper(p[0]));
         body = p.substr(2);                        // may or may not start with backslash
-        if (!body.empty() && body[0]!=L'\\') {
-            // drive-relative (X:foo) -- treat as under current dir on that drive; rare, join to root
-            body = L"\\" + body;
+        if (body.empty() || body[0]!=L'\\') {
+            // drive-relative (X:foo, X:) -- under the current dir when it is on that
+            // drive, else that drive's root (no per-drive cwds are kept). Not rare:
+            // the static CRT's _getcwd IS GetFullPathNameW(L"D:."), and joining it to
+            // the root put every relative Source search path at D:\ (Garry's Mod).
+            const bool sameDrive = g_vCwd.size() >= 2 && g_vCwd[1] == L':' &&
+                                   (wchar_t)towupper(g_vCwd[0]) == drive[0];
+            body = (sameDrive ? g_vCwd.substr(2) : std::wstring()) + L"\\" + body;
         }
     } else if (p.rfind(L"\\\\",0)==0){
         drive = L"UNC"; body = p.substr(1);         // keep one leading backslash
@@ -851,6 +856,7 @@ static std::wstring CanonToWin(const std::wstring& canon)
 // points at <install>\guest\cacert.pem).
 static std::wstring g_installDir;   // set in RunGuest: package install root
 static std::wstring g_guestDir;     // set in RunGuest: the guest's own directory
+static std::wstring g_guestRootDir; // set in RunGuest: the install root when a title's "launch" sits below it, else empty
 static std::wstring g_guestDataDir; // set in RunGuest: the Unity _Data folder
 static ghovl::Index g_modOvl;       // §53: the armed profile's game\ folder and mounts (GhModsBegin); off = none
 static std::wstring g_modOvlBase;    // the game's install folder g_modOvl's paths are relative to (trailing '\')
@@ -918,13 +924,17 @@ struct GhTitle {
     std::string from;             // the file it was loaded from, for the log
     std::wstring exe;             // guest exe basename
     std::wstring installProbe;    // under kDevGames: proves the title is installed (may be empty)
+    std::wstring launch;          // exe path relative to the install folder, when the picker's guess is wrong
     std::wstring seed;            // guest\seed\<seed>\ in the package (default: exe base)
     std::wstring args;            // appended to the guest command line
     std::vector<GhTitleKnob> knobs;
     bool hasPsoDeny = false;      // gh_pso_deny.txt stand-in when that file is absent
     std::string psoDeny;          // 32-hex keys, one per line
     unsigned steamAppId = 0;
+    std::string steamBranch;      // Steam branch the download takes ("" = public), e.g. "x86-64"
     std::vector<std::string> services;   // runtime services the title needs ("steam-runtime")
+    bool workshop = false;        // Steam Workshop: sync the account's subscriptions before launch
+    std::string input;            // overlay input profile a game starts on until the player picks one
     std::wstring SeedName() const
     {
         if (!seed.empty()) return seed;
@@ -1037,6 +1047,10 @@ static std::wstring MapToReal(const wchar_t* guestPath)
             std::wstring m = GhModOvlFor(p);
             if (!m.empty()) return m;
         }
+        // The install root of a title launched from below it (Garry's Mod's
+        // garrysmod\ beside bin\win64\) is the game's own tree as well.
+        if (!g_guestRootDir.empty() && StartsWithNoCase(p, g_guestRootDir))
+            return p;
         // §53: the OS font folder, read-only, when the container has one. Unity's
         // IMGUI default font (LegacyRuntime) is dynamic and renders its glyphs from
         // OS fonts; with C:\Windows\Fonts mapped to an empty vfs mirror a MelonLoader
@@ -1078,6 +1092,10 @@ static std::wstring MapToReal(const wchar_t* guestPath)
         std::wstring rel(guestPath);
         if (rel.rfind(L"\\\\?\\",0)==0) rel = rel.substr(4);
         for (auto& c : rel) if (c==L'/') c=L'\\';
+        // Such a title's cwd is its install root, a real folder: every relative
+        // path, read or write, lands in the game's tree as it does under Steam.
+        if (IsRelativeGuestPath(rel) && !g_guestRootDir.empty())
+            return CanonToWin(CanonVirtual(rel.c_str()));
         if (IsRelativeGuestPath(rel)){
             for (const std::wstring* base : { &g_guestDataDir, &g_guestDir }){
                 if (base->empty()) continue;
@@ -1227,8 +1245,44 @@ static bool GhHideCrashpad(const std::wstring& real)
     return true;
 }
 
+// An app container may only create and open named pipes in its own LOCAL\
+// namespace: CreateNamedPipeW("\\.\pipe\mojo.<pid>.<tid>.<n>") is ACCESS_DENIED,
+// and Chromium's mojo PCHECKs it (FATAL platform_channel.cc(72), GMod's CEF,
+// §57). Both ends of every guest pipe are in this process, so moving the name
+// into \\.\pipe\LOCAL\ for the creator and the opener alike keeps them paired.
+static bool GhPipeLocal(LPCWSTR name, std::wstring& out)
+{
+    static const wchar_t kPipe[] = L"\\\\.\\pipe\\";
+    const size_t n = wcslen(kPipe);
+    if (!name || _wcsnicmp(name, kPipe, n) != 0 || _wcsnicmp(name + n, L"LOCAL\\", 6) == 0) return false;
+    out = std::wstring(kPipe) + L"LOCAL\\" + (name + n);
+    static volatile LONG k = 0;
+    if (InterlockedIncrement(&k) <= 4) Diag("PIPE " + std::string(out.begin(), out.end()));
+    return true;
+}
+static HANDLE WINAPI Bed_CreateNamedPipeW(LPCWSTR name, DWORD open, DWORD mode, DWORD inst, DWORD outSz,
+                                          DWORD inSz, DWORD ms, LPSECURITY_ATTRIBUTES sa)
+{
+    std::wstring local;
+    HANDLE h = CreateNamedPipeW(GhPipeLocal(name, local) ? local.c_str() : name, open, mode, inst, outSz, inSz, ms, sa);
+    if (h == INVALID_HANDLE_VALUE){
+        const DWORD e = GetLastError();
+        static volatile LONG k = 0;
+        if (InterlockedIncrement(&k) <= 4) Diag("PIPE create failed err=" + std::to_string(e));
+        SetLastError(e);
+    }
+    return h;
+}
+static BOOL WINAPI Bed_WaitNamedPipeW(LPCWSTR name, DWORD ms)
+{
+    std::wstring local;
+    return WaitNamedPipeW(GhPipeLocal(name, local) ? local.c_str() : name, ms);
+}
+
 static HANDLE WINAPI Bed_CreateFileW(LPCWSTR name, DWORD acc, DWORD share, LPSECURITY_ATTRIBUTES sa,
                                      DWORD disp, DWORD flags, HANDLE tmpl){
+    std::wstring pipe;
+    if (GhPipeLocal(name, pipe)) return CreateFileW(pipe.c_str(), acc, share, sa, disp, flags, tmpl);
     std::wstring mapped = name ? RedirectDriveRootSave(name) : L"";
     const wchar_t* use = mapped.empty() ? name : mapped.c_str();
     std::wstring real = MapToReal(use);
@@ -1269,6 +1323,8 @@ static HANDLE WINAPI Bed_CreateFileA(LPCSTR name, DWORD acc, DWORD share, LPSECU
     return Bed_CreateFileW(w, acc, share, sa, disp, flags, tmpl);
 }
 static HANDLE WINAPI Bed_CreateFile2(LPCWSTR name, DWORD acc, DWORD share, DWORD disp, LPCREATEFILE2_EXTENDED_PARAMETERS params){
+    std::wstring pipe;
+    if (GhPipeLocal(name, pipe)) return CreateFile2(pipe.c_str(), acc, share, disp, params);
     std::wstring real = MapToReal(name);
     if (GhHidePsoCache(real, acc) || GhHideCrashpad(real)){
         VfsTrace("CreateFile2[HIDDEN]", name, real);
@@ -1850,7 +1906,16 @@ static BOOL WINAPI Bed_FindNextFileA(HANDLE h, LPWIN32_FIND_DATAA fd){
     if (r) FindDataWtoA(wd, fd);
     return r;
 }
+// First few cwd calls of a session, with what the guest asked and got.
+static void CwdTrace(const char* what, const std::wstring& in, const std::wstring& out)
+{
+    static volatile LONG n = 0;
+    if (InterlockedIncrement(&n) > 32) return;
+    Diag(std::string("CWD ") + what + " [" + std::string(in.begin(), in.end()) + "] -> [" +
+         std::string(out.begin(), out.end()) + "]");
+}
 static DWORD WINAPI Bed_GetCurrentDirectoryW(DWORD len, LPWSTR buf){
+    CwdTrace("GetW", L"", g_vCwd);
     DWORD need = (DWORD)g_vCwd.size();
     if (buf && len>need){ wcscpy_s(buf, len, g_vCwd.c_str()); return need; }
     return need+1;
@@ -1862,7 +1927,30 @@ static BOOL WINAPI Bed_SetCurrentDirectoryW(LPCWSTR path){
     std::wstring w = CanonToWin(CanonVirtual(path));
     if (w.size() > 3 && w.back() == L'\\') w.pop_back();
     g_vCwd = w;
+    // Keep the REAL cwd with it when the folder really exists: the guest's CRT
+    // (_getcwd, _fullpath, fopen of a relative name inside a static CRT) asks the
+    // OS, not us, and must land in the same folder.
+    std::wstring real = MapToReal(w.c_str());
+    const DWORD at = GetFileAttributesW(real.c_str());
+    const BOOL rs = (at != INVALID_FILE_ATTRIBUTES && (at & FILE_ATTRIBUTE_DIRECTORY)) ? SetCurrentDirectoryW(real.c_str()) : FALSE;
+    CwdTrace(rs ? "SetW+real" : "SetW", path ? path : L"", w);
     return TRUE;
+}
+// The ANSI pair answers from the same virtual cwd. Source 1 (GMod) asks for it
+// with GetCurrentDirectoryA (launcher, filesystem_stdio) and sets it with
+// SetCurrentDirectoryA (gmod.exe): unbedded, they saw the REAL cwd
+// (D:\DevelopmentFiles\gh_saves) and the game looked for D:\garrysmod\*.vpk.
+static DWORD WINAPI Bed_GetCurrentDirectoryA(DWORD len, LPSTR buf){
+    CwdTrace("GetA", L"", g_vCwd);
+    char a[1024]; int n = WideCharToMultiByte(CP_ACP, 0, g_vCwd.c_str(), -1, a, sizeof(a), nullptr, nullptr);
+    if (n <= 0) return 0;
+    DWORD need = (DWORD)(n - 1);
+    if (buf && len > need){ memcpy(buf, a, n); return need; }
+    return need + 1;
+}
+static BOOL WINAPI Bed_SetCurrentDirectoryA(LPCSTR path){
+    wchar_t w[1024]; if (!path || !MultiByteToWideChar(CP_ACP, 0, path, -1, w, 1024)) return FALSE;
+    return Bed_SetCurrentDirectoryW(w);
 }
 static DWORD WINAPI Bed_GetTempPathW(DWORD len, LPWSTR buf){
     static const wchar_t* t = L"C:\\Temp\\";
@@ -1875,6 +1963,16 @@ static DWORD WINAPI Bed_GetFullPathNameW(LPCWSTR name, DWORD len, LPWSTR buf, LP
     DWORD need=(DWORD)win.size();
     if (buf && len>need){ wcscpy_s(buf,len,win.c_str()); if(part){ size_t s=win.find_last_of(L'\\'); *part = (s==std::wstring::npos)?buf:buf+s+1; } return need; }
     return need+1;
+}
+static DWORD WINAPI Bed_GetFullPathNameA(LPCSTR name, DWORD len, LPSTR buf, LPSTR* part){
+    wchar_t w[1024]; if (!name || !MultiByteToWideChar(CP_ACP, 0, name, -1, w, 1024)) return 0;
+    std::wstring win = CanonToWin(CanonVirtual(w));
+    CwdTrace("FullA", w, win);
+    char a[1024]; int n = WideCharToMultiByte(CP_ACP, 0, win.c_str(), -1, a, sizeof(a), nullptr, nullptr);
+    if (n <= 0) return 0;
+    DWORD need = (DWORD)(n - 1);
+    if (buf && len > need){ memcpy(buf, a, n); if (part){ char* s = strrchr(buf, '\\'); *part = s ? s + 1 : buf; } return need; }
+    return need + 1;
 }
 
 // ===========================================================================
@@ -2389,6 +2487,45 @@ static HMODULE LoadGuestDll(const char* dll);                       // fwd
 static void    RepublishGuestTls(const char* why);                  // fwd (see TLS section)
 static void    RunGuestTlsCallbacksForThread();                     // fwd (see TLS section)
 static std::wstring FindGuestSupportDll(const wchar_t* name);       // fwd (see support DLLs)
+#ifdef GH_LAUNCHER
+// d3d9.dll, which the console does not have: gh_d3d9rt.h (included far below).
+struct IDirect3D9; struct IDirect3D9Ex;
+static IDirect3D9* WINAPI Bed_Direct3DCreate9(UINT sdk);
+static HRESULT WINAPI Bed_Direct3DCreate9Ex(UINT sdk, IDirect3D9Ex** pp);
+static int   WINAPI Bed_D3DPERF_BeginEvent(DWORD col, LPCWSTR name);
+static int   WINAPI Bed_D3DPERF_EndEvent();
+static void  WINAPI Bed_D3DPERF_SetMarker(DWORD col, LPCWSTR name);
+static void  WINAPI Bed_D3DPERF_SetRegion(DWORD col, LPCWSTR name);
+static BOOL  WINAPI Bed_D3DPERF_QueryRepeatFrame();
+static void  WINAPI Bed_D3DPERF_SetOptions(DWORD opt);
+static DWORD WINAPI Bed_D3DPERF_GetStatus();
+static void* WINAPI Bed_Direct3DShaderValidatorCreate9();
+static void  WINAPI Bed_D3D9Nop();
+static int   WINAPI Bed_Direct3D9EnableMaximizedWindowedModeShim(UINT on);
+static HMODULE GhD3d9Module();
+#ifdef GH_LAUNCHER
+static HMODULE GhDsoundModule();   // gh_dsound.h: the module dsound.dll is served from
+static HMODULE g_dsAlias = nullptr;   // ...once LoadGuestDll has handed it out
+#endif
+static void* DsoundImport(const char* dll, const char* fn, unsigned ord);
+// d3dx9_42.dll, which neither the console nor the game ships: gh_d3dx9.h.
+static float*  WINAPI Bed_D3DXPlaneNormalize(float* o, const float* p);
+static float*  WINAPI Bed_D3DXPlaneTransform(float* o, const float* p, const float* m);
+static HRESULT WINAPI Bed_D3DXCreateMatrixStack(DWORD flags, void** pp);
+static float*  WINAPI Bed_D3DXVec3TransformCoord(float* o, const float* v, const float* m);
+static float*  WINAPI Bed_D3DXMatrixMultiply(float* o, const float* a, const float* b);
+static float*  WINAPI Bed_D3DXVec4Normalize(float* o, const float* v);
+static float*  WINAPI Bed_D3DXVec4Transform(float* o, const float* v, const float* m);
+static float*  WINAPI Bed_D3DXMatrixTranspose(float* o, const float* m);
+static float*  WINAPI Bed_D3DXMatrixInverse(float* o, float* det, const float* m);
+static float*  WINAPI Bed_D3DXMatrixTranslation(float* o, float x, float y, float z);
+static float*  WINAPI Bed_D3DXMatrixPerspectiveRH(float* o, float w, float h, float zn, float zf);
+static float*  WINAPI Bed_D3DXMatrixPerspectiveOffCenterRH(float* o, float l, float r, float b, float t, float zn, float zf);
+static float*  WINAPI Bed_D3DXMatrixOrthoOffCenterRH(float* o, float l, float r, float b, float t, float zn, float zf);
+static HRESULT WINAPI Bed_D3DXCompileShader(const char* src, UINT len, const void* defines, void* include,
+                                            const char* fn, const char* profile, DWORD flags,
+                                            void** ppShader, void** ppErrors, void** ppConstants);
+#endif
 
 // SetDllDirectory: a packaged app's DLL search order leaves the DLL directory out,
 // so the real call succeeds and changes nothing. Unity sets <Data>\Plugins\x86_64
@@ -2586,7 +2723,7 @@ static bool __cdecl Bed_GetClientBootstrapMetrics(void* buf, uint32_t cb, uint32
 // GetProcAddress cannot see its exports -- we walk the export directory
 // ourselves (Bed_GetProcAddress below), and dedup on it in LoadGuestDll.
 // ---------------------------------------------------------------------------
-struct GhSelfMod { uint8_t* base; std::string name; };
+struct GhSelfMod { uint8_t* base; std::string name; std::wstring path; };
 static std::vector<GhSelfMod> g_selfMods;
 static SRWLOCK                g_selfModLock = SRWLOCK_INIT;
 static HMODULE GhSelfMapDll(const std::wstring& full, const char* dll,
@@ -2619,10 +2756,22 @@ static bool GhSelfMapIs(HMODULE h)
     ReleaseSRWLockShared(&g_selfModLock);
     return r;
 }
-// Export lookup for a module WE mapped. Handles ordinals and forwarders.
-static FARPROC GhSelfMapExport(HMODULE h, LPCSTR name)
+// The file a module WE mapped came from: GetModuleFileName on its handle (Source's
+// FileSystem_GetBaseDir asks engine.dll where it lives). Empty when not ours.
+static std::wstring GhSelfMapPath(HMODULE h)
 {
-    if (!GhSelfMapIs(h)) return nullptr;
+    std::wstring r;
+    if (!h) return r;
+    AcquireSRWLockShared(&g_selfModLock);
+    for (auto& m : g_selfMods) if ((HMODULE)m.base == h){ r = m.path; break; }
+    ReleaseSRWLockShared(&g_selfModLock);
+    return r;
+}
+static FARPROC GhSelfMapExport(HMODULE h, LPCSTR name);
+// Export lookup in an image WE mapped. Handles ordinals and forwarders.
+static FARPROC GhImageExport(HMODULE h, LPCSTR name)
+{
+    if (!h) return nullptr;
     uint8_t* base = (uint8_t*)h;
     auto* dos = (IMAGE_DOS_HEADER*)base;
     auto* nt  = (IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
@@ -2651,6 +2800,35 @@ static FARPROC GhSelfMapExport(HMODULE h, LPCSTR name)
         return GetProcAddress(fm, f.c_str() + dot + 1);
     }
     return (FARPROC)(base + rva);
+}
+static FARPROC GhSelfMapExport(HMODULE h, LPCSTR name)
+{
+    return GhSelfMapIs(h) ? GhImageExport(h, name) : nullptr;
+}
+// The guest's own exports for a lookup on the main module: GetModuleHandle(NULL)
+// is the host exe, and the game asks it for ITS exports -- GMod's html_chromium
+// wants CreateCefSandboxInfo from gmod.exe and gave up on CEF without it (§57).
+static FARPROC GhGuestMainExport(HMODULE mod, LPCSTR name);
+// libcef's user32 windowing and message calls go to gh_cefwin.h instead of the
+// game's window surrogate, which hands every window the one kFakeHwnd and never
+// sends WM_NCCREATE (FATAL hwnd_util.cc(81)), and whose hidden windows stole the
+// game's WndProc. The real user32 is no help: the container refuses
+// RegisterClassExW with 0x78 (GMod, §57). t_cefWin covers the load-time imports.
+static thread_local bool t_cefWin = false;
+static void* GhCefWinLookup(const char* fn);
+static void* GhCefWrapExport(const char* fn, void* real);
+static bool GhWantsCefWin(const std::string& nm){ return 0 == _stricmp(nm.c_str(), "libcef.dll"); }
+static bool GhCefWinCaller(const void* ra)
+{
+    bool r = false;
+    AcquireSRWLockShared(&g_selfModLock);
+    for (auto& m : g_selfMods){
+        if (!GhWantsCefWin(m.name)) continue;
+        auto* nt = (IMAGE_NT_HEADERS64*)(m.base + ((IMAGE_DOS_HEADER*)m.base)->e_lfanew);
+        if ((const uint8_t*)ra >= m.base && (const uint8_t*)ra < m.base + nt->OptionalHeader.SizeOfImage){ r = true; break; }
+    }
+    ReleaseSRWLockShared(&g_selfModLock);
+    return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -3412,6 +3590,8 @@ static FARPROC WINAPI Bed_GetProcAddress(HMODULE mod, LPCSTR name)
                 return (FARPROC)e.p;
             }
         }
+        if (mod == GetModuleHandleW(L"user32.dll") && GhCefWinCaller(_ReturnAddress()))
+            if (void* r = GhCefWinLookup(name)) return (FARPROC)r;
         auto& t = ShimTable();
         auto it = t.find(name);
         if (it != t.end()){
@@ -3441,7 +3621,15 @@ static FARPROC WINAPI Bed_GetProcAddress(HMODULE mod, LPCSTR name)
         }
     }
     // #146: a module we mapped ourselves is invisible to the real loader.
-    if (FARPROC f = GhSelfMapExport(mod, name)) return f;
+    if (FARPROC f = GhSelfMapExport(mod, name)) return HIWORD(name) ? (FARPROC)GhCefWrapExport(name, (void*)f) : f;
+    if (FARPROC f = GhGuestMainExport(mod, name)) return f;
+#ifdef GH_LAUNCHER
+    if (mod && mod == g_dsAlias){   // "dsound.dll": XAudio2's own names first, then the beds
+        if (FARPROC f = GetProcAddress(mod, name)) return f;
+        return (FARPROC)DsoundImport("dsound.dll", HIWORD(name) ? name : nullptr,
+                                     HIWORD(name) ? 0u : (unsigned)LOWORD(name));
+    }
+#endif
     return GetProcAddress(mod, name);
 }
 
@@ -13590,6 +13778,50 @@ static void GhDdiProbeDxilStages()
 // so the whole graphics stack can be copied out and pulled with the file API.
 // Take each module's REAL path from the loaded module wherever there is one: the
 // UMD need not live in System32, and guessing is how you RE the wrong binary.
+// gh_syscopy.txt: whitespace-separated module names to copy out of the console's
+// System32 into D:\DevelopmentFiles\gh_sys\ at Launcher start, for host-side RE.
+// The DDIPROBE copy above needs a guest's first D3D12 device and lands in the
+// LocalState quota; this needs neither, so a DLL no guest loads (d3d9on12) can
+// come off the console from the picker alone. The file is deleted after use.
+static void GhSysCopyForRE()
+{
+    std::wstring knob = std::wstring(kLocalState) + L"gh_syscopy.txt";
+    HANDLE h = CreateFileW(knob.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    char raw[2048] = {}; DWORD got = 0;
+    ReadFile(h, raw, sizeof raw - 1, &got, nullptr);
+    CloseHandle(h);
+    DeleteFileW(knob.c_str());
+    std::wstring dir = std::wstring(kDevRoot) + L"gh_sys";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    wchar_t sys[MAX_PATH] = {};
+    GetSystemDirectoryW(sys, MAX_PATH);
+    std::string tok;
+    auto copyOne = [&](const std::string& nm){
+        std::wstring m(nm.begin(), nm.end());
+        std::wstring src = std::wstring(sys) + L"\\" + m;
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        std::string tail;
+        if (!GetFileAttributesExW(src.c_str(), GetFileExInfoStandard, &fa))
+            tail = " MISSING err=" + Hex(GetLastError());
+        else {
+            tail = " size=" + std::to_string(((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow);
+            tail += CopyFileW(src.c_str(), (dir + L"\\" + m).c_str(), FALSE)
+                        ? std::string(" -> gh_sys OK")
+                        : std::string(" copy FAILED err=") + Hex(GetLastError());
+        }
+        Diag("SYSCOPY " + nm + tail);
+    };
+    for (DWORD i = 0; i <= got; ++i){
+        const char c = i < got ? raw[i] : ' ';
+        if (c == ' ' || c == '\r' || c == '\n' || c == '\t' || c == 0){
+            if (!tok.empty()) copyOne(tok);
+            tok.clear();
+        } else if (c > 32 && c < 127 && c != '\\' && c != '/' && tok.size() < 64) tok += c;
+    }
+}
+
 static void GhDdiCopyStackForRE()
 {
     // #209: umd12ddi memoizes SCSimpleCompileShader behind a two-tier
@@ -34513,6 +34745,8 @@ static HRESULT WINAPI Bed_D3D11CreateDeviceAndSwapChain(
 // this by capturing the WndProc at RegisterClass time and synthesising the
 // activation sequence through the guest's own PeekMessage/DispatchMessage flow.
 static WNDPROC g_guestWndProc = nullptr;
+// The fake window's GWL longs (GhFakeWndLong, below the window beds).
+static LONG_PTR g_fakeWndUser = 0, g_fakeWndStyle = WS_POPUP | WS_VISIBLE, g_fakeWndExStyle = 0;
 // A guest that registers more than one window class used to end up dispatching
 // through whichever class registered LAST, because both beds just assigned
 // g_guestWndProc and moved on. Tsushima registers two ("BED RegisterClassExW
@@ -34821,6 +35055,151 @@ static void KM_Push(UINT msg, WPARAM wp, LPARAM lp){
     }
 }
 
+// §57. A window the guest creates on a thread other than its main one. Unreal's
+// splash thread builds a bitmap, creates SplashScreenClass and loops on PeekMessage
+// until WM_QUIT; Hide() on the main thread posts WM_CLOSE to that window and then
+// waits on the thread with INFINITE (DefWindowProc -> DestroyWindow -> WM_DESTROY ->
+// PostQuitMessage is what ends the loop). Every window used to be kFakeHwnd and take over
+// g_guestWndProc, PostMessage went to the real user32 (which has no such window) and
+// PostQuitMessage was a no-op, so the splash never ended and RV There Yet? sat on its
+// loading screen for good. 0.0.776 never saw it only because CreateDIBSection failed
+// and the splash thread gave up first; the GDI work for GMod let it through. Such a
+// window now gets a handle, a queue and a WM_QUIT of its own thread, and never touches
+// the main window's proc, burst or keyboard/mouse queue. gh_wnd_threads.txt=0 puts
+// every window back on kFakeHwnd.
+namespace ghwnd2 {
+struct Wnd { WNDPROC proc; DWORD tid; bool dying = false; };
+struct Thr { std::deque<MSG> q; bool quit = false; int code = 0; };
+static std::mutex                         g_mu;
+static std::unordered_map<uintptr_t, Wnd> g_wnd;
+static std::unordered_map<DWORD, Thr>     g_thr;     // threads that own one of them
+static uintptr_t                          g_next = 0x00478001;   // 32-bit, clear of kFakeHwnd and cefwin
+static volatile LONG                      g_live = 0;            // none was ever made: every call is a no-op
+static bool Enabled(){
+    static int v = -1;
+    if (v < 0) v = GhCfgNumZ(L"gh_wnd_threads.txt", "GH_WND_THREADS", 1) ? 1 : 0;
+    return v != 0;
+}
+static bool OwnsAnyLocked(DWORD tid){
+    for (auto& w : g_wnd) if (w.second.tid == tid) return true;
+    return false;
+}
+static HWND Create(const std::wstring& cls){
+    const DWORD tid = GetCurrentThreadId();
+    if (!g_guestWorkerTid || tid == g_guestWorkerTid || !Enabled()) return nullptr;
+    WNDPROC p = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_wndClassMutex);
+        auto it = g_wndClasses.find(cls);
+        if (it != g_wndClasses.end()) p = it->second;
+    }
+    if (!p) return nullptr;
+    HWND h;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        h = (HWND)g_next++;
+        g_wnd[(uintptr_t)h] = Wnd{ p, tid, false };
+        g_thr[tid];
+    }
+    InterlockedExchange(&g_live, 1);
+    Diag("BED CreateWindowEx cls=" + std::string(cls.begin(), cls.end()) + " on tid=" + std::to_string(tid) +
+         " (not the main thread) -> own window " + Hex((uint64_t)(uintptr_t)h) +
+         " proc=" + Hex((uint64_t)(uintptr_t)p) + ", main WndProc kept");
+    return h;
+}
+static bool Find(HWND h, Wnd* out){
+    if (!g_live) return false;
+    std::lock_guard<std::mutex> lk(g_mu);
+    auto it = g_wnd.find((uintptr_t)h);
+    if (it == g_wnd.end()) return false;
+    if (out) *out = it->second;
+    return true;
+}
+// DestroyWindow sends the window WM_DESTROY and WM_NCDESTROY before it goes, and a
+// proc that answers WM_DESTROY with DestroyWindow again must not recurse.
+static bool BeginDestroy(HWND h, Wnd* out){
+    if (!g_live) return false;
+    std::lock_guard<std::mutex> lk(g_mu);
+    auto it = g_wnd.find((uintptr_t)h);
+    if (it == g_wnd.end() || it->second.dying) return false;
+    it->second.dying = true;
+    *out = it->second;
+    return true;
+}
+static bool Destroy(HWND h){
+    if (!g_live) return false;
+    std::lock_guard<std::mutex> lk(g_mu);
+    auto it = g_wnd.find((uintptr_t)h);
+    if (it == g_wnd.end()) return false;
+    const DWORD tid = it->second.tid;
+    g_wnd.erase(it);
+    auto t = g_thr.find(tid);
+    if (t != g_thr.end() && !OwnsAnyLocked(tid) && t->second.q.empty() && !t->second.quit) g_thr.erase(t);
+    Diag("BED DestroyWindow own window " + Hex((uint64_t)(uintptr_t)h));
+    return true;
+}
+static bool Post(HWND h, UINT msg, WPARAM wp, LPARAM lp){
+    if (!g_live) return false;
+    std::lock_guard<std::mutex> lk(g_mu);
+    auto it = g_wnd.find((uintptr_t)h);
+    if (it == g_wnd.end()) return false;
+    MSG m{}; m.hwnd = h; m.message = msg; m.wParam = wp; m.lParam = lp;
+    g_thr[it->second.tid].q.push_back(m);
+    static int n = 0;
+    if (++n <= 20) Diag("BED PostMessage own window " + Hex((uint64_t)(uintptr_t)h) + " msg=" + Hex(msg) +
+                        " -> tid=" + std::to_string(it->second.tid));
+    return true;
+}
+// False when this thread owns none of these windows: the caller goes on as before.
+// True when it does, with *got saying whether m was filled. Such a thread is never
+// handed the main window's burst or keyboard/mouse messages.
+static bool Peek(LPMSG m, HWND h, UINT mn, UINT mx, UINT flags, bool* got){
+    *got = false;
+    if (!g_live) return false;
+    const DWORD tid = GetCurrentThreadId();
+    std::lock_guard<std::mutex> lk(g_mu);
+    auto t = g_thr.find(tid);
+    if (t == g_thr.end()) return false;
+    auto& q = t->second.q;
+    {
+        static volatile LONG n = 0;
+        if (!q.empty() && InterlockedIncrement(&n) <= 6)
+            Diag("BED own-window peek tid=" + std::to_string(tid) + " queued=" + std::to_string(q.size()) +
+                 " h=" + Hex((uint64_t)(uintptr_t)h) + " range=" + Hex(mn) + ".." + Hex(mx) + " flags=" + Hex(flags));
+    }
+    for (auto it = q.begin(); it != q.end(); ++it){
+        if (h == (HWND)-1 || (h && it->hwnd != h)) continue;
+        if ((mn || mx) && (it->message < mn || it->message > mx)) continue;
+        if (m) *m = *it;
+        if (flags & PM_REMOVE) q.erase(it);
+        *got = true;
+        return true;
+    }
+    if (t->second.quit){                          // WM_QUIT ignores the filters, as in user32
+        if (m){
+            *m = MSG{}; m->message = WM_QUIT; m->wParam = (WPARAM)t->second.code;
+        }
+        *got = true;
+        if (flags & PM_REMOVE){
+            Diag("BED WM_QUIT delivered on tid=" + std::to_string(tid) + " code=" + std::to_string(t->second.code));
+            t->second.quit = false;
+            if (!OwnsAnyLocked(tid) && q.empty()) g_thr.erase(t);
+        }
+    }
+    return true;
+}
+static bool Quit(int code){
+    if (!g_live) return false;
+    const DWORD tid = GetCurrentThreadId();
+    std::lock_guard<std::mutex> lk(g_mu);
+    auto t = g_thr.find(tid);
+    if (t == g_thr.end()) return false;
+    t->second.quit = true; t->second.code = code;
+    Diag("BED PostQuitMessage on tid=" + std::to_string(tid) + " (owns its own window)");
+    return true;
+}
+} // namespace ghwnd2
+
 static ATOM   WINAPI Bed_RegisterClassExW(const WNDCLASSEXW* wc){
     if (wc) GhClassRegister(wc->lpszClassName, wc->lpfnWndProc, "RegisterClassExW");
     return (ATOM)1;
@@ -34841,7 +35220,9 @@ static HWND   WINAPI Bed_CreateWindowExW(DWORD, LPCWSTR cls, LPCWSTR, DWORD styl
     Diag("BED CreateWindowExW cls=" + std::string(c.begin(), c.end()) +
          " style=" + Hex((uint32_t)style) + " at " + std::to_string(x) + "," + std::to_string(y) +
          " size " + std::to_string(w) + "x" + std::to_string(h));
+    if (HWND own = ghwnd2::Create(c)) return own;
     GhClassSelect(c);
+    g_fakeWndStyle = (LONG_PTR)style;
     return kFakeHwnd;
 }
 static HWND   WINAPI Bed_CreateWindowExA(DWORD, LPCSTR cls, LPCSTR, DWORD style,
@@ -34853,11 +35234,22 @@ static HWND   WINAPI Bed_CreateWindowExA(DWORD, LPCSTR cls, LPCSTR, DWORD style,
          " size " + std::to_string(w) + "x" + std::to_string(h));
     {
         std::string a = (cls && (uintptr_t)cls > 0xFFFF) ? cls : "(atom)";
-        GhClassSelect(std::wstring(a.begin(), a.end()));
+        const std::wstring wa(a.begin(), a.end());
+        if (HWND own = ghwnd2::Create(wa)) return own;
+        GhClassSelect(wa);
     }
+    g_fakeWndStyle = (LONG_PTR)style;
     return kFakeHwnd;
 }
-static BOOL   WINAPI Bed_DestroyWindow(HWND){ return TRUE; }
+static BOOL   WINAPI Bed_DestroyWindow(HWND h){
+    ghwnd2::Wnd own;
+    if (ghwnd2::BeginDestroy(h, &own)){
+        own.proc(h, WM_DESTROY, 0, 0);
+        own.proc(h, WM_NCDESTROY, 0, 0);
+        ghwnd2::Destroy(h);
+    }
+    return TRUE;
+}
 static BOOL   WINAPI Bed_ShowWindow(HWND, int){ return TRUE; }
 static BOOL   WINAPI Bed_UpdateWindow(HWND){ return TRUE; }
 // Both answer the CoreWindow size. Logged a handful of times because "the guest
@@ -34885,7 +35277,13 @@ static BOOL WINAPI Bed_IsMouseInPointerEnabled(){
     RECON_ONCE("IsMouseInPointerEnabled");
     return FALSE;
 }
-static LRESULT WINAPI Bed_DefWindowProcW(HWND, UINT, WPARAM, LPARAM){ return 0; }
+// §57. The one default a window of its own needs: WM_CLOSE destroys it. Unreal's
+// splash Hide() posts WM_CLOSE, its proc leaves that to DefWindowProc, and only the
+// WM_DESTROY that DestroyWindow then sends makes it PostQuitMessage.
+static LRESULT WINAPI Bed_DefWindowProcW(HWND h, UINT msg, WPARAM, LPARAM){
+    if (msg == WM_CLOSE && ghwnd2::Find(h, nullptr)) Bed_DestroyWindow(h);
+    return 0;
+}
 // One-shot activation sequence delivered through PeekMessage the first few times
 // Unity drains its queue. WM_ACTIVATEAPP(TRUE) + WM_ACTIVATE(WA_ACTIVE) +
 // WM_SETFOCUS is what flips Unity's gAppActive true; NCACTIVATE is harmless
@@ -34966,8 +35364,26 @@ static bool FillInjectedMsg(LPMSG m, HWND h = nullptr, UINT mn = 0, UINT mx = 0,
     }
     return false;
 }
-static BOOL   WINAPI Bed_PeekMessageW(LPMSG m, HWND h, UINT mn, UINT mx, UINT fl){ RECON_COUNT("PeekMessageW"); return FillInjectedMsg(m, h, mn, mx, fl) ? TRUE : FALSE; }
-static BOOL   WINAPI Bed_PeekMessageA(LPMSG m, HWND h, UINT mn, UINT mx, UINT fl){ RECON_ONCE("PeekMessageA"); return FillInjectedMsg(m, h, mn, mx, fl) ? TRUE : FALSE; }
+static BOOL   WINAPI Bed_PeekMessageW(LPMSG m, HWND h, UINT mn, UINT mx, UINT fl){
+    RECON_COUNT("PeekMessageW");
+    bool got; if (ghwnd2::Peek(m, h, mn, mx, fl, &got)) return got ? TRUE : FALSE;
+    return FillInjectedMsg(m, h, mn, mx, fl) ? TRUE : FALSE;
+}
+static BOOL   WINAPI Bed_PeekMessageA(LPMSG m, HWND h, UINT mn, UINT mx, UINT fl){
+    RECON_ONCE("PeekMessageA");
+    bool got; if (ghwnd2::Peek(m, h, mn, mx, fl, &got)) return got ? TRUE : FALSE;
+    return FillInjectedMsg(m, h, mn, mx, fl) ? TRUE : FALSE;
+}
+// The guest's own posts to a window of its own thread (§57) are queued there; any
+// other HWND goes to the real user32 as it always did.
+static BOOL   WINAPI Bed_PostMessageW(HWND h, UINT msg, WPARAM wp, LPARAM lp){
+    if (ghwnd2::Post(h, msg, wp, lp)) return TRUE;
+    return PostMessageW(h, msg, wp, lp);
+}
+static BOOL   WINAPI Bed_PostMessageA(HWND h, UINT msg, WPARAM wp, LPARAM lp){
+    if (ghwnd2::Post(h, msg, wp, lp)) return TRUE;
+    return PostMessageA(h, msg, wp, lp);
+}
 // #199 bit 1. This was `if(m) m->message = WM_QUIT; return 0;` -- a stub that
 // told every caller the app was closing and never once looked at the queue the
 // CoreWindow handlers fill. Nothing else drains that queue either: the guest has
@@ -34981,6 +35397,11 @@ static BOOL   WINAPI Bed_GetMessageW(LPMSG m, HWND h, UINT mn, UINT mx){
     if (!(GhRawInput() & 1)){ if(m) m->message = WM_QUIT; return 0; }
     if (!m) return 0;
     for (int i = 0; i < 50; ++i){                 // ~100 ms
+        bool got;
+        if (ghwnd2::Peek(m, h, mn, mx, PM_REMOVE, &got)){
+            if (got) return (m->message == WM_QUIT) ? 0 : TRUE;
+            Sleep(2); continue;
+        }
         if (FillInjectedMsg(m, h, mn, mx)) return (m->message == WM_QUIT) ? 0 : TRUE;
         Sleep(2);
     }
@@ -35002,6 +35423,16 @@ static void ClickDiagDispatch(const MSG* m, const char* via){
     }
 }
 static LRESULT WINAPI Bed_DispatchMessageW(const MSG* m){
+    ghwnd2::Wnd own;
+    if (m && ghwnd2::Find(m->hwnd, &own)){
+        static volatile LONG n = 0;
+        if (InterlockedIncrement(&n) <= 20)
+            Diag("BED dispatch own window " + Hex((uint64_t)(uintptr_t)m->hwnd) + " msg=" + Hex(m->message) +
+                 " -> proc " + Hex((uint64_t)(uintptr_t)own.proc));
+        const LRESULT r = own.proc(m->hwnd, m->message, m->wParam, m->lParam);
+        if (n <= 20) Diag("BED dispatch own window msg=" + Hex(m->message) + " returned");
+        return r;
+    }
     if (m && g_guestWndProc && m->hwnd == kFakeHwnd){
         // RECON: note the first few input (non-activation) messages actually
         // reaching Unity's WndProc, so we know the channel end-to-end works.
@@ -35024,6 +35455,8 @@ static LRESULT WINAPI Bed_DispatchMessageW(const MSG* m){
 // user32 drops it on our fake HWND and those messages never reach Unity's WndProc.
 // Route it to the same captured WndProc as the W variant.
 static LRESULT WINAPI Bed_DispatchMessageA(const MSG* m){
+    ghwnd2::Wnd own;
+    if (m && ghwnd2::Find(m->hwnd, &own)) return own.proc(m->hwnd, m->message, m->wParam, m->lParam);
     if (m && g_guestWndProc && m->hwnd == kFakeHwnd){
         ClickDiagDispatch(m, "A");
         return g_guestWndProc(m->hwnd, m->message, m->wParam, m->lParam);
@@ -35039,12 +35472,64 @@ static DWORD  WINAPI Bed_MsgWaitForMultipleObjects(DWORD nCount, const HANDLE*, 
 static DWORD  WINAPI Bed_MsgWaitForMultipleObjectsEx(DWORD nCount, const HANDLE*, DWORD, DWORD, DWORD){
     return WAIT_OBJECT_0 + nCount;
 }
-static void   WINAPI Bed_PostQuitMessage(int){}
+// A no-op except on a thread that owns a window of its own (§57): the main window's
+// thread quitting would end the guest, which every title so far has survived only
+// because this never reached it.
+static void   WINAPI Bed_PostQuitMessage(int code){
+    const bool own = ghwnd2::Quit(code);
+    static volatile LONG n = 0;
+    if (!own && InterlockedIncrement(&n) <= 10)
+        Diag("BED PostQuitMessage(" + std::to_string(code) + ") on tid=" + std::to_string(GetCurrentThreadId()) + " ignored");
+}
 static HCURSOR WINAPI Bed_LoadCursorW(HINSTANCE, LPCWSTR){ return nullptr; }
 static HICON  WINAPI Bed_LoadIconW(HINSTANCE, LPCWSTR){ return nullptr; }
-static LONG_PTR WINAPI Bed_SetWindowLongPtrW(HWND, int, LONG_PTR){ return 0; }
-static LONG_PTR WINAPI Bed_GetWindowLongPtrW(HWND, int){ return 0; }
-static BOOL   WINAPI Bed_IsWindow(HWND h){ return h == kFakeHwnd; }
+// The fake window keeps the four longs a guest reads back. Source registers
+// "Valve001" with DefWindowProc and installs its real procedure afterwards with
+// SetWindowLongPtr(GWLP_WNDPROC), chaining to the old one through
+// CallWindowProc -- dropping the set left the engine deaf to every message.
+static LONG_PTR GhFakeWndLong(HWND h, int i){
+    if (h != kFakeHwnd) return 0;
+    switch (i){
+    case GWLP_WNDPROC:  return (LONG_PTR)g_guestWndProc;
+    case GWLP_USERDATA: return g_fakeWndUser;
+    case GWL_STYLE:     return g_fakeWndStyle;
+    case GWL_EXSTYLE:   return g_fakeWndExStyle;
+    }
+    return 0;
+}
+static LONG_PTR GhFakeWndSetLong(HWND h, int i, LONG_PTR v){
+    if (h != kFakeHwnd) return 0;
+    LONG_PTR old = GhFakeWndLong(h, i);
+    switch (i){
+    case GWLP_WNDPROC:
+        if (v){
+            g_guestWndProc = (WNDPROC)v;
+            Diag("BED SetWindowLongPtr WNDPROC " + Hex((uint64_t)old) + " -> " + Hex((uint64_t)v));
+        }
+        break;
+    case GWLP_USERDATA: g_fakeWndUser = v; break;
+    case GWL_STYLE:     g_fakeWndStyle = v; break;
+    case GWL_EXSTYLE:   g_fakeWndExStyle = v; break;
+    }
+    return old;
+}
+static LONG_PTR WINAPI Bed_SetWindowLongPtrW(HWND h, int i, LONG_PTR v){ return GhFakeWndSetLong(h, i, v); }
+static LONG_PTR WINAPI Bed_GetWindowLongPtrW(HWND h, int i){ return GhFakeWndLong(h, i); }
+static LONG     WINAPI Bed_SetWindowLongW(HWND h, int i, LONG v){ return (LONG)GhFakeWndSetLong(h, i, v); }
+static LONG     WINAPI Bed_GetWindowLongW(HWND h, int i){ return (LONG)GhFakeWndLong(h, i); }
+static LRESULT  WINAPI Bed_DefWindowProcA(HWND h, UINT msg, WPARAM, LPARAM){
+    if (msg == WM_CLOSE && ghwnd2::Find(h, nullptr)) Bed_DestroyWindow(h);
+    return 0;
+}
+static LRESULT  WINAPI Bed_CallWindowProcW(WNDPROC p, HWND h, UINT m, WPARAM w, LPARAM l){ return p ? p(h, m, w, l) : 0; }
+// The fake window is top-level and alone. Real user32 on the console answered
+// GetParent(kFakeHwnd) with something non-null forever, and shaderapidx9's
+// "while ((p = GetParent(h))) h = p;" spun the main thread after CreateDevice.
+static HWND     WINAPI Bed_GetParent(HWND){ return nullptr; }
+static HWND     WINAPI Bed_GetAncestor(HWND h, UINT){ return h; }
+static HWND     WINAPI Bed_GetWindow(HWND, UINT){ return nullptr; }
+static BOOL     WINAPI Bed_IsChild(HWND, HWND){ return FALSE; }
+static BOOL   WINAPI Bed_IsWindow(HWND h){ return h == kFakeHwnd || ghwnd2::Find(h, nullptr); }
 static HWND   WINAPI Bed_SetFocus(HWND){ return kFakeHwnd; }
 static HWND   WINAPI Bed_SetCapture(HWND){ return nullptr; }
 static BOOL   WINAPI Bed_SetForegroundWindow(HWND){ return TRUE; }
@@ -35075,6 +35560,21 @@ static int WINAPI Bed_MessageBoxW(HWND, const wchar_t* text, const wchar_t* cap,
     // the message cannot be traced back to code by searching for it.
     DiagGuestBacktrace("MessageBoxW");
     return 1;   // IDOK
+}
+// comctl32 in the container answers InitCommonControlsEx with FALSE and
+// ERROR_CALL_NOT_IMPLEMENTED, and Chromium's InitializeToolkit PLOG(FATAL)s on
+// it (GMod's CEF, §57). Nothing a guest renders offscreen uses those classes.
+typedef BOOL (WINAPI* PFN_InitCommonControlsEx)(const void*);
+static BOOL WINAPI Bed_InitCommonControlsEx(const void* icc)
+{
+    static PFN_InitCommonControlsEx real = [] {
+        HMODULE m = LoadLibraryW(L"comctl32.dll");
+        return m ? (PFN_InitCommonControlsEx)GetProcAddress(m, "InitCommonControlsEx") : nullptr;
+    }();
+    BOOL ok = real ? real(icc) : FALSE;
+    static bool once = false;
+    if (!once){ once = true; Diag(std::string("BED InitCommonControlsEx real=") + (ok ? "TRUE" : "FALSE gle=" + std::to_string(GetLastError())) + " -> TRUE"); }
+    return TRUE;
 }
 static int WINAPI Bed_MessageBoxA(HWND, const char* text, const char* cap, UINT type)
 {
@@ -35155,6 +35655,8 @@ static BOOL   WINAPI Bed_IsIconic(HWND){ return FALSE; }
 // WindowFromPoint(cursor) and drops the click when the answer is not one of its windows;
 // IsWindowEnabled is how it tells a window under a modal from a live one.
 static DWORD  WINAPI Bed_GetWindowThreadProcessId(HWND h, LPDWORD pid){
+    ghwnd2::Wnd own;
+    if (ghwnd2::Find(h, &own)){ if (pid) *pid = GetCurrentProcessId(); return own.tid; }
     if (h != kFakeHwnd) return GetWindowThreadProcessId(h, pid);
     if (pid) *pid = GetCurrentProcessId();
     const DWORD t = g_guestWndTid;
@@ -35287,8 +35789,11 @@ static int WINAPI Bed_CombineRgn(HRGN dst, HRGN a, HRGN b, int mode){
     ReleaseSRWLockExclusive(&g_rgnLock);
     return GhRcEmpty(out) ? NULLREGION : (ew ? COMPLEXREGION : SIMPLEREGION);
 }
+#include "gh_gdifont.h"   // guest DCs, fonts and DIBs: GDI text from DirectWrite
+#include "gh_cefwin.h"     // libcef's hidden windows and message queues (§57)
+static void* GhCefWinLookup(const char* fn){ return cefwin::Lookup(fn); }
 static BOOL WINAPI Bed_DeleteObject(HGDIOBJ h){
-    if (GhRgnDrop(h)) return TRUE;
+    if (GhRgnDrop(h) || GhGdiDrop(h)) return TRUE;
     GH_REAL_GDI(L"gdi32.dll", DeleteObject, FALSE); return r_DeleteObject(h);
 }
 // SetWindowRgn takes ownership of the region on success.
@@ -35995,6 +36500,13 @@ static void GhVaSitesDump(const char* when)
 // Both must return the guest's path (not the host p0_spike_host.exe), so we
 // treat null and the cached real main-module handle identically.
 static HMODULE g_mainModule = nullptr;   // GetModuleHandleW(nullptr), cached in RunGuest
+static FARPROC GhGuestMainExport(HMODULE mod, LPCSTR name)
+{
+    if (!g_guestImageBase || !mod || (mod != g_mainModule && mod != GetModuleHandleW(nullptr))) return nullptr;
+    FARPROC f = GhImageExport((HMODULE)g_guestImageBase, name);
+    if (f && HIWORD(name)) Diag(std::string("GPA guest-main ") + name + " -> " + Hex((uintptr_t)f));
+    return f;
+}
 // ...and a THIRD way, which is the one a native C++ game actually uses: its own
 // hInstance. The CRT hands WinMain the guest's ImageBase, and the guest passes
 // that straight back to GetModuleFileNameW. It is neither null nor the host's
@@ -36017,13 +36529,15 @@ static bool IsMainModule(HMODULE h)
 // module; forward genuine per-DLL queries through to real.
 static DWORD WINAPI Bed_GetModuleFileNameW(HMODULE h, LPWSTR buf, DWORD cch)
 {
-    if (IsMainModule(h) && !g_guestExePath.empty() && buf){
-        DWORD n = (DWORD)g_guestExePath.size();
+    const std::wstring self = IsMainModule(h) ? std::wstring() : GhSelfMapPath(h);
+    const std::wstring& path = self.empty() ? g_guestExePath : self;
+    if ((IsMainModule(h) || !self.empty()) && !path.empty() && buf && cch){
+        DWORD n = (DWORD)path.size();
         if (n + 1 > cch){                 // truncate + set ERROR_INSUFFICIENT_BUFFER
-            std::memcpy(buf, g_guestExePath.c_str(), cch * sizeof(wchar_t));
+            std::memcpy(buf, path.c_str(), cch * sizeof(wchar_t));
             buf[cch - 1] = 0; SetLastError(ERROR_INSUFFICIENT_BUFFER); return cch;
         }
-        std::memcpy(buf, g_guestExePath.c_str(), (n + 1) * sizeof(wchar_t));
+        std::memcpy(buf, path.c_str(), (n + 1) * sizeof(wchar_t));
         return n;
     }
     DWORD n = GetModuleFileNameW(h, buf, cch);
@@ -36036,14 +36550,16 @@ static DWORD WINAPI Bed_GetModuleFileNameW(HMODULE h, LPWSTR buf, DWORD cch)
 }
 static DWORD WINAPI Bed_GetModuleFileNameA(HMODULE h, LPSTR buf, DWORD cch)
 {
-    if (IsMainModule(h) && !g_guestExePath.empty() && buf){
-        int n = WideCharToMultiByte(CP_ACP, 0, g_guestExePath.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    const std::wstring self = IsMainModule(h) ? std::wstring() : GhSelfMapPath(h);
+    const std::wstring& path = self.empty() ? g_guestExePath : self;
+    if ((IsMainModule(h) || !self.empty()) && !path.empty() && buf && cch){
+        int n = WideCharToMultiByte(CP_ACP, 0, path.c_str(), -1, nullptr, 0, nullptr, nullptr);
         if (n <= 0) return 0;
         if ((DWORD)n > cch){
-            WideCharToMultiByte(CP_ACP, 0, g_guestExePath.c_str(), -1, buf, cch, nullptr, nullptr);
+            WideCharToMultiByte(CP_ACP, 0, path.c_str(), -1, buf, cch, nullptr, nullptr);
             buf[cch - 1] = 0; SetLastError(ERROR_INSUFFICIENT_BUFFER); return cch;
         }
-        WideCharToMultiByte(CP_ACP, 0, g_guestExePath.c_str(), -1, buf, n, nullptr, nullptr);
+        WideCharToMultiByte(CP_ACP, 0, path.c_str(), -1, buf, n, nullptr, nullptr);
         return (DWORD)(n - 1);   // exclude trailing NUL as Win32 convention
     }
     DWORD n2 = GetModuleFileNameA(h, buf, cch);
@@ -37336,6 +37852,40 @@ static BOOL WINAPI Bed_GetMonitorInfoA(HMONITOR, LPMONITORINFO mi){
         strcpy_s(((MONITORINFOEXA*)mi)->szDevice, CCHDEVICENAME, "\\\\.\\DISPLAY1");
     return TRUE;
 }
+// The container's user32 answers 0 for GetGuiResources. Chromium only asks from
+// base::debug::CollectGDIUsageAndDie (libcef 86 +0x3030800), which it calls when a
+// GDI allocation has ALREADY failed; a 0 count crashes one CHECK earlier. The cause
+// is the failed allocation (Bed_GetDC, Bed_CreateDIBSection); this keeps the die
+// path's own report readable. A real count where there is one, else a believable one.
+static DWORD WINAPI Bed_GetGuiResources(HANDLE proc, DWORD flags)
+{
+    using Fn = DWORD (WINAPI*)(HANDLE, DWORD);
+    static Fn real = (Fn)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetGuiResources");
+    if (DWORD n = real ? real(proc, flags) : 0) return n;
+    RECON_ONCE("GetGuiResources (container answers 0)");
+    return flags == 0 ? 64 : flags == 1 ? 32 : 128;   // GR_GDIOBJECTS, GR_USEROBJECTS, peaks
+}
+// The container's GetDC(NULL) has no screen DC, and Chromium's ScopedGetDC(nullptr)
+// dies on that (libcef 86 +0x2788A5D -> CollectGDIUsageAndDie). It only reads
+// GetDeviceCaps from it, which Bed_GetDeviceCaps answers for any DC; so a DC of
+// ours (gh_gdifont.h) that lives as long as the process stands in for the screen.
+static HDC GhScreenDc(){
+    static HDC dc = (HDC)GhGdiNew(GhGdiObj{ GhGdiKind::Dc });
+    return dc;
+}
+static HDC WINAPI Bed_GetDC(HWND w){
+    using Fn = HDC (WINAPI*)(HWND);
+    static Fn real = (Fn)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDC");
+    if (HDC dc = real ? real(w) : nullptr) return dc;
+    RECON_ONCE("GetDC (container answers NULL)");
+    return GhScreenDc();
+}
+static int WINAPI Bed_ReleaseDC(HWND w, HDC dc){
+    if (dc && dc == GhScreenDc()) return 1;
+    using Fn = int (WINAPI*)(HWND, HDC);
+    static Fn real = (Fn)GetProcAddress(GetModuleHandleW(L"user32.dll"), "ReleaseDC");
+    return real ? real(w, dc) : 0;
+}
 static BOOL WINAPI Bed_EnumDisplayMonitors(HDC, LPCRECT, MONITORENUMPROC proc, LPARAM lp){
     Diag("BED EnumDisplayMonitors -> 1 monitor " + std::to_string(g_winW) + "x" + std::to_string(g_winH));
     if (proc){ RECT r = {0,0,(LONG)g_winW,(LONG)g_winH}; proc(kFakeMonitor, nullptr, &r, lp); }
@@ -37725,6 +38275,87 @@ static MMRESULT WINAPI Bed_waveInClose(HWAVEIN h)
 }
 #endif
 
+// DirectSound: the container has no dsound.dll, so these were generic stubs that
+// returned 0 -- S_OK to a COM caller, with the out-pointer never written. RV There
+// Yet?'s voice capture took DirectSoundCaptureCreate8's S_OK and called GetCaps
+// through the NULL it had zeroed (GUEST+0x4E35494) the moment a session started.
+// Answer as a PC with no sound card would: every create fails with DSERR_NODRIVER
+// and the enumerations list no devices.
+static const HRESULT kDsErrNoDriver = (HRESULT)0x88780078;
+static HRESULT WINAPI Bed_DirectSoundCreate(const GUID*, void** pp, void*)
+{
+    RECON_ONCE("DirectSoundCreate");
+    if (pp) *pp = nullptr;
+    return kDsErrNoDriver;
+}
+static HRESULT WINAPI Bed_DirectSoundFullDuplexCreate(const GUID*, const GUID*, const void*, const void*,
+                                                      HWND, DWORD, void** ppDuplex, void** ppCapBuf,
+                                                      void** ppBuf, void*)
+{
+    RECON_ONCE("DirectSoundFullDuplexCreate");
+    if (ppDuplex) *ppDuplex = nullptr;
+    if (ppCapBuf) *ppCapBuf = nullptr;
+    if (ppBuf)    *ppBuf = nullptr;
+    return kDsErrNoDriver;
+}
+static HRESULT WINAPI Bed_DirectSoundEnumerate(void*, void*){ RECON_ONCE("DirectSoundEnumerate"); return S_OK; }
+static HRESULT WINAPI Bed_DirectSoundGetDeviceID(const GUID*, GUID* out)
+{
+    if (out) memset(out, 0, sizeof(*out));
+    return kDsErrNoDriver;
+}
+static HRESULT WINAPI Bed_DirectSoundDllGetClassObject(REFCLSID, REFIID, void** pp)
+{
+    if (pp) *pp = nullptr;
+    return CLASS_E_CLASSNOTAVAILABLE;
+}
+static HRESULT WINAPI Bed_DirectSoundDllCanUnloadNow(){ return S_FALSE; }
+#ifdef GH_LAUNCHER
+#include "gh_dsound.h"
+#endif
+// Output devices are real (gh_dsound.h, over XAudio2) only for titles that ask
+// (gh_dsound = 1, e.g. Garry's Mod's title config); everyone else gets "no sound
+// card", which is what every title shipped against before GMod. (RV There Yet?'s
+// loading-screen freeze on 0.0.811+ was blamed on this device and was not it: 0.0.818
+// froze the same way on NODRIVER. It was the splash window, see ghwnd2.) Capture
+// stays NODRIVER.
+static HRESULT WINAPI Bed_DirectSoundOutCreate(const GUID* g, void** pp, void* outer)
+{
+#ifdef GH_LAUNCHER
+    if (GhCfgNumZ(L"gh_dsound.txt", "GH_DSOUND", 0)){
+        RECON_ONCE("DirectSoundCreate (XAudio2)");
+        return ghds::Create(g, (IUnknown**)pp, (IUnknown*)outer);
+    }
+#endif
+    return Bed_DirectSoundCreate(g, pp, outer);
+}
+// Keyed by DLL, not in the name-keyed shim table: GetDeviceID and DllGetClassObject
+// are names other DLLs export too. `ord` is used when fn is null (UE imports
+// dsound.dll by ordinal).
+static void* DsoundImport(const char* dll, const char* fn, unsigned ord = 0)
+{
+    if (_stricmp(dll, "dsound.dll") != 0 && _stricmp(dll, "dsound") != 0) return nullptr;
+    static const struct { const char* name; void* bed; } k[] = {
+        { nullptr, nullptr },
+        { "DirectSoundCreate",            (void*)&Bed_DirectSoundOutCreate },         // 1
+        { "DirectSoundEnumerateA",        (void*)&Bed_DirectSoundEnumerate },         // 2
+        { "DirectSoundEnumerateW",        (void*)&Bed_DirectSoundEnumerate },         // 3
+        { "DllCanUnloadNow",              (void*)&Bed_DirectSoundDllCanUnloadNow },   // 4
+        { "DllGetClassObject",            (void*)&Bed_DirectSoundDllGetClassObject }, // 5
+        { "DirectSoundCaptureCreate",     (void*)&Bed_DirectSoundCreate },            // 6
+        { "DirectSoundCaptureEnumerateA", (void*)&Bed_DirectSoundEnumerate },         // 7
+        { "DirectSoundCaptureEnumerateW", (void*)&Bed_DirectSoundEnumerate },         // 8
+        { "GetDeviceID",                  (void*)&Bed_DirectSoundGetDeviceID },       // 9
+        { "DirectSoundFullDuplexCreate",  (void*)&Bed_DirectSoundFullDuplexCreate },  // 10
+        { "DirectSoundCreate8",           (void*)&Bed_DirectSoundOutCreate },         // 11
+        { "DirectSoundCaptureCreate8",    (void*)&Bed_DirectSoundCreate },            // 12
+    };
+    const size_t n = sizeof(k)/sizeof(k[0]);
+    if (!fn) return ord < n ? k[ord].bed : nullptr;
+    for (size_t i = 1; i < n; ++i) if (0 == strcmp(fn, k[i].name)) return k[i].bed;
+    return nullptr;
+}
+
 // CreateProcess surrogate -- defined after the PE mapper (needs ResolveImport
 // etc.); forward-declared here so the shim table can point at them.
 static BOOL WINAPI Bed_CreateProcessW(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES,
@@ -37877,9 +38508,36 @@ static bool GhTitleFromJson(const ghjson::Value& j, GhTitle& t, std::string& why
             v->s[0] == '\\' || v->s[0] == '/'){ why = "match.installProbe is not a relative path"; return false; }
         t.installProbe = GhUtf8ToW(v->s);
     }
+    // Garry's Mod's root holds the 32-bit hl2.exe; the x64 game is bin\win64\gmod.exe.
+    if ((v = m->get("launch"))){
+        if (!v->isStr() || v->s.empty() || v->s.find("..") != std::string::npos || v->s.find(':') != std::string::npos ||
+            v->s[0] == '\\' || v->s[0] == '/'){ why = "match.launch is not a relative path"; return false; }
+        t.launch = GhUtf8ToW(v->s);
+        for (wchar_t& c : t.launch) if (c == L'/') c = L'\\';
+        const size_t slash = t.launch.find_last_of(L'\\');
+        if (_wcsicmp(t.launch.c_str() + (slash == std::wstring::npos ? 0 : slash + 1), t.exe.c_str()) != 0){
+            why = "match.launch does not end in match.exe"; return false;
+        }
+    }
     if ((v = m->get("steamAppId"))){
         if (!v->isNum() || !v->isInt || v->i < 0 || v->i > 0xFFFFFFFFLL){ why = "match.steamAppId is not a uint32"; return false; }
         t.steamAppId = (unsigned)v->i;
+    }
+    // A public beta the title must run from -- Garry's Mod's default branch is
+    // 32-bit, and only its "x86-64" branch has bin\win64. Password branches are
+    // not supported: the name goes to GetManifestRequestCode as-is.
+    if ((v = m->get("steamBranch"))){
+        bool ok = v->isStr() && !v->s.empty() && v->s.size() <= 64;
+        if (ok) for (char c : v->s) if (!isalnum((unsigned char)c) && c != '-' && c != '_' && c != '.') ok = false;
+        if (!ok){ why = "match.steamBranch is not a branch name"; return false; }
+        t.steamBranch = v->s;
+    }
+    // Workshop content is part of the game for some titles (Garry's Mod mounts
+    // every subscribed addon at start): the Launcher syncs the account's
+    // subscriptions through the Steam add-on before launch.
+    if ((v = m->get("workshop"))){
+        if (!v->isBool()){ why = "match.workshop is not a boolean"; return false; }
+        t.workshop = v->b;
     }
 
     if ((m = j.get("requires"))){
@@ -37927,13 +38585,19 @@ static bool GhTitleFromJson(const ghjson::Value& j, GhTitle& t, std::string& why
         }
     }
     if ((v = j.get("args"))){ if (!v->isStr()){ why = "args is not a string"; return false; } t.args = GhUtf8ToW(v->s); }
+    // Garry's Mod is a keyboard-and-mouse game: XInput is not on until the
+    // player types "joystick 1", so the pad has to arrive as WASD + mouse.
+    if ((v = j.get("input"))){
+        if (!v->isStr() || v->s.empty() || v->s.size() >= 32 || !GhSafeName(v->s, false)){ why = "input is not a profile id"; return false; }
+        t.input = v->s;
+    }
     if ((v = j.get("seed"))){
         if (!v->isStr() || !GhSafeName(v->s, true)){ why = "seed is not a bare folder name"; return false; }
         t.seed = GhUtf8ToW(v->s);
     }
 
     static const char* kKnown[] = { "schema", "id", "name", "match", "requires", "early", "knobs",
-                                    "psoDeny", "args", "seed" };
+                                    "psoDeny", "args", "seed", "input" };
     for (const auto& kv : j.obj){
         bool known = false;
         for (const char* k : kKnown) if (kv.first == k){ known = true; break; }
@@ -43889,10 +44553,25 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"MsgWaitForMultipleObjects",   (void*)&Bed_MsgWaitForMultipleObjects},
         {"MsgWaitForMultipleObjectsEx", (void*)&Bed_MsgWaitForMultipleObjectsEx},
         {"PostQuitMessage",    (void*)&Bed_PostQuitMessage},
+        {"PostMessageW",       (void*)&Bed_PostMessageW},
+        {"PostMessageA",       (void*)&Bed_PostMessageA},
         {"LoadCursorW",        (void*)&Bed_LoadCursorW},
         {"LoadIconW",          (void*)&Bed_LoadIconW},
         {"SetWindowLongPtrW",  (void*)&Bed_SetWindowLongPtrW},
         {"GetWindowLongPtrW",  (void*)&Bed_GetWindowLongPtrW},
+        {"SetWindowLongPtrA",  (void*)&Bed_SetWindowLongPtrW},
+        {"GetWindowLongPtrA",  (void*)&Bed_GetWindowLongPtrW},
+        {"SetWindowLongW",     (void*)&Bed_SetWindowLongW},
+        {"GetWindowLongW",     (void*)&Bed_GetWindowLongW},
+        {"SetWindowLongA",     (void*)&Bed_SetWindowLongW},
+        {"GetWindowLongA",     (void*)&Bed_GetWindowLongW},
+        {"DefWindowProcA",     (void*)&Bed_DefWindowProcA},
+        {"CallWindowProcW",    (void*)&Bed_CallWindowProcW},
+        {"CallWindowProcA",    (void*)&Bed_CallWindowProcW},
+        {"GetParent",          (void*)&Bed_GetParent},
+        {"GetAncestor",        (void*)&Bed_GetAncestor},
+        {"GetWindow",          (void*)&Bed_GetWindow},
+        {"IsChild",            (void*)&Bed_IsChild},
         {"IsWindow",           (void*)&Bed_IsWindow},
         {"SetFocus",           (void*)&Bed_SetFocus},
         {"SetCapture",         (void*)&Bed_SetCapture},
@@ -43910,6 +44589,18 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"CreateRoundRectRgn", (void*)&Bed_CreateRoundRectRgn},
         {"CreateEllipticRgn",  (void*)&Bed_CreateEllipticRgn},
         {"PtInRegion",         (void*)&Bed_PtInRegion},
+        // GDI text (gh_gdifont.h): the container's gdi32 has no font engine
+        {"CreateCompatibleDC", (void*)&Bed_CreateCompatibleDC}, {"DeleteDC", (void*)&Bed_DeleteDC},
+        {"CreateFontA", (void*)&Bed_CreateFontA}, {"CreateFontIndirectA", (void*)&Bed_CreateFontIndirectA},
+        {"CreateFontIndirectW", (void*)&Bed_CreateFontIndirectW}, {"SelectObject", (void*)&Bed_SelectObject},
+        {"SetMapMode", (void*)&Bed_SetMapMode}, {"SetTextAlign", (void*)&Bed_SetTextAlign},
+        {"GetTextMetricsA", (void*)&Bed_GetTextMetricsA}, {"GetTextMetricsW", (void*)&Bed_GetTextMetricsW},
+        {"GetCharABCWidthsA", (void*)&Bed_GetCharABCWidthsA}, {"GetCharABCWidthsW", (void*)&Bed_GetCharABCWidthsW},
+        {"GetGlyphOutlineA", (void*)&Bed_GetGlyphOutlineA}, {"GetGlyphOutlineW", (void*)&Bed_GetGlyphOutlineW},
+        {"GetTextExtentPoint32A", (void*)&Bed_GetTextExtentPoint32A}, {"GetTextExtentPoint32W", (void*)&Bed_GetTextExtentPoint32W},
+        {"GetFontUnicodeRanges", (void*)&Bed_GetFontUnicodeRanges}, {"EnumFontFamiliesExA", (void*)&Bed_EnumFontFamiliesExA},
+        {"AddFontResourceA", (void*)&Bed_AddFontResourceA}, {"RemoveFontResourceA", (void*)&Bed_RemoveFontResourceA},
+        {"CreateDIBSection", (void*)&Bed_CreateDIBSection}, {"GetObjectA", (void*)&Bed_GetObjectA}, {"GetObjectW", (void*)&Bed_GetObjectW},
         {"RectInRegion",       (void*)&Bed_RectInRegion},
         {"GetRgnBox",          (void*)&Bed_GetRgnBox},
         {"OffsetRgn",          (void*)&Bed_OffsetRgn},
@@ -43926,6 +44617,7 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"SetWindowPos",       (void*)&Bed_SetWindowPos},
         {"MessageBoxW",        (void*)&Bed_MessageBoxW},
         {"MessageBoxA",        (void*)&Bed_MessageBoxA},
+        {"InitCommonControlsEx", (void*)&Bed_InitCommonControlsEx},
         {"WinVerifyTrust",     (void*)&Bed_WinVerifyTrust},
         {"crs_start_handler",  (void*)&Bed_crs_start_handler},
         // #141 memory accounting -- see the beds above.
@@ -43955,6 +44647,9 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"MonitorFromPoint",     (void*)&Bed_MonitorFromPoint},
         {"MonitorFromRect",      (void*)&Bed_MonitorFromRect},
         {"GetMonitorInfoW",      (void*)&Bed_GetMonitorInfoW},
+        {"GetGuiResources",      (void*)&Bed_GetGuiResources},
+        {"GetDC",                (void*)&Bed_GetDC},
+        {"ReleaseDC",            (void*)&Bed_ReleaseDC},
         {"GetMonitorInfoA",      (void*)&Bed_GetMonitorInfoA},
         {"GetSystemMetrics",     (void*)&Bed_GetSystemMetrics},
         {"GetSystemInfo",        (void*)&Bed_GetSystemInfo},
@@ -43995,6 +44690,37 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"waveInStart",            (void*)&Bed_waveInStart},
         {"waveInReset",            (void*)&Bed_waveInReset},
         {"waveInClose",            (void*)&Bed_waveInClose},
+        // d3d9.dll: our API runtime over the console's d3d9on12 DDI.
+        {"Direct3DCreate9",        (void*)&Bed_Direct3DCreate9},
+        {"Direct3DCreate9Ex",      (void*)&Bed_Direct3DCreate9Ex},
+        {"D3DPERF_BeginEvent",     (void*)&Bed_D3DPERF_BeginEvent},
+        {"D3DPERF_EndEvent",       (void*)&Bed_D3DPERF_EndEvent},
+        {"D3DPERF_SetMarker",      (void*)&Bed_D3DPERF_SetMarker},
+        {"D3DPERF_SetRegion",      (void*)&Bed_D3DPERF_SetRegion},
+        {"D3DPERF_QueryRepeatFrame", (void*)&Bed_D3DPERF_QueryRepeatFrame},
+        {"D3DPERF_SetOptions",     (void*)&Bed_D3DPERF_SetOptions},
+        {"D3DPERF_GetStatus",      (void*)&Bed_D3DPERF_GetStatus},
+        {"Direct3DShaderValidatorCreate9", (void*)&Bed_Direct3DShaderValidatorCreate9},
+        {"PSGPError",              (void*)&Bed_D3D9Nop},
+        {"PSGPSampleTexture",      (void*)&Bed_D3D9Nop},
+        {"DebugSetLevel",          (void*)&Bed_D3D9Nop},
+        {"DebugSetMute",           (void*)&Bed_D3D9Nop},
+        {"Direct3D9EnableMaximizedWindowedModeShim", (void*)&Bed_Direct3D9EnableMaximizedWindowedModeShim},
+        // d3dx9_42.dll: the math, the matrix stack and the compiler (gh_d3dx9.h).
+        {"D3DXPlaneNormalize", (void*)&Bed_D3DXPlaneNormalize},
+        {"D3DXPlaneTransform", (void*)&Bed_D3DXPlaneTransform},
+        {"D3DXCreateMatrixStack", (void*)&Bed_D3DXCreateMatrixStack},
+        {"D3DXVec3TransformCoord", (void*)&Bed_D3DXVec3TransformCoord},
+        {"D3DXMatrixMultiply", (void*)&Bed_D3DXMatrixMultiply},
+        {"D3DXVec4Normalize", (void*)&Bed_D3DXVec4Normalize},
+        {"D3DXVec4Transform", (void*)&Bed_D3DXVec4Transform},
+        {"D3DXMatrixTranspose", (void*)&Bed_D3DXMatrixTranspose},
+        {"D3DXMatrixInverse", (void*)&Bed_D3DXMatrixInverse},
+        {"D3DXMatrixTranslation", (void*)&Bed_D3DXMatrixTranslation},
+        {"D3DXMatrixPerspectiveRH", (void*)&Bed_D3DXMatrixPerspectiveRH},
+        {"D3DXMatrixPerspectiveOffCenterRH", (void*)&Bed_D3DXMatrixPerspectiveOffCenterRH},
+        {"D3DXMatrixOrthoOffCenterRH", (void*)&Bed_D3DXMatrixOrthoOffCenterRH},
+        {"D3DXCompileShader", (void*)&Bed_D3DXCompileShader},
 #endif
         // Child processes: in-process PE surrogate.
         {"CreateProcessW",     (void*)&Bed_CreateProcessW},
@@ -44024,6 +44750,8 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"CreateFileW",                (void*)&Bed_CreateFileW},
         {"CreateFileA",                (void*)&Bed_CreateFileA},
         {"CreateFile2",                (void*)&Bed_CreateFile2},
+        {"CreateNamedPipeW",           (void*)&Bed_CreateNamedPipeW},
+        {"WaitNamedPipeW",             (void*)&Bed_WaitNamedPipeW},
         {"CreateDirectoryW",           (void*)&Bed_CreateDirectoryW},
         {"DeleteFileW",                (void*)&Bed_DeleteFileW},
         {"RemoveDirectoryW",           (void*)&Bed_RemoveDirectoryW},
@@ -44044,8 +44772,11 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"FindClose",                  (void*)&Bed_FindClose},
         {"GetCurrentDirectoryW",       (void*)&Bed_GetCurrentDirectoryW},
         {"SetCurrentDirectoryW",       (void*)&Bed_SetCurrentDirectoryW},
+        {"GetCurrentDirectoryA",       (void*)&Bed_GetCurrentDirectoryA},
+        {"SetCurrentDirectoryA",       (void*)&Bed_SetCurrentDirectoryA},
         {"GetTempPathW",               (void*)&Bed_GetTempPathW},
         {"GetFullPathNameW",           (void*)&Bed_GetFullPathNameW},
+        {"GetFullPathNameA",           (void*)&Bed_GetFullPathNameA},
         // #164: the known-folder family has to be reachable from the guest EXE's
         // own IAT, not only from PatchModuleForGuest -- exactly the #155 mistake,
         // repeated. The beds existed and were correct; nothing that mattered ever
@@ -44148,6 +44879,7 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"GetCommandLineW", (void*)&Bed_GetCommandLineW}, {"GetCommandLineA", (void*)&Bed_GetCommandLineA},
         {"CreateFileW", (void*)&Bed_CreateFileW}, {"CreateFileA", (void*)&Bed_CreateFileA},
         {"CreateFile2", (void*)&Bed_CreateFile2},
+        {"CreateNamedPipeW", (void*)&Bed_CreateNamedPipeW}, {"WaitNamedPipeW", (void*)&Bed_WaitNamedPipeW},
         {"GetFileAttributesW", (void*)&Bed_GetFileAttributesW}, {"SetFileAttributesW", (void*)&Bed_SetFileAttributesW},
         {"GetFileAttributesExW", (void*)&Bed_GetFileAttributesExW},
         // Virtual registry (Path X cold-client): steamclient reads/writes the
@@ -44235,10 +44967,25 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"MsgWaitForMultipleObjects",   (void*)&Bed_MsgWaitForMultipleObjects},
         {"MsgWaitForMultipleObjectsEx", (void*)&Bed_MsgWaitForMultipleObjectsEx},
         {"PostQuitMessage",    (void*)&Bed_PostQuitMessage},
+        {"PostMessageW",       (void*)&Bed_PostMessageW},
+        {"PostMessageA",       (void*)&Bed_PostMessageA},
         {"LoadCursorW",        (void*)&Bed_LoadCursorW},
         {"LoadIconW",          (void*)&Bed_LoadIconW},
         {"SetWindowLongPtrW",  (void*)&Bed_SetWindowLongPtrW},
         {"GetWindowLongPtrW",  (void*)&Bed_GetWindowLongPtrW},
+        {"SetWindowLongPtrA",  (void*)&Bed_SetWindowLongPtrW},
+        {"GetWindowLongPtrA",  (void*)&Bed_GetWindowLongPtrW},
+        {"SetWindowLongW",     (void*)&Bed_SetWindowLongW},
+        {"GetWindowLongW",     (void*)&Bed_GetWindowLongW},
+        {"SetWindowLongA",     (void*)&Bed_SetWindowLongW},
+        {"GetWindowLongA",     (void*)&Bed_GetWindowLongW},
+        {"DefWindowProcA",     (void*)&Bed_DefWindowProcA},
+        {"CallWindowProcW",    (void*)&Bed_CallWindowProcW},
+        {"CallWindowProcA",    (void*)&Bed_CallWindowProcW},
+        {"GetParent",          (void*)&Bed_GetParent},
+        {"GetAncestor",        (void*)&Bed_GetAncestor},
+        {"GetWindow",          (void*)&Bed_GetWindow},
+        {"IsChild",            (void*)&Bed_IsChild},
         {"IsWindow",           (void*)&Bed_IsWindow},
         {"SetFocus",           (void*)&Bed_SetFocus},
         {"SetCapture",         (void*)&Bed_SetCapture},
@@ -44256,6 +45003,18 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"CreateRoundRectRgn", (void*)&Bed_CreateRoundRectRgn},
         {"CreateEllipticRgn",  (void*)&Bed_CreateEllipticRgn},
         {"PtInRegion",         (void*)&Bed_PtInRegion},
+        // GDI text (gh_gdifont.h): the container's gdi32 has no font engine
+        {"CreateCompatibleDC", (void*)&Bed_CreateCompatibleDC}, {"DeleteDC", (void*)&Bed_DeleteDC},
+        {"CreateFontA", (void*)&Bed_CreateFontA}, {"CreateFontIndirectA", (void*)&Bed_CreateFontIndirectA},
+        {"CreateFontIndirectW", (void*)&Bed_CreateFontIndirectW}, {"SelectObject", (void*)&Bed_SelectObject},
+        {"SetMapMode", (void*)&Bed_SetMapMode}, {"SetTextAlign", (void*)&Bed_SetTextAlign},
+        {"GetTextMetricsA", (void*)&Bed_GetTextMetricsA}, {"GetTextMetricsW", (void*)&Bed_GetTextMetricsW},
+        {"GetCharABCWidthsA", (void*)&Bed_GetCharABCWidthsA}, {"GetCharABCWidthsW", (void*)&Bed_GetCharABCWidthsW},
+        {"GetGlyphOutlineA", (void*)&Bed_GetGlyphOutlineA}, {"GetGlyphOutlineW", (void*)&Bed_GetGlyphOutlineW},
+        {"GetTextExtentPoint32A", (void*)&Bed_GetTextExtentPoint32A}, {"GetTextExtentPoint32W", (void*)&Bed_GetTextExtentPoint32W},
+        {"GetFontUnicodeRanges", (void*)&Bed_GetFontUnicodeRanges}, {"EnumFontFamiliesExA", (void*)&Bed_EnumFontFamiliesExA},
+        {"AddFontResourceA", (void*)&Bed_AddFontResourceA}, {"RemoveFontResourceA", (void*)&Bed_RemoveFontResourceA},
+        {"CreateDIBSection", (void*)&Bed_CreateDIBSection}, {"GetObjectA", (void*)&Bed_GetObjectA}, {"GetObjectW", (void*)&Bed_GetObjectW},
         {"RectInRegion",       (void*)&Bed_RectInRegion},
         {"GetRgnBox",          (void*)&Bed_GetRgnBox},
         {"OffsetRgn",          (void*)&Bed_OffsetRgn},
@@ -44266,6 +45025,7 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"SetWindowPos",       (void*)&Bed_SetWindowPos},
         {"MessageBoxW",        (void*)&Bed_MessageBoxW},
         {"MessageBoxA",        (void*)&Bed_MessageBoxA},
+        {"InitCommonControlsEx", (void*)&Bed_InitCommonControlsEx},
         {"WinVerifyTrust",     (void*)&Bed_WinVerifyTrust},
         {"crs_start_handler",  (void*)&Bed_crs_start_handler},
         // #141 memory accounting -- see the beds above.
@@ -44920,6 +45680,20 @@ static void GhMelonBoot(HMODULE unity)
 static HMODULE LoadGuestDll(const char* dll)
 {
     if (GuestDllDenied(dll)){ SetLastError(ERROR_MOD_NOT_FOUND); return nullptr; }
+    // Garry's Mod's launcher joins its lowercased base dir onto a path that is
+    // already absolute ("d:\...\win64\D:\...\filesystem_stdio.dll"). Windows
+    // takes such a string as one path and fails it (0x7B); a drive spec after a
+    // separator can only mean the second path is the one meant.
+    std::string undoubled;
+    for (size_t i = 3; dll[0] && dll[1] == ':' && dll[i] && dll[i+1] && dll[i+2]; ++i){
+        if ((dll[i-1] == '\\' || dll[i-1] == '/') && isalpha((unsigned char)dll[i]) && dll[i+1] == ':' &&
+            (dll[i+2] == '\\' || dll[i+2] == '/')){
+            undoubled = dll + i;
+            Diag(std::string("LoadGuestDll doubled path ") + dll + " -> " + undoubled);
+            dll = undoubled.c_str();
+            break;
+        }
+    }
     // A LoadLibrary of a module that is already loaded takes a reference, as the
     // real call does: Gang Beasts' baselib loaded steam_api64.dll by bare name
     // for every lookup and freed it again, and without the reference those
@@ -44940,6 +45714,31 @@ static HMODULE LoadGuestDll(const char* dll)
                 return pre;
             }
         }
+#ifdef GH_LAUNCHER
+        // No d3d9.dll on the console. Its exports are our shim-table beds, so a
+        // module is all the name needs: the console's d3d9on12, a real DLL that
+        // GetModuleFileName and FreeLibrary treat normally.
+        // d3dx9_NN likewise: the exports shaderapidx9 uses are beds (gh_d3dx9.h),
+        // and Source's launcher only probes that D3DX9_40.dll loads at all.
+        // Only while a guest session is live: steamclient64 probes D3D9.DLL at
+        // Launcher startup, and that load must keep failing (+41 MB otherwise).
+        if (g_guestSessionLive &&
+            (0 == _stricmp(base, "d3d9.dll") || 0 == _stricmp(base, "d3d9") ||
+             0 == _strnicmp(base, "d3dx9_", 6))){
+            HMODULE d = GhD3d9Module();
+            Diag(std::string("LoadGuestDll(") + dll + ") -> d3d9on12 " + Hex((uintptr_t)d));
+            if (d) return d;
+        }
+        // No dsound.dll either. Its exports are DsoundImport's beds, which
+        // Bed_GetProcAddress answers for this module; XAudio2 is what plays them.
+        if (g_guestSessionLive &&
+            (0 == _stricmp(base, "dsound.dll") || 0 == _stricmp(base, "dsound")) &&
+            GhCfgNumZ(L"gh_dsound.txt", "GH_DSOUND", 0)){
+            HMODULE d = GhDsoundModule();
+            Diag(std::string("LoadGuestDll(") + dll + ") -> xaudio2_9 " + Hex((uintptr_t)d));
+            if (d){ g_dsAlias = d; return d; }
+        }
+#endif
     }
 
     wchar_t w[1024];
@@ -45268,8 +46067,204 @@ static void PinGuestModule(HMODULE m, const char* dll)
          (ok ? "" : " FAILED err=" + Hex(GetLastError())));
 }
 
+// §57 diag: which libcef exports the guest calls, and in what order. The thunk
+// saves the four argument registers (and xmm0-3), logs the first few calls of
+// the name, then jumps to the real export -- the return goes straight back to
+// the guest, so it costs one call per import and changes nothing it returns.
+#include <deque>
+struct GhCallLogRec { std::string name; volatile LONG n; };
+static std::deque<GhCallLogRec> g_callLogRecs;
+static void GhCallLogHit(GhCallLogRec* r)
+{
+    const LONG n = InterlockedIncrement(&r->n);
+    if (n <= 3) Diag("CALL " + r->name + " #" + std::to_string(n) + " tid=" + std::to_string(GetCurrentThreadId()));
+}
+static void* MakeCallLogThunk(const char* dll, const char* fn, void* real)
+{
+    static SRWLOCK lk = SRWLOCK_INIT;
+    static uint8_t* page = nullptr; static size_t off = 0;
+    static const size_t kCap = 0x10000;
+    uint8_t code[] = {
+        0x51, 0x52, 0x41,0x50, 0x41,0x51,                 // push rcx/rdx/r8/r9
+        0x48,0x83,0xEC,0x68,                              // sub rsp, 0x68
+        0xF3,0x0F,0x7F,0x44,0x24,0x20, 0xF3,0x0F,0x7F,0x4C,0x24,0x30,   // movdqu [rsp+20/30], xmm0/1
+        0xF3,0x0F,0x7F,0x54,0x24,0x40, 0xF3,0x0F,0x7F,0x5C,0x24,0x50,   // movdqu [rsp+40/50], xmm2/3
+        0x48,0xB9, 0,0,0,0,0,0,0,0,                       // mov rcx, rec
+        0x48,0xB8, 0,0,0,0,0,0,0,0,                       // mov rax, GhCallLogHit
+        0xFF,0xD0,                                        // call rax
+        0xF3,0x0F,0x6F,0x44,0x24,0x20, 0xF3,0x0F,0x6F,0x4C,0x24,0x30,   // movdqu xmm0/1, [rsp+20/30]
+        0xF3,0x0F,0x6F,0x54,0x24,0x40, 0xF3,0x0F,0x6F,0x5C,0x24,0x50,   // movdqu xmm2/3, [rsp+40/50]
+        0x48,0x83,0xC4,0x68,                              // add rsp, 0x68
+        0x41,0x59, 0x41,0x58, 0x5A, 0x59,                 // pop r9/r8/rdx/rcx
+        0x48,0xB8, 0,0,0,0,0,0,0,0,                       // mov rax, real
+        0xFF,0xE0 };                                      // jmp rax
+    AcquireSRWLockExclusive(&lk);
+    if (!page || off + sizeof(code) > kCap){
+        page = (uint8_t*)VirtualAlloc(nullptr, kCap, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+        off = 0;
+        if (!page){ ReleaseSRWLockExclusive(&lk); return real; }
+    }
+    g_callLogRecs.push_back(GhCallLogRec{ GhDllBaseName(dll) + "!" + fn, 0 });
+    uint64_t rec = (uint64_t)&g_callLogRecs.back(), hit = (uint64_t)&GhCallLogHit, to = (uint64_t)real;
+    std::memcpy(code + 36, &rec, 8);
+    std::memcpy(code + 46, &hit, 8);
+    std::memcpy(code + 92, &to, 8);
+    DWORD old;
+    VirtualProtect(page, kCap, PAGE_READWRITE, &old);
+    uint8_t* t = page + off;
+    std::memcpy(t, code, sizeof(code));
+    off += (sizeof(code) + 15) & ~(size_t)15;
+    VirtualProtect(page, kCap, PAGE_EXECUTE_READ, &old);
+    FlushInstructionCache(GetCurrentProcess(), page, kCap);
+    ReleaseSRWLockExclusive(&lk);
+    return t;
+}
+
+// §57: html_chromium hands CEF its own switches only (command_line_args_disabled),
+// so the title's --single-process never reached Chromium, the browser asked for a
+// NetworkService child the container refuses, and after three refusals GMod was
+// gone. Chain the app's command-line hook and append the switches there. Offsets
+// are the CEF 86 (branch 4240) C API: cef_app_t +40 on_before_command_line_processing,
+// cef_command_line_t +152 append_switch, cef_settings_t +104 command_line_args_disabled.
+namespace ghcef {
+using CmdHook = void (*)(void* self, const void* processType, void* cmdLine);
+using AppendSwitch = void (*)(void* cmdLine, const void* name);
+using Initialize = int (*)(const void* args, const void* settings, void* app, void* sandbox);
+struct Str16 { const wchar_t* str; size_t length; void* dtor; };   // cef_string_utf16_t
+static Initialize g_realInit = nullptr;
+static CmdHook g_appHook = nullptr;
+
+// The renderer half of GMod's CEF lives in gmod.exe: WinMain sees `--type=` and
+// runs a ChromiumApp whose render-process handler builds the page's `lua` and
+// `gmod` objects. Single-process never starts that child, so the renderer thread
+// asks html_chromium's app (cef_app_t +72 get_render_process_handler), gets none,
+// and the menu dies on `lua is not defined`. Run gmod.exe's own child entry with
+// cef_execute_process answering "browser" (-1) to keep its app, and lend that
+// app's handler to the one cef_initialize gets.
+using GetHandler = void* (*)(void* self);
+using ExecuteProcess = int (*)(const void* args, void* app, void* sandbox);
+using ChildMain = int (*)(void* instance);
+static ExecuteProcess g_realExec = nullptr;
+static bool g_capturing = false;
+static void* g_childApp = nullptr;
+static GetHandler g_childGetHandler = nullptr;
+
+static int Exec(const void* args, void* app, void* sandbox)
+{
+    if (!g_capturing) return g_realExec ? g_realExec(args, app, sandbox) : -1;
+    if (app){
+        (*(void (**)(void*))((uint8_t*)app + 8))(app);   // cef_base_ref_counted_t add_ref
+        g_childApp = app;
+    }
+    return -1;
+}
+
+static void* LentRenderHandler(void*) { return g_childGetHandler(g_childApp); }
+
+// WinMain's `strstr(cmdline, "--type=")` is a lea of that string, the strstr
+// call, then the child entry's call; the second E8 after the lea is the entry.
+static ChildMain FindChildMain()
+{
+    if (!g_guestImageBase || g_guestImageSize < 64) return nullptr;
+    uint8_t* b = g_guestImageBase; const size_t n = g_guestImageSize;
+    static const char kType[] = "--type=";
+    for (size_t s = 0; s + sizeof kType <= n; ++s){
+        if (memcmp(b + s, kType, sizeof kType)) continue;
+        for (size_t i = 0; i + 7 + 48 <= n; ++i){
+            if (b[i] != 0x48 || b[i+1] != 0x8D || b[i+2] != 0x15) continue;
+            if ((intptr_t)(i + 7) + *(int32_t*)(b + i + 3) != (intptr_t)s) continue;
+            for (size_t j = i + 7, calls = 0; j < i + 7 + 48; ++j){
+                if (b[j] != 0xE8) continue;
+                const intptr_t t = (intptr_t)(j + 5) + *(int32_t*)(b + j + 1);
+                if (++calls == 2) return t > 0 && (size_t)t < n ? (ChildMain)(b + t) : nullptr;
+                j += 4;
+            }
+        }
+    }
+    return nullptr;
+}
+
+// No C++ objects in a function with __except.
+static int RunChildMain(ChildMain f, void* instance, DWORD* code)
+{
+    __try { return f(instance); }
+    __except (*code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) { return -2; }
+}
+
+static void LendRenderHandler(void* app)
+{
+    auto slot = (GetHandler*)((uint8_t*)app + 72);
+    if (*slot){
+        if (void* h = (*slot)(app)){
+            (*(int (**)(void*))((uint8_t*)h + 16))(h);   // release
+            Diag("CEF app has its own render-process handler");
+            return;
+        }
+    }
+    ChildMain child = FindChildMain();
+    if (!child){ Diag("CEF render handler: no `--type=` child entry in the guest exe"); return; }
+    DWORD code = 0;
+    g_capturing = true;
+    const int r = RunChildMain(child, g_guestImageBase, &code);
+    g_capturing = false;
+    if (!g_childApp || !*(GetHandler*)((uint8_t*)g_childApp + 72)){
+        Diag("CEF render handler: child entry +" + Hex((uintptr_t)child - (uintptr_t)g_guestImageBase) +
+             " returned " + std::to_string(r) + " code=" + Hex(code) + " app=" + Hex((uintptr_t)g_childApp));
+        return;
+    }
+    g_childGetHandler = *(GetHandler*)((uint8_t*)g_childApp + 72);
+    *slot = &LentRenderHandler;
+    Diag("CEF render handler lent from guest child entry +" +
+         Hex((uintptr_t)child - (uintptr_t)g_guestImageBase) + " app=" + Hex((uintptr_t)g_childApp));
+}
+
+static void OnBeforeCommandLine(void* self, const void* processType, void* cmdLine)
+{
+    if (g_appHook) g_appHook(self, processType, cmdLine);
+    if (!cmdLine) return;
+    auto append = *(AppendSwitch*)((uint8_t*)cmdLine + 152);
+    for (const wchar_t* s : { L"single-process", L"no-sandbox" }){
+        Str16 name{ s, wcslen(s), nullptr };
+        append(cmdLine, &name);
+    }
+    Diag("CEF command line: appended --single-process --no-sandbox");
+}
+
+static int Init(const void* args, const void* settings, void* app, void* sandbox)
+{
+    Diag("CEF cef_initialize settings.size=" + std::to_string(settings ? *(const size_t*)settings : 0) +
+         " args_disabled=" + std::to_string(settings ? *(const int*)((const uint8_t*)settings + 104) : -1) +
+         " app=" + Hex((uintptr_t)app));
+    if (app){
+        auto slot = (CmdHook*)((uint8_t*)app + 40);
+        if (*slot != &OnBeforeCommandLine){ g_appHook = *slot; *slot = &OnBeforeCommandLine; }
+        if (GhCfgNum(L"gh_cef_render.txt", "GH_CEF_RENDER", 1)) LendRenderHandler(app);
+    }
+    return g_realInit(args, settings, app, sandbox);
+}
+}
+
+// libcef exports the loader stands in front of, for both a static import and
+// GetProcAddress (gmod.exe delay-loads libcef, so its cef_execute_process comes
+// through the latter). The names are libcef's alone.
+static void* GhCefWrapExport(const char* fn, void* real)
+{
+    if (!real || fn[0] != 'c' || 0 != strncmp(fn, "cef_", 4)) return real;
+    if (0 == strcmp(fn, "cef_initialize")){
+        ghcef::g_realInit = (ghcef::Initialize)real;
+        return (void*)&ghcef::Init;
+    }
+    if (0 == strcmp(fn, "cef_execute_process")){
+        ghcef::g_realExec = (ghcef::ExecuteProcess)real;
+        return (void*)&ghcef::Exec;
+    }
+    return real;
+}
+
 static void* ResolveImport(const char* dll, const char* fn)
 {
+    if (t_cefWin && 0 == _stricmp(dll, "user32.dll"))
+        if (void* r = GhCefWinLookup(fn)) return r;
     auto& tbl = ShimTable();
     auto it = tbl.find(fn);
     if (it != tbl.end()) return it->second;
@@ -45280,7 +46275,17 @@ static void* ResolveImport(const char* dll, const char* fn)
         if (0 == strcmp(fn, "_beginthread"))   return (void*)&Bed_beginthread;
     }
     HMODULE m = LoadGuestDll(dll);
-    if (!m) return nullptr;
+    if (!m) return DsoundImport(dll, fn);   // a real one wins wherever it exists
+    // A module WE mapped is not in the loader's list, so GetProcAddress cannot
+    // see it: html_chromium bound every libcef export to a stub (GMod, §57).
+    if (GhSelfMapIs(m)){
+        void* real = (void*)GhSelfMapExport(m, fn);
+        const bool cef = real && 0 == _stricmp(GhDllBaseName(dll).c_str(), "libcef.dll");
+        if (cef) real = GhCefWrapExport(fn, real);
+        if (cef && GhCfgNum(L"gh_cef_calllog.txt", "GH_CEF_CALLLOG", 1))
+            return MakeCallLogThunk(dll, fn, real);
+        return real;
+    }
     PinGuestModule(m, dll);
     return (void*)GetProcAddress(m, fn);
 }
@@ -49479,6 +50484,7 @@ static bool MapAndRun(std::vector<uint8_t>& file)
                     HMODULE m = LoadGuestDll(dll);
                     if (m) PinGuestModule(m, dll);
                     void* p = m ? (void*)GetProcAddress(m, (LPCSTR)(oft->u1.Ordinal & 0xFFFF)) : nullptr;
+                    if (!p) p = DsoundImport(dll, nullptr, (unsigned)(oft->u1.Ordinal & 0xFFFF));
                     if (!p){ char ord[24]; std::snprintf(ord,sizeof(ord),"#%u",(unsigned)(oft->u1.Ordinal&0xFFFF)); p=MakeStub(dll,ord); stubbed++; }
                     else real++;
                     ft->u1.Function = (ULONGLONG)p;
@@ -49680,7 +50686,9 @@ static bool MapChildImage(const std::vector<uint8_t>& file, uint8_t** outBase, v
                 if (IMAGE_SNAP_BY_ORDINAL64(oft->u1.Ordinal)){
                     HMODULE m = LoadGuestDll(dll);
                     if (m) PinGuestModule(m, dll);
-                    ft->u1.Function = (ULONGLONG)(m ? GetProcAddress(m, (LPCSTR)(oft->u1.Ordinal & 0xFFFF)) : nullptr);
+                    void* p = m ? (void*)GetProcAddress(m, (LPCSTR)(oft->u1.Ordinal & 0xFFFF)) : nullptr;
+                    if (!p) p = DsoundImport(dll, nullptr, (unsigned)(oft->u1.Ordinal & 0xFFFF));
+                    ft->u1.Function = (ULONGLONG)p;
                     continue;
                 }
                 auto* ibn = (IMAGE_IMPORT_BY_NAME*)(base + oft->u1.AddressOfData);
@@ -49733,14 +50741,33 @@ static BOOL GhCallDllMainSeh(void* entry, uint8_t* base, DWORD* outCode)
 // GhTlsSetTemplate seeds the calling thread, and the threads that predate the
 // donor are seeded by TEB. EOSSDK (RV There Yet?, §55) keeps a relocated pointer
 // in its template and crashed in its first static constructor without this.
-// TLS callbacks are not run: MSVC's is __dyn_tls_init, which only matters with
-// thread_local dynamic initializers, and a module that has those is refused.
+// An empty MSVC __dyn_tls_init is not run. Any other callback runs once, with
+// DLL_PROCESS_ATTACH on this thread, after the index is in place: refusing left
+// the module on index 0 -- someone else's block -- which is worse (libcef.dll,
+// whose callbacks are Chromium's thread-exit hooks, §57). Threads created later
+// get the template from the donor but no THREAD_ATTACH callback.
+static DWORD GhCallTlsCallbackSeh(ULONGLONG cb, uint8_t* base)
+{
+    DWORD code = 0;
+    __try { ((PIMAGE_TLS_CALLBACK)cb)((PVOID)base, DLL_PROCESS_ATTACH, nullptr); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { code = GetExceptionCode(); }
+    return code;
+}
+static void GhRunTlsCallbacksSeh(uint8_t* base, const ULONGLONG* cbs)
+{
+    for (int i = 0; i < 16 && cbs[i]; ++i){
+        const DWORD code = GhCallTlsCallbackSeh(cbs[i], base);
+        Diag("SELFMAP TLS: callback " + std::to_string(i) + " rva=" + Hex((uint32_t)(cbs[i] - (ULONGLONG)base)) +
+             (code ? " exception=" + Hex((uint32_t)code) : " ok"));
+    }
+}
 static bool GhSelfMapTls(uint8_t* base, unsigned slot)
 {
     auto* nt  = (IMAGE_NT_HEADERS64*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
     auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
     if (!dir.Size) return true;
     auto* tls = (IMAGE_TLS_DIRECTORY64*)(base + dir.VirtualAddress);
+    bool runCallbacks = false;
     if (tls->AddressOfCallBacks && *(ULONGLONG*)tls->AddressOfCallBacks) {
         // __dyn_tls_init walks [__xd_a, __xd_z); its two LEAs name the same
         // address when the module has no thread_local dynamic initializers.
@@ -49754,9 +50781,9 @@ static bool GhSelfMapTls(uint8_t* base, unsigned slot)
             }
         }
         if (!lea1 || lea1 != lea2){
-            Diag("SELFMAP TLS: module has TLS callbacks with work to do -- refusing"); return false;
-        }
-        Diag("SELFMAP TLS: callback is an empty __dyn_tls_init -- not run");
+            Diag("SELFMAP TLS: module has TLS callbacks with work to do -- run after the index");
+            runCallbacks = true;
+        } else Diag("SELFMAP TLS: callback is an empty __dyn_tls_init -- not run");
     }
     const unsigned raw = (unsigned)(tls->EndAddressOfRawData - tls->StartAddressOfRawData);
     const unsigned total = raw + tls->SizeOfZeroFill;
@@ -49777,6 +50804,7 @@ static bool GhSelfMapTls(uint8_t* base, unsigned slot)
     Diag("SELFMAP TLS: donor slot=" + std::to_string(slot) + " index=" + std::to_string(index) +
          " template=" + Hex((uint32_t)total) + " existing_seeded=" + std::to_string(seeded) +
          " no_block=" + std::to_string(missed));
+    if (runCallbacks) GhRunTlsCallbacksSeh(base, (const ULONGLONG*)tls->AddressOfCallBacks);
     return true;
 }
 
@@ -49789,12 +50817,15 @@ static HMODULE GhSelfMapDll(const std::wstring& full, const char* dll, bool (*pr
         return nullptr;
     }
     uint8_t* base = nullptr; void* entry = nullptr;
-    if (!MapChildImage(bytes, &base, &entry)){
+    t_cefWin = GhWantsCefWin(nm);
+    const bool mapped = MapChildImage(bytes, &base, &entry);
+    t_cefWin = false;
+    if (!mapped){
         Diag("SELFMAP " + nm + " map failed");
         return nullptr;
     }
     AcquireSRWLockExclusive(&g_selfModLock);
-    g_selfMods.push_back(GhSelfMod{ base, nm });
+    g_selfMods.push_back(GhSelfMod{ base, nm, full });
     ReleaseSRWLockExclusive(&g_selfModLock);
     Diag("SELFMAP " + nm + " mapped base=" + Hex((uintptr_t)base) +
          " entry=" + Hex((uintptr_t)entry) + " size=" + Hex((uint64_t)bytes.size()));
@@ -49805,7 +50836,9 @@ static HMODULE GhSelfMapDll(const std::wstring& full, const char* dll, bool (*pr
         static volatile LONG s_nextSlot = 0;
         if (tnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size && !preMain){
             const LONG slot = InterlockedIncrement(&s_nextSlot);
-            if (slot > 3 || !GhSelfMapTls(base, (unsigned)slot))
+            // Source 1 self-maps six TLS modules (engine, inputsystem,
+            // vguimatsurface, vgui2, shaderapidx9, ...): three ran out (GMod g9).
+            if (slot > 15 || !GhSelfMapTls(base, (unsigned)slot))
                 Diag("SELFMAP " + nm + " has a TLS directory and no index of its own");
         }
     }
@@ -49895,6 +50928,22 @@ static BOOL WINAPI Bed_CreateProcessW(
         // no login window). Distinct log so we can tell a deliberate CEF refusal
         // from a child we might actually want; and so we can later A/B the return
         // (FALSE vs faked-success) if the engine hard-requires it.
+        // A Chromium child (GMod's html_chromium relaunches gmod.exe with
+        // --type=renderer|gpu-process|utility). Mapping a second game image into
+        // this process is never right; the title config runs CEF --single-process,
+        // and anything that still asks gets the failure Chromium already handles.
+        if (cmdLine && wcsstr(cmdLine, L" --type=")){
+            static std::atomic<long> refused{0};
+            const long n = ++refused;
+            if (n <= 8 || (n & (n - 1)) == 0){   // the first few in full, then every power of two
+                const int len = WideCharToMultiByte(CP_UTF8, 0, cmdLine, -1, nullptr, 0, nullptr, nullptr);
+                std::string cl(len > 0 ? len - 1 : 0, '\0');
+                if (len > 1) WideCharToMultiByte(CP_UTF8, 0, cmdLine, -1, cl.data(), len, nullptr, nullptr);
+                if (cl.size() > 600) cl.resize(600);
+                Diag("CP: refusing Chromium subprocess #" + std::to_string(n) + " " + cl);
+            }
+            SetLastError(ERROR_FILE_NOT_FOUND); return FALSE;
+        }
         if (low.find(L"steamwebhelper") != std::wstring::npos){
             Diag("CP: refusing steamwebhelper (CEF) " + std::string(exe.begin(), exe.end()));
             SetLastError(ERROR_FILE_NOT_FOUND); return FALSE;
@@ -50020,6 +51069,9 @@ static std::wstring GuestExtraArgs(const std::wstring& exePath)
     for (const GhTitle& t : GhTitles()){
         if (_wcsicmp(base.c_str(), t.exe.c_str()) != 0 || t.args.empty()) continue;
         std::wstring args(t.args);
+        // The command line is exe + args as they stand: "-condebug" without its
+        // leading space became "gmod.exe-condebug".
+        if (!iswspace(args[0])) args.insert(args.begin(), L' ');
         // #231 (plan Phase 2b): the Nixxes EXE parses "-job-threads N"
         // ("Overriding number of worker threads to %d"). Knob-gated, 0 = absent,
         // so no existing runargs can change the command line by accident.
@@ -50871,8 +51923,23 @@ static void RunGuest()
             if (h != INVALID_HANDLE_VALUE){ writable = true; CloseHandle(h); }
             else Diag("VCWD guest dir not writable err=" + Hex(GetLastError()));
         }
+        g_guestRootDir.clear();
         if (writable){
             std::wstring cwd = g_guestDir;
+            // A title whose "launch" sits below the install root runs, as under
+            // Steam, from the root: Garry's Mod's bin\win64\gmod.exe opens
+            // garrysmod\gameinfo.txt relative to it.
+            if (g_title && !g_title->launch.empty()){
+                const size_t s = g_title->launch.find_last_of(L'\\');
+                if (s != std::wstring::npos){
+                    const std::wstring sub = g_title->launch.substr(0, s + 1);
+                    if (cwd.size() > sub.size() &&
+                        _wcsicmp(cwd.c_str() + cwd.size() - sub.size(), sub.c_str()) == 0){
+                        cwd.resize(cwd.size() - sub.size());
+                        g_guestRootDir = cwd;            // keeps its trailing backslash
+                    }
+                }
+            }
             while (cwd.size() > 3 && (cwd.back()==L'\\' || cwd.back()==L'/')) cwd.pop_back();
             g_vCwd = cwd;
         }
@@ -51332,6 +52399,7 @@ static bool GhLicenseGate(std::vector<uint8_t>&, const std::string&, std::string
 #ifdef GH_LAUNCHER
 #include "gh_input.h"
 #include "launcher_ui.h"
+#include "gh_d3d9.h"     // D3D9 over the console's d3d9on12 (Garry's Mod)
 
 // ---------------------------------------------------------------------------
 // #178. The guest worker thread, and how big its stack is.
@@ -51523,11 +52591,27 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
         try {
             window.KeyDown([](CoreWindow const&, KeyEventArgs const& e){ KM_OnKey(e, true);  });
             window.KeyUp  ([](CoreWindow const&, KeyEventArgs const& e){ KM_OnKey(e, false); });
-#ifdef GH_LAUNCHER
+            // Text reaches a guest only as WM_CHAR. Its TranslateMessage is a bed that
+            // does nothing (our WM_KEYDOWNs are synthetic), so without this no text
+            // box (UE's Slate editable text, Unity's InputField) ever got a letter.
             window.CharacterReceived([](CoreWindow const&, CharacterReceivedEventArgs const& e){
-                PickerOnChar((wchar_t)e.KeyCode());
-            });
+                UINT ch = e.KeyCode();
+                if (g_guestRunning) {
+                    if (ch == 0 || ch > 0xFFFF) return;
+                    auto st = e.KeyStatus();
+                    LPARAM lp = (LPARAM)(st.RepeatCount ? st.RepeatCount : 1);
+                    lp |= (LPARAM)(st.ScanCode & 0xFF) << 16;
+                    if (st.IsExtendedKey) lp |= (LPARAM)1 << 24;
+                    if (st.WasKeyDown)    lp |= (LPARAM)1 << 30;
+                    static std::atomic<unsigned> s_chars{0};
+                    if (s_chars.fetch_add(1) == 0) Diag("INPUT km: first character ch=" + std::to_string(ch) + " -> WM_CHAR");
+                    KM_Push(WM_CHAR, (WPARAM)ch, lp);
+                    return;
+                }
+#ifdef GH_LAUNCHER
+                PickerOnChar((wchar_t)ch);
 #endif
+            });
             window.PointerMoved       ([](CoreWindow const&, PointerEventArgs const& e){ KM_OnPointer(e); });
             window.PointerPressed     ([](CoreWindow const&, PointerEventArgs const& e){ KM_OnPointer(e); });
             window.PointerReleased    ([](CoreWindow const&, PointerEventArgs const& e){ KM_OnPointer(e); });
@@ -51557,7 +52641,9 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
         // render the launcher and let the user pick a game. The selection overrides
         // the ghguest.txt read in RunGuest. If the bridge/D2D can't init, the picker
         // returns empty and we fall through to the default guest.
+        GhSysCopyForRE();
         try { BuildBridgeOnUi(); } catch (...) { Diag("LAUNCHER bridge build threw"); }
+        GhD3d9Probe();
         // The package's guest\ dir: where the shim is staged and where the in-process
         // CreateProcess surrogate resolves child exes from.
         {

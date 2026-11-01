@@ -234,6 +234,10 @@ static void GhInputMakeWasd(GhInputProfile& p)
     p.bind[GH_SRC_RB].kind = GH_TGT_KEY; p.bind[GH_SRC_RB].vk = 'F';
     p.bind[GH_SRC_LT].kind = GH_TGT_KEY; p.bind[GH_SRC_LT].vk = 'C';
     p.bind[GH_SRC_RT].kind = GH_TGT_KEY; p.bind[GH_SRC_RT].vk = VK_SPACE;
+    p.bind[GH_SRC_L3].kind = GH_TGT_KEY; p.bind[GH_SRC_L3].vk = VK_SHIFT;
+    p.bind[GH_SRC_R3].kind = GH_TGT_KEY; p.bind[GH_SRC_R3].vk = VK_CONTROL;
+    p.bind[GH_SRC_START].kind = GH_TGT_KEY; p.bind[GH_SRC_START].vk = VK_ESCAPE;
+    p.bind[GH_SRC_BACK].kind  = GH_TGT_KEY; p.bind[GH_SRC_BACK].vk  = VK_TAB;
     p.bind[GH_SRC_LS].kind = GH_TGT_WASD;
     p.bind[GH_SRC_RS].kind = GH_TGT_MOUSE;
 }
@@ -509,9 +513,48 @@ static void GhInputReleaseAll()
     }
 }
 
+// Set-1 scan code for a virtual key. Source's inputsystem keys its button codes
+// on the lParam scan code, not the VK, so a WM_KEYDOWN with scan 0 is KEY_NONE:
+// Garry's Mod dropped every remapped key (W, Esc...) while the mouse half worked.
+static UINT GhVkToScan(int vk, bool* extended)
+{
+    *extended = (vk == VK_RCONTROL || vk == VK_RMENU || vk == VK_INSERT || vk == VK_DELETE ||
+                 vk == VK_HOME || vk == VK_END || vk == VK_PRIOR || vk == VK_NEXT ||
+                 (vk >= VK_LEFT && vk <= VK_DOWN));
+    using Fn = UINT(WINAPI*)(UINT, UINT);
+    static Fn real = nullptr; static bool tried = false;
+    if (!tried) { tried = true; if (HMODULE u = GetModuleHandleA("user32.dll")) real = (Fn)GetProcAddress(u, "MapVirtualKeyW"); }
+    if (real) { UINT sc = real((UINT)vk, 0 /*MAPVK_VK_TO_VSC*/); if (sc) return sc & 0xFF; }
+    static const char kRow1[] = "QWERTYUIOP", kRow2[] = "ASDFGHJKL", kRow3[] = "ZXCVBNM";
+    for (int i = 0; kRow1[i]; ++i) if (vk == kRow1[i]) return 0x10 + i;
+    for (int i = 0; kRow2[i]; ++i) if (vk == kRow2[i]) return 0x1E + i;
+    for (int i = 0; kRow3[i]; ++i) if (vk == kRow3[i]) return 0x2C + i;
+    if (vk >= '1' && vk <= '9') return 0x02 + (vk - '1');
+    switch (vk) {
+        case '0':          return 0x0B;
+        case VK_ESCAPE:    return 0x01;
+        case VK_BACK:      return 0x0E;
+        case VK_TAB:       return 0x0F;
+        case VK_RETURN:    return 0x1C;
+        case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL: return 0x1D;
+        case VK_SHIFT:   case VK_LSHIFT:   return 0x2A;
+        case VK_RSHIFT:    return 0x36;
+        case VK_MENU:    case VK_LMENU:    case VK_RMENU:    return 0x38;
+        case VK_SPACE:     return 0x39;
+        case VK_UP:        return 0x48;
+        case VK_LEFT:      return 0x4B;
+        case VK_RIGHT:     return 0x4D;
+        case VK_DOWN:      return 0x50;
+        default:           return 0;
+    }
+}
+
 static void GhInputSetSynKey(int vk, bool down)
 {
     if (vk <= 0 || vk > 255) return;
+    bool ext = false;
+    const UINT scan = GhVkToScan(vk, &ext);
+    LPARAM lp = 1 | ((LPARAM)scan << 16) | (ext ? ((LPARAM)1 << 24) : 0);
     if (down) {
         if (g_synVk[vk]) return;
         bool was = false;
@@ -522,7 +565,10 @@ static void GhInputSetSynKey(int vk, bool down)
             g_kmActive = true;
         }
         g_synVk[vk] = true;
-        if (!was) KM_Push(WM_KEYDOWN, (WPARAM)vk, 1);
+        if (!was) {
+            KM_Push(WM_KEYDOWN, (WPARAM)vk, lp);
+            if (GhRawInput() & 4) PushRawKeyboard((USHORT)vk, (USHORT)scan, true, ext);
+        }
     } else {
         if (!g_synVk[vk]) return;
         g_synVk[vk] = false;
@@ -530,8 +576,9 @@ static void GhInputSetSynKey(int vk, bool down)
             std::lock_guard<std::mutex> lk(g_kmMutex);
             g_vkDown[vk] = false;
         }
-        LPARAM lp = 1 | ((LPARAM)1 << 30) | ((LPARAM)1 << 31);
+        lp |= ((LPARAM)1 << 30) | ((LPARAM)1 << 31);
         KM_Push(WM_KEYUP, (WPARAM)vk, lp);
+        if (GhRawInput() & 4) PushRawKeyboard((USHORT)vk, (USHORT)scan, false, ext);
     }
 }
 
@@ -749,11 +796,18 @@ static void GhInputOnGuestStart(uint32_t app, const wchar_t* guestDir)
              " id=" + g_ghProf.id + (on ? " on" : " off"));
         return;
     }
+    // No choice saved for this game: start on the title's own default. It is
+    // not written to active.txt -- only the player's picks are -- so a title
+    // whose default changes later still reaches everyone who never chose.
+    if (g_title && !g_title->input.empty() && GhInputSelectId(g_title->input.c_str(), false)) {
+        Diag(std::string("INPUT title default game=") + std::to_string(g_ghGameKey) + " id=" + g_ghProf.id);
+        return;
+    }
     std::vector<uint8_t> b;
     bool legacyOn = false;
     if (ReadWholeFile(std::wstring(kLocalState) + L"gh_remap.txt", b) && !b.empty())
         legacyOn = (b[0] == '1' || b[0] == 't' || b[0] == 'T');
-    GhInputSelectId(legacyOn ? "builtin-mouse" : "builtin-off", true);
+    GhInputSelectId(legacyOn ? "builtin-mouse" : "builtin-off", false);
 }
 
 static void GhInputSetEnabled(bool on)

@@ -669,6 +669,7 @@ static std::map<std::string, std::string> g_modsArmed;    // title id -> the pro
 static std::string g_modsUiLine;                          // the mod engine's last log line, for the busy panel
 static std::atomic<bool> g_modsArmedDirty{true};          // gh_mod_profile.txt changed: re-read it
 static bool LuiModsOffered(const LauncherItem& it);       // RB opens Mods for this row
+static const GhTitle* LuiWorkshopTitle(const LauncherItem& it);   // ...or the Workshop, for a "workshop" title
 static std::wstring LuiModsBadge(const LauncherItem& it); // "Mods: <profile>", or empty
 
 static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const std::wstring& status,
@@ -761,7 +762,8 @@ static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const s
         // the View glyph is shown only when one does.
         const bool verify = GhSteamRuntimeProvided();
         const bool mods = sel >= 0 && sel < total && LuiModsOffered(items[sel]);
-        const std::wstring right = std::wstring(verify ? L"  Verify      " : L"") + (mods ? L"RB  Mods      " : L"") +
+        const bool ws = sel >= 0 && sel < total && !mods && LuiWorkshopTitle(items[sel]);
+        const std::wstring right = std::wstring(verify ? L"  Verify      " : L"") + (mods ? L"RB  Mods      " : ws ? L"RB  Workshop      " : L"") +
                                    L"Y  Search      B  Back";
         float wl = LuiMeasure(left, fs);
         LuiText(left, fs, D2D1::RectF(x, y0, x + wl + 2.f, y1), dim);
@@ -896,7 +898,7 @@ static void LuiDrawStatus(const std::wstring& msg)
 
 // Progress state shared with the download callback and the add-on host API
 // (same UI thread). Outside the Steam block: add-ons draw it in every build.
-struct LauncherDlProg { std::wstring name, phase, head; int percent=0, fdone=0, ftot=0; unsigned long long bytes=0; bool verify=false; };   // head: replaces "Downloading <name>"
+struct LauncherDlProg { std::wstring name, phase, head, hint; int percent=0, fdone=0, ftot=0; unsigned long long bytes=0; bool verify=false; };   // head: replaces "Downloading <name>"
 static LauncherDlProg g_dlProg;
 
 static void LuiDrawProgress()
@@ -928,6 +930,9 @@ static void LuiDrawProgress()
                  g_dlProg.phase.c_str(), g_dlProg.percent, g_dlProg.bytes / (1024.0 * 1024.0));
     LuiText(line, g_lui.fmtSmall.get(), D2D1::RectF(x0, y + hgt + 16, x1, y + hgt + 60),
             g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+    if (!g_dlProg.hint.empty())
+        LuiText(g_dlProg.hint.c_str(), g_lui.fmtSmall.get(), D2D1::RectF(x0, H - 120, x1, H - 76),
+                g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
     dc->EndDraw();
 }
 
@@ -1006,7 +1011,11 @@ static void LuiSrcInstalledScan(std::vector<LauncherItem>& out, const std::wstri
                 continue;
             }
         }
-        std::wstring exe = LuiPickExe(gameDir + sub + L"\\", sub);
+        std::wstring exe;
+        if (app)
+            for (const GhTitle& t : GhTitles())
+                if (t.steamAppId == app && !t.launch.empty()) { exe = t.launch; break; }
+        if (exe.empty()) exe = LuiPickExe(gameDir + sub + L"\\", sub);
         if (exe.empty()) exe = sub + L".exe";
         LauncherItem it;
         it.guest = gameDir + sub + L"\\" + exe;   // absolute
@@ -1202,6 +1211,30 @@ static void LuiAddonStatus(const wchar_t* text)
     LuiDrawStatus(text ? text : L"");
     LuiPresent();
 }
+// B on a cancellable progress screen (the workshop sync): latched until the next
+// cancellable call starts. Polled by every drawing call and by cancelRequested.
+static bool g_luiAddonCancellable = false, g_luiAddonCancel = false;
+static WORD g_luiCancelPrev = 0xFFFF;
+static void LuiAddonPollCancel()
+{
+    if (!g_luiAddonCancellable) return;
+    PollGamepadOnUi();
+    PollSyntheticPad();
+    WORD b; { std::lock_guard<std::mutex> lk(g_padMutex); b = g_padState.wButtons; }
+    if ((b & ~g_luiCancelPrev & XINPUT_GAMEPAD_B) && !g_luiAddonCancel) {
+        g_luiAddonCancel = true;
+        g_dlProg.hint = L"Skipping \u2014 finishing the current request";
+        Diag("LAUNCHER progress: B -- cancel requested");
+    }
+    g_luiCancelPrev = b;
+}
+static int LuiAddonCancelRequested()
+{
+    if (!g_luiAddonCancellable || !LuiAddonUiLive("cancelRequested")) return 0;
+    if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+    LuiAddonPollCancel();
+    return g_luiAddonCancel ? 1 : 0;
+}
 static void LuiAddonProgressFiles(const wchar_t* phase, int percent, int fdone, int ftot, uint64_t bytes)
 {
     if (!LuiAddonUiLive("progressFiles")) return;
@@ -1209,6 +1242,7 @@ static void LuiAddonProgressFiles(const wchar_t* phase, int percent, int fdone, 
     g_dlProg.percent = percent < 0 ? 0 : percent > 100 ? 100 : percent;
     g_dlProg.fdone = fdone; g_dlProg.ftot = ftot; g_dlProg.bytes = bytes;
     if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+    LuiAddonPollCancel();
     LuiDrawProgress();
     LuiPresent();
 }
@@ -1235,6 +1269,17 @@ static uint32_t LuiAddonInstallDir(uint32_t app, wchar_t* buf, uint32_t cap)
     return (uint32_t)d.size();
 }
 
+static uint32_t LuiAddonSteamBranch(uint32_t app, char* buf, uint32_t cap)
+{
+    if (!app || !buf || !cap) return 0;
+    for (const GhTitle& t : GhTitles())
+        if (t.steamAppId == app && !t.steamBranch.empty() && t.steamBranch.size() < cap) {
+            strcpy_s(buf, cap, t.steamBranch.c_str());
+            return (uint32_t)t.steamBranch.size();
+        }
+    return 0;
+}
+
 template <int K> static bool LuiAddonAcquire(const LauncherItem& it, int mode)
 {
     if (!g_luiAddons[K].api.acquire) return false;
@@ -1247,6 +1292,37 @@ template <int K> static bool LuiAddonAcquire(const LauncherItem& it, int mode)
     const bool ok = g_luiAddons[K].api.acquire(&r, m) != 0;
     g_luiAddonAcquiring = false;
     return ok;
+}
+// Steam Workshop: before a title whose config says "workshop" launches, the add-on
+// that has workshopSync brings the account's subscribed items onto the console and
+// rewrites LocalState\gh_workshop_<app>.txt, which the shim's ISteamUGC answers from.
+// A failed or offline sync still launches (the items already on disk stay usable).
+static void LuiWorkshopSync(const LauncherItem& it)
+{
+    if (!it.app) return;
+    bool want = false;
+    for (const GhTitle& t : GhTitles()) if (t.steamAppId == it.app && t.workshop) { want = true; break; }
+    if (!want) return;
+    for (int k = 0; k < g_luiAddonN; ++k) {
+        LuiAddon& a = g_luiAddons[k];
+        if (!GH_ADDON_HAS(&a.api, workshopSync) || !a.api.workshopSync) continue;
+        g_dlProg = LauncherDlProg{};
+        g_dlProg.name = it.display;
+        g_dlProg.head = L"Updating Workshop items for " + it.display;
+        g_dlProg.hint = L"B  Skip and play with the items already installed";
+        g_luiAddonAcqTid = GetCurrentThreadId();
+        g_luiAddonAcquiring = true;
+        g_luiAddonCancellable = true; g_luiAddonCancel = false; g_luiCancelPrev = 0xFFFF;
+        const DWORD t0 = GetTickCount();
+        const int rc = a.api.workshopSync(it.app);
+        g_luiAddonCancellable = false;
+        g_luiAddonAcquiring = false;
+        g_dlProg.hint.clear();
+        Diag("LAUNCHER workshop sync app=" + std::to_string(it.app) + " via " + a.pkg + " rc=" + std::to_string(rc) +
+             " in " + std::to_string(GetTickCount() - t0) + " ms");
+        return;
+    }
+    Diag("LAUNCHER workshop: no add-on syncs app=" + std::to_string(it.app));
 }
 template <int K> static bool LuiAddonCanVerify(const LauncherItem& it)
 {
@@ -1437,6 +1513,8 @@ static void LuiAddonsLoad(const std::vector<std::string>& taken)
         a.host.progressFiles = LuiAddonProgressFiles;
         a.host.signInScreen = LuiAddonSignInScreen;
         a.host.installDir = LuiAddonInstallDir;
+        a.host.steamBranch = LuiAddonSteamBranch;
+        a.host.cancelRequested = LuiAddonCancelRequested;
         a.api.size = sizeof(GhAddonApi);
         const int rc = LuiAddonCallInit(init, &a.host, &a.api);
         if (rc != 0 || a.api.abi != GH_ADDON_ABI || !a.api.id || !*a.api.id) {
@@ -2083,6 +2161,296 @@ static std::wstring LuiModsName(const std::string& name)   // Thunderstore names
     std::wstring w = ghrepo::Widen(name);
     for (auto& c : w) if (c == L'_') c = L' ';
     return w;
+}
+
+// ---------------------------------------------------------------------------
+// Steam Workshop screen (RB on a title whose config says "workshop"). Browse the
+// app's Workshop through the Steam add-on, subscribe / unsubscribe with the
+// signed-in account, and sync: the content itself always comes from Steam onto
+// this console (never through us), and the game sees it through the shim's
+// ISteamUGC. Queries run on a worker thread; the sync draws on this one.
+// ---------------------------------------------------------------------------
+static LuiAddon* LuiWorkshopAddon()
+{
+    for (int k = 0; k < g_luiAddonN; ++k)
+        if (GH_ADDON_HAS(&g_luiAddons[k].api, workshopSubscribe) && g_luiAddons[k].api.workshopQuery) return &g_luiAddons[k];
+    return nullptr;
+}
+static const GhTitle* LuiWorkshopTitle(const LauncherItem& it)
+{
+    const GhTitle* t = LuiModsTitle(it);
+    return t && t->workshop && LuiWorkshopAddon() ? t : nullptr;
+}
+
+static void LauncherWorkshop(const GhTitle& title)
+{
+    if (!LuiInit()) return;
+    LuiAddon* ad = LuiWorkshopAddon();
+    if (!ad) return;
+    struct Item { uint64_t id = 0, bytes = 0; uint32_t flags = 0, subs = 0, updated = 0; std::wstring title, desc; };
+    struct Job {
+        std::atomic<bool> done{true};
+        int rc = 0; uint32_t total = 0;
+        std::vector<Item> items;
+    };
+    const uint32_t app = title.steamAppId;
+    const std::wstring tname = ghrepo::Widen(title.name.empty() ? title.id : title.name);
+    enum { kSubscribed, kPopular, kTrending, kNewest, kSearch, kTabs };
+    static const wchar_t* kTabName[kTabs] = {L"Subscribed", L"Popular", L"Trending", L"Newest", L"Search"};
+    static const uint32_t kTabSort[kTabs] = {GH_WS_SORT_SUBSCRIBED, GH_WS_SORT_POPULAR, GH_WS_SORT_TRENDING,
+                                            GH_WS_SORT_NEWEST, GH_WS_SORT_POPULAR};
+    int tab = kSubscribed;
+    std::vector<Item> list[kTabs];
+    uint32_t page[kTabs] = {}, total[kTabs] = {};
+    int sel[kTabs] = {};
+    std::wstring status = L"Loading…", busy, ask, query;
+    bool bad = false, typing = false;
+    bool dirty = false;                            // subscriptions changed: sync before the next launch
+    std::shared_ptr<Job> job;
+    int jobTab = -1;
+    std::function<void()> onAsk;
+    WORD prev = 0xFFFF;
+    DWORD lastNav = 0;
+    const std::wstring pickQuery = g_pickQuery;
+
+    auto load = [&](int t, bool more) {
+        if (job && !job->done) return;
+        if (t == kSearch && query.empty()) { list[t].clear(); total[t] = 0; status = L"Y to search the Workshop"; bad = false; return; }
+        if (!more) { list[t].clear(); page[t] = 0; sel[t] = 0; total[t] = 0; }
+        job = std::make_shared<Job>();
+        job->done = false;
+        jobTab = t;
+        const uint32_t pg = page[t] + 1, sort = kTabSort[t];
+        const std::wstring q = t == kSearch ? query : L"";
+        GhAddonApi api = ad->api;
+        busy = more ? L"Loading more…" : L"Loading " + std::wstring(kTabName[t]) + L"…";
+        std::thread([job = job, api, app, sort, pg, q] {
+            job->rc = api.workshopQuery(app, sort, pg, q.c_str(), job.get(), [](void* c, const GhWorkshopItem* w) {
+                Item it;
+                it.id = w->id; it.bytes = w->bytes; it.flags = w->flags; it.subs = w->subscriptions; it.updated = w->updated;
+                if (w->title) it.title = w->title;
+                if (w->desc) it.desc = w->desc;
+                ((Job*)c)->items.push_back(std::move(it));
+            }, &job->total);
+            job->done = true;
+        }).detach();
+    };
+    auto mb = [](uint64_t b) {
+        wchar_t buf[32];
+        if (b >= (1ull << 30)) swprintf_s(buf, L"%.1f GB", b / 1073741824.0);
+        else swprintf_s(buf, L"%.1f MB", b / 1048576.0);
+        return std::wstring(buf);
+    };
+    auto subscribe = [&](const Item& it, bool to) {
+        busy = (to ? L"Subscribing to " : L"Unsubscribing from ") + it.title + L"…";
+        auto j = std::make_shared<Job>();
+        j->done = false;
+        job = j; jobTab = -2;
+        GhAddonApi api = ad->api;
+        const uint64_t id = it.id;
+        std::thread([j, api, app, id, to] { j->rc = api.workshopSubscribe(app, id, to ? 1 : 0); j->done = true; }).detach();
+        Diag(std::string("WORKSHOP UI ") + (to ? "subscribe " : "unsubscribe ") + std::to_string((unsigned long long)id));
+        // The flag on every copy of the item, so all tabs agree once it lands.
+        onAsk = [&, id, to, name = it.title] {
+            if (job->rc) { bad = true; status = L"Steam refused that (" + std::to_wstring(job->rc) + L")"; return; }
+            bad = false; dirty = true;
+            status = (to ? L"Subscribed to " : L"Unsubscribed from ") + name + L"  ·  X syncs it now, or it syncs at launch";
+            for (auto& l : list) for (auto& x : l) if (x.id == id) x.flags = to ? (x.flags | GH_WS_SUBSCRIBED) : (x.flags & ~(uint32_t)GH_WS_SUBSCRIBED);
+        };
+    };
+    auto sync = [&] {
+        g_dlProg = LauncherDlProg{};
+        g_dlProg.name = tname;
+        g_dlProg.head = L"Updating Workshop items for " + tname;
+        g_luiAddonAcqTid = GetCurrentThreadId();
+        g_luiAddonAcquiring = true;
+        const DWORD t0 = GetTickCount();
+        const int rc = ad->api.workshopSync(app);
+        g_luiAddonAcquiring = false;
+        Diag("WORKSHOP UI sync app=" + std::to_string(app) + " rc=" + std::to_string(rc) + " in " + std::to_string(GetTickCount() - t0) + " ms");
+        bad = rc != 0;
+        status = rc == 0 ? L"Subscribed items are on this console" : rc > 0 ? std::to_wstring(rc) + L" items could not be downloaded"
+               : L"Sync failed (signed in? network?)";
+        if (rc == 0) dirty = false;
+        load(kSubscribed, false);
+    };
+    auto draw = [&] {
+        auto* dc = g_lui.dc.get();
+        const float W = (float)g_lui.w, H = (float)g_lui.h;
+        IDWriteTextFormat* fs = g_lui.fmtSmall.get();
+        dc->BeginDraw();
+        dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
+        LuiText((L"WORKSHOP  ·  " + tname).c_str(), g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
+        LuiText((L"●  " + status).c_str(), fs, D2D1::RectF(84, 140, W - 80, 182), bad ? g_lui.brWarn.get() : g_lui.brAccent.get());
+        float x = 84;
+        for (int t = 0; t < kTabs; ++t) {
+            std::wstring s = kTabName[t];
+            if (t == kSubscribed && page[t]) s += L" (" + std::to_wstring(total[t]) + L")";
+            const float w = LuiMeasure(s.c_str(), g_lui.fmtItem.get());
+            LuiText(s.c_str(), g_lui.fmtItem.get(), D2D1::RectF(x, 186, x + w + 4, 236), t == tab ? g_lui.brFg.get() : g_lui.brDim.get());
+            if (t == tab) dc->FillRectangle(D2D1::RectF(x, 238, x + w, 242), g_lui.brAccent.get());
+            x += w + 56;
+        }
+        std::wstring line = tab == kSearch ? L"Search:  " + (typing ? g_pickQuery + L"_" : query.empty() ? std::wstring(L"Y to search") : query)
+                          : tab == kSubscribed ? std::wstring(L"Your account's subscriptions  ·  they download to this console before the game starts")
+                          : std::to_wstring(total[tab]) + L" items";
+        LuiText(line.c_str(), fs, D2D1::RectF(84, 252, W - 80, 290), typing ? g_lui.brFg.get() : g_lui.brDim.get());
+
+        const float x0 = 80, x1 = W - 80, rowH = 70, top = 300, detail = H - 160;
+        const std::vector<Item>& l = list[tab];
+        const int nfit = (int)((detail - top) / rowH), n = (int)l.size(), cur = sel[tab];
+        int first = 0;
+        if (nfit > 0 && n > nfit) { first = cur - nfit / 2; if (first < 0) first = 0; if (first > n - nfit) first = n - nfit; }
+        for (int vi = 0; vi < nfit && first + vi < n; ++vi) {
+            const int i = first + vi; const Item& it = l[i];
+            const float y = top + (float)vi * rowH; const bool on = i == cur;
+            dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x0, y, x1, y + rowH - 10), 10, 10), on ? g_lui.brSel.get() : g_lui.brPanel.get());
+            std::wstring sub = mb(it.bytes) + L"  ·  " + LuiModsThousands(it.subs) + L" subscribers";
+            if (it.flags & GH_WS_INSTALLED) sub = L"✓ on console  ·  " + sub;
+            else if (it.flags & GH_WS_SUBSCRIBED) sub = L"subscribed  ·  " + sub;
+            LuiText(it.title.c_str(), g_lui.fmtItem.get(), D2D1::RectF(x0 + 28, y, x1 - 560, y + rowH - 10), g_lui.brFg.get());
+            LuiText(sub.c_str(), fs, D2D1::RectF(x1 - 600, y, x1 - 24, y + rowH - 10), on ? g_lui.brFg.get() : g_lui.brDim.get(),
+                    DWRITE_TEXT_ALIGNMENT_TRAILING);
+        }
+        if (l.empty() && busy.empty())
+            LuiText(tab == kSubscribed ? L"No subscriptions yet: find something in Popular or Search" : L"Nothing here",
+                    g_lui.fmtItem.get(), D2D1::RectF(x0, top, x1, top + 60), g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+        if (cur >= 0 && cur < n && !l[cur].desc.empty())
+            LuiText(l[cur].desc.c_str(), fs, D2D1::RectF(84, detail, W - 80, H - 80), g_lui.brDim.get());
+        const bool subd = cur >= 0 && cur < n && (l[cur].flags & GH_WS_SUBSCRIBED);
+        const std::wstring hint = std::wstring(subd ? L"A  Unsubscribe" : L"A  Subscribe") + L"      LB RB  Tabs      X  Sync now      " +
+                                  (tab == kSearch ? L"Y  Search      " : L"") + L"B  Back";
+        LuiText(hint.c_str(), fs, D2D1::RectF(84, H - 70, W - 80, H - 30), g_lui.brDim.get());
+        if (!busy.empty() || !ask.empty()) {
+            dc->FillRectangle(D2D1::RectF(0, 0, W, H), g_lui.brBg.get());
+            const float cx = W * 0.5f, cy = H * 0.5f;
+            dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 460, cy - 140, cx + 460, cy + 140), 16, 16), g_lui.brPanel.get());
+            if (!ask.empty()) {
+                LuiText(L"UNSUBSCRIBE", g_lui.fmtTitle.get(), D2D1::RectF(cx - 430, cy - 120, cx + 430, cy - 40), g_lui.brWarn.get(),
+                        DWRITE_TEXT_ALIGNMENT_CENTER);
+                LuiText(ask.c_str(), g_lui.fmtItem.get(), D2D1::RectF(cx - 430, cy - 30, cx + 430, cy + 30), g_lui.brAccent.get(),
+                        DWRITE_TEXT_ALIGNMENT_CENTER);
+                LuiText(L"A  Yes, unsubscribe            B  Cancel", fs, D2D1::RectF(cx - 430, cy + 60, cx + 430, cy + 110), g_lui.brFg.get(),
+                        DWRITE_TEXT_ALIGNMENT_CENTER);
+            } else
+                LuiText(busy.c_str(), g_lui.fmtItem.get(), D2D1::RectF(cx - 430, cy - 30, cx + 430, cy + 30), g_lui.brFg.get(),
+                        DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
+        dc->EndDraw();
+        LuiPresent();
+    };
+
+    Diag("WORKSHOP UI open " + title.id + " app=" + std::to_string(app));
+    load(kSubscribed, false);
+    std::function<void()> afterSub;
+    for (;;) {
+        if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+        PollGamepadOnUi();
+        PollSyntheticPad();
+        WORD b, ly_hi = 0, ly_lo = 0;
+        { std::lock_guard<std::mutex> lk(g_padMutex);
+          b = g_padState.wButtons;
+          if (g_padState.sThumbLY >  16000) ly_hi = 1;
+          if (g_padState.sThumbLY < -16000) ly_lo = 1; }
+        const DWORD now = GetTickCount();
+        const bool navGate = (now - lastNav) > 160;
+        WORD synth = b;
+        if (ly_hi && navGate) synth |= XINPUT_GAMEPAD_DPAD_UP;
+        if (ly_lo && navGate) synth |= XINPUT_GAMEPAD_DPAD_DOWN;
+        const WORD pressed = synth & ~prev;
+        prev = b;
+
+        if (typing) {
+            {
+                std::lock_guard<std::mutex> lk(g_pickKbMu);
+                if (g_pickOskOpen && g_pickQueryChanged) { g_pickKbBack = 0; g_pickKbChars.clear(); }
+                g_pickQueryChanged = false;
+                if (g_pickKbClear) { g_pickQuery.clear(); g_pickKbClear = false; }
+                for (; g_pickKbBack > 0; --g_pickKbBack) if (!g_pickQuery.empty()) g_pickQuery.pop_back();
+                if (!g_pickKbChars.empty()) { g_pickQuery += g_pickKbChars; g_pickKbChars.clear(); }
+            }
+            if (pressed & XINPUT_GAMEPAD_B) { PickerOskHide(); typing = false; }
+            else if ((pressed & XINPUT_GAMEPAD_START) || !g_pickOskOpen) {
+                typing = false;
+                PickerOskHide();
+                query = g_pickQuery;
+                while (!query.empty() && query.back() == L' ') query.pop_back();
+                while (!query.empty() && query.front() == L' ') query.erase(query.begin());
+                Diag("WORKSHOP UI search '" + LuiNarrow(query) + "'");
+                load(kSearch, false);
+            }
+            draw(); Sleep(16); continue;
+        }
+        if (!busy.empty()) {
+            if (job && job->done) {
+                busy.clear();
+                if (jobTab >= 0) {
+                    const int t = jobTab;
+                    if (job->rc) { bad = true; status = job->rc == -10 ? L"Sign in to Steam first (Packages page)" : L"The Workshop could not be reached (" + std::to_wstring(job->rc) + L")"; }
+                    else {
+                        bad = false;
+                        ++page[t]; total[t] = job->total;
+                        for (auto& it : job->items) list[t].push_back(std::move(it));
+                        status = t == kSubscribed ? std::to_wstring(total[t]) + L" subscribed" + (dirty ? L"  ·  not synced yet" : L"")
+                               : std::to_wstring(list[t].size()) + L" of " + std::to_wstring(total[t]) + L" shown";
+                    }
+                    Diag("WORKSHOP UI loaded tab=" + std::to_string(t) + " page=" + std::to_string(page[t]) + " rc=" + std::to_string(job->rc) +
+                         " n=" + std::to_string(list[t].size()) + "/" + std::to_string(total[t]));
+                } else if (auto f = std::move(onAsk)) { onAsk = nullptr; f(); }
+            }
+            draw(); Sleep(16); continue;
+        }
+        if (!ask.empty()) {
+            if (pressed & XINPUT_GAMEPAD_A) { ask.clear(); if (auto f = std::move(afterSub)) { afterSub = nullptr; f(); } }
+            else if (pressed & XINPUT_GAMEPAD_B) { ask.clear(); afterSub = nullptr; }
+            draw(); Sleep(16); continue;
+        }
+
+        std::vector<Item>& l = list[tab];
+        const int n = (int)l.size();
+        int& s = sel[tab];
+        auto jump = [&](int d) {
+            int ns = s + d;
+            if (ns > n - 1) {
+                ns = n - 1;
+                if (n > 0 && s == n - 1 && (uint32_t)n < total[tab]) load(tab, true);   // the next page
+            }
+            if (ns < 0) ns = 0;
+            if (ns != s) { s = ns; lastNav = now; }
+        };
+        if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) jump(-1);
+        if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) jump(+1);
+        if (pressed & XINPUT_GAMEPAD_DPAD_LEFT) jump(-5);
+        if (pressed & XINPUT_GAMEPAD_DPAD_RIGHT) jump(+5);
+        if (pressed & (XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER)) {
+            tab = (tab + ((pressed & XINPUT_GAMEPAD_LEFT_SHOULDER) ? kTabs - 1 : 1)) % kTabs;
+            if (!page[tab] && (tab != kSearch || !query.empty())) load(tab, false);
+            else if (tab == kSearch && query.empty()) { status = L"Y to search the Workshop"; bad = false; }
+        }
+        if (pressed & XINPUT_GAMEPAD_B) {
+            Diag("WORKSHOP UI closed " + title.id + (dirty ? " (unsynced changes: the launch syncs)" : ""));
+            g_pickQuery = pickQuery;
+            g_pickSelStart = g_pickSelEnd = (int)g_pickQuery.size();
+            return;
+        }
+        if ((pressed & XINPUT_GAMEPAD_Y) && tab == kSearch) {
+            typing = true;
+            g_pickQuery = query;
+            g_pickQueryChanged = false;
+            { std::lock_guard<std::mutex> lk(g_pickKbMu); g_pickKbChars.clear(); g_pickKbBack = 0; g_pickKbClear = false; }
+            PickerOskShow();
+        }
+        if (pressed & XINPUT_GAMEPAD_X) sync();
+        if ((pressed & XINPUT_GAMEPAD_A) && s >= 0 && s < n) {
+            const Item it = l[s];
+            if (it.flags & GH_WS_SUBSCRIBED) {
+                ask = it.title;
+                afterSub = [&, it] { subscribe(it, false); };
+            } else subscribe(it, true);
+        }
+        draw();
+        Sleep(16);
+    }
 }
 
 static void LauncherMods(const GhTitle& title)
@@ -5475,6 +5843,13 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
                      "' app=" + std::to_string(verifyIt.app));
             }
         }
+        if ((pressed & XINPUT_GAMEPAD_RIGHT_SHOULDER) && !g_pickOskOpen && LuiWorkshopTitle(items[sel])) {
+            const GhTitle* t = LuiWorkshopTitle(items[sel]);
+            Diag("LAUNCHER workshop '" + LuiNarrow(items[sel].display) + "' title=" + t->id);
+            LauncherWorkshop(*t);
+            prev = 0xFFFF;
+            continue;
+        }
         if ((pressed & XINPUT_GAMEPAD_RIGHT_SHOULDER) && !g_pickOskOpen && LuiModsOffered(items[sel])) {
             const GhTitle* t = LuiModsTitle(items[sel]);
             Diag("LAUNCHER mods '" + LuiNarrow(items[sel].display) + "' title=" + t->id);
@@ -5530,6 +5905,7 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
                     continue;
                 }
             }
+            LuiWorkshopSync(it);
             g_launcherSelectedApp = it.app;
             PickerOskHide();
             return it.guest;
