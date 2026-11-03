@@ -183,10 +183,12 @@ int main(int argc, char** argv)
         return rc;
     }
     if (mode == "pak" && argc >= 7){
-        std::vector<uint8_t> key = Bytes(argv[5]), out;
+        // key "plain" opens the store the way the bundled corpus is (no key).
+        const bool plain = std::string(argv[5]) == "plain";
+        std::vector<uint8_t> key = plain ? std::vector<uint8_t>(32) : Bytes(argv[5]), out;
         std::wstring dir = ghrepo::Widen(argv[2]); if (dir.back() != L'\\') dir += L'\\';
         ghpak::Store st; std::string why;
-        if (key.size() != 32 || !st.Open(dir, argv[3], argv[4], key.data(), why)){ printf("PAK open failed: %s\n", why.c_str()); return 1; }
+        if (key.size() != 32 || !st.Open(dir, argv[3], argv[4], plain ? nullptr : key.data(), why)){ printf("PAK open failed: %s\n", why.c_str()); return 1; }
         printf("PAK %zu records in %zu packs\n", st.Count(), st.Packs());
         if (!st.Read(argv[6], out, why)){ printf("PAK read %s: %s\n", argv[6], why.empty() ? "missing" : why.c_str()); return 1; }
         printf("PAK sha256 %s\n", ghrepo::Sha256Hex(out.data(), out.size()).c_str());

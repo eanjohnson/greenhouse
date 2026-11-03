@@ -1280,6 +1280,18 @@ static uint32_t LuiAddonSteamBranch(uint32_t app, char* buf, uint32_t cap)
     return 0;
 }
 
+static uint32_t LuiAddonSteamSkipDepots(uint32_t app, uint32_t* out, uint32_t cap)
+{
+    if (!app || !out || !cap) return 0;
+    for (const GhTitle& t : GhTitles())
+        if (t.steamAppId == app && !t.steamSkipDepots.empty()) {
+            uint32_t n = 0;
+            for (unsigned d : t.steamSkipDepots) if (n < cap) out[n++] = d;
+            return n;
+        }
+    return 0;
+}
+
 template <int K> static bool LuiAddonAcquire(const LauncherItem& it, int mode)
 {
     if (!g_luiAddons[K].api.acquire) return false;
@@ -1462,6 +1474,34 @@ static bool GhReadPackBlob(const std::wstring& wname, std::vector<uint8_t>& out,
     return false;
 }
 
+// The dev package's bundled corpus: plain *.ghpak packs in <install>\guest\ghlo\
+// (gh_pak.h). Opened once; an older build's loose gh_*.bin has no packs, and
+// GhReadPkgBlob then reads the files as before. The package is immutable while
+// the process runs, so nothing here ever reopens.
+static bool GhReadBundledBlob(const std::wstring& wname, std::vector<uint8_t>& out, bool probe)
+{
+    static ghpak::Store* store = [] () -> ghpak::Store* {
+        const std::wstring& d = GhPkgCorpusDir();
+        if (d.empty()) return nullptr;
+        WIN32_FIND_DATAW fd;
+        HANDLE f = FindFirstFileExW((d + L"*.ghpak").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
+        if (f == INVALID_HANDLE_VALUE) return nullptr;
+        FindClose(f);
+        auto* s = new ghpak::Store;
+        std::string why;
+        if (!s->Open(d, "bundle", "", nullptr, why)) { Diag("PACK bundled corpus FAILED: " + why); delete s; return nullptr; }
+        Diag("PACK bundled corpus open: " + std::to_string(s->Count()) + " records in " + std::to_string(s->Packs()) + " pack(s)");
+        return s;
+    }();
+    if (!store) return false;
+    const std::string name = ghrepo::Narrow(wname);
+    if (probe) return store->Has(name);
+    std::string why;
+    if (store->Read(name, out, why)) return true;
+    if (!why.empty()) Diag("PACK bundled " + name + " " + why);
+    return false;
+}
+
 // Full path of the fetched copy of `base` if it is one of the three and verified, else empty.
 static std::wstring GhSteamRuntimeFor(const std::wstring& base)
 {
@@ -1515,6 +1555,7 @@ static void LuiAddonsLoad(const std::vector<std::string>& taken)
         a.host.installDir = LuiAddonInstallDir;
         a.host.steamBranch = LuiAddonSteamBranch;
         a.host.cancelRequested = LuiAddonCancelRequested;
+        a.host.steamSkipDepots = LuiAddonSteamSkipDepots;
         a.api.size = sizeof(GhAddonApi);
         const int rc = LuiAddonCallInit(init, &a.host, &a.api);
         if (rc != 0 || a.api.abi != GH_ADDON_ABI || !a.api.id || !*a.api.id) {

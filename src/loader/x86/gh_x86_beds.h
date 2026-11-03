@@ -34,6 +34,10 @@
 #include <objbase.h>
 #include <mmsystem.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
+#include <setupapi.h>
+#include <imm.h>
+#include <shlobj.h>
 
 #include "gh_x86_win.h"
 // The COM boundary. Included here rather than beside the run loop so that the
@@ -41,6 +45,8 @@
 // register BEFORE the generated forward table, whose dynamically-resolved
 // d3d11.dll entries would otherwise shadow them under first-registration-wins.
 #include "gh_x86_com_d3d.h"
+#include "gh_x86_com_d3d9.h"
+#include "gh_x86_gdi.h"
 
 namespace ghx86 {
 
@@ -264,6 +270,23 @@ inline uint32_t gh_load_library(Machine& m, const std::wstring& want)
     if (!path.empty()) {
         if (uint32_t b = m.load_guest_dll(path)) return b;
         return 0;                              // it IS there and it did not load
+    }
+    // Only an OS DLL gets a synthetic handle: one we have beds for, an API-set
+    // contract, or one the host itself ships. Anything else is a game plugin
+    // that is not installed, and NULL is the answer the game is written for --
+    // HL2's launcher probes for sourcevr.dll, which current builds no longer
+    // ship, and a synthetic handle sent it straight into GetProcAddress(...)()
+    // on a NULL CreateInterface.
+    if (!m.registry.has_dll(nm) && nm.rfind("api-ms-", 0) != 0 && nm.rfind("ext-ms-", 0) != 0) {
+        wchar_t sys[MAX_PATH];
+        const UINT n = GetSystemDirectoryW(sys, MAX_PATH);
+        const std::wstring host = (n && n < MAX_PATH) ? std::wstring(sys, n) + L"\\" + widen(nm.c_str())
+                                                      : std::wstring();
+        if (host.empty() || GetFileAttributesW(host.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            log_capped("ll:" + nm, "X86 LoadLibrary(" + nm + ") -> 0 (not installed, no beds)");
+            SetLastError(ERROR_MOD_NOT_FOUND);
+            return 0;
+        }
     }
     return gh_synth_module(m, nm);
 }
@@ -623,17 +646,19 @@ inline void install(Machine& m, Machine::GuestDll& d)
 constexpr uint32_t kWndTag   = 0x57480000u;   // 'WH'
 constexpr uint32_t kFakeHwnd = kWndTag | 1u;
 constexpr uint32_t kFakeHdc  = 0x44430001u;   // 'DC'
+constexpr uint32_t kFakeMonitor = 0x4D4E0001u;   // 'MN'
 
 // MSG is 28 bytes on x86 and 48 on x64: hwnd 0, message 4, wParam 8, lParam 12,
 // time 16, pt.x 20, pt.y 24. Written field by field at the x86 offsets, because
 // a forwarded PeekMessage would put twenty bytes of host MSG past the end of the
 // guest's -- and a guest's MSG is a local, so what follows it is a saved
 // register or a return address. That is rule 10 again, from the other side.
-inline void write_msg32(uint32_t at, uint32_t message, uint32_t wparam, uint32_t lparam)
+inline void write_msg32(uint32_t at, uint32_t message, uint32_t wparam, uint32_t lparam,
+                        int32_t ptx = 0, int32_t pty = 0)
 {
     if (!at) return;
     const uint32_t v[7] = { kFakeHwnd, message, wparam, lparam,
-                            (uint32_t)GetTickCount(), 0, 0 };
+                            (uint32_t)GetTickCount(), (uint32_t)ptx, (uint32_t)pty };
     std::memcpy((void*)(uintptr_t)at, v, sizeof(v));
 }
 
@@ -645,23 +670,111 @@ inline void write_msg32(uint32_t at, uint32_t message, uint32_t wparam, uint32_t
 // failure that looks like a graphics bug and is not one. WM_NCACTIVATE is
 // harmless padding that some versions also read.
 //
-// Real input does not come through here. It arrives via raw input, which is its
-// own piece of work; this queue exists to answer the one question the player
-// asks before it will draw.
-inline uint64_t peek_message32(Machine& m, uint32_t msg_ptr, bool remove)
+// After it, in the Launcher, the queue is the host's keyboard/mouse queue
+// (KM_Push, fed by the CoreWindow handlers) -- the same one the x64 pump drains
+// in FillInjectedMsg. Until s855 it was empty forever, so HL2 never saw a key:
+// ESC did nothing. WM_INPUT goes through too: its lParam is one of our own
+// synthetic HRAWINPUTs (0x7A00xxxx, PushRawMouse), which fits 32 bits, and the
+// x86 GetRawInputData bed below hands back the 32-bit layout of that packet.
+// Source reads its mouse ONLY from raw input, so without it the pad's right
+// stick turned nothing in HL2.
+// Input messages (WM_INPUT, keys) that reached a guest pump or window procedure, for
+// "who ate it" questions: ret is the guest return address (a[-1] on a stdcall frame).
+inline bool is_input_msg(uint32_t msg) { return msg == WM_INPUT || (msg >= WM_KEYFIRST && msg <= WM_KEYLAST); }
+inline void log_input_hop(const char* where, uint32_t msg, uint32_t wp, uint32_t target, uint32_t ret)
+{
+    // Separate budgets: a few seconds of mouse look is 48 WM_INPUTs on its own.
+    static std::atomic<int> n_raw{0}, n_key{0};
+    if (is_input_msg(msg) && (msg == WM_INPUT ? n_raw : n_key).fetch_add(1) < 48)
+        log(std::string("X86 INPUTHOP ") + where + " msg=" + hex(msg) + " wp=" + hex(wp) +
+            " to=" + hex(target) + " ret=" + hex(ret));
+}
+
+// The procedure that receives a message for `hwnd`: a SubWindow's own, else the
+// game window's.
+inline uint32_t wndproc_for(Machine& m, uint32_t hwnd)
+{
+    auto it = m.bed.sub_windows.find(hwnd);
+    return it == m.bed.sub_windows.end() ? m.bed.wndproc : it->second.proc;
+}
+
+// A class name as the key RegisterClass and CreateWindowEx agree on: lowercased,
+// since Win32 class names are case-insensitive.
+inline std::string x86_class_key(uint32_t p, bool wide)
+{
+    std::string k;
+    if (wide) { for (const uint16_t* w = (const uint16_t*)(uintptr_t)p; *w && k.size() < 256; ++w) k += (char)std::tolower(*w & 0x7F); }
+    else      { for (const char* c = (const char*)(uintptr_t)p; *c && k.size() < 256; ++c) k += (char)std::tolower((unsigned char)*c); }
+    return k;
+}
+
+inline uint64_t x86_register_class(Machine& m, uint32_t proc, uint32_t name, bool wide, const char* who)
+{
+    const uint32_t atom = m.bed.next_atom++;
+    m.bed.class_proc["#" + std::to_string(atom)] = proc;
+    if (name >= 0x10000) m.bed.class_proc[x86_class_key(name, wide)] = proc;
+    if (proc && !m.bed.main_window_made) m.bed.wndproc = proc;
+    log(std::string("X86 ") + who + " " + (name >= 0x10000 ? x86_class_key(name, wide) : "#" + std::to_string(name)) +
+        " WndProc " + hex(proc) + (m.bed.main_window_made ? " (recorded)" : " (captured)"));
+    return atom;
+}
+
+inline uint64_t x86_create_window(Machine& m, const uint32_t* a, bool wide, const char* who)
+{
+    const uint32_t cls = a[1];
+    auto it = m.bed.class_proc.find(cls >= 0x10000 ? x86_class_key(cls, wide) : "#" + std::to_string(cls));
+    const uint32_t proc = it == m.bed.class_proc.end() ? 0 : it->second;
+    const int32_t w = (int32_t)a[6], h = (int32_t)a[7];
+    const bool game_sized = w == (int32_t)CW_USEDEFAULT || h == (int32_t)CW_USEDEFAULT ||
+                            ((uint32_t)w >= m.bed.win_w && (uint32_t)h >= m.bed.win_h);
+    const bool child = (a[3] & WS_CHILD) != 0 || a[8] == (uint32_t)-3;   // HWND_MESSAGE
+    uint32_t hwnd = kFakeHwnd;
+    if (child || (m.bed.main_window_made && !game_sized)) {
+        hwnd = kWndTag | m.bed.next_sub_hwnd++;
+        m.bed.sub_windows[hwnd].proc = proc;
+    } else {
+        if (proc) m.bed.wndproc = proc;
+        m.bed.main_window_made = true;
+    }
+    log(std::string("X86 ") + who + " " + std::to_string(w) + "x" + std::to_string(h) +
+        " style=" + hex(a[3]) + " proc=" + hex(proc) + " -> " +
+        (hwnd == kFakeHwnd ? "game HWND " : "sub HWND ") + hex(hwnd));
+    return hwnd;
+}
+
+inline uint64_t peek_message32(Machine& m, uint32_t msg_ptr, uint32_t mn, uint32_t mx, bool remove,
+                               uint32_t ret = 0)
 {
     static const UINT kSeq[] = { WM_ACTIVATEAPP, WM_ACTIVATE, WM_SETFOCUS, WM_NCACTIVATE };
     if (!msg_ptr || !m.bed.wndproc) return 0;
-    if (m.bed.inject_idx >= (int)(sizeof(kSeq) / sizeof(kSeq[0]))) return 0;
-
-    const UINT msg = kSeq[m.bed.inject_idx];
-    // WA_ACTIVE and TRUE are both 1, but they are different things being said.
-    write_msg32(msg_ptr, msg, (msg == WM_ACTIVATE) ? (uint32_t)WA_ACTIVE : 1u, 0);
+    auto admits = [&](UINT msg) { return (!mn && !mx) || (msg >= mn && msg <= mx); };
+    if (m.bed.inject_idx < (int)(sizeof(kSeq) / sizeof(kSeq[0]))) {
+        const UINT msg = kSeq[m.bed.inject_idx];
+        if (!admits(msg)) return 0;
+        // WA_ACTIVE and TRUE are both 1, but they are different things being said.
+        write_msg32(msg_ptr, msg, (msg == WM_ACTIVATE) ? (uint32_t)WA_ACTIVE : 1u, 0);
+        if (remove) {
+            if (m.bed.inject_idx == 0) log("X86 injecting activation sequence -> guest WndProc");
+            ++m.bed.inject_idx;
+        }
+        return 1;
+    }
+#ifdef GH_LAUNCHER
+    std::lock_guard<std::mutex> lk(g_kmMutex);
+    if (g_kmQueue.empty() || !admits(g_kmQueue.front().message)) return 0;
+    const MSG q = g_kmQueue.front();
+    write_msg32(msg_ptr, q.message, (uint32_t)q.wParam, (uint32_t)q.lParam, g_kmCurX, g_kmCurY);
     if (remove) {
-        if (m.bed.inject_idx == 0) log("X86 injecting activation sequence -> guest WndProc");
-        ++m.bed.inject_idx;
+        g_kmQueue.pop_front();
+        static int drained = 0;
+        if (q.message != WM_MOUSEMOVE && q.message != WM_INPUT && ++drained <= 24)
+            log("X86 guest drained input msg=" + hex(q.message) + " wp=" + hex((uint32_t)q.wParam));
+        log_input_hop("peek", q.message, (uint32_t)q.wParam, (mn << 16) | (mx & 0xFFFF), ret);
     }
     return 1;
+#else
+    return 0;
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -714,6 +827,28 @@ inline bool put_ptr_out(uint32_t slot, uint64_t v, const char* who)
 // host. Zero-extending it hands the host 0x0000000080000002, which is not any
 // key at all.
 inline HKEY hkey32(uint32_t v) { return (HKEY)(intptr_t)(int32_t)v; }
+
+// The registry a guest sees. On its own (x86host on the VM) that is the real
+// advapi32; the Launcher points every entry at its virtual hive in
+// guest_loader.cpp, the one x64 guests already use. The container's own HKCU
+// refuses a KEY_ALL_ACCESS create, and HL2's engine treats exactly that failure
+// (RegCreateKeyEx of ...\Settings) as a fatal init error. The hive's handles are
+// small sentinels, so they survive the 4-byte out-param.
+struct RegApi {
+    decltype(&::RegOpenKeyExW)    OpenKeyExW    = &::RegOpenKeyExW;
+    decltype(&::RegOpenKeyExA)    OpenKeyExA    = &::RegOpenKeyExA;
+    decltype(&::RegOpenKeyA)      OpenKeyA      = &::RegOpenKeyA;
+    decltype(&::RegCreateKeyW)    CreateKeyW    = &::RegCreateKeyW;
+    decltype(&::RegCreateKeyExW)  CreateKeyExW  = &::RegCreateKeyExW;
+    decltype(&::RegCreateKeyExA)  CreateKeyExA  = &::RegCreateKeyExA;
+    decltype(&::RegCloseKey)      CloseKey      = &::RegCloseKey;
+    decltype(&::RegSetValueExA)   SetValueExA   = &::RegSetValueExA;
+    decltype(&::RegSetValueExW)   SetValueExW   = &::RegSetValueExW;
+    decltype(&::RegQueryValueExA) QueryValueExA = &::RegQueryValueExA;
+    decltype(&::RegQueryValueExW) QueryValueExW = &::RegQueryValueExW;
+    decltype(&::RegDeleteValueA)  DeleteValueA  = &::RegDeleteValueA;
+};
+inline RegApi g_reg;
 
 inline void RegisterPtrToPtrBeds(ThunkRegistry& R)
 {
@@ -772,10 +907,10 @@ inline void RegisterPtrToPtrBeds(ThunkRegistry& R)
     GH_X86_BED(R, "advapi32.dll", "RegOpenKeyExW", 20,
         [](Machine&, const uint32_t* a) -> uint64_t {
             HKEY out = nullptr;
-            const LONG rc = RegOpenKeyExW(hkey32(a[0]), (LPCWSTR)(uintptr_t)a[1], a[2], a[3], &out);
+            const LONG rc = g_reg.OpenKeyExW(hkey32(a[0]), (LPCWSTR)(uintptr_t)a[1], a[2], a[3], &out);
             if (rc != ERROR_SUCCESS) return (uint32_t)rc;
             if (!put_ptr_out(a[4], (uint64_t)(uintptr_t)out, "RegOpenKeyExW")) {
-                RegCloseKey(out);
+                g_reg.CloseKey(out);
                 return (uint32_t)ERROR_INVALID_HANDLE;
             }
             return 0;
@@ -785,10 +920,10 @@ inline void RegisterPtrToPtrBeds(ThunkRegistry& R)
     GH_X86_BED(R, "advapi32.dll", "RegCreateKeyW", 12,
         [](Machine&, const uint32_t* a) -> uint64_t {
             HKEY out = nullptr;
-            const LONG rc = RegCreateKeyW(hkey32(a[0]), (LPCWSTR)(uintptr_t)a[1], &out);
+            const LONG rc = g_reg.CreateKeyW(hkey32(a[0]), (LPCWSTR)(uintptr_t)a[1], &out);
             if (rc != ERROR_SUCCESS) return (uint32_t)rc;
             if (!put_ptr_out(a[2], (uint64_t)(uintptr_t)out, "RegCreateKeyW")) {
-                RegCloseKey(out);
+                g_reg.CloseKey(out);
                 return (uint32_t)ERROR_INVALID_HANDLE;
             }
             return 0;
@@ -799,13 +934,13 @@ inline void RegisterPtrToPtrBeds(ThunkRegistry& R)
         [](Machine&, const uint32_t* a) -> uint64_t {
             HKEY  out  = nullptr;
             DWORD disp = 0;
-            const LONG rc = RegCreateKeyExW(hkey32(a[0]), (LPCWSTR)(uintptr_t)a[1], a[2],
+            const LONG rc = g_reg.CreateKeyExW(hkey32(a[0]), (LPCWSTR)(uintptr_t)a[1], a[2],
                                             (LPWSTR)(uintptr_t)a[3], a[4], a[5],
                                             sa32_translate(a[6]), &out, a[8] ? &disp : nullptr);
             if (rc != ERROR_SUCCESS) return (uint32_t)rc;
             if (a[8]) { const uint32_t d = disp; std::memcpy((void*)(uintptr_t)a[8], &d, 4); }
             if (!put_ptr_out(a[7], (uint64_t)(uintptr_t)out, "RegCreateKeyExW")) {
-                RegCloseKey(out);
+                g_reg.CloseKey(out);
                 return (uint32_t)ERROR_INVALID_HANDLE;
             }
             return 0;
@@ -869,15 +1004,43 @@ inline void RegisterPtrToPtrBeds(ThunkRegistry& R)
 
     // CryptoAPI contexts, keys and hashes are HCRYPTPROV/HCRYPTKEY/HCRYPTHASH
     // -- pointer-sized VALUES, not kernel handles, so nothing guarantees they
-    // fit in 32 bits. A guest that cannot be given a working context is better
-    // told so: every caller of these has a failure path, and none of them has a
-    // path for a context that is half a pointer.
+    // fit in 32 bits. So no host context is ever handed over. What a guest
+    // acquires a context FOR is almost always CryptGenRandom -- Crypto++'s
+    // AutoSeededX917RNG does it in a static initializer and throws OS_RNG_Err
+    // when it cannot (HL2's filesystem_stdio, before DllMain returns) -- and
+    // that needs no provider: the context is a token, and the random bytes come
+    // from the system RNG. Keys and hashes still fail (below), and every caller
+    // of those has a failure path.
     static_assert(thunk_bytes_of(&::CryptAcquireContextA) == 20, "CryptAcquireContextA");
-    GH_X86_BED(R, "advapi32.dll", "CryptAcquireContextA", 20,
+    static_assert(thunk_bytes_of(&::CryptAcquireContextW) == 20, "CryptAcquireContextW");
+    static_assert(thunk_bytes_of(&::CryptGenRandom) == 12, "CryptGenRandom");
+    static_assert(thunk_bytes_of(&::CryptReleaseContext) == 8, "CryptReleaseContext");
+    // A and W differ only in the two names they are given, which are ignored.
+    static uint64_t (*const acquire)(Machine&, const uint32_t*) =
         [](Machine&, const uint32_t* a) -> uint64_t {
-            if (a[0]) { const uint32_t z = 0; std::memcpy((void*)(uintptr_t)a[0], &z, 4); }
-            SetLastError(NTE_NOT_FOUND);
-            return 0;
+            if (!a[0]) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+            const uint32_t tok = 0x43505256u;          // "VRPC": any nonzero value
+            std::memcpy((void*)(uintptr_t)a[0], &tok, 4);
+            return 1;
+        };
+    GH_X86_BED(R, "advapi32.dll", "CryptAcquireContextA", 20, acquire);
+    GH_X86_BED(R, "advapi32.dll", "CryptAcquireContextW", 20, acquire);
+    GH_X86_BED(R, "advapi32.dll", "CryptGenRandom", 12,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            using Fn = LONG (WINAPI*)(void*, PUCHAR, ULONG, ULONG);
+            static Fn gen = (Fn)dyn_resolve("bcrypt.dll", "BCryptGenRandom");
+            if (!a[0] || (a[1] && !a[2])) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+            if (!a[1]) return 1;
+            if (!gen || gen(nullptr, (PUCHAR)(uintptr_t)a[2], a[1], 2 /*SYSTEM_PREFERRED_RNG*/) != 0) {
+                SetLastError(NTE_FAIL);
+                return 0;
+            }
+            return 1;
+        });
+    GH_X86_BED(R, "advapi32.dll", "CryptReleaseContext", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (!a[0]) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+            return 1;
         });
     static_assert(thunk_bytes_of(&::CryptCreateHash) == 20, "CryptCreateHash");
     GH_X86_BED(R, "advapi32.dll", "CryptCreateHash", 20,
@@ -924,6 +1087,781 @@ inline void RegisterPtrToPtrBeds(ThunkRegistry& R)
 }
 
 // ---------------------------------------------------------------------------
+// Source engine gaps (HL2, app 220)
+// ---------------------------------------------------------------------------
+// What HL2's 56 modules import that nothing above implements and that cannot
+// simply be forwarded: the startup audit's three rules (callback, pointer to a
+// pointer-sized object, host pointer returned) plus the cases the audit cannot
+// see, where a STRUCT changes width (PAINTSTRUCT, TRACKMOUSEEVENT, the CPU
+// topology record, the x86 SLIST_HEADER). The plain ones are forwards at the
+// end of the generated table.
+//
+// Pop sizes come from the real declarations through decltype, never from an
+// address: taking &::SetupDiGetClassDevsA would make the Launcher import
+// setupapi.dll, and a DLL the console lacks fails the whole package.
+#define GH_X86_POP(F) thunk_bytes_of((decltype(&::F))nullptr)
+
+// One display mode for EnumDisplaySettings(Ex)A/W: mode 0, ENUM_CURRENT_SETTINGS
+// (-1) and ENUM_REGISTRY_SETTINGS (-2); anything else ends the enumeration.
+template <typename DM>
+inline uint64_t display_mode32(Machine& m, uint32_t mode, uint32_t p)
+{
+    if (mode != 0 && mode != 0xFFFFFFFFu && mode != 0xFFFFFFFEu) return 0;
+    if (DM* dm = (DM*)(uintptr_t)p) {
+        dm->dmPelsWidth = m.bed.win_w; dm->dmPelsHeight = m.bed.win_h;
+        dm->dmBitsPerPel = 32; dm->dmDisplayFrequency = 60;
+        dm->dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY;
+    }
+    return 1;
+}
+
+// OVERLAPPED, as the guest lays it out: Internal, InternalHigh, Offset,
+// OffsetHigh, hEvent -- 20 bytes (32 on x64).
+struct Overlapped32 { uint32_t internal, internal_high, offset, offset_high, event; };
+static_assert(sizeof(Overlapped32) == 20, "OVERLAPPED is 20 bytes on x86");
+
+// Signals a guest event: a green-thread SyncObj in the interpreter, a real
+// host event in native mode.
+inline void signal_guest_event(Machine& m, uint32_t h)
+{
+    if (!h) return;
+    if (SyncObj* o = m.sync_by_handle(h)) { o->signalled = true; return; }
+    SetEvent((HANDLE)(intptr_t)(int32_t)h);
+}
+
+// ReadFile/WriteFile(h, buf, n, done, ovl) with a guest OVERLAPPED. The I/O is
+// real overlapped I/O on the host's own struct at the guest's offset, waited
+// for here, and the result written back the way a request that completed
+// immediately leaves it: Internal = NTSTATUS, InternalHigh = bytes, hEvent
+// signalled. GetOverlappedResult (below) then only reads that back. Source's
+// VPK reader opens its archives FILE_FLAG_OVERLAPPED and reads at explicit
+// offsets; reading at the file pointer instead returned the wrong bytes.
+inline uint64_t overlapped_io32(Machine& m, const uint32_t* a, bool write)
+{
+    Overlapped32& g = *(Overlapped32*)(uintptr_t)a[4];
+    thread_local HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    OVERLAPPED ov{};
+    ov.Offset = g.offset; ov.OffsetHigh = g.offset_high; ov.hEvent = ev;
+    ResetEvent(ev);
+    const HANDLE h = (HANDLE)(intptr_t)(int32_t)a[0];
+    DWORD done = 0;
+    BOOL rc = write ? WriteFile(h, (LPCVOID)(uintptr_t)a[1], a[2], nullptr, &ov)
+                    : ReadFile(h, (LPVOID)(uintptr_t)a[1], a[2], nullptr, &ov);
+    DWORD err = rc ? 0 : GetLastError();
+    if (rc || err == ERROR_IO_PENDING) {
+        rc = GetOverlappedResult(h, &ov, &done, TRUE);
+        err = rc ? 0 : GetLastError();
+    }
+    g.internal = rc ? 0u : err == ERROR_HANDLE_EOF ? 0xC0000011u   // STATUS_END_OF_FILE
+                                                   : 0xC0000001u;  // STATUS_UNSUCCESSFUL
+    g.internal_high = done;
+    if (a[3]) std::memcpy((void*)(uintptr_t)a[3], &done, 4);
+    signal_guest_event(m, g.event);
+    if (!rc) SetLastError(err);
+    return (uint32_t)rc;
+}
+
+inline void RegisterSourceGapBeds(ThunkRegistry& R)
+{
+    // The A forms of the registry beds in RegisterPtrToPtrBeds, same rules.
+    static_assert(GH_X86_POP(RegOpenKeyA) == 12, "RegOpenKeyA");
+    GH_X86_BED(R, "advapi32.dll", "RegOpenKeyA", 12,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            HKEY out = nullptr;
+            const LONG rc = g_reg.OpenKeyA(hkey32(a[0]), (LPCSTR)(uintptr_t)a[1], &out);
+            if (rc != ERROR_SUCCESS) return (uint32_t)rc;
+            if (!put_ptr_out(a[2], (uint64_t)(uintptr_t)out, "RegOpenKeyA")) {
+                g_reg.CloseKey(out);
+                return (uint32_t)ERROR_INVALID_HANDLE;
+            }
+            return 0;
+        });
+    static_assert(GH_X86_POP(RegOpenKeyExA) == 20, "RegOpenKeyExA");
+    GH_X86_BED(R, "advapi32.dll", "RegOpenKeyExA", 20,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            HKEY out = nullptr;
+            const LONG rc = g_reg.OpenKeyExA(hkey32(a[0]), (LPCSTR)(uintptr_t)a[1], a[2], a[3], &out);
+            if (rc != ERROR_SUCCESS) return (uint32_t)rc;
+            if (!put_ptr_out(a[4], (uint64_t)(uintptr_t)out, "RegOpenKeyExA")) {
+                g_reg.CloseKey(out);
+                return (uint32_t)ERROR_INVALID_HANDLE;
+            }
+            return 0;
+        });
+    static_assert(GH_X86_POP(RegCreateKeyExA) == 36, "RegCreateKeyExA");
+    GH_X86_BED(R, "advapi32.dll", "RegCreateKeyExA", 36,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            HKEY  out  = nullptr;
+            DWORD disp = 0;
+            const LONG rc = g_reg.CreateKeyExA(hkey32(a[0]), (LPCSTR)(uintptr_t)a[1], a[2],
+                                            (LPSTR)(uintptr_t)a[3], a[4], a[5],
+                                            sa32_translate(a[6]), &out, a[8] ? &disp : nullptr);
+            if (rc != ERROR_SUCCESS) return (uint32_t)rc;
+            if (a[8]) { const uint32_t d = disp; std::memcpy((void*)(uintptr_t)a[8], &d, 4); }
+            if (!put_ptr_out(a[7], (uint64_t)(uintptr_t)out, "RegCreateKeyExA")) {
+                g_reg.CloseKey(out);
+                return (uint32_t)ERROR_INVALID_HANDLE;
+            }
+            return 0;
+        });
+
+    // The rest of the family, so a key opened in the hive is also read, written
+    // and closed there (these were plain forwards to the real advapi32).
+    static_assert(GH_X86_POP(RegCloseKey) == 4, "RegCloseKey");
+    GH_X86_BED(R, "advapi32.dll", "RegCloseKey", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            return (uint32_t)g_reg.CloseKey(hkey32(a[0]));
+        });
+    static_assert(GH_X86_POP(RegSetValueExA) == 24, "RegSetValueExA");
+    GH_X86_BED(R, "advapi32.dll", "RegSetValueExA", 24,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            return (uint32_t)g_reg.SetValueExA(hkey32(a[0]), (LPCSTR)(uintptr_t)a[1], a[2], a[3],
+                                               (const BYTE*)(uintptr_t)a[4], a[5]);
+        });
+    static_assert(GH_X86_POP(RegSetValueExW) == 24, "RegSetValueExW");
+    GH_X86_BED(R, "advapi32.dll", "RegSetValueExW", 24,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            return (uint32_t)g_reg.SetValueExW(hkey32(a[0]), (LPCWSTR)(uintptr_t)a[1], a[2], a[3],
+                                               (const BYTE*)(uintptr_t)a[4], a[5]);
+        });
+    static_assert(GH_X86_POP(RegQueryValueExA) == 24, "RegQueryValueExA");
+    GH_X86_BED(R, "advapi32.dll", "RegQueryValueExA", 24,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            return (uint32_t)g_reg.QueryValueExA(hkey32(a[0]), (LPCSTR)(uintptr_t)a[1],
+                                                 (LPDWORD)(uintptr_t)a[2], (LPDWORD)(uintptr_t)a[3],
+                                                 (LPBYTE)(uintptr_t)a[4], (LPDWORD)(uintptr_t)a[5]);
+        });
+    static_assert(GH_X86_POP(RegQueryValueExW) == 24, "RegQueryValueExW");
+    GH_X86_BED(R, "advapi32.dll", "RegQueryValueExW", 24,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            return (uint32_t)g_reg.QueryValueExW(hkey32(a[0]), (LPCWSTR)(uintptr_t)a[1],
+                                                 (LPDWORD)(uintptr_t)a[2], (LPDWORD)(uintptr_t)a[3],
+                                                 (LPBYTE)(uintptr_t)a[4], (LPDWORD)(uintptr_t)a[5]);
+        });
+    static_assert(GH_X86_POP(RegDeleteValueA) == 8, "RegDeleteValueA");
+    GH_X86_BED(R, "advapi32.dll", "RegDeleteValueA", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            return (uint32_t)g_reg.DeleteValueA(hkey32(a[0]), (LPCSTR)(uintptr_t)a[1]);
+        });
+
+    // Two PHANDLE outs (vstdlib's process pipes).
+    static_assert(GH_X86_POP(CreatePipe) == 16, "CreatePipe");
+    GH_X86_BED(R, "kernel32.dll", "CreatePipe", 16,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            HANDLE rd = nullptr, wr = nullptr;
+            if (!CreatePipe(&rd, &wr, sa32_translate(a[2]), a[3])) return 0;
+            if (!put_ptr_out(a[0], (uint64_t)(uintptr_t)rd, "CreatePipe") ||
+                !put_ptr_out(a[1], (uint64_t)(uintptr_t)wr, "CreatePipe")) {
+                CloseHandle(rd); CloseHandle(wr);
+                SetLastError(ERROR_INVALID_HANDLE);
+                return 0;
+            }
+            return 1;
+        });
+
+    // A 32-bit child could not run here anyway, and STARTUPINFOA and
+    // PROCESS_INFORMATION both change width. Logged: a game that wants a child
+    // process says what it wanted.
+    static_assert(GH_X86_POP(CreateProcessA) == 40, "CreateProcessA");
+    GH_X86_BED(R, "kernel32.dll", "CreateProcessA", 40,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            const char* app = (const char*)(uintptr_t)a[0];
+            const char* cmd = (const char*)(uintptr_t)a[1];
+            log(std::string("X86 CreateProcessA refused: ") + (app ? app : "") + " | " +
+                std::string(cmd ? cmd : "").substr(0, 200));
+            SetLastError(ERROR_NOT_SUPPORTED);
+            return 0;
+        });
+
+    // PROCESSENTRY32 carries a ULONG_PTR (296 bytes on x86, 304 on x64). The
+    // snapshot itself is a plain forward; the guest is told its walk is empty.
+    static_assert(GH_X86_POP(Process32First) == 8, "Process32First");
+    for (const char* n : { "Process32First", "Process32Next" })
+        GH_X86_BED(R, "kernel32.dll", n, 8,
+            [](Machine&, const uint32_t*) -> uint64_t {
+                SetLastError(ERROR_NO_MORE_FILES);
+                return 0;
+            });
+
+    // SYSTEM_LOGICAL_PROCESSOR_INFORMATION is 24 bytes on x86 (ULONG_PTR mask)
+    // and 32 on x64. Synthesised rather than translated, so the topology agrees
+    // with the one processor GetSystemInfo reports (kGuestProcessorCount): one
+    // package holding one core.
+    static_assert(GH_X86_POP(GetLogicalProcessorInformation) == 8, "GetLogicalProcessorInformation");
+    GH_X86_BED(R, "kernel32.dll", "GetLogicalProcessorInformation", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            constexpr uint32_t kRec = 24, kCount = 2;
+            if (!a[1]) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+            uint32_t have = 0;
+            std::memcpy(&have, (void*)(uintptr_t)a[1], 4);
+            const uint32_t need = kRec * kCount;
+            std::memcpy((void*)(uintptr_t)a[1], &need, 4);
+            if (!a[0] || have < need) { SetLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
+            uint8_t* d = (uint8_t*)(uintptr_t)a[0];
+            std::memset(d, 0, need);
+            const uint32_t mask = kGuestAffinityMask;
+            const uint32_t core = RelationProcessorCore, pkg = RelationProcessorPackage;
+            std::memcpy(d + 0,  &mask, 4); std::memcpy(d + 4,  &core, 4);
+            std::memcpy(d + 24, &mask, 4); std::memcpy(d + 28, &pkg, 4);
+            return 1;
+        });
+
+    // PROCESS_HEAP_ENTRY is full of pointers, and the guest's heap handles name
+    // OUR heap (gh_x86_win.h), which the host cannot walk. An empty walk.
+    static_assert(GH_X86_POP(HeapWalk) == 8, "HeapWalk");
+    GH_X86_BED(R, "kernel32.dll", "HeapWalk", 8,
+        [](Machine&, const uint32_t*) -> uint64_t {
+            SetLastError(ERROR_NO_MORE_ITEMS);
+            return 0;
+        });
+
+    // CONTEXT is a different structure at each width (tier0 sets hardware
+    // breakpoints with it). Refused rather than mistranslated.
+    static_assert(GH_X86_POP(SetThreadContext) == 8, "SetThreadContext");
+    GH_X86_BED(R, "kernel32.dll", "SetThreadContext", 8,
+        [](Machine&, const uint32_t*) -> uint64_t {
+            SetLastError(ERROR_NOT_SUPPORTED);
+            return 0;
+        });
+
+    // The x86 SLIST_HEADER is 8 bytes -- {Next, Depth:16, Sequence:16} -- and
+    // the x64 one is 16 and must be 16-aligned, so the forwards in the
+    // generated table write past the guest's header. Done here on the guest's
+    // own layout with one 64-bit compare-exchange, which is exactly what the
+    // x86 kernel32 does (cmpxchg8b). GameUI and steam_api use these.
+    static_assert(GH_X86_POP(InitializeSListHead) == 4, "InitializeSListHead");
+    GH_X86_BED(R, "kernel32.dll", "InitializeSListHead", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (a[0]) std::memset((void*)(uintptr_t)a[0], 0, 8);
+            return 0;
+        });
+    static_assert(GH_X86_POP(InterlockedPushEntrySList) == 8, "InterlockedPushEntrySList");
+    GH_X86_BED(R, "kernel32.dll", "InterlockedPushEntrySList", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            volatile LONG64* h = (volatile LONG64*)(uintptr_t)a[0];
+            for (;;) {
+                const LONG64 old = *h;
+                const uint32_t first = (uint32_t)old;
+                std::memcpy((void*)(uintptr_t)a[1], &first, 4);
+                const uint32_t hi = (uint32_t)(old >> 32);
+                const uint32_t nhi = ((hi & 0xFFFF) + 1) | (((hi >> 16) + 1) << 16);   // depth+1, seq+1
+                const LONG64 nv = (LONG64)(((uint64_t)nhi << 32) | a[1]);
+                if (InterlockedCompareExchange64(h, nv, old) == old) return first;
+            }
+        });
+    static_assert(GH_X86_POP(InterlockedPopEntrySList) == 4, "InterlockedPopEntrySList");
+    GH_X86_BED(R, "kernel32.dll", "InterlockedPopEntrySList", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            volatile LONG64* h = (volatile LONG64*)(uintptr_t)a[0];
+            for (;;) {
+                const LONG64 old = *h;
+                const uint32_t first = (uint32_t)old;
+                if (!first) return 0;
+                uint32_t next = 0;
+                std::memcpy(&next, (void*)(uintptr_t)first, 4);
+                const uint32_t hi = (uint32_t)(old >> 32);
+                const uint32_t nhi = ((hi - 1) & 0xFFFF) | (hi & 0xFFFF0000u);         // depth-1
+                const LONG64 nv = (LONG64)(((uint64_t)nhi << 32) | next);
+                if (InterlockedCompareExchange64(h, nv, old) == old) return first;
+            }
+        });
+    static_assert(GH_X86_POP(InterlockedFlushSList) == 4, "InterlockedFlushSList");
+    GH_X86_BED(R, "kernel32.dll", "InterlockedFlushSList", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            volatile LONG64* h = (volatile LONG64*)(uintptr_t)a[0];
+            for (;;) {
+                const LONG64 old = *h;
+                if (!(uint32_t)old) return 0;
+                const uint32_t hi = (uint32_t)(old >> 32);
+                const LONG64 nv = (LONG64)((uint64_t)(hi & 0xFFFF0000u) << 32);        // empty, seq kept
+                if (InterlockedCompareExchange64(h, nv, old) == old) return (uint32_t)old;
+            }
+        });
+    static_assert(GH_X86_POP(QueryDepthSList) == 4, "QueryDepthSList");
+    GH_X86_BED(R, "kernel32.dll", "QueryDepthSList", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            uint16_t depth = 0;
+            std::memcpy(&depth, (const uint8_t*)(uintptr_t)a[0] + 4, 2);
+            return depth;
+        });
+
+    // Activation contexts (GameUI asking for comctl32 v6). There is no side-by-
+    // side assembly store for a 32-bit guest; the create fails and the
+    // activate/deactivate pair succeeds with cookie 0, which is what callers
+    // that ignore the create's failure need.
+    static_assert(GH_X86_POP(CreateActCtxA) == 4, "CreateActCtxA");
+    GH_X86_BED(R, "kernel32.dll", "CreateActCtxA", 4,
+        [](Machine&, const uint32_t*) -> uint64_t {
+            SetLastError(ERROR_NOT_SUPPORTED);
+            return 0xFFFFFFFFu;
+        });
+    static_assert(GH_X86_POP(ActivateActCtx) == 8, "ActivateActCtx");
+    GH_X86_BED(R, "kernel32.dll", "ActivateActCtx", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (a[1]) std::memset((void*)(uintptr_t)a[1], 0, 4);
+            return 1;
+        });
+    static_assert(GH_X86_POP(DeactivateActCtx) == 8, "DeactivateActCtx");
+    GH_X86_BED(R, "kernel32.dll", "DeactivateActCtx", 8,
+        [](Machine&, const uint32_t*) -> uint64_t { return 1; });
+
+    // A code pointer is good if the guest says so; the host cannot probe it
+    // any better than the guest's own fault would.
+    static_assert(GH_X86_POP(IsBadCodePtr) == 4, "IsBadCodePtr");
+    GH_X86_BED(R, "kernel32.dll", "IsBadCodePtr", 4,
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+
+    // -- user32 ---------------------------------------------------------------
+    // CallWindowProc's first argument is a window procedure the guest got from
+    // GetWindowLong(GWL_WNDPROC) -- guest code (or one of our import thunks,
+    // which is guest-callable too). Entered the way dispatch enters it.
+    static_assert(GH_X86_POP(CallWindowProcA) == 20, "CallWindowProcA");
+    for (const char* n : { "CallWindowProcA", "CallWindowProcW" })
+        GH_X86_BED(R, "user32.dll", n, 20,
+            [](Machine& m, const uint32_t* a) -> uint64_t {
+                if (!a[0]) return 0;
+                const uint32_t args[4] = { a[1], a[2], a[3], a[4] };
+                log_input_hop("callwndproc", a[2], a[3], a[0], a[-1]);
+                return m.call_guest32(a[0], args, 4);
+            });
+
+    // There is no window tree (see CreateWindowExW): no child to visit.
+    static_assert(GH_X86_POP(EnumChildWindows) == 12, "EnumChildWindows");
+    GH_X86_BED(R, "user32.dll", "EnumChildWindows", 12,
+        [](Machine&, const uint32_t*) -> uint64_t { return 1; });
+
+    // PAINTSTRUCT: HDC first, so every later field moves (64 bytes on x86, 72
+    // on x64). The paint DC is the host's; handles fit in 32 bits.
+    static_assert(GH_X86_POP(BeginPaint) == 8, "BeginPaint");
+    GH_X86_BED(R, "user32.dll", "BeginPaint", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            PAINTSTRUCT ps{};
+            HDC dc = BeginPaint((HWND)(uintptr_t)a[0], &ps);
+            if (a[1]) {
+                uint8_t* d = (uint8_t*)(uintptr_t)a[1];
+                std::memset(d, 0, 64);
+                const uint32_t h = (uint32_t)(uintptr_t)ps.hdc, erase = (uint32_t)ps.fErase;
+                std::memcpy(d + 0, &h, 4);
+                std::memcpy(d + 4, &erase, 4);
+                std::memcpy(d + 8, &ps.rcPaint, 16);
+            }
+            return (uint32_t)(uintptr_t)dc;
+        });
+    static_assert(GH_X86_POP(EndPaint) == 8, "EndPaint");
+    GH_X86_BED(R, "user32.dll", "EndPaint", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            PAINTSTRUCT ps{};
+            if (a[1]) {
+                const uint8_t* s = (const uint8_t*)(uintptr_t)a[1];
+                uint32_t h = 0;
+                std::memcpy(&h, s, 4);
+                ps.hdc = (HDC)(uintptr_t)h;
+                std::memcpy(&ps.rcPaint, s + 8, 16);
+            }
+            return EndPaint((HWND)(uintptr_t)a[0], &ps);
+        });
+
+    // TRACKMOUSEEVENT {cbSize, dwFlags, HWND, dwHoverTime}: 16 bytes on x86.
+    static_assert(GH_X86_POP(TrackMouseEvent) == 4, "TrackMouseEvent");
+    GH_X86_BED(R, "user32.dll", "TrackMouseEvent", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (!a[0]) return 0;
+            uint32_t g[4] = {};
+            std::memcpy(g, (void*)(uintptr_t)a[0], 16);
+            TRACKMOUSEEVENT t{ sizeof(t), g[1], (HWND)(uintptr_t)g[2], g[3] };
+            const BOOL ok = TrackMouseEvent(&t);
+            if (ok && (g[1] & TME_QUERY)) {
+                const uint32_t out[4] = { 16, t.dwFlags, (uint32_t)(uintptr_t)t.hwndTrack, t.dwHoverTime };
+                std::memcpy((void*)(uintptr_t)a[0], out, 16);
+            }
+            return ok;
+        });
+
+    // Structures with handles in them, for features with no console analogue.
+    static_assert(GH_X86_POP(FlashWindowEx) == 4, "FlashWindowEx");
+    GH_X86_BED(R, "user32.dll", "FlashWindowEx", 4,
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+    static_assert(GH_X86_POP(GetGUIThreadInfo) == 8, "GetGUIThreadInfo");
+    GH_X86_BED(R, "user32.dll", "GetGUIThreadInfo", 8,
+        [](Machine&, const uint32_t*) -> uint64_t { SetLastError(ERROR_NOT_SUPPORTED); return 0; });
+    static_assert(GH_X86_POP(GetIconInfo) == 8, "GetIconInfo");
+    GH_X86_BED(R, "user32.dll", "GetIconInfo", 8,
+        [](Machine&, const uint32_t*) -> uint64_t { SetLastError(ERROR_INVALID_CURSOR_HANDLE); return 0; });
+    // WNDCLASSEXW is all pointers. "Not registered" sends SDL to RegisterClass,
+    // which is the bed that knows about guest window procedures.
+    static_assert(GH_X86_POP(GetClassInfoExW) == 12, "GetClassInfoExW");
+    GH_X86_BED(R, "user32.dll", "GetClassInfoExW", 12,
+        [](Machine&, const uint32_t*) -> uint64_t { SetLastError(ERROR_CLASS_DOES_NOT_EXIST); return 0; });
+    static_assert(GH_X86_POP(GetKeyboardLayoutList) == 8, "GetKeyboardLayoutList");
+    GH_X86_BED(R, "user32.dll", "GetKeyboardLayoutList", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            HKL host[32];
+            const int n = GetKeyboardLayoutList(32, host);
+            if (!a[0] || !a[1]) return (uint32_t)n;
+            const int k = n < (int)a[0] ? n : (int)a[0];
+            for (int i = 0; i < k; ++i) {
+                const uint32_t v = (uint32_t)(uintptr_t)host[i];
+                std::memcpy((uint8_t*)(uintptr_t)a[1] + 4 * i, &v, 4);
+            }
+            return (uint32_t)k;
+        });
+    static_assert(GH_X86_POP(DialogBoxIndirectParamW) == 20, "DialogBoxIndirectParamW");
+    GH_X86_BED(R, "user32.dll", "DialogBoxIndirectParamW", 20,
+        [](Machine&, const uint32_t*) -> uint64_t { return 0xFFFFFFFFu; });
+    static_assert(GH_X86_POP(SetWindowsHookExW) == 16, "SetWindowsHookExW");
+    GH_X86_BED(R, "user32.dll", "SetWindowsHookExW", 16,
+        [](Machine&, const uint32_t*) -> uint64_t { SetLastError(ERROR_ACCESS_DENIED); return 0; });
+
+    // -- gdi32: font enumeration --------------------------------------------
+    // vgui asks "does this face exist" by enumerating it. The callback is
+    // guest code, so each answer is copied to guest memory (ENUMLOGFONTEXA and
+    // NEWTEXTMETRICEXA hold no pointers -- same bytes at both widths) and the
+    // guest entered once per face, stopping when it returns 0.
+    static_assert(GH_X86_POP(EnumFontFamiliesExA) == 20, "EnumFontFamiliesExA");
+    GH_X86_BED(R, "gdi32.dll", "EnumFontFamiliesExA", 20,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            struct Ctx { Machine* m; uint32_t fn, lparam, scratch, last; } c{ &m, a[2], a[3], 0, 0 };
+            if (!a[1] || !a[2]) return 0;
+            c.scratch = m.heap_alloc(sizeof(ENUMLOGFONTEXA) + sizeof(NEWTEXTMETRICEXA), true);
+            if (!c.scratch) return 0;
+            LOGFONTA lf;
+            std::memcpy(&lf, (void*)(uintptr_t)a[1], sizeof(lf));
+            EnumFontFamiliesExA((HDC)(uintptr_t)a[0], &lf,
+                [](const LOGFONTA* f, const TEXTMETRICA* t, DWORD type, LPARAM lp) -> int {
+                    Ctx& c = *(Ctx*)lp;
+                    uint8_t* s = (uint8_t*)(uintptr_t)c.scratch;
+                    std::memcpy(s, f, sizeof(ENUMLOGFONTEXA));
+                    std::memcpy(s + sizeof(ENUMLOGFONTEXA), t, sizeof(NEWTEXTMETRICEXA));
+                    const uint32_t args[4] = { c.scratch, c.scratch + (uint32_t)sizeof(ENUMLOGFONTEXA),
+                                               (uint32_t)type, c.lparam };
+                    c.last = c.m->call_guest32(c.fn, args, 4);
+                    return (int)c.last;
+                }, (LPARAM)&c, a[4]);
+            m.heap_free(c.scratch);
+            return c.last;
+        });
+
+    // -- user32/gdi32: the one display ---------------------------------------
+    // The container has no desktop: its user32 enumerates no monitors and no
+    // display devices, and answers 0 for the screen size. These are the x86
+    // twins of the x64 display beds -- one primary monitor exactly the size of
+    // the surrogate window (m.bed.win_w x win_h). Every struct here is pointer
+    // free, so the guest's own memory is filled in place.
+    static_assert(GH_X86_POP(EnumDisplayMonitors) == 16, "EnumDisplayMonitors");
+    GH_X86_BED(R, "user32.dll", "EnumDisplayMonitors", 16,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            log("X86 BED EnumDisplayMonitors -> 1 monitor " + std::to_string(m.bed.win_w) + "x" +
+                std::to_string(m.bed.win_h));
+            if (!a[2]) return 1;
+            const uint32_t rc = m.heap_alloc(16, true);
+            if (!rc) return 0;
+            const int32_t v[4] = { 0, 0, (int32_t)m.bed.win_w, (int32_t)m.bed.win_h };
+            std::memcpy((void*)(uintptr_t)rc, v, sizeof(v));
+            const uint32_t args[4] = { kFakeMonitor, a[0], rc, a[3] };
+            m.call_guest32(a[2], args, 4);
+            m.heap_free(rc);
+            return 1;
+        });
+    static_assert(GH_X86_POP(MonitorFromWindow) == 8, "MonitorFromWindow");
+    static_assert(GH_X86_POP(MonitorFromRect) == 8, "MonitorFromRect");
+    for (const char* n : { "MonitorFromWindow", "MonitorFromRect" })
+        GH_X86_BED(R, "user32.dll", n, 8,
+            [](Machine&, const uint32_t*) -> uint64_t { return kFakeMonitor; });
+    static_assert(GH_X86_POP(MonitorFromPoint) == 12, "MonitorFromPoint");   // POINT by value
+    GH_X86_BED(R, "user32.dll", "MonitorFromPoint", 12,
+        [](Machine&, const uint32_t*) -> uint64_t { return kFakeMonitor; });
+    static_assert(GH_X86_POP(GetMonitorInfoW) == 8, "GetMonitorInfoW");
+    for (const char* n : { "GetMonitorInfoA", "GetMonitorInfoW" })
+        GH_X86_BED(R, "user32.dll", n, 8,
+            [](Machine& m, const uint32_t* a) -> uint64_t {
+                MONITORINFO* mi = (MONITORINFO*)(uintptr_t)a[1];
+                if (!mi || mi->cbSize < sizeof(MONITORINFO)) return 0;
+                mi->rcMonitor = { 0, 0, (LONG)m.bed.win_w, (LONG)m.bed.win_h };
+                mi->rcWork    = mi->rcMonitor;
+                mi->dwFlags   = MONITORINFOF_PRIMARY;
+                if (mi->cbSize == sizeof(MONITORINFOEXW))
+                    std::memcpy(((MONITORINFOEXW*)mi)->szDevice, L"\\\\.\\DISPLAY1", sizeof(L"\\\\.\\DISPLAY1"));
+                else if (mi->cbSize == sizeof(MONITORINFOEXA))
+                    std::memcpy(((MONITORINFOEXA*)mi)->szDevice, "\\\\.\\DISPLAY1", sizeof("\\\\.\\DISPLAY1"));
+                return 1;
+            });
+    // One adapter, one mode. SDL walks adapters by index and then each
+    // adapter's monitors with the adapter's name; both answer index 0 only.
+    static_assert(GH_X86_POP(EnumDisplayDevicesW) == 16, "EnumDisplayDevicesW");
+    GH_X86_BED(R, "user32.dll", "EnumDisplayDevicesW", 16,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            DISPLAY_DEVICEW* dd = (DISPLAY_DEVICEW*)(uintptr_t)a[2];
+            if (a[1] != 0 || !dd) return 0;
+            wcscpy_s(dd->DeviceName, 32, L"\\\\.\\DISPLAY1");
+            wcscpy_s(dd->DeviceString, 128, L"Greenhouse Display");
+            dd->StateFlags = DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE;
+            return 1;
+        });
+    GH_X86_BED(R, "user32.dll", "EnumDisplayDevicesA", 16,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            DISPLAY_DEVICEA* dd = (DISPLAY_DEVICEA*)(uintptr_t)a[2];
+            if (a[1] != 0 || !dd) return 0;
+            strcpy_s(dd->DeviceName, 32, "\\\\.\\DISPLAY1");
+            strcpy_s(dd->DeviceString, 128, "Greenhouse Display");
+            dd->StateFlags = DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE;
+            return 1;
+        });
+    static_assert(GH_X86_POP(EnumDisplaySettingsW) == 12, "EnumDisplaySettingsW");
+    static_assert(GH_X86_POP(EnumDisplaySettingsExW) == 16, "EnumDisplaySettingsExW");
+    GH_X86_BED(R, "user32.dll", "EnumDisplaySettingsW", 12,
+        [](Machine& m, const uint32_t* a) -> uint64_t { return display_mode32<DEVMODEW>(m, a[1], a[2]); });
+    GH_X86_BED(R, "user32.dll", "EnumDisplaySettingsA", 12,
+        [](Machine& m, const uint32_t* a) -> uint64_t { return display_mode32<DEVMODEA>(m, a[1], a[2]); });
+    GH_X86_BED(R, "user32.dll", "EnumDisplaySettingsExW", 16,
+        [](Machine& m, const uint32_t* a) -> uint64_t { return display_mode32<DEVMODEW>(m, a[1], a[2]); });
+    GH_X86_BED(R, "user32.dll", "EnumDisplaySettingsExA", 16,
+        [](Machine& m, const uint32_t* a) -> uint64_t { return display_mode32<DEVMODEA>(m, a[1], a[2]); });
+    // Screen-size metrics are ours; the rest still come from the real user32.
+    static_assert(GH_X86_POP(GetSystemMetrics) == 4, "GetSystemMetrics");
+    GH_X86_BED(R, "user32.dll", "GetSystemMetrics", 4,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            switch ((int)a[0]) {
+                case SM_CXSCREEN: case SM_CXFULLSCREEN: case SM_CXVIRTUALSCREEN: return m.bed.win_w;
+                case SM_CYSCREEN: case SM_CYFULLSCREEN: case SM_CYVIRTUALSCREEN: return m.bed.win_h;
+                case SM_CMONITORS: return 1;
+                case SM_XVIRTUALSCREEN: case SM_YVIRTUALSCREEN: return 0;
+                default: return (uint32_t)GetSystemMetrics((int)a[0]);
+            }
+        });
+    // Any DC the guest holds is a DC on the one display (the x64 bed's #154
+    // lesson: answer the physical size too, at 96 DPI, never a silent 0).
+    static_assert(GH_X86_POP(GetDeviceCaps) == 8, "GetDeviceCaps");
+    GH_X86_BED(R, "gdi32.dll", "GetDeviceCaps", 8,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            const uint32_t w = m.bed.win_w, h = m.bed.win_h;
+            switch ((int)a[1]) {
+                case HORZRES:   return w;
+                case VERTRES:   return h;
+                case HORZSIZE:  return (w * 254 + 480) / 960;
+                case VERTSIZE:  return (h * 254 + 480) / 960;
+                case BITSPIXEL: return 32;
+                case PLANES:    return 1;
+                case COLORRES:  return 24;
+                case VREFRESH:  return 60;
+                case LOGPIXELSX: case LOGPIXELSY: return 96;
+                default: {
+                    static std::atomic<uint64_t> seen{0};
+                    const uint64_t bit = a[1] < 64 ? 1ull << a[1] : 0;
+                    if (bit && !(seen.fetch_or(bit) & bit))
+                        log("X86 BED GetDeviceCaps UNANSWERED index " + std::to_string(a[1]) + " -> 0");
+                    return 0;
+                }
+            }
+        });
+
+    // -- callbacks a plain forward would hand the host as a 64-bit pointer ----
+    // Each of these takes a guest function the real API would call in 64-bit
+    // mode. None has a desktop to act on here, so each answers the way an empty
+    // session would without ever calling it -- except the locale walk, which
+    // has a real answer and gets it through the guest call path.
+    static_assert(GH_X86_POP(SetConsoleCtrlHandler) == 8, "SetConsoleCtrlHandler");
+    GH_X86_BED(R, "kernel32.dll", "SetConsoleCtrlHandler", 8,
+        [](Machine&, const uint32_t*) -> uint64_t { return 1; });   // no console, no Ctrl+C
+    static_assert(GH_X86_POP(EnumSystemLocalesA) == 8, "EnumSystemLocalesA");
+    GH_X86_BED(R, "kernel32.dll", "EnumSystemLocalesA", 8,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            if (!a[0]) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+            const uint32_t s = guest_strdup_a(m, "00000409");   // en-US, the one we report
+            if (!s) return 0;
+            const uint32_t args[1] = { s };
+            m.call_guest32(a[0], args, 1);
+            m.heap_free(s);
+            return 1;
+        });
+    // The completion routine would be an APC into guest code; the timer itself
+    // is real and still signals, which is all a waiter needs.
+    static_assert(GH_X86_POP(SetWaitableTimer) == 24, "SetWaitableTimer");
+    GH_X86_BED(R, "kernel32.dll", "SetWaitableTimer", 24,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (a[3]) log("X86 BED SetWaitableTimer drops its completion routine");
+            return SetWaitableTimer((HANDLE)(intptr_t)(int32_t)a[0],
+                                    (const LARGE_INTEGER*)(uintptr_t)a[1], (LONG)a[2],
+                                    nullptr, nullptr, (BOOL)a[5]);
+        });
+    // No window can own a timer and nothing pumps WM_TIMER into a TIMERPROC, so
+    // a timer is an id that never fires.
+    static_assert(GH_X86_POP(SetTimer) == 16, "SetTimer");
+    GH_X86_BED(R, "user32.dll", "SetTimer", 16,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            static std::atomic<uint32_t> next{0x7100};
+            log("X86 BED SetTimer " + std::to_string(a[2]) + " ms proc=" + std::to_string(a[3] != 0) +
+                " (never fires)");
+            return a[1] ? a[1] : next.fetch_add(1);
+        });
+    static_assert(GH_X86_POP(KillTimer) == 8, "KillTimer");
+    GH_X86_BED(R, "user32.dll", "KillTimer", 8,
+        [](Machine&, const uint32_t*) -> uint64_t { return 1; });
+    static_assert(GH_X86_POP(EnumWindows) == 8, "EnumWindows");
+    GH_X86_BED(R, "user32.dll", "EnumWindows", 8,
+        [](Machine&, const uint32_t*) -> uint64_t { return 1; });   // no top-level windows
+    // Dialogs: -1 / NULL is "could not create", the answer a game's error path
+    // already handles (it falls back to a message box or the log).
+    static_assert(GH_X86_POP(DialogBoxParamW) == 20, "DialogBoxParamW");
+    for (const char* n : { "DialogBoxParamA", "DialogBoxParamW" })
+        GH_X86_BED(R, "user32.dll", n, 20,
+            [](Machine&, const uint32_t*) -> uint64_t { return 0xFFFFFFFFu; });
+    static_assert(GH_X86_POP(CreateDialogParamW) == 20, "CreateDialogParamW");
+    for (const char* n : { "CreateDialogParamA", "CreateDialogParamW" })
+        GH_X86_BED(R, "user32.dll", n, 20,
+            [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+
+    // The request already completed inside overlapped_io32; this only reads
+    // the guest's OVERLAPPED back.
+    static_assert(GH_X86_POP(GetOverlappedResult) == 16, "GetOverlappedResult");
+    GH_X86_BED(R, "kernel32.dll", "GetOverlappedResult", 16,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (!a[1]) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+            const Overlapped32& g = *(const Overlapped32*)(uintptr_t)a[1];
+            if (a[2]) std::memcpy((void*)(uintptr_t)a[2], &g.internal_high, 4);
+            if (g.internal == 0) return 1;
+            SetLastError(g.internal == 0xC0000011u ? ERROR_HANDLE_EOF : ERROR_GEN_FAILURE);
+            return 0;
+        });
+    static_assert(GH_X86_POP(GetOverlappedResultEx) == 20, "GetOverlappedResultEx");
+    GH_X86_BED(R, "kernel32.dll", "GetOverlappedResultEx", 20,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (!a[1]) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+            const Overlapped32& g = *(const Overlapped32*)(uintptr_t)a[1];
+            if (a[2]) std::memcpy((void*)(uintptr_t)a[2], &g.internal_high, 4);
+            if (g.internal == 0) return 1;
+            SetLastError(g.internal == 0xC0000011u ? ERROR_HANDLE_EOF : ERROR_GEN_FAILURE);
+            return 0;
+        });
+
+    // -- shell32 / ole32 ----------------------------------------------------
+    // SHFILEINFO and NOTIFYICONDATA hold HICON/HWND (width changes); no shell.
+    static_assert(GH_X86_POP(SHGetFileInfoA) == 20, "SHGetFileInfoA");
+    for (const char* n : { "SHGetFileInfoA", "SHGetFileInfoW" })
+        GH_X86_BED(R, "shell32.dll", n, 20,
+            [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+    static_assert(GH_X86_POP(Shell_NotifyIconA) == 8, "Shell_NotifyIconA");
+    GH_X86_BED(R, "shell32.dll", "Shell_NotifyIconA", 8,
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+    static_assert(GH_X86_POP(ExtractIconExW) == 20, "ExtractIconExW");
+    GH_X86_BED(R, "shell32.dll", "ExtractIconExW", 20,
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+    // The drop target is a guest COM object the host would call into. There is
+    // no drag and drop on a console, so registration "succeeds" and nothing is
+    // ever dropped.
+    static_assert(GH_X86_POP(RegisterDragDrop) == 8, "RegisterDragDrop");
+    GH_X86_BED(R, "ole32.dll", "RegisterDragDrop", 8,
+        [](Machine&, const uint32_t*) -> uint64_t { return S_OK; });
+    static_assert(GH_X86_POP(RevokeDragDrop) == 4, "RevokeDragDrop");
+    GH_X86_BED(R, "ole32.dll", "RevokeDragDrop", 4,
+        [](Machine&, const uint32_t*) -> uint64_t { return S_OK; });
+    static_assert(GH_X86_POP(ReleaseStgMedium) == 4, "ReleaseStgMedium");
+    GH_X86_BED(R, "ole32.dll", "ReleaseStgMedium", 4,
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+
+    // -- rpcrt4 ---------------------------------------------------------------
+    // The string comes back through a pointer the guest frees with
+    // RpcStringFreeA, so it is allocated from the guest heap.
+    static_assert(GH_X86_POP(UuidToStringA) == 8, "UuidToStringA");
+    GH_X86_BED(R, "rpcrt4.dll", "UuidToStringA", 8,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            if (!a[0] || !a[1]) return RPC_S_INVALID_ARG;
+            GUID g;
+            std::memcpy(&g, (void*)(uintptr_t)a[0], sizeof(g));
+            const uint32_t s = m.heap_alloc(40, true);
+            if (!s) return RPC_S_OUT_OF_MEMORY;
+            snprintf((char*)(uintptr_t)s, 40, "%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                     (unsigned long)g.Data1, g.Data2, g.Data3, g.Data4[0], g.Data4[1], g.Data4[2],
+                     g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
+            std::memcpy((void*)(uintptr_t)a[1], &s, 4);
+            return RPC_S_OK;
+        });
+    static_assert(GH_X86_POP(RpcStringFreeA) == 4, "RpcStringFreeA");
+    GH_X86_BED(R, "rpcrt4.dll", "RpcStringFreeA", 4,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            if (!a[0]) return RPC_S_INVALID_ARG;
+            uint32_t s = 0;
+            std::memcpy(&s, (void*)(uintptr_t)a[0], 4);
+            if (s) m.heap_free(s);
+            std::memset((void*)(uintptr_t)a[0], 0, 4);
+            return RPC_S_OK;
+        });
+
+    // -- winmm mixer ----------------------------------------------------------
+    // MIXERLINECONTROLS and MIXERCONTROLDETAILS embed pointers, and the volume
+    // mixer is not something a game on a console should drive. No mixers.
+    static_assert(GH_X86_POP(mixerOpen) == 20, "mixerOpen");
+    GH_X86_BED(R, "winmm.dll", "mixerGetNumDevs", 0,
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+    GH_X86_BED(R, "winmm.dll", "mixerOpen", 20,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (a[0]) std::memset((void*)(uintptr_t)a[0], 0, 4);
+            return MMSYSERR_NODRIVER;
+        });
+    static_assert(GH_X86_POP(mixerGetDevCapsA) == 12, "mixerGetDevCapsA");
+    GH_X86_BED(R, "winmm.dll", "mixerGetDevCapsA", 12,
+        [](Machine&, const uint32_t*) -> uint64_t { return MMSYSERR_BADDEVICEID; });
+    static_assert(GH_X86_POP(mixerClose) == 4, "mixerClose");
+    GH_X86_BED(R, "winmm.dll", "mixerClose", 4,
+        [](Machine&, const uint32_t*) -> uint64_t { return MMSYSERR_INVALHANDLE; });
+    static_assert(GH_X86_POP(mixerGetLineInfoA) == 12 && GH_X86_POP(mixerGetLineControlsA) == 12 &&
+                  GH_X86_POP(mixerGetControlDetailsA) == 12 && GH_X86_POP(mixerSetControlDetails) == 12,
+                  "mixer*");
+    for (const char* n : { "mixerGetLineInfoA", "mixerGetLineControlsA",
+                           "mixerGetControlDetailsA", "mixerSetControlDetails" })
+        GH_X86_BED(R, "winmm.dll", n, 12,
+            [](Machine&, const uint32_t*) -> uint64_t { return MMSYSERR_INVALHANDLE; });
+
+    // -- setupapi -------------------------------------------------------------
+    // SDL2, valvedeviceapi and xinput1_3 enumerate HID devices this way. Every
+    // structure involved embeds pointers or ULONG_PTRs; the pad reaches the
+    // guest as keys instead (builtin-wasd), so the device list is empty.
+    static_assert(GH_X86_POP(SetupDiGetClassDevsA) == 16, "SetupDiGetClassDevsA");
+    for (const char* n : { "SetupDiGetClassDevsA", "SetupDiGetClassDevsW" })
+        GH_X86_BED(R, "setupapi.dll", n, 16,
+            [](Machine&, const uint32_t*) -> uint64_t {
+                SetLastError(ERROR_INVALID_DATA);
+                return 0xFFFFFFFFu;                     // INVALID_HANDLE_VALUE
+            });
+    static_assert(GH_X86_POP(SetupDiEnumDeviceInfo) == 12, "SetupDiEnumDeviceInfo");
+    GH_X86_BED(R, "setupapi.dll", "SetupDiEnumDeviceInfo", 12,
+        [](Machine&, const uint32_t*) -> uint64_t { SetLastError(ERROR_NO_MORE_ITEMS); return 0; });
+    static_assert(GH_X86_POP(SetupDiEnumDeviceInterfaces) == 20, "SetupDiEnumDeviceInterfaces");
+    GH_X86_BED(R, "setupapi.dll", "SetupDiEnumDeviceInterfaces", 20,
+        [](Machine&, const uint32_t*) -> uint64_t { SetLastError(ERROR_NO_MORE_ITEMS); return 0; });
+    static_assert(GH_X86_POP(SetupDiGetDeviceInterfaceDetailA) == 24, "SetupDiGetDeviceInterfaceDetailA");
+    for (const char* n : { "SetupDiGetDeviceInterfaceDetailA", "SetupDiGetDeviceInterfaceDetailW" })
+        GH_X86_BED(R, "setupapi.dll", n, 24,
+            [](Machine&, const uint32_t*) -> uint64_t { SetLastError(ERROR_INVALID_HANDLE); return 0; });
+    static_assert(GH_X86_POP(SetupDiGetDeviceRegistryPropertyA) == 28, "SetupDiGetDeviceRegistryPropertyA");
+    GH_X86_BED(R, "setupapi.dll", "SetupDiGetDeviceRegistryPropertyA", 28,
+        [](Machine&, const uint32_t*) -> uint64_t { SetLastError(ERROR_INVALID_HANDLE); return 0; });
+    static_assert(GH_X86_POP(SetupDiDestroyDeviceInfoList) == 4, "SetupDiDestroyDeviceInfoList");
+    GH_X86_BED(R, "setupapi.dll", "SetupDiDestroyDeviceInfoList", 4,
+        [](Machine&, const uint32_t*) -> uint64_t { return 1; });
+
+    // -- wininet --------------------------------------------------------------
+    // engine.dll's update/news fetches. wininet.h cannot be included beside the
+    // loader's winhttp.h, so the pop sizes are written out (5, 6, 4, 2, 1, 4
+    // and 5 stdcall arguments). No network session is ever opened, which every
+    // caller already handles: it is what an offline PC returns.
+    GH_X86_BED(R, "wininet.dll", "InternetOpenA", 20,
+        [](Machine&, const uint32_t*) -> uint64_t { SetLastError(12029); return 0; });
+    GH_X86_BED(R, "wininet.dll", "InternetOpenUrlA", 24,
+        [](Machine&, const uint32_t*) -> uint64_t { SetLastError(12029); return 0; });
+    GH_X86_BED(R, "wininet.dll", "InternetCrackUrlA", 16,
+        [](Machine&, const uint32_t*) -> uint64_t { SetLastError(12006); return 0; });
+    GH_X86_BED(R, "wininet.dll", "InternetSetStatusCallback", 8,
+        [](Machine&, const uint32_t*) -> uint64_t { return 0xFFFFFFFFu; });
+    GH_X86_BED(R, "wininet.dll", "InternetCloseHandle", 4,
+        [](Machine&, const uint32_t*) -> uint64_t { return 1; });
+    GH_X86_BED(R, "wininet.dll", "InternetReadFile", 16,
+        [](Machine&, const uint32_t*) -> uint64_t { SetLastError(ERROR_INVALID_HANDLE); return 0; });
+    GH_X86_BED(R, "wininet.dll", "HttpQueryInfoA", 20,
+        [](Machine&, const uint32_t*) -> uint64_t { SetLastError(ERROR_INVALID_HANDLE); return 0; });
+}
+
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 inline void RegisterStdBeds(Machine& m)
@@ -931,6 +1869,7 @@ inline void RegisterStdBeds(Machine& m)
     m.dll_loaded_hook = &mono_probe::install;
     ThunkRegistry& R = m.registry;
     Machine* mp = &m;
+    const size_t std0 = R.size(), drop0 = R.dropped().size();
 
     // -- pass-through kernel32 -------------------------------------------
     // These take and return only handles and scalars, so the x64 export is
@@ -966,8 +1905,34 @@ inline void RegisterStdBeds(Machine& m)
     GH_X86_FWD(R, "kernel32.dll", SetFilePointer);
     GH_X86_FWD(R, "kernel32.dll", GetFileSize);
     GH_X86_FWD(R, "kernel32.dll", FlushFileBuffers);
-    GH_X86_FWD(R, "kernel32.dll", DeleteFileA);
-    GH_X86_FWD(R, "kernel32.dll", DeleteFileW);
+    // Beds for the same reason as the opens below: a failed delete is logged.
+    // Files go through the loader's VFS beds, as a 64-bit guest's do; a create
+    // through the VFS and a delete around it name two different files.
+    GH_X86_BED(R, "kernel32.dll", "DeleteFileA", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            const char* p = (const char*)(uintptr_t)a[0];
+            wchar_t w[1024];
+            const BOOL ok = p && MultiByteToWideChar(CP_ACP, 0, p, -1, w, 1024) && Bed_DeleteFileW(w);
+            if (!ok) {
+                const DWORD e = GetLastError();
+                log("X86 DeleteFileA FAILED err=" + std::to_string(e) + " " + std::string(p ? p : ""));
+                SetLastError(e);
+            }
+            return ok;
+        });
+    GH_X86_BED(R, "kernel32.dll", "DeleteFileW", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            const wchar_t* w = (const wchar_t*)(uintptr_t)a[0];
+            const BOOL ok = Bed_DeleteFileW(w);
+            if (!ok) {
+                const DWORD e = GetLastError();
+                std::string p;
+                for (; w && *w; ++w) p += (char)(*w < 128 ? *w : '?');
+                log("X86 DeleteFileW FAILED err=" + std::to_string(e) + " " + p);
+                SetLastError(e);
+            }
+            return ok;
+        });
     // Beds rather than forwards purely so a FAILED open is always logged, no
     // matter how long ago the startup trace budget ran out. A guest that cannot
     // open a file it needs almost always reports that as something vaguer
@@ -976,7 +1941,7 @@ inline void RegisterStdBeds(Machine& m)
     // on the ordinary trace, because there are thousands of them.
     GH_X86_BED(R, "kernel32.dll", "CreateFileW", 28,
         [](Machine& m, const uint32_t* a) -> uint64_t {
-            HANDLE h = CreateFileW((LPCWSTR)(uintptr_t)a[0], a[1], a[2],
+            HANDLE h = Bed_CreateFileW((LPCWSTR)(uintptr_t)a[0], a[1], a[2],
                                    sa32_translate(a[3]),
                                    a[4], a[5], (HANDLE)(uintptr_t)a[6]);
             if (h != INVALID_HANDLE_VALUE && m.window_prof) {
@@ -997,7 +1962,7 @@ inline void RegisterStdBeds(Machine& m)
         });
     GH_X86_BED(R, "kernel32.dll", "CreateFileA", 28,
         [](Machine&, const uint32_t* a) -> uint64_t {
-            HANDLE h = CreateFileA((LPCSTR)(uintptr_t)a[0], a[1], a[2],
+            HANDLE h = Bed_CreateFileA((LPCSTR)(uintptr_t)a[0], a[1], a[2],
                                    sa32_translate(a[3]),
                                    a[4], a[5], (HANDLE)(uintptr_t)a[6]);
             if (h == INVALID_HANDLE_VALUE)
@@ -1142,15 +2107,33 @@ inline void RegisterStdBeds(Machine& m)
             return 0;
         });
 
+    // The launcher's command line: the exe path, the title's args and any
+    // ghcmd.txt override, exactly as an x64 guest gets it. Until HL2 s859 this
+    // answered "guest.exe" in the launcher too, so no 32-bit title ever saw an
+    // argument -- HL2 ran without -game, -novid and every +convar.
     GH_X86_BED(R, "kernel32.dll", "GetCommandLineA", 0,
         [](Machine& m, const uint32_t*) -> uint64_t {
             BedState& b = m.bed;
+#ifdef GH_LAUNCHER
+            if (!b.cmdline_a) {
+                std::string acp;
+                const int n = WideCharToMultiByte(CP_ACP, 0, g_guestCmdLineW.c_str(), -1, nullptr, 0, nullptr, nullptr);
+                if (n > 1) {
+                    acp.resize((size_t)n - 1);
+                    WideCharToMultiByte(CP_ACP, 0, g_guestCmdLineW.c_str(), -1, acp.data(), n, nullptr, nullptr);
+                }
+                b.cmdline_a = guest_strdup_a(m, acp.empty() ? "guest.exe" : acp.c_str());
+            }
+#endif
             if (!b.cmdline_a) b.cmdline_a = guest_strdup_a(m, "guest.exe");
             return b.cmdline_a;
         });
     GH_X86_BED(R, "kernel32.dll", "GetCommandLineW", 0,
         [](Machine& m, const uint32_t*) -> uint64_t {
             BedState& b = m.bed;
+#ifdef GH_LAUNCHER
+            if (!b.cmdline_w && !g_guestCmdLineW.empty()) b.cmdline_w = guest_strdup_w(m, g_guestCmdLineW.c_str());
+#endif
             if (!b.cmdline_w) b.cmdline_w = guest_strdup_w(m, L"guest.exe");
             return b.cmdline_w;
         });
@@ -1164,7 +2147,7 @@ inline void RegisterStdBeds(Machine& m)
             if (Machine::GuestDll* d = m.dll_by_name(want)) return d->base;
             for (auto& mod : b.modules) if (mod.name == want) return mod.handle;
             if (m.registry.has_dll(want)) return gh_synth_module(m, want);
-            log("X86 GetModuleHandleA(" + want + ") -> 0 (nothing implements it)");
+            log_capped("gmha:" + want, "X86 GetModuleHandleA(" + want + ") -> 0 (nothing implements it)");
             return 0;
         });
     // A handle is granted for any DLL Greenhouse actually services, whether or
@@ -1182,7 +2165,37 @@ inline void RegisterStdBeds(Machine& m)
             if (Machine::GuestDll* d = m.dll_by_name(nm)) return d->base;
             for (auto& mod : m.bed.modules) if (mod.name == nm) return mod.handle;
             if (m.registry.has_dll(nm)) return gh_synth_module(m, nm);
-            log("X86 GetModuleHandleW(" + nm + ") -> 0 (nothing implements it)");
+            log_capped("gmhw:" + nm, "X86 GetModuleHandleW(" + nm + ") -> 0 (nothing implements it)");
+            return 0;
+        });
+
+    // GetModuleHandleEx(flags, name-or-address, HMODULE* out). The CRT's exit
+    // path asks for mscoree.dll by name; FROM_ADDRESS (4) asks which module
+    // holds a code address, which is the exe or one of our mapped DLLs.
+    GH_X86_BED(R, "kernel32.dll", "GetModuleHandleExW", 12,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            uint32_t h = 0;
+            if (a[0] & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) {
+                const uint32_t va = a[1];
+                if (va >= m.image_base && va - m.image_base < m.image_size) h = m.image_base;
+                for (auto& d : m.dlls) if (va >= d.base && va - d.base < d.size) h = d.base;
+            } else if (!a[1]) {
+                h = m.image_base;
+            } else {
+                std::string nm = Machine::base_name_lower(std::wstring((const wchar_t*)(uintptr_t)a[1]));
+                if (Machine::GuestDll* d = m.dll_by_name(nm)) h = d->base;
+                else for (auto& mod : m.bed.modules) if (mod.name == nm) h = mod.handle;
+            }
+            if (a[2]) std::memcpy((void*)(uintptr_t)a[2], &h, 4);
+            if (!h) { SetLastError(ERROR_MOD_NOT_FOUND); return 0; }
+            return 1;
+        });
+    GH_X86_BED(R, "kernel32.dll", "OutputDebugStringW", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            const wchar_t* w = (const wchar_t*)(uintptr_t)a[0];
+            std::string s;
+            for (; w && *w; ++w) s += (*w < 0x80) ? (char)*w : '?';
+            if (a[0]) log_capped("dbg:" + s, "X86 dbg: " + s);
             return 0;
         });
 
@@ -1257,7 +2270,7 @@ inline void RegisterStdBeds(Machine& m)
     GH_X86_BED(R, "kernel32.dll", "OutputDebugStringA", 4,
         [](Machine&, const uint32_t* a) -> uint64_t {
             const char* s = (const char*)(uintptr_t)a[0];
-            if (s) log(std::string("X86 dbg: ") + s);
+            if (s) log_capped(std::string("dbg:") + s, std::string("X86 dbg: ") + s);
             return 0;
         });
 
@@ -1647,13 +2660,12 @@ inline void RegisterStdBeds(Machine& m)
             return (uint32_t)rc;
         });
 
-    // OVERLAPPED is 20 bytes on x86 and 32 on x64. Rather than translate it,
-    // refuse it: no guest reaches a menu through asynchronous file I/O, and a
-    // named refusal is worth more than a silent 12-byte overwrite. The
-    // synchronous path -- the only one anything has used so far -- is unchanged.
+    // OVERLAPPED is 20 bytes on x86 and 32 on x64, so an overlapped request is
+    // carried out by overlapped_io32 (completed before the call returns, at the
+    // guest's offset) and never reaches the host with the guest's struct.
     GH_X86_BED(R, "kernel32.dll", "ReadFile", 20,
         [](Machine& m, const uint32_t* a) -> uint64_t {
-            if (a[4]) log("X86 ReadFile with OVERLAPPED -- unsupported; forcing synchronous");
+            if (a[4]) return overlapped_io32(m, a, false);
             DWORD got = 0;
             const BOOL rc = ReadFile((HANDLE)(uintptr_t)a[0], (LPVOID)(uintptr_t)a[1],
                                      a[2], &got, nullptr);
@@ -1671,8 +2683,8 @@ inline void RegisterStdBeds(Machine& m)
             return (uint32_t)rc;
         });
     GH_X86_BED(R, "kernel32.dll", "WriteFile", 20,
-        [](Machine&, const uint32_t* a) -> uint64_t {
-            if (a[4]) log("X86 WriteFile with OVERLAPPED -- unsupported; forcing synchronous");
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            if (a[4]) return overlapped_io32(m, a, true);
             // A short, printable write is almost always the guest telling us
             // what went wrong -- Unity's output_log and mono's own diagnostics
             // both come through here, and on this console nobody will ever open
@@ -2586,57 +3598,59 @@ inline void RegisterStdBeds(Machine& m)
 
     // x86 WNDCLASSW:   style 0, lpfnWndProc 4  ... 40 bytes
     // x86 WNDCLASSEXW: cbSize 0, style 4, lpfnWndProc 8 ... 48 bytes
+    // A class is remembered by name (and by the atom we hand back, which is how
+    // CreateWindowEx may name it). Until the game window exists the newest
+    // class procedure is also the dispatch target, which is all a Unity player
+    // ever needed; after that a registration only records -- the window
+    // created from the class decides where its messages go.
+    // x86 WNDCLASS:   style 0, lpfnWndProc 4 ... lpszClassName 36; 40 bytes
+    // x86 WNDCLASSEX: cbSize 0, style 4, lpfnWndProc 8 ... lpszClassName 40; 48 bytes
     GH_X86_BED(R, "user32.dll", "RegisterClassW", 4,
         [](Machine& m, const uint32_t* a) -> uint64_t {
-            if (a[0]) {
-                const uint32_t proc = *(const uint32_t*)(uintptr_t)(a[0] + 4);
-                if (proc) { m.bed.wndproc = proc; log("X86 RegisterClassW captured WndProc " + hex(proc)); }
-            }
-            return 1;                                   // any non-zero ATOM
+            if (!a[0]) return 0;
+            const uint32_t* wc = (const uint32_t*)(uintptr_t)a[0];
+            return x86_register_class(m, wc[1], wc[9], true, "RegisterClassW");
         });
     GH_X86_BED(R, "user32.dll", "RegisterClassExW", 4,
         [](Machine& m, const uint32_t* a) -> uint64_t {
-            if (a[0]) {
-                const uint32_t proc = *(const uint32_t*)(uintptr_t)(a[0] + 8);
-                if (proc) { m.bed.wndproc = proc; log("X86 RegisterClassExW captured WndProc " + hex(proc)); }
-            }
-            return 1;
+            if (!a[0]) return 0;
+            const uint32_t* wc = (const uint32_t*)(uintptr_t)a[0];
+            return x86_register_class(m, wc[2], wc[10], true, "RegisterClassExW");
         });
     GH_X86_BED(R, "user32.dll", "RegisterClassA", 4,
         [](Machine& m, const uint32_t* a) -> uint64_t {
-            if (a[0]) {
-                const uint32_t proc = *(const uint32_t*)(uintptr_t)(a[0] + 4);
-                if (proc) m.bed.wndproc = proc;
-            }
-            return 1;
+            if (!a[0]) return 0;
+            const uint32_t* wc = (const uint32_t*)(uintptr_t)a[0];
+            return x86_register_class(m, wc[1], wc[9], false, "RegisterClassA");
         });
     GH_X86_BED(R, "user32.dll", "RegisterClassExA", 4,
         [](Machine& m, const uint32_t* a) -> uint64_t {
-            if (a[0]) {
-                const uint32_t proc = *(const uint32_t*)(uintptr_t)(a[0] + 8);
-                if (proc) m.bed.wndproc = proc;
-            }
-            return 1;
+            if (!a[0]) return 0;
+            const uint32_t* wc = (const uint32_t*)(uintptr_t)a[0];
+            return x86_register_class(m, wc[2], wc[10], false, "RegisterClassExA");
         });
-    GH_X86_BED(R, "user32.dll", "UnregisterClassW", 8,
-        [](Machine&, const uint32_t*) -> uint64_t { return 1; });
+    for (const char* n : { "UnregisterClassW", "UnregisterClassA" })
+        GH_X86_BED(R, "user32.dll", n, 8,
+            [](Machine&, const uint32_t*) -> uint64_t { return 1; });
 
     // CreateWindowExW takes 12 arguments; getting that count wrong is a silent
     // 4-byte stack drift per call, so it is asserted like the WS2_32 table.
+    //
+    // The game window is kFakeHwnd and every guest window that IS the game
+    // shares it (HL2 makes one at CW_USEDEFAULT, then the real 1920x1080 one).
+    // A child, a message-only window, or a small window made once the game
+    // window exists is a SubWindow with an HWND of its own.
     static_assert(thunk_bytes_of(&::CreateWindowExW) == 48, "CreateWindowExW");
     GH_X86_BED(R, "user32.dll", "CreateWindowExW", 48,
-        [](Machine& m, const uint32_t* a) -> uint64_t {
-            (void)m;
-            log("X86 CreateWindowExW " + std::to_string((int32_t)a[6]) + "x" +
-                std::to_string((int32_t)a[7]) + " -> synthetic HWND " + hex(kFakeHwnd));
-            return kFakeHwnd;
-        });
+        [](Machine& m, const uint32_t* a) -> uint64_t { return x86_create_window(m, a, true, "CreateWindowExW"); });
     GH_X86_BED(R, "user32.dll", "CreateWindowExA", 48,
-        [](Machine&, const uint32_t*) -> uint64_t { return kFakeHwnd; });
+        [](Machine& m, const uint32_t* a) -> uint64_t { return x86_create_window(m, a, false, "CreateWindowExA"); });
+    GH_X86_BED(R, "user32.dll", "DestroyWindow", 4,
+        [](Machine& m, const uint32_t* a) -> uint64_t { m.bed.sub_windows.erase(a[0]); return 1; });
 
     // The rest of the window lifecycle: there is nothing to do, and saying so
     // truthfully (TRUE, "it worked") is what keeps the guest on its happy path.
-    for (const char* n : { "DestroyWindow", "UpdateWindow", "SetForegroundWindow",
+    for (const char* n : { "UpdateWindow", "SetForegroundWindow",
                            "IsWindowVisible", "ValidateRect" })
         GH_X86_BED(R, "user32.dll", n, 4,
             [](Machine&, const uint32_t*) -> uint64_t { return 1; });
@@ -2699,17 +3713,105 @@ inline void RegisterStdBeds(Machine& m)
         GH_X86_BED(R, "user32.dll", n, 8,
             [](Machine&, const uint32_t*) -> uint64_t { return 1; });   // identity
 
-    // GetWindowLong/SetWindowLong on a window that does not exist. Returning 0
-    // and accepting every store is right for the two things a player uses them
-    // for: reading GWL_STYLE (it only ever compares against what it set) and
-    // stashing a `this` pointer in GWLP_USERDATA, which it re-reads through the
-    // same pair. Anything more would need a real window object; nothing asks.
+    // GetWindowLong/SetWindowLong on a window that does not exist: the values
+    // are kept per index and read back. GWL_WNDPROC is the window procedure
+    // itself -- Source's inputsystem subclasses the game window with it and
+    // chains to the old proc through CallWindowProc. Answering 0 and dropping
+    // the store (as this did until s855) left every key with the engine's own
+    // proc, which never hands one to the input system.
+    // GWL_WNDPROC (-4) is only declared for 32-bit builds; this one is 64-bit.
+    constexpr int32_t kGwlWndProc32 = -4;
     for (const char* n : { "GetWindowLongA", "GetWindowLongW" })
         GH_X86_BED(R, "user32.dll", n, 8,
-            [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+            [](Machine& m, const uint32_t* a) -> uint64_t {
+                const int32_t i = (int32_t)a[1];
+                auto sw = m.bed.sub_windows.find(a[0]);
+                if (sw != m.bed.sub_windows.end()) {
+                    if (i == kGwlWndProc32) return sw->second.proc;
+                    auto it = sw->second.longs.find(i);
+                    return it == sw->second.longs.end() ? 0 : it->second;
+                }
+                if (i == kGwlWndProc32) return m.bed.wndproc;
+                auto it = m.bed.win_long.find(i);
+                return it == m.bed.win_long.end() ? 0 : it->second;
+            });
     for (const char* n : { "SetWindowLongA", "SetWindowLongW" })
         GH_X86_BED(R, "user32.dll", n, 12,
-            [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+            [](Machine& m, const uint32_t* a) -> uint64_t {
+                const int32_t i = (int32_t)a[1];
+                uint32_t old;
+                auto sw = m.bed.sub_windows.find(a[0]);
+                if (sw != m.bed.sub_windows.end()) {
+                    uint32_t& slot = (i == kGwlWndProc32) ? sw->second.proc : sw->second.longs[i];
+                    old = slot;
+                    if (i != kGwlWndProc32 || a[2]) slot = a[2];
+                    return old;
+                }
+                if (i == kGwlWndProc32) {
+                    old = m.bed.wndproc;
+                    if (a[2]) m.bed.wndproc = a[2];
+                    log("X86 SetWindowLong(GWL_WNDPROC) " + hex(old) + " -> " + hex(a[2]));
+                } else {
+                    old = m.bed.win_long[i];
+                    m.bed.win_long[i] = a[2];
+                }
+                return old;
+            });
+
+#ifdef GH_LAUNCHER
+    // Polled keyboard/mouse: the x64 beds' state (g_vkDown, g_kmCur*), which the
+    // CoreWindow handlers keep. Forwarded, the container's user32 reports
+    // nothing pressed and the cursor at 0,0. Same arguments at both widths.
+    GH_X86_BED(R, "user32.dll", "GetAsyncKeyState", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t { return (uint16_t)Bed_GetAsyncKeyState((int)a[0]); });
+    GH_X86_BED(R, "user32.dll", "GetKeyState", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t { return (uint16_t)Bed_GetKeyState((int)a[0]); });
+    GH_X86_BED(R, "user32.dll", "GetKeyboardState", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t { return Bed_GetKeyboardState((PBYTE)(uintptr_t)a[0]); });
+    GH_X86_BED(R, "user32.dll", "GetCursorPos", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t { return Bed_GetCursorPos((LPPOINT)(uintptr_t)a[0]); });
+
+    // Raw input: the x64 beds' synthetic packets in the 32-bit layout. Forwarded,
+    // these reached the container's user32 with x86 strides (RAWINPUTDEVICE is 12
+    // bytes here, 16 there), so registration failed and the device count could
+    // come back as (UINT)-1. RAWINPUTHEADER is 16 bytes on x86 (hDevice and wParam
+    // narrow) and 24 on x64; RAWMOUSE and RAWKEYBOARD are the same at both widths.
+    GH_X86_BED(R, "user32.dll", "RegisterRawInputDevices", 12,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            static bool once = false;
+            if (!once) { once = true; log("X86 RegisterRawInputDevices n=" + std::to_string(a[1]) + " cb=" + std::to_string(a[2])); }
+            return TRUE;
+        });
+    GH_X86_BED(R, "user32.dll", "GetRawInputDeviceList", 12,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (a[1]) *(uint32_t*)(uintptr_t)a[1] = 0;     // no devices; never (UINT)-1 (see the x64 bed)
+            return 0;
+        });
+    GH_X86_BED(R, "user32.dll", "GetRawInputData", 20,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            constexpr UINT kHdr32 = 16;
+            RAWINPUT ri{};
+            UINT cb = sizeof ri;
+            if (Bed_GetRawInputData((HRAWINPUT)(uintptr_t)a[0], RID_INPUT, &ri, &cb, sizeof(RAWINPUTHEADER)) == 0 ||
+                cb == (UINT)-1 || cb < sizeof(RAWINPUTHEADER)) {
+                if (!a[2] && a[3]) *(uint32_t*)(uintptr_t)a[3] = 0;
+                return 0;
+            }
+            const UINT body = cb - (UINT)sizeof(RAWINPUTHEADER);
+            const UINT want = (a[1] == RID_HEADER) ? kHdr32 : kHdr32 + body;
+            uint32_t* pcb = (uint32_t*)(uintptr_t)a[3];
+            if (!a[2]) { if (pcb) *pcb = want; return 0; }
+            if (!pcb || *pcb < want) return (uint32_t)-1;
+            const uint32_t h32[4] = { ri.header.dwType, kHdr32 + body,
+                                      (uint32_t)(uintptr_t)ri.header.hDevice, (uint32_t)ri.header.wParam };
+            uint8_t* out = (uint8_t*)(uintptr_t)a[2];
+            std::memcpy(out, h32, kHdr32);
+            if (a[1] != RID_HEADER) std::memcpy(out + kHdr32, &ri.data, body);
+            static int n = 0;
+            if (++n <= 4) log("X86 GetRawInputData served type=" + std::to_string(ri.header.dwType) + " bytes=" + std::to_string(want));
+            return want;
+        });
+#endif
 
     // -- the message pump ---------------------------------------------------
     // MSG on x86 is 28 bytes: hwnd 0, message 4, wParam 8, lParam 12, time 16,
@@ -2727,7 +3829,7 @@ inline void RegisterStdBeds(Machine& m)
     for (const char* n : { "PeekMessageW", "PeekMessageA" })
         GH_X86_BED(R, "user32.dll", n, 20,
             [](Machine& m, const uint32_t* a) -> uint64_t {
-                return peek_message32(m, a[0], (a[4] & PM_REMOVE) != 0);
+                return peek_message32(m, a[0], a[2], a[3], (a[4] & PM_REMOVE) != 0, a[-1]);
             });
 
     // GetMessage BLOCKS until a message arrives, and on this boundary nothing
@@ -2758,10 +3860,13 @@ inline void RegisterStdBeds(Machine& m)
     for (const char* n : { "DispatchMessageW", "DispatchMessageA" })
         GH_X86_BED(R, "user32.dll", n, 4,
             [](Machine& m, const uint32_t* a) -> uint64_t {
-                if (!a[0] || !m.bed.wndproc) return 0;
+                if (!a[0]) return 0;
                 const uint32_t* msg = (const uint32_t*)(uintptr_t)a[0];
+                const uint32_t proc = wndproc_for(m, msg[0]);
+                if (!proc) return 0;
                 uint32_t args[4] = { msg[0], msg[1], msg[2], msg[3] };   // hwnd, message, wParam, lParam
-                return m.call_guest32(m.bed.wndproc, args, 4);
+                log_input_hop("dispatch", msg[1], msg[2], proc, a[-1]);
+                return m.call_guest32(proc, args, 4);
             });
     GH_X86_BED(R, "user32.dll", "DefWindowProcW", 16,
         [](Machine&, const uint32_t*) -> uint64_t { return 0; });
@@ -2772,15 +3877,17 @@ inline void RegisterStdBeds(Machine& m)
     // same host->guest hop as dispatch and cannot be a forward either.
     GH_X86_BED(R, "user32.dll", "SendMessageW", 16,
         [](Machine& m, const uint32_t* a) -> uint64_t {
-            if (!m.bed.wndproc) return 0;
+            const uint32_t proc = wndproc_for(m, a[0]);
+            if (!proc) return 0;
             uint32_t args[4] = { a[0], a[1], a[2], a[3] };
-            return m.call_guest32(m.bed.wndproc, args, 4);
+            return m.call_guest32(proc, args, 4);
         });
     GH_X86_BED(R, "user32.dll", "SendMessageA", 16,
         [](Machine& m, const uint32_t* a) -> uint64_t {
-            if (!m.bed.wndproc) return 0;
+            const uint32_t proc = wndproc_for(m, a[0]);
+            if (!proc) return 0;
             uint32_t args[4] = { a[0], a[1], a[2], a[3] };
-            return m.call_guest32(m.bed.wndproc, args, 4);
+            return m.call_guest32(proc, args, 4);
         });
 
     // MsgWaitForMultipleObjects would block the one host thread every guest
@@ -3162,6 +4269,24 @@ inline void RegisterStdBeds(Machine& m)
             std::memcpy(out, dir.c_str(), (dir.size() + 1) * 2);            // MAX_PATH buffer
             return 0;
         });
+    // The A form, registered as shfolder.dll so LoadLibrary("shfolder.dll")
+    // succeeds (lookup by name finds it for shell32 imports too). HL2's
+    // libfontconfig loads it for its fallback config -- WINDOWSUSERFONTDIR and
+    // the cache dir -- and without it that config fails to parse ("SHGetFolderPathA
+    // failed", s853), which can leave fontconfig with no fonts: the 2024 main menu
+    // is all FreeType text, so it was invisible.
+    GH_X86_BED(R, "shfolder.dll", "SHGetFolderPathA", 20,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            if (!a[4]) return 0x80070057u;                                  // E_INVALIDARG
+            std::wstring dir = m.image_path;
+            size_t cut = dir.find_last_of(L'\\');
+            dir = (cut == std::wstring::npos) ? std::wstring(L"C:\\") : dir.substr(0, cut);
+            char buf[MAX_PATH] = {};
+            if (!WideCharToMultiByte(CP_ACP, 0, dir.c_str(), -1, buf, MAX_PATH, nullptr, nullptr)) return 0x80004005u;
+            std::memcpy((void*)(uintptr_t)a[4], buf, std::strlen(buf) + 1);
+            log("X86 SHGetFolderPathA csidl=" + hex(a[1]) + " -> " + buf);
+            return 0;
+        });
 
     // -- test hooks ---------------------------------------------------------
     // Not a Windows API. This is the M2 proof for the OTHER direction across the
@@ -3180,16 +4305,28 @@ inline void RegisterStdBeds(Machine& m)
             return r2;
         });
 
+    // GDI text: the container's gdi32 has no font engine (gh_x86_gdi.h). Ahead
+    // of the two tables below, whose CreateDIBSection (always fails) and
+    // EnumFontFamiliesExA (asks the real, empty gdi32) are the non-Launcher
+    // answers and would otherwise win.
+    RegisterGdiBeds(R);
+
     // The eighteen entry points the rule-10 audit named. Registered here, ahead
     // of the generated forward table, so the beds shadow the forwards that
     // would otherwise write eight bytes through four-byte guest objects.
     RegisterPtrToPtrBeds(R);
+    // What HL2's modules need that is neither of the above nor a forward.
+    RegisterSourceGapBeds(R);
 
     // DXGI and D3D11. Kept in their own file: they are not Win32 calls but a
     // COM vtable boundary, and the marshalling they need has nothing in common
     // with the rest of this table.
     RegisterD3DBeds(R);
+    RegisterD3D9Beds(R);
 
+    for (size_t i = drop0; i < R.dropped().size(); ++i)
+        if (R.dropped()[i].winner >= std0)
+            log(std::string("X86 bed SHADOWED by an earlier hand-written bed: ") + R.dropped()[i].name);
     log("X86 beds registered: " + std::to_string(R.size()));
 }
 

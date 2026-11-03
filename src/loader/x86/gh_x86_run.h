@@ -145,6 +145,7 @@ inline bool RunPe32Guest(const std::vector<uint8_t>& file, uint32_t& result, std
     if (!m.load_image(file))      { why = m.err; return false; }
     if (!m.setup_thread())        { why = m.err; return false; }
     if (!m.init_heap(64u << 20))  { why = m.err; return false; }   // grows on demand
+    m.tls_thread_init(m.threads[0].teb);   // the exe's TLS callbacks are not run here
 
     // Recording is what costs, not the ranges: with no range armed the check in
     // ptr() is one compare, so the budget is only opened when there is

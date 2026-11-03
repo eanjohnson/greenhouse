@@ -403,6 +403,214 @@ inline void RegisterGeneratedBeds(Machine& m)
     GH_X86_FWD_DYN(R, "shlwapi.dll", SHDeleteKeyW);
     GH_X86_FWD_DYN(R, "shlwapi.dll", PathCanonicalizeW);
 
+    // ---- Half-Life 2 (Source 2013) additions -- hand-maintained ----
+    // HL2's imports that nothing registered, sorted by the same constexpr
+    // audit the startup log runs (no callback, no pointer to a pointer-sized
+    // object) plus a read of every struct argument for a width change. Those
+    // that failed either test are beds in RegisterSourceGapBeds; handle
+    // returns stay forwards, because the dispatcher checks them against 4GB.
+    // ---- advapi32.dll ----
+    GH_X86_FWD_DYN(R, "advapi32.dll", CryptGenRandom);
+    GH_X86_FWD_DYN(R, "advapi32.dll", RegisterEventSourceW);
+    // ---- gdi32.dll ----
+    GH_X86_FWD_DYN(R, "gdi32.dll", AddFontResourceA);
+    GH_X86_FWD_DYN(R, "gdi32.dll", BitBlt);
+    GH_X86_FWD_DYN(R, "gdi32.dll", CombineRgn);
+    GH_X86_FWD_DYN(R, "gdi32.dll", CreateCompatibleBitmap);
+    GH_X86_FWD_DYN(R, "gdi32.dll", CreateCompatibleDC);
+    GH_X86_FWD_DYN(R, "gdi32.dll", CreateDCW);
+    GH_X86_FWD_DYN(R, "gdi32.dll", CreateFontA);
+    GH_X86_FWD_DYN(R, "gdi32.dll", CreateFontIndirectW);
+    GH_X86_FWD_DYN(R, "gdi32.dll", CreateFontW);
+    GH_X86_FWD_DYN(R, "gdi32.dll", CreatePen);
+    GH_X86_FWD_DYN(R, "gdi32.dll", CreateRectRgn);
+    GH_X86_FWD_DYN(R, "gdi32.dll", CreateSolidBrush);
+    GH_X86_FWD_DYN(R, "gdi32.dll", DeleteDC);
+    GH_X86_FWD_DYN(R, "gdi32.dll", DescribePixelFormat);
+    GH_X86_FWD_DYN(R, "gdi32.dll", ExtTextOutA);
+    GH_X86_FWD_DYN(R, "gdi32.dll", ExtTextOutW);
+    GH_X86_FWD_DYN(R, "gdi32.dll", GetBitmapBits);
+    GH_X86_FWD_DYN(R, "gdi32.dll", GetBkColor);
+    GH_X86_FWD_DYN(R, "gdi32.dll", GetCharABCWidthsA);
+    GH_X86_FWD_DYN(R, "gdi32.dll", GetCharABCWidthsW);
+    GH_X86_FWD_DYN(R, "gdi32.dll", GetDIBits);
+    GH_X86_FWD_DYN(R, "gdi32.dll", GetDeviceGammaRamp);
+    GH_X86_FWD_DYN(R, "gdi32.dll", GetGlyphOutlineA);
+    GH_X86_FWD_DYN(R, "gdi32.dll", GetPixel);
+    GH_X86_FWD_DYN(R, "gdi32.dll", GetPixelFormat);
+    GH_X86_FWD_DYN(R, "gdi32.dll", GetStockObject);
+    GH_X86_FWD_DYN(R, "gdi32.dll", GetTextColor);
+    GH_X86_FWD_DYN(R, "gdi32.dll", GetTextExtentPoint32A);
+    GH_X86_FWD_DYN(R, "gdi32.dll", GetTextExtentPoint32W);
+    GH_X86_FWD_DYN(R, "gdi32.dll", GetTextMetricsA);
+    GH_X86_FWD_DYN(R, "gdi32.dll", GetTextMetricsW);
+    GH_X86_FWD_DYN(R, "gdi32.dll", MoveToEx);
+    GH_X86_FWD_DYN(R, "gdi32.dll", Polygon);
+    GH_X86_FWD_DYN(R, "gdi32.dll", Polyline);
+    GH_X86_FWD_DYN(R, "gdi32.dll", Rectangle);
+    GH_X86_FWD_DYN(R, "gdi32.dll", RemoveFontResourceA);
+    GH_X86_FWD_DYN(R, "gdi32.dll", SelectObject);
+    GH_X86_FWD_DYN(R, "gdi32.dll", SetBkColor);
+    GH_X86_FWD_DYN(R, "gdi32.dll", SetBkMode);
+    GH_X86_FWD_DYN(R, "gdi32.dll", SetDeviceGammaRamp);
+    GH_X86_FWD_DYN(R, "gdi32.dll", SetMapMode);
+    GH_X86_FWD_DYN(R, "gdi32.dll", SetPixel);
+    GH_X86_FWD_DYN(R, "gdi32.dll", SetRectRgn);
+    GH_X86_FWD_DYN(R, "gdi32.dll", SetStretchBltMode);
+    GH_X86_FWD_DYN(R, "gdi32.dll", SetTextAlign);
+    GH_X86_FWD_DYN(R, "gdi32.dll", SetTextColor);
+    GH_X86_FWD_DYN(R, "gdi32.dll", SetViewportOrgEx);
+    GH_X86_FWD_DYN(R, "gdi32.dll", StretchBlt);
+    // ---- imm32.dll ----
+    GH_X86_FWD_DYN(R, "imm32.dll", ImmGetCandidateListCountW);
+    GH_X86_FWD_DYN(R, "imm32.dll", ImmGetCandidateListW);
+    GH_X86_FWD_DYN(R, "imm32.dll", ImmGetIMEFileNameA);
+    GH_X86_FWD_DYN(R, "imm32.dll", ImmGetProperty);
+    GH_X86_FWD_DYN(R, "imm32.dll", ImmIsUIMessageA);
+    GH_X86_FWD_DYN(R, "imm32.dll", ImmNotifyIME);
+    GH_X86_FWD_DYN(R, "imm32.dll", ImmSetCandidateWindow);
+    GH_X86_FWD_DYN(R, "imm32.dll", ImmSetCompositionWindow);
+    GH_X86_FWD_DYN(R, "imm32.dll", ImmSetConversionStatus);
+    // ---- kernel32.dll ----
+    // (the next three for our own guest msvcrt.dll, not for HL2 directly)
+    GH_X86_FWD_DYN(R, "kernel32.dll", MoveFileExA);
+    GH_X86_FWD_DYN(R, "kernel32.dll", RemoveDirectoryA);
+    GH_X86_FWD_DYN(R, "kernel32.dll", SetFileAttributesA);
+    GH_X86_FWD_DYN(R, "kernel32.dll", AllocConsole);
+    GH_X86_FWD_DYN(R, "kernel32.dll", AreFileApisANSI);
+    GH_X86_FWD_DYN(R, "kernel32.dll", AttachConsole);
+    GH_X86_FWD_DYN(R, "kernel32.dll", ChangeTimerQueueTimer);
+    GH_X86_FWD_DYN(R, "kernel32.dll", CompareStringA);
+    GH_X86_FWD_DYN(R, "kernel32.dll", CopyFileA);
+    GH_X86_FWD_DYN(R, "kernel32.dll", CreateDirectoryA);
+    GH_X86_FWD_DYN(R, "kernel32.dll", CreateTimerQueue);
+    GH_X86_FWD_DYN(R, "kernel32.dll", CreateToolhelp32Snapshot);
+    GH_X86_FWD_DYN(R, "kernel32.dll", DeleteTimerQueueTimer);
+    GH_X86_FWD_DYN(R, "kernel32.dll", DeviceIoControl);
+    GH_X86_FWD_DYN(R, "kernel32.dll", DosDateTimeToFileTime);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GetComputerNameA);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GetConsoleOutputCP);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GetDateFormatW);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GetDiskFreeSpaceA);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GetExitCodeProcess);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GetFileAttributesExA);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GetFileSizeEx);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GetHandleInformation);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GetLogicalDriveStringsA);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GetLongPathNameA);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GetNumaHighestNodeNumber);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GetNumberOfConsoleInputEvents);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GetProcessTimes);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GetProfileStringA);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GetShortPathNameA);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GetStringTypeA);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GetTempPathA);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GetThreadTimes);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GetTickCount64);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GetTimeFormatW);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GetWindowsDirectoryA);
+    GH_X86_FWD_DYN(R, "kernel32.dll", GlobalSize);
+    GH_X86_FWD_DYN(R, "kernel32.dll", IsBadReadPtr);
+    GH_X86_FWD_DYN(R, "kernel32.dll", IsBadWritePtr);
+    GH_X86_FWD_DYN(R, "kernel32.dll", IsDBCSLeadByteEx);
+    GH_X86_FWD_DYN(R, "kernel32.dll", LCMapStringA);
+    GH_X86_FWD_DYN(R, "kernel32.dll", MulDiv);
+    GH_X86_FWD_DYN(R, "kernel32.dll", OpenFileMappingW);
+    GH_X86_FWD_DYN(R, "kernel32.dll", OpenProcess);
+    GH_X86_FWD_DYN(R, "kernel32.dll", OpenThread);
+    GH_X86_FWD_DYN(R, "kernel32.dll", ReadConsoleW);
+    GH_X86_FWD_DYN(R, "kernel32.dll", SetCurrentDirectoryA);
+    GH_X86_FWD_DYN(R, "kernel32.dll", SetPriorityClass);
+    GH_X86_FWD_DYN(R, "kernel32.dll", SetProcessAffinityMask);
+    GH_X86_FWD_DYN(R, "kernel32.dll", SetThreadExecutionState);
+    GH_X86_FWD_DYN(R, "kernel32.dll", SetThreadPriorityBoost);
+    GH_X86_FWD_DYN(R, "kernel32.dll", SystemTimeToTzSpecificLocalTime);
+    GH_X86_FWD_DYN(R, "kernel32.dll", TerminateThread);
+    GH_X86_FWD_DYN(R, "kernel32.dll", Thread32First);
+    GH_X86_FWD_DYN(R, "kernel32.dll", Thread32Next);
+    GH_X86_FWD_DYN(R, "kernel32.dll", UnregisterWait);
+    GH_X86_FWD_DYN(R, "kernel32.dll", UnregisterWaitEx);
+    GH_X86_FWD_DYN(R, "kernel32.dll", WriteConsoleA);
+    GH_X86_FWD_DYN(R, "kernel32.dll", lstrcatA);
+    // ---- ole32.dll ----
+    GH_X86_FWD_DYN(R, "ole32.dll", OleInitialize);
+    // ---- rpcrt4.dll ----
+    GH_X86_FWD_DYN(R, "rpcrt4.dll", UuidCreate);
+    GH_X86_FWD_DYN(R, "rpcrt4.dll", UuidFromStringA);
+    // ---- shell32.dll ----
+    GH_X86_FWD_DYN(R, "shell32.dll", DragAcceptFiles);
+    GH_X86_FWD_DYN(R, "shell32.dll", DragFinish);
+    GH_X86_FWD_DYN(R, "shell32.dll", DragQueryFileA);
+    GH_X86_FWD_DYN(R, "shell32.dll", DragQueryFileW);
+    GH_X86_FWD_DYN(R, "shell32.dll", SHGetPathFromIDListW);
+    GH_X86_FWD_DYN(R, "shell32.dll", SHGetSpecialFolderPathA);
+    GH_X86_FWD_DYN(R, "shell32.dll", ShellExecuteA);
+    // ---- shlwapi.dll ----
+    GH_X86_FWD_DYN(R, "shlwapi.dll", SHDeleteKeyA);
+    // ---- user32.dll ----
+    GH_X86_FWD_DYN(R, "user32.dll", ActivateKeyboardLayout);
+    GH_X86_FWD_DYN(R, "user32.dll", CallNextHookEx);
+    GH_X86_FWD_DYN(R, "user32.dll", ChangeDisplaySettingsExA);
+    GH_X86_FWD_DYN(R, "user32.dll", ChangeDisplaySettingsExW);
+    GH_X86_FWD_DYN(R, "user32.dll", CopyIcon);
+    GH_X86_FWD_DYN(R, "user32.dll", CreateIconFromResource);
+    GH_X86_FWD_DYN(R, "user32.dll", DrawIconEx);
+    GH_X86_FWD_DYN(R, "user32.dll", DrawTextA);
+    GH_X86_FWD_DYN(R, "user32.dll", DrawTextW);
+    GH_X86_FWD_DYN(R, "user32.dll", EnumDisplayDevicesW);
+    GH_X86_FWD_DYN(R, "user32.dll", EnumDisplaySettingsW);
+    GH_X86_FWD_DYN(R, "user32.dll", FillRect);
+    GH_X86_FWD_DYN(R, "user32.dll", FindWindowA);
+    GH_X86_FWD_DYN(R, "user32.dll", FlashWindow);
+    GH_X86_FWD_DYN(R, "user32.dll", GetClassLongA);
+    GH_X86_FWD_DYN(R, "user32.dll", GetClipCursor);
+    GH_X86_FWD_DYN(R, "user32.dll", GetClipboardSequenceNumber);
+    GH_X86_FWD_DYN(R, "user32.dll", GetDlgItemInt);
+    GH_X86_FWD_DYN(R, "user32.dll", GetDoubleClickTime);
+    GH_X86_FWD_DYN(R, "user32.dll", GetKeyboardLayout);
+    GH_X86_FWD_DYN(R, "user32.dll", GetKeyboardState);
+    GH_X86_FWD_DYN(R, "user32.dll", GetMenu);
+    GH_X86_FWD_DYN(R, "user32.dll", GetMonitorInfoW);
+    GH_X86_FWD_DYN(R, "user32.dll", GetPropW);
+    GH_X86_FWD_DYN(R, "user32.dll", GetRawInputDeviceInfoA);
+    GH_X86_FWD_DYN(R, "user32.dll", GetTopWindow);
+    GH_X86_FWD_DYN(R, "user32.dll", GetUpdateRect);
+    GH_X86_FWD_DYN(R, "user32.dll", GetWindow);
+    GH_X86_FWD_DYN(R, "user32.dll", GetWindowTextLengthW);
+    GH_X86_FWD_DYN(R, "user32.dll", GetWindowTextW);
+    GH_X86_FWD_DYN(R, "user32.dll", GetWindowThreadProcessId);
+    GH_X86_FWD_DYN(R, "user32.dll", InvalidateRect);
+    GH_X86_FWD_DYN(R, "user32.dll", IsRectEmpty);
+    GH_X86_FWD_DYN(R, "user32.dll", IsWindow);
+    GH_X86_FWD_DYN(R, "user32.dll", IsWindowEnabled);
+    GH_X86_FWD_DYN(R, "user32.dll", LoadCursorFromFileA);
+    GH_X86_FWD_DYN(R, "user32.dll", LoadCursorW);
+    GH_X86_FWD_DYN(R, "user32.dll", LoadIconW);
+    GH_X86_FWD_DYN(R, "user32.dll", LoadImageA);
+    GH_X86_FWD_DYN(R, "user32.dll", LoadStringA);
+    GH_X86_FWD_DYN(R, "user32.dll", MoveWindow);
+    GH_X86_FWD_DYN(R, "user32.dll", PostMessageA);
+    GH_X86_FWD_DYN(R, "user32.dll", PostMessageW);
+    GH_X86_FWD_DYN(R, "user32.dll", PostThreadMessageW);
+    GH_X86_FWD_DYN(R, "user32.dll", RemovePropW);
+    GH_X86_FWD_DYN(R, "user32.dll", SetActiveWindow);
+    GH_X86_FWD_DYN(R, "user32.dll", SetDlgItemInt);
+    GH_X86_FWD_DYN(R, "user32.dll", SetLayeredWindowAttributes);
+    GH_X86_FWD_DYN(R, "user32.dll", SetPropW);
+    GH_X86_FWD_DYN(R, "user32.dll", SetWindowRgn);
+    GH_X86_FWD_DYN(R, "user32.dll", SetWindowTextA);
+    GH_X86_FWD_DYN(R, "user32.dll", SystemParametersInfoA);
+    GH_X86_FWD_DYN(R, "user32.dll", ToUnicode);
+    GH_X86_FWD_DYN(R, "user32.dll", UnhookWindowsHookEx);
+    GH_X86_FWD_DYN(R, "user32.dll", UnregisterClassA);
+    // ---- winmm.dll ----
+    GH_X86_FWD_DYN(R, "winmm.dll", PlaySoundA);
+    GH_X86_FWD_DYN(R, "winmm.dll", waveOutGetErrorTextW);
+    GH_X86_FWD_DYN(R, "winmm.dll", waveOutGetID);
+    GH_X86_FWD_DYN(R, "winmm.dll", waveOutPause);
+    GH_X86_FWD_DYN(R, "winmm.dll", waveOutRestart);
+    GH_X86_FWD_DYN(R, "winmm.dll", waveOutSetVolume);
+
     log("X86 generated forwards: " + std::to_string(R.size()));
 }
 

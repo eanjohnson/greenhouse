@@ -94,8 +94,9 @@ def pack_fingerprint(entries):
 
 def build_packs(records, pid, version, key, pack_bytes):
     """records: [(name, bytes)] -> [bytes] (*.ghpak files). Layout (src/loader/gh_pak.h):
-    magic(8) | u32 count | u32 flags (1 = encrypted) | count x (u16 nlen, name, u64 off, u32 len) | records.
-    An encrypted record is iv(12) || ct || tag(16) with aad pak_aad(pid, version, name)."""
+    magic(8) | u32 count | u32 flags (1 = encrypted, 0 = plain) | count x (u16 nlen, name, u64 off, u32 len) | records.
+    An encrypted record is iv(12) || ct || tag(16) with aad pak_aad(pid, version, name);
+    key None writes plain records (the dev package's bundled corpus)."""
     groups, cur, size = [], [], 0
     for name, b in records:
         if cur and size + len(b) + 28 > pack_bytes:
@@ -110,6 +111,10 @@ def build_packs(records, pid, version, key, pack_bytes):
             nb = name.encode('ascii')
             if not 0 < len(nb) < 256:
                 die(f'record name {name!r} must be 1..255 ASCII bytes')
+            if key is None:
+                if not b:
+                    die(f'record {name!r} is empty')
+                sealed.append((nb, b)); continue
             iv = os.urandom(12)
             sealed.append((nb, iv + AESGCM(key).encrypt(iv, b, pak_aad(pid, version, name))))
         hdr = 16 + sum(2 + len(nb) + 12 for nb, _ in sealed)
@@ -117,7 +122,7 @@ def build_packs(records, pid, version, key, pack_bytes):
         for nb, rec in sealed:
             table.append(struct.pack('<H', len(nb)) + nb + struct.pack('<QI', off, len(rec)))
             body.append(rec); off += len(rec)
-        out.append(PAK_MAGIC + struct.pack('<II', len(sealed), 1) + b''.join(table) + b''.join(body))
+        out.append(PAK_MAGIC + struct.pack('<II', len(sealed), 0 if key is None else 1) + b''.join(table) + b''.join(body))
     return out
 
 
@@ -269,6 +274,31 @@ def cmd_title(a):
                 ['title:' + t['id']], [], files, a.sealed, a.keys_dir, a.auto)
 
 
+def corpus_records(dir_, overlay):
+    """gh_*.bin blobs of dir_, then overlay's (which win), named without .bin."""
+    recs = {}
+    for d in [dir_] + ([overlay] if overlay else []):
+        for n in sorted(os.listdir(d)):
+            if n.startswith('gh_') and n.endswith('.bin'):
+                with open(os.path.join(d, n), 'rb') as f:
+                    recs[n[:-4]] = f.read()
+    if not recs:
+        die(f'{dir_} has no gh_*.bin blobs')
+    return recs
+
+
+def cmd_bundle(a):
+    """The dev package's corpus as a few PLAIN packs (guest\\ghlo\\packNN.ghpak) instead of
+    ~13.5k loose blobs: the MSIX registers per file, and those made a deploy take ~9 min."""
+    recs = corpus_records(a.dir, a.overlay)
+    packs = build_packs(sorted(recs.items()), None, None, None, a.pack_mb << 20)
+    os.makedirs(a.out, exist_ok=True)
+    for i, b in enumerate(packs):
+        with open(os.path.join(a.out, f'pack{i:02d}.ghpak'), 'wb') as f:
+            f.write(b)
+    print(f'  bundle: {len(recs)} records in {len(packs)} plain pack(s), {sum(map(len, packs)) >> 20} MB')
+
+
 def cmd_corpus(a):
     """A members-only data add-on of *.ghpak packs (shader corpus). Records are named by their
     file name without .bin (gh_lo_<key>, gh_tl_<key>); --overlay files win over --dir's."""
@@ -277,14 +307,7 @@ def cmd_corpus(a):
         die(f'id {pid!r} is not a safe id')
     ver_tuple(version)
     keys_dir = outside_tree(a.keys_dir or DEFAULT_KEYS_DIR, 'artifact keys')
-    recs = {}
-    for d in [a.dir] + ([a.overlay] if a.overlay else []):
-        for n in sorted(os.listdir(d)):
-            if n.startswith('gh_') and n.endswith('.bin'):
-                with open(os.path.join(d, n), 'rb') as f:
-                    recs[n[:-4]] = f.read()
-    if not recs:
-        die(f'{a.dir} has no gh_*.bin blobs')
+    recs = corpus_records(a.dir, a.overlay)
     key = os.urandom(32)
     packs = build_packs(sorted(recs.items()), pid, version, key, a.pack_mb << 20)
     blobs = {f'pack{i:02d}.ghpak': b for i, b in enumerate(packs)}
@@ -509,6 +532,8 @@ def main():
     s.add_argument('--version', required=True); s.add_argument('--name'); s.add_argument('--min-loader')
     s.add_argument('--dir', required=True); s.add_argument('--overlay'); s.add_argument('--pack-mb', type=int, default=64)
     s.add_argument('--keys-dir'); s.add_argument('--auto', action='store_true'); s.set_defaults(fn=cmd_corpus)
+    s = sp.add_parser('bundle'); s.add_argument('--dir', required=True); s.add_argument('--overlay')
+    s.add_argument('--out', required=True); s.add_argument('--pack-mb', type=int, default=64); s.set_defaults(fn=cmd_bundle)
     s = sp.add_parser('vendor'); s.add_argument('--repo', required=True); s.add_argument('--version', required=True)
     s.add_argument('--zip', help='a local copy of the vendor zip (else it is downloaded)'); s.add_argument('--min-loader')
     s.add_argument('spec'); s.set_defaults(fn=cmd_vendor)

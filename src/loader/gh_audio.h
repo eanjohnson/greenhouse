@@ -5,6 +5,10 @@
 // only touch the ring + WAVEHDR queue under g_audioMu.
 #pragma once
 
+// The real declarations, so that a later <mmsystem.h> (the x86 beds include it)
+// does not meet the hand-written ones below, kept for builds that cannot see it.
+#include <mmsystem.h>
+
 #ifndef MMSYSERR_NOERROR
 typedef UINT MMRESULT;
 #define MMSYSERR_NOERROR      0
@@ -82,8 +86,9 @@ typedef struct { WORD wMid, wPid; UINT vDriverVersion; CHAR szPname[MAXPNAMELEN]
 typedef struct { WORD wMid, wPid; UINT vDriverVersion; WCHAR szPname[MAXPNAMELEN];
                  DWORD dwFormats; WORD wChannels, wReserved1; } WAVEINCAPSW;
 DECLARE_HANDLE(HWAVEIN);
-typedef void (CALLBACK *WAVEINPROC)(HWAVEIN, UINT, DWORD_PTR, DWORD_PTR, DWORD_PTR);
 #endif
+// Ours, not the SDK's: mmsystem.h has no name for a waveIn callback.
+typedef void (CALLBACK *WAVEINPROC)(HWAVEIN, UINT, DWORD_PTR, DWORD_PTR, DWORD_PTR);
 
 static const HWAVEIN kGhWaveIn = (HWAVEIN)(uintptr_t)0x1A0D1001;
 static const int     kGhCapRate = 48000;

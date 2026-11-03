@@ -28,6 +28,7 @@
 
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <d3d9.h>      // gh_x86_com_gen.h registers the D3D9 interfaces too
 
 #include "gh_x86_com.h"
 #include "gh_x86_com_gen.h"
@@ -136,9 +137,11 @@ inline uint64_t com_map(Machine& m, const uint32_t* a)
     if (!b) { map_bounces().push_back(MapBounce{}); b = &map_bounces().back(); }
 
     if (b->cap < need) {
-        const uint32_t g = m.heap_alloc((uint32_t)need, false);
+        // 64-aligned: D3D11 promises 16-byte-aligned Map pointers and SSE
+        // streaming stores (movntps) #GP on less; the guest heap gives 8.
+        const uint32_t g = m.heap_alloc((uint32_t)need + 64, false);
         if (!g) { self->Unmap(res, sub); return (uint64_t)(uint32_t)E_OUTOFMEMORY; }
-        b->guest = g;
+        b->guest = (g + 63u) & ~63u;
         b->cap   = (uint32_t)need;
     }
     b->res = res; b->sub = sub; b->host = ms.pData; b->size = need;
@@ -738,6 +741,8 @@ inline void com_apply_overrides(ComState& c)
 // Registration is lazy: a guest that never draws should not spend a thunk slot,
 // a guest heap block or a millisecond on any of this. The first DXGI factory or
 // D3D11 device the guest asks for brings the whole surface up.
+inline void com_register_d3d9(ComState& c);   // gh_x86_com_d3d9.h
+
 inline void com_bringup(Machine& m)
 {
     ComState& c = com();
@@ -746,6 +751,7 @@ inline void com_bringup(Machine& m)
     c.mach  = &m;
     com_register_generated(c);
     com_apply_overrides(c);
+    com_register_d3d9(c);
     log("X86 COM " + std::to_string(c.ifaces.size()) + " interfaces registered");
     c.log_poison_audit();
 }

@@ -165,5 +165,28 @@ PYEOF
 out=$(wine "$W/t.exe" pak "$PAKW" corpus-a 1.0.0.0 "$PK" "$LAST" | tr -d '\r' || true)
 grep -q 'does not decrypt' <<<"$out" && echo "  ok   tampered record refused" || fail "pak tampered: $out"
 
+# Plain packs (the dev package's bundled corpus, ghpkg.py bundle).
+mkdir -p "$W/plain"
+python3 - "$W" <<'PYEOF'
+import os, sys, random, hashlib
+sys.path.insert(0, '$HOME/greenhouse/toolchain')
+import ghpkg
+W = sys.argv[1]
+random.seed(8)
+recs = [(f'gh_lo_{i:016x}', os.urandom(random.randint(1, 40000))) for i in range(300)]
+for i, p in enumerate(ghpkg.build_packs(recs, None, None, None, 2 << 20)):
+    open(f'{W}/plain/pack{i:02d}.ghpak', 'wb').write(p)
+n, b = recs[211]
+open(f'{W}/pwant', 'w').write(f'{n} {hashlib.sha256(b).hexdigest()}\n')
+PYEOF
+read PNAME PWANT < "$W/pwant"
+PLW="$(winepath -w "$W/plain")"
+out=$(wine "$W/t.exe" pak "$PLW" bundle "" plain "$PNAME" | tr -d '\r' || true)
+grep -q "^PAK sha256 $PWANT" <<<"$out" && echo "  ok   plain record round-trips ($(head -1 <<<"$out"))" || fail "plain pak: $out"
+out=$(wine "$W/t.exe" pak "$PLW" corpus-a 1.0.0.0 "$PK" "$PNAME" | tr -d '\r' || true)
+grep -q 'bad pack header' <<<"$out" && echo "  ok   plain pack refused by a keyed store" || fail "plain as keyed: $out"
+out=$(wine "$W/t.exe" pak "$PAKW" bundle "" plain "$NAME" | tr -d '\r' || true)
+grep -q 'bad pack header' <<<"$out" && echo "  ok   keyed pack refused by a plain store" || fail "keyed as plain: $out"
+
 [ $rc = 0 ] && echo "ALL PASSED" || echo "SOME FAILED"
 exit $rc

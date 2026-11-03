@@ -22,6 +22,8 @@
 #include <functional>
 #include <thread>
 #include <string>
+#include <mutex>
+#include <unordered_map>
 #include <deque>
 #include <vector>
 
@@ -36,6 +38,18 @@ namespace ghx86 {
 // the loader's Diag directly) so this header stays independent of guest_loader.
 inline std::function<void(const std::string&)> g_log;
 inline void log(const std::string& s) { if (g_log) g_log(s); }
+// For lines a guest can repeat in a retry loop (HL2 calls SteamAPI_Init ~250
+// times a second, 55k diag lines in 30 s): the first kLogRepeats of each key,
+// then one line at every power-of-two count after that.
+inline void log_capped(const std::string& key, const std::string& s) {
+    constexpr uint32_t kLogRepeats = 8;
+    static std::mutex mu;
+    static std::unordered_map<std::string, uint32_t> seen;
+    uint32_t n;
+    { std::lock_guard<std::mutex> lk(mu); n = ++seen[key]; }
+    if (n <= kLogRepeats) log(n == kLogRepeats ? s + " (repeats suppressed)" : s);
+    else if ((n & (n - 1)) == 0) log(s + " (x" + std::to_string(n) + ")");
+}
 
 inline std::string hex(uint64_t v)
 {
@@ -194,6 +208,24 @@ struct BedState {
     uint32_t win_w = 1920, win_h = 1080;   // the console's own framebuffer
     int      inject_idx = 0;               // position in the activation sequence
     bool     quit_posted = false;
+    // SetWindowLong stores, by index (GWL_WNDPROC goes to `wndproc` instead):
+    // Source's inputsystem subclasses the game window and keeps `this` in
+    // GWL_USERDATA, then reads both back.
+    std::unordered_map<int32_t, uint32_t> win_long;
+    // Every window that is not the game's (a 0x0 child, a message-only helper)
+    // is a SubWindow with its own procedure and long slots. HL2's shaderapidx9
+    // registers a class of its own and makes a WS_CHILD of the game window after
+    // the engine's chain is in place; while there was one `wndproc` for
+    // everything, that registration took every dispatch, and no key or WM_INPUT
+    // reached the inputsystem again (s867).
+    struct SubWindow {
+        uint32_t proc = 0;
+        std::unordered_map<int32_t, uint32_t> longs;
+    };
+    std::unordered_map<uint32_t, SubWindow> sub_windows;    // HWND -> window; never kFakeHwnd
+    std::unordered_map<std::string, uint32_t> class_proc;   // lowercased name, or "#atom" -> WndProc
+    uint32_t next_atom = 0xC000, next_sub_hwnd = 2;
+    bool     main_window_made = false;
 
     // Vectored exception handlers. Guest code, so they cannot be handed to the
     // host's AddVectoredExceptionHandler -- the host CPU cannot call them. They
@@ -249,6 +281,15 @@ inline std::string ordinal_name(const std::string& dll, uint32_t ord)
     std::string d = dll;
     for (auto& c : d) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
     if (d == "ws2_32.dll" || d == "wsock32.dll") {
+        // WSOCK32 (Winsock 1.1) shares WS2_32's numbering except 10-12, which it
+        // orders inet_addr, inet_ntoa, ioctlsocket. HL2's engine imports WSOCK32
+        // by ordinal; with the WS2_32 order its inet_addr ran ioctlsocket, whose
+        // 12-byte stdcall pop restored edi/esi out of the "127.0.0.1" buffer.
+        if (d == "wsock32.dll") {
+            if (ord == 10) return "inet_addr";
+            if (ord == 11) return "inet_ntoa";
+            if (ord == 12) return "ioctlsocket";
+        }
         static const char* k[] = {
             /*  0 */ nullptr,
             "accept", "bind", "closesocket", "connect", "getpeername",
@@ -445,6 +486,11 @@ struct SyncObj {
     std::wstring name;                // named objects are matched by name
 };
 
+// Where the 32-bit system DLLs we build ourselves live (guest\x86\ in the
+// package); see resolve_dll_path. Set by the host before a run, with its
+// trailing backslash.
+inline std::wstring g_x86_sys_dir;
+
 struct Machine {
     // The watchdog is a real host thread, so it has to be joined before the
     // members it reads go away.
@@ -463,6 +509,13 @@ struct Machine {
     // TLS_MINIMUM_AVAILABLE and fits inside the TEB page: 0xE10 + 64*4 = 0xF10.
     static constexpr uint32_t kTlsBase  = 0xE10;
     static constexpr uint32_t kTlsSlots = 64;
+    // Then 1024 more, as Windows has them: TEB32+0xF94 (TlsExpansionSlots)
+    // points at a per-thread array, made on the thread's first store. Source's
+    // CThreadLocal takes one index per object and runs past 64 by the time
+    // client/server are in ("Out of thread local storage!", s841). Native
+    // runtime only; the interpreter's beds still stop at 64.
+    static constexpr uint32_t kTlsExpOffset = 0xF94;
+    static constexpr uint32_t kTlsExpSlots  = 1024;
 
     // deque for the same reason `thunks` is one: a bed can hold a GuestThread&
     // across a call that spawns another thread, and a vector would reallocate
@@ -473,6 +526,7 @@ struct Machine {
     uint32_t next_tid  = 0;
     uint32_t next_sync = 0;
     bool     tls_used[kTlsSlots] = {};
+    bool     tls_exp_used[kTlsExpSlots] = {};
 
     // Instructions a thread runs before it is preempted. Large enough that the
     // context-switch cost is noise, small enough that a spin loop cannot starve
@@ -631,9 +685,10 @@ struct Machine {
         put(t.teb + 0x08, t.stack_limit); // StackLimit (low)
         put(t.teb + 0x18, t.teb);         // Self
         put(t.teb + 0x24, t.id);          // ClientId.UniqueThread
-        put(t.teb + 0x2C, 0);             // ThreadLocalStoragePointer -- static TLS, still unbuilt
+        put(t.teb + 0x2C, 0);             // ThreadLocalStoragePointer: tls_thread_init
         put(t.teb + 0x30, peb);           // ProcessEnvironmentBlock
         put(t.teb + 0x34, 0);             // LastErrorValue
+        tls_thread_init(t.teb);           // no-op for thread 0: no heap yet
         return true;
     }
 
@@ -955,6 +1010,15 @@ struct Machine {
 
     static constexpr uint32_t kDefaultStack = 1u << 20;    // 1 MB
 
+    // What alloc and load_image commit guest pages as. PAGE_READWRITE under the
+    // interpreter (see alloc); the native runtime executes guest code on the CPU
+    // and patches fs: prefixes in place, so it sets PAGE_EXECUTE_READWRITE.
+    DWORD commit_protect = PAGE_READWRITE;
+
+    // Set by the native runtime: guest code is entered on the CPU rather than
+    // interpreted, so a bed's call back into the guest goes through this.
+    uint32_t (*native_call)(Machine&, uint32_t func, const uint32_t* args, int nargs) = nullptr;
+
     // Reserves the guest address space. Everything the guest can hold a pointer
     // to is carved out of this.
     bool reserve(uint32_t bytes)
@@ -1038,7 +1102,7 @@ struct Machine {
         // makes the invariant the rest of this file already assumes TRUE.
         const uint32_t from = brk ? brk : base;      // both page-aligned
         if (!VirtualAlloc((void*)(uintptr_t)from, (base + size) - from,
-                          MEM_COMMIT, PAGE_READWRITE)) {
+                          MEM_COMMIT, commit_protect)) {
             err = "commit failed at " + hex(from) + " err=" + std::to_string(GetLastError());
             return 0;
         }
@@ -1152,14 +1216,14 @@ struct Machine {
         // still free; otherwise take whatever the bump allocator gives and relocate.
         uint32_t want = info.image_base;
         if (want >= region_base && (uint64_t)want + image_size <= (uint64_t)region_base + region_size &&
-            VirtualAlloc((void*)(uintptr_t)want, image_size, MEM_COMMIT, PAGE_READWRITE)) {
+            VirtualAlloc((void*)(uintptr_t)want, image_size, MEM_COMMIT, commit_protect)) {
             std::memset((void*)(uintptr_t)want, 0, image_size);
             image_base = want;
             // Close any gap this leaves below the image, so that "committed
             // below brk" stays literally true -- guest_region_query answers
             // VirtualQuery from that invariant and nothing else.
             if (brk < want)
-                VirtualAlloc((void*)(uintptr_t)brk, want - brk, MEM_COMMIT, PAGE_READWRITE);
+                VirtualAlloc((void*)(uintptr_t)brk, want - brk, MEM_COMMIT, commit_protect);
             note_block(want, want + image_size);
             if (brk < want + image_size) brk = want + image_size;
         } else {
@@ -1175,6 +1239,7 @@ struct Machine {
 
         pe32_imports(img, info, imports, err);
         pe32_tls(img, info, tls);
+        exe_tls = tls_add_module(tls, image_base, "exe");
 
         entry = image_base + info.entry_rva;
         log("X86 image " + hex(image_base) + " size " + hex(image_size) +
@@ -2549,6 +2614,10 @@ struct Machine {
         std::wstring b = (cut == std::wstring::npos) ? p : p.substr(cut + 1);
         std::string s;
         for (wchar_t c : b) s += (char)((c >= L'A' && c <= L'Z') ? c - L'A' + 'a' : c);
+        // The loader's module-name rule: no extension means ".dll" (vgui asks
+        // GetModuleHandleA("kernel32")), and a trailing dot means none at all.
+        if (!s.empty() && s.back() == '.') s.pop_back();
+        else if (s.find('.') == std::string::npos && !s.empty()) s += ".dll";
         return s;
     }
 
@@ -2574,25 +2643,65 @@ struct Machine {
         return ok;
     }
 
-    // Where a DLL name resolves to on disk. A bare name is looked for beside the
-    // guest's own exe, which is where a game keeps the libraries it ships --
+    // Where a DLL name resolves to on disk. A bare name is looked for in the
+    // importing DLL's own folder (`from_dir`, what LOAD_WITH_ALTERED_SEARCH_PATH
+    // does), beside the guest's exe, then in each folder of the GUEST's PATH --
     // never on a system search path, because there is no 32-bit system to search.
-    std::wstring resolve_dll_path(const std::wstring& want)
+    // Half-Life 2's hl2.exe sits in the game root, sets PATH=<root>\bin\;... and
+    // loads bin\launcher.dll by full path; launcher's tier0/vstdlib/steam_api
+    // are beside it in bin\, and binding them as beds instead handed launcher a
+    // thunk address for tier0's g_pMemAlloc data export.
+    std::wstring resolve_dll_path(const std::wstring& want, const std::wstring& from_dir = std::wstring())
     {
-        if (want.find(L'\\') != std::wstring::npos || want.find(L'/') != std::wstring::npos) {
-            if (GetFileAttributesW(want.c_str()) != INVALID_FILE_ATTRIBUTES) return want;
-            return std::wstring();
-        }
+        auto exists = [](const std::wstring& p) {
+            return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+        };
+        if (want.find(L'\\') != std::wstring::npos || want.find(L'/') != std::wstring::npos)
+            return exists(want) ? want : std::wstring();
+        if (!from_dir.empty() && exists(from_dir + want)) return from_dir + want;
         std::wstring p = guest_dir() + want;
-        if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return p;
+        if (exists(p)) return p;
+        for (auto& kv : bed.env) {
+            if (_wcsicmp(kv.first.c_str(), L"PATH") != 0) continue;
+            const std::wstring& v = kv.second;
+            for (size_t s = 0; s < v.size();) {
+                size_t e = v.find(L';', s);
+                if (e == std::wstring::npos) e = v.size();
+                std::wstring d = v.substr(s, e - s);
+                s = e + 1;
+                // Only absolute folders: a relative entry would resolve against
+                // our process's cwd, not the game's.
+                if (d.size() < 3 || d[1] != L':') continue;
+                if (d.back() != L'\\' && d.back() != L'/') d += L'\\';
+                if (exists(d + want)) return d + want;
+            }
+            break;
+        }
+        // Last, the guest system folder: the few 32-bit system DLLs we build
+        // ourselves (msvcrt.dll) because a mingw-built game library links them
+        // and there is no SysWOW64 to find them in. After the game's own
+        // folders, so a game that ships its own copy keeps it.
+        if (!g_x86_sys_dir.empty() && exists(g_x86_sys_dir + want)) return g_x86_sys_dir + want;
         return std::wstring();
+    }
+
+    static std::wstring dir_of(const std::wstring& path)
+    {
+        size_t cut = path.find_last_of(L"\\/");
+        return (cut == std::wstring::npos) ? std::wstring() : path.substr(0, cut + 1);
     }
 
     // Resolves one import of a mapped guest DLL: another guest DLL's export
     // first, then a bed. Returns a guest-callable address either way.
-    uint32_t resolve_for_module(const std::string& dll, const std::string& name)
+    uint32_t resolve_for_module(const std::string& dll, const std::string& name,
+                                const std::string& raw = std::string())
     {
         if (GuestDll* d = dll_by_name(dll)) {
+            // The exact name first: a guest DLL exports what its importer asked
+            // for, and undecorate() turns msvcrt's _initterm into "initterm" --
+            // SDL2's TLS callback called that and found no such export.
+            if (!raw.empty() && raw != name)
+                if (uint32_t a = export_addr(*d, raw, 0)) return a;
             uint32_t a = export_addr(*d, name, 0);
             if (a) return a;
         }
@@ -2673,15 +2782,18 @@ struct Machine {
 
             // A dependency the game ships is loaded rather than bedded.
             if (!dll_by_name(idll)) {
-                std::wstring dep = resolve_dll_path(std::wstring(idll.begin(), idll.end()));
+                std::wstring dep = resolve_dll_path(std::wstring(idll.begin(), idll.end()), dir_of(path));
                 if (!dep.empty()) load_guest_dll(dep, depth + 1);
             }
-            uint32_t addr = resolve_for_module(idll, iname);
+            uint32_t addr = resolve_for_module(idll, iname, imp.name);
             if (dll_by_name(idll)) from_guest++;
             if (addr && imp.iat_rva && (uint64_t)imp.iat_rva + 4 <= mod.info.image_size)
                 std::memcpy((void*)(uintptr_t)(mod.base + imp.iat_rva), &addr, 4);
         }
 
+#ifdef GH_LAUNCHER
+        GhNoteX86Module(nm, mod.base);
+#endif
         log("X86 mapped " + nm + " at " + hex(mod.base) + " size " + hex(mod.size) +
             " exports=" + std::to_string(mod.exports.size()) +
             " imports=" + std::to_string(imps.size()) +
@@ -2692,6 +2804,11 @@ struct Machine {
         // a probe might be watching happens in there.
         if (dll_loaded_hook) dll_loaded_hook(*this, mod);
 
+        Pe32Tls dtls;
+        if (pe32_tls(img, mod.info, dtls)) {
+            const int ti = tls_add_module(dtls, mod.base, nm);
+            if (ti >= 0) tls_callbacks(tls_mods[(size_t)ti], 1 /*DLL_PROCESS_ATTACH*/);
+        }
         if (mod.entry) {
             uint32_t base = mod.base, ep = mod.entry;
             uint32_t args[3] = { base, 1 /*DLL_PROCESS_ATTACH*/, 0 };
@@ -2707,6 +2824,92 @@ struct Machine {
         // the rest of the log is telling instead of needing their own probes.
         timing_mark(nm + " loaded");
         return mod.base;
+    }
+
+    // -- implicit TLS (__declspec(thread)) ------------------------------------
+    // Every module with a TLS directory gets the next index, written to its
+    // AddressOfIndex. TEB32+0x2C points at a per-thread array of kTlsModules
+    // dwords, one per index, each pointing at that thread's copy of the
+    // module's template (raw data, then SizeOfZeroFill zeroes). A DLL loaded
+    // later gets a block in every live thread, as Windows has done since
+    // Vista: HL2's steam_api.dll, LoadLibrary'd long after the threads started,
+    // reads fs:[0x2C] first thing and faulted on the 0 we used to leave there.
+    // Guest heap throughout, and every caller holds the gil in native mode.
+    static constexpr uint32_t kTlsModules = 64;
+    struct TlsModule { uint32_t raw_start = 0, raw_end = 0, zero_fill = 0, callbacks = 0, base = 0; };
+    std::vector<TlsModule> tls_mods;
+    int exe_tls = -1;   // its callbacks get PROCESS_ATTACH from the runtime, before the entry point
+
+    static uint32_t tls_rd(uint32_t at) { uint32_t v; std::memcpy(&v, (const void*)(uintptr_t)at, 4); return v; }
+    static void tls_wr(uint32_t at, uint32_t v) { std::memcpy((void*)(uintptr_t)at, &v, 4); }
+
+    uint32_t tls_block(const TlsModule& t)
+    {
+        const uint32_t raw = t.raw_end > t.raw_start ? t.raw_end - t.raw_start : 0;
+        const uint32_t want = raw + t.zero_fill;
+        const uint32_t p = heap_alloc(want < 4 ? 4u : want, true);
+        if (p && raw) std::memcpy((void*)(uintptr_t)p, (const void*)(uintptr_t)t.raw_start, raw);
+        return p;
+    }
+
+    // A new thread's TLS array, before it runs any guest code. The heap does
+    // not exist yet when thread 0 is built, so the runtimes call this again for
+    // it once init_heap has run; a second call on a built thread does nothing.
+    void tls_thread_init(uint32_t teb)
+    {
+        if (!teb || heap_segs.empty() || tls_rd(teb + 0x2C)) return;
+        const uint32_t arr = heap_alloc(kTlsModules * 4, true);
+        if (!arr) { log("X86 TLS: no memory for a thread's TLS array"); return; }
+        for (size_t i = 0; i < tls_mods.size(); ++i) tls_wr(arr + (uint32_t)i * 4, tls_block(tls_mods[i]));
+        tls_wr(teb + 0x2C, arr);
+    }
+    void tls_thread_free(uint32_t teb)
+    {
+        if (const uint32_t exp = teb ? tls_rd(teb + kTlsExpOffset) : 0) {
+            tls_wr(teb + kTlsExpOffset, 0);
+            heap_free(exp);
+        }
+        const uint32_t arr = teb ? tls_rd(teb + 0x2C) : 0;
+        if (!arr) return;
+        tls_wr(teb + 0x2C, 0);
+        for (size_t i = 0; i < tls_mods.size(); ++i)
+            if (const uint32_t b = tls_rd(arr + (uint32_t)i * 4)) heap_free(b);
+        heap_free(arr);
+    }
+
+    // Gives a module its index and a block in every thread that has an array.
+    // Returns the index, or -1 when the module has no TLS directory.
+    int tls_add_module(const Pe32Tls& t, uint32_t base, const std::string& who)
+    {
+        if (!t.present) return -1;
+        if (tls_mods.size() >= kTlsModules) { log("X86 TLS: more than 64 modules; " + who + " gets none"); return -1; }
+        TlsModule mod;
+        mod.raw_start = t.raw_start; mod.raw_end = t.raw_end; mod.zero_fill = t.zero_fill;
+        mod.callbacks = t.callbacks_va; mod.base = base;
+        const uint32_t idx = (uint32_t)tls_mods.size();
+        tls_mods.push_back(mod);
+        if (t.index_va) tls_wr(t.index_va, idx);
+        int filled = 0;
+        for (auto& th : threads) {
+            if (!th.teb || th.state == GuestThread::St::Done) continue;
+            if (const uint32_t arr = tls_rd(th.teb + 0x2C)) { tls_wr(arr + idx * 4, tls_block(mod)); ++filled; }
+        }
+        log("X86 TLS index " + std::to_string(idx) + " -> " + who + " (" +
+            std::to_string(mod.raw_end - mod.raw_start) + "+" + std::to_string(mod.zero_fill) + " bytes" +
+            (mod.callbacks && tls_rd(mod.callbacks) ? ", callbacks" : "") + ", " +
+            std::to_string(filled) + " live thread(s))");
+        return (int)idx;
+    }
+    // By value: a callback can load a DLL, and tls_mods is a vector.
+    void tls_callbacks(TlsModule t, uint32_t reason)
+    {
+        if (!t.callbacks) return;
+        for (uint32_t p = t.callbacks; ; p += 4) {
+            const uint32_t cb = tls_rd(p);
+            if (!cb) break;
+            uint32_t args[3] = { t.base, reason, 0 };
+            call_guest32(cb, args, 3);
+        }
     }
 
     // Windows tells every loaded DLL when a thread starts and when it ends, and
@@ -2725,8 +2928,12 @@ struct Machine {
     int dll_notify_reports = 4;
     void notify_dlls_thread(bool attach)
     {
-        if (dlls.empty()) return;
         const uint32_t reason = attach ? 2u /*DLL_THREAD_ATTACH*/ : 3u /*DLL_THREAD_DETACH*/;
+        // TLS callbacks first, as the loader does: they build what DllMain and
+        // the module's own __declspec(thread) data may rely on.
+        if (attach) { for (size_t i = 0; i < tls_mods.size(); ++i) tls_callbacks(tls_mods[i], reason); }
+        else        { for (size_t i = tls_mods.size(); i-- > 0;)    tls_callbacks(tls_mods[i], reason); }
+        if (dlls.empty()) return;
         int sent = 0;
         auto tell = [&](GuestDll& d) {
             if (!d.entry || !d.attached || d.no_thread_calls) return;
@@ -3799,6 +4006,7 @@ struct Machine {
     uint32_t call_guest32(uint32_t func, const uint32_t* args, int nargs,
                           bool stdcall_callee = true, uint64_t budget = 200000000ull)
     {
+        if (native_call) return native_call(*this, func, args, nargs);
         Cpu saved = cpu;                       // registers, eip, flags
 
         // Which guest function, for the thread table. By index rather than by

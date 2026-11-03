@@ -222,6 +222,11 @@ struct HostFn {
     // See ArgLayout::has_ptr_to_ptr_sized.
     bool        ptr_to_ptr_sized_args = false;
 
+    // True when invoke touches nothing in the Machine, so the native runtime
+    // (gh_x86_native.h) may run it on the calling thread without the bed lock.
+    // Every forward qualifies; a bed has to say so.
+    bool        lockless = false;
+
     // args points at [esp+4] in guest memory. Returns the 64-bit result; the
     // dispatcher splits it into EDX:EAX.
     uint64_t (*invoke)(Machine&, const uint32_t* args) = nullptr;
@@ -278,9 +283,17 @@ public:
     // forwards for names that have since become beds.
     void add(const HostFn& f)
     {
-        for (const auto& e : fns_) if (std::strcmp(e.name, f.name) == 0) return;
+        for (size_t i = 0; i < fns_.size(); ++i)
+            if (std::strcmp(fns_[i].name, f.name) == 0) { dropped_.push_back({ f.name, i }); return; }
         fns_.push_back(f);
     }
+
+    // What add() threw away, and the index of the entry that kept the name.
+    // Shadowing a forward or a green-thread bed is the point of the rule; one
+    // hand-written bed shadowing another is dead code nobody sees (HL2 s860:
+    // two gdi32 beds hid the DirectWrite ones, so vgui never made a font).
+    struct Dropped { const char* name; size_t winner; };
+    const std::vector<Dropped>& dropped() const { return dropped_; }
 
     const HostFn* find(const std::string& dll, const std::string& name) const
     {
@@ -303,6 +316,7 @@ public:
 
 private:
     std::vector<HostFn> fns_;
+    std::vector<Dropped> dropped_;
 };
 
 // Strips the 32-bit decoration a guest might carry: `_Foo@8` (stdcall) or
@@ -346,6 +360,7 @@ inline std::string undecorate(const std::string& s)
         f.ptr_sized_int_args = ghx86::thunk_has_ptr_sized_int((T)nullptr);            \
         f.callback_args = ghx86::thunk_has_callback((T)nullptr);                      \
         f.ptr_to_ptr_sized_args = ghx86::thunk_has_ptr_to_ptr_sized((T)nullptr);      \
+        f.lockless = true;                                                            \
         f.invoke = [](ghx86::Machine&, const uint32_t* sp) -> uint64_t {              \
             return ghx86::detail::call_typed(&FUNC, sp,                               \
                        std::make_index_sequence<ghx86::thunk_argc_of((T)nullptr)>{}); \
@@ -379,6 +394,7 @@ inline std::string undecorate(const std::string& s)
             f.ptr_sized_int_args = ghx86::thunk_has_ptr_sized_int((T)nullptr);        \
             f.callback_args = ghx86::thunk_has_callback((T)nullptr);                  \
             f.ptr_to_ptr_sized_args = ghx86::thunk_has_ptr_to_ptr_sized((T)nullptr);  \
+            f.lockless = true;                                                        \
             f.invoke = [](ghx86::Machine&, const uint32_t* sp) -> uint64_t {          \
                 return ghx86::detail::call_typed(pfn_, sp,                            \
                     std::make_index_sequence<ghx86::thunk_argc_of((T)nullptr)>{});    \

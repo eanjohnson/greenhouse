@@ -31,12 +31,21 @@ struct GhGdiObj {
     std::shared_ptr<GhGdiFont> font;                         // Font
     HGDIOBJ selFont = nullptr, selBmp = nullptr;             // Dc
     int mapMode = MM_TEXT; UINT align = TA_TOP | TA_LEFT;    // Dc
+    int cpX = 0, cpY = 0;                                    // Dc: MoveToEx's current position
+    COLORREF textColor = 0, bkColor = 0xFFFFFF; int bkMode = OPAQUE;   // Dc
     void* bits = nullptr; BITMAPINFOHEADER bi{}; LONG stride = 0;   // Bmp
     void* view = nullptr;                                    // Bmp over a caller's section: the mapped view
 };
 static SRWLOCK g_gdiLock = SRWLOCK_INIT;
 static std::unordered_map<HGDIOBJ, GhGdiObj>* g_gdiObjs = nullptr;
 static uintptr_t g_gdiNext = 0x00006E6800000000ull;   // beside the regions' 0x6E67 range
+// A 32-bit guest holds our handles as their low 32 bits (gh_x86_gdi.h), so those
+// stay below 0x10000: real GDI handles carry their object type in bits 16-22 and
+// are never that small. GhGdiNew wraps there and skips handles still live.
+static constexpr uint32_t kGhGdiLowSpan = 0x10000;
+// Where a DIB's bits come from. A 32-bit guest needs them below 4 GB, so its
+// runtime sets this (gh_x86_gdi.h); the memory must be VirtualFree(MEM_RELEASE)-able.
+static void* (*g_gdiBitsAlloc)(SIZE_T) = nullptr;
 
 static IDWriteFactory2*                g_dw2 = nullptr;
 static IDWriteFactory5*                g_dw5 = nullptr;        // custom fonts need 5 (in-memory loader)
@@ -200,8 +209,12 @@ static wchar_t GhAnsiChar(UINT ch){
 static HGDIOBJ GhGdiNew(GhGdiObj&& o){
     AcquireSRWLockExclusive(&g_gdiLock);
     if (!g_gdiObjs) g_gdiObjs = new std::unordered_map<HGDIOBJ, GhGdiObj>();
-    g_gdiNext += 4;
-    HGDIOBJ h = (HGDIOBJ)g_gdiNext;
+    HGDIOBJ h = nullptr;
+    do {
+        g_gdiNext += 4;
+        if ((uint32_t)g_gdiNext >= kGhGdiLowSpan) g_gdiNext = 0x00006E6800000004ull;
+        h = (HGDIOBJ)g_gdiNext;
+    } while (g_gdiObjs->count(h));
     (*g_gdiObjs)[h] = std::move(o);
     ReleaseSRWLockExclusive(&g_gdiLock);
     return h;
@@ -431,9 +444,9 @@ static DWORD WINAPI Bed_GetFontUnicodeRanges(HDC dc, LPGLYPHSET gs){
     return size;
 }
 // Source only asks whether the face exists (its callback sets a flag); every face does.
-static int WINAPI Bed_EnumFontFamiliesExA(HDC, LPLOGFONTA lf, FONTENUMPROCA cb, LPARAM lp, DWORD){
-    if (!cb) return 0;
-    ENUMLOGFONTEXA elf{}; NEWTEXTMETRICEXA ntm{};
+// The one record every enumeration reports (the x86 bed fills guest copies with it).
+static void GhFontEnumRecord(const LOGFONTA* lf, ENUMLOGFONTEXA& elf, NEWTEXTMETRICEXA& ntm){
+    elf = ENUMLOGFONTEXA{}; ntm = NEWTEXTMETRICEXA{};
     if (lf) elf.elfLogFont = *lf;
     if (!elf.elfLogFont.lfFaceName[0]) strcpy_s(elf.elfLogFont.lfFaceName, "Segoe UI");
     memcpy(elf.elfFullName, elf.elfLogFont.lfFaceName, LF_FACESIZE);
@@ -442,6 +455,11 @@ static int WINAPI Bed_EnumFontFamiliesExA(HDC, LPLOGFONTA lf, FONTENUMPROCA cb, 
     ntm.ntmTm.tmHeight = 16; ntm.ntmTm.tmAscent = 13; ntm.ntmTm.tmDescent = 3; ntm.ntmTm.tmWeight = FW_NORMAL;
     ntm.ntmTm.tmCharSet = elf.elfLogFont.lfCharSet; ntm.ntmTm.tmPitchAndFamily = TMPF_TRUETYPE | TMPF_VECTOR | TMPF_FIXED_PITCH;
     ntm.ntmTm.ntmFlags = NTM_REGULAR | NTM_TT_OPENTYPE; ntm.ntmTm.ntmSizeEM = 2048;
+}
+static int WINAPI Bed_EnumFontFamiliesExA(HDC, LPLOGFONTA lf, FONTENUMPROCA cb, LPARAM lp, DWORD){
+    if (!cb) return 0;
+    ENUMLOGFONTEXA elf; NEWTEXTMETRICEXA ntm;
+    GhFontEnumRecord(lf, elf, ntm);
     return cb((const LOGFONTA*)&elf, (const TEXTMETRICA*)&ntm, TRUETYPE_FONTTYPE, lp);
 }
 static int WINAPI Bed_AddFontResourceA(LPCSTR path){
@@ -476,6 +494,94 @@ static int WINAPI Bed_AddFontResourceA(LPCSTR path){
     return SUCCEEDED(hr) ? 1 : 0;
 }
 static BOOL WINAPI Bed_RemoveFontResourceA(LPCSTR){ return TRUE; }   // the custom set lives as long as the process
+static int WINAPI Bed_AddFontResourceExA(LPCSTR path, DWORD, PVOID){ return Bed_AddFontResourceA(path); }   // FR_PRIVATE is all we do
+
+// The render-to-bitmap half of vgui's CWin32Font::GetCharRGBA. A font that is
+// not antialiased (or a glyph GetGlyphOutline(GGO_GRAY8) answers 0 for) is drawn
+// with ExtTextOutW into the DIB selected into the DC: OPAQUE background in the
+// bk colour, the glyph in the text colour, at the current position (vgui sets
+// TA_UPDATECP and MoveToEx(-A, 0) first). Pixels are 32-bit BGRX.
+static BOOL WINAPI Bed_MoveToEx(HDC dc, int x, int y, LPPOINT old){
+    if (!GhGdiIsOurs(dc)){ GH_REAL_GDI(L"gdi32.dll", MoveToEx, FALSE); return r_MoveToEx(dc, x, y, old); }
+    GhGdiGuard g; GhGdiObj* d = GhGdiAt(dc, GhGdiKind::Dc); if (!d) return FALSE;
+    if (old){ old->x = d->cpX; old->y = d->cpY; }
+    d->cpX = x; d->cpY = y; return TRUE;
+}
+static COLORREF WINAPI Bed_SetTextColor(HDC dc, COLORREF c){
+    if (!GhGdiIsOurs(dc)){ GH_REAL_GDI(L"gdi32.dll", SetTextColor, CLR_INVALID); return r_SetTextColor(dc, c); }
+    GhGdiGuard g; GhGdiObj* d = GhGdiAt(dc, GhGdiKind::Dc); if (!d) return CLR_INVALID;
+    const COLORREF prev = d->textColor; d->textColor = c; return prev;
+}
+static COLORREF WINAPI Bed_SetBkColor(HDC dc, COLORREF c){
+    if (!GhGdiIsOurs(dc)){ GH_REAL_GDI(L"gdi32.dll", SetBkColor, CLR_INVALID); return r_SetBkColor(dc, c); }
+    GhGdiGuard g; GhGdiObj* d = GhGdiAt(dc, GhGdiKind::Dc); if (!d) return CLR_INVALID;
+    const COLORREF prev = d->bkColor; d->bkColor = c; return prev;
+}
+static int WINAPI Bed_SetBkMode(HDC dc, int mode){
+    if (!GhGdiIsOurs(dc)){ GH_REAL_GDI(L"gdi32.dll", SetBkMode, 0); return r_SetBkMode(dc, mode); }
+    GhGdiGuard g; GhGdiObj* d = GhGdiAt(dc, GhGdiKind::Dc); if (!d) return 0;
+    const int prev = d->bkMode; d->bkMode = mode; return prev;
+}
+static BOOL GhTextOut(HDC dc, int x, int y, UINT opts, const RECT* clip, const wchar_t* s, UINT n, const INT* dx){
+    GhGdiGuard g;
+    GhGdiObj* d = GhGdiAt(dc, GhGdiKind::Dc);
+    GhGdiObj* b = d ? GhGdiAt(d->selBmp, GhGdiKind::Bmp) : nullptr;
+    GhGdiFont* f = GhDcFont(dc);
+    if (!d || !f) return FALSE;
+    const bool upd = (d->align & TA_UPDATECP) != 0;
+    int px = upd ? d->cpX : x, py = upd ? d->cpY : y;
+    if ((d->align & (TA_BASELINE | TA_BOTTOM)) == TA_BASELINE) py -= f->asc;
+    else if ((d->align & (TA_BASELINE | TA_BOTTOM)) == TA_BOTTOM) py -= f->asc + f->desc;
+    const bool canDraw = b && b->bits && b->bi.biBitCount == 32;
+    static volatile LONG logged = 0;
+    if (InterlockedIncrement(&logged) <= 4)
+        Diag("FONT ExtTextOut n=" + std::to_string(n) + " at " + std::to_string(px) + "," + std::to_string(py) +
+             " bmp=" + (b ? std::to_string(b->bi.biWidth) + "x" + std::to_string(b->bi.biHeight) + "x" + std::to_string(b->bi.biBitCount) : std::string("none")) +
+             " bk=" + std::to_string(d->bkMode) + (canDraw ? "" : " NOT DRAWN"));
+    const LONG W = canDraw ? b->bi.biWidth : 0, H = canDraw ? (b->bi.biHeight < 0 ? -b->bi.biHeight : b->bi.biHeight) : 0;
+    auto at = [&](LONG xx, LONG yy) -> uint32_t* {
+        if (xx < 0 || yy < 0 || xx >= W || yy >= H) return nullptr;
+        if (clip && (opts & ETO_CLIPPED) && (xx < clip->left || xx >= clip->right || yy < clip->top || yy >= clip->bottom)) return nullptr;
+        const LONG row = b->bi.biHeight < 0 ? yy : H - 1 - yy;
+        return (uint32_t*)((uint8_t*)b->bits + (size_t)row * b->stride) + xx;
+    };
+    auto bgrx = [](COLORREF c) -> uint32_t { return (uint32_t)GetBValue(c) | ((uint32_t)GetGValue(c) << 8) | ((uint32_t)GetRValue(c) << 16); };
+    const uint32_t fg = bgrx(d->textColor), bk = bgrx(d->bkColor);
+    if (canDraw && (opts & ETO_OPAQUE) && clip)
+        for (LONG yy = clip->top; yy < clip->bottom; ++yy) for (LONG xx = clip->left; xx < clip->right; ++xx) if (uint32_t* p = at(xx, yy)) *p = bk;
+    for (UINT i = 0; i < n; ++i){
+        const GhGlyph& gl = GhDwGlyph(*f, GhDwIndex(*f, s[i]));
+        if (canDraw){
+            if (d->bkMode == OPAQUE)
+                for (int yy = 0; yy < f->asc + f->desc; ++yy) for (int xx = 0; xx < gl.adv; ++xx) if (uint32_t* p = at(px + xx, py + yy)) *p = bk;
+            const LONG gw = gl.box.right - gl.box.left, gh = gl.box.bottom - gl.box.top;
+            for (LONG yy = 0; !gl.px.empty() && yy < gh; ++yy)
+                for (LONG xx = 0; xx < gw; ++xx){
+                    const uint8_t cov = gl.px[(size_t)yy * gw + xx];
+                    if (!cov) continue;
+                    uint32_t* p = at(px + gl.box.left + xx, py + f->asc + gl.box.top + yy);
+                    if (!p) continue;
+                    if (f->aa){
+                        auto mix = [&](int sh){ const int a = (fg >> sh) & 0xFF, z = (*p >> sh) & 0xFF; return (uint32_t)((z + (a - z) * cov / 255) & 0xFF) << sh; };
+                        *p = mix(0) | mix(8) | mix(16);
+                    } else if (cov >= 128) *p = fg;
+                }
+        }
+        px += dx ? dx[i] : gl.adv;
+    }
+    if (upd) d->cpX = px;
+    return TRUE;
+}
+static BOOL WINAPI Bed_ExtTextOutW(HDC dc, int x, int y, UINT opts, const RECT* rc, LPCWSTR s, UINT n, const INT* dx){
+    if (!GhGdiIsOurs(dc)){ GH_REAL_GDI(L"gdi32.dll", ExtTextOutW, FALSE); return r_ExtTextOutW(dc, x, y, opts, rc, s, n, dx); }
+    return GhTextOut(dc, x, y, opts, rc, s ? s : L"", s ? n : 0, dx);
+}
+static BOOL WINAPI Bed_ExtTextOutA(HDC dc, int x, int y, UINT opts, const RECT* rc, LPCSTR s, UINT n, const INT* dx){
+    if (!GhGdiIsOurs(dc)){ GH_REAL_GDI(L"gdi32.dll", ExtTextOutA, FALSE); return r_ExtTextOutA(dc, x, y, opts, rc, s, n, dx); }
+    std::wstring w;
+    if (s && n){ w.resize(n); w.resize(MultiByteToWideChar(CP_ACP, 0, s, (int)n, &w[0], (int)n)); }
+    return GhTextOut(dc, x, y, opts, rc, w.c_str(), (UINT)w.size(), w.size() == n ? dx : nullptr);
+}
 // A real DC goes to the real gdi32 first. When that fails too -- the container's
 // CreateDIBSection(NULL, ..) does, and Chromium's paint canvas (skia
 // CreateHBitmap over a shared section, libcef 86 +0x2704425) dies on it -- the
@@ -499,7 +605,7 @@ static HBITMAP WINAPI Bed_CreateDIBSection(HDC dc, const BITMAPINFO* bi, UINT us
         view = MapViewOfFile(sec, FILE_MAP_READ | FILE_MAP_WRITE, 0, base, size + (off - base));
         if (view) p = (uint8_t*)view + (off - base);
     } else {
-        p = VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        p = g_gdiBitsAlloc ? g_gdiBitsAlloc(size) : VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     }
     static volatile LONG logged = 0;
     if (!GhGdiIsOurs(dc) && InterlockedIncrement(&logged) <= 4)

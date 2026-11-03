@@ -78,9 +78,120 @@ static bool LoadDriver(Driver& d)
     return d.priv.pfnOpenAdapter != nullptr;
 }
 
+// gh_d9_psolog=1: every pipeline 9on12 creates on our device, logged when it
+// FAILS (and the first 8 that succeed, as the control), with the desc fields that
+// D3D12 validates. The guest-hook path (GhHookD12Device) only runs for a guest's
+// own D3D12CreateDevice, so a D3D9 guest's pipelines are otherwise invisible.
+// HL2 s842-s845: the first present either throws a caught E_INVALIDARG from
+// D3D12Core (no driver compile) or reaches the compiler and removes the device;
+// these lines say which field is garbage. Failing VS/PS bytecode (first 6) goes
+// to <diag dir>\d9sh\pso<N>.vs/.ps.
+static void* g_psoOrig10 = nullptr;
+static void* g_psoOrig47 = nullptr;
+static void PsoDumpBlob(const D3D12_SHADER_BYTECODE& b, long n, const wchar_t* ext)
+{
+    if (!b.pShaderBytecode || !b.BytecodeLength) return;
+    const std::wstring dir = GhDiagDir() + L"d9sh\\";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    wchar_t nm[32]; swprintf(nm, 32, L"pso%ld.%s", n, ext);
+    HANDLE f = CreateFileW((dir + nm).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    WriteFile(f, b.pShaderBytecode, (DWORD)b.BytecodeLength, &w, nullptr);
+    CloseHandle(f);
+}
+static std::string PsoBlob(const D3D12_SHADER_BYTECODE& b)
+{
+    if (!b.pShaderBytecode) return "-";
+    const uint8_t* p = (const uint8_t*)b.pShaderBytecode;
+    std::string tag = b.BytecodeLength >= 4 ? std::string((const char*)p, 4) : "?";
+    for (char& c : tag) if (c < 32 || c > 126) c = '.';
+    return tag + "/" + std::to_string((unsigned long long)b.BytecodeLength);
+}
+static HRESULT __stdcall Hook_D9CreateGPS(ID3D12Device* self, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d,
+                                          REFIID riid, void** pp)
+{
+    using Fn = HRESULT(__stdcall*)(ID3D12Device*, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*, REFIID, void**);
+    const HRESULT hr = ((Fn)g_psoOrig10)(self, d, riid, pp);
+    static volatile LONG nOk = 0, nBad = 0;
+    long k;
+    if (SUCCEEDED(hr)){ k = InterlockedIncrement(&nOk); if (k > 8) return hr; }
+    else { k = InterlockedIncrement(&nBad); if (k > 16 && (k & (k - 1))) return hr; }
+    if (!d){ Diag("D9PSO desc=null hr=" + Hr(hr)); return hr; }
+    std::string m = std::string("D9PSO ") + (SUCCEEDED(hr) ? "ok #" : "FAIL #") + std::to_string(k) + " hr=" + Hr(hr)
+        + " rs=" + Hex((uint64_t)(uintptr_t)d->pRootSignature) + " vs=" + PsoBlob(d->VS) + " ps=" + PsoBlob(d->PS)
+        + " gs=" + PsoBlob(d->GS) + " ds=" + PsoBlob(d->DS) + " hs=" + PsoBlob(d->HS)
+        + " so=" + std::to_string(d->StreamOutput.NumEntries) + " topo=" + std::to_string((int)d->PrimitiveTopologyType)
+        + " nrt=" + std::to_string(d->NumRenderTargets) + " rtv=";
+    for (UINT i = 0; i < 8; ++i) m += std::to_string((int)d->RTVFormats[i]) + (i < 7 ? "," : "");
+    m += " dsv=" + std::to_string((int)d->DSVFormat) + " ms=" + std::to_string(d->SampleDesc.Count) + "/"
+        + std::to_string(d->SampleDesc.Quality) + " smask=" + Hex(d->SampleMask)
+        + " rast=" + std::to_string((int)d->RasterizerState.FillMode) + "/" + std::to_string((int)d->RasterizerState.CullMode)
+        + "/bias" + std::to_string(d->RasterizerState.DepthBias) + "/clip" + std::to_string(d->RasterizerState.DepthClipEnable)
+        + "/msaa" + std::to_string(d->RasterizerState.MultisampleEnable) + "/aal" + std::to_string(d->RasterizerState.AntialiasedLineEnable)
+        + "/fsc" + std::to_string(d->RasterizerState.ForcedSampleCount) + "/cons" + std::to_string((int)d->RasterizerState.ConservativeRaster)
+        + " blend=a2c" + std::to_string(d->BlendState.AlphaToCoverageEnable) + "/ind" + std::to_string(d->BlendState.IndependentBlendEnable);
+    for (UINT i = 0; i < (d->BlendState.IndependentBlendEnable ? 8u : 1u); ++i){
+        const auto& r = d->BlendState.RenderTarget[i];
+        m += " rt" + std::to_string(i) + "=" + std::to_string(r.BlendEnable) + "," + std::to_string(r.LogicOpEnable) + ","
+            + std::to_string((int)r.SrcBlend) + "," + std::to_string((int)r.DestBlend) + "," + std::to_string((int)r.BlendOp) + ","
+            + std::to_string((int)r.SrcBlendAlpha) + "," + std::to_string((int)r.DestBlendAlpha) + "," + std::to_string((int)r.BlendOpAlpha) + ","
+            + std::to_string((int)r.LogicOp) + ",m" + Hex(r.RenderTargetWriteMask);
+    }
+    const auto& z = d->DepthStencilState;
+    m += " ds=" + std::to_string(z.DepthEnable) + "," + std::to_string((int)z.DepthWriteMask) + "," + std::to_string((int)z.DepthFunc)
+        + ",st" + std::to_string(z.StencilEnable) + "," + Hex(z.StencilReadMask) + "," + Hex(z.StencilWriteMask)
+        + ",f" + std::to_string((int)z.FrontFace.StencilFunc) + "/" + std::to_string((int)z.FrontFace.StencilFailOp) + "/"
+        + std::to_string((int)z.FrontFace.StencilDepthFailOp) + "/" + std::to_string((int)z.FrontFace.StencilPassOp)
+        + ",b" + std::to_string((int)z.BackFace.StencilFunc) + "/" + std::to_string((int)z.BackFace.StencilFailOp) + "/"
+        + std::to_string((int)z.BackFace.StencilDepthFailOp) + "/" + std::to_string((int)z.BackFace.StencilPassOp)
+        + " cut=" + std::to_string((int)d->IBStripCutValue) + " node=" + Hex(d->NodeMask) + " flags=" + Hex((uint32_t)d->Flags)
+        + " cached=" + std::to_string((unsigned long long)d->CachedPSO.CachedBlobSizeInBytes)
+        + " il=" + std::to_string(d->InputLayout.NumElements) + ":";
+    for (UINT i = 0; i < d->InputLayout.NumElements && d->InputLayout.pInputElementDescs; ++i){
+        const auto& e = d->InputLayout.pInputElementDescs[i];
+        m += std::string(" ") + (e.SemanticName ? e.SemanticName : "?") + std::to_string(e.SemanticIndex) + "/f"
+            + std::to_string((int)e.Format) + "/s" + std::to_string(e.InputSlot) + "/o" + std::to_string(e.AlignedByteOffset)
+            + "/c" + std::to_string((int)e.InputSlotClass) + "/r" + std::to_string(e.InstanceDataStepRate);
+    }
+    Diag(m);
+    if (FAILED(hr) && k <= 6){ PsoDumpBlob(d->VS, k, L"vs"); PsoDumpBlob(d->PS, k, L"ps"); }
+    return hr;
+}
+static HRESULT __stdcall Hook_D9CreatePSS(ID3D12Device* self, const D3D12_PIPELINE_STATE_STREAM_DESC* sd,
+                                          REFIID riid, void** pp)
+{
+    using Fn = HRESULT(__stdcall*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
+    const HRESULT hr = ((Fn)g_psoOrig47)(self, sd, riid, pp);
+    static volatile LONG n = 0;
+    const long k = InterlockedIncrement(&n);
+    if (k <= 8 || FAILED(hr))
+        Diag("D9PSO stream #" + std::to_string(k) + " hr=" + Hr(hr) + " bytes=" + std::to_string(sd ? (unsigned long long)sd->SizeInBytes : 0ull));
+    return hr;
+}
+static void InstallPsoLog(ID3D12Device* dev)
+{
+    static bool done = false;
+    if (done || !dev || !GhCfgNum(L"gh_d9_psolog.txt", "GH_D9_PSOLOG", 0)) return;
+    done = true;
+    void** vt = *(void***)dev;
+    DWORD old = 0;
+    if (!VirtualProtect(vt, sizeof(void*) * 48, PAGE_READWRITE, &old)){ Diag("D9PSO hook protect failed"); return; }
+    g_psoOrig10 = vt[10]; vt[10] = (void*)&Hook_D9CreateGPS;
+    ID3D12Device2* d2 = nullptr;
+    if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d2))) && d2){
+        void** vt2 = *(void***)d2;
+        if (vt2 == vt){ g_psoOrig47 = vt[47]; vt[47] = (void*)&Hook_D9CreatePSS; }
+        d2->Release();
+    }
+    VirtualProtect(vt, sizeof(void*) * 48, old, &old);
+    Diag(std::string("D9PSO hooks on: gps=1 pss=") + (g_psoOrig47 ? "1" : "0"));
+}
+
 static bool OpenAdapter(Driver& d, ID3D12Device* dev, ID3D12CommandQueue* q)
 {
     LUID luid = dev->GetAdapterLuid();
+    InstallPsoLog(dev);
     d.adapterCbs.pfnQueryAdapterInfoCb = QueryAdapterInfoCb;
     d.adapterCbs.pfnGetMultisampleMethodListCb = GetMsMethodListCb;
     D3DDDIARG_OPENADAPTER oa{};

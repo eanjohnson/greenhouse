@@ -357,6 +357,13 @@ static int Acquire(const GhAddonRow* row, int mode)
     std::string branch = "public";
     if (GH_HOST_HAS(g_host, steamBranch) && g_host->steamBranch(row->app, br, sizeof br)) branch = br;
     if (branch != "public") Log("acquire app=" + std::to_string(row->app) + " branch=" + branch);
+    ghdl::g_dlSkipDepots.clear();
+    if (GH_HOST_HAS(g_host, steamSkipDepots)) {
+        uint32_t skip[32] = {};
+        const uint32_t n = g_host->steamSkipDepots(row->app, skip, 32);
+        ghdl::g_dlSkipDepots.assign(skip, skip + (n > 32 ? 32 : n));
+        if (n) Log("acquire app=" + std::to_string(row->app) + " skips " + std::to_string(n) + " depot(s)");
+    }
     int rc = ghdl::DownloadApp(row->app, dir, branch, c.token, c.sid, c.account, DlProgress, nullptr, verify);
     Scrub(c.token);
     Log(std::string(verify ? "verify" : "download") + " rc=" + std::to_string(rc) + " app=" + std::to_string(row->app));

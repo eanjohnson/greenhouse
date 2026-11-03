@@ -533,6 +533,8 @@ struct Decl : Obj<IDirect3DVertexDeclaration9> {
 template<class I, bool kPS> struct Shader : Obj<I> {
     Dev* dev = nullptr; HANDLE h = nullptr;
     std::vector<DWORD> code;
+    uint64_t hash = 0;          // FNV-1a of code, for gh_d9_shlog
+    bool     dumped = false;
     ~Shader() override;
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID r, void** pp) override
     {
@@ -629,6 +631,10 @@ static bool OpenAdapterOnce()
         Diag("D9 adapter open FAILED");
         return false;
     }
+    // The guest-D3D12 path starts this from GhHookD12Device; without it a GPU
+    // removal under D3D9 (HL2 on the x86 path) left no reason, no DRED and no
+    // time -- only a process the system froze and suspended.
+    GhStartRemovalWatch(g_gfx.d12.get());
     GetCaps(g_ad.drv, D3DDDICAPS_GETD3D9CAPS, &g_ad.caps, sizeof g_ad.caps);
     g_ad.caps.DeviceType = D3DDEVTYPE_HAL;
     g_ad.caps.AdapterOrdinal = 0;
@@ -908,6 +914,8 @@ struct Dev : Obj<IDirect3DDevice9> {
     void DropSwapchain();
     HRESULT DoPresent();
     bool DrawOk();
+    bool pairNew = false;          // gh_d9_shlog: this draw is its pair's first
+    void LogDraw(D3DPRIMITIVETYPE t, INT base, UINT minV, UINT numV, UINT start, UINT n);
     Decl* FvfDecl(DWORD fvf);
     HRESULT NewSurf(UINT w, UINT hh, D3DFORMAT fmt, D3DPOOL pool, DWORD usage, D3DMULTISAMPLE_TYPE ms, Surf** out);
 
@@ -1210,7 +1218,9 @@ struct Dev : Obj<IDirect3DDevice9> {
         Lk l;
         if (!n || !DrawOk()) return D3D_OK;
         D3DDDIARG_DRAWPRIMITIVE a{ t, start, n };
+        InterlockedExchange64(&g_ddiDrawSince, (LONGLONG)GetTickCount64());
         DDI(this, pfnDrawPrimitive, &a, nullptr);
+        InterlockedExchange64(&g_ddiDrawSince, 0);
         return D3D_OK;
     }
     HRESULT STDMETHODCALLTYPE DrawIndexedPrimitive(D3DPRIMITIVETYPE t, INT base, UINT minV, UINT numV, UINT start, UINT n) override
@@ -1218,7 +1228,12 @@ struct Dev : Obj<IDirect3DDevice9> {
         Lk l;
         if (!n || !DrawOk()) return D3D_OK;
         D3DDDIARG_DRAWINDEXEDPRIMITIVE a{ t, base, minV, numV, start, n };
+        if (pairNew) LogDraw(t, base, minV, numV, start, n);
+        InterlockedExchange64(&g_ddiDrawSince, (LONGLONG)GetTickCount64());
         DDI(this, pfnDrawIndexedPrimitive, &a);
+        InterlockedExchange64(&g_ddiDrawSince, 0);
+        if (pairNew) Diag("D9 draw returned");
+        pairNew = false;
         return D3D_OK;
     }
     HRESULT STDMETHODCALLTYPE DrawPrimitiveUP(D3DPRIMITIVETYPE t, UINT n, const void* data, UINT stride) override
@@ -2075,16 +2090,86 @@ Decl* Dev::FvfDecl(DWORD v)
 
 // 9on12 has no fixed function. A draw it cannot run is skipped and counted
 // rather than handed to the driver with a stale shader still bound.
+// gh_d9_shlog=1: one synchronous line per new VS/PS pair BEFORE its first draw,
+// and each shader's bytecode saved once to <diag dir>\d9sh\. d3d9on12 builds the
+// pipeline inside the draw, and a driver compile that kills the process leaves no
+// fault behind (HL2 s843 vanished in DrawIndexedPrimitive), so the last "newpair"
+// line in the diag names the pair the compiler died on.
+template<class S> static uint64_t ShHash(S* s)
+{
+    if (!s->hash){
+        uint64_t h = 1469598103934665603ull;
+        for (DWORD d : s->code) for (int i = 0; i < 4; ++i){ h ^= (d >> (8 * i)) & 0xFF; h *= 1099511628211ull; }
+        s->hash = h ? h : 1;
+    }
+    return s->hash;
+}
+template<class S> static void ShDump(S* s, const wchar_t* ext)
+{
+    if (!s || s->dumped) return;
+    s->dumped = true;
+    const std::wstring dir = GhDiagDir() + L"d9sh\\";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    wchar_t nm[32]; swprintf(nm, 32, L"%016llx.%s", (unsigned long long)ShHash(s), ext);
+    HANDLE f = CreateFileW((dir + nm).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    WriteFile(f, s->code.data(), (DWORD)(s->code.size() * 4), &w, nullptr);
+    CloseHandle(f);
+}
+static bool ShLogPair(VS* v, PS* p, bool preT)
+{
+    static const bool on = GhCfgNum(L"gh_d9_shlog.txt", "GH_D9_SHLOG", 0) != 0;
+    if (!on) return false;
+    static std::set<std::pair<uint64_t, uint64_t>> seen;
+    const uint64_t hv = v ? ShHash(v) : 0, hp = p ? ShHash(p) : 0;
+    if (!seen.insert({ hv, hp }).second) return false;
+    ShDump(v, L"vs"); ShDump(p, L"ps");
+    Diag("D9 newpair #" + std::to_string(seen.size()) + " vs=" + Hex(hv) + "/" + (v ? Hex(v->code[0]) : std::string("-"))
+         + " ps=" + Hex(hp) + "/" + (p ? Hex(p->code[0]) : std::string("-")) + (preT ? " preT" : ""));
+    return true;
+}
+
 bool Dev::DrawOk()
 {
     ++draws;
+    pairNew = false;
     const bool preT = decl && decl->preT;
-    if (ps && (vs || preT)) return true;
+    if (ps && (vs || preT)){ pairNew = ShLogPair(vs, ps, preT); return true; }
     ++ffSkips;
     if (ffSkips == 1 || (ffSkips & (ffSkips - 1)) == 0)
         Diag("D9 fixed-function draw skipped #" + std::to_string(ffSkips) + " ps=" + (ps ? "y" : "n")
              + " vs=" + (vs ? "y" : "n") + " preT=" + (preT ? "y" : "n") + " fvf=" + Hex(fvf));
     return false;
+}
+
+// gh_d9_shlog: the first indexed draw of each new pair, with the buffers it reads,
+// then a line once the DDI returns. HL2 s843/s844 died inside such a draw with
+// system commit falling ~900 MB in the last seconds; a draw whose ranges run past
+// its buffers is what would make 9on12 or the driver allocate like that.
+void Dev::LogDraw(D3DPRIMITIVETYPE t, INT base, UINT minV, UINT numV, UINT start, UINT n)
+{
+    std::string m = "D9 draw t=" + std::to_string((int)t) + " base=" + std::to_string(base) + " minV=" + std::to_string(minV)
+        + " numV=" + std::to_string(numV) + " start=" + std::to_string(start) + " n=" + std::to_string(n);
+    if (ib) m += " ib=" + std::to_string((int)ib->c.fmt) + "/" + std::to_string(ib->c.w) + "B/p" + std::to_string((int)ib->c.pool)
+        + "/u" + Hex(ib->c.usage);
+    else m += " ib=-";
+    for (UINT i = 0; i < 16; ++i){
+        const Stream& s = streams[i];
+        if (!s.vb) continue;
+        m += " vb" + std::to_string(i) + "=" + std::to_string(s.vb->c.w) + "B/p" + std::to_string((int)s.vb->c.pool) + "/u"
+            + Hex(s.vb->c.usage) + "+" + std::to_string(s.off) + "*" + std::to_string(s.stride)
+            + (s.freq != 1 ? "/f" + Hex(s.freq) : std::string());
+    }
+    if (decl){
+        m += " decl=";
+        for (const auto& e : decl->el){
+            if (e.Stream == 0xFF) break;
+            m += std::to_string(e.Stream) + ":" + std::to_string(e.Offset) + ":t" + std::to_string(e.Type)
+                + ":u" + std::to_string(e.Usage) + "." + std::to_string(e.UsageIndex) + " ";
+        }
+    }
+    Diag(m);
 }
 
 // ---------------------------------------------------------------- queries

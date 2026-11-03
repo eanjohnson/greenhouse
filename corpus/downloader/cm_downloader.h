@@ -396,18 +396,27 @@ struct VdfParser {
         ws(); if(p<e&&*p=='{'){ p++; VdfNode c; obj(c); n.kids.emplace_back(std::move(k),std::move(c)); }
         else { std::string v; tok(v); VdfNode c; c.value=std::move(v); n.kids.emplace_back(std::move(k),std::move(c)); } } }
 };
-struct DepotInfo { uint32_t depot=0; uint64_t manifest=0; std::string branch; };   // branch the manifest came from
+struct DepotInfo { uint32_t depot=0; uint64_t manifest=0; std::string branch; uint32_t app=0; };   // branch the manifest came from; app = owning app for depotfromapp (0 = this app)
 inline bool vdf_all_digits(const std::string& s){ if(s.empty())return false; for(char c:s) if(c<'0'||c>'9')return false; return true; }
 // Resolve the downloadable depots (numeric depot id + public-branch manifest gid) from
 // an appinfo VDF. Skips: named sub-sections (branches/baselanguages/...), depots with an
-// oslist that excludes windows, and shared/other-app depots (depotfromapp/sharedinstall)
-// whose keys live under a different app. DLC/unowned depots are left in -- get_depot_key
-// filters them at download time (a depot key we can't obtain => depot skipped).
+// oslist that excludes windows, other-language depots (config.language set and not english)
+// and lowviolence depots. A depotfromapp depot comes back with manifest=0 and app=<owner>:
+// its manifest, key and manifest code live under the owning app (HL2 220 pulls the Source
+// engine/episode depots this way), resolved by get_app_depots. DLC/unowned depots are left
+// in -- get_depot_key filters them at download time (no key => depot skipped).
 inline void parse_app_depots_vdf(const Bytes& vdf,const std::string& branch,std::vector<DepotInfo>& out){
     VdfNode root; VdfParser((const char*)vdf.data(),vdf.size()).obj(root);
     if(root.kids.empty())return; const VdfNode* app=&root.kids[0].second;
     const VdfNode* depots=app->find("depots"); if(!depots)return;
     for(auto& kv:depots->kids){ if(!vdf_all_digits(kv.first))continue; const VdfNode& d=kv.second;
+        const VdfNode* cfg=d.find("config");
+        if(cfg){ const VdfNode* os=cfg->find("oslist"); if(os&&!os->value.empty()&&os->value.find("windows")==std::string::npos) continue;
+            const VdfNode* lang=cfg->find("language"); if(lang&&!lang->value.empty()&&_stricmp(lang->value.c_str(),"english")!=0) continue;
+            const VdfNode* lv=cfg->find("lowviolence"); if(lv&&lv->value=="1") continue; }
+        if(const VdfNode* fa=d.find("depotfromapp")){
+            DepotInfo di; di.depot=(uint32_t)strtoul(kv.first.c_str(),0,10); di.app=(uint32_t)strtoul(fa->value.c_str(),0,10);
+            if(di.depot&&di.app) out.push_back(di); continue; }
         const VdfNode* mans=d.find("manifests"); if(!mans)continue;
         // A beta lists only the depots it changes; the rest come from public.
         std::string from=branch; const VdfNode* pub=mans->find(branch.c_str());
@@ -415,9 +424,6 @@ inline void parse_app_depots_vdf(const Bytes& vdf,const std::string& branch,std:
         if(!pub)continue;
         std::string gid; if(!pub->kids.empty()){ const VdfNode* g=pub->find("gid"); if(g)gid=g->value; } else gid=pub->value;
         if(gid.empty())continue;
-        const VdfNode* cfg=d.find("config");
-        if(cfg){ const VdfNode* os=cfg->find("oslist"); if(os&&!os->value.empty()&&os->value.find("windows")==std::string::npos) continue; }
-        if(d.find("depotfromapp")||d.find("sharedinstall")) continue;
         DepotInfo di; di.depot=(uint32_t)strtoul(kv.first.c_str(),0,10); di.manifest=strtoull(gid.c_str(),0,10); di.branch=from;
         if(di.depot&&di.manifest) out.push_back(di); }
 }
@@ -624,6 +630,20 @@ struct CmClient {
         uint64_t tok=0; pics_access_token(app,tok);              // best-effort; 0 = public app
         Bytes vdf; if(!pics_product_info(app,tok,vdf)){ ghlog("pics no appinfo app="+std::to_string(app)); return false; }
         parse_app_depots_vdf(vdf,branch,out);
+        // depotfromapp: take the manifest from the owning app's own depot entry (that app's
+        // public branch -- our branch name means nothing there). One appinfo fetch per owner.
+        std::vector<std::pair<uint32_t,std::vector<DepotInfo>>> owners;
+        for(size_t i=0;i<out.size();){
+            DepotInfo& di=out[i]; if(!di.app){ i++; continue; }
+            std::vector<DepotInfo>* od=nullptr; for(auto& o:owners) if(o.first==di.app) od=&o.second;
+            if(!od){ owners.emplace_back(di.app,std::vector<DepotInfo>()); od=&owners.back().second;
+                uint64_t otok=0; pics_access_token(di.app,otok); Bytes ov;
+                if(pics_product_info(di.app,otok,ov)) parse_app_depots_vdf(ov,"public",*od);
+                else ghlog("pics no appinfo owner app="+std::to_string(di.app)); }
+            bool found=false;
+            for(auto& o:*od) if(o.depot==di.depot&&!o.app&&o.manifest){ di.manifest=o.manifest; di.branch=o.branch; found=true; break; }
+            ghlog("pics depot "+std::to_string(di.depot)+" fromapp="+std::to_string(di.app)+(found?" manifest="+std::to_string(di.manifest):" UNRESOLVED"));
+            if(found) i++; else out.erase(out.begin()+i); }
         ghlog("pics app="+std::to_string(app)+" depots="+std::to_string(out.size()));
         return !out.empty();
     }
@@ -730,6 +750,20 @@ inline bool parse_manifest(const Bytes& man,std::vector<FileEntry>& files,bool& 
     }
     return !files.empty();
 }
+// Bytes already under a folder (resumed files need no new space).
+inline uint64_t folder_bytes(const std::wstring& dir){
+    uint64_t n=0; WIN32_FIND_DATAW fd; HANDLE f=FindFirstFileW((dir+L"\\*").c_str(),&fd);
+    if(f==INVALID_HANDLE_VALUE) return 0;
+    do { if(!wcscmp(fd.cFileName,L".")||!wcscmp(fd.cFileName,L"..")) continue;
+        if(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) n+=folder_bytes(dir+L"\\"+fd.cFileName);
+        else n+=((uint64_t)fd.nFileSizeHigh<<32)|fd.nFileSizeLow; } while(FindNextFileW(f,&fd));
+    FindClose(f); return n;
+}
+// Free space DownloadApp leaves on the games drive (Tsushima's spill file and the
+// Workshop live there too).
+inline uint64_t g_dlReserve = 2ull << 30;
+// Depots DownloadApp leaves out (the title config's steamSkipDepots, set by the add-on).
+inline std::vector<uint32_t> g_dlSkipDepots;
 inline void mkdirs(const std::wstring& path){ std::wstring cur; for(size_t i=0;i<path.size();i++){ wchar_t c=path[i]; cur+=c; if(c==L'\\'||c==L'/') CreateDirectoryW(cur.c_str(),NULL); } }
 inline std::wstring towide(const std::string& s){ int n=MultiByteToWideChar(CP_UTF8,0,s.c_str(),-1,NULL,0); std::wstring w(n?n-1:0,0); if(n)MultiByteToWideChar(CP_UTF8,0,s.c_str(),-1,&w[0],n); return w; }
 inline uint64_t existing_size(const std::wstring& path){
@@ -1045,8 +1079,11 @@ inline int DownloadApp(uint32_t app,const std::wstring& outdir,const std::string
     struct DW { uint32_t depot; Bytes key; std::vector<FileEntry> files; };
     std::vector<DW> work; int totalChunks=0,totalFiles=0;
     for(auto& d:depots){
-        Bytes key; if(!c.get_depot_key(app,d.depot,key)||key.size()!=32){ ghlog("skip depot(no key) "+std::to_string(d.depot)); continue; }
-        uint64_t mcode; if(!c.get_manifest_code(app,d.depot,d.manifest,d.branch.empty()?branch:d.branch,mcode)){ ghlog("skip depot(no mcode) "+std::to_string(d.depot)); continue; }
+        if(std::find(g_dlSkipDepots.begin(),g_dlSkipDepots.end(),d.depot)!=g_dlSkipDepots.end()){
+            ghlog_always("depot "+std::to_string(d.depot)+" skipped (title config)"); continue; }
+        uint32_t kapp=d.app?d.app:app;   // depotfromapp: key + manifest code belong to the owner
+        Bytes key; if(!c.get_depot_key(kapp,d.depot,key)||key.size()!=32){ ghlog("skip depot(no key) "+std::to_string(d.depot)); continue; }
+        uint64_t mcode; if(!c.get_manifest_code(kapp,d.depot,d.manifest,d.branch.empty()?branch:d.branch,mcode)){ ghlog("skip depot(no mcode) "+std::to_string(d.depot)); continue; }
         char mp[256]; sprintf(mp,"/depot/%u/manifest/%llu/5/%llu",d.depot,(unsigned long long)d.manifest,(unsigned long long)mcode);
         Bytes zip=http_fetch_retry(servers,mp); Bytes man; if(!unzip_first(zip,man)){ ghlog("skip depot(no manifest) "+std::to_string(d.depot)); continue; }
         std::vector<FileEntry> files; bool fenc=false; if(!parse_manifest(man,files,fenc)) continue;
@@ -1078,6 +1115,20 @@ inline int DownloadApp(uint32_t app,const std::wstring& outdir,const std::string
         GHDL_CB("finding files",2,0,totalFiles,0);
     }
     if(work.empty()){ GHDL_CB("error-nodepots",0,0,0,0); closesocket(c.s); trace_exe("END rc=-8 nodepots"); return -8; }
+
+    // Space check before writing anything: the whole app must fit, less what a resume
+    // already has on disk, with g_dlReserve left over. Each depot's size is logged.
+    { uint64_t want=0;
+      for(auto& dw:work){ uint64_t b=0; for(auto& fe:dw.files) if(!(fe.flags&FLAG_DIRECTORY)) b+=fe.size;
+          ghlog_always("depot "+std::to_string(dw.depot)+" bytes="+std::to_string(b)+" ("+std::to_string(b>>20)+" MB)"); want+=b; }
+      const uint64_t have=folder_bytes(outdir); const uint64_t need=want>have?want-have:0;
+      std::wstring root=outdir; size_t cut=root.find_last_of(L"\\/"); if(cut!=std::wstring::npos) root.resize(cut+1);
+      ULARGE_INTEGER fr{}; const bool haveFree=GetDiskFreeSpaceExW(root.c_str(),&fr,nullptr,nullptr)!=0;
+      ghlog_always("space app="+std::to_string(app)+" want="+std::to_string(want>>20)+"MB have="+std::to_string(have>>20)+
+                   "MB need="+std::to_string(need>>20)+"MB free="+(haveFree?std::to_string(fr.QuadPart>>20)+"MB":std::string("?"))+
+                   " reserve="+std::to_string(g_dlReserve>>20)+"MB");
+      if(haveFree && need+g_dlReserve>fr.QuadPart){
+          GHDL_CB("storage full",0,0,totalFiles,need); closesocket(c.s); trace_exe("END rc=-9 space"); return -9; } }
 
     // Pass 2: download every chunk across all depots, with a single global counter.
     // Exes first: LocalState quota fills mid-walk (ERROR_DISK_FULL 112) and used to

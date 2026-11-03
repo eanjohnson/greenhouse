@@ -163,6 +163,10 @@ mkdir -p "$STAGE/guest/vcrt"
 for d in MSVCP140.dll VCRUNTIME140.dll VCRUNTIME140_1.dll; do
   cp "$RED/vcrt/$d" "$STAGE/guest/vcrt/$d" || { echo "FATAL: missing $RED/vcrt/$d"; exit 1; }
 done
+# guest\x86\   system DLLs for 32-bit guests that the console has no copy of
+# (g_x86_sys_dir, resolve_dll_path's last stop). Our own builds, from source.
+mkdir -p "$STAGE/guest/x86"
+"$GH/corpus/x86sys/msvcrt/build.sh" "$STAGE/guest/x86" || { echo "FATAL: guest x86 msvcrt build"; exit 1; }
 # §47: the on-device shader bake's toolchain. dxcompiler.dll (DXC 1.9.2607, the
 # same release as the host's Linux build, so its disassembly and assembly match
 # the recipe byte for byte) with the C++ runtime it imports beside it, because
@@ -223,14 +227,15 @@ cp "$GH"/corpus/titles/*.ghtitle.json "$STAGE/guest/titles/"
 # LocalState gh_tl_ blobs (the lane-solo NonUniform fixes, which win over ghlo
 # there) laid on top. The loader reads guest\ghlo\ LAST, so a console with its own
 # corpus is unchanged; a fresh one (a tester's Series X) gets this one.
+# Staged as a few plain *.ghpak packs, not ~13.5k loose blobs: the MSIX registers
+# per file, and the loose corpus made every deploy take ~9 minutes (gh_pak.h).
 GHLO="$RED/ghlo"
 NLO=$(find "$GHLO" -maxdepth 1 -name 'gh_*.bin' 2>/dev/null | wc -l)
 [ "$NLO" -ge 10000 ] || { echo "FATAL: corpus/redist/ghlo has $NLO blobs (expected ~13.5k) -- pull it from the reference console"; exit 1; }
 rm -rf "$STAGE/guest/ghlo"; mkdir -p "$STAGE/guest/ghlo"
-cp "$GHLO"/gh_*.bin "$STAGE/guest/ghlo/"
-NTL=0
-for f in "$RED/ghlo_localstate"/gh_tl_*.bin; do [ -e "$f" ] || continue; cp "$f" "$STAGE/guest/ghlo/"; NTL=$((NTL+1)); done
-echo "  corpus: $NLO blobs + $NTL LocalState gh_tl_ overlays, $(du -sm "$STAGE/guest/ghlo" | cut -f1) MB"
+OVL=(); [ -d "$RED/ghlo_localstate" ] && OVL=(--overlay "$RED/ghlo_localstate")
+python3 "$GH/toolchain/ghpkg.py" bundle --dir "$GHLO" "${OVL[@]}" --out "$STAGE/guest/ghlo" \
+  || { echo "FATAL: corpus bundle failed"; exit 1; }
 else
   echo "  first-party value NOT bundled (GH_BUNDLE_FIRSTPARTY=0): title configs, hive seed and corpus come from the repository"
 fi

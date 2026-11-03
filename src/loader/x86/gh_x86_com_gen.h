@@ -1346,6 +1346,668 @@
     X("CreateGeometryShaderWithStreamOutput", "D3D11_SO_DECLARATION_ENTRY holds a pointer")
 #define GH_COM_ID3D11Device_SLOTS 43
 
+// IDirect3D9 : IUnknown -- 17 vtable slots
+#define GH_COM_IDirect3D9(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(RegisterSoftwareDevice) \
+    X(GetAdapterCount) \
+    X(GetAdapterIdentifier) \
+    X(GetAdapterModeCount) \
+    X(EnumAdapterModes) \
+    X(GetAdapterDisplayMode) \
+    X(CheckDeviceType) \
+    X(CheckDeviceFormat) \
+    X(CheckDeviceMultiSampleType) \
+    X(CheckDepthStencilMatch) \
+    X(CheckDeviceFormatConversion) \
+    X(GetDeviceCaps) \
+    X(GetAdapterMonitor) \
+    X(CreateDevice)
+#define GH_COM_IDirect3D9_SUSPECT(X) \
+    X("CreateDevice", "D3DPRESENT_PARAMETERS holds a pointer")
+#define GH_COM_IDirect3D9_SLOTS 17
+
+// IDirect3DDevice9 : IUnknown -- 119 vtable slots
+#define GH_COM_IDirect3DDevice9(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(TestCooperativeLevel) \
+    X(GetAvailableTextureMem) \
+    X(EvictManagedResources) \
+    X(GetDirect3D) \
+    X(GetDeviceCaps) \
+    X(GetDisplayMode) \
+    X(GetCreationParameters) \
+    X(SetCursorProperties) \
+    X(SetCursorPosition) \
+    X(ShowCursor) \
+    X(CreateAdditionalSwapChain) \
+    X(GetSwapChain) \
+    X(GetNumberOfSwapChains) \
+    X(Reset) \
+    X(Present) \
+    X(GetBackBuffer) \
+    X(GetRasterStatus) \
+    X(SetDialogBoxMode) \
+    X(SetGammaRamp) \
+    X(GetGammaRamp) \
+    X(CreateTexture) \
+    X(CreateVolumeTexture) \
+    X(CreateCubeTexture) \
+    X(CreateVertexBuffer) \
+    X(CreateIndexBuffer) \
+    X(CreateRenderTarget) \
+    X(CreateDepthStencilSurface) \
+    X(UpdateSurface) \
+    X(UpdateTexture) \
+    X(GetRenderTargetData) \
+    X(GetFrontBufferData) \
+    X(StretchRect) \
+    X(ColorFill) \
+    X(CreateOffscreenPlainSurface) \
+    X(SetRenderTarget) \
+    X(GetRenderTarget) \
+    X(SetDepthStencilSurface) \
+    X(GetDepthStencilSurface) \
+    X(BeginScene) \
+    X(EndScene) \
+    X(Clear) \
+    X(SetTransform) \
+    X(GetTransform) \
+    X(MultiplyTransform) \
+    X(SetViewport) \
+    X(GetViewport) \
+    X(SetMaterial) \
+    X(GetMaterial) \
+    X(SetLight) \
+    X(GetLight) \
+    X(LightEnable) \
+    X(GetLightEnable) \
+    X(SetClipPlane) \
+    X(GetClipPlane) \
+    X(SetRenderState) \
+    X(GetRenderState) \
+    X(CreateStateBlock) \
+    X(BeginStateBlock) \
+    X(EndStateBlock) \
+    X(SetClipStatus) \
+    X(GetClipStatus) \
+    X(GetTexture) \
+    X(SetTexture) \
+    X(GetTextureStageState) \
+    X(SetTextureStageState) \
+    X(GetSamplerState) \
+    X(SetSamplerState) \
+    X(ValidateDevice) \
+    X(SetPaletteEntries) \
+    X(GetPaletteEntries) \
+    X(SetCurrentTexturePalette) \
+    X(GetCurrentTexturePalette) \
+    X(SetScissorRect) \
+    X(GetScissorRect) \
+    X(SetSoftwareVertexProcessing) \
+    X(GetSoftwareVertexProcessing) \
+    X(SetNPatchMode) \
+    X(GetNPatchMode) \
+    X(DrawPrimitive) \
+    X(DrawIndexedPrimitive) \
+    X(DrawPrimitiveUP) \
+    X(DrawIndexedPrimitiveUP) \
+    X(ProcessVertices) \
+    X(CreateVertexDeclaration) \
+    X(SetVertexDeclaration) \
+    X(GetVertexDeclaration) \
+    X(SetFVF) \
+    X(GetFVF) \
+    X(CreateVertexShader) \
+    X(SetVertexShader) \
+    X(GetVertexShader) \
+    X(SetVertexShaderConstantF) \
+    X(GetVertexShaderConstantF) \
+    X(SetVertexShaderConstantI) \
+    X(GetVertexShaderConstantI) \
+    X(SetVertexShaderConstantB) \
+    X(GetVertexShaderConstantB) \
+    X(SetStreamSource) \
+    X(GetStreamSource) \
+    X(SetStreamSourceFreq) \
+    X(GetStreamSourceFreq) \
+    X(SetIndices) \
+    X(GetIndices) \
+    X(CreatePixelShader) \
+    X(SetPixelShader) \
+    X(GetPixelShader) \
+    X(SetPixelShaderConstantF) \
+    X(GetPixelShaderConstantF) \
+    X(SetPixelShaderConstantI) \
+    X(GetPixelShaderConstantI) \
+    X(SetPixelShaderConstantB) \
+    X(GetPixelShaderConstantB) \
+    X(DrawRectPatch) \
+    X(DrawTriPatch) \
+    X(DeletePatch) \
+    X(CreateQuery)
+#define GH_COM_IDirect3DDevice9_SUSPECT(X) \
+    X("GetCreationParameters", "D3DDEVICE_CREATION_PARAMETERS holds a pointer") \
+    X("CreateAdditionalSwapChain", "D3DPRESENT_PARAMETERS holds a pointer") \
+    X("Reset", "D3DPRESENT_PARAMETERS holds a pointer")
+#define GH_COM_IDirect3DDevice9_SLOTS 119
+
+// IDirect3DStateBlock9 : IUnknown -- 6 vtable slots
+#define GH_COM_IDirect3DStateBlock9(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(GetDevice) \
+    X(Capture) \
+    X(Apply)
+#define GH_COM_IDirect3DStateBlock9_SUSPECT(X)
+#define GH_COM_IDirect3DStateBlock9_SLOTS 6
+
+// IDirect3DSwapChain9 : IUnknown -- 10 vtable slots
+#define GH_COM_IDirect3DSwapChain9(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(Present) \
+    X(GetFrontBufferData) \
+    X(GetBackBuffer) \
+    X(GetRasterStatus) \
+    X(GetDisplayMode) \
+    X(GetDevice) \
+    X(GetPresentParameters)
+#define GH_COM_IDirect3DSwapChain9_SUSPECT(X) \
+    X("GetPresentParameters", "D3DPRESENT_PARAMETERS holds a pointer")
+#define GH_COM_IDirect3DSwapChain9_SLOTS 10
+
+// IDirect3DResource9 : IUnknown -- 11 vtable slots
+#define GH_COM_IDirect3DResource9(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(GetDevice) \
+    X(SetPrivateData) \
+    X(GetPrivateData) \
+    X(FreePrivateData) \
+    X(SetPriority) \
+    X(GetPriority) \
+    X(PreLoad) \
+    X(GetType)
+#define GH_COM_IDirect3DResource9_SUSPECT(X)
+#define GH_COM_IDirect3DResource9_SLOTS 11
+
+// IDirect3DVertexDeclaration9 : IUnknown -- 5 vtable slots
+#define GH_COM_IDirect3DVertexDeclaration9(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(GetDevice) \
+    X(GetDeclaration)
+#define GH_COM_IDirect3DVertexDeclaration9_SUSPECT(X)
+#define GH_COM_IDirect3DVertexDeclaration9_SLOTS 5
+
+// IDirect3DVertexShader9 : IUnknown -- 5 vtable slots
+#define GH_COM_IDirect3DVertexShader9(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(GetDevice) \
+    X(GetFunction)
+#define GH_COM_IDirect3DVertexShader9_SUSPECT(X)
+#define GH_COM_IDirect3DVertexShader9_SLOTS 5
+
+// IDirect3DPixelShader9 : IUnknown -- 5 vtable slots
+#define GH_COM_IDirect3DPixelShader9(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(GetDevice) \
+    X(GetFunction)
+#define GH_COM_IDirect3DPixelShader9_SUSPECT(X)
+#define GH_COM_IDirect3DPixelShader9_SLOTS 5
+
+// IDirect3DBaseTexture9 : IDirect3DResource9 -- 17 vtable slots
+#define GH_COM_IDirect3DBaseTexture9(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(GetDevice) \
+    X(SetPrivateData) \
+    X(GetPrivateData) \
+    X(FreePrivateData) \
+    X(SetPriority) \
+    X(GetPriority) \
+    X(PreLoad) \
+    X(GetType) \
+    X(SetLOD) \
+    X(GetLOD) \
+    X(GetLevelCount) \
+    X(SetAutoGenFilterType) \
+    X(GetAutoGenFilterType) \
+    X(GenerateMipSubLevels)
+#define GH_COM_IDirect3DBaseTexture9_SUSPECT(X)
+#define GH_COM_IDirect3DBaseTexture9_SLOTS 17
+
+// IDirect3DTexture9 : IDirect3DBaseTexture9 -- 22 vtable slots
+#define GH_COM_IDirect3DTexture9(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(GetDevice) \
+    X(SetPrivateData) \
+    X(GetPrivateData) \
+    X(FreePrivateData) \
+    X(SetPriority) \
+    X(GetPriority) \
+    X(PreLoad) \
+    X(GetType) \
+    X(SetLOD) \
+    X(GetLOD) \
+    X(GetLevelCount) \
+    X(SetAutoGenFilterType) \
+    X(GetAutoGenFilterType) \
+    X(GenerateMipSubLevels) \
+    X(GetLevelDesc) \
+    X(GetSurfaceLevel) \
+    X(LockRect) \
+    X(UnlockRect) \
+    X(AddDirtyRect)
+#define GH_COM_IDirect3DTexture9_SUSPECT(X) \
+    X("LockRect", "D3DLOCKED_RECT holds a pointer")
+#define GH_COM_IDirect3DTexture9_SLOTS 22
+
+// IDirect3DVolumeTexture9 : IDirect3DBaseTexture9 -- 22 vtable slots
+#define GH_COM_IDirect3DVolumeTexture9(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(GetDevice) \
+    X(SetPrivateData) \
+    X(GetPrivateData) \
+    X(FreePrivateData) \
+    X(SetPriority) \
+    X(GetPriority) \
+    X(PreLoad) \
+    X(GetType) \
+    X(SetLOD) \
+    X(GetLOD) \
+    X(GetLevelCount) \
+    X(SetAutoGenFilterType) \
+    X(GetAutoGenFilterType) \
+    X(GenerateMipSubLevels) \
+    X(GetLevelDesc) \
+    X(GetVolumeLevel) \
+    X(LockBox) \
+    X(UnlockBox) \
+    X(AddDirtyBox)
+#define GH_COM_IDirect3DVolumeTexture9_SUSPECT(X) \
+    X("LockBox", "D3DLOCKED_BOX holds a pointer")
+#define GH_COM_IDirect3DVolumeTexture9_SLOTS 22
+
+// IDirect3DCubeTexture9 : IDirect3DBaseTexture9 -- 22 vtable slots
+#define GH_COM_IDirect3DCubeTexture9(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(GetDevice) \
+    X(SetPrivateData) \
+    X(GetPrivateData) \
+    X(FreePrivateData) \
+    X(SetPriority) \
+    X(GetPriority) \
+    X(PreLoad) \
+    X(GetType) \
+    X(SetLOD) \
+    X(GetLOD) \
+    X(GetLevelCount) \
+    X(SetAutoGenFilterType) \
+    X(GetAutoGenFilterType) \
+    X(GenerateMipSubLevels) \
+    X(GetLevelDesc) \
+    X(GetCubeMapSurface) \
+    X(LockRect) \
+    X(UnlockRect) \
+    X(AddDirtyRect)
+#define GH_COM_IDirect3DCubeTexture9_SUSPECT(X) \
+    X("LockRect", "D3DLOCKED_RECT holds a pointer")
+#define GH_COM_IDirect3DCubeTexture9_SLOTS 22
+
+// IDirect3DVertexBuffer9 : IDirect3DResource9 -- 14 vtable slots
+#define GH_COM_IDirect3DVertexBuffer9(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(GetDevice) \
+    X(SetPrivateData) \
+    X(GetPrivateData) \
+    X(FreePrivateData) \
+    X(SetPriority) \
+    X(GetPriority) \
+    X(PreLoad) \
+    X(GetType) \
+    X(Lock) \
+    X(Unlock) \
+    X(GetDesc)
+#define GH_COM_IDirect3DVertexBuffer9_SUSPECT(X)
+#define GH_COM_IDirect3DVertexBuffer9_SLOTS 14
+
+// IDirect3DIndexBuffer9 : IDirect3DResource9 -- 14 vtable slots
+#define GH_COM_IDirect3DIndexBuffer9(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(GetDevice) \
+    X(SetPrivateData) \
+    X(GetPrivateData) \
+    X(FreePrivateData) \
+    X(SetPriority) \
+    X(GetPriority) \
+    X(PreLoad) \
+    X(GetType) \
+    X(Lock) \
+    X(Unlock) \
+    X(GetDesc)
+#define GH_COM_IDirect3DIndexBuffer9_SUSPECT(X)
+#define GH_COM_IDirect3DIndexBuffer9_SLOTS 14
+
+// IDirect3DSurface9 : IDirect3DResource9 -- 17 vtable slots
+#define GH_COM_IDirect3DSurface9(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(GetDevice) \
+    X(SetPrivateData) \
+    X(GetPrivateData) \
+    X(FreePrivateData) \
+    X(SetPriority) \
+    X(GetPriority) \
+    X(PreLoad) \
+    X(GetType) \
+    X(GetContainer) \
+    X(GetDesc) \
+    X(LockRect) \
+    X(UnlockRect) \
+    X(GetDC) \
+    X(ReleaseDC)
+#define GH_COM_IDirect3DSurface9_SUSPECT(X) \
+    X("LockRect", "D3DLOCKED_RECT holds a pointer")
+#define GH_COM_IDirect3DSurface9_SLOTS 17
+
+// IDirect3DVolume9 : IUnknown -- 11 vtable slots
+#define GH_COM_IDirect3DVolume9(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(GetDevice) \
+    X(SetPrivateData) \
+    X(GetPrivateData) \
+    X(FreePrivateData) \
+    X(GetContainer) \
+    X(GetDesc) \
+    X(LockBox) \
+    X(UnlockBox)
+#define GH_COM_IDirect3DVolume9_SUSPECT(X) \
+    X("LockBox", "D3DLOCKED_BOX holds a pointer")
+#define GH_COM_IDirect3DVolume9_SLOTS 11
+
+// IDirect3DQuery9 : IUnknown -- 8 vtable slots
+#define GH_COM_IDirect3DQuery9(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(GetDevice) \
+    X(GetType) \
+    X(GetDataSize) \
+    X(Issue) \
+    X(GetData)
+#define GH_COM_IDirect3DQuery9_SUSPECT(X)
+#define GH_COM_IDirect3DQuery9_SLOTS 8
+
+// IDirect3D9Ex : IDirect3D9 -- 22 vtable slots
+#define GH_COM_IDirect3D9Ex(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(RegisterSoftwareDevice) \
+    X(GetAdapterCount) \
+    X(GetAdapterIdentifier) \
+    X(GetAdapterModeCount) \
+    X(EnumAdapterModes) \
+    X(GetAdapterDisplayMode) \
+    X(CheckDeviceType) \
+    X(CheckDeviceFormat) \
+    X(CheckDeviceMultiSampleType) \
+    X(CheckDepthStencilMatch) \
+    X(CheckDeviceFormatConversion) \
+    X(GetDeviceCaps) \
+    X(GetAdapterMonitor) \
+    X(CreateDevice) \
+    X(GetAdapterModeCountEx) \
+    X(EnumAdapterModesEx) \
+    X(GetAdapterDisplayModeEx) \
+    X(CreateDeviceEx) \
+    X(GetAdapterLUID)
+#define GH_COM_IDirect3D9Ex_SUSPECT(X) \
+    X("CreateDevice", "D3DPRESENT_PARAMETERS holds a pointer") \
+    X("CreateDeviceEx", "D3DPRESENT_PARAMETERS holds a pointer")
+#define GH_COM_IDirect3D9Ex_SLOTS 22
+
+// IDirect3DDevice9Ex : IDirect3DDevice9 -- 134 vtable slots
+#define GH_COM_IDirect3DDevice9Ex(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(TestCooperativeLevel) \
+    X(GetAvailableTextureMem) \
+    X(EvictManagedResources) \
+    X(GetDirect3D) \
+    X(GetDeviceCaps) \
+    X(GetDisplayMode) \
+    X(GetCreationParameters) \
+    X(SetCursorProperties) \
+    X(SetCursorPosition) \
+    X(ShowCursor) \
+    X(CreateAdditionalSwapChain) \
+    X(GetSwapChain) \
+    X(GetNumberOfSwapChains) \
+    X(Reset) \
+    X(Present) \
+    X(GetBackBuffer) \
+    X(GetRasterStatus) \
+    X(SetDialogBoxMode) \
+    X(SetGammaRamp) \
+    X(GetGammaRamp) \
+    X(CreateTexture) \
+    X(CreateVolumeTexture) \
+    X(CreateCubeTexture) \
+    X(CreateVertexBuffer) \
+    X(CreateIndexBuffer) \
+    X(CreateRenderTarget) \
+    X(CreateDepthStencilSurface) \
+    X(UpdateSurface) \
+    X(UpdateTexture) \
+    X(GetRenderTargetData) \
+    X(GetFrontBufferData) \
+    X(StretchRect) \
+    X(ColorFill) \
+    X(CreateOffscreenPlainSurface) \
+    X(SetRenderTarget) \
+    X(GetRenderTarget) \
+    X(SetDepthStencilSurface) \
+    X(GetDepthStencilSurface) \
+    X(BeginScene) \
+    X(EndScene) \
+    X(Clear) \
+    X(SetTransform) \
+    X(GetTransform) \
+    X(MultiplyTransform) \
+    X(SetViewport) \
+    X(GetViewport) \
+    X(SetMaterial) \
+    X(GetMaterial) \
+    X(SetLight) \
+    X(GetLight) \
+    X(LightEnable) \
+    X(GetLightEnable) \
+    X(SetClipPlane) \
+    X(GetClipPlane) \
+    X(SetRenderState) \
+    X(GetRenderState) \
+    X(CreateStateBlock) \
+    X(BeginStateBlock) \
+    X(EndStateBlock) \
+    X(SetClipStatus) \
+    X(GetClipStatus) \
+    X(GetTexture) \
+    X(SetTexture) \
+    X(GetTextureStageState) \
+    X(SetTextureStageState) \
+    X(GetSamplerState) \
+    X(SetSamplerState) \
+    X(ValidateDevice) \
+    X(SetPaletteEntries) \
+    X(GetPaletteEntries) \
+    X(SetCurrentTexturePalette) \
+    X(GetCurrentTexturePalette) \
+    X(SetScissorRect) \
+    X(GetScissorRect) \
+    X(SetSoftwareVertexProcessing) \
+    X(GetSoftwareVertexProcessing) \
+    X(SetNPatchMode) \
+    X(GetNPatchMode) \
+    X(DrawPrimitive) \
+    X(DrawIndexedPrimitive) \
+    X(DrawPrimitiveUP) \
+    X(DrawIndexedPrimitiveUP) \
+    X(ProcessVertices) \
+    X(CreateVertexDeclaration) \
+    X(SetVertexDeclaration) \
+    X(GetVertexDeclaration) \
+    X(SetFVF) \
+    X(GetFVF) \
+    X(CreateVertexShader) \
+    X(SetVertexShader) \
+    X(GetVertexShader) \
+    X(SetVertexShaderConstantF) \
+    X(GetVertexShaderConstantF) \
+    X(SetVertexShaderConstantI) \
+    X(GetVertexShaderConstantI) \
+    X(SetVertexShaderConstantB) \
+    X(GetVertexShaderConstantB) \
+    X(SetStreamSource) \
+    X(GetStreamSource) \
+    X(SetStreamSourceFreq) \
+    X(GetStreamSourceFreq) \
+    X(SetIndices) \
+    X(GetIndices) \
+    X(CreatePixelShader) \
+    X(SetPixelShader) \
+    X(GetPixelShader) \
+    X(SetPixelShaderConstantF) \
+    X(GetPixelShaderConstantF) \
+    X(SetPixelShaderConstantI) \
+    X(GetPixelShaderConstantI) \
+    X(SetPixelShaderConstantB) \
+    X(GetPixelShaderConstantB) \
+    X(DrawRectPatch) \
+    X(DrawTriPatch) \
+    X(DeletePatch) \
+    X(CreateQuery) \
+    X(SetConvolutionMonoKernel) \
+    X(ComposeRects) \
+    X(PresentEx) \
+    X(GetGPUThreadPriority) \
+    X(SetGPUThreadPriority) \
+    X(WaitForVBlank) \
+    X(CheckResourceResidency) \
+    X(SetMaximumFrameLatency) \
+    X(GetMaximumFrameLatency) \
+    X(CheckDeviceState) \
+    X(CreateRenderTargetEx) \
+    X(CreateOffscreenPlainSurfaceEx) \
+    X(CreateDepthStencilSurfaceEx) \
+    X(ResetEx) \
+    X(GetDisplayModeEx)
+#define GH_COM_IDirect3DDevice9Ex_SUSPECT(X) \
+    X("GetCreationParameters", "D3DDEVICE_CREATION_PARAMETERS holds a pointer") \
+    X("CreateAdditionalSwapChain", "D3DPRESENT_PARAMETERS holds a pointer") \
+    X("Reset", "D3DPRESENT_PARAMETERS holds a pointer") \
+    X("ResetEx", "D3DPRESENT_PARAMETERS holds a pointer")
+#define GH_COM_IDirect3DDevice9Ex_SLOTS 134
+
+// IDirect3DSwapChain9Ex : IDirect3DSwapChain9 -- 13 vtable slots
+#define GH_COM_IDirect3DSwapChain9Ex(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(Present) \
+    X(GetFrontBufferData) \
+    X(GetBackBuffer) \
+    X(GetRasterStatus) \
+    X(GetDisplayMode) \
+    X(GetDevice) \
+    X(GetPresentParameters) \
+    X(GetLastPresentCount) \
+    X(GetPresentStats) \
+    X(GetDisplayModeEx)
+#define GH_COM_IDirect3DSwapChain9Ex_SUSPECT(X) \
+    X("GetPresentParameters", "D3DPRESENT_PARAMETERS holds a pointer")
+#define GH_COM_IDirect3DSwapChain9Ex_SLOTS 13
+
+// IDirect3D9ExOverlayExtension : IUnknown -- 4 vtable slots
+#define GH_COM_IDirect3D9ExOverlayExtension(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(CheckDeviceOverlayType)
+#define GH_COM_IDirect3D9ExOverlayExtension_SUSPECT(X)
+#define GH_COM_IDirect3D9ExOverlayExtension_SLOTS 4
+
+// IDirect3DDevice9Video : IUnknown -- 6 vtable slots
+#define GH_COM_IDirect3DDevice9Video(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(GetContentProtectionCaps) \
+    X(CreateAuthenticatedChannel) \
+    X(CreateCryptoSession)
+#define GH_COM_IDirect3DDevice9Video_SUSPECT(X)
+#define GH_COM_IDirect3DDevice9Video_SLOTS 6
+
+// IDirect3DAuthenticatedChannel9 : IUnknown -- 8 vtable slots
+#define GH_COM_IDirect3DAuthenticatedChannel9(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(GetCertificateSize) \
+    X(GetCertificate) \
+    X(NegotiateKeyExchange) \
+    X(Query) \
+    X(Configure)
+#define GH_COM_IDirect3DAuthenticatedChannel9_SUSPECT(X) \
+    X("Configure", "D3DAUTHENTICATEDCHANNEL_CONFIGURE_OUTPUT holds a pointer")
+#define GH_COM_IDirect3DAuthenticatedChannel9_SLOTS 8
+
+// IDirect3DCryptoSession9 : IUnknown -- 12 vtable slots
+#define GH_COM_IDirect3DCryptoSession9(X) \
+    X(QueryInterface) \
+    X(AddRef) \
+    X(Release) \
+    X(GetCertificateSize) \
+    X(GetCertificate) \
+    X(NegotiateKeyExchange) \
+    X(EncryptionBlt) \
+    X(DecryptionBlt) \
+    X(GetSurfacePitch) \
+    X(StartSessionKeyRefresh) \
+    X(FinishSessionKeyRefresh) \
+    X(GetEncryptionBltKey)
+#define GH_COM_IDirect3DCryptoSession9_SUSPECT(X)
+#define GH_COM_IDirect3DCryptoSession9_SLOTS 12
+
 // IUnknown : - -- 3 vtable slots
 #define GH_COM_IUnknown(X) \
     X(QueryInterface) \
@@ -2241,6 +2903,597 @@ inline void com_register_ID3D11CommandList(ComState& c)
     GH_X86_COM_ADD(c, id, ID3D11CommandList, GetContextFlags);
 }
 
+inline void com_register_IDirect3D9(ComState& c)
+{
+    const int id = c.add("IDirect3D9", &__uuidof(IDirect3D9));
+    ComTypeId<IDirect3D9>::v = id;
+    GH_X86_COM_ADD_IUNKNOWN(c, id, IDirect3D9);
+    GH_X86_COM_ADD(c, id, IDirect3D9, RegisterSoftwareDevice);
+    GH_X86_COM_ADD(c, id, IDirect3D9, GetAdapterCount);
+    GH_X86_COM_ADD(c, id, IDirect3D9, GetAdapterIdentifier);
+    GH_X86_COM_ADD(c, id, IDirect3D9, GetAdapterModeCount);
+    GH_X86_COM_ADD(c, id, IDirect3D9, EnumAdapterModes);
+    GH_X86_COM_ADD(c, id, IDirect3D9, GetAdapterDisplayMode);
+    GH_X86_COM_ADD(c, id, IDirect3D9, CheckDeviceType);
+    GH_X86_COM_ADD(c, id, IDirect3D9, CheckDeviceFormat);
+    GH_X86_COM_ADD(c, id, IDirect3D9, CheckDeviceMultiSampleType);
+    GH_X86_COM_ADD(c, id, IDirect3D9, CheckDepthStencilMatch);
+    GH_X86_COM_ADD(c, id, IDirect3D9, CheckDeviceFormatConversion);
+    GH_X86_COM_ADD(c, id, IDirect3D9, GetDeviceCaps);
+    GH_X86_COM_ADD(c, id, IDirect3D9, GetAdapterMonitor);
+    GH_X86_COM_ADD(c, id, IDirect3D9, CreateDevice);
+    c.poison(id, "CreateDevice", "D3DPRESENT_PARAMETERS holds a pointer");
+}
+
+inline void com_register_IDirect3D9Ex(ComState& c)
+{
+    const int id = c.add("IDirect3D9Ex", &__uuidof(IDirect3D9Ex));
+    ComTypeId<IDirect3D9Ex>::v = id;
+    GH_X86_COM_ADD_IUNKNOWN(c, id, IDirect3D9Ex);
+    GH_X86_COM_ADD(c, id, IDirect3D9Ex, RegisterSoftwareDevice);
+    GH_X86_COM_ADD(c, id, IDirect3D9Ex, GetAdapterCount);
+    GH_X86_COM_ADD(c, id, IDirect3D9Ex, GetAdapterIdentifier);
+    GH_X86_COM_ADD(c, id, IDirect3D9Ex, GetAdapterModeCount);
+    GH_X86_COM_ADD(c, id, IDirect3D9Ex, EnumAdapterModes);
+    GH_X86_COM_ADD(c, id, IDirect3D9Ex, GetAdapterDisplayMode);
+    GH_X86_COM_ADD(c, id, IDirect3D9Ex, CheckDeviceType);
+    GH_X86_COM_ADD(c, id, IDirect3D9Ex, CheckDeviceFormat);
+    GH_X86_COM_ADD(c, id, IDirect3D9Ex, CheckDeviceMultiSampleType);
+    GH_X86_COM_ADD(c, id, IDirect3D9Ex, CheckDepthStencilMatch);
+    GH_X86_COM_ADD(c, id, IDirect3D9Ex, CheckDeviceFormatConversion);
+    GH_X86_COM_ADD(c, id, IDirect3D9Ex, GetDeviceCaps);
+    GH_X86_COM_ADD(c, id, IDirect3D9Ex, GetAdapterMonitor);
+    GH_X86_COM_ADD(c, id, IDirect3D9Ex, CreateDevice);
+    GH_X86_COM_ADD(c, id, IDirect3D9Ex, GetAdapterModeCountEx);
+    GH_X86_COM_ADD(c, id, IDirect3D9Ex, EnumAdapterModesEx);
+    GH_X86_COM_ADD(c, id, IDirect3D9Ex, GetAdapterDisplayModeEx);
+    GH_X86_COM_ADD(c, id, IDirect3D9Ex, CreateDeviceEx);
+    GH_X86_COM_ADD(c, id, IDirect3D9Ex, GetAdapterLUID);
+    c.poison(id, "CreateDevice", "D3DPRESENT_PARAMETERS holds a pointer");
+    c.poison(id, "CreateDeviceEx", "D3DPRESENT_PARAMETERS holds a pointer");
+}
+
+inline void com_register_IDirect3DDevice9(ComState& c)
+{
+    const int id = c.add("IDirect3DDevice9", &__uuidof(IDirect3DDevice9));
+    ComTypeId<IDirect3DDevice9>::v = id;
+    GH_X86_COM_ADD_IUNKNOWN(c, id, IDirect3DDevice9);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, TestCooperativeLevel);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetAvailableTextureMem);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, EvictManagedResources);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetDirect3D);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetDeviceCaps);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetDisplayMode);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetCreationParameters);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetCursorProperties);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetCursorPosition);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, ShowCursor);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, CreateAdditionalSwapChain);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetSwapChain);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetNumberOfSwapChains);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, Reset);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, Present);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetBackBuffer);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetRasterStatus);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetDialogBoxMode);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetGammaRamp);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetGammaRamp);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, CreateTexture);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, CreateVolumeTexture);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, CreateCubeTexture);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, CreateVertexBuffer);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, CreateIndexBuffer);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, CreateRenderTarget);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, CreateDepthStencilSurface);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, UpdateSurface);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, UpdateTexture);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetRenderTargetData);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetFrontBufferData);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, StretchRect);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, ColorFill);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, CreateOffscreenPlainSurface);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetRenderTarget);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetRenderTarget);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetDepthStencilSurface);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetDepthStencilSurface);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, BeginScene);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, EndScene);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, Clear);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetTransform);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetTransform);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, MultiplyTransform);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetViewport);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetViewport);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetMaterial);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetMaterial);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetLight);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetLight);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, LightEnable);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetLightEnable);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetClipPlane);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetClipPlane);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetRenderState);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetRenderState);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, CreateStateBlock);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, BeginStateBlock);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, EndStateBlock);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetClipStatus);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetClipStatus);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetTexture);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetTexture);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetTextureStageState);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetTextureStageState);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetSamplerState);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetSamplerState);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, ValidateDevice);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetPaletteEntries);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetPaletteEntries);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetCurrentTexturePalette);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetCurrentTexturePalette);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetScissorRect);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetScissorRect);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetSoftwareVertexProcessing);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetSoftwareVertexProcessing);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetNPatchMode);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetNPatchMode);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, DrawPrimitive);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, DrawIndexedPrimitive);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, DrawPrimitiveUP);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, DrawIndexedPrimitiveUP);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, ProcessVertices);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, CreateVertexDeclaration);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetVertexDeclaration);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetVertexDeclaration);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetFVF);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetFVF);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, CreateVertexShader);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetVertexShader);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetVertexShader);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetVertexShaderConstantF);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetVertexShaderConstantF);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetVertexShaderConstantI);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetVertexShaderConstantI);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetVertexShaderConstantB);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetVertexShaderConstantB);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetStreamSource);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetStreamSource);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetStreamSourceFreq);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetStreamSourceFreq);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetIndices);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetIndices);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, CreatePixelShader);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetPixelShader);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetPixelShader);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetPixelShaderConstantF);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetPixelShaderConstantF);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetPixelShaderConstantI);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetPixelShaderConstantI);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, SetPixelShaderConstantB);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, GetPixelShaderConstantB);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, DrawRectPatch);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, DrawTriPatch);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, DeletePatch);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9, CreateQuery);
+    c.poison(id, "GetCreationParameters", "D3DDEVICE_CREATION_PARAMETERS holds a pointer");
+    c.poison(id, "CreateAdditionalSwapChain", "D3DPRESENT_PARAMETERS holds a pointer");
+    c.poison(id, "Reset", "D3DPRESENT_PARAMETERS holds a pointer");
+}
+
+inline void com_register_IDirect3DDevice9Ex(ComState& c)
+{
+    const int id = c.add("IDirect3DDevice9Ex", &__uuidof(IDirect3DDevice9Ex));
+    ComTypeId<IDirect3DDevice9Ex>::v = id;
+    GH_X86_COM_ADD_IUNKNOWN(c, id, IDirect3DDevice9Ex);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, TestCooperativeLevel);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetAvailableTextureMem);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, EvictManagedResources);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetDirect3D);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetDeviceCaps);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetDisplayMode);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetCreationParameters);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetCursorProperties);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetCursorPosition);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, ShowCursor);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, CreateAdditionalSwapChain);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetSwapChain);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetNumberOfSwapChains);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, Reset);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, Present);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetBackBuffer);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetRasterStatus);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetDialogBoxMode);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetGammaRamp);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetGammaRamp);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, CreateTexture);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, CreateVolumeTexture);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, CreateCubeTexture);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, CreateVertexBuffer);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, CreateIndexBuffer);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, CreateRenderTarget);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, CreateDepthStencilSurface);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, UpdateSurface);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, UpdateTexture);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetRenderTargetData);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetFrontBufferData);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, StretchRect);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, ColorFill);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, CreateOffscreenPlainSurface);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetRenderTarget);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetRenderTarget);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetDepthStencilSurface);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetDepthStencilSurface);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, BeginScene);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, EndScene);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, Clear);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetTransform);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetTransform);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, MultiplyTransform);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetViewport);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetViewport);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetMaterial);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetMaterial);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetLight);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetLight);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, LightEnable);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetLightEnable);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetClipPlane);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetClipPlane);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetRenderState);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetRenderState);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, CreateStateBlock);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, BeginStateBlock);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, EndStateBlock);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetClipStatus);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetClipStatus);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetTexture);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetTexture);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetTextureStageState);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetTextureStageState);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetSamplerState);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetSamplerState);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, ValidateDevice);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetPaletteEntries);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetPaletteEntries);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetCurrentTexturePalette);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetCurrentTexturePalette);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetScissorRect);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetScissorRect);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetSoftwareVertexProcessing);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetSoftwareVertexProcessing);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetNPatchMode);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetNPatchMode);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, DrawPrimitive);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, DrawIndexedPrimitive);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, DrawPrimitiveUP);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, DrawIndexedPrimitiveUP);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, ProcessVertices);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, CreateVertexDeclaration);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetVertexDeclaration);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetVertexDeclaration);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetFVF);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetFVF);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, CreateVertexShader);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetVertexShader);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetVertexShader);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetVertexShaderConstantF);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetVertexShaderConstantF);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetVertexShaderConstantI);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetVertexShaderConstantI);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetVertexShaderConstantB);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetVertexShaderConstantB);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetStreamSource);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetStreamSource);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetStreamSourceFreq);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetStreamSourceFreq);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetIndices);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetIndices);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, CreatePixelShader);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetPixelShader);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetPixelShader);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetPixelShaderConstantF);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetPixelShaderConstantF);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetPixelShaderConstantI);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetPixelShaderConstantI);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetPixelShaderConstantB);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetPixelShaderConstantB);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, DrawRectPatch);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, DrawTriPatch);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, DeletePatch);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, CreateQuery);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetConvolutionMonoKernel);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, ComposeRects);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, PresentEx);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetGPUThreadPriority);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetGPUThreadPriority);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, WaitForVBlank);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, CheckResourceResidency);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, SetMaximumFrameLatency);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetMaximumFrameLatency);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, CheckDeviceState);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, CreateRenderTargetEx);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, CreateOffscreenPlainSurfaceEx);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, CreateDepthStencilSurfaceEx);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, ResetEx);
+    GH_X86_COM_ADD(c, id, IDirect3DDevice9Ex, GetDisplayModeEx);
+    c.poison(id, "GetCreationParameters", "D3DDEVICE_CREATION_PARAMETERS holds a pointer");
+    c.poison(id, "CreateAdditionalSwapChain", "D3DPRESENT_PARAMETERS holds a pointer");
+    c.poison(id, "Reset", "D3DPRESENT_PARAMETERS holds a pointer");
+    c.poison(id, "ResetEx", "D3DPRESENT_PARAMETERS holds a pointer");
+}
+
+inline void com_register_IDirect3DSwapChain9(ComState& c)
+{
+    const int id = c.add("IDirect3DSwapChain9", &__uuidof(IDirect3DSwapChain9));
+    ComTypeId<IDirect3DSwapChain9>::v = id;
+    GH_X86_COM_ADD_IUNKNOWN(c, id, IDirect3DSwapChain9);
+    GH_X86_COM_ADD(c, id, IDirect3DSwapChain9, Present);
+    GH_X86_COM_ADD(c, id, IDirect3DSwapChain9, GetFrontBufferData);
+    GH_X86_COM_ADD(c, id, IDirect3DSwapChain9, GetBackBuffer);
+    GH_X86_COM_ADD(c, id, IDirect3DSwapChain9, GetRasterStatus);
+    GH_X86_COM_ADD(c, id, IDirect3DSwapChain9, GetDisplayMode);
+    GH_X86_COM_ADD(c, id, IDirect3DSwapChain9, GetDevice);
+    GH_X86_COM_ADD(c, id, IDirect3DSwapChain9, GetPresentParameters);
+    c.poison(id, "GetPresentParameters", "D3DPRESENT_PARAMETERS holds a pointer");
+}
+
+inline void com_register_IDirect3DSwapChain9Ex(ComState& c)
+{
+    const int id = c.add("IDirect3DSwapChain9Ex", &__uuidof(IDirect3DSwapChain9Ex));
+    ComTypeId<IDirect3DSwapChain9Ex>::v = id;
+    GH_X86_COM_ADD_IUNKNOWN(c, id, IDirect3DSwapChain9Ex);
+    GH_X86_COM_ADD(c, id, IDirect3DSwapChain9Ex, Present);
+    GH_X86_COM_ADD(c, id, IDirect3DSwapChain9Ex, GetFrontBufferData);
+    GH_X86_COM_ADD(c, id, IDirect3DSwapChain9Ex, GetBackBuffer);
+    GH_X86_COM_ADD(c, id, IDirect3DSwapChain9Ex, GetRasterStatus);
+    GH_X86_COM_ADD(c, id, IDirect3DSwapChain9Ex, GetDisplayMode);
+    GH_X86_COM_ADD(c, id, IDirect3DSwapChain9Ex, GetDevice);
+    GH_X86_COM_ADD(c, id, IDirect3DSwapChain9Ex, GetPresentParameters);
+    GH_X86_COM_ADD(c, id, IDirect3DSwapChain9Ex, GetLastPresentCount);
+    GH_X86_COM_ADD(c, id, IDirect3DSwapChain9Ex, GetPresentStats);
+    GH_X86_COM_ADD(c, id, IDirect3DSwapChain9Ex, GetDisplayModeEx);
+    c.poison(id, "GetPresentParameters", "D3DPRESENT_PARAMETERS holds a pointer");
+}
+
+inline void com_register_IDirect3DResource9(ComState& c)
+{
+    const int id = c.add("IDirect3DResource9", &__uuidof(IDirect3DResource9));
+    ComTypeId<IDirect3DResource9>::v = id;
+    GH_X86_COM_ADD_IUNKNOWN(c, id, IDirect3DResource9);
+    GH_X86_COM_ADD(c, id, IDirect3DResource9, GetDevice);
+    GH_X86_COM_ADD(c, id, IDirect3DResource9, SetPrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DResource9, GetPrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DResource9, FreePrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DResource9, SetPriority);
+    GH_X86_COM_ADD(c, id, IDirect3DResource9, GetPriority);
+    GH_X86_COM_ADD(c, id, IDirect3DResource9, PreLoad);
+    GH_X86_COM_ADD(c, id, IDirect3DResource9, GetType);
+}
+
+inline void com_register_IDirect3DBaseTexture9(ComState& c)
+{
+    const int id = c.add("IDirect3DBaseTexture9", &__uuidof(IDirect3DBaseTexture9));
+    ComTypeId<IDirect3DBaseTexture9>::v = id;
+    GH_X86_COM_ADD_IUNKNOWN(c, id, IDirect3DBaseTexture9);
+    GH_X86_COM_ADD(c, id, IDirect3DBaseTexture9, GetDevice);
+    GH_X86_COM_ADD(c, id, IDirect3DBaseTexture9, SetPrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DBaseTexture9, GetPrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DBaseTexture9, FreePrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DBaseTexture9, SetPriority);
+    GH_X86_COM_ADD(c, id, IDirect3DBaseTexture9, GetPriority);
+    GH_X86_COM_ADD(c, id, IDirect3DBaseTexture9, PreLoad);
+    GH_X86_COM_ADD(c, id, IDirect3DBaseTexture9, GetType);
+    GH_X86_COM_ADD(c, id, IDirect3DBaseTexture9, SetLOD);
+    GH_X86_COM_ADD(c, id, IDirect3DBaseTexture9, GetLOD);
+    GH_X86_COM_ADD(c, id, IDirect3DBaseTexture9, GetLevelCount);
+    GH_X86_COM_ADD(c, id, IDirect3DBaseTexture9, SetAutoGenFilterType);
+    GH_X86_COM_ADD(c, id, IDirect3DBaseTexture9, GetAutoGenFilterType);
+    GH_X86_COM_ADD(c, id, IDirect3DBaseTexture9, GenerateMipSubLevels);
+}
+
+inline void com_register_IDirect3DTexture9(ComState& c)
+{
+    const int id = c.add("IDirect3DTexture9", &__uuidof(IDirect3DTexture9));
+    ComTypeId<IDirect3DTexture9>::v = id;
+    GH_X86_COM_ADD_IUNKNOWN(c, id, IDirect3DTexture9);
+    GH_X86_COM_ADD(c, id, IDirect3DTexture9, GetDevice);
+    GH_X86_COM_ADD(c, id, IDirect3DTexture9, SetPrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DTexture9, GetPrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DTexture9, FreePrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DTexture9, SetPriority);
+    GH_X86_COM_ADD(c, id, IDirect3DTexture9, GetPriority);
+    GH_X86_COM_ADD(c, id, IDirect3DTexture9, PreLoad);
+    GH_X86_COM_ADD(c, id, IDirect3DTexture9, GetType);
+    GH_X86_COM_ADD(c, id, IDirect3DTexture9, SetLOD);
+    GH_X86_COM_ADD(c, id, IDirect3DTexture9, GetLOD);
+    GH_X86_COM_ADD(c, id, IDirect3DTexture9, GetLevelCount);
+    GH_X86_COM_ADD(c, id, IDirect3DTexture9, SetAutoGenFilterType);
+    GH_X86_COM_ADD(c, id, IDirect3DTexture9, GetAutoGenFilterType);
+    GH_X86_COM_ADD(c, id, IDirect3DTexture9, GenerateMipSubLevels);
+    GH_X86_COM_ADD(c, id, IDirect3DTexture9, GetLevelDesc);
+    GH_X86_COM_ADD(c, id, IDirect3DTexture9, GetSurfaceLevel);
+    GH_X86_COM_ADD(c, id, IDirect3DTexture9, LockRect);
+    GH_X86_COM_ADD(c, id, IDirect3DTexture9, UnlockRect);
+    GH_X86_COM_ADD(c, id, IDirect3DTexture9, AddDirtyRect);
+    c.poison(id, "LockRect", "D3DLOCKED_RECT holds a pointer");
+}
+
+inline void com_register_IDirect3DCubeTexture9(ComState& c)
+{
+    const int id = c.add("IDirect3DCubeTexture9", &__uuidof(IDirect3DCubeTexture9));
+    ComTypeId<IDirect3DCubeTexture9>::v = id;
+    GH_X86_COM_ADD_IUNKNOWN(c, id, IDirect3DCubeTexture9);
+    GH_X86_COM_ADD(c, id, IDirect3DCubeTexture9, GetDevice);
+    GH_X86_COM_ADD(c, id, IDirect3DCubeTexture9, SetPrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DCubeTexture9, GetPrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DCubeTexture9, FreePrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DCubeTexture9, SetPriority);
+    GH_X86_COM_ADD(c, id, IDirect3DCubeTexture9, GetPriority);
+    GH_X86_COM_ADD(c, id, IDirect3DCubeTexture9, PreLoad);
+    GH_X86_COM_ADD(c, id, IDirect3DCubeTexture9, GetType);
+    GH_X86_COM_ADD(c, id, IDirect3DCubeTexture9, SetLOD);
+    GH_X86_COM_ADD(c, id, IDirect3DCubeTexture9, GetLOD);
+    GH_X86_COM_ADD(c, id, IDirect3DCubeTexture9, GetLevelCount);
+    GH_X86_COM_ADD(c, id, IDirect3DCubeTexture9, SetAutoGenFilterType);
+    GH_X86_COM_ADD(c, id, IDirect3DCubeTexture9, GetAutoGenFilterType);
+    GH_X86_COM_ADD(c, id, IDirect3DCubeTexture9, GenerateMipSubLevels);
+    GH_X86_COM_ADD(c, id, IDirect3DCubeTexture9, GetLevelDesc);
+    GH_X86_COM_ADD(c, id, IDirect3DCubeTexture9, GetCubeMapSurface);
+    GH_X86_COM_ADD(c, id, IDirect3DCubeTexture9, LockRect);
+    GH_X86_COM_ADD(c, id, IDirect3DCubeTexture9, UnlockRect);
+    GH_X86_COM_ADD(c, id, IDirect3DCubeTexture9, AddDirtyRect);
+    c.poison(id, "LockRect", "D3DLOCKED_RECT holds a pointer");
+}
+
+inline void com_register_IDirect3DVolumeTexture9(ComState& c)
+{
+    const int id = c.add("IDirect3DVolumeTexture9", &__uuidof(IDirect3DVolumeTexture9));
+    ComTypeId<IDirect3DVolumeTexture9>::v = id;
+    GH_X86_COM_ADD_IUNKNOWN(c, id, IDirect3DVolumeTexture9);
+    GH_X86_COM_ADD(c, id, IDirect3DVolumeTexture9, GetDevice);
+    GH_X86_COM_ADD(c, id, IDirect3DVolumeTexture9, SetPrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DVolumeTexture9, GetPrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DVolumeTexture9, FreePrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DVolumeTexture9, SetPriority);
+    GH_X86_COM_ADD(c, id, IDirect3DVolumeTexture9, GetPriority);
+    GH_X86_COM_ADD(c, id, IDirect3DVolumeTexture9, PreLoad);
+    GH_X86_COM_ADD(c, id, IDirect3DVolumeTexture9, GetType);
+    GH_X86_COM_ADD(c, id, IDirect3DVolumeTexture9, SetLOD);
+    GH_X86_COM_ADD(c, id, IDirect3DVolumeTexture9, GetLOD);
+    GH_X86_COM_ADD(c, id, IDirect3DVolumeTexture9, GetLevelCount);
+    GH_X86_COM_ADD(c, id, IDirect3DVolumeTexture9, SetAutoGenFilterType);
+    GH_X86_COM_ADD(c, id, IDirect3DVolumeTexture9, GetAutoGenFilterType);
+    GH_X86_COM_ADD(c, id, IDirect3DVolumeTexture9, GenerateMipSubLevels);
+    GH_X86_COM_ADD(c, id, IDirect3DVolumeTexture9, GetLevelDesc);
+    GH_X86_COM_ADD(c, id, IDirect3DVolumeTexture9, GetVolumeLevel);
+    GH_X86_COM_ADD(c, id, IDirect3DVolumeTexture9, LockBox);
+    GH_X86_COM_ADD(c, id, IDirect3DVolumeTexture9, UnlockBox);
+    GH_X86_COM_ADD(c, id, IDirect3DVolumeTexture9, AddDirtyBox);
+    c.poison(id, "LockBox", "D3DLOCKED_BOX holds a pointer");
+}
+
+inline void com_register_IDirect3DSurface9(ComState& c)
+{
+    const int id = c.add("IDirect3DSurface9", &__uuidof(IDirect3DSurface9));
+    ComTypeId<IDirect3DSurface9>::v = id;
+    GH_X86_COM_ADD_IUNKNOWN(c, id, IDirect3DSurface9);
+    GH_X86_COM_ADD(c, id, IDirect3DSurface9, GetDevice);
+    GH_X86_COM_ADD(c, id, IDirect3DSurface9, SetPrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DSurface9, GetPrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DSurface9, FreePrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DSurface9, SetPriority);
+    GH_X86_COM_ADD(c, id, IDirect3DSurface9, GetPriority);
+    GH_X86_COM_ADD(c, id, IDirect3DSurface9, PreLoad);
+    GH_X86_COM_ADD(c, id, IDirect3DSurface9, GetType);
+    GH_X86_COM_ADD(c, id, IDirect3DSurface9, GetContainer);
+    GH_X86_COM_ADD(c, id, IDirect3DSurface9, GetDesc);
+    GH_X86_COM_ADD(c, id, IDirect3DSurface9, LockRect);
+    GH_X86_COM_ADD(c, id, IDirect3DSurface9, UnlockRect);
+    GH_X86_COM_ADD(c, id, IDirect3DSurface9, GetDC);
+    GH_X86_COM_ADD(c, id, IDirect3DSurface9, ReleaseDC);
+    c.poison(id, "LockRect", "D3DLOCKED_RECT holds a pointer");
+}
+
+inline void com_register_IDirect3DVolume9(ComState& c)
+{
+    const int id = c.add("IDirect3DVolume9", &__uuidof(IDirect3DVolume9));
+    ComTypeId<IDirect3DVolume9>::v = id;
+    GH_X86_COM_ADD_IUNKNOWN(c, id, IDirect3DVolume9);
+    GH_X86_COM_ADD(c, id, IDirect3DVolume9, GetDevice);
+    GH_X86_COM_ADD(c, id, IDirect3DVolume9, SetPrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DVolume9, GetPrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DVolume9, FreePrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DVolume9, GetContainer);
+    GH_X86_COM_ADD(c, id, IDirect3DVolume9, GetDesc);
+    GH_X86_COM_ADD(c, id, IDirect3DVolume9, LockBox);
+    GH_X86_COM_ADD(c, id, IDirect3DVolume9, UnlockBox);
+    c.poison(id, "LockBox", "D3DLOCKED_BOX holds a pointer");
+}
+
+inline void com_register_IDirect3DVertexBuffer9(ComState& c)
+{
+    const int id = c.add("IDirect3DVertexBuffer9", &__uuidof(IDirect3DVertexBuffer9));
+    ComTypeId<IDirect3DVertexBuffer9>::v = id;
+    GH_X86_COM_ADD_IUNKNOWN(c, id, IDirect3DVertexBuffer9);
+    GH_X86_COM_ADD(c, id, IDirect3DVertexBuffer9, GetDevice);
+    GH_X86_COM_ADD(c, id, IDirect3DVertexBuffer9, SetPrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DVertexBuffer9, GetPrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DVertexBuffer9, FreePrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DVertexBuffer9, SetPriority);
+    GH_X86_COM_ADD(c, id, IDirect3DVertexBuffer9, GetPriority);
+    GH_X86_COM_ADD(c, id, IDirect3DVertexBuffer9, PreLoad);
+    GH_X86_COM_ADD(c, id, IDirect3DVertexBuffer9, GetType);
+    GH_X86_COM_ADD(c, id, IDirect3DVertexBuffer9, Lock);
+    GH_X86_COM_ADD(c, id, IDirect3DVertexBuffer9, Unlock);
+    GH_X86_COM_ADD(c, id, IDirect3DVertexBuffer9, GetDesc);
+}
+
+inline void com_register_IDirect3DIndexBuffer9(ComState& c)
+{
+    const int id = c.add("IDirect3DIndexBuffer9", &__uuidof(IDirect3DIndexBuffer9));
+    ComTypeId<IDirect3DIndexBuffer9>::v = id;
+    GH_X86_COM_ADD_IUNKNOWN(c, id, IDirect3DIndexBuffer9);
+    GH_X86_COM_ADD(c, id, IDirect3DIndexBuffer9, GetDevice);
+    GH_X86_COM_ADD(c, id, IDirect3DIndexBuffer9, SetPrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DIndexBuffer9, GetPrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DIndexBuffer9, FreePrivateData);
+    GH_X86_COM_ADD(c, id, IDirect3DIndexBuffer9, SetPriority);
+    GH_X86_COM_ADD(c, id, IDirect3DIndexBuffer9, GetPriority);
+    GH_X86_COM_ADD(c, id, IDirect3DIndexBuffer9, PreLoad);
+    GH_X86_COM_ADD(c, id, IDirect3DIndexBuffer9, GetType);
+    GH_X86_COM_ADD(c, id, IDirect3DIndexBuffer9, Lock);
+    GH_X86_COM_ADD(c, id, IDirect3DIndexBuffer9, Unlock);
+    GH_X86_COM_ADD(c, id, IDirect3DIndexBuffer9, GetDesc);
+}
+
+inline void com_register_IDirect3DStateBlock9(ComState& c)
+{
+    const int id = c.add("IDirect3DStateBlock9", &__uuidof(IDirect3DStateBlock9));
+    ComTypeId<IDirect3DStateBlock9>::v = id;
+    GH_X86_COM_ADD_IUNKNOWN(c, id, IDirect3DStateBlock9);
+    GH_X86_COM_ADD(c, id, IDirect3DStateBlock9, GetDevice);
+    GH_X86_COM_ADD(c, id, IDirect3DStateBlock9, Capture);
+    GH_X86_COM_ADD(c, id, IDirect3DStateBlock9, Apply);
+}
+
+inline void com_register_IDirect3DVertexDeclaration9(ComState& c)
+{
+    const int id = c.add("IDirect3DVertexDeclaration9", &__uuidof(IDirect3DVertexDeclaration9));
+    ComTypeId<IDirect3DVertexDeclaration9>::v = id;
+    GH_X86_COM_ADD_IUNKNOWN(c, id, IDirect3DVertexDeclaration9);
+    GH_X86_COM_ADD(c, id, IDirect3DVertexDeclaration9, GetDevice);
+    GH_X86_COM_ADD(c, id, IDirect3DVertexDeclaration9, GetDeclaration);
+}
+
+inline void com_register_IDirect3DVertexShader9(ComState& c)
+{
+    const int id = c.add("IDirect3DVertexShader9", &__uuidof(IDirect3DVertexShader9));
+    ComTypeId<IDirect3DVertexShader9>::v = id;
+    GH_X86_COM_ADD_IUNKNOWN(c, id, IDirect3DVertexShader9);
+    GH_X86_COM_ADD(c, id, IDirect3DVertexShader9, GetDevice);
+    GH_X86_COM_ADD(c, id, IDirect3DVertexShader9, GetFunction);
+}
+
+inline void com_register_IDirect3DPixelShader9(ComState& c)
+{
+    const int id = c.add("IDirect3DPixelShader9", &__uuidof(IDirect3DPixelShader9));
+    ComTypeId<IDirect3DPixelShader9>::v = id;
+    GH_X86_COM_ADD_IUNKNOWN(c, id, IDirect3DPixelShader9);
+    GH_X86_COM_ADD(c, id, IDirect3DPixelShader9, GetDevice);
+    GH_X86_COM_ADD(c, id, IDirect3DPixelShader9, GetFunction);
+}
+
+inline void com_register_IDirect3DQuery9(ComState& c)
+{
+    const int id = c.add("IDirect3DQuery9", &__uuidof(IDirect3DQuery9));
+    ComTypeId<IDirect3DQuery9>::v = id;
+    GH_X86_COM_ADD_IUNKNOWN(c, id, IDirect3DQuery9);
+    GH_X86_COM_ADD(c, id, IDirect3DQuery9, GetDevice);
+    GH_X86_COM_ADD(c, id, IDirect3DQuery9, GetType);
+    GH_X86_COM_ADD(c, id, IDirect3DQuery9, GetDataSize);
+    GH_X86_COM_ADD(c, id, IDirect3DQuery9, Issue);
+    GH_X86_COM_ADD(c, id, IDirect3DQuery9, GetData);
+}
+
 // Registers every interface above. Called once, lazily, the first time a
 // guest asks for a DXGI factory or a D3D11 device.
 inline void com_register_generated(ComState& c)
@@ -2291,6 +3544,31 @@ inline void com_register_generated(ComState& c)
     com_register_ID3D11ClassLinkage(c);
     com_register_ID3D11ClassInstance(c);
     com_register_ID3D11CommandList(c);
+}
+
+// Direct3D 9: registered the first time a guest calls Direct3DCreate9(Ex).
+inline void com_register_generated_d3d9(ComState& c)
+{
+    com_register_IDirect3D9(c);
+    com_register_IDirect3D9Ex(c);
+    com_register_IDirect3DDevice9(c);
+    com_register_IDirect3DDevice9Ex(c);
+    com_register_IDirect3DSwapChain9(c);
+    com_register_IDirect3DSwapChain9Ex(c);
+    com_register_IDirect3DResource9(c);
+    com_register_IDirect3DBaseTexture9(c);
+    com_register_IDirect3DTexture9(c);
+    com_register_IDirect3DCubeTexture9(c);
+    com_register_IDirect3DVolumeTexture9(c);
+    com_register_IDirect3DSurface9(c);
+    com_register_IDirect3DVolume9(c);
+    com_register_IDirect3DVertexBuffer9(c);
+    com_register_IDirect3DIndexBuffer9(c);
+    com_register_IDirect3DStateBlock9(c);
+    com_register_IDirect3DVertexDeclaration9(c);
+    com_register_IDirect3DVertexShader9(c);
+    com_register_IDirect3DPixelShader9(c);
+    com_register_IDirect3DQuery9(c);
 }
 
 }   // namespace ghx86

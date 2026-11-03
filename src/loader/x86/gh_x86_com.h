@@ -97,10 +97,30 @@ struct IsOutIfacePP {
     static constexpr bool value = std::is_pointer_v<T> && IsIfacePtr<P>::value;
 };
 
+// `..., IDirect3DTexture9** ppTex, HANDLE* pSharedHandle)` -- every D3D9 Create*
+// ends this way. The out-interface is one slot from the end, and the trailing
+// HANDLE* is the only other 8-byte write; both are handled by com_call_out_sh.
+template <typename T>
+struct IsHandleOut {
+    static constexpr bool value = std::is_same_v<std::remove_cv_t<T>, HANDLE*>;
+};
+
 template <bool Empty, typename... A> struct LastArg { using type = void; };
 template <typename... A>
 struct LastArg<false, A...> {
     using type = std::tuple_element_t<sizeof...(A) - 1, std::tuple<A...>>;
+};
+template <bool Short, typename... A> struct PenultArg { using type = void; };
+template <typename... A>
+struct PenultArg<false, A...> {
+    using type = std::tuple_element_t<sizeof...(A) - 2, std::tuple<A...>>;
+};
+template <typename... A>
+struct SharedHandleTail {
+    static constexpr size_t N = sizeof...(A);
+    static constexpr bool value =
+        N >= 2 && IsHandleOut<typename LastArg<N == 0, A...>::type>::value &&
+        IsOutIfacePP<typename PenultArg<(N < 2), A...>::type>::value;
 };
 
 // -- the registry ------------------------------------------------------------
@@ -321,12 +341,50 @@ uint64_t com_call_out(R (C::*pmf)(A...), S* self, Machine& m,
     return rv;
 }
 
+// The shared-handle form: the interface comes back through the penultimate
+// argument and a HANDLE through the last. Both land in HOST locals; the guest
+// gets the wrapped interface and the handle's low 32 bits (kernel handles fit).
+template <typename S, typename C, typename R, typename... A, size_t... I>
+uint64_t com_call_out_sh(R (C::*pmf)(A...), S* self, Machine& m,
+                         const uint32_t* sp, std::index_sequence<I...>)
+{
+    using Tup = std::tuple<A...>;
+    constexpr size_t N = sizeof...(A);
+    using OutP = std::remove_pointer_t<std::tuple_element_t<N - 2, Tup>>;
+    using OutT = std::remove_cv_t<std::remove_pointer_t<OutP>>;
+
+    OutP out = nullptr;
+    HANDLE sh = nullptr;
+    const uint32_t slot  = sp[ArgLayout<A...>::offset((int)N - 2)];
+    const uint32_t hslot = sp[ArgLayout<A...>::offset((int)N - 1)];
+    if (hslot) std::memcpy(&sh, (const void*)(uintptr_t)hslot, 4);   // 9Ex: an IN handle when non-null
+    C* c = static_cast<C*>(self);
+    R r = (c->*pmf)(ComArg<std::tuple_element_t<I, Tup>>::get(
+                        m, sp + ArgLayout<A...>::offset((int)I))...,
+                    &out, hslot ? &sh : nullptr);
+    uint64_t rv = 0;
+    std::memcpy(&rv, &r, sizeof(R) > 8 ? 8 : sizeof(R));
+    if (slot) {
+        uint32_t g = 0;
+        if (out) {
+            const int id = ComTypeId<OutT>::v;
+            if (id < 0) log("X86 COM out-parameter of an unregistered interface");
+            else        g = com().wrap(m, (void*)out, id);
+        }
+        std::memcpy((void*)(uintptr_t)slot, &g, 4);
+    }
+    if (hslot) { const uint32_t h32 = (uint32_t)(uintptr_t)sh; std::memcpy((void*)(uintptr_t)hslot, &h32, 4); }
+    return rv;
+}
+
 template <typename S, typename C, typename R, typename... A>
 uint64_t com_invoke(R (C::*pmf)(A...), S* self, Machine& m, const uint32_t* sp)
 {
     constexpr size_t N = sizeof...(A);
     using Last = typename LastArg<N == 0, A...>::type;
-    if constexpr (N > 0 && IsOutIfacePP<Last>::value)
+    if constexpr (SharedHandleTail<A...>::value)
+        return com_call_out_sh(pmf, self, m, sp, std::make_index_sequence<N - 2>{});
+    else if constexpr (N > 0 && IsOutIfacePP<Last>::value)
         return com_call_out(pmf, self, m, sp, std::make_index_sequence<N - 1>{});
     else
         return com_call(pmf, self, m, sp, std::make_index_sequence<N>{});
@@ -429,7 +487,8 @@ constexpr const char* com_hand_marshal_reason(R (C::*)(A...))
         // The trailing out-interface is handled, so it does not count against
         // the rule-10 check that would otherwise flag every Create* method.
         constexpr int npp = (0 + ... + (PtrToPtrSized<A>::value ? 1 : 0));
-        constexpr int budget = IsOutIfacePP<Last>::value ? 1 : 0;
+        constexpr int budget = SharedHandleTail<A...>::value ? 2
+                             : IsOutIfacePP<Last>::value ? 1 : 0;
         if constexpr (npp > budget)
             return "writes 8 bytes through a 4-byte guest object (rule 10)";
         else

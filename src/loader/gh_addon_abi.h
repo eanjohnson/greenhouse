@@ -79,6 +79,11 @@ typedef struct GhHostApi {
      * Polls input itself, so a long download can ask between requests; same thread
      * rule as progress. Outside a cancellable call it always answers 0. */
     int (*cancelRequested)(void);
+
+    /* Appended in loader 0.0.824.0 (still ABI 1). Depot ids a title's config tells
+     * the download to leave out (Half-Life 2 without the Episode depots it shares
+     * with apps 380/420). Writes up to cap ids and returns how many; 0 = none. */
+    uint32_t (*steamSkipDepots)(uint32_t app, uint32_t* out, uint32_t cap);
 } GhHostApi;
 
 /* True when the host's struct carries field f (an older host leaves it out). */

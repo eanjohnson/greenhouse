@@ -25,6 +25,7 @@ SDK = os.path.join(os.path.dirname(__file__), 'xwin-sdk/sdk/include/10.0.26100')
 HEADERS = [
     'shared/dxgi.h', 'shared/dxgi1_2.h', 'shared/dxgitype.h', 'shared/dxgicommon.h',
     'um/d3dcommon.h', 'um/d3d11.h',
+    'shared/d3d9types.h', 'shared/d3d9caps.h', 'shared/d3d9.h',
 ]
 
 # Typedefs that are a pointer or a pointer-sized integer on x64 and 4 bytes on
@@ -59,6 +60,17 @@ REGISTER = [
     'ID3D11SamplerState', 'ID3D11Asynchronous', 'ID3D11Query',
     'ID3D11Predicate', 'ID3D11Counter', 'ID3D11ClassLinkage',
     'ID3D11ClassInstance', 'ID3D11CommandList',
+]
+
+# Direct3D 9 (Source engine titles), registered by com_register_generated_d3d9.
+REGISTER_D3D9 = [
+    'IDirect3D9', 'IDirect3D9Ex', 'IDirect3DDevice9', 'IDirect3DDevice9Ex',
+    'IDirect3DSwapChain9', 'IDirect3DSwapChain9Ex', 'IDirect3DResource9',
+    'IDirect3DBaseTexture9', 'IDirect3DTexture9', 'IDirect3DCubeTexture9',
+    'IDirect3DVolumeTexture9', 'IDirect3DSurface9', 'IDirect3DVolume9',
+    'IDirect3DVertexBuffer9', 'IDirect3DIndexBuffer9', 'IDirect3DStateBlock9',
+    'IDirect3DVertexDeclaration9', 'IDirect3DVertexShader9',
+    'IDirect3DPixelShader9', 'IDirect3DQuery9',
 ]
 
 
@@ -138,6 +150,36 @@ for m in IFACE_RE.finditer(text):
     ifaces[name] = dict(base=base, guid=guid, methods=methods)
     order.append(name)
 
+# d3d9.h is not MIDL output: DECLARE_INTERFACE_(Name, Base) lists EVERY slot,
+# inherited ones included, as STDMETHOD(name)(THIS_ ...) / STDMETHOD_(ret,name).
+# Its inherited prefix is checked against the base's own derived slots below,
+# the same two-statements rule as the MIDL C vtables.
+D9_IFACE_RE = re.compile(r'DECLARE_INTERFACE_\((\w+)\s*,\s*(\w+)\)\s*\{')
+D9_METHOD_RE = re.compile(r'STDMETHOD(?:_\(\s*[\w\s\*]+?\s*,\s*(\w+)\s*\)|\((\w+)\))\s*\(')
+d9_listed = {}
+for m in D9_IFACE_RE.finditer(text):
+    name, base = m.group(1), m.group(2)
+    if name in ifaces: continue
+    depth, i = 1, m.end()
+    while i < len(text) and depth:
+        if text[i] == '{': depth += 1
+        elif text[i] == '}': depth -= 1
+        i += 1
+    body = text[m.end():i-1]
+    methods = []
+    for mm in D9_METHOD_RE.finditer(body):
+        mname = mm.group(1) or mm.group(2)
+        d, j = 1, mm.end()
+        while j < len(body) and d:
+            if body[j] == '(': d += 1
+            elif body[j] == ')': d -= 1
+            j += 1
+        params = re.sub(r'^\s*THIS_?\s*', '', body[mm.end():j-1])
+        methods.append((mname, params))
+    d9_listed[name] = methods
+    ifaces[name] = dict(base=base, guid='', methods=None)
+    order.append(name)
+
 # ---------------------------------------------------------- cross-check
 # The same headers carry a C-style vtable struct for every interface, written
 # by MIDL from the same IDL. It lists the methods in vtable order INCLUDING the
@@ -153,6 +195,17 @@ for m in VTBL_RE.finditer(text):
 
 ifaces['IUnknown'] = dict(base=None, guid='', methods=[
     ('QueryInterface', 'REFIID riid, void **ppv'), ('AddRef', ''), ('Release', '')])
+
+def _d9_resolve(name):
+    if ifaces[name]['methods'] is not None: return
+    base = ifaces[name]['base']
+    if base in d9_listed: _d9_resolve(base)
+    listed = d9_listed[name]
+    inherited = [mn for mn, _ in all_methods(base)]
+    got = [mn for mn, _ in listed[:len(inherited)]]
+    if got != inherited:
+        sys.exit('d3d9 %s: inherited slots %s != %s %s' % (name, got, base, inherited))
+    ifaces[name]['methods'] = listed[len(inherited):]
 
 def chain(name):
     out = []
@@ -211,6 +264,8 @@ def suspects(params):
         if w not in seen: seen.add(w); uniq.append(w)
     return '; '.join(uniq)
 
+for _n in d9_listed: _d9_resolve(_n)
+
 # Compare the derived order against MIDL's own C vtable, interface by
 # interface. A mismatch here means a guest would call the wrong method through
 # a vtable index -- the exact failure this whole file exists to prevent -- so it
@@ -219,6 +274,7 @@ bad = 0
 for name in order:
     derived = [mn for mn, _ in all_methods(name)]
     ref = cvtbl.get(name)
+    if ref is None and name in d9_listed: continue   # checked by _d9_resolve
     if ref is None:
         print('WARNING: no C vtable to check %s against' % name); continue
     if derived != ref:
@@ -271,7 +327,7 @@ w('// It is generated, so it cannot drift from the headers; it is explicit, so i
 w('// can be read.')
 w('')
 w('namespace ghx86 {')
-for name in REGISTER:
+for name in REGISTER + REGISTER_D3D9:
     ms = all_methods(name)
     sus = dict((mn, suspects(p)) for mn, p in ms)
     w('')
@@ -295,6 +351,13 @@ w('// guest asks for a DXGI factory or a D3D11 device.')
 w('inline void com_register_generated(ComState& c)')
 w('{')
 for name in REGISTER:
+    w('    com_register_%s(c);' % name)
+w('}')
+w('')
+w('// Direct3D 9: registered the first time a guest calls Direct3DCreate9(Ex).')
+w('inline void com_register_generated_d3d9(ComState& c)')
+w('{')
+for name in REGISTER_D3D9:
     w('    com_register_%s(c);' % name)
 w('}')
 w('')

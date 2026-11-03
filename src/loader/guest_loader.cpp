@@ -665,6 +665,8 @@ static const std::wstring& GhDumpDir();
 static const std::wstring& GhCorpusDir();
 static void GhCheckDeviceRemoved(const char* where,
                                  ID3D12Device* dev = nullptr); // #158 removal + DRED
+static void GhStartRemovalWatch(ID3D12Device* dev);           // #158 100 ms removal poll + GPU heartbeat
+static volatile LONGLONG g_ddiDrawSince = 0;                  // GetTickCount64 at entry of the D3D9 draw in flight, 0 if none
 static std::string GhLazyStats();                             // #145 demand-commit counters
 static void        GhLazyCashIn();                            // #230 cash promises before the container is gone
 static void        GhLazySpillReserve();                       // #233 age granules + keep a commit reserve (sampler thread)
@@ -932,6 +934,7 @@ struct GhTitle {
     std::string psoDeny;          // 32-hex keys, one per line
     unsigned steamAppId = 0;
     std::string steamBranch;      // Steam branch the download takes ("" = public), e.g. "x86-64"
+    std::vector<unsigned> steamSkipDepots;   // depots the download leaves out (space)
     std::vector<std::string> services;   // runtime services the title needs ("steam-runtime")
     bool workshop = false;        // Steam Workshop: sync the account's subscriptions before launch
     std::string input;            // overlay input profile a game starts on until the player picks one
@@ -2166,7 +2169,12 @@ static LSTATUS RegOpenImpl(HKEY root, const std::wstring& sub, PHKEY out){
     std::lock_guard<std::mutex> lk(g_regMutex);
     std::wstring path=RegPathLocked(root,sub);
     bool hit=g_regKeys.count(path)!=0;
-    Diag("REG open " + RegNarrow(path) + (hit?" [hit]":" [miss]"));
+    // Capped per path: a guest retry loop (HL2's SteamAPI_Init) reopens one key
+    // thousands of times. Every first-8 open is still logged, x64 included.
+    static std::unordered_map<std::wstring,uint32_t> s_opens;
+    const uint32_t n=++s_opens[path];
+    if(n<=8 || (n&(n-1))==0)
+        Diag("REG open " + RegNarrow(path) + (hit?" [hit]":" [miss]") + (n>8?" (x"+std::to_string(n)+")":""));
     if(hit){ if(out)*out=RegMakeHandleLocked(path); return ERROR_SUCCESS; }
     if(out)*out=nullptr; return ERROR_FILE_NOT_FOUND;
 }
@@ -9278,12 +9286,14 @@ static bool GhCorpusPkgOnly()
 static bool GhCorpusBakeOnly()
 { static const bool v = GhCfgNumZ(L"gh_corpus_bake_only.txt", "GH_CORPUS_BAKE_ONLY", 0) != 0; return v; }
 static bool GhReadPackBlob(const std::wstring& name, std::vector<uint8_t>& out, bool probe = false);   // launcher_ui.h (§44)
-// The package's corpus: its plaintext guest\ghlo\ (a bundled dev build), then the
+static bool GhReadBundledBlob(const std::wstring& name, std::vector<uint8_t>& out, bool probe = false); // launcher_ui.h
+// The package's corpus: guest\ghlo\ of a bundled dev build -- plain *.ghpak packs
+// (iterate-launcher.sh), else loose gh_*.bin from an older build -- then the
 // encrypted packs of the installed corpus add-on (§44, members only).
 static bool GhReadPkgBlob(const wchar_t* prefix, const std::wstring& wkey, std::vector<uint8_t>& out)
 {
     const std::wstring& d = GhPkgCorpusDir();
-    if (!d.empty()) ReadWholeFile(d + prefix + wkey + L".bin", out, true);
+    if (!d.empty() && !GhReadBundledBlob(prefix + wkey, out)) ReadWholeFile(d + prefix + wkey + L".bin", out, true);
     if (out.empty()) return GhReadPackBlob(prefix + wkey, out);
     static LONG n = 0;
     if (InterlockedIncrement(&n) <= 3)
@@ -9818,8 +9828,9 @@ static void GhPsoRecStash(const void* code, SIZE_T n, char keyOut[40])
         GetFileAttributesW((std::wstring(kDevBake) + L"gh_lo_" + wkey + L".bin").c_str())
             != INVALID_FILE_ATTRIBUTES ||
         (!GhPkgCorpusDir().empty() &&
-         GetFileAttributesW((GhPkgCorpusDir() + L"gh_lo_" + wkey + L".bin").c_str())
-            != INVALID_FILE_ATTRIBUTES) ||
+         (GetFileAttributesW((GhPkgCorpusDir() + L"gh_lo_" + wkey + L".bin").c_str())
+            != INVALID_FILE_ATTRIBUTES ||
+          [&]{ std::vector<uint8_t> none; return GhReadBundledBlob(L"gh_lo_" + wkey, none, true); }())) ||
         [&]{ std::vector<uint8_t> none; return GhReadPackBlob(L"gh_lo_" + wkey, none, true); }())
         return;                                  // the lowered blob is already staged
     HANDLE h = CreateFileW((std::wstring(kLocalState) + L"gh_ps_" + wkey + L".bin").c_str(),
@@ -34444,6 +34455,67 @@ static void GhInstallScacheShim()
              " the cell is VOID, not a negative");
 }
 
+static volatile LONG g_removalWatchOn = 0;
+static void GhStartRemovalWatch(ID3D12Device* dev)
+{
+    // One watcher per process: the guest's D3D12 device and the d3d9on12 path
+    // (gh_d3d9rt.h) both run on g_gfx.d12, and either may get here first.
+    if (!dev || InterlockedCompareExchange(&g_removalWatchOn, 1, 0) != 0) return;
+    // #158: poll for device removal on a 100 ms cadence. The 3-second memory
+    // sampler is far too coarse to say WHERE a removal happened, and asking only
+    // from inside failing hooks can only ever report the calls that come after
+    // it. A tight poll puts the first sighting within a tenth of a second of the
+    // cause, and tells us whether the device died during a burst of guest D3D
+    // calls or while nothing was being asked of it at all. Holds its own
+    // reference so the pointer stays valid; the thread exits after it reports.
+    // The same thread carries the GPU heartbeat. One line a second is nothing next
+    // to a 1.5 MB log, and it is the only way to see the shape of the failure: if
+    // submissions keep flowing and fences keep retiring right up to the removal,
+    // the GPU was healthy and something else killed it; if a fence stops short of
+    // the value it was last told to reach and stays there, we have the submission
+    // that hung and the second it hung on.
+    dev->AddRef();
+    if (HANDLE th = CreateThread(nullptr, 0, [](void* p) -> DWORD {
+            ID3D12Device* d = (ID3D12Device*)p;
+            std::string last;
+            for (unsigned tick = 0;; ++tick){
+                if (d->GetDeviceRemovedReason() != S_OK){
+                    Diag("GPUHEARTBEAT final" + GhGpuProgress());
+                    GhCheckDeviceRemoved("watchdog-100ms", d);
+                    break;
+                }
+                if (g_guestDone) break;
+                // HL2 s846-s848: the first draw of a new shader pair went into
+                // d3d9on12 and never came back, with nothing removed and the
+                // driver's last words still in the ring. Say so while the
+                // process can still write, and empty the ring.
+                static bool s_drawStallSaid = false;
+                const LONGLONG since = InterlockedCompareExchange64(&g_ddiDrawSince, 0, 0);
+                if (since && !s_drawStallSaid && GetTickCount64() - (ULONGLONG)since > 5000){
+                    s_drawStallSaid = true;
+                    Diag("D9 draw STALL " + std::to_string((unsigned long long)(GetTickCount64() - (ULONGLONG)since)) +
+                         " ms in the DDI" + GhGpuProgress());
+                    GhDbgStrFlush("d9-draw-stall");
+                }
+                if ((tick % 10) == 0){
+                    std::string now = GhGpuProgress();
+                    // Drop the "sincelastsubmit" clause when comparing, or every
+                    // line differs and a genuinely idle GPU looks busy.
+                    std::string key = now.substr(0, now.find(" sincelastsubmit="));
+                    // Repeat every 5 s even when nothing moved: a silent stretch
+                    // has to be readable as a stall, not as a gap in the log.
+                    if (key != last || (tick % 50) == 0){ last = key; Diag("GPUHEARTBEAT" + now); }
+                    GhDrainInfoQueue();
+                }
+                Sleep(100);
+            }
+            d->Release();
+            return 0;
+        }, dev, 0, nullptr))
+        CloseHandle(th);
+    else dev->Release();
+}
+
 static void GhHookD12Device(ID3D12Device* dev)
 {
     GhInstallUmdVaTrace();
@@ -34566,47 +34638,7 @@ static void GhHookD12Device(ID3D12Device* dev)
     }
     GhLogMemoryBudget("device-created");
 
-    // #158: poll for device removal on a 100 ms cadence. The 3-second memory
-    // sampler is far too coarse to say WHERE a removal happened, and asking only
-    // from inside failing hooks can only ever report the calls that come after
-    // it. A tight poll puts the first sighting within a tenth of a second of the
-    // cause, and tells us whether the device died during a burst of guest D3D
-    // calls or while nothing was being asked of it at all. Holds its own
-    // reference so the pointer stays valid; the thread exits after it reports.
-    // The same thread carries the GPU heartbeat. One line a second is nothing next
-    // to a 1.5 MB log, and it is the only way to see the shape of the failure: if
-    // submissions keep flowing and fences keep retiring right up to the removal,
-    // the GPU was healthy and something else killed it; if a fence stops short of
-    // the value it was last told to reach and stays there, we have the submission
-    // that hung and the second it hung on.
-    dev->AddRef();
-    if (HANDLE th = CreateThread(nullptr, 0, [](void* p) -> DWORD {
-            ID3D12Device* d = (ID3D12Device*)p;
-            std::string last;
-            for (unsigned tick = 0;; ++tick){
-                if (d->GetDeviceRemovedReason() != S_OK){
-                    Diag("GPUHEARTBEAT final" + GhGpuProgress());
-                    GhCheckDeviceRemoved("watchdog-100ms", d);
-                    break;
-                }
-                if (g_guestDone) break;
-                if ((tick % 10) == 0){
-                    std::string now = GhGpuProgress();
-                    // Drop the "sincelastsubmit" clause when comparing, or every
-                    // line differs and a genuinely idle GPU looks busy.
-                    std::string key = now.substr(0, now.find(" sincelastsubmit="));
-                    // Repeat every 5 s even when nothing moved: a silent stretch
-                    // has to be readable as a stall, not as a gap in the log.
-                    if (key != last || (tick % 50) == 0){ last = key; Diag("GPUHEARTBEAT" + now); }
-                    GhDrainInfoQueue();
-                }
-                Sleep(100);
-            }
-            d->Release();
-            return 0;
-        }, dev, 0, nullptr))
-        CloseHandle(th);
-    else dev->Release();
+    GhStartRemovalWatch(dev);
     // Only five methods are hooked, so a crash inside any of the others shows up
     // in a backtrace as a bare D3D12Core.dll+offset with nothing naming the call
     // the guest made. Printing the slot map once turns that offset back into a
@@ -35084,9 +35116,19 @@ static bool OwnsAnyLocked(DWORD tid){
     for (auto& w : g_wnd) if (w.second.tid == tid) return true;
     return false;
 }
-static HWND Create(const std::wstring& cls){
+// A window that covers the screen (or asks for the default size) is the game's
+// window whatever thread makes it: Tsushima creates "Reign" 1920x1080 on a window
+// thread of its own. As an own window it left kFakeHwnd on the first class ever
+// registered -- steamclient's SteamWinsockInitFakeClass, whose proc is a heap thunk
+// that is gone by then -- and the first input dispatch jumped into freed memory
+// (0.0.821-0.0.851). Splash screens are smaller than the screen; they stay here.
+static bool IsGameSized(int w, int h){
+    if (w == CW_USEDEFAULT || h == CW_USEDEFAULT) return true;
+    return (UINT)w >= g_winW && (UINT)h >= g_winH;
+}
+static HWND Create(const std::wstring& cls, int cw, int ch){
     const DWORD tid = GetCurrentThreadId();
-    if (!g_guestWorkerTid || tid == g_guestWorkerTid || !Enabled()) return nullptr;
+    if (!g_guestWorkerTid || tid == g_guestWorkerTid || !Enabled() || IsGameSized(cw, ch)) return nullptr;
     WNDPROC p = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_wndClassMutex);
@@ -35220,7 +35262,7 @@ static HWND   WINAPI Bed_CreateWindowExW(DWORD, LPCWSTR cls, LPCWSTR, DWORD styl
     Diag("BED CreateWindowExW cls=" + std::string(c.begin(), c.end()) +
          " style=" + Hex((uint32_t)style) + " at " + std::to_string(x) + "," + std::to_string(y) +
          " size " + std::to_string(w) + "x" + std::to_string(h));
-    if (HWND own = ghwnd2::Create(c)) return own;
+    if (HWND own = ghwnd2::Create(c, w, h)) return own;
     GhClassSelect(c);
     g_fakeWndStyle = (LONG_PTR)style;
     return kFakeHwnd;
@@ -35235,7 +35277,7 @@ static HWND   WINAPI Bed_CreateWindowExA(DWORD, LPCSTR cls, LPCSTR, DWORD style,
     {
         std::string a = (cls && (uintptr_t)cls > 0xFFFF) ? cls : "(atom)";
         const std::wstring wa(a.begin(), a.end());
-        if (HWND own = ghwnd2::Create(wa)) return own;
+        if (HWND own = ghwnd2::Create(wa, w, h)) return own;
         GhClassSelect(wa);
     }
     g_fakeWndStyle = (LONG_PTR)style;
@@ -38531,6 +38573,16 @@ static bool GhTitleFromJson(const ghjson::Value& j, GhTitle& t, std::string& why
         if (ok) for (char c : v->s) if (!isalnum((unsigned char)c) && c != '-' && c != '_' && c != '.') ok = false;
         if (!ok){ why = "match.steamBranch is not a branch name"; return false; }
         t.steamBranch = v->s;
+    }
+    // Depots to leave out of the download. Half-Life 2's app pulls in the two
+    // Episodes' depots (380/389 from app 380, 420 from app 420) for its
+    // hl2_complete mod; a console short of space can run plain -game hl2 without.
+    if ((v = m->get("steamSkipDepots"))){
+        if (!v->isArr()){ why = "match.steamSkipDepots is not an array"; return false; }
+        for (const auto& e : v->arr){
+            if (!e.isNum() || !e.isInt || e.i <= 0 || e.i > 0xFFFFFFFFLL){ why = "match.steamSkipDepots holds a non-depot id"; return false; }
+            t.steamSkipDepots.push_back((unsigned)e.i);
+        }
     }
     // Workshop content is part of the game for some titles (Garry's Mod mounts
     // every subscribed addon at start): the Launcher syncs the account's
@@ -44600,6 +44652,9 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"GetTextExtentPoint32A", (void*)&Bed_GetTextExtentPoint32A}, {"GetTextExtentPoint32W", (void*)&Bed_GetTextExtentPoint32W},
         {"GetFontUnicodeRanges", (void*)&Bed_GetFontUnicodeRanges}, {"EnumFontFamiliesExA", (void*)&Bed_EnumFontFamiliesExA},
         {"AddFontResourceA", (void*)&Bed_AddFontResourceA}, {"RemoveFontResourceA", (void*)&Bed_RemoveFontResourceA},
+        {"AddFontResourceExA", (void*)&Bed_AddFontResourceExA}, {"MoveToEx", (void*)&Bed_MoveToEx},
+        {"SetTextColor", (void*)&Bed_SetTextColor}, {"SetBkColor", (void*)&Bed_SetBkColor}, {"SetBkMode", (void*)&Bed_SetBkMode},
+        {"ExtTextOutA", (void*)&Bed_ExtTextOutA}, {"ExtTextOutW", (void*)&Bed_ExtTextOutW},
         {"CreateDIBSection", (void*)&Bed_CreateDIBSection}, {"GetObjectA", (void*)&Bed_GetObjectA}, {"GetObjectW", (void*)&Bed_GetObjectW},
         {"RectInRegion",       (void*)&Bed_RectInRegion},
         {"GetRgnBox",          (void*)&Bed_GetRgnBox},
@@ -45014,6 +45069,9 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"GetTextExtentPoint32A", (void*)&Bed_GetTextExtentPoint32A}, {"GetTextExtentPoint32W", (void*)&Bed_GetTextExtentPoint32W},
         {"GetFontUnicodeRanges", (void*)&Bed_GetFontUnicodeRanges}, {"EnumFontFamiliesExA", (void*)&Bed_EnumFontFamiliesExA},
         {"AddFontResourceA", (void*)&Bed_AddFontResourceA}, {"RemoveFontResourceA", (void*)&Bed_RemoveFontResourceA},
+        {"AddFontResourceExA", (void*)&Bed_AddFontResourceExA}, {"MoveToEx", (void*)&Bed_MoveToEx},
+        {"SetTextColor", (void*)&Bed_SetTextColor}, {"SetBkColor", (void*)&Bed_SetBkColor}, {"SetBkMode", (void*)&Bed_SetBkMode},
+        {"ExtTextOutA", (void*)&Bed_ExtTextOutA}, {"ExtTextOutW", (void*)&Bed_ExtTextOutW},
         {"CreateDIBSection", (void*)&Bed_CreateDIBSection}, {"GetObjectA", (void*)&Bed_GetObjectA}, {"GetObjectW", (void*)&Bed_GetObjectW},
         {"RectInRegion",       (void*)&Bed_RectInRegion},
         {"GetRgnBox",          (void*)&Bed_GetRgnBox},
@@ -46991,6 +47049,10 @@ static LONG GhCrashObserverVehBody(EXCEPTION_POINTERS* ep);
 
 static LONG CALLBACK CrashObserverVeh(EXCEPTION_POINTERS* ep)
 {
+    // §58. A fault in 32-bit code (compat mode, CS 0x23) belongs to the native
+    // x86 runtime's own handler: an fs: access it patches, or a guest exception
+    // it dispatches to the guest's SEH. Nothing below can read a 32-bit frame.
+    if (ep->ContextRecord && ep->ContextRecord->SegCs == 0x23) return EXCEPTION_CONTINUE_SEARCH;
     // §56. A host call that brought its own __except (the scache guard) is not a
     // crash: stand aside before any analysis, or the observer ends the guest from
     // the worker thread first, or faults in its own dump (RV: REENTRY on scache).
@@ -48211,6 +48273,29 @@ static bool GhReadableQword(uintptr_t a, uintptr_t* out)
     return SafeQword(a, out);
 }
 
+// x86 guest modules by lowercased name, for gh_peek's "module.dll+rva" form:
+// a 32-bit guest's DLL bases move from run to run (HL2 engine.dll sat at
+// 0xF49E000 in s857 and 0x4E30E000 in s858), so a bare address written before
+// launch points nowhere. Filled by the x86 mapper (gh_x86_win.h).
+static SRWLOCK g_x86ModLock = SRWLOCK_INIT;
+static std::vector<std::pair<std::string, uint32_t>> g_x86Mods;
+static void GhNoteX86Module(const std::string& lname, uint32_t base)
+{
+    AcquireSRWLockExclusive(&g_x86ModLock);
+    bool found = false;
+    for (auto& e : g_x86Mods) if (e.first == lname){ e.second = base; found = true; }
+    if (!found) g_x86Mods.emplace_back(lname, base);
+    ReleaseSRWLockExclusive(&g_x86ModLock);
+}
+static uintptr_t GhX86ModuleBase(const std::string& lname)
+{
+    uintptr_t b = 0;
+    AcquireSRWLockShared(&g_x86ModLock);
+    for (auto& e : g_x86Mods) if (e.first == lname) b = e.second;
+    ReleaseSRWLockShared(&g_x86ModLock);
+    return b;
+}
+
 // #152: read named guest addresses live. The tracepoints are one-shot and fire
 // on the first pass through a loop, but what a stall actually needs is the same
 // word sampled repeatedly -- "issued keeps climbing while completed is stuck"
@@ -48233,10 +48318,20 @@ static void GhPollPeekRequest()
         while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
         if (line.empty() || line[0] == '#') continue;
         size_t sp = line.find_first_of(" \t");
-        uintptr_t a = (uintptr_t)strtoull(line.substr(0, sp).c_str(), nullptr, 16);
+        std::string tok = line.substr(0, sp);
+        uintptr_t a = 0;
+        const size_t plus = tok.find('+');
+        if (plus != std::string::npos){                   // "engine.dll+66c780"
+            std::string mod = tok.substr(0, plus);
+            for (char& c : mod) c = (char)tolower((unsigned char)c);
+            const uintptr_t b = GhX86ModuleBase(mod);
+            if (!b){ Diag("PEEK " + tok + " module not mapped"); continue; }
+            a = b + (uintptr_t)strtoull(tok.substr(plus + 1).c_str(), nullptr, 16);
+        } else a = (uintptr_t)strtoull(tok.c_str(), nullptr, 16);
         if (!a) continue;
         std::string label = (sp == std::string::npos) ? std::string() : line.substr(sp + 1);
-        std::string out = "PEEK " + Hex((uint64_t)a) + (label.empty() ? "" : " " + label) + " dw=";
+        std::string out = "PEEK " + Hex((uint64_t)a) + (plus != std::string::npos ? " " + tok : "")
+                        + (label.empty() ? "" : " " + label) + " dw=";
         for (int k = 0; k < 4; ++k){
             uintptr_t q = 0;
             if (!GhReadableQword(a + (uintptr_t)k * 8, &q)){ out += " ??"; break; }
@@ -50080,7 +50175,11 @@ static void FlushGuestImageOnly()
 #endif
 
 #ifdef GH_X86_GUEST
+#ifndef GH_X86_JIT
+#include "x86/jit/gh_jit_stubs.h"   // the BoxedWine JIT is not linked
+#endif
 #include "x86/gh_x86_run.h"
+#include "x86/gh_x86_native.h"
 
 // 32-bit (PE32/i386) guests. Everything x64 above this line runs natively; a
 // PE32 cannot, so it is mapped into a sub-4GB region and interpreted instead.
@@ -50088,6 +50187,20 @@ static void FlushGuestImageOnly()
 static bool MapAndRun32(const std::vector<uint8_t>& file)
 {
     ghx86::g_log = [](const std::string& s) { Diag(s); };
+    // The guest's registry is the same virtual hive x64 guests get (loaded,
+    // Steam-seeded and saved around MapAndRun by RunGuest).
+    ghx86::g_reg = { Bed_RegOpenKeyExW, Bed_RegOpenKeyExA, Bed_RegOpenKeyA, Bed_RegCreateKeyW,
+                     Bed_RegCreateKeyExW, Bed_RegCreateKeyExA, Bed_RegCloseKey,
+                     Bed_RegSetValueExA, Bed_RegSetValueExW, Bed_RegQueryValueExA,
+                     Bed_RegQueryValueExW, Bed_RegDeleteValueA };
+    // ...minus Steam's ActiveProcess key. It is seeded for steamclient64; a 32-bit
+    // steam_api reading it believes Steam is running, then fails to load a
+    // steamclient.dll that does not exist -- every frame (s839: 838 tries).
+    // Without the key it reports "Steam not running" once, as before the hive.
+    {
+        std::lock_guard<std::mutex> lk(g_regMutex);
+        g_regKeys.erase(L"hkcu\\software\\valve\\steam\\activeprocess");
+    }
 
     // ghx86opts.txt = "quiet" strips the interpreter's diagnostics for a run
     // that exists to measure throughput. Delivered the same way as ghguest.txt
@@ -50282,7 +50395,16 @@ static bool MapAndRun32(const std::vector<uint8_t>& file)
 
     uint32_t result = 0;
     std::string why;
-    bool ok = ghx86::RunPe32Guest(file, result, why, g_guestExePath);
+    // §58. gh_x86_native.txt=1 runs the guest's own x86 code on the CPU in
+    // compatibility mode instead of interpreting it.
+    const bool native = GhCfgNum(L"gh_x86_native.txt", "GH_X86_NATIVE", 0) != 0;
+    Diag(std::string("X86 runtime: ") + (native ? "native (compat mode)" : "interpreter"));
+    ghx86::g_x86_sys_dir = g_installDir + L"guest\\x86\\";
+    // gh_x86_sample.txt=N: every N s, log where each guest thread is (stalls).
+    ghx86::native::S.sample_ms = (uint32_t)GhCfgNum(L"gh_x86_sample.txt", "GH_X86_SAMPLE", 0) * 1000u;
+    ghx86::native::S.host_stack_mb = (uint32_t)GhCfgNum(L"gh_x86_host_stack_mb.txt", "GH_X86_HOST_STACK_MB", 32);
+    bool ok = native ? ghx86::native::RunPe32Native(file, result, why, g_guestExePath)
+                     : ghx86::RunPe32Guest(file, result, why, g_guestExePath);
 
     if (!ok) {
         Diag("STAGE=x86_guest_failed " + why);
@@ -51111,12 +51233,14 @@ static std::wstring ReadCfgW(const wchar_t* file, const std::wstring& dflt)
 //     DOWN|UP|LEFT|RIGHT        left-stick full deflection (DOWN => LY=-32000)
 //     LX=<n> LY=<n> RX=<n> RY=<n>   raw stick axes  (-32768..32767; +LY is up)
 //     A B X Y LB RB START BACK LS RS   face/shoulder/thumb buttons
+//     LT RT                      triggers, fully pulled
 //     DUP DDOWN DLEFT DRIGHT     d-pad
 //     T=<ms>                     hold duration (default 400, clamp 50..5000)
 //   e.g.  "DOWN"        one downward flick of the left stick
 //         "A T=120"     a short A press
 static WORD  g_synBtn = 0;       // buttons to OR while active
 static SHORT g_synLX = 0, g_synLY = 0, g_synRX = 0, g_synRY = 0;
+static BYTE  g_synLT = 0, g_synRT = 0;
 static DWORD g_synUntil = 0;     // GetTickCount() deadline; 0 == inactive
 static bool  g_synLogged = false;
 static void PollSyntheticPad()
@@ -51133,7 +51257,7 @@ static void PollSyntheticPad()
             // Accept ASCII or UTF-16LE: drop NUL/BOM bytes, keep the ASCII tokens.
             std::string s;
             for (uint8_t c : b){ if (c && c != 0xFF && c != 0xFE) s += (char)std::toupper(c); }
-            WORD btn = 0; SHORT lx=0, ly=0, rx=0, ry=0; long hold = 400;
+            WORD btn = 0; SHORT lx=0, ly=0, rx=0, ry=0; BYTE lt=0, rt=0; long hold = 400;
             auto axis = [](const std::string& v)->SHORT{
                 long n = std::strtol(v.c_str(), nullptr, 10);
                 if (n >  32767) n =  32767; if (n < -32768) n = -32768; return (SHORT)n; };
@@ -51155,6 +51279,8 @@ static void PollSyntheticPad()
                 else if (t == "RB")    btn |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
                 else if (t == "LS")    btn |= XINPUT_GAMEPAD_LEFT_THUMB;
                 else if (t == "RS")    btn |= XINPUT_GAMEPAD_RIGHT_THUMB;
+                else if (t == "LT")    lt = 255;
+                else if (t == "RT")    rt = 255;
                 else if (t == "START") btn |= XINPUT_GAMEPAD_START;
                 else if (t == "BACK")  btn |= XINPUT_GAMEPAD_BACK;
                 else if (t == "DUP")   btn |= XINPUT_GAMEPAD_DPAD_UP;
@@ -51168,13 +51294,13 @@ static void PollSyntheticPad()
                 else if (t.rfind("T=",0)==0)  hold = std::strtol(t.c_str()+2, nullptr, 10);
             }
             if (hold < 50) hold = 50; if (hold > 5000) hold = 5000;
-            g_synBtn = btn; g_synLX = lx; g_synLY = ly; g_synRX = rx; g_synRY = ry;
+            g_synBtn = btn; g_synLX = lx; g_synLY = ly; g_synRX = rx; g_synRY = ry; g_synLT = lt; g_synRT = rt;
             g_synUntil = now + (DWORD)hold;
             if (!g_synLogged){ g_synLogged = true; Diag("INPUT synthpad: hook armed"); }
             g_synSticky = true;
             char msg[128];
-            std::snprintf(msg, sizeof msg, "INPUT synthpad fire btn=0x%04X LX=%d LY=%d RX=%d RY=%d hold=%ldms",
-                          btn, lx, ly, rx, ry, hold);
+            std::snprintf(msg, sizeof msg, "INPUT synthpad fire btn=0x%04X LX=%d LY=%d RX=%d RY=%d LT=%d RT=%d hold=%ldms",
+                          btn, lx, ly, rx, ry, lt, rt, hold);
             Diag(msg);
         }
     }
@@ -51186,6 +51312,8 @@ static void PollSyntheticPad()
         if (g_synLY) g_padState.sThumbLY = g_synLY;
         if (g_synRX) g_padState.sThumbRX = g_synRX;
         if (g_synRY) g_padState.sThumbRY = g_synRY;
+        if (g_synLT) g_padState.bLeftTrigger = g_synLT;
+        if (g_synRT) g_padState.bRightTrigger = g_synRT;
         g_padConnected = true;                       // works with no real pad
         ++g_padPacket;
     } else if (g_synUntil){
@@ -52394,6 +52522,7 @@ static void ResetGuestForRelaunch()
 // (g_launcherSelectedGuest is declared far above, before RunGuest, which reads it.)
 #ifndef GH_LAUNCHER
 static bool GhReadPackBlob(const std::wstring&, std::vector<uint8_t>&, bool) { return false; }   // §44: Launcher only
+static bool GhReadBundledBlob(const std::wstring&, std::vector<uint8_t>&, bool) { return false; }   // Launcher only
 static bool GhLicenseGate(std::vector<uint8_t>&, const std::string&, std::string&, std::string&) { return true; }   // §46: Launcher only
 #endif
 #ifdef GH_LAUNCHER

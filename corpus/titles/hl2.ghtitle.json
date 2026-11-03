@@ -1,0 +1,27 @@
+{
+  "schema": "greenhouse.title/1",
+  "id": "hl2",
+  "name": "Half-Life 2",
+  "match": {
+    "exe": "hl2.exe",
+    "launch": "hl2.exe",
+    "steamAppId": 220,
+    "steamSkipDepots": [
+      380,
+      389,
+      420
+    ]
+  },
+  "requires": {
+    "loader": "0.0.824.0",
+    "services": [
+      "steam-runtime"
+    ]
+  },
+  "args": "-game hl2 -condebug -novid",
+  "input": "builtin-wasd",
+  "knobs": {
+    "gh_dsound": 1,
+    "gh_x86_native": 1
+  }
+}

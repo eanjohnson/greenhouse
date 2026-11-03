@@ -198,18 +198,7 @@ inline void ws_clear_folder(const std::wstring& dir){
 
 // Bytes already in an item folder. A first fetch resumes them (write_or_repair_file)
 // and an update deletes them first, so either way they need no new space.
-inline uint64_t ws_folder_bytes(const std::wstring& dir){
-    uint64_t n = 0;
-    WIN32_FIND_DATAW fd; HANDLE f = FindFirstFileW((dir + L"\\*").c_str(), &fd);
-    if (f == INVALID_HANDLE_VALUE) return 0;
-    do {
-        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) n += ws_folder_bytes(dir + L"\\" + fd.cFileName);
-        else n += ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-    } while (FindNextFileW(f, &fd));
-    FindClose(f);
-    return n;
-}
+inline uint64_t ws_folder_bytes(const std::wstring& dir){ return folder_bytes(dir); }
 
 // Free space WorkshopSync leaves on the content drive: games and the pager's
 // spill file live there too. The add-on may lower it (gh_ws_reserve_mb.txt).
