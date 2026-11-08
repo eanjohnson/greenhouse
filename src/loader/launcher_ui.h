@@ -1368,11 +1368,25 @@ static ghrepo::Config LuiRepoConfig();   // Packages page, below
 // Valve's SteamCMD zip it comes from -- GREENHOUSE.md §38). The loader's engine
 // RVAs (§25.5, §26.10) fit exactly one build, 10.41.26.25, so the hashes are pinned
 // here too: a file on D: that differs is never loaded, whatever installed.json says.
-// steamclient64's hash is AFTER the MapVirtualKeyExA import rename (§19 trick).
-static const struct { const wchar_t* name; const char* sha256; } kSteamRuntimePin[] = {
-    { L"steamclient64.dll", "3bae281da1059a4b71b3540af63df52adaf3256f9fd640af0dfd68b9d8dc671f" },
-    { L"tier0_s64.dll",     "af89cb6e94b20a5660d8f33427460fcd3b5e43e16b13372321d09cebab1288b8" },
-    { L"vstdlib_s64.dll",   "9bb287b195f0a246f68ea462371178d9a2ebc23b03df295606ef189910aee2d2" },
+// Two hashes are accepted per file, both of the SAME Valve build 10.41.26.25:
+//   sha256    steamclient64 AFTER the MapVirtualKeyExA import rename (§19 trick),
+//             which the OS loader needs but which breaks Valve's signature;
+//   sha256Alt Valve's file exactly as the CDN serves it (steam-runtime 1.0.1.0).
+// #277: the pristine file cannot be OS-loaded (the slim user32 has no
+// MapVirtualKeyExA), so it is self-mapped instead -- our own mapper beds that
+// one import. A SteamStub-wrapped game verifies the file behind steamclient64's
+// CreateInterface, and only the pristine file is Valve's own (Dead as Disco).
+// The other two load either way and have one hash each.
+// #278: steam.exe (Valve's own bootstrapper, from the client's steam_win32/steamrow
+// package) is `opt`: add-on 1.0.1.0 and older do not carry it, and a missing optional
+// file must not refuse the whole runtime. It is never executed -- a SteamStub-wrapped
+// game only checks that it EXISTS at the install path it reads from the registry.
+static const struct { const wchar_t* name; const char* sha256; const char* sha256Alt; bool opt; } kSteamRuntimePin[] = {
+    { L"steamclient64.dll", "3bae281da1059a4b71b3540af63df52adaf3256f9fd640af0dfd68b9d8dc671f",
+                            "71b391fe9f3e2006cbc81a5c75eef3eb4186012deabfdb2c8b7e8d4850ecf640", false },
+    { L"tier0_s64.dll",     "af89cb6e94b20a5660d8f33427460fcd3b5e43e16b13372321d09cebab1288b8", nullptr, false },
+    { L"vstdlib_s64.dll",   "9bb287b195f0a246f68ea462371178d9a2ebc23b03df295606ef189910aee2d2", nullptr, false },
+    { L"steam.exe",         "1d2fbcc0402dc5a1f64b2e1d924e6e38e1dd76197c0246ddf89094fb86fda915", nullptr, true  },
 };
 
 // The folder holding a verified copy of all three, or empty. Hashed once per
@@ -1387,18 +1401,27 @@ static std::wstring GhSteamRuntimeDir()
         for (const ghrepo::Installed& p : st.pkgs) {
             if (p.id != "steam-runtime" || p.files.empty()) continue;
             std::wstring d = p.files[0]; if (d.empty() || d.back() != L'\\') d += L'\\';
+            int nok = 0;
             for (const auto& pin : kSteamRuntimePin) {
                 std::vector<uint8_t> b;
                 std::string h = ReadWholeFile(d + pin.name, b, true) && !b.empty()
                               ? ghrepo::Sha256Hex(b.data(), b.size()) : std::string("missing");
-                if (h != pin.sha256) {
+                if (pin.opt && h == "missing") {   // an older add-on build: not an error
+                    Diag("STEAMRT " + p.version + " carries no " + ghrepo::Narrow(pin.name) + " (optional)");
+                    continue;
+                }
+                if (h != pin.sha256 && !(pin.sha256Alt && h == pin.sha256Alt)) {
                     Diag("STEAMRT " + p.version + " REFUSED " + ghrepo::Narrow(pin.name) + " sha256=" +
-                         h.substr(0, 16) + " is not the pinned " + std::string(pin.sha256).substr(0, 16));
+                         h.substr(0, 16) + " is not the pinned " + std::string(pin.sha256).substr(0, 16) +
+                         (pin.sha256Alt ? " (nor " + std::string(pin.sha256Alt).substr(0, 16) + ")" : ""));
                     return;
                 }
+                if (pin.sha256Alt && h == pin.sha256Alt)
+                    Diag("STEAMRT " + ghrepo::Narrow(pin.name) + " is Valve's own file, unpatched -- it will be self-mapped");
+                ++nok;
             }
             dir = d;
-            Diag("STEAMRT " + p.version + " verified (3 files) at " + ghrepo::Narrow(d));
+            Diag("STEAMRT " + p.version + " verified (" + std::to_string(nok) + " files) at " + ghrepo::Narrow(d));
             return;
         }
         Diag("STEAMRT not installed -- the engine loads from the package, if it carries one");
@@ -1500,6 +1523,18 @@ static bool GhReadBundledBlob(const std::wstring& wname, std::vector<uint8_t>& o
     if (store->Read(name, out, why)) return true;
     if (!why.empty()) Diag("PACK bundled " + name + " " + why);
     return false;
+}
+
+// #278: the verified copy of Valve's steam.exe, or empty when the installed add-on
+// predates it. Nothing executes this file; it is what makes the folder look like the
+// Steam installation that HKLM\Software\Valve\Steam\InstallPath names, which a
+// SteamStub-wrapped game checks for with GetFileAttributes before it will start.
+static std::wstring GhSteamExePath()
+{
+    const std::wstring d = GhSteamRuntimeDir();        // hashes everything present, once
+    if (d.empty()) return std::wstring();
+    const std::wstring p = d + L"steam.exe";
+    return GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES ? std::wstring() : p;
 }
 
 // Full path of the fetched copy of `base` if it is one of the three and verified, else empty.

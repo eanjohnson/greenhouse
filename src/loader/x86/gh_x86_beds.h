@@ -47,6 +47,9 @@
 #include "gh_x86_com_d3d.h"
 #include "gh_x86_com_d3d9.h"
 #include "gh_x86_gdi.h"
+#include "gh_x86_dsound.h"
+#include "gh_x86_input.h"
+#include "gh_x86_wndq.h"
 
 namespace ghx86 {
 
@@ -743,7 +746,7 @@ inline uint64_t x86_create_window(Machine& m, const uint32_t* a, bool wide, cons
 }
 
 inline uint64_t peek_message32(Machine& m, uint32_t msg_ptr, uint32_t mn, uint32_t mx, bool remove,
-                               uint32_t ret = 0)
+                               uint32_t ret = 0, uint32_t hwnd_filter = 0)
 {
     static const UINT kSeq[] = { WM_ACTIVATEAPP, WM_ACTIVATE, WM_SETFOCUS, WM_NCACTIVATE };
     if (!msg_ptr || !m.bed.wndproc) return 0;
@@ -759,9 +762,17 @@ inline uint64_t peek_message32(Machine& m, uint32_t msg_ptr, uint32_t mn, uint32
         }
         return 1;
     }
+    // Timers and device notifications rank below input (gh_x86_wndq.h).
+    auto system_msg = [&]() -> uint64_t {
+        uint32_t s[4];
+        if (!wndq_next(m, hwnd_filter, mn, mx, remove, s)) return 0;
+        write_msg32(msg_ptr, s[1], s[2], s[3]);
+        std::memcpy((void*)(uintptr_t)msg_ptr, &s[0], 4);              // MSG.hwnd
+        return 1;
+    };
 #ifdef GH_LAUNCHER
-    std::lock_guard<std::mutex> lk(g_kmMutex);
-    if (g_kmQueue.empty() || !admits(g_kmQueue.front().message)) return 0;
+    std::unique_lock<std::mutex> lk(g_kmMutex);
+    if (g_kmQueue.empty() || !admits(g_kmQueue.front().message)) { lk.unlock(); return system_msg(); }
     const MSG q = g_kmQueue.front();
     write_msg32(msg_ptr, q.message, (uint32_t)q.wParam, (uint32_t)q.lParam, g_kmCurX, g_kmCurY);
     if (remove) {
@@ -773,7 +784,7 @@ inline uint64_t peek_message32(Machine& m, uint32_t msg_ptr, uint32_t mn, uint32
     }
     return 1;
 #else
-    return 0;
+    return system_msg();
 #endif
 }
 
@@ -1683,19 +1694,31 @@ inline void RegisterSourceGapBeds(ThunkRegistry& R)
                                     (const LARGE_INTEGER*)(uintptr_t)a[1], (LONG)a[2],
                                     nullptr, nullptr, (BOOL)a[5]);
         });
-    // No window can own a timer and nothing pumps WM_TIMER into a TIMERPROC, so
-    // a timer is an id that never fires.
+    // A window's timer posts WM_TIMER through PeekMessage (gh_x86_wndq.h). A
+    // thread timer (hwnd 0) is an id that never fires: no window procedure
+    // would see it, and its TIMERPROC would run on whichever thread pumped.
     static_assert(GH_X86_POP(SetTimer) == 16, "SetTimer");
     GH_X86_BED(R, "user32.dll", "SetTimer", 16,
         [](Machine&, const uint32_t* a) -> uint64_t {
+            if (a[0]) return wndq_set_timer(a[0], a[1], a[2], a[3]);
             static std::atomic<uint32_t> next{0x7100};
             log("X86 BED SetTimer " + std::to_string(a[2]) + " ms proc=" + std::to_string(a[3] != 0) +
-                " (never fires)");
+                " (thread timer, never fires)");
             return a[1] ? a[1] : next.fetch_add(1);
         });
     static_assert(GH_X86_POP(KillTimer) == 8, "KillTimer");
     GH_X86_BED(R, "user32.dll", "KillTimer", 8,
-        [](Machine&, const uint32_t*) -> uint64_t { return 1; });
+        [](Machine&, const uint32_t* a) -> uint64_t { if (a[0]) wndq_kill_timer(a[0], a[1]); return 1; });
+    // RegisterDeviceNotification(recipient, filter, flags). Forwarded, it failed
+    // on the surrogate HWND and SDL2 gave up on finding pads after SDL_Init.
+    for (const char* n : { "RegisterDeviceNotificationA", "RegisterDeviceNotificationW" })
+        GH_X86_BED(R, "user32.dll", n, 12,
+            [](Machine&, const uint32_t* a) -> uint64_t {
+                if (!a[0] || (a[2] & 1 /*DEVICE_NOTIFY_SERVICE_HANDLE*/)) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+                return wndq_register_notify(a[0]);
+            });
+    GH_X86_BED(R, "user32.dll", "UnregisterDeviceNotification", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t { return wndq_unregister_notify(a[0]) ? 1 : 0; });
     static_assert(GH_X86_POP(EnumWindows) == 8, "EnumWindows");
     GH_X86_BED(R, "user32.dll", "EnumWindows", 8,
         [](Machine&, const uint32_t*) -> uint64_t { return 1; });   // no top-level windows
@@ -3215,7 +3238,8 @@ inline void RegisterStdBeds(Machine& m)
     GH_X86_BED(R, "ole32.dll", "CoUninitialize", 0,
         [](Machine&, const uint32_t*) -> uint64_t { return 0; });
     GH_X86_BED(R, "ole32.dll", "CoCreateInstance", 20,
-        [](Machine&, const uint32_t* a) -> uint64_t {
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            if (uint64_t hr; di8_cocreate(m, a, hr)) return hr;          // gh_x86_input.h
             if (a[4]) { uint32_t z = 0; std::memcpy((void*)(uintptr_t)a[4], &z, 4); }
             return 0x80040154u;                                            // REGDB_E_CLASSNOTREG
         });
@@ -3488,6 +3512,9 @@ inline void RegisterStdBeds(Machine& m)
         env_set(m, L"OS", L"Windows_NT");
         env_set(m, L"NUMBER_OF_PROCESSORS", L"1");   // see kGuestProcessorCount
         env_set(m, L"PROCESSOR_ARCHITECTURE", L"x86");
+        // SDL2 prefers its raw-input joysticks to XInput once that driver
+        // starts, and it starts with no devices here (gh_x86_input.h).
+        env_set(m, L"SDL_JOYSTICK_RAWINPUT", L"0");
     }
     GH_X86_BED(R, "kernel32.dll", "GetEnvironmentVariableW", 12,
         [](Machine& m, const uint32_t* a) -> uint64_t {
@@ -3506,7 +3533,12 @@ inline void RegisterStdBeds(Machine& m)
     GH_X86_BED(R, "kernel32.dll", "GetEnvironmentVariableA", 12,
         [](Machine& m, const uint32_t* a) -> uint64_t {
             if (!a[0]) return 0;
-            const std::wstring* v = env_find(m, widen((const char*)(uintptr_t)a[0]));
+            const char* nm = (const char*)(uintptr_t)a[0];
+            const std::wstring* v = env_find(m, widen(nm));
+            // Once per name: SDL reads its hints through here on hot paths.
+            static std::mutex mu; static std::set<std::string> seen;
+            { std::lock_guard<std::mutex> lk(mu);
+              if (seen.insert(nm).second) log(std::string("X86 getenvA(") + nm + ") -> " + (v ? "set" : "not set")); }
             if (!v) { SetLastError(ERROR_ENVVAR_NOT_FOUND); return 0; }
             return env_copy_out(*v, a[1], a[2], false);
         });
@@ -3770,6 +3802,19 @@ inline void RegisterStdBeds(Machine& m)
         [](Machine&, const uint32_t* a) -> uint64_t { return Bed_GetKeyboardState((PBYTE)(uintptr_t)a[0]); });
     GH_X86_BED(R, "user32.dll", "GetCursorPos", 4,
         [](Machine&, const uint32_t* a) -> uint64_t { return Bed_GetCursorPos((LPPOINT)(uintptr_t)a[0]); });
+    // The cursor the guest moves and hides is the x64 beds' too. Forwarded, the
+    // recentre each mouse-look frame never reached g_kmCur*, and the crosshair
+    // stamp stayed on screen in gameplay because the hide went to the real user32.
+    GH_X86_BED(R, "user32.dll", "SetCursorPos", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t { return Bed_SetCursorPos((int)a[0], (int)a[1]); });
+    GH_X86_BED(R, "user32.dll", "ShowCursor", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t { return (uint32_t)Bed_ShowCursor((BOOL)a[0]); });
+    GH_X86_BED(R, "user32.dll", "SetCursor", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            return (uint32_t)(uintptr_t)Bed_SetCursor((HCURSOR)(uintptr_t)a[0]);
+        });
+    GH_X86_BED(R, "user32.dll", "ClipCursor", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t { return Bed_ClipCursor((const RECT*)(uintptr_t)a[0]); });
 
     // Raw input: the x64 beds' synthetic packets in the 32-bit layout. Forwarded,
     // these reached the container's user32 with x86 strides (RAWINPUTDEVICE is 12
@@ -3829,7 +3874,7 @@ inline void RegisterStdBeds(Machine& m)
     for (const char* n : { "PeekMessageW", "PeekMessageA" })
         GH_X86_BED(R, "user32.dll", n, 20,
             [](Machine& m, const uint32_t* a) -> uint64_t {
-                return peek_message32(m, a[0], a[2], a[3], (a[4] & PM_REMOVE) != 0, a[-1]);
+                return peek_message32(m, a[0], a[2], a[3], (a[4] & PM_REMOVE) != 0, a[-1], a[1]);
             });
 
     // GetMessage BLOCKS until a message arrives, and on this boundary nothing
@@ -3862,6 +3907,10 @@ inline void RegisterStdBeds(Machine& m)
             [](Machine& m, const uint32_t* a) -> uint64_t {
                 if (!a[0]) return 0;
                 const uint32_t* msg = (const uint32_t*)(uintptr_t)a[0];
+                if (msg[1] == WM_TIMER && msg[3]) {                    // TIMERPROC(hwnd, msg, id, time)
+                    uint32_t targs[4] = { msg[0], WM_TIMER, msg[2], (uint32_t)GetTickCount() };
+                    return m.call_guest32(msg[3], targs, 4);
+                }
                 const uint32_t proc = wndproc_for(m, msg[0]);
                 if (!proc) return 0;
                 uint32_t args[4] = { msg[0], msg[1], msg[2], msg[3] };   // hwnd, message, wParam, lParam
@@ -4323,6 +4372,10 @@ inline void RegisterStdBeds(Machine& m)
     // with the rest of this table.
     RegisterD3DBeds(R);
     RegisterD3D9Beds(R);
+    // DirectSound onto gh_dsound.h's XAudio2 device (the console has no dsound.dll).
+    RegisterDsoundBeds(R);
+    // XInput and an empty DirectInput8, for SDL2's controller init.
+    RegisterInputBeds(R);
 
     for (size_t i = drop0; i < R.dropped().size(); ++i)
         if (R.dropped()[i].winner >= std0)

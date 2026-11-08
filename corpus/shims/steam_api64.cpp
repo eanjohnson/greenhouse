@@ -1431,6 +1431,13 @@ __declspec(dllexport) bool SteamAPI_ManualDispatch_GetNextCallback(HSteamPipe pi
         // DIAG: always log lobby-relevant callbacks (703=SteamAPICallCompleted_t,
         // 510=LobbyMatchList_t, 513=LobbyCreated_t, 504=LobbyEnter_t, 503=LobbyInvite_t,
         // 333=GameLobbyJoinRequested_t).
+        if ((icb==163 || icb==168) && cub>=8) {
+            // GetAuthSessionTicketResponse_t / GetTicketForWebApiResponse_t: {HAuthTicket; EResult; ...}
+            void* p = *(void**)((char*)pCallbackMsg + 8);
+            static volatile LONG nTk = 0;
+            if (p && InterlockedIncrement(&nTk) <= 40)
+                gh_logf("[gh-diag] cb-deliver id=%d ticket=%u result=%d", icb, *(uint32_t*)p, *(int*)((char*)p + 4));
+        }
         if (icb==703 || icb==510 || icb==513 || icb==504 || icb==503 || icb==333 || icb==500 || icb==502) {
             gh_logf("[gh-diag] cb-deliver id=%d cub=%d", icb, cub);
             if (icb==703 && cub>=sizeof(SteamAPICall_t)+8) {
@@ -1778,16 +1785,24 @@ static void* const* g_rp_fallback = g_rp_vtbl;   // the object IS its vtable poi
 //       that a stray NaN out of a bed costs weeks. xmm0 is zeroed explicitly.
 //   (c) a struct too big (or too non-trivial) to return in rax -- CSteamID,
 //       SteamNetworkingIdentity, InputAnalogActionData_t -- is returned through a
-//       HIDDEN POINTER: the caller passes the buffer in rcx, `this` shifts to rdx,
-//       and the callee must return that same buffer in rax. Returning 0 here
-//       hands the caller a null it will dereference.
+//       HIDDEN POINTER, and the callee must return that same buffer in rax.
+//       Returning 0 here hands the caller a null it will dereference.
 //
-// (c) is decidable at runtime and needs no SDK header, which is the whole point:
-// the Steamworks headers for these versions (SteamUser023, SteamUtils010,
-// SteamFriends017, ...) are newer than the Open Steamworks copies in toolchain/,
-// so the vtable layouts are not knowable here -- but WE own the object address.
-// If rcx is one of our interface objects the call is shape (a)/(b); if rdx is one
-// and rcx is not, rcx is the hidden return buffer and the call is shape (c).
+// WHICH REGISTER holds that buffer was got wrong here once and cost #286. For a
+// member function in the Microsoft C++ ABI the sret pointer comes AFTER `this`:
+// rcx = this, rdx = buffer. (The Itanium ABI is the other way round; clang spells
+// the difference MicrosoftCXXABI::isSRetParameterAfterThis.) So for a vtable call
+// rcx is ALWAYS `this` and the object-address test below can never see a buffer
+// there -- it only fires for a flat/foreign caller that passes our object second.
+//
+// That means shape (c) is NOT decidable from the registers for a normal vtable
+// call, and the stub deliberately does not guess: rdx of a plain slot is a real
+// argument (an AppId_t, an index), and zeroing eight bytes "at" 3763830 is a wild
+// write. A structret slot that goes down the plain branch leaves the caller's own
+// uninitialised buffer alone, which is a garbage id -- bad, but local, and the
+// STUBCALL line names the slot so it can be given a real answer by hand. The
+// hand-written vtables (g_rp_vtbl, g_apps/user/friends_vtbl) are exactly that:
+// the slots whose shape IS known.
 //
 // How much of that buffer to zero is the one genuinely unknowable number, so it
 // is a knob (gh_stub_ret_bytes.txt, default 8 = sizeof(CSteamID)). Writing more
@@ -1851,6 +1866,11 @@ static bool gh_stub_is_obj(const void* p) {
     return false;
 }
 
+// Every interface object this DLL hands out: the generic ones above and the three
+// hand-written ones at the end of the file. Nothing may ever be written through a
+// pointer that is one of these -- see #286.
+static bool gh_iface_is_our_obj(const void* p);
+
 // Called by the emitted common stub with the ORIGINAL rcx/rdx and the packed
 // (interface<<16 | slot) the per-slot thunk put in r10d.
 extern "C" void* gh_stub_dispatch(void* a, void* b, unsigned id) {
@@ -1877,6 +1897,12 @@ extern "C" void* gh_stub_dispatch(void* a, void* b, unsigned id) {
     }
 
     if (structret && a) {                        // shape (c): zero and return the buffer
+        if (gh_iface_is_our_obj(a)) {            // never over one of our own objects (#286)
+            static LONG once = 0;
+            if (InterlockedCompareExchange(&once, 1, 0) == 0)
+                gh_logf("[gh-shim] STUBCALL refused structret into our own object %p slot=%u", a, slot);
+            return a;
+        }
         memset(a, 0, gh_stub_ret_bytes());
         return a;
     }
@@ -2669,13 +2695,39 @@ __declspec(dllexport) int      SteamAPI_ISteamApps_GetAppInstallDir(void*, AppId
 // x64 ABI notes that matter here:
 //   * one zero-returning stub serves any arity (the callee never cleans the stack)
 //   * a const char* return must be "" and never nullptr -- a caller may strlen it
-//   * CSteamID is returned through a HIDDEN POINTER: buffer in rcx, `this` in rdx
+//   * CSteamID is returned through a HIDDEN POINTER, and the pointer comes AFTER
+//     `this`: rcx = this, rdx = buffer. #286 is the proof. The first version of
+//     gh_hw_steamid had the two the other way round -- buffer in rcx -- which is
+//     what g_rp_vtbl's own comment, twenty lines of this file earlier, had already
+//     got right for GetSessionSteamID. In the Microsoft C++ ABI the sret pointer
+//     is the second argument of a member function (it is clang's
+//     MicrosoftCXXABI::isSRetParameterAfterThis, and the Itanium order is the
+//     opposite one), so writing through rcx writes through `this`: eight bytes of
+//     kFakeSteamID straight over the interface object's own vtable pointer.
+//     Dead as Disco (#286) called ISteamUser slot 2 twice. The first call was
+//     silent -- it loaded the still-good vtable, called here, and clobbered
+//     g_user_obj. The second loaded 0x0110000100000001 as the vtable and died in
+//     `call [rax+0x10]`, 318 frames in, with nothing at the fault site to say a
+//     SteamID had ever been involved.
 static uint64_t    gh_hw_zero(void*)                          { return 0; }
 static uint64_t    gh_hw_one(void*)                           { return 1; }
 static uint64_t    gh_hw_rate(void*)                          { return 11025; }
 static const char* gh_hw_english(void*)                       { return "english"; }
 static const char* gh_hw_empty(void*, const char*)            { return ""; }
-static void*       gh_hw_steamid(void* ret, void*)            { if (ret) *(uint64_steamid*)ret = kFakeSteamID; return ret; }
+// `self` is this, `ret` is the hidden buffer. The our-object test is not belt and
+// braces for the ABI -- it is the tripwire that was missing: whichever register a
+// future caller puts the buffer in, this never writes over one of our own objects
+// again, and says so instead.
+static void*       gh_hw_steamid(void* self, void* ret) {
+    if (gh_iface_is_our_obj(ret)) {
+        static LONG once = 0;
+        if (InterlockedCompareExchange(&once, 1, 0) == 0)
+            gh_logf("[gh-shim] HWSTEAMID refused: retptr %p is our own object (this=%p)", ret, self);
+        return ret;
+    }
+    if (ret) *(uint64_steamid*)ret = kFakeSteamID;
+    return ret;
+}
 static uint64_t    gh_hw_buf2(void*, char* b, int)            { if (b) b[0] = 0; return 0; }
 static uint64_t    gh_hw_buf3(void*, AppId_t, char* b, uint32_t) { if (b) b[0] = 0; return 0; }
 static const char* gh_hw_emptystr(void*)                      { return ""; }
@@ -2705,7 +2757,7 @@ static void* const g_apps_vtbl[64] = {
     (void*)&gh_hw_zero,   // 17 GetInstalledDepots
     (void*)&gh_hw_buf3,   // 18 GetAppInstallDir(id,char*,uint32) -> 0, empty
     (void*)&gh_hw_one,   // 19 BIsAppInstalled          -> TRUE
-    (void*)&gh_hw_steamid,   // 20 GetAppOwner -> CSteamID through the HIDDEN POINTER in rcx
+    (void*)&gh_hw_steamid,   // 20 GetAppOwner -> CSteamID through the hidden pointer in RDX
     (void*)&gh_hw_empty,   // 21 GetLaunchQueryParam -> empty string, never nullptr
     (void*)&gh_hw_zero,   // 22 GetDlcDownloadProgress
     (void*)&gh_hw_one,   // 23 GetAppBuildId            -> 1, matching the flat export
@@ -2754,7 +2806,7 @@ static void* const g_apps_vtbl[64] = {
 static void* const g_user_vtbl[64] = {
     (void*)&gh_hw_one,   // 0  GetHSteamUser            -> 1, the same fake handle the flat API uses
     (void*)&gh_hw_one,   // 1  BLoggedOn                -> TRUE
-    (void*)&gh_hw_steamid,   // 2  GetSteamID -> CSteamID through the HIDDEN POINTER in rcx
+    (void*)&gh_hw_steamid,   // 2  GetSteamID -> CSteamID through the hidden pointer in RDX (#286)
     (void*)&gh_hw_zero,   // 3  InitiateGameConnection
     (void*)&gh_hw_zero,   // 4  TerminateGameConnection (void)
     (void*)&gh_hw_zero,   // 5  TrackAppUsageEvent (void)
@@ -2829,7 +2881,7 @@ static void* const g_friends_vtbl[64] = {
     (void*)&gh_hw_zero,   // 1  SetPersonaName -> no API call
     (void*)&gh_hw_online,   // 2  GetPersonaState -> Online, matching the flat export
     (void*)&gh_hw_zero,   // 3  GetFriendCount -> 0
-    (void*)&gh_hw_steamid,   // 4  GetFriendByIndex -> CSteamID through the HIDDEN POINTER
+    (void*)&gh_hw_steamid,   // 4  GetFriendByIndex -> CSteamID through the hidden pointer in RDX
     (void*)&gh_hw_zero,   // 5  GetFriendRelationship
     (void*)&gh_hw_zero,   // 6  GetFriendPersonaState
     (void*)&gh_hw_emptystr,   // 7  GetFriendPersonaName -> "" , never nullptr
@@ -2844,7 +2896,7 @@ static void* const g_friends_vtbl[64] = {
     (void*)&gh_hw_zero,   // 16 GetFriendsGroupMembersList
     (void*)&gh_hw_zero,   // 17 HasFriend
     (void*)&gh_hw_zero,   // 18 GetClanCount
-    (void*)&gh_hw_steamid,   // 19 GetClanByIndex -> CSteamID through the HIDDEN POINTER
+    (void*)&gh_hw_steamid,   // 19 GetClanByIndex -> CSteamID through the hidden pointer in RDX
     (void*)&gh_hw_zero,
     (void*)&gh_hw_zero,
     (void*)&gh_hw_zero,
@@ -2890,9 +2942,20 @@ static void* const g_friends_vtbl[64] = {
     (void*)&gh_hw_zero,
     (void*)&gh_hw_zero,
 };
-static void* const* g_apps_obj = g_apps_vtbl;
-static void* const* g_user_obj = g_user_vtbl;
-static void* const* g_friends_obj = g_friends_vtbl;
+// const, so the three objects live in .rdata. They are one pointer each and they
+// never change after load; putting them in read-only memory means the NEXT shim
+// that gets a return ABI wrong faults AT the bad store, in our own module, with
+// its own rip -- instead of corrupting a vtable pointer that only kills the
+// process later, somewhere else, with no trace of who wrote it (#286).
+static void* const* const g_apps_obj = g_apps_vtbl;
+static void* const* const g_user_obj = g_user_vtbl;
+static void* const* const g_friends_obj = g_friends_vtbl;
+
+static bool gh_iface_is_our_obj(const void* p) {
+    if (!p) return false;
+    return p == (const void*)&g_apps_obj || p == (const void*)&g_user_obj
+        || p == (const void*)&g_friends_obj || gh_stub_is_obj(p);
+}
 
 static void* gh_handwritten_iface(const char* prefix) {
     if (!prefix) return nullptr;

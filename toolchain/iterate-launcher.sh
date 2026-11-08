@@ -72,7 +72,14 @@ clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \
   "$SRC" "$GH/corpus/vendor/qrcodegen/qrcodegen.c" \
   -o "$STAGE/p0_spike_host.exe" \
   /link /libpath:"$SDK/crt/lib/x86_64" /libpath:"$SDK/sdk/lib/um/x86_64" /libpath:"$SDK/sdk/lib/ucrt/x86_64" \
-        WindowsApp.lib $EXTRALIBS /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup /APPCONTAINER
+        WindowsApp.lib $EXTRALIBS /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup /APPCONTAINER \
+        /MAP:"$GH/artifacts/p0_spike_host.$NEW.map"
+# The map goes to artifacts/, NOT the stage: anything in $STAGE is packed into the
+# MSIX. It is the only way to read the RVAs the diag prints. Every VEH line says
+# "p0_spike_host.exe+0xRVA" and nothing else -- no PDB is produced (/O2, no /DEBUG),
+# so without this an "exec 0x0 site=...+0x509561" costs a guessing session. Resolve
+# one with: toolchain/ghsym.py <ver> 0x509561   (several RVAs per call is fine).
+ls -l "$GH/artifacts/p0_spike_host.$NEW.map" 2>/dev/null || echo "WARN: no link map emitted"
 
 # Bump from what the manifest ACTUALLY says, not from $OLD. $OLD is the version
 # on the CONSOLE (used for the GH_CLEAN uninstall); the manifest can be on a
@@ -159,9 +166,31 @@ done
 # from the reference console; tbs.dll is built from our own stub.
 echo "== stage VC++ runtime + title seeds =="
 RED="$GH/corpus/redist"
-mkdir -p "$STAGE/guest/vcrt"
-for d in MSVCP140.dll VCRUNTIME140.dll VCRUNTIME140_1.dll; do
-  cp "$RED/vcrt/$d" "$STAGE/guest/vcrt/$d" || { echo "FATAL: missing $RED/vcrt/$d"; exit 1; }
+# ONE runtime for every guest, and it is the NEWEST one we ship (14.51.36247,
+# Microsoft-signed). guest\vcrt used to be the 14.27 set copied byte-for-byte off
+# the reference console, with the 14.5x files only in guest\vcrt14 for UE4SS and
+# DXC -- and #287 is what that cost: Dead as Disco (UE5, VS 17.10+) bound MSVCP140
+# 14.27 from vcrt and MSVCP140_1 14.51 from vcrt14 in the SAME process, then died
+# in _Mtx_lock (MSVCP140+0x12E20, reading 0) on a constexpr std::mutex -- the exact
+# fault dxcompiler hit in #268. Two reasons to stop choosing per case:
+#   * >= 14.40 is a hard requirement of anything built with VS 17.10+, which now
+#     means most new Unreal and Unity titles, not an exception;
+#   * the VC++ redist is backward compatible BY DESIGN (one 14.x ABI, newest
+#     serves oldest), so a modern set is the safe default and a mixed set never is.
+# corpus/redist/vcrt (14.27) is still what goes next to Tsushima's PsPcSdk.dll
+# below -- that seed is a byte-for-byte copy of a console that worked and is not
+# ours to modernise blind.
+# The staging dir is INCREMENTAL, so the switch had to clear it: the old set was
+# copied from $RED/vcrt with its uppercase names (MSVCP140.dll, VCRUNTIME140.dll,
+# VCRUNTIME140_1.dll) and the new one is lowercase, so on this case-sensitive
+# filesystem both survived -- 10 files with 3 case-duplicate pairs, bundled as 10
+# ghpak records. The console's filesystem is case-INSENSITIVE, so extraction is
+# last-writer-wins and MSVCP140.dll (14.27) would have landed on top of
+# msvcp140.dll (14.51), putting #287 straight back while the build looked clean.
+# rm -rf the directory, the way the dxc block already does.
+rm -rf "$STAGE/guest/vcrt"; mkdir -p "$STAGE/guest/vcrt"
+for d in msvcp140 msvcp140_1 msvcp140_2 msvcp140_atomic_wait msvcp140_codecvt_ids vcruntime140 vcruntime140_1; do
+  cp "$RED/vcrt14/$d.dll" "$STAGE/guest/vcrt/$d.dll" || { echo "FATAL: missing $RED/vcrt14/$d.dll"; exit 1; }
 done
 # guest\x86\   system DLLs for 32-bit guests that the console has no copy of
 # (g_x86_sys_dir, resolve_dll_path's last stop). Our own builds, from source.

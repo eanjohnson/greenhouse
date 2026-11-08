@@ -2,18 +2,32 @@
   "schema": "greenhouse.vendor/1",
   "id": "steam-runtime",
   "name": "Steam runtime (fetched from Valve by the console)",
-  "notes": "The three Valve DLLs the Steam engine needs. Our repository publishes only their hashes; the console fetches the bytes from Valve's own client-update CDN. Pinned to SteamCMD's steamcmd_bins_win32 package of 2026-01-30 (steamclient 10.41.26.25): the build every RVA in gh_steam_engine.h / GREENHOUSE.md 25.5 and 26.10 was reverse-engineered on. A different build is refused, not installed.",
-  "provides": ["runtime:steamclient"],
+  "notes": "The Valve files the Steam engine needs. Our repository publishes only their hashes; the console fetches the bytes from Valve's own client-update CDN. Pinned to SteamCMD's steamcmd_bins_win32 package of 2026-01-30 (steamclient 10.41.26.25): the build every RVA in gh_steam_engine.h / GREENHOUSE.md 25.5 and 26.10 was reverse-engineered on. A different build is refused, not installed. #277 (1.0.1.0): no patch any more -- the file stays byte-identical to Valve's, signature intact, because a SteamStub-wrapped game verifies the file behind steamclient64's CreateInterface. The slim Xbox user32 has no MapVirtualKeyExA, so the OS loader refuses the pristine DLL and the loader self-maps it instead, bedding that one import in memory (GhSelfMapDll). 1.0.0.0, with the import renamed on disk, stays published for rollback. #278 (1.0.2.0): steam.exe joins the add-on, Valve's own bootstrapper from the steam_client_win32 manifest's steam_win32/steamrow package (IsBootstrapperPackage, client version 1769731672). It is NEVER run -- the Steam client on the console is our own in-process engine -- it is there because a SteamStub-wrapped game checks that a steam.exe exists at the install path it reads from HKLM\\Software\\Valve\\Steam (Dead as Disco: GetFileAttributesW MISSING -> exit 53, s973). Per-file 'source' is how one add-on pins two vendor zips.",
+  "provides": [
+    "runtime:steamclient"
+  ],
   "source": {
     "url": "https://client-update.steamstatic.com/steamcmd_bins_win32.zip.7ae579f513787b332395a86b4515b400c2f57eaa",
     "size": 23455433,
     "sha256": "89af5e9c4a781f4849544fe6194f3681af6f8f9d89ced3a9dfa58bf9dd14041a"
   },
   "files": [
-    { "entry": "steamclient64.dll",
-      "patches": [ { "find": "MapVirtualKeyExA", "replace": "CharUpperW",
-                     "why": "the slim Xbox user32 has no MapVirtualKeyExA, so the OS loader refuses the DLL; the same import-name rename as UnityPlayer.dll (GREENHOUSE.md 19), byte-identical to the copy every Steam test so far ran" } ] },
-    { "entry": "tier0_s64.dll" },
-    { "entry": "vstdlib_s64.dll" }
+    {
+      "entry": "steamclient64.dll"
+    },
+    {
+      "entry": "tier0_s64.dll"
+    },
+    {
+      "entry": "vstdlib_s64.dll"
+    },
+    {
+      "entry": "steam.exe",
+      "source": {
+        "url": "https://client-update.steamstatic.com/steam_win32_steamrow.zip.3e96965d109fc2d4cc14206b2fc4ec960a746ed3",
+        "size": 2307664,
+        "sha256": "1369615c795b60de822876b4dc4042186cf58d0dc8f63ea1371167f667e16925"
+      }
+    }
   ]
 }

@@ -43,6 +43,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>      // MODULEINFO: UE4SS's main-module query (M4.4)
+#include <shellapi.h>   // SHELLEXECUTEINFOW: the #279 ShellExecute beds
 #include <xmmintrin.h>   // _mm_getcsr/_mm_setcsr, for the #154 invalid-op trap
 #include <functional>
 #include <unordered_set>
@@ -57,6 +58,7 @@
 #include <setjmp.h>
 #include <thread>
 #include <mutex>
+#include <chrono>
 #include <shared_mutex>
 #include <map>
 #include <cstdint>
@@ -423,6 +425,15 @@ static uintptr_t     g_guestStackLow = 0, g_guestStackHigh = 0;
 // frame #4 (t~16.6 s) in EVERY run -- so it is the UI thread that goes quiet,
 // not the guest, and the live sampler has never once looked at it.
 static DWORD         g_uiTid = 0;
+// #290. The step the UI pump is inside RIGHT NOW, and when it entered.
+// #165's UiStep prints from its destructor, so a step that blocks and never
+// returns prints NOTHING -- which is how s990-s993 showed no UIPUMP line at all
+// while the CoreWindow thread was already dead, and why I read that silence as
+// a healthy UI thread for four cells. Absence of the line was never evidence.
+// The pad-poll thread (GhPadPollProc) watches these two from off the UI thread
+// and names a step while it is still hanging.
+static const char* volatile g_uiStepName = nullptr;
+static volatile LONG64      g_uiStepT0   = 0;
 // #163. Last thread to call into our D3D12 hooks. A liveness trace that can only
 // name the guest's main thread is nearly useless for a renderer: the thread that
 // matters is whichever one last touched the device.
@@ -1166,6 +1177,14 @@ static void VfsTrace(const char* api, const wchar_t* g, const std::wstring& r){
     // Our own Steam shim reopens gh_shim.log for every line it writes: ~7% of a
     // whole run's diag was that one path (§56). It is ours, not the guest's.
     if (r.size() >= 12 && _wcsicmp(r.c_str() + r.size() - 12, L"\\gh_shim.log") == 0) return;
+    // #288, second half: refusing the symbol probe stopped it reaching the disk, but the
+    // [HIDDEN] trace still wrote a line per probe -- 17,996 of them in s992, each its own
+    // CreateFile/Write/Close. Hiding a file and then logging that you hid it, thousands of
+    // times, keeps the cost you just removed. SYMHIDE already reports the running count.
+    if (r.size() >= 4){
+        const wchar_t* e = r.c_str() + r.size() - 4;
+        if (_wcsicmp(e, L".pdb") == 0 || _wcsicmp(e, L".dbg") == 0) return;
+    }
     std::wstring gw(g ? g : L"");
     std::string gg(gw.begin(), gw.end());
     std::string rr(r.begin(), r.end());
@@ -1248,6 +1267,60 @@ static bool GhHideCrashpad(const std::wstring& real)
     return true;
 }
 
+// #288: one guest stack walk costs us thousands of file opens.
+//
+// Dead as Disco (UE5) ran 3x slower than the same build on the same screen and
+// died at `PLM Suspending`, and 97% of its diag -- 18,779 `VFS CreateFileW`
+// against 887 total opens in the run that lived -- was DbgHelp walking its
+// symbol search path. Our loader never calls DbgHelp; the walk is the GUEST's
+// (UE stack-walks on ensure, on thread naming, and from its hang detector).
+// The cost is ours: DbgHelp probes ~20 directories x 194 loaded modules, and
+// every probe becomes a MapToReal redirect, a real CreateFileW on console
+// storage, and -- with the trace on -- its own CreateFile/Write/Close for the
+// diag line. None of it can ever succeed: a shipping build ships no .pdb, so
+// each probe is pure loss, and the walk produces exactly the same (unsymbolised)
+// answer whether we look or not.
+//
+// So answer "not there" without touching the disk, the way GhHideCrashpad does.
+// This is a class fix, not a Dead as Disco fix: UE, Unity and Mono all stack-walk,
+// and every one of them pays this on the console.
+// gh_hide_sympath=0 restores the probes.
+static bool GhHideSymbolProbe(const std::wstring& real, DWORD acc = 0)
+{
+    if (acc & (GENERIC_WRITE | FILE_APPEND_DATA)) return false;   // never refuse a writer
+    // DbgHelp also asks whether each candidate is a DIRECTORY, as
+    // `...\ole32.pdb\*`, so the find patterns have to be normalised back to the
+    // module name before the extension test -- those enumerations were 1,976 of
+    // s990's lines on their own.
+    std::wstring s = real;
+    for (;;){
+        if (s.size() >= 4 && _wcsicmp(s.c_str() + s.size() - 4, L"\\*.*") == 0) s.resize(s.size() - 4);
+        else if (s.size() >= 2 && wcscmp(s.c_str() + s.size() - 2, L"\\*") == 0) s.resize(s.size() - 2);
+        else break;
+    }
+    // leaf/extension test first: the knob read below opens a file, and this
+    // also runs underneath the file hooks.
+    const size_t cut = s.find_last_of(L"\\/");
+    const wchar_t* leaf = s.c_str() + (cut == std::wstring::npos ? 0 : cut + 1);
+    const size_t len = wcslen(leaf);
+    if (len < 5) return false;                       // ".pdb" alone is not a module
+    const wchar_t* ext = leaf + len - 4;
+    if (_wcsicmp(ext, L".pdb") != 0 && _wcsicmp(ext, L".dbg") != 0) return false;
+    static const unsigned on = GhCfgNumZ(L"gh_hide_sympath.txt", "GH_HIDE_SYMPATH", 1);
+    if (!on) return false;
+    static volatile LONG n = 0;
+    const LONG k = InterlockedIncrement(&n);
+    // first few by name, then a running count: the whole point is the volume,
+    // so the number has to reach the diag without re-creating the storm.
+    if (k <= 4)
+        Diag("SYMHIDE n=" + std::to_string((long)k) + " refusing " +
+             std::string(real.begin(), real.end()) +
+             " -- the guest stack walk gets no symbols either way");
+    else if ((k % 2048) == 0)
+        Diag("SYMHIDE n=" + std::to_string((long)k) + " symbol probes refused so far");
+    return true;
+}
+
 // An app container may only create and open named pipes in its own LOCAL\
 // namespace: CreateNamedPipeW("\\.\pipe\mojo.<pid>.<tid>.<n>") is ACCESS_DENIED,
 // and Chromium's mojo PCHECKs it (FATAL platform_channel.cc(72), GMod's CEF,
@@ -1289,7 +1362,7 @@ static HANDLE WINAPI Bed_CreateFileW(LPCWSTR name, DWORD acc, DWORD share, LPSEC
     std::wstring mapped = name ? RedirectDriveRootSave(name) : L"";
     const wchar_t* use = mapped.empty() ? name : mapped.c_str();
     std::wstring real = MapToReal(use);
-    if (GhHidePsoCache(real, acc) || GhHideCrashpad(real)){
+    if (GhHidePsoCache(real, acc) || GhHideCrashpad(real) || GhHideSymbolProbe(real, acc)){
         VfsTrace("CreateFileW[HIDDEN]", name, real);
         SetLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_HANDLE_VALUE;
@@ -1329,7 +1402,7 @@ static HANDLE WINAPI Bed_CreateFile2(LPCWSTR name, DWORD acc, DWORD share, DWORD
     std::wstring pipe;
     if (GhPipeLocal(name, pipe)) return CreateFile2(pipe.c_str(), acc, share, disp, params);
     std::wstring real = MapToReal(name);
-    if (GhHidePsoCache(real, acc) || GhHideCrashpad(real)){
+    if (GhHidePsoCache(real, acc) || GhHideCrashpad(real) || GhHideSymbolProbe(real, acc)){
         VfsTrace("CreateFile2[HIDDEN]", name, real);
         SetLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_HANDLE_VALUE;
@@ -1776,17 +1849,44 @@ static DWORD WINAPI Bed_GetFileAttributesW(LPCWSTR path){
     std::wstring real = MapToReal(path);
     // A probe must agree with the open, or the game sees the file exist and then
     // fail to open, which is a different (and usually fatal) path from "absent".
-    if (GhHidePsoCache(real, 0) || GhHideCrashpad(real)){ SetLastError(ERROR_FILE_NOT_FOUND); return INVALID_FILE_ATTRIBUTES; }
+    if (GhHidePsoCache(real, 0) || GhHideCrashpad(real) || GhHideSymbolProbe(real)){ SetLastError(ERROR_FILE_NOT_FOUND); return INVALID_FILE_ATTRIBUTES; }
     DWORD a = GetFileAttributesW(real.c_str());
     if (path && GhVfsTraceOn()){ std::wstring g(path); Diag("GetFileAttributesW " + std::string(g.begin(),g.end()) + (a==INVALID_FILE_ATTRIBUTES?" MISSING":" ok")); }
     return a; }
 // M4.4: MSVC's std::filesystem (exists, is_directory, file_size) and UE4SS's
-// Mods\ check ask through the Ex form. Only a modded launch maps it, so the
-// probes of every vanilla title stay exactly as they were.
+// Mods\ check ask through the Ex form.
+//
+// #293. This used to map the path only when the mods overlay was on, so that
+// "the probes of every vanilla title stay exactly as they were". That caution
+// was the bug, and it killed Dead as Disco. Two queries for the same path have
+// to agree, which is exactly what the comment on Bed_GetFileAttributesW above
+// says -- and they did not: CreateDirectoryW maps, this did not.
+//
+// std::filesystem::create_directory is not "mkdir, ignore EEXIST". MSVC's
+// __std_fs_create_directory (GUEST+0x834D644) calls CreateDirectoryW, and on
+// ERROR_ALREADY_EXISTS it re-stats the path through __std_fs_get_stats, whose
+// first call is GetFileAttributesExW; if that stat fails, or reports something
+// without FILE_ATTRIBUTE_DIRECTORY, it returns the error and the throwing
+// overload throws std::filesystem::filesystem_error.
+//
+// Dead as Disco's GameAnalytics thread does exactly that for its ga.sqlite3
+// folder (s1003 line 8797):
+//   CreateDirectoryW U:\...\greenhouse.launcher_mgw46vk3ppz9w\AC\GameAnalytics\
+//       3798077f03545cb3dd578651473c89d2 err=0xB7   <- mapped, the dir is there
+// then this bed passed that same guest path straight to the real kernel32,
+// where it does not exist (the real one is ...\Greenhouse.Launcher_...\
+// LocalState\...), so the stat said ERROR_PATH_NOT_FOUND. One line later:
+//   CXXTHROW n=2663 ... site=GUEST+0x7EC9815  .?AVfilesystem_error@filesystem@std@@
+// uncaught, and ~50 frames later WerFault suspends the process to write a
+// 2.84 GB dump, which is the "freeze" s996-s1001 kept measuring.
+//
+// So map unconditionally, and run the same three hide filters as the plain W
+// form on the same (mapped) path, so the two forms cannot disagree again.
 static BOOL WINAPI Bed_GetFileAttributesExW(LPCWSTR path, GET_FILEEX_INFO_LEVELS lvl, LPVOID info){
-    if (path && GhHideCrashpad(path)){ SetLastError(ERROR_FILE_NOT_FOUND); return FALSE; }
-    if (!g_modOvl.on() || !path) return GetFileAttributesExW(path, lvl, info);
+    if (!path) return GetFileAttributesExW(path, lvl, info);
     std::wstring real = MapToReal(path);
+    if (GhHidePsoCache(real, 0) || GhHideCrashpad(real) || GhHideSymbolProbe(real)){
+        SetLastError(ERROR_FILE_NOT_FOUND); return FALSE; }
     BOOL ok = GetFileAttributesExW(real.c_str(), lvl, info);
     if (GhVfsTraceOn()){ std::wstring g(path); Diag("GetFileAttributesExW " + std::string(g.begin(),g.end()) + (ok?" ok":" MISSING")); }
     return ok; }
@@ -1850,6 +1950,7 @@ static BOOL WINAPI Bed_FindClose(HANDLE h){
 static HANDLE WINAPI Bed_FindFirstFileW(LPCWSTR pattern, LPWIN32_FIND_DATAW fd){
     if (HANDLE m = GhModOvlFind(pattern, FindExInfoStandard, fd)) return m;
     std::wstring realPat = MapFindPattern(pattern);
+    if (GhHideSymbolProbe(realPat)){ SetLastError(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
     HANDLE h = FindFirstFileW(realPat.c_str(), fd);           // returns filenames only; no translation needed
     VfsTrace("FindFirstFileW", pattern, realPat);
     return h;                                                 // FindNextFileW/FindClose pass through to real
@@ -1859,6 +1960,7 @@ static HANDLE WINAPI Bed_FindFirstFileExW(LPCWSTR pattern, FINDEX_INFO_LEVELS le
     if (level == FindExInfoStandard || level == FindExInfoBasic)
         if (HANDLE m = GhModOvlFind(pattern, level, (LPWIN32_FIND_DATAW)fd)) return m;
     std::wstring realPat = MapFindPattern(pattern);
+    if (GhHideSymbolProbe(realPat)){ SetLastError(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
     HANDLE h = FindFirstFileExW(realPat.c_str(), level, fd, op, filter, flags);
     VfsTrace("FindFirstFileExW", pattern, realPat);
     return h;
@@ -2067,6 +2169,38 @@ static int WINAPI Bed_SHCreateDirectoryExW(HWND, LPCWSTR path, const SECURITY_AT
     return ok ? ERROR_SUCCESS : ERROR_ACCESS_DENIED;
 }
 
+// #279: observation. Nothing in the container can service a ShellExecute: the real
+// SHELL32 path runs into windows.storage's shell namespace, which throws a wil
+// ResultException (0xE06D7363) and takes the guest with it. Dead as Disco's SteamStub
+// wrapper calls this after it has verified steamclient64 and found steam.exe at the
+// HKLM InstallPath -- it is asking the shell to start Valve's client and then exits 53
+// (s974). So log what it wants to run and report success WITHOUT running anything: we
+// never execute steam.exe, and no other title gets a working ShellExecute either way.
+static void GhShellExecLog(const char* api, LPCWSTR verb, LPCWSTR file, LPCWSTR parms)
+{
+    auto nar = [](LPCWSTR s) -> std::string {
+        if (!s) return "(null)";
+        std::wstring w(s); return std::string(w.begin(), w.end());
+    };
+    Diag(std::string("BED ") + api + " verb=[" + nar(verb) + "] file=[" + nar(file) +
+         "] parms=[" + nar(parms) + "] -> reported ok, NOT executed");
+}
+static HINSTANCE WINAPI Bed_ShellExecuteW(HWND, LPCWSTR verb, LPCWSTR file, LPCWSTR parms,
+                                          LPCWSTR dir, INT)
+{
+    (void)dir;
+    GhShellExecLog("ShellExecuteW", verb, file, parms);
+    return (HINSTANCE)42;          // anything > 32 is success to the caller
+}
+static BOOL WINAPI Bed_ShellExecuteExW(SHELLEXECUTEINFOW* si)
+{
+    if (!si){ SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    GhShellExecLog("ShellExecuteExW", si->lpVerb, si->lpFile, si->lpParameters);
+    si->hInstApp = (HINSTANCE)42;
+    si->hProcess = nullptr;        // SEE_MASK_NOCLOSEPROCESS callers must see no handle
+    return TRUE;
+}
+
 // The older CSIDL form of the same question, which plenty of shipping games still
 // use as a fallback when SHGetKnownFolderPath fails. Redirect the same folders to
 // the same places, or the two APIs would disagree about where saves live.
@@ -2114,6 +2248,14 @@ static std::mutex g_regMutex;
 static std::map<std::wstring, GhRegKey> g_regKeys;                     // keyPathLower -> key
 static std::map<HKEY, std::wstring> g_regHandles;                      // sentinel -> keyPathLower
 static uintptr_t g_regNextHandle = 0x5A5A0000;
+// Write-behind for the persisted hive (§60). Saving only in FinishGuestSession
+// lost every setting of a game that is closed from the Xbox home screen, killed
+// by WDP, or dies -- Scratch Creek's "Toaster" preset (s936) never reached disk.
+// A change now marks the hive dirty and a flusher writes it within ~2 s.
+static std::atomic<bool> g_regDirty{false};
+static std::atomic<bool> g_regHiveReady{false};   // true between RegHiveLoad and FinishGuestSession
+static void RegHiveSave(bool quiet = false);
+static void RegMarkDirty();
 
 static std::wstring RegLower(const std::wstring& s){ std::wstring o=s; for(auto&c:o) if(c>=L'A'&&c<=L'Z') c=(wchar_t)(c+32); return o; }
 static std::string  RegNarrow(const std::wstring& s){ return std::string(s.begin(), s.end()); }
@@ -2183,6 +2325,7 @@ static LSTATUS RegCreateImpl(HKEY root, const std::wstring& sub, PHKEY out, LPDW
     std::wstring path=RegPathLocked(root,sub);
     bool existed=g_regKeys.count(path)!=0; g_regKeys[path];
     Diag("REG create " + RegNarrow(path));
+    if(!existed) RegMarkDirty();
     if(out)*out=RegMakeHandleLocked(path);
     if(disp)*disp=existed?REG_OPENED_EXISTING_KEY:REG_CREATED_NEW_KEY;
     return ERROR_SUCCESS;
@@ -2195,6 +2338,7 @@ static LSTATUS RegSetImpl(HKEY hk, const std::wstring& name, DWORD type, const B
     else if(data && cb) v.data.assign(data,data+cb);
     g_regKeys[it->second].values[RegLower(name)]=v;
     Diag("REG set " + RegNarrow(it->second) + " : " + RegNarrow(name) + " = " + RegShow(v));
+    RegMarkDirty();
     return ERROR_SUCCESS;
 }
 static LSTATUS RegQueryImpl(HKEY hk, const std::wstring& name, LPDWORD ptype, LPBYTE data, LPDWORD pcb, bool ansi){
@@ -2326,13 +2470,14 @@ static LSTATUS APIENTRY Bed_RegQueryInfoKeyA(HKEY hk, LPSTR, LPDWORD, LPDWORD, L
 static LSTATUS APIENTRY Bed_RegDeleteValueA(HKEY hk, LPCSTR name){
     std::lock_guard<std::mutex> lk(g_regMutex);
     auto it=g_regHandles.find(hk); if(it==g_regHandles.end()) return ERROR_SUCCESS;
-    auto ki=g_regKeys.find(it->second); if(ki!=g_regKeys.end()) ki->second.values.erase(RegLower(RegWiden(name)));
+    auto ki=g_regKeys.find(it->second); if(ki!=g_regKeys.end() && ki->second.values.erase(RegLower(RegWiden(name)))) RegMarkDirty();
     return ERROR_SUCCESS; }
 static LSTATUS APIENTRY Bed_RegDeleteTreeA(HKEY, LPCSTR){ return ERROR_SUCCESS; }
 
 // Pre-seed the Steam cold-client keys. Called once from RunGuest after g_guestDir
 // is known. steamclient reads these to bootstrap its global engine; it may also
 // overwrite/extend them via RegSetValueEx (which the hive above honours).
+static std::wstring GhSteamExePath();   // launcher_ui.h (#278)
 static void SeedSteamRegistry(){
     std::wstring gd = g_guestDir;
     while(!gd.empty() && gd.back()==L'\\') gd.pop_back();
@@ -2347,6 +2492,24 @@ static void SeedSteamRegistry(){
     { GhRegVal v; RegPutString(v,REG_SZ,L"Public");                 ap.values[L"universe"]=v; }
     { GhRegVal v; RegPutDword(v,0);                                 ap.values[L"activeuser"]=v; }
     { GhRegVal v; RegPutDword(v,GetCurrentProcessId());            ap.values[L"pid"]=v; }
+    // #277/#278: the machine-wide mirror. A real install also writes
+    // HKLM\SOFTWARE\Valve\Steam (and the WOW6432Node view of it) with InstallPath, and a
+    // SteamStub-wrapped exe reads that one after it has verified the client DLL: Dead as
+    // Disco opened hklm\software\valve\steam, missed, and exited 53 (s972). Given the key,
+    // it then checks InstallPath\steam.exe exists (s973) -- so InstallPath is the folder
+    // holding the Steam runtime add-on's verified copy of Valve's own steam.exe, when the
+    // installed add-on carries one, and the guest dir (as HKCU says) when it does not.
+    std::wstring sx = GhSteamExePath(), ip = gd;
+    if (!sx.empty()){ ip = sx.substr(0, sx.find_last_of(L'\\')); }
+    g_regKeys[L"hklm\\software"]; g_regKeys[L"hklm\\software\\valve"];
+    g_regKeys[L"hklm\\software\\wow6432node"]; g_regKeys[L"hklm\\software\\wow6432node\\valve"];
+    for (const wchar_t* mk : { L"hklm\\software\\valve\\steam", L"hklm\\software\\wow6432node\\valve\\steam" }){
+        auto& m = g_regKeys[mk];
+        { GhRegVal v; RegPutString(v,REG_SZ,ip);                                m.values[L"installpath"]=v; m.values[L"steampath"]=v; }
+        { GhRegVal v; RegPutString(v,REG_SZ,sx.empty()? gd+L"\\steam.exe" : sx); m.values[L"steamexe"]=v; }
+    }
+    Diag("REG HKLM Valve\\Steam InstallPath=" + RegNarrow(ip) +
+         (sx.empty() ? " (no steam.exe in the installed runtime)" : " steam.exe present"));
     Diag("REG seeded Steam cold-client keys (guestdir=" + RegNarrow(gd) + ")");
 }
 
@@ -2405,6 +2568,7 @@ static void RegHiveLoad()
         }
         if (seed.empty() || (b.empty() && !ReadWholeFile(seed, b, true)) || b.empty()){
             Diag("REG hive none (" + RegNarrow(GhRegHivePath()) + ")");
+            g_regHiveReady = true;
             return;
         }
         Diag("REG hive none yet -- seeded from " + RegNarrow(seed));
@@ -2438,9 +2602,10 @@ static void RegHiveLoad()
         }
     }
     Diag("REG hive loaded values=" + std::to_string(n) + " keys=" + std::to_string(g_regKeys.size()));
+    g_regHiveReady = true;
 }
 
-static void RegHiveSave()
+static void RegHiveSave(bool quiet)
 {
     std::string out =
         "# Greenhouse virtual registry. Hand-editable: V|<key>|<value>|<type>|<hex little-endian>\n"
@@ -2461,12 +2626,33 @@ static void RegHiveSave()
             }
         }
     }
-    std::wstring path = GhRegHivePath();
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+    // Through a temp file and a rename: the write-behind flusher can now be
+    // mid-write when the process is killed, and a torn hive loses everything.
+    std::wstring path = GhRegHivePath(), tmp = path + L".tmp";
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE){ Diag("REG hive save failed err=" + Hex(GetLastError())); return; }
-    DWORD w = 0; WriteFile(h, out.data(), (DWORD)out.size(), &w, nullptr); CloseHandle(h);
-    Diag("REG hive saved values=" + std::to_string(n) + " bytes=" + std::to_string(out.size()));
+    DWORD w = 0; BOOL ok = WriteFile(h, out.data(), (DWORD)out.size(), &w, nullptr); CloseHandle(h);
+    if (!ok || w != out.size() || !MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)){
+        Diag("REG hive save failed (write/rename) err=" + Hex(GetLastError())); DeleteFileW(tmp.c_str()); return; }
+    static int s_quiet = 0;
+    if (!quiet || ++s_quiet <= 3)
+        Diag(std::string("REG hive saved") + (quiet ? " (write-behind)" : "") + " values=" + std::to_string(n) + " bytes=" + std::to_string(out.size()));
+}
+
+static void RegMarkDirty()
+{
+    g_regDirty = true;
+    static std::once_flag once;
+    std::call_once(once, []{
+        HANDLE t = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+            for (;;){
+                Sleep(2000);
+                if (g_regHiveReady.load() && g_regDirty.exchange(false)) RegHiveSave(true);
+            }
+        }, nullptr, 0, nullptr);
+        if (t) CloseHandle(t);
+    });
 }
 // OpenProcessToken is left REAL so the guest gets a genuine, closeable token
 // handle; AdjustTokenPrivileges below simply reports "privilege not held".
@@ -2731,7 +2917,7 @@ static bool __cdecl Bed_GetClientBootstrapMetrics(void* buf, uint32_t cb, uint32
 // GetProcAddress cannot see its exports -- we walk the export directory
 // ourselves (Bed_GetProcAddress below), and dedup on it in LoadGuestDll.
 // ---------------------------------------------------------------------------
-struct GhSelfMod { uint8_t* base; std::string name; std::wstring path; };
+struct GhSelfMod { uint8_t* base; std::string name; std::wstring path; size_t size; };
 static std::vector<GhSelfMod> g_selfMods;
 static SRWLOCK                g_selfModLock = SRWLOCK_INIT;
 static HMODULE GhSelfMapDll(const std::wstring& full, const char* dll,
@@ -2755,6 +2941,20 @@ static HMODULE GhSelfMapFind(const char* dll)
     ReleaseSRWLockShared(&g_selfModLock);
     return r;
 }
+// The module WE mapped that holds this address, or null. #277: SteamStub asks
+// which module a function pointer belongs to (GetModuleHandleEx FROM_ADDRESS)
+// and then where that module's file is, so a self-mapped steamclient64 has to
+// answer both or the stub sees the wrong file.
+static HMODULE GhSelfMapFromAddr(const void* p)
+{
+    if (!p) return nullptr;
+    HMODULE r = nullptr;
+    AcquireSRWLockShared(&g_selfModLock);
+    for (auto& m : g_selfMods)
+        if ((const uint8_t*)p >= m.base && (const uint8_t*)p < m.base + m.size){ r = (HMODULE)m.base; break; }
+    ReleaseSRWLockShared(&g_selfModLock);
+    return r;
+}
 static bool GhSelfMapIs(HMODULE h)
 {
     if (!h) return false;
@@ -2772,6 +2972,28 @@ static std::wstring GhSelfMapPath(HMODULE h)
     if (!h) return r;
     AcquireSRWLockShared(&g_selfModLock);
     for (auto& m : g_selfMods) if ((HMODULE)m.base == h){ r = m.path; break; }
+    ReleaseSRWLockShared(&g_selfModLock);
+    return r;
+}
+// #281 diagnostic: who is in the self-map, for a lookup that found nothing.
+static std::string GhSelfModList()
+{
+    std::string s;
+    AcquireSRWLockShared(&g_selfModLock);
+    for (auto& m : g_selfMods){
+        if (!s.empty()) s += ",";
+        s += m.name + "@" + Hex((uintptr_t)m.base);
+    }
+    ReleaseSRWLockShared(&g_selfModLock);
+    return s.empty() ? std::string("(none)") : s;
+}
+// The self-mapped module of a given file name, for a caller that handed us a
+// handle the loader cannot place (#281).
+static HMODULE GhSelfMapByName(const char* name)
+{
+    HMODULE r = nullptr;
+    AcquireSRWLockShared(&g_selfModLock);
+    for (auto& m : g_selfMods) if (0 == _stricmp(m.name.c_str(), name)){ r = (HMODULE)m.base; break; }
     ReleaseSRWLockShared(&g_selfModLock);
     return r;
 }
@@ -3556,6 +3778,288 @@ static int Bed_il2cpp_init(const char* domain)
     return r;
 }
 
+// SteamStub (Dead as Disco): the DRM stub's embedded S_API resolves steamclient64's
+// exports itself and asks for "SteamClient0xx" -- it never calls our steam_api64 shim.
+// To see what it wants from Steam, a guest GPA on steamclient64 is logged, CreateInterface
+// is a logging pass-through, and an ISteamClient handed to self-mapped guest code (the
+// stub) is wrapped in a call-and-return proxy that logs each slot, args and result.
+// Nothing in the stub is touched; the proxy only logs, and (see #282 below) hands
+// back our own live session where the public bootstrapper returns nothing.
+// gh_sc_trace.txt=2 turns the whole layer off.
+typedef void* (*GhSciFn)(const char*, int*);
+static GhSciFn g_sciReal = nullptr;
+static LONG g_sciLogN = 0;
+static bool GhSciOn(){ static const unsigned v = GhCfgNumZ(L"gh_sc_trace.txt", "GH_SC_TRACE", 1); return v != 2; }
+static bool GhSciCopyStr(const void* p, char* out, size_t n)
+{
+    out[0] = 0;
+    if ((uintptr_t)p < 0x10000) return false;
+    __try {
+        const char* c = (const char*)p; size_t i = 0;
+        for (; i + 1 < n && c[i]; ++i){ if (c[i] < 0x20 || c[i] > 0x7e) { out[0] = 0; return false; } out[i] = c[i]; }
+        out[i] = 0; return i > 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return false; }
+}
+static void GhSciArgStr(uintptr_t v, std::string& o)
+{
+    char b[80]; o = Hex(v);
+    if (GhSciCopyStr((const void*)v, b, sizeof b)) o += std::string("'") + b + "'";
+}
+// s982: #283 rebound the pipe to 3763830 and the stub behaved IDENTICALLY, so GetAppID
+// was not the question -- a fourth guess is not worth a console cycle. The thunks now
+// carry a TAG in the high half of the slot word so a second interface can be proxied and
+// told apart in the log: tag 0 = ISteamClient, tag 1 = the ISteamUtils we hand back from
+// GetISteamUtils. Whatever the stub asks ISteamUtils, the next run names the slot.
+enum { kSciTagClient = 0, kSciTagUtils = 1, kSciTags = 2 };
+static const char* GhSciTagName(unsigned t){ return t == kSciTagUtils ? "ISteamUtils" : "ISteamClient"; }
+extern "C" void GhSciEnter(unsigned packed, uintptr_t a1, uintptr_t a2, uintptr_t a3)
+{
+    if (InterlockedIncrement(&g_sciLogN) > 200) return;
+    std::string s1, s2, s3; GhSciArgStr(a1, s1); GhSciArgStr(a2, s2); GhSciArgStr(a3, s3);
+    Diag(std::string("SCLIENT call ") + GhSciTagName(packed >> 16) + " slot=" + std::to_string(packed & 0xffff) +
+         " a1=" + s1 + " a2=" + s2 + " a3=" + s3);
+}
+// #282: the stub's public ISteamClient::CreateSteamPipe (slot 0) returns 0. That
+// route is the one that expects a steam.exe IPC bootstrapper, and there is none
+// in this container. But our add-on engine already holds a LIVE in-process
+// session on this very module -- the same self-mapped steamclient64 base the stub
+// loaded -- brought up through IClientEngine::CreateLocalUser (gh_shim.log:
+// "CreateLocalUser -> user=1 pipe=1", EConnect=1, BLoggedOn=1). The engine itself
+// then drives the PUBLIC ISteamClient021 accessors with exactly those two handles
+// (gh_steam_engine.h:181 passes g_gh_engine_user/g_gh_engine_pipe and gets real
+// sub-interfaces back), so they are valid at the public layer the stub is using.
+//
+// So when the public bootstrapper hands the guest a zero, give it the session we
+// already have instead: slot 0 (CreateSteamPipe) -> the engine's pipe, slot 2
+// (ConnectToGlobalUser) -> the engine's user. Nothing in the stub is touched and
+// nothing is faked -- these are the handles of a real, connected, logged-on Steam
+// client living in this process. gh_sc_bridge.txt=2 turns it off.
+static bool GhScBridgeOn(){ static const unsigned v = GhCfgNumZ(L"gh_sc_bridge.txt", "GH_SC_BRIDGE", 1); return v != 2; }
+// The shipped shim already exports both handles (steam_api64.cpp:1339/1345) and
+// returns the engine's values once state==2, so no add-on rebuild is needed.
+// Never cache a zero: the engine may still be logging on at the first ask.
+static bool GhEngSession(int* pipe, int* user)
+{
+    static int s_pipe = 0, s_user = 0;
+    if (!s_pipe){
+        if (HMODULE stm = GetModuleHandleA("steam_api64.dll")){
+            if (auto fp = (int(*)())GetProcAddress(stm, "SteamAPI_GetHSteamPipe")) s_pipe = fp();
+            if (auto fu = (int(*)())GetProcAddress(stm, "SteamAPI_GetHSteamUser")) s_user = fu();
+            static LONG k = 0;
+            if (InterlockedIncrement(&k) <= 4)
+                Diag("SCLIENT engine session pipe=" + std::to_string(s_pipe) +
+                     " user=" + std::to_string(s_user));
+        }
+    }
+    if (pipe) *pipe = s_pipe;
+    if (user) *user = s_user;
+    return s_pipe != 0;
+}
+static void* GhSciProxy(void* real, unsigned tag);            // s982: forward, for slot 9
+extern "C" uintptr_t GhSciRet(unsigned packed, uintptr_t r)
+{
+    const unsigned tag = packed >> 16, slot = packed & 0xffff;
+    uintptr_t out = r;
+    // s980: slot 2 (ConnectToGlobalUser) does not fail with 0, it fails with -1 --
+    // "Tried to connect to global user, but we don't have one" / "ConnectToGlobalUser
+    // returned invalid hSteamUserEngine=-1" (steamengine.cpp:4060, steamclient.cpp:380).
+    // Our engine bootstraps with IClientEngine::CreateLocalUser (vt[4]), so the engine
+    // has no GLOBAL user slot; the local user it does have is a valid public-layer
+    // handle, which is what the engine itself passes to the public ISteamClient021
+    // accessors. Treat 0 and -1 alike as "the bootstrapper has nothing for you".
+    // Letting -1 through is also what faulted the run: the stub carried it on to
+    // GetISteamUtils and steamclient64 then walked it as a pointer (movzx [rdi+rax-1],
+    // rdi=0xFFFFFFFF).
+    const bool failed = (r == 0 || r == (uintptr_t)(unsigned)-1 || (int)(unsigned)r < 0);
+    if (failed && tag == kSciTagClient && (slot == 0 || slot == 2) && GhScBridgeOn()){
+        int pipe = 0, user = 0;
+        if (GhEngSession(&pipe, &user)){
+            out = (uintptr_t)(unsigned)(slot == 0 ? pipe : user);
+            Diag("SCLIENT SUB slot=" + std::to_string(slot) + " 0 -> " + std::to_string((int)out) +
+                 (slot == 0 ? " (engine pipe)" : " (engine user)"));
+        }
+    }
+    // #284 (s983): the question that decides the relaunch, named at last. With a pipe,
+    // a user and a logged-on ISteamUser in hand the stub asks its ISteamUtils exactly
+    // two things and then gives up:
+    //   slot 2 (GetConnectedUniverse) -> 1   k_EUniversePublic, accepted
+    //   slot 9 (GetAppID)             -> 0   <-- and it ShellExecutes steam://run
+    // Zero is not "the wrong app", it is "no app context at all": the engine's own
+    // ISteamUtils (…AF1A40) answers 3763830 after the #283 rebind, while the object the
+    // stub gets back from GetISteamUtils (…AF1B60) is a different CSteamUtils that is
+    // bound to nothing -- so SetAppIDForCurrentPipe is not per-pipe in the way the name
+    // promises, and rebinding ours could never have reached the stub's. The loader is
+    // the one party that knows the answer for certain (it picked the row and launched
+    // the exe), so it answers: the running title's appid. Same shape as the SteamAppId
+    // environment stamp at the launch site (#280) -- telling the guest which app it is,
+    // not telling it anything about a licence.
+    if (tag == kSciTagUtils && slot == 9 && r == 0 && GhScBridgeOn()){
+        uint32_t app = g_launcherSelectedApp;
+        if (!app){ const char* e = getenv("SteamAppId"); if (e) app = (uint32_t)strtoul(e, nullptr, 10); }
+        if (app){
+            out = (uintptr_t)app;
+            Diag("SCLIENT SUB ISteamUtils slot=9 GetAppID 0 -> " + std::to_string(app));
+        }
+    }
+    // s982: wrap the ISteamUtils that GetISteamUtils (ISteamClient slot 9) hands back,
+    // so the one question the stub asks it is named in the log instead of guessed at.
+    if (tag == kSciTagClient && slot == 9 && out && out > 0x10000 && GhScBridgeOn()){
+        void* w = GhSciProxy((void*)out, kSciTagUtils);
+        if (w && (uintptr_t)w != out){
+            Diag("SCLIENT wrap ISteamUtils " + Hex(out) + " -> " + Hex((uintptr_t)w));
+            out = (uintptr_t)w;
+        }
+    }
+    if (g_sciLogN <= 200)
+        Diag(std::string("SCLIENT ret  ") + GhSciTagName(tag) + " slot=" + std::to_string(slot) +
+             " -> " + Hex(r) + (out != r ? " SUB " + Hex(out) : std::string()));
+    return out;
+}
+static void* GhSciProxy(void* real, unsigned tag)
+{
+    // ISteamClient/ISteamUtils methods all take <= 3 register args after `this` and no
+    // floats. s982: one code block + vtable PER TAG, so the thunk can bake the tag into
+    // the slot word it passes to GhSciEnter/GhSciRet and the log says which interface.
+    const int kSlots = 40;
+    if (tag >= kSciTags) return real;
+    static uint8_t* codeFor[kSciTags] = {nullptr, nullptr};
+    static void**   vtFor[kSciTags]   = {nullptr, nullptr};
+    uint8_t*& code = codeFor[tag];
+    void**&   vt   = vtFor[tag];
+    if (!code){
+        code = (uint8_t*)VirtualAlloc(nullptr, 0x2000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        vt = (void**)VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!code || !vt) return real;
+        uint8_t* p = code;
+        auto b = [&](std::initializer_list<uint8_t> l){ for (uint8_t x : l) *p++ = x; };
+        auto q = [&](uint64_t v){ memcpy(p, &v, 8); p += 8; };
+        auto d = [&](uint32_t v){ memcpy(p, &v, 4); p += 4; };
+        for (int i = 0; i < kSlots; ++i){
+            vt[i] = p;
+            b({0x53});                                  // push rbx
+            b({0x48,0x83,0xEC,0x40});                   // sub rsp,0x40
+            b({0x48,0x89,0x4C,0x24,0x20});              // mov [rsp+20],rcx
+            b({0x48,0x89,0x54,0x24,0x28});              // mov [rsp+28],rdx
+            b({0x4C,0x89,0x44,0x24,0x30});              // mov [rsp+30],r8
+            b({0x4C,0x89,0x4C,0x24,0x38});              // mov [rsp+38],r9
+            b({0xB9}); d((uint32_t)i | (tag << 16));    // mov ecx,(tag<<16)|i  (rdx,r8,r9 = a1..a3)
+            b({0x48,0xB8}); q((uint64_t)&GhSciEnter);   // mov rax,GhSciEnter
+            b({0xFF,0xD0});                             // call rax
+            b({0x48,0x8B,0x4C,0x24,0x20});              // mov rcx,[rsp+20]
+            b({0x48,0x8B,0x54,0x24,0x28});              // mov rdx,[rsp+28]
+            b({0x4C,0x8B,0x44,0x24,0x30});              // mov r8,[rsp+30]
+            b({0x4C,0x8B,0x4C,0x24,0x38});              // mov r9,[rsp+38]
+            b({0x48,0x8B,0x49,0x08});                   // mov rcx,[rcx+8]   real this
+            b({0x48,0x8B,0x01});                        // mov rax,[rcx]
+            b({0xFF,0x90}); d((uint32_t)(i * 8));       // call [rax+i*8]
+            b({0x48,0x89,0xC2});                        // mov rdx,rax      real result
+            b({0xB9}); d((uint32_t)i | (tag << 16));    // mov ecx,(tag<<16)|i
+            b({0x48,0xB8}); q((uint64_t)&GhSciRet);     // mov rax,GhSciRet
+            b({0xFF,0xD0});                             // call rax         #282: ITS rax is the
+            // result the guest sees, so GhSciRet can substitute the engine's live
+            // pipe/user for a zero from the public bootstrapper.
+            b({0x48,0x83,0xC4,0x40});                   // add rsp,0x40
+            b({0x5B,0xC3});                             // pop rbx; ret
+        }
+        DWORD old = 0; VirtualProtect(code, 0x2000, PAGE_EXECUTE_READ, &old);
+        FlushInstructionCache(GetCurrentProcess(), code, 0x2000);
+    }
+    void** o = (void**)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 16);
+    if (!o) return real;
+    o[0] = vt; o[1] = real;
+    return o;
+}
+// s970: does an in-process ISteamClient pipe work at all? Same calls a game's S_API
+// makes (CreateSteamPipe, ConnectToGlobalUser, GetISteamUser -> BLoggedOn), made by us
+// on the stub's thread at the moment it looks CreateInterface up; then released.
+static int GhSciPipeProbeSeh(GhSciFn ci, uintptr_t out[6])
+{
+    __try {
+        int rc = 0;
+        void** sc = (void**)ci("SteamClient017", &rc);
+        out[0] = (uintptr_t)sc; if (!sc) return 1;
+        void** vt = (void**)sc[0];
+        int pipe = ((int(*)(void*))vt[0])(sc);                                  out[1] = (uintptr_t)pipe;
+        // #282: a zero here is the public bootstrapper, not the client. Carry on
+        // with the engine's own live handles so the probe answers the question
+        // that matters -- does the PUBLIC layer report a logged-on user for them?
+        // Substituted handles belong to the engine's session, so never release
+        // them: ReleaseUser/BReleaseSteamPipe on the engine's pipe would tear
+        // down the very session the Launcher is running on.
+        bool borrowed = false;
+        int euser = 0;
+        if (!pipe){
+            if (!GhEngSession(&pipe, &euser)) return 2;
+            borrowed = true; out[1] = (uintptr_t)pipe;
+        }
+        int user = ((int(*)(void*, int))vt[2])(sc, pipe);                        out[2] = (uintptr_t)user;
+        if (user <= 0 && borrowed){ user = euser; out[2] = (uintptr_t)user; }   // s980: -1, not 0
+        if (user){
+            void** su = (void**)((void*(*)(void*, int, int, const char*))vt[5])(sc, user, pipe, "SteamUser019");
+            out[3] = (uintptr_t)su;
+            if (su) out[4] = (uintptr_t)((bool(*)(void*))((void**)su[0])[1])(su);
+            if (!borrowed) ((void(*)(void*, int, int))vt[4])(sc, pipe, user);    // ReleaseUser
+        }
+        if (borrowed){ out[5] = 0x8e; return 0; }                               // 0x8e = borrowed, not released
+        out[5] = (uintptr_t)((bool(*)(void*, int))vt[1])(sc, pipe);             // BReleaseSteamPipe
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { out[5] = GetExceptionCode(); return 9; }
+}
+static void GhSciPipeProbe(GhSciFn ci)
+{
+    static LONG once = 0;
+    if (InterlockedExchange(&once, 1)) return;
+    uintptr_t o[6] = {0};
+    const ULONGLONG t0 = GetTickCount64();
+    const int st = GhSciPipeProbeSeh(ci, o);
+    Diag("SCLIENT pipe probe st=" + std::to_string(st) + " client=" + Hex(o[0]) + " pipe=" + std::to_string((int)o[1]) +
+         " user=" + std::to_string((int)o[2]) + " isteamuser=" + Hex(o[3]) + " loggedOn=" + std::to_string((int)o[4]) +
+         " release=" + Hex(o[5]) + " ms=" + std::to_string(GetTickCount64() - t0));
+}
+// #283 (s981): the stub acquired a logged-on user, asked ISteamUtils ONE question and
+// then released the user, released the pipe and relaunched. The question is GetAppID:
+// SetAppIDForCurrentPipe is per-pipe, and the pipe it is holding is the engine's, still
+// bound to whatever the Launcher's login bound (3809440). The loader deliberately does
+// not rebind in the pre-guest window -- SetAppID + Advertise before Unity exists aborted
+// UnityMain with 0xE06D7363 -- and leaves it to our SteamAPI_Init. This stub has its own
+// embedded S_API and never calls ours, so nothing ever rebinds.
+//
+// Do it here instead: once, on the first GUEST CreateInterface. That is exactly the set
+// of titles that talk to steamclient64 directly (never the Unity path), and
+// GhRebindAppContext does not advertise -- the engine thread still does that once the game
+// is actually up.
+//
+// s982 OUTCOME: the rebind works (SetAppIDForCurrentPipe(3763830)->3763830, GetAppID
+// 3809440->3763830) and the stub behaved identically, so GetAppID was NOT what it asks
+// ISteamUtils. Keep this -- a pipe bound to the running title is correct regardless -- but
+// it is not the answer to the relaunch.
+static void GhSciRebindAppCtx()
+{
+    static LONG once = 0;
+    if (InterlockedExchange(&once, 1)) return;
+    HMODULE stm = GetModuleHandleA("steam_api64.dll");
+    auto fn = stm ? (int(*)())GetProcAddress(stm, "GhRebindAppContext") : nullptr;
+    if (!fn){ Diag("SCLIENT appctx rebind NO_EXPORT"); return; }
+    const int ok = fn();
+    Diag("SCLIENT appctx rebind -> " + std::to_string(ok) + " (see gh_shim.log for GetAppID before/after)");
+}
+static void* GhSciCreateInterface(const char* ver, int* rc)
+{
+    void* r = g_sciReal ? g_sciReal(ver, rc) : nullptr;
+    HMODULE cm = nullptr;
+    const bool guestCaller = !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                                 (LPCWSTR)_ReturnAddress(), &cm);
+    char v[96]; GhSciCopyStr(ver, v, sizeof v);
+    const bool wrap = r && guestCaller && 0 == strncmp(v, "SteamClient", 11);
+    if (wrap && GhScBridgeOn()) GhSciRebindAppCtx();     // #283: bind the pipe to THIS title
+    void* out = wrap ? GhSciProxy(r, kSciTagClient) : r;
+    if (InterlockedIncrement(&g_sciLogN) <= 200)
+        Diag(std::string("SCLIENT CreateInterface ver=") + v + " rc=" + std::to_string(rc ? *rc : -1) +
+             " -> " + Hex((uintptr_t)r) + (guestCaller ? " guest" : " host") + (wrap ? " PROXY" : ""));
+    return out;
+}
+
+static const char* GhImportOrdinalName(const char* dll, unsigned ord);   // §60, defined with the import resolver
 static FARPROC WINAPI Bed_GetProcAddress(HMODULE mod, LPCSTR name)
 {
     if (name && HIWORD(name) && !g_modClrDir.empty() && 0 == strcmp(name, "il2cpp_init")){
@@ -3575,6 +4079,66 @@ static FARPROC WINAPI Bed_GetProcAddress(HMODULE mod, LPCSTR name)
             g_monoJitInitReal = (void*)real;
             Diag("MODS hooked mono_jit_init_version");
             return (FARPROC)&Bed_mono_jit_init_version;
+        }
+    }
+    // #281c observation: every lookup that arrives with no module, and every
+    // CreateInterface, capped so a chatty guest cannot flood the ring.
+    if (name && HIWORD(name) && (!mod || 0 == strcmp(name, "CreateInterface"))){
+        static LONG s_nullGpa = 0;
+        if (InterlockedIncrement(&s_nullGpa) <= 64)
+            Diag(std::string("GPA probe mod=") + Hex((uintptr_t)mod) + " name=" + name +
+                 " caller=" + Hex((uintptr_t)_ReturnAddress()));
+    }
+    if (name && HIWORD(name) && GhSciOn()){
+        // #281c: find the steamclient64 this lookup is aimed at. THREE cases, and until
+        // now only the first was handled -- which is why this whole block went dead the
+        // moment option B started self-mapping the DLL (0.0.882):
+        //   1. a real OS module      -> GetModuleFileNameA names it;
+        //   2. a self-mapped module  -> the loader cannot place it, so ask the self-map;
+        //   3. a NULL/stale handle   -> Dead as Disco's embedded S_API asks with mod=0
+        //      (s978), and the flat client API lives in exactly one module anyway.
+        HMODULE sc = nullptr;
+        char mp[MAX_PATH] = {0};
+        const bool wantsClientApi = (0 == strcmp(name, "CreateInterface") ||
+                                     0 == strncmp(name, "Steam_", 6));
+        if (mod && GetModuleFileNameA(mod, mp, MAX_PATH)){
+            const char* bn = strrchr(mp, '\\'); bn = bn ? bn + 1 : mp;
+            if (0 == _stricmp(bn, "steamclient64.dll")) sc = mod;
+        } else if (mod && GhSelfMapIs(mod)){
+            const std::wstring p = GhSelfMapPath(mod);
+            const size_t s = p.find_last_of(L'\\');
+            const std::wstring bn = (s == std::wstring::npos) ? p : p.substr(s + 1);
+            if (0 == _wcsicmp(bn.c_str(), L"steamclient64.dll")) sc = mod;
+        } else if (!mod && wantsClientApi){
+            sc = GhSelfMapByName("steamclient64.dll");
+            if (sc) Diag(std::string("SCLIENT GPA null-handle ") + name + " -> steamclient64@" + Hex((uintptr_t)sc));
+        }
+        {
+            if (sc){
+                const HMODULE mod = sc;                 // the rest of this block talks to it
+                FARPROC r = GhSelfMapExport(mod, name);
+                if (!r) r = GetProcAddress(mod, name);
+                if (InterlockedIncrement(&g_sciLogN) <= 200)
+                    Diag(std::string("SCLIENT GPA ") + name + " -> " + Hex((uintptr_t)r) + " caller=" + Hex((uintptr_t)_ReturnAddress()));
+                // Only the FIRST guest lookup (the stub's embedded S_API) gets the logging
+                // pass-through: the stub itself looks CreateInterface up again and verifies
+                // the FILE of the module that holds it (s968), so it must see the real export.
+                static LONG s_guestCi = 0;
+                HMODULE cm = nullptr;
+                const bool guestCaller = !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)_ReturnAddress(), &cm);
+                if (r && 0 == strcmp(name, "CreateInterface") && guestCaller && s_guestCi >= 1)
+                    GhSciPipeProbe((GhSciFn)r);
+                if (r && 0 == strcmp(name, "CreateInterface") && guestCaller &&
+                    InterlockedIncrement(&s_guestCi) == 1){
+                    g_sciReal = (GhSciFn)r;
+                    return (FARPROC)&GhSciCreateInterface;
+                }
+                // #281c: hand the resolved export back. The paths below cannot find it
+                // for a self-mapped or NULL handle, and returning their NULL is exactly
+                // the bug that made the stub give up and relaunch via steam://run.
+                if (r) return r;
+            }
         }
     }
     if (name && HIWORD(name)){                 // by name, not ordinal
@@ -3609,12 +4173,15 @@ static FARPROC WINAPI Bed_GetProcAddress(HMODULE mod, LPCSTR name)
         // DIAG (2026-08-03): trace SteamAPI_* resolution — which module services it?
         if (0 == strncmp(name, "SteamAPI_", 9) || 0 == strncmp(name, "SteamInternal_", 14) ||
             0 == strncmp(name, "SteamGameServer", 15)){
-            FARPROC r = GetProcAddress(mod, name);
+            // #281: ask the self-map FIRST. A module we mapped ourselves is invisible to
+            // the real loader, so GetProcAddress answers NULL for every export it holds.
+            FARPROC r = GhSelfMapExport(mod, name);
+            if (!r) r = GetProcAddress(mod, name);
             char mp[MAX_PATH] = {0};
             GetModuleFileNameA(mod, mp, MAX_PATH);
             Diag(std::string("GPA steam ") + name + " mod=" + Hex((uintptr_t)mod) +
                  " -> " + Hex((uintptr_t)r) + " modpath=" + mp);
-            return r;
+            if (r) return r;
         }
         // Diagnostic: log any GetProcAddress probe that hints at further
         // bootstrapper/service callbacks steamclient wants (so we know what to
@@ -3622,9 +4189,55 @@ static FARPROC WINAPI Bed_GetProcAddress(HMODULE mod, LPCSTR name)
         if (name[0]=='S' || name[0]=='G' || name[0]=='F' || name[0]=='I'){
             if (strstr(name,"Steam") || strstr(name,"Bootstrap") ||
                 strstr(name,"Launcher") || strstr(name,"Update")){
-                FARPROC r = GetProcAddress(mod, name);
-                if (!r) Diag(std::string("GPA miss ") + name);
-                return r;
+                // #281: this started as a diagnostic, and its unconditional `return r`
+                // turned into a real bug the moment option B began self-mapping Valve's
+                // steamclient64 (0.0.882): a self-mapped module is invisible to the OS
+                // loader, so the real GetProcAddress answers NULL and this branch handed
+                // that NULL straight back, never reaching the GhSelfMapExport fallback at
+                // the end of this function. Dead as Disco's stub asked the client DLL for
+                // Steam_ReleaseThreadLocalMemory -- which Valve's file really does export,
+                // one of its 41 names -- got NULL, concluded there was no usable client and
+                // ShellExecute'd steam://run/3763830 instead of starting (s975/s976).
+                FARPROC r = GhSelfMapExport(mod, name);
+                if (!r) r = GetProcAddress(mod, name);
+                // The flat client API lives in exactly one place. When the caller hands
+                // us a handle the OS loader cannot place and that is not a self-map base
+                // either, ask the self-mapped steamclient64 by name (#281).
+                if (!r && (0 == strncmp(name, "Steam_", 6) || 0 == strcmp(name, "CreateInterface"))){
+                    char mp0[MAX_PATH] = {0};
+                    const bool osMod = mod && GetModuleFileNameA(mod, mp0, MAX_PATH) != 0;
+                    if (!osMod && !GhSelfMapIs(mod)){
+                        if (HMODULE sc = GhSelfMapByName("steamclient64.dll")){
+                            r = GhSelfMapExport(sc, name);
+                            if (r) Diag(std::string("GPA selfmap-by-name ") + name +
+                                        " mod=" + Hex((uintptr_t)mod) + " -> steamclient64@" + Hex((uintptr_t)sc));
+                        }
+                    }
+                }
+                if (!r){
+                    char mp1[MAX_PATH] = {0};
+                    std::string s = std::string("GPA miss ") + name + " mod=" + Hex((uintptr_t)mod);
+                    s += (mod && GetModuleFileNameA(mod, mp1, MAX_PATH)) ? (std::string(" modpath=") + mp1)
+                                                                         : std::string(" (not an OS module)");
+                    s += GhSelfMapIs(mod) ? " selfmapped=yes" : " selfmapped=no";
+                    Diag(s + " selfmods=" + GhSelfModList());
+                }
+                if (r) return r;
+            }
+        }
+    }
+    // §60. By ordinal: the delay-load helper inside UnityPlayer asks for d3d12 #101
+    // this way, and the import-table path (GhImportOrdinalName) never sees it.
+    if (name && !HIWORD(name) && mod){
+        char mp[MAX_PATH] = {0};
+        if (GetModuleFileNameA(mod, mp, MAX_PATH)){
+            const char* b = strrchr(mp, '\\'); b = b ? b + 1 : mp;
+            if (const char* on = GhImportOrdinalName(b, (unsigned)LOWORD(name))){
+                auto it = ShimTable().find(on);
+                if (it != ShimTable().end()){
+                    Diag(std::string("GPA ordinal ") + b + " #" + std::to_string((unsigned)LOWORD(name)) + " -> shim " + on);
+                    return (FARPROC)it->second;
+                }
             }
         }
     }
@@ -4266,6 +4879,22 @@ static Gfx g_gfx;
 // D2D draw both use g_gfx.d11ctx; serialize them or the overlay snap loses
 // glyphs (rectangles commit, DrawText does not).
 static std::mutex g_d11Mutex;
+// #291. The "exactly one wrapped back buffer is acquired" dance on g_gfx.swap.
+// GfxPresent releases the wrap INSIDE g_d11Mutex, Presents OUTSIDE it, then
+// re-acquires at the end of the function -- so g_d11Mutex does NOT cover the
+// window in which the swapchain has no acquired back buffer, and LuiPresent runs
+// the same dance from the UI thread. One mutex held across the whole of
+// GfxPresent is what makes the two mutually exclusive. Lock order is always
+// g_swapDance then g_d11Mutex, and the keepalive only ever TRY-locks it, so a
+// guest wedged inside GfxPresent can never also wedge the UI pump.
+static std::timed_mutex g_swapDance;
+// #291b. The tick of the last COMPLETED guest present, stamped after Present
+// returns. g_presentTick is stamped at the TOP of GfxPresent, before the lock,
+// so a present that is merely BLOCKED refreshes it -- which is how s997's
+// keepalive sat out a 94-second stall believing the guest had just presented.
+// "Silent" has to mean "produced no frame", not "entered the function".
+static volatile LONG64 g_presentDoneTick = 0;
+static volatile LONG   g_presentThreads  = 0;   // distinct tids seen presenting
 static CoreDispatcher g_dispatcher{ nullptr };   // set on the UI thread in App::Run
 
 // guestRT is TYPELESS (see BuildBridgeOnUi) so a guest may view it as UNORM or
@@ -6923,6 +7552,44 @@ static HRESULT GfxPresent(UINT sync)
 #ifdef GH_LAUNCHER
     if (!g_guestSessionLive) return S_OK;
 #endif
+    // #291. Held for the whole of the dance -- release, Present, re-acquire --
+    // so the keepalive presenter on the UI thread cannot be inside it too.
+    //
+    // #291b: TIMED, never unbounded. If a second guest thread presents while the
+    // first is wedged in here, an unbounded wait piles every one of them up
+    // behind it; dropping the frame instead is what a swapchain already does to
+    // a late Present, and it keeps the stall confined to the one thread that
+    // owns it. Three seconds is longer than any honest present and far shorter
+    // than the shell's patience.
+    std::unique_lock<std::timed_mutex> dance(g_swapDance, std::chrono::milliseconds(3000));
+    if (!dance.owns_lock()){
+        static LONG drops = 0;
+        const LONG k = InterlockedIncrement(&drops);
+        if (k <= 4 || (k % 100) == 0)
+            Diag("GfxPresent #" + std::to_string(k) + " DROPPED at " + std::to_string(GhUpMs()) +
+                 "ms: another thread has held the swap dance for 3s (tid=" +
+                 std::to_string((unsigned long)GetCurrentThreadId()) + ") -- frame skipped, not queued");
+        return S_OK;
+    }
+    // One line the first time a SECOND thread presents. Whether this proxy is
+    // called from one thread or several decides whether serialising it here is
+    // free or is itself a cost, and nothing has ever measured it.
+    {
+        static volatile LONG firstTid = 0;
+        const LONG me = (LONG)GetCurrentThreadId();
+        const LONG was = InterlockedCompareExchange(&firstTid, me, 0);
+        if (was == 0) InterlockedIncrement(&g_presentThreads);
+        else if (was != me){
+            static bool said = false;
+            if (!said){
+                said = true;
+                InterlockedIncrement(&g_presentThreads);
+                Diag("GfxPresent is called from MORE THAN ONE THREAD: first tid=" +
+                     std::to_string((unsigned long)was) + " now tid=" + std::to_string((unsigned long)me) +
+                     " at " + std::to_string(GhUpMs()) + "ms");
+            }
+        }
+    }
     // The guest rendered into the stable guestRT. Copy it into the live physical
     // back buffer (currently acquired), then release+flush+present. This makes
     // the guest's single cached render target land on whichever flip buffer is
@@ -7111,6 +7778,9 @@ static HRESULT GfxPresent(UINT sync)
     // skips the destructor and leaves g_d11Mutex locked for the next launch.
     if (g_overlayQuitNow) {
         g_overlayQuitNow = false;
+        // #291: and the same is true of g_swapDance -- ExitThread would leave it
+        // locked for the next launch, so drop it before the exit, by hand.
+        dance.unlock();
         Diag("OVERLAY quit: Bed_exit after Present unlock");
         GhGuestExit(0, false);   // the player quit: no static destructors on the render thread
     }
@@ -7123,6 +7793,8 @@ static HRESULT GfxPresent(UINT sync)
         g_gfx.scQueue->Wait(g_gfx.scFence.get(), g_gfx.scFenceV);
     }
     hr = g_gfx.swap->Present(sync, 0);
+    if (SUCCEEDED(hr))
+        InterlockedExchange64(&g_presentDoneTick, (LONG64)GetTickCount64());   // #291b
     if (InterlockedCompareExchange(&g_prPost, 0, 0) > 0){
         InterlockedDecrement(&g_prPost);
         Diag("POOLRESET post present hr=" + Hex((uint32_t)hr) +
@@ -15210,17 +15882,44 @@ static void GhPsoDedupPublish(const GhPsoKey& k, ID3D12PipelineState* pso, LONG6
 
 // A tick of the microsecond clock the #202 accounting is kept in. GetTickCount64
 // is 16 ms granular, which is the same order as the thing being measured.
+//
+// #290. This used to return 0 when QueryPerformanceCounter failed, and that is
+// not merely a lost timing. BOTH PSO hooks gate their counters AND their timers
+// on `const LONG64 tEnter = GhNowUs()`, so a failing QPC made the pipeline count
+// nothing, the timers measure nothing, and the #289 PSOSPLIT instrument print
+// nothing: s994's diag holds 54 `CREATED` lines and reports psoN=3. Fifty-one
+// creations had tEnter == 0. An instrument may not depend on the clock it is
+// measuring, and a zero that means "no time" is indistinguishable from a zero
+// that means "no clock".
+//
+// So when QPC fails, latch -- one way, for the rest of the process -- onto
+// GetTickCount64, which has no failure mode. It is 16 ms granular, coarse for a
+// 2 ms driver compile and entirely adequate for the 95-second and 211-second
+// questions this clock exists to answer. Both clocks count from boot, so the
+// epochs agree to within a tick; the latch is one-way anyway so that no single
+// run keeps flipping between them mid-delta.
+static volatile LONG g_nowUsTicks = 0;      // 1 = QPC failed, we are on ticks
+
 static LONG64 GhNowUs()
 {
     static LARGE_INTEGER freq = []{ LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f; }();
-    LARGE_INTEGER c{};
-    if (!freq.QuadPart || !QueryPerformanceCounter(&c)) return 0;
-    // #202. `c.QuadPart * 1000000` overflows int64 once the counter passes
-    // 9.22e12, which at a 10 MHz QPC is 10.7 days of uptime -- the timing would
-    // silently go negative and stay there. Split the divide so the product can
-    // never exceed 1e6 * freq.
-    return (LONG64)((c.QuadPart / freq.QuadPart) * 1000000ll
-                  + ((c.QuadPart % freq.QuadPart) * 1000000ll) / freq.QuadPart);
+    if (!InterlockedCompareExchange(&g_nowUsTicks, 0, 0)){
+        LARGE_INTEGER c{};
+        if (freq.QuadPart && QueryPerformanceCounter(&c)){
+            // #202. `c.QuadPart * 1000000` overflows int64 once the counter
+            // passes 9.22e12, which at a 10 MHz QPC is 10.7 days of uptime --
+            // the timing would silently go negative and stay there. Split the
+            // divide so the product can never exceed 1e6 * freq.
+            return (LONG64)((c.QuadPart / freq.QuadPart) * 1000000ll
+                          + ((c.QuadPart % freq.QuadPart) * 1000000ll) / freq.QuadPart);
+        }
+        if (!InterlockedExchange(&g_nowUsTicks, 1))
+            Diag("CLOCK QueryPerformanceCounter failed at " + std::to_string(GhUpMs()) +
+                 "ms -- GhNowUs is on GetTickCount64 (16ms granular) for the rest of the run");
+    }
+    // +1 so the value is never 0: GhDeltaUs reads 0 as "that endpoint is not a
+    // real timestamp", which is the whole bug this branch exists to retire.
+    return (LONG64)(GetTickCount64() * 1000ull) + 1;
 }
 
 // #202. GhNowUs returns 0 when QueryPerformanceCounter fails, and a caller that
@@ -16399,6 +17098,14 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
         static volatile LONG nlog = 0;
         if (GhPsoLogThis(&nlog)) Diag(m);   // #202: throttled by gh_pso_log
     }
+    // #289. psoPreMs said 211 SECONDS of pre-driver time in s993 against 11.9 s
+    // of driver, on a run that lasted 103 s -- so the number is cumulative over
+    // threads, and with 17 pipeline creations in flight it says our side of the
+    // hook is where they queue. It does NOT say WHICH part, and the hook runs
+    // ~450 lines before it hands over. These four marks split it, and the line
+    // below only prints when one call is actually slow, so measuring the storm
+    // cannot become one.
+    const LONG64 tCk1 = GhNowUs();
 
     // Establish, once, whether this device can build ANY graphics PSO, using
     // shaders and a root signature of our own. That separates "the console's
@@ -16599,6 +17306,7 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
         }
     }
 
+    const LONG64 tCk2 = GhNowUs();
     if (GhDxilScreen() >= 2 && use){
         // #186: a shader the corpus supplied is exempt. It is not that a lowered
         // blob is harmless by definition -- 33 of them still declare WaveOps,
@@ -16660,6 +17368,7 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
         }
     }
 
+    const LONG64 tCk3 = GhNowUs();
     static LONG faulted = 0;
     // gh_pso_faults = how many faulting pipelines to absorb before giving up on
     // the rest. 1 is the old behaviour. Raising it answers the question the old
@@ -16680,6 +17389,9 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     // and this shader is innocent. One GetDeviceRemovedReason is nothing next to
     // a PSO compile.
     HRESULT preRemoved = self->GetDeviceRemovedReason();
+    // GetDeviceRemovedReason is a call INTO the driver and it sits in front of
+    // the timer split, so any device-level queueing it does is charged to us.
+    const LONG64 tCk4 = GhNowUs();
     if (preRemoved != S_OK){
         Diag("  device ALREADY removed BEFORE this PSO: reason=" + Hex((uint32_t)preRemoved));
         GhCheckDeviceRemoved("pso-pre", self);
@@ -16714,8 +17426,23 @@ static HRESULT __stdcall Hook_D12CreateGPS(ID3D12Device* self,
     const LONG64 drvUs = GhDeltaUs(GhNowUs(), tDrv0);
     if (tEnter){
         InterlockedExchangeAdd64(&g_psoDrvUs, drvUs);
-        InterlockedExchangeAdd64(&g_psoPreUs, GhDeltaUs(tDrv0, tEnter));
+        const LONG64 preUs = GhDeltaUs(tDrv0, tEnter);
+        InterlockedExchangeAdd64(&g_psoPreUs, preUs);
         InterlockedIncrement(&g_psoCalls);
+        // gh_pso_split_ms = print a split for any call whose pre-driver half took
+        // at least this many ms. 0 turns it off. The default of 50 is well under
+        // the ~3,800 ms per call s993 implies and well over an ordinary hook pass,
+        // so a healthy run prints nothing at all.
+        static const long splitMs = (long)GhCfgNumZ(L"gh_pso_split_ms.txt", "GH_PSO_SPLIT_MS", 50);
+        if (splitMs && preUs >= (LONG64)splitMs * 1000)
+            Diag("PSOSPLIT tid=" + std::to_string((unsigned long)GetCurrentThreadId()) +
+                 " pre=" + std::to_string((long long)(preUs / 1000)) + "ms" +
+                 " desc=" + std::to_string((long long)(GhDeltaUs(tCk1, tEnter) / 1000)) +
+                 " setup=" + std::to_string((long long)(GhDeltaUs(tCk2, tCk1) / 1000)) +
+                 " screen=" + std::to_string((long long)(GhDeltaUs(tCk3, tCk2) / 1000)) +
+                 " drr=" + std::to_string((long long)(GhDeltaUs(tCk4, tCk3) / 1000)) +
+                 " tail=" + std::to_string((long long)(GhDeltaUs(tDrv0, tCk4) / 1000)) +
+                 " drv=" + std::to_string((long long)(drvUs / 1000)) + "ms");
     }
     --depth;
     if (serialize) ReleaseSRWLockExclusive(&g_psoLock);
@@ -19403,7 +20130,7 @@ static bool GhGprArmed()
     if (InterlockedExchange(&armed, 1) == 0) Diag("GPUPROF armed at present " + std::to_string((unsigned long long)m));
     return true;
 }
-static const LONG kGprBlk = 1024, kGprBlocks = 256, kGprPerList = 8;
+static const LONG kGprBlk = 128, kGprBlocks = 2048, kGprPerList = 64;   // §60: ~96 lists/frame (Scratch Creek) recycled 256 x 1024 blocks in <3 frames -> 98% stale
 static const LONG kGprMaxRec = kGprBlk * kGprPerList;
 struct GhGprList { LONG n; LONG closed; LONG cap; LONG blk[kGprPerList]; LONG gen[kGprPerList]; void** rec; };
 static GhGprList g_gprList[512]{};          // indexed by the GhCLNote slot; a list owns its slot for life
@@ -34698,11 +35425,26 @@ static HRESULT WINAPI Bed_CreateDXGIFactory2(UINT /*flags*/, REFIID riid, void**
 
 // Hand the guest the bridged device/context (both AddRef'd for the guest to own).
 static void ReturnBridgedDevice(ID3D11Device** dev, ID3D11DeviceContext** ctx,
-                                D3D_FEATURE_LEVEL* fl)
+                                D3D_FEATURE_LEVEL* fl, D3D_FEATURE_LEVEL level)
 {
     if (dev){ *dev = g_gfx.d11.get(); (*dev)->AddRef(); }
     if (ctx){ *ctx = g_gfx.d11ctx.get(); (*ctx)->AddRef(); }
-    if (fl)  *fl  = g_gfx.level;
+    if (fl)  *fl  = level;
+}
+
+// The level D3D11CreateDevice reports is the FIRST entry of the caller's list the
+// device supports, and a NULL list means {11_0, 10_1, 10_0, 9_x} -- 11_1 only when
+// asked for. We used to answer the bridge's own 11_1 to everyone, which a caller
+// that asked only for 11_0 has no case for. Returns 0 when nothing in the list
+// fits (real D3D11: E_INVALIDARG).
+static D3D_FEATURE_LEVEL GhPickFeatureLevel(const D3D_FEATURE_LEVEL* req, UINT n)
+{
+    static const D3D_FEATURE_LEVEL kDefault[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_9_3, D3D_FEATURE_LEVEL_9_2, D3D_FEATURE_LEVEL_9_1 };
+    if (!req || !n){ req = kDefault; n = (UINT)(sizeof(kDefault) / sizeof(kDefault[0])); }
+    for (UINT i = 0; i < n; i++)
+        if (req[i] <= g_gfx.level) return req[i];
+    return (D3D_FEATURE_LEVEL)0;
 }
 
 // Unity asks for a second, "dedicated video" device (flags 0x820: VIDEO_SUPPORT |
@@ -34717,30 +35459,35 @@ static void ReturnBridgedDevice(ID3D11Device** dev, ID3D11DeviceContext** ctx,
 // "Dedicated video D3D11 device creation failed" and decodes without one.
 static LONG g_d11Handed = 0;
 static HRESULT WINAPI Bed_D3D11CreateDevice(
-    IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT flags, const D3D_FEATURE_LEVEL*, UINT, UINT,
+    IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT flags, const D3D_FEATURE_LEVEL* req, UINT nreq, UINT,
     ID3D11Device** dev, D3D_FEATURE_LEVEL* fl, ID3D11DeviceContext** ctx)
 {
-    Diag("BED D3D11CreateDevice flags=" + Hex((uint32_t)flags));
     if (!EnsureBridge()) return E_FAIL;
+    const D3D_FEATURE_LEVEL level = GhPickFeatureLevel(req, nreq);
+    Diag("BED D3D11CreateDevice flags=" + Hex((uint32_t)flags) + " nreq=" + std::to_string(nreq) +
+         " level=" + Hex((uint32_t)level));
+    if (!level) return E_INVALIDARG;
     if ((flags & D3D11_CREATE_DEVICE_VIDEO_SUPPORT) && dev && InterlockedCompareExchange(&g_d11Handed, 0, 0)){
         *dev = nullptr;
         if (ctx) *ctx = nullptr;
         Diag("BED D3D11CreateDevice second VIDEO_SUPPORT device refused (only one bridged device exists)");
         return DXGI_ERROR_UNSUPPORTED;
     }
-    ReturnBridgedDevice(dev, ctx, fl);
+    ReturnBridgedDevice(dev, ctx, fl, level);
     if (dev) InterlockedExchange(&g_d11Handed, 1);
     return S_OK;
 }
 
 static HRESULT WINAPI Bed_D3D11CreateDeviceAndSwapChain(
-    IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT, const D3D_FEATURE_LEVEL*, UINT, UINT,
+    IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT, const D3D_FEATURE_LEVEL* req, UINT nreq, UINT,
     const DXGI_SWAP_CHAIN_DESC* scDesc, IDXGISwapChain** swap,
     ID3D11Device** dev, D3D_FEATURE_LEVEL* fl, ID3D11DeviceContext** ctx)
 {
-    Diag("BED D3D11CreateDeviceAndSwapChain");
     if (!EnsureBridge()) return E_FAIL;
-    ReturnBridgedDevice(dev, ctx, fl);
+    const D3D_FEATURE_LEVEL level = GhPickFeatureLevel(req, nreq);
+    Diag("BED D3D11CreateDeviceAndSwapChain nreq=" + std::to_string(nreq) + " level=" + Hex((uint32_t)level));
+    if (!level) return E_INVALIDARG;
+    ReturnBridgedDevice(dev, ctx, fl, level);
     if (dev) InterlockedExchange(&g_d11Handed, 1);
     if (swap){
         SwapProxy* proxy = new SwapProxy();
@@ -34906,6 +35653,17 @@ static int               g_kmPrevButtons = 0;        // bit0 L, bit1 R, bit2 M (
 static std::deque<MSG>   g_kmQueue;                  // synthetic msgs -> guest WndProc
 static const size_t      kKmQueueCap = 512;
 static unsigned          g_kmKeyEvents = 0, g_kmPtrEvents = 0, g_kmRelEvents = 0;
+// §60. Unity 6's Input System takes mouse BUTTONS only from WM_POINTERUPDATE/DOWN/UP
+// (HIWORD(wParam) FIRSTBUTTON..FIFTHBUTTON), never from WM_LBUTTONDOWN (UnityPlayer
+// 0xa16790 handles 0x200 and 0x245..0x24F only). It turns mouse-in-pointer on with
+// EnableMouseInPointer, which the container refuses ("not supported"), so the uGUI
+// menu of Scratch Creek saw the cursor move but never a click (s930-s932). The bed
+// says yes and KM_Push then sends each mouse message twice, as on a desktop where
+// DefWindowProc turns an unhandled WM_POINTER into the legacy message; Unity's
+// legacy path drops mouse-type WM_POINTER (0xa26ca0) and keeps WM_LBUTTONDOWN.
+// gh_mouse_pointer.txt=2 refuses EnableMouseInPointer again.
+static std::atomic<bool> g_mouseInPointer{false};
+static const UINT32      kGhPointerId = 1;
 
 // ---------------------------------------------------------------------------
 // Raw-input mouse feed (WM_INPUT + GetRawInputData).
@@ -34921,7 +35679,10 @@ static unsigned          g_kmKeyEvents = 0, g_kmPtrEvents = 0, g_kmRelEvents = 0
 // the game hands back to GetRawInputData during the same synchronous dispatch.
 // ---------------------------------------------------------------------------
 static std::mutex                         g_rawMutex;
-static std::map<uintptr_t, RAWINPUT>      g_rawEvents;      // HRAWINPUT value -> event
+// §60: each packet is delivered ONCE, by whichever path reads it first --
+// GetRawInputData on its WM_INPUT, or a GetRawInputBuffer drain (Unity 6).
+struct GhRawEv { RAWINPUT ri; bool used; };
+static std::map<uintptr_t, GhRawEv>       g_rawEvents;      // HRAWINPUT value -> event
 static uintptr_t                          g_rawNextHandle = 0x7A000001;
 static HANDLE                             g_rawMouseDev   = (HANDLE)0x1D000001;  // fake hDevice
 static HANDLE                             g_rawKbdDev     = (HANDLE)0x1D000002;  // #199, the keyboard half
@@ -34948,8 +35709,15 @@ static HANDLE                             g_rawKbdDev     = (HANDLE)0x1D000002; 
 // never looked again.
 static unsigned GhRawInput()
 {
-    static const unsigned v = GhCfgNumZ(L"gh_rawinput.txt", "GH_RAWINPUT", 0);
-    return v;
+    // Cached only once a title is chosen: the Launcher's own key path reads this
+    // before any game is picked, and caching THAT read would pin a per-title
+    // default (unreal-default's bit 2) to 0 for the run.
+    static std::atomic<int> v{-1};
+    const int c = v.load(std::memory_order_relaxed);
+    if (c >= 0) return (unsigned)c;
+    const unsigned r = GhCfgNumZ(L"gh_rawinput.txt", "GH_RAWINPUT", 0);
+    if (g_title) v.store((int)r, std::memory_order_relaxed);
+    return r;
 }
 
 // RECON_ONCE says a path was touched once, ever. #197 needed to know how OFTEN:
@@ -34987,7 +35755,7 @@ static void PushRawMouse(USHORT buttonFlags, USHORT buttonData, LONG dx, LONG dy
         ri.data.mouse.lLastX           = dx;
         ri.data.mouse.lLastY           = dy;
         ri.data.mouse.ulExtraInformation = 0;
-        g_rawEvents[h] = ri;
+        g_rawEvents[h] = GhRawEv{ ri, false };
         // Bound memory: keep only the most recent ~512 (game reads each once,
         // synchronously, right after the WM_INPUT dispatch).
         while (g_rawEvents.size() > 512) g_rawEvents.erase(g_rawEvents.begin());
@@ -35018,7 +35786,7 @@ static void PushRawKeyboard(USHORT vk, USHORT scan, bool down, bool extended)
         ri.data.keyboard.VKey             = vk;
         ri.data.keyboard.Message          = down ? WM_KEYDOWN : WM_KEYUP;
         ri.data.keyboard.ExtraInformation = 0;
-        g_rawEvents[h] = ri;
+        g_rawEvents[h] = GhRawEv{ ri, false };
         while (g_rawEvents.size() > 512) g_rawEvents.erase(g_rawEvents.begin());
         ++g_rawPushed;
     }
@@ -35040,6 +35808,10 @@ static void PushRawFromButtons(int buttons, int prev, int wheel, LONG dx, LONG d
     if (rf || dx || dy) PushRawMouse(rf, rdata, dx, dy);
 }
 
+// The guest's cursor visibility, kept by Bed_ShowCursor/Bed_SetCursor below.
+static std::atomic<int>  g_guestCursorCount{0};
+static std::atomic<bool> g_guestCursorNull{false};
+
 // Stamp the crosshair into `dst` (the live back buffer) at the current cursor pos.
 // No pipeline state is touched (CopySubresourceRegion only), so the guest's D3D
 // state is untouched. Gated on g_kmActive so pure-gamepad sessions show no cursor.
@@ -35054,6 +35826,7 @@ static void DrawCursorOverlay(ID3D11Resource* dst)
     // alone left the cursor stamped after remap was turned off (SetRemap(true)
     // sets g_kmActive and never cleared it).
     if (g_guestRunning && !g_kmRemapOn) return;
+    if (g_guestRunning && (g_guestCursorCount.load() < 0 || g_guestCursorNull.load())) return;
     if (!active && g_kmRemapOn) { active = true; }
 #endif
     if (!active) return;
@@ -35078,6 +35851,25 @@ static void KM_Push(UINT msg, WPARAM wp, LPARAM lp){
     std::lock_guard<std::mutex> lk(g_kmMutex);
     if (g_kmQueue.size() >= kKmQueueCap) g_kmQueue.pop_front();
     MSG m{}; m.hwnd = kFakeHwnd; m.message = msg; m.wParam = wp; m.lParam = lp;
+    if (g_mouseInPointer.load(std::memory_order_relaxed)){
+        UINT pm = 0;
+        WORD hi = 0x0002 /*INRANGE*/ | 0x2000 /*PRIMARY*/ | 0x4000 /*CONFIDENCE*/;
+        if (g_vkDown[VK_LBUTTON]) hi |= 0x0010 | 0x0004;   // FIRSTBUTTON | INCONTACT
+        if (g_vkDown[VK_RBUTTON]) hi |= 0x0020 | 0x0004;
+        if (g_vkDown[VK_MBUTTON]) hi |= 0x0040 | 0x0004;
+        switch (msg){
+        case WM_MOUSEMOVE:                                         pm = 0x0245; break; // WM_POINTERUPDATE
+        case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: pm = 0x0246; break; // WM_POINTERDOWN
+        case WM_LBUTTONUP:   case WM_RBUTTONUP:   case WM_MBUTTONUP:   pm = 0x0247; break; // WM_POINTERUP
+        case WM_MOUSEWHEEL:  pm = 0x024E; hi = HIWORD(wp); break;                         // WM_POINTERWHEEL
+        }
+        if (pm){
+            if (g_kmQueue.size() >= kKmQueueCap) g_kmQueue.pop_front();
+            MSG p = m; p.message = pm; p.wParam = MAKEWPARAM((WORD)kGhPointerId, hi);
+            g_kmQueue.push_back(p);
+            if (pm != 0x0245){ static int np = 0; if (++np <= 40) Diag("CLICKDIAG pointer msg=" + Hex(pm) + " flags=" + Hex((uint32_t)hi)); }
+        }
+    }
     g_kmQueue.push_back(m);
     // [gh-clickdiag] Log every non-move mouse/key message (buttons, wheel, keys)
     // so we can see clicks travel the pump end-to-end. WM_MOUSEMOVE is excluded
@@ -35317,7 +36109,53 @@ static BOOL WINAPI Bed_AdjustWindowRectExForDpi(LPRECT r, DWORD style, BOOL menu
 }
 static BOOL WINAPI Bed_IsMouseInPointerEnabled(){
     RECON_ONCE("IsMouseInPointerEnabled");
-    return FALSE;
+    return g_mouseInPointer.load() ? TRUE : FALSE;
+}
+// §60 (see g_mouseInPointer). Only UnityPlayer's import is bedded.
+static BOOL WINAPI Bed_EnableMouseInPointer(BOOL on){
+    static const unsigned k = GhCfgNum(L"gh_mouse_pointer.txt", "GH_MOUSE_POINTER", 1);
+    if (k == 2){ RECON_ONCE("EnableMouseInPointer (refused, knob=2)"); SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
+    g_mouseInPointer.store(on != FALSE);
+    Diag(std::string("BED EnableMouseInPointer(") + (on ? "TRUE" : "FALSE") + ") -> TRUE, WM_POINTER mouse feed " + (on ? "on" : "off"));
+    return TRUE;
+}
+// Our one synthetic pointer is a mouse; any other id goes to the real user32.
+static BOOL WINAPI Bed_GetPointerType(UINT32 id, POINTER_INPUT_TYPE* t){
+    if (g_mouseInPointer.load() && id == kGhPointerId){
+        RECON_ONCE("GetPointerType (synthetic mouse)");
+        if (!t){ SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+        *t = PT_MOUSE; return TRUE;
+    }
+    using Fn = BOOL (WINAPI*)(UINT32, POINTER_INPUT_TYPE*);
+    static Fn real = (Fn)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetPointerType");
+    if (!real){ SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
+    return real(id, t);
+}
+static BOOL WINAPI Bed_GetPointerInfo(UINT32 id, POINTER_INFO* pi){
+    if (g_mouseInPointer.load() && id == kGhPointerId){
+        RECON_ONCE("GetPointerInfo (synthetic mouse)");
+        if (!pi){ SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+        static volatile LONG frame = 0;
+        memset(pi, 0, sizeof(*pi));
+        pi->pointerType = PT_MOUSE; pi->pointerId = id; pi->frameId = (UINT32)InterlockedIncrement(&frame);
+        pi->pointerFlags = POINTER_FLAG_INRANGE | POINTER_FLAG_PRIMARY | POINTER_FLAG_CONFIDENCE;
+        pi->hwndTarget = kFakeHwnd; pi->historyCount = 1; pi->dwTime = GetTickCount();
+        {
+            std::lock_guard<std::mutex> lk(g_kmMutex);
+            pi->ptPixelLocation.x = g_kmCurX; pi->ptPixelLocation.y = g_kmCurY;
+            if (g_vkDown[VK_LBUTTON]) pi->pointerFlags |= POINTER_FLAG_FIRSTBUTTON | POINTER_FLAG_INCONTACT;
+            if (g_vkDown[VK_RBUTTON]) pi->pointerFlags |= POINTER_FLAG_SECONDBUTTON | POINTER_FLAG_INCONTACT;
+            if (g_vkDown[VK_MBUTTON]) pi->pointerFlags |= POINTER_FLAG_THIRDBUTTON | POINTER_FLAG_INCONTACT;
+        }
+        pi->ptPixelLocationRaw = pi->ptPixelLocation; pi->ptHimetricLocation = pi->ptPixelLocation;
+        pi->ptHimetricLocationRaw = pi->ptPixelLocation;
+        LARGE_INTEGER q; QueryPerformanceCounter(&q); pi->PerformanceCount = (UINT64)q.QuadPart;
+        return TRUE;
+    }
+    using Fn = BOOL (WINAPI*)(UINT32, POINTER_INFO*);
+    static Fn real = (Fn)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetPointerInfo");
+    if (!real){ SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
+    return real(id, pi);
 }
 // §57. The one default a window of its own needs: WM_CLOSE destroys it. Unreal's
 // splash Hide() posts WM_CLOSE, its proc leaves that to DefWindowProc, and only the
@@ -35505,14 +36343,50 @@ static LRESULT WINAPI Bed_DispatchMessageA(const MSG* m){
     }
     return 0;
 }
-// Never let Unity park waiting for OS input: report "message available" so it
-// loops back to PeekMessage (delivering our activation) and then PlayerLoop.
-// Once active, Unity renders every frame and stops calling this entirely.
-static DWORD  WINAPI Bed_MsgWaitForMultipleObjects(DWORD nCount, const HANDLE*, BOOL, DWORD, DWORD){
-    return WAIT_OBJECT_0 + nCount;   // the "input in queue" return code
+// Never let Unity park waiting for OS input: with no handles, report "message
+// available" so it loops back to PeekMessage (delivering our activation) and then
+// PlayerLoop. Once active, Unity renders every frame and stops calling this.
+//
+// §60. With handles it must really wait on them. Unity 6's wait-while-pumping
+// helper (UnityPlayer+0x983240, Fears to Fathom: Scratch Creek) is
+//   for(;;){ r = MsgWait(n, h, ...); if (r < n) return true; if (r != n) return false;
+//            while (PeekMessageA(..PM_REMOVE|PM_QS_SENDMESSAGE)) dispatch; }
+// and the old answer "n" (input in queue) with an empty queue spun it forever: the
+// handle it waits on was never even looked at, so the main thread pumped an empty
+// queue until the run ended and the game never drew a frame. "Input in queue" is now
+// answered only when one of our queues really holds a message for this thread.
+static bool GhMsgPendingForThisThread(){
+    MSG t; bool got;
+    if (ghwnd2::Peek(&t, nullptr, 0, 0, PM_NOREMOVE, &got)) return got;
+    return FillInjectedMsg(&t, nullptr, 0, 0, PM_NOREMOVE);
 }
-static DWORD  WINAPI Bed_MsgWaitForMultipleObjectsEx(DWORD nCount, const HANDLE*, DWORD, DWORD, DWORD){
-    return WAIT_OBJECT_0 + nCount;
+static DWORD GhMsgWait(DWORD n, const HANDLE* hs, BOOL all, DWORD timeout, BOOL alertable){
+    if (!n || !hs) return WAIT_OBJECT_0 + n;            // pre-§60 behaviour, every title so far
+    {
+        static volatile LONG c = 0;
+        if (InterlockedIncrement(&c) <= 4)
+            Diag("BED MsgWait n=" + std::to_string(n) + " timeout=" + Hex(timeout) + " all=" + std::to_string(all ? 1 : 0) +
+                 " tid=" + std::to_string(GetCurrentThreadId()) + " -> real wait");
+    }
+    const ULONGLONG t0 = GetTickCount64();
+    for (;;){
+        if (GhMsgPendingForThisThread()) return WAIT_OBJECT_0 + n;
+        DWORD slice = 10;
+        if (timeout != INFINITE){
+            const ULONGLONG el = GetTickCount64() - t0;
+            const DWORD left = el >= timeout ? 0 : (DWORD)(timeout - el);
+            if (left < slice) slice = left;
+        }
+        const DWORD r = WaitForMultipleObjectsEx(n, hs, all, slice, alertable);
+        if (r != WAIT_TIMEOUT) return r;                 // signaled, abandoned, IO completion, failed
+        if (timeout != INFINITE && GetTickCount64() - t0 >= timeout) return WAIT_TIMEOUT;
+    }
+}
+static DWORD  WINAPI Bed_MsgWaitForMultipleObjects(DWORD nCount, const HANDLE* hs, BOOL all, DWORD ms, DWORD){
+    return GhMsgWait(nCount, hs, all, ms, FALSE);
+}
+static DWORD  WINAPI Bed_MsgWaitForMultipleObjectsEx(DWORD nCount, const HANDLE* hs, DWORD ms, DWORD, DWORD fl){
+    return GhMsgWait(nCount, hs, (fl & MWMO_WAITALL) != 0, ms, (fl & MWMO_ALERTABLE) != 0);
 }
 // A no-op except on a thread that owns a window of its own (§57): the main window's
 // thread quitting would end the guest, which every title so far has survived only
@@ -36610,6 +37484,79 @@ static DWORD WINAPI Bed_GetModuleFileNameA(HMODULE h, LPSTR buf, DWORD cch)
     return n2;
 }
 
+// #277. GetModuleHandle[Ex] is the OS loader's view, and a module WE mapped is
+// not in it. The real call runs first, so nothing the OS knows about changes;
+// only a miss consults our own registry. SteamStub (Dead as Disco) needs this:
+// it asks which module a steamclient64 export lives in before it verifies that
+// module's file, and a self-mapped engine answered "no module" there.
+static HMODULE WINAPI Bed_GetModuleHandleW(LPCWSTR name)
+{
+    HMODULE m = GetModuleHandleW(name);
+    if (m || !name) return m;
+    const DWORD err = GetLastError();
+    std::string n = RegNarrow(name);
+    if (HMODULE sm = GhSelfMapFind(n.c_str())){
+        static LONG lg = 0;
+        if (InterlockedIncrement(&lg) <= 8) Diag("BED GetModuleHandleW " + n + " -> self-mapped " + Hex((uintptr_t)sm));
+        return sm;
+    }
+    SetLastError(err);
+    return nullptr;
+}
+static HMODULE WINAPI Bed_GetModuleHandleA(LPCSTR name)
+{
+    HMODULE m = GetModuleHandleA(name);
+    if (m || !name) return m;
+    const DWORD err = GetLastError();
+    if (HMODULE sm = GhSelfMapFind(name)){
+        static LONG lg = 0;
+        if (InterlockedIncrement(&lg) <= 8) Diag(std::string("BED GetModuleHandleA ") + name + " -> self-mapped " + Hex((uintptr_t)sm));
+        return sm;
+    }
+    SetLastError(err);
+    return nullptr;
+}
+// FROM_ADDRESS is the form that matters, and the one the real API cannot answer
+// for our ranges. PIN / UNCHANGED_REFCOUNT need no bookkeeping: a self-mapped
+// module is never unloaded.
+static HMODULE GhSelfMapForHandleEx(DWORD flags, const void* name)
+{
+    if (flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) return GhSelfMapFromAddr(name);
+    return nullptr;
+}
+static BOOL WINAPI Bed_GetModuleHandleExW(DWORD flags, LPCWSTR name, HMODULE* out)
+{
+    if (GetModuleHandleExW(flags, name, out)) return TRUE;
+    const DWORD err = GetLastError();
+    HMODULE sm = GhSelfMapForHandleEx(flags, (const void*)name);
+    if (!sm && !(flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) && name)
+        sm = GhSelfMapFind(RegNarrow(name).c_str());
+    if (sm && out){
+        static LONG lg = 0;
+        if (InterlockedIncrement(&lg) <= 8)
+            Diag("BED GetModuleHandleExW flags=" + Hex((uint32_t)flags) + " " + Hex((uintptr_t)name) +
+                 " -> self-mapped " + Hex((uintptr_t)sm));
+        *out = sm; return TRUE;
+    }
+    SetLastError(err);
+    return FALSE;
+}
+static BOOL WINAPI Bed_GetModuleHandleExA(DWORD flags, LPCSTR name, HMODULE* out)
+{
+    if (GetModuleHandleExA(flags, name, out)) return TRUE;
+    const DWORD err = GetLastError();
+    HMODULE sm = GhSelfMapForHandleEx(flags, (const void*)name);
+    if (!sm && !(flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) && name) sm = GhSelfMapFind(name);
+    if (sm && out){
+        static LONG lg = 0;
+        if (InterlockedIncrement(&lg) <= 8)
+            Diag("BED GetModuleHandleExA flags=" + Hex((uint32_t)flags) + " -> self-mapped " + Hex((uintptr_t)sm));
+        *out = sm; return TRUE;
+    }
+    SetLastError(err);
+    return FALSE;
+}
+
 // ...and a FOURTH way: psapi, asking about our own process. Mono's
 // Process.GetCurrentProcess().MainModule is EnumProcessModules + these two, and
 // MelonLoader's managed side takes the game's folder from it (MelonEnvironment:
@@ -36717,13 +37664,17 @@ static SHORT StickToShort(double v)
     return (SHORT)s;
 }
 
-// The gamepad is polled on the UI thread (PollGamepadOnUi, below) into this
-// cached state; the XInput beds are cheap lock-guarded copies. This matters:
-// Windows.Gaming.Input enumeration goes through a broker and, called every frame
-// from the guest's worker thread, stalls badly. The UI thread already spins a
-// 20ms pump loop -- exactly the right place and rate to read input -- and it
-// keeps all WGI activity on one thread (where CoreWindow input lives) while the
-// guest reads a plain struct.
+// The gamepad is polled into this cached state by one dedicated thread
+// (GhPadPollProc, below); the XInput beds are cheap lock-guarded copies. This
+// matters: Windows.Gaming.Input enumeration goes through a broker and, called
+// every frame from the guest's worker thread, stalls badly.
+//
+// It used to be polled on the UI thread, on the argument that the pump already
+// spins at 20ms and CoreWindow input lives there. #290 retracts that: WGI can
+// stall ANY caller, and the UI thread is the one caller whose stall ends the
+// app -- s994 lost Dead as Disco to a 95-second WGI call on the CoreWindow
+// thread. One thread of our own still keeps all WGI activity on one thread and
+// still reads at ~60Hz, and the guest still reads a plain struct.
 static std::mutex        g_padMutex;
 static XINPUT_GAMEPAD    g_padState{};
 static bool              g_padConnected = false;
@@ -36733,6 +37684,9 @@ static bool              g_padConnected = false;
 // synthetic press at its title screen was lost. Once a harness has driven the
 // synthetic pad, slot 0 stays connected with neutral state between pulses.
 static bool              g_synSticky = false;
+// Bumped on every flip of the connected state XInputGetState reports, so a
+// 32-bit guest's RegisterDeviceNotification windows hear about it (gh_x86_wndq.h).
+static std::atomic<uint32_t> g_padEpoch{0};
 static DWORD             g_padPacket = 0;
 static bool              g_wgiDead = false;      // WGI threw once; stop trying
 static bool              g_padLogged = false;
@@ -37235,7 +38189,7 @@ static void GhInstallWgiSwallow()
     } catch (...) {}
 }
 
-static void PollGamepadOnUi()
+static void GhPadPollWgi()
 {
     if (g_wgiDead) return;
     try {
@@ -37296,6 +38250,115 @@ static void PollGamepadOnUi()
         g_wgiDead = true;
         Diag("INPUT WGI unavailable (exception) -- gamepad disabled");
     }
+}
+
+// ---------------------------------------------------------------------------
+// #290. The UI pump must never call WGI.
+// ---------------------------------------------------------------------------
+// s994 printed the sentence #165's watchdog was built for:
+//
+//     UIPUMP PollGamepadOnUi blocked 95375ms, ending at 164750ms
+//     STALL  frames=405 t=164750ms
+//     PLM Suspending at 164765ms
+//
+// Ninety-five seconds inside Windows.Gaming.Input, on the launcher's own
+// CoreWindow thread, ending fifteen milliseconds before the platform suspended
+// the app for not presenting. Dead as Disco's guest was not the one that died:
+// it goes on creating pipelines AFTER `PLM Suspending`, and its WndProc is
+// pumped the whole way. The shell killed us because OUR pump stopped, and the
+// game went down as a passenger. Four cells of guest-side counters were
+// measuring the passenger.
+//
+// The comment above g_padMutex says WGI "stalls badly" when the guest's worker
+// thread calls it every frame, and that the UI thread is "exactly the right
+// place". The first half is right and the second half is exactly backwards: the
+// UI thread is the ONE thread in the process that may not block, because it is
+// the thread the platform watches. Any thread that calls WGI can be stalled by
+// it; only this one takes the whole app down when it is.
+//
+// So nothing on a UI thread calls WGI any more. This runs the real poll on a
+// thread of its own and PollGamepadOnUi -- all eleven call sites of it, nine of
+// them in the launcher's own menu loops -- becomes "make sure that thread is
+// running" and returns. Every reader already took its pad from g_padState under
+// g_padMutex, so no caller changes: the snapshot is simply now written by a
+// thread whose stalling costs nothing but a stale pad.
+//
+// Rollback is gh_pad_ui_poll=1, which polls inline on the caller as before.
+static std::atomic<bool>     g_padPollStarted{false};
+static std::atomic<uint32_t> g_padPollIters{0};
+static std::atomic<uint32_t> g_padPollBlocks{0};
+// 1 while the poll thread is inside WGI. The stall watchdog (#165) can only see
+// a step that RETURNS -- UiStep prints from its destructor, which is why s990 to
+// s993 showed no UIPUMP line at all and I read the silence as a healthy thread.
+// This flag is readable from outside, so a stall can be named while it is still
+// happening instead of only after it ends.
+static volatile LONG         g_padPollInWgi = 0;
+static ULONGLONG             g_padPollEnterMs = 0;
+
+static DWORD WINAPI GhPadPollProc(LPVOID)
+{
+    // CreateThread, so this thread arrives with no apartment: WGI needs one, and
+    // MTA is the right one for a thread that only reads devices (the UCRT would
+    // have done this for a std::thread -- see GhStartGuestWorker -- but being
+    // explicit is cheaper than depending on it).
+    try { winrt::init_apartment(winrt::apartment_type::multi_threaded); } catch (...) {}
+    Diag("PADPOLL thread tid=" + std::to_string((unsigned long)GetCurrentThreadId()));
+    const unsigned ms = GhCfgNum(L"gh_pad_poll_ms.txt", "GH_PAD_POLL_MS", 16);
+    for (;;){
+        const ULONGLONG t0 = GetTickCount64();
+        g_padPollEnterMs = t0;
+        InterlockedExchange(&g_padPollInWgi, 1);
+        GhPadPollWgi();
+        InterlockedExchange(&g_padPollInWgi, 0);
+        const ULONGLONG dt = GetTickCount64() - t0;
+        g_padPollIters.fetch_add(1, std::memory_order_relaxed);
+        if (dt >= 300){
+            const uint32_t k = g_padPollBlocks.fetch_add(1, std::memory_order_relaxed) + 1;
+            // Capped: a device that stalls once usually stalls every poll, and
+            // LocalState is shared with the game's own log (#187).
+            if (k <= 20 || (k % 100) == 0)
+                Diag("PADPOLL #" + std::to_string((unsigned long)k) + " blocked " +
+                     std::to_string((unsigned long long)dt) + "ms, ending at " +
+                     std::to_string(GhUpMs()) + "ms -- the UI thread did not wait");
+        }
+        // #290. Watch the UI pump from off the UI pump. One line per episode,
+        // at 2s and then every 15s, so a step that NEVER returns is still named
+        // -- the case UiStep's destructor can by definition never report.
+        {
+            const LONG64 st = g_uiStepT0;
+            const char*  sn = g_uiStepName;
+            static LONG64 lastT0 = 0; static ULONGLONG lastSay = 0;
+            if (st && sn){
+                const ULONGLONG held = GetTickCount64() - (ULONGLONG)st;
+                if (st != lastT0){ lastT0 = st; lastSay = 0; }
+                if (held >= 2000 && (lastSay == 0 || GetTickCount64() - lastSay >= 15000)){
+                    lastSay = GetTickCount64();
+                    Diag(std::string("UIPUMP IN FLIGHT ") + sn + " held " +
+                         std::to_string((unsigned long long)held) + "ms, now " +
+                         std::to_string(GhUpMs()) + "ms -- the step has NOT returned");
+                }
+            }
+        }
+        if (g_wgiDead){ Diag("PADPOLL stopping -- WGI threw"); return 0; }
+        Sleep(ms);
+    }
+}
+
+static void PollGamepadOnUi()
+{
+    static const unsigned onUi = GhCfgNum(L"gh_pad_ui_poll.txt", "GH_PAD_UI_POLL", 0);
+    if (onUi){ GhPadPollWgi(); return; }    // rollback only
+    if (g_padPollStarted.exchange(true)) return;
+    if (HANDLE h = CreateThread(nullptr, 0, &GhPadPollProc, nullptr, 0, nullptr)){
+        CloseHandle(h);
+        return;
+    }
+    // No thread: a pad that cannot be polled at all is worse than a pad polled
+    // in the wrong place, so say so and fall back to the old behaviour.
+    Diag("PADPOLL CreateThread failed err=" + std::to_string((unsigned long)GetLastError()) +
+         " -- falling back to polling WGI on the caller");
+    g_padPollStarted.store(false);
+    GhPadPollWgi();
 }
 
 // #214. The one measurement that splits Tsushima's input wall. The main menu
@@ -38050,11 +39113,43 @@ static UINT WINAPI Bed_MapVirtualKeyExA(UINT code, UINT mapType, void* /*hkl*/)
 // return 0 there so the game allocates nothing. With pData!=NULL we return 0
 // (zero events read). Raw-input registration fails in the container anyway, so
 // the game falls back to Windows.Gaming.Input for the gamepad.
-static UINT WINAPI Bed_GetRawInputBuffer(void* pData, UINT* pcbSize, UINT /*cbSizeHeader*/)
+static UINT WINAPI Bed_GetRawInputBuffer(void* pData, UINT* pcbSize, UINT cbSizeHeader)
 {
-    RECON_ONCE("GetRawInputBuffer");
-    if (!pData && pcbSize) *pcbSize = 0;
-    return 0;
+    RECON_COUNT("GetRawInputBuffer");
+    // §60: Unity 6 drains raw input through this buffer every frame; answering
+    // "nothing" here meant a click never reached its Input System (Scratch Creek).
+    // Serve the not-yet-delivered packets PushRawMouse/PushRawKeyboard queued, oldest
+    // first, QWORD-aligned as NEXTRAWINPUTBLOCK walks them on x64.
+    if (!pcbSize || cbSizeHeader != sizeof(RAWINPUTHEADER)) return 0;
+    auto sz = [](const RAWINPUT& r) -> UINT {
+        return (UINT)(sizeof(RAWINPUTHEADER) + (r.header.dwType == RIM_TYPEKEYBOARD ? sizeof(RAWKEYBOARD) : sizeof(RAWMOUSE)));
+    };
+    std::lock_guard<std::mutex> lk(g_rawMutex);
+    if (!pData){
+        UINT need = 0;
+        for (auto& kv : g_rawEvents) if (!kv.second.used){ need = sz(kv.second.ri); break; }
+        *pcbSize = need;
+        return 0;
+    }
+    BYTE* out = (BYTE*)pData;
+    const UINT cap = *pcbSize;
+    UINT off = 0, cnt = 0;
+    for (auto& kv : g_rawEvents){
+        if (kv.second.used) continue;
+        const UINT n = sz(kv.second.ri);
+        if (off + n > cap) break;
+        RAWINPUT r = kv.second.ri; r.header.dwSize = n;
+        memcpy(out + off, &r, n);
+        kv.second.used = true; ++cnt; ++g_rawServed;
+        const bool edge = r.header.dwType == RIM_TYPEKEYBOARD || r.data.mouse.usButtonFlags;
+        static int ne = 0;
+        if (edge && ++ne <= 200)
+            Diag(std::string("CLICKDIAG GetRawInputBuffer served ") +
+                 (r.header.dwType == RIM_TYPEKEYBOARD ? ("kbd vk=" + Hex((uint32_t)r.data.keyboard.VKey))
+                                                      : ("mouse flags=" + Hex((uint32_t)r.data.mouse.usButtonFlags))));
+        off = (off + n + 7) & ~7u;
+    }
+    return cnt;   // a buffer too small for one packet answers 0 (never -1: see the 232 GB note above); it waits for the next drain
 }
 // The rest of the raw-input family. These DO resolve against the container's
 // user32, but that user32's implementations error out (raw input isn't wired up
@@ -38113,7 +39208,7 @@ static UINT WINAPI Bed_GetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPVO
     {
         std::lock_guard<std::mutex> lk(g_rawMutex);
         auto it = g_rawEvents.find((uintptr_t)hRawInput);
-        if (it != g_rawEvents.end()){ ri = it->second; found = true; }
+        if (it != g_rawEvents.end() && !it->second.used){ ri = it->second.ri; found = true; }
     }
     if (!found){ if (!pData && pcbSize) *pcbSize = 0; return 0; }
 
@@ -38133,7 +39228,9 @@ static UINT WINAPI Bed_GetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPVO
     if (!pcbSize || *pcbSize < full) return (UINT)-1;
     memcpy(pData, &ri, full);
     { std::lock_guard<std::mutex> lk(g_rawMutex); ++g_rawServed;
-      static int n=0; if(++n<=20) Diag(std::string("CLICKDIAG GetRawInputData served ") +
+      auto it = g_rawEvents.find((uintptr_t)hRawInput); if (it != g_rawEvents.end()) it->second.used = true;
+      const bool edge = ri.header.dwType == RIM_TYPEKEYBOARD || ri.data.mouse.usButtonFlags;
+      static int n=0, ne=0; if(edge ? ++ne<=200 : ++n<=20) Diag(std::string("CLICKDIAG GetRawInputData served ") +
           (ri.header.dwType == RIM_TYPEKEYBOARD
              ? ("kbd vk=" + Hex((uint32_t)ri.data.keyboard.VKey) + " flags=" + Hex((uint32_t)ri.data.keyboard.Flags))
              : ("mouse flags=" + Hex((uint32_t)ri.data.mouse.usButtonFlags)))); }
@@ -38185,6 +39282,28 @@ static UINT WINAPI Bed_GetRawInputDeviceInfoW(HANDLE dev, UINT cmd, void* data, 
     if (!data && sz) *sz = 0;                      // RIDI_PREPARSEDDATA and friends
     return 0;
 }
+// The ANSI twin. Unreal's FWindowsApplication::QueryConnectedMice asks for each
+// listed mouse's RIDI_DEVICENAME through the A function only; a mouse whose name
+// it cannot read is not counted, bIsMouseAttached stays false, and then
+// UGameViewportClient::GetMousePosition fails -- UMG still clicks, but every
+// GetHitResultUnderCursor (FPS Chess's board pieces) hits nothing. Sizes are in
+// chars, which for A are bytes; RIDI_DEVICEINFO is the same struct either way.
+static UINT WINAPI Bed_GetRawInputDeviceInfoA(HANDLE dev, UINT cmd, void* data, UINT* sz){
+    RECON_COUNT("GetRawInputDeviceInfoA");
+    if (cmd != RIDI_DEVICENAME) return Bed_GetRawInputDeviceInfoW(dev, cmd, data, sz);
+    if (!(GhRawInput() & 2)){ if(!data && sz) *sz=0; return 0; }
+    if (dev != g_rawKbdDev && dev != g_rawMouseDev){ if(!data && sz) *sz=0; return 0; }
+    const char* name = (dev == g_rawKbdDev)
+        ? "\\\\?\\GHKBD#VID_0000&PID_0001#1#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}"
+        : "\\\\?\\GHMOU#VID_0000&PID_0002#1#{378de44c-56ef-11d1-bc8c-00a0c91405dd}";
+    const UINT chars = (UINT)strlen(name) + 1;
+    if (!data){ if (sz) *sz = chars; return 0; }
+    if (!sz || *sz < chars){ if (sz) *sz = chars; return 0; }
+    memcpy(data, name, chars);
+    static bool once = false;
+    if (!once){ once = true; Diag("RAWLIST device name served (A)"); }
+    return chars;
+}
 // Honour cursor warps (games recentre the cursor each frame for mouse-look) so a
 // subsequent GetCursorPos reads back what the game set, not a stale forwarded pos.
 static BOOL  WINAPI Bed_SetCursorPos(int x, int y){
@@ -38192,7 +39311,20 @@ static BOOL  WINAPI Bed_SetCursorPos(int x, int y){
     g_kmCurX = x; g_kmCurY = y;
     return TRUE;
 }
-static int   WINAPI Bed_ShowCursor(BOOL){ return 0; }
+// The guest's own cursor visibility (g_guestCursor*, declared above
+// DrawCursorOverlay): the ShowCursor display count and whether its last SetCursor
+// was NULL. Either one hides the crosshair DrawCursorOverlay
+// stamps, as Windows would hide the real cursor. Source in particular sets a NULL
+// cursor for mouse-look and an arrow in its menus; the stamp used to sit on screen
+// through gameplay, pinned to an edge.
+static int   WINAPI Bed_ShowCursor(BOOL show){ return g_guestCursorCount += show ? 1 : -1; }
+static HCURSOR WINAPI Bed_SetCursor(HCURSOR c){
+    const bool was = g_guestCursorNull.exchange(c == nullptr);
+    static HCURSOR last = nullptr;
+    HCURSOR prev = was ? nullptr : last;
+    last = c;
+    return prev;
+}
 static BOOL  WINAPI Bed_ClipCursor(const RECT*){ return TRUE; }
 // Client == screen for the fake HWND. UnityPlayer statically imports these and
 // does GetCursorPos + ScreenToClient to fill Input.mousePosition; the real
@@ -38758,6 +39890,39 @@ static const std::vector<GhTitle>& GhTitles()
     return *t;
 }
 
+// Unreal games with no title config of their own. UE skips any adapter whose
+// vendor is 0x1414 as WARP and exits 0 with no frame, so they get the RV fix:
+// report 0x1002 and run D3D11 on d3d11on12 (-dx11). MECCHA CHAMELEON (UE 5.6)
+// reached its main menu this way. A real config for the exe still wins.
+static const GhTitle& GhUnrealDefault()
+{
+    static const GhTitle* t = []{
+        auto* u = new GhTitle();
+        u->id = "unreal-default"; u->name = "Unreal (built-in)"; u->from = "built-in";
+        u->exe = L"*-Win64-Shipping.exe";
+        u->seed = L"unreal-default";      // no seed folder in the package
+        u->args = L" -dx11";
+        u->knobs.push_back({L"gh_gpu_vendor.txt", 0x1002, false});
+        // UE counts mice from the raw-input device list (QueryConnectedMice); with
+        // none listed it never reports a cursor position to world picking.
+        u->knobs.push_back({L"gh_rawinput.txt", 2, false});
+        return u;
+    }();
+    return *t;
+}
+
+// The title for a guest exe basename: an exact config first, then the built-in
+// Unreal default for <Project>-Win64-Shipping.exe.
+static const GhTitle* GhTitleByExe(const std::wstring& exe)
+{
+    for (const GhTitle& t : GhTitles())
+        if (_wcsicmp(t.exe.c_str(), exe.c_str()) == 0) return &t;
+    static const wchar_t kUe[] = L"-Win64-Shipping.exe";
+    const size_t n = wcslen(kUe);
+    if (exe.size() > n && _wcsicmp(exe.c_str() + exe.size() - n, kUe) == 0) return &GhUnrealDefault();
+    return nullptr;
+}
+
 static bool GhTitleInstalled(const GhTitle& t)
 {
     if (t.installProbe.empty()) return false;
@@ -38767,6 +39932,11 @@ static bool GhTitleInstalled(const GhTitle& t)
 static bool GhTitleKnobDefault(const wchar_t* file, unsigned* out, const char** src)
 {
     const GhTitle* cur = g_title;
+    if (cur && cur == &GhUnrealDefault()){
+        for (const GhTitleKnob& k : cur->knobs)
+            if (_wcsicmp(k.file.c_str(), file) == 0){ *out = k.value; *src = "title"; return true; }
+        return false;
+    }
     for (const GhTitle& t : GhTitles()){
         for (const GhTitleKnob& k : t.knobs){
             if (_wcsicmp(k.file.c_str(), file) != 0) continue;
@@ -38911,9 +40081,7 @@ static const GhTitle* GhTitleForGuest(const std::wstring& guest)
 {
     size_t s = guest.find_last_of(L"\\/");
     const std::wstring exe = (s == std::wstring::npos) ? guest : guest.substr(s + 1);
-    for (const GhTitle& t : GhTitles())
-        if (_wcsicmp(t.exe.c_str(), exe.c_str()) == 0) return &t;
-    return nullptr;
+    return GhTitleByExe(exe);
 }
 
 static bool GhEarlyNeedsRelaunch(const std::wstring& guest, std::string* why)
@@ -38975,9 +40143,7 @@ static void GhTitleBegin(const std::wstring& exePath)
 {
     size_t s = exePath.find_last_of(L"\\/");
     const std::wstring exe = (s == std::wstring::npos) ? exePath : exePath.substr(s + 1);
-    g_title = nullptr;
-    for (const GhTitle& t : GhTitles())
-        if (_wcsicmp(t.exe.c_str(), exe.c_str()) == 0){ g_title = &t; break; }
+    g_title = GhTitleByExe(exe);
     if (!g_title){ Diag("TITLE none for " + RegNarrow(exe) + " -- no per-title defaults"); return; }
     Diag("TITLE " + RegNarrow(exe) + ": " + std::to_string(g_title->knobs.size()) +
          " knob defaults (a LocalState file still wins) id=" + g_title->id + " from " + g_title->from);
@@ -38986,7 +40152,8 @@ static void GhTitleBegin(const std::wstring& exePath)
     ReleaseSRWLockExclusive(&g_titleLk);
     for (const GhTitleKnob& k : g_title->knobs)
         for (const std::wstring& e : early)
-            if (_wcsicmp(e.c_str(), k.file.c_str()) == 0)
+            if (_wcsicmp(e.c_str(), k.file.c_str()) == 0 &&
+                _wcsicmp(e.c_str(), L"gh_rawinput.txt") != 0)   // GhRawInput re-reads until a title is set
                 Diag("TITLE late " + RegNarrow(e) + ": read before the game was chosen, so its title default " +
                      std::to_string(k.value) + " does NOT apply this run");
 
@@ -44298,6 +45465,7 @@ static BOOL WINAPI Bed_VirtualProtect(LPVOID addr, SIZE_T size, DWORD prot, PDWO
 // reading assets straight into its pool is exactly this case. Materialise the
 // buffer up front, and keep a retry as the safety net: if some other API turns
 // out to do the same thing, the log names it instead of corrupting silently.
+static void GhIoFailLog(const char* what, HANDLE h, const void* buf, DWORD n, LPOVERLAPPED ov);
 static BOOL WINAPI Bed_ReadFile(HANDLE h, LPVOID buf, DWORD n, LPDWORD got, LPOVERLAPPED ov)
 {
     GhLazyMaterialise(buf, n);
@@ -44308,6 +45476,44 @@ static BOOL WINAPI Bed_ReadFile(HANDLE h, LPVOID buf, DWORD n, LPDWORD got, LPOV
                   " n=" + Hex((uint64_t)n));
         ok = ReadFile(h, buf, n, got, ov);
     }
+    if (!ok) GhIoFailLog("ReadFile", h, buf, n, ov);
+    return ok;
+}
+
+// s911: UE 4.27's FAsyncBufferedFileReaderWindows::Seek fails only when
+// GetOverlappedResult(h, ov, &n, TRUE) fails with anything but ERROR_HANDLE_EOF;
+// Transience died on "PanicSyncRead failed to seek pak file". Failures only,
+// capped, with the error, offset, buffer and path, so the cause is named.
+static volatile LONG g_ioFailLogs = 0;
+static void GhIoFailLog(const char* what, HANDLE h, const void* buf, DWORD n, LPOVERLAPPED ov)
+{
+    const DWORD e = GetLastError();
+    if (e == ERROR_IO_PENDING || e == ERROR_HANDLE_EOF) { SetLastError(e); return; }
+    if (InterlockedIncrement(&g_ioFailLogs) <= 80){
+        wchar_t p[300] = L"?";
+        if (!GetFinalPathNameByHandleW(h, p, 299, 0)) wcscpy_s(p, L"?");
+        uint64_t off = ov ? ((uint64_t)ov->OffsetHigh << 32 | ov->Offset) : ~0ull;
+        Diag(std::string("IOFAIL ") + what + " err=" + std::to_string(e) +
+             " h=" + Hex((uint64_t)(uintptr_t)h) + " off=" + Hex(off) + " n=" + Hex((uint64_t)n) +
+             " buf=" + Hex((uint64_t)(uintptr_t)buf) + " ovst=" + Hex((uint64_t)(ov ? ov->Internal : 0)) +
+             " path=" + RegNarrow(std::wstring(p)) + " from=" + NameForCodeAddr((uintptr_t)_ReturnAddress()));
+    }
+    SetLastError(e);
+}
+
+static BOOL WINAPI Bed_GetOverlappedResult(HANDLE h, LPOVERLAPPED ov, LPDWORD got, BOOL wait)
+{
+    BOOL ok = GetOverlappedResult(h, ov, got, wait);
+    if (!ok && GetLastError() != ERROR_IO_INCOMPLETE) GhIoFailLog("GetOverlappedResult", h, nullptr, 0, ov);
+    return ok;
+}
+
+static BOOL WINAPI Bed_GetOverlappedResultEx(HANDLE h, LPOVERLAPPED ov, LPDWORD got, DWORD ms, BOOL alertable)
+{
+    BOOL ok = GetOverlappedResultEx(h, ov, got, ms, alertable);
+    if (!ok){ DWORD e = GetLastError();
+        if (e != ERROR_IO_INCOMPLETE && e != WAIT_TIMEOUT && e != WAIT_IO_COMPLETION)
+            GhIoFailLog("GetOverlappedResultEx", h, nullptr, 0, ov); }
     return ok;
 }
 
@@ -44538,6 +45744,419 @@ static HRESULT WINAPI Bed_DStorageGetFactory(REFIID riid, void** ppv)
     return ((GetFac)gp)(riid, ppv);
 }
 
+// The container's ole32 answers the legacy CoInitialize with E_NOTIMPL; only
+// CoInitializeEx works. UE4's CommandLineCommands calls CoInitialize and quits
+// on any failure, so the engine exits 1 before its first window (Transience,
+// s900). CoInitialize is defined as CoInitializeEx(STA).
+static HRESULT WINAPI Bed_CoInitialize(LPVOID reserved)
+{
+    const HRESULT hr = CoInitializeEx(reserved, COINIT_APARTMENTTHREADED);
+    static LONG once = 0;
+    if (!InterlockedExchange(&once, 1)) Diag("BED CoInitialize -> CoInitializeEx(STA) hr=" + Hex((uint32_t)hr));
+    return hr;
+}
+
+// Media Foundation trace (Transience s907). UE4's WmfMedia plays the intro
+// cinematic through an IMFMediaSession and the TV stays black with nothing in the
+// diag: shipping UE4 has no log, and MF reports a failed open or a missing decoder
+// as a session EVENT, not a return code. The creators log their HRESULTs, and the
+// session's and source resolver's vtables are patched (once; every instance shares
+// them) to log each event's type and status. Diag only -- every call forwards.
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+// The attribute keys live in mfuuid.lib, which the loader does not link.
+static const GUID kGhMfMajorType  = {0x48eba18e,0xf8c9,0x4687,{0xbf,0x11,0x0a,0x74,0xc9,0xf9,0x6a,0x8f}};
+static const GUID kGhMfSubtype    = {0xf7e34c9a,0x42e8,0x4714,{0xb7,0x4b,0xcb,0x29,0xd7,0x2c,0x35,0xe5}};
+static const GUID kGhMfTopoStatus = {0x30c5018d,0x9a53,0x454b,{0xad,0x9e,0x6d,0x5f,0x8f,0xa7,0xc4,0x3b}};
+static LONG g_mfLog = 0;
+static bool MfLogOk(){ return InterlockedIncrement(&g_mfLog) <= 400; }
+static FARPROC MfReal(const wchar_t* dll, const char* fn)
+{
+    HMODULE h = GetModuleHandleW(dll);
+    if (!h) h = LoadLibraryW(dll);
+    return h ? GetProcAddress(h, fn) : nullptr;
+}
+static void MfPatchSlot(void** vt, int slot, void* fn, void** orig)
+{
+    if (*orig) return;
+    DWORD old = 0;
+    if (!VirtualProtect(&vt[slot], sizeof(void*), PAGE_READWRITE, &old)) return;
+    *orig = vt[slot];
+    vt[slot] = fn;
+    VirtualProtect(&vt[slot], sizeof(void*), old, &old);
+}
+
+static void* g_mfSessEndGetEvent = nullptr;
+static void* g_mfSessSetTopology = nullptr;
+static void* g_mfSessStart       = nullptr;
+static HRESULT STDMETHODCALLTYPE MfSess_EndGetEvent(IMFMediaSession* s, IMFAsyncResult* r, IMFMediaEvent** ev)
+{
+    using Fn = HRESULT (STDMETHODCALLTYPE*)(IMFMediaSession*, IMFAsyncResult*, IMFMediaEvent**);
+    const HRESULT hr = ((Fn)g_mfSessEndGetEvent)(s, r, ev);
+    if (MfLogOk()){
+        MediaEventType t = 0; HRESULT st = 0; UINT32 topo = 0xFFFFFFFF;
+        if (SUCCEEDED(hr) && ev && *ev){
+            (*ev)->GetType(&t);
+            (*ev)->GetStatus(&st);
+            (*ev)->GetUINT32(kGhMfTopoStatus, &topo);
+        }
+        Diag("MF session event hr=" + Hex((uint32_t)hr) + " type=" + std::to_string(t) +
+             " status=" + Hex((uint32_t)st) + (topo != 0xFFFFFFFF ? " topo=" + std::to_string(topo) : ""));
+    }
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE MfSess_SetTopology(IMFMediaSession* s, DWORD f, IMFTopology* t)
+{
+    using Fn = HRESULT (STDMETHODCALLTYPE*)(IMFMediaSession*, DWORD, IMFTopology*);
+    const HRESULT hr = ((Fn)g_mfSessSetTopology)(s, f, t);
+    if (MfLogOk()) Diag("MF session SetTopology flags=" + Hex((uint32_t)f) + " hr=" + Hex((uint32_t)hr));
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE MfSess_Start(IMFMediaSession* s, const GUID* fmt, const PROPVARIANT* pos)
+{
+    using Fn = HRESULT (STDMETHODCALLTYPE*)(IMFMediaSession*, const GUID*, const PROPVARIANT*);
+    const HRESULT hr = ((Fn)g_mfSessStart)(s, fmt, pos);
+    if (MfLogOk()) Diag("MF session Start hr=" + Hex((uint32_t)hr));
+    return hr;
+}
+
+static void* g_mfResFromUrl = nullptr;
+static void* g_mfResFromStream = nullptr;
+static HRESULT STDMETHODCALLTYPE MfRes_CreateObjectFromURL(IMFSourceResolver* r, LPCWSTR url, DWORD f,
+    IPropertyStore* p, MF_OBJECT_TYPE* ot, IUnknown** obj)
+{
+    using Fn = HRESULT (STDMETHODCALLTYPE*)(IMFSourceResolver*, LPCWSTR, DWORD, IPropertyStore*, MF_OBJECT_TYPE*, IUnknown**);
+    const HRESULT hr = ((Fn)g_mfResFromUrl)(r, url, f, p, ot, obj);
+    if (MfLogOk()) Diag("MF resolver FromURL " + (url ? RegNarrow(url) : std::string("(null)")) +
+                        " flags=" + Hex((uint32_t)f) + " hr=" + Hex((uint32_t)hr) +
+                        " type=" + std::to_string(ot ? (int)*ot : -1));
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE MfRes_CreateObjectFromByteStream(IMFSourceResolver* r, IMFByteStream* bs,
+    LPCWSTR url, DWORD f, IPropertyStore* p, MF_OBJECT_TYPE* ot, IUnknown** obj)
+{
+    using Fn = HRESULT (STDMETHODCALLTYPE*)(IMFSourceResolver*, IMFByteStream*, LPCWSTR, DWORD, IPropertyStore*, MF_OBJECT_TYPE*, IUnknown**);
+    const HRESULT hr = ((Fn)g_mfResFromStream)(r, bs, url, f, p, ot, obj);
+    if (MfLogOk()) Diag("MF resolver FromByteStream " + (url ? RegNarrow(url) : std::string("(null)")) +
+                        " flags=" + Hex((uint32_t)f) + " hr=" + Hex((uint32_t)hr) +
+                        " type=" + std::to_string(ot ? (int)*ot : -1));
+    return hr;
+}
+
+static HRESULT WINAPI Bed_MFStartup(ULONG ver, DWORD flags)
+{
+    using Fn = HRESULT (WINAPI*)(ULONG, DWORD);
+    auto f = (Fn)MfReal(L"mfplat.dll", "MFStartup");
+    const HRESULT hr = f ? f(ver, flags) : E_NOTIMPL;
+    if (MfLogOk()) Diag("MF MFStartup ver=" + Hex((uint32_t)ver) + " flags=" + Hex((uint32_t)flags) + " hr=" + Hex((uint32_t)hr));
+    return hr;
+}
+static HRESULT WINAPI Bed_MFCreateSourceResolver(IMFSourceResolver** out)
+{
+    using Fn = HRESULT (WINAPI*)(IMFSourceResolver**);
+    auto f = (Fn)MfReal(L"mfplat.dll", "MFCreateSourceResolver");
+    const HRESULT hr = f ? f(out) : E_NOTIMPL;
+    if (SUCCEEDED(hr) && out && *out){
+        void** vt = *(void***)*out;
+        MfPatchSlot(vt, 3, (void*)&MfRes_CreateObjectFromURL, &g_mfResFromUrl);
+        MfPatchSlot(vt, 4, (void*)&MfRes_CreateObjectFromByteStream, &g_mfResFromStream);
+    }
+    if (MfLogOk()) Diag("MF MFCreateSourceResolver hr=" + Hex((uint32_t)hr));
+    return hr;
+}
+static HRESULT WINAPI Bed_MFCreateMediaSession(IMFAttributes* cfg, IMFMediaSession** out)
+{
+    using Fn = HRESULT (WINAPI*)(IMFAttributes*, IMFMediaSession**);
+    auto f = (Fn)MfReal(L"mf.dll", "MFCreateMediaSession");
+    const HRESULT hr = f ? f(cfg, out) : E_NOTIMPL;
+    if (SUCCEEDED(hr) && out && *out){
+        void** vt = *(void***)*out;
+        MfPatchSlot(vt, 5, (void*)&MfSess_EndGetEvent, &g_mfSessEndGetEvent);
+        MfPatchSlot(vt, 7, (void*)&MfSess_SetTopology, &g_mfSessSetTopology);
+        MfPatchSlot(vt, 9, (void*)&MfSess_Start, &g_mfSessStart);
+    }
+    if (MfLogOk()) Diag("MF MFCreateMediaSession hr=" + Hex((uint32_t)hr));
+    return hr;
+}
+static HRESULT WINAPI Bed_MFCreateDXGIDeviceManager(UINT* token, IMFDXGIDeviceManager** out)
+{
+    using Fn = HRESULT (WINAPI*)(UINT*, IMFDXGIDeviceManager**);
+    auto f = (Fn)MfReal(L"mfplat.dll", "MFCreateDXGIDeviceManager");
+    const HRESULT hr = f ? f(token, out) : E_NOTIMPL;
+    if (MfLogOk()) Diag("MF MFCreateDXGIDeviceManager hr=" + Hex((uint32_t)hr));
+    return hr;
+}
+static HRESULT WINAPI Bed_MFCreateSampleGrabberSinkActivate(IMFMediaType* mt, IMFSampleGrabberSinkCallback* cb, IMFActivate** out)
+{
+    using Fn = HRESULT (WINAPI*)(IMFMediaType*, IMFSampleGrabberSinkCallback*, IMFActivate**);
+    auto f = (Fn)MfReal(L"mf.dll", "MFCreateSampleGrabberSinkActivate");
+    const HRESULT hr = f ? f(mt, cb, out) : E_NOTIMPL;
+    GUID major = GUID_NULL, sub = GUID_NULL;
+    if (mt){ mt->GetGUID(kGhMfMajorType, &major); mt->GetGUID(kGhMfSubtype, &sub); }
+    if (MfLogOk()) Diag("MF MFCreateSampleGrabberSinkActivate major=" + Hex((uint32_t)major.Data1) +
+                        " sub=" + Hex((uint32_t)sub.Data1) + " hr=" + Hex((uint32_t)hr));
+    return hr;
+}
+
+// Source-reader trace (Catch Me!, 2026-11-04). Unity's WindowsVideoMedia uses
+// mfreadwrite's IMFSourceReader, not a media session, and its 4K H.264 intro failed
+// SetCurrentMediaType with MF_E_INVALIDMEDIATYPE 2800 times on the Xbox One.
+// Log what the reader was created with and every failing SetCurrentMediaType
+// (requested type + the stream's native types). gh_mf_probe.txt=1 also tries
+// NV12/YUY2/I420/RGB32 outputs on the first failure -- whether ANY decoder takes
+// the stream -- and may leave the reader on one of them (diag cells only).
+static const GUID kGhMfFrameSize = {0x1652c33d,0xd6b2,0x4012,{0xb8,0x34,0x72,0x03,0x08,0x49,0xa3,0x7d}};
+static const GUID kGhMfRdrD3dMgr = {0xec822da2,0xe1e9,0x4b29,{0xa0,0xd8,0x56,0x3c,0x71,0x9f,0x52,0x69}};
+static const GUID kGhMfRdrAdvVp  = {0x0f81da2c,0xb537,0x4672,{0xa8,0xb2,0xa6,0x81,0xb1,0x73,0x07,0xa3}};
+static const GUID kGhMfRdrVp     = {0xfb394f3d,0xccf1,0x42ee,{0xbb,0xb3,0xf9,0xb8,0x45,0xd5,0x68,0x1d}};
+static const GUID kGhMfRwHwMft   = {0xa634a91c,0x822b,0x41b9,{0xa4,0x94,0x4d,0xe4,0x64,0x36,0x12,0xb0}};
+static std::string MfTypeStr(IMFMediaType* t)
+{
+    if (!t) return "(null)";
+    GUID major = GUID_NULL, sub = GUID_NULL; UINT64 fs = 0;
+    t->GetGUID(kGhMfMajorType, &major); t->GetGUID(kGhMfSubtype, &sub); t->GetUINT64(kGhMfFrameSize, &fs);
+    return "major=" + Hex((uint32_t)major.Data1) + " sub=" + Hex((uint32_t)sub.Data1) +
+           " size=" + std::to_string((uint32_t)(fs >> 32)) + "x" + std::to_string((uint32_t)fs);
+}
+static void* g_mfRdrSetCur = nullptr;
+// Undecodable video = a clip that ends at once (gh_mf_skip.txt, default 1; 2 = off).
+// The Xbox One has no decoder for 4K H.264 (s961: NV12/YUY2/I420/RGB32 all
+// MF_E_INVALIDMEDIATYPE on Catch Me!'s 3840x2160 intro), and Unity's VideoPlayer
+// answers that by recreating the reader forever, so the game never leaves its intro
+// scene. Instead: accept the type, keep the stream deselected in the REAL reader
+// (so it never buffers compressed samples), report the requested type back, and
+// answer every ReadSample on it with MF_SOURCE_READERF_ENDOFSTREAM -- through the
+// async callback when the reader has one (Unity's does). Audio plays as normal.
+static const GUID kGhMfRdrAsyncCb = {0x1e3dbeac,0xbb43,0x4c35,{0xb5,0x07,0xcd,0x64,0x44,0x64,0xc9,0x65}};
+static const GUID kGhMfFrameRate  = {0xc459a2e8,0x3d2c,0x4e44,{0xb1,0x32,0xfe,0xe5,0x15,0x6c,0x7b,0xb0}};
+static const GUID kGhMfVideo      = {0x73646976,0x0000,0x0010,{0x80,0x00,0x00,0xAA,0x00,0x38,0x9B,0x71}};
+struct MfSkipEnt { IMFSourceReader* r; DWORD stream; IMFMediaType* type; };
+static SRWLOCK g_mfSkipLk = SRWLOCK_INIT;
+static std::vector<MfSkipEnt>* g_mfSkip = nullptr;
+static std::vector<std::pair<IMFSourceReader*, IMFSourceReaderCallback*>>* g_mfRdrCb = nullptr;
+static void* g_mfRdrGetSel = nullptr; static void* g_mfRdrSetSel = nullptr;
+static void* g_mfRdrGetCur = nullptr; static void* g_mfRdrRead   = nullptr;
+static bool MfSkipOn(){ static const unsigned v = GhCfgNumZ(L"gh_mf_skip.txt", "GH_MF_SKIP", 1); return v == 1; }
+// MF_SOURCE_READER_FIRST_VIDEO_STREAM -> the real index (other specials unchanged).
+static DWORD MfRealStream(IMFSourceReader* r, DWORD s)
+{
+    if (s != 0xFFFFFFFC) return s;
+    for (DWORD i = 0; i < 16; ++i){
+        IMFMediaType* nt = nullptr;
+        if (FAILED(r->GetNativeMediaType(i, 0, &nt))) break;
+        GUID major = GUID_NULL; nt->GetGUID(kGhMfMajorType, &major); nt->Release();
+        if (major == kGhMfVideo) return i;
+    }
+    return s;
+}
+static IMFMediaType* MfSkipType(IMFSourceReader* r, DWORD s)   // AddRef'd, or null
+{
+    IMFMediaType* t = nullptr;
+    AcquireSRWLockShared(&g_mfSkipLk);
+    if (g_mfSkip) for (auto& e : *g_mfSkip) if (e.r == r && e.stream == s){ t = e.type; t->AddRef(); break; }
+    ReleaseSRWLockShared(&g_mfSkipLk);
+    return t;
+}
+static bool MfSkipFirst(IMFSourceReader* r, DWORD* s)
+{
+    bool f = false;
+    AcquireSRWLockShared(&g_mfSkipLk);
+    if (g_mfSkip) for (auto& e : *g_mfSkip) if (e.r == r){ *s = e.stream; f = true; break; }
+    ReleaseSRWLockShared(&g_mfSkipLk);
+    return f;
+}
+static IMFSourceReaderCallback* MfRdrCallback(IMFSourceReader* r)
+{
+    IMFSourceReaderCallback* cb = nullptr;
+    AcquireSRWLockShared(&g_mfSkipLk);
+    if (g_mfRdrCb) for (auto& e : *g_mfRdrCb) if (e.first == r){ cb = e.second; break; }
+    ReleaseSRWLockShared(&g_mfSkipLk);
+    return cb;
+}
+static void MfRdrForget(IMFSourceReader* r)   // a new reader at a freed one's address
+{
+    AcquireSRWLockExclusive(&g_mfSkipLk);
+    if (g_mfSkip) for (size_t i = 0; i < g_mfSkip->size();)
+        if ((*g_mfSkip)[i].r == r){ (*g_mfSkip)[i].type->Release(); g_mfSkip->erase(g_mfSkip->begin() + i); } else ++i;
+    if (g_mfRdrCb) for (size_t i = 0; i < g_mfRdrCb->size();)
+        if ((*g_mfRdrCb)[i].first == r) g_mfRdrCb->erase(g_mfRdrCb->begin() + i); else ++i;
+    ReleaseSRWLockExclusive(&g_mfSkipLk);
+}
+static bool MfSkipVideo(IMFSourceReader* r, DWORD stream, IMFMediaType* t)
+{
+    GUID major = GUID_NULL;
+    if (!t || FAILED(t->GetGUID(kGhMfMajorType, &major)) || major != kGhMfVideo) return false;
+    const DWORD s = MfRealStream(r, stream);
+    if (s >= 0xFFFFFFF0) return false;
+    using MkFn = HRESULT (WINAPI*)(IMFMediaType**);
+    auto mk = (MkFn)MfReal(L"mfplat.dll", "MFCreateMediaType");
+    IMFMediaType* c = nullptr;
+    if (!mk || FAILED(mk(&c)) || !c) return false;
+    t->CopyAllItems(c);
+    IMFMediaType* nt = nullptr;
+    if (SUCCEEDED(r->GetNativeMediaType(s, 0, &nt)) && nt){
+        UINT64 v = 0;
+        if (FAILED(c->GetUINT64(kGhMfFrameSize, &v)) && SUCCEEDED(nt->GetUINT64(kGhMfFrameSize, &v))) c->SetUINT64(kGhMfFrameSize, v);
+        if (FAILED(c->GetUINT64(kGhMfFrameRate, &v)) && SUCCEEDED(nt->GetUINT64(kGhMfFrameRate, &v))) c->SetUINT64(kGhMfFrameRate, v);
+        nt->Release();
+    }
+    using SelFn = HRESULT (STDMETHODCALLTYPE*)(IMFSourceReader*, DWORD, BOOL);
+    if (g_mfRdrSetSel) ((SelFn)g_mfRdrSetSel)(r, s, FALSE);
+    AcquireSRWLockExclusive(&g_mfSkipLk);
+    if (!g_mfSkip) g_mfSkip = new std::vector<MfSkipEnt>();
+    g_mfSkip->push_back({r, s, c});
+    ReleaseSRWLockExclusive(&g_mfSkipLk);
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) <= 4) Diag("MF skip undecodable video stream=" + std::to_string(s) + " " + MfTypeStr(c) +
+                                            " -> ends at once (gh_mf_skip.txt=2 turns this off)");
+    return true;
+}
+static HRESULT STDMETHODCALLTYPE MfRdr_GetStreamSelection(IMFSourceReader* r, DWORD stream, BOOL* sel)
+{
+    using Fn = HRESULT (STDMETHODCALLTYPE*)(IMFSourceReader*, DWORD, BOOL*);
+    if (sel) if (IMFMediaType* t = MfSkipType(r, MfRealStream(r, stream))){ t->Release(); *sel = TRUE; return S_OK; }
+    return ((Fn)g_mfRdrGetSel)(r, stream, sel);
+}
+static HRESULT STDMETHODCALLTYPE MfRdr_SetStreamSelection(IMFSourceReader* r, DWORD stream, BOOL sel)
+{
+    using Fn = HRESULT (STDMETHODCALLTYPE*)(IMFSourceReader*, DWORD, BOOL);
+    const HRESULT hr = ((Fn)g_mfRdrSetSel)(r, stream, sel);
+    DWORD s = 0;
+    if (sel && MfSkipFirst(r, &s) && (stream == 0xFFFFFFFE || MfRealStream(r, stream) == s))
+        ((Fn)g_mfRdrSetSel)(r, s, FALSE);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE MfRdr_GetCurrentMediaType(IMFSourceReader* r, DWORD stream, IMFMediaType** out)
+{
+    using Fn = HRESULT (STDMETHODCALLTYPE*)(IMFSourceReader*, DWORD, IMFMediaType**);
+    if (out) if (IMFMediaType* t = MfSkipType(r, MfRealStream(r, stream))){ *out = t; return S_OK; }
+    return ((Fn)g_mfRdrGetCur)(r, stream, out);
+}
+struct MfEosJob { IMFSourceReaderCallback* cb; DWORD stream; };
+static DWORD WINAPI MfEosThread(void* p)
+{
+    auto* j = (MfEosJob*)p;
+    Sleep(10);   // never re-enter the caller's ReadSample; a looping clip cannot spin
+    j->cb->OnReadSample(S_OK, j->stream, MF_SOURCE_READERF_ENDOFSTREAM, 0, nullptr);
+    j->cb->Release();
+    delete j;
+    return 0;
+}
+static HRESULT STDMETHODCALLTYPE MfRdr_ReadSample(IMFSourceReader* r, DWORD stream, DWORD flags,
+    DWORD* actual, DWORD* sflags, LONGLONG* ts, IMFSample** sample)
+{
+    using Fn = HRESULT (STDMETHODCALLTYPE*)(IMFSourceReader*, DWORD, DWORD, DWORD*, DWORD*, LONGLONG*, IMFSample**);
+    const DWORD s = MfRealStream(r, stream);
+    if (IMFMediaType* t = MfSkipType(r, s)){
+        t->Release();
+        static LONG n = 0;
+        if (InterlockedIncrement(&n) <= 4) Diag("MF skip ReadSample stream=" + std::to_string(s) + " -> ENDOFSTREAM");
+        if (IMFSourceReaderCallback* cb = MfRdrCallback(r)){
+            cb->AddRef();
+            HANDLE th = CreateThread(nullptr, 0, &MfEosThread, new MfEosJob{cb, s}, 0, nullptr);
+            if (th) CloseHandle(th);
+            return S_OK;
+        }
+        if (actual) *actual = s;
+        if (sflags) *sflags = MF_SOURCE_READERF_ENDOFSTREAM;
+        if (ts) *ts = 0;
+        if (sample) *sample = nullptr;
+        return S_OK;
+    }
+    return ((Fn)g_mfRdrRead)(r, stream, flags, actual, sflags, ts, sample);
+}
+static HRESULT STDMETHODCALLTYPE MfRdr_SetCurrentMediaType(IMFSourceReader* r, DWORD stream, DWORD* res, IMFMediaType* t)
+{
+    using Fn = HRESULT (STDMETHODCALLTYPE*)(IMFSourceReader*, DWORD, DWORD*, IMFMediaType*);
+    const HRESULT hr = ((Fn)g_mfRdrSetCur)(r, stream, res, t);
+    static LONG nOk = 0, nBad = 0;
+    if (SUCCEEDED(hr)){
+        if (InterlockedIncrement(&nOk) <= 8) Diag("MF reader SetCurrentMediaType stream=" + Hex((uint32_t)stream) + " " + MfTypeStr(t) + " hr=0x0");
+        return hr;
+    }
+    const LONG n = InterlockedIncrement(&nBad);
+    if (n <= 6) Diag("MF reader SetCurrentMediaType stream=" + Hex((uint32_t)stream) + " " + MfTypeStr(t) + " hr=" + Hex((uint32_t)hr));
+    if (n == 1){
+        for (DWORD i = 0; i < 4; ++i){
+            IMFMediaType* nt = nullptr;
+            const HRESULT h2 = r->GetNativeMediaType(stream, i, &nt);
+            if (FAILED(h2)) break;
+            Diag("MF reader native[" + std::to_string(i) + "] " + MfTypeStr(nt));
+            nt->Release();
+        }
+        if (GhCfgNumZ(L"gh_mf_probe.txt", "GH_MF_PROBE", 0) == 1){
+            using MkFn = HRESULT (WINAPI*)(IMFMediaType**);
+            auto mk = (MkFn)MfReal(L"mfplat.dll", "MFCreateMediaType");
+            static const uint32_t subs[] = {0x3231564E /*NV12*/, 0x32595559 /*YUY2*/, 0x30323449 /*I420*/, 0x16 /*RGB32*/};
+            for (uint32_t sd : subs){
+                IMFMediaType* p = nullptr;
+                if (!mk || FAILED(mk(&p)) || !p) break;
+                t->CopyAllItems(p);
+                GUID g = {sd, 0x0000, 0x0010, {0x80,0x00,0x00,0xAA,0x00,0x38,0x9B,0x71}};
+                p->SetGUID(kGhMfSubtype, g);
+                const HRESULT h3 = ((Fn)g_mfRdrSetCur)(r, stream, nullptr, p);
+                Diag("MF probe output sub=" + Hex(sd) + " hr=" + Hex((uint32_t)h3));
+                p->Release();
+            }
+        }
+    }
+    if (hr == (HRESULT)0xC00D36B4 && MfSkipOn() && MfSkipVideo(r, stream, t)) return S_OK;
+    return hr;
+}
+static void MfRdrHook(IMFAttributes* a, IMFSourceReader** out, HRESULT hr, const char* how)
+{
+    if (SUCCEEDED(hr) && out && *out){
+        void** vt = *(void***)*out;
+        MfPatchSlot(vt, 7, (void*)&MfRdr_SetCurrentMediaType, &g_mfRdrSetCur);
+        if (MfSkipOn()){
+            MfPatchSlot(vt, 3, (void*)&MfRdr_GetStreamSelection, &g_mfRdrGetSel);
+            MfPatchSlot(vt, 4, (void*)&MfRdr_SetStreamSelection, &g_mfRdrSetSel);
+            MfPatchSlot(vt, 6, (void*)&MfRdr_GetCurrentMediaType, &g_mfRdrGetCur);
+            MfPatchSlot(vt, 9, (void*)&MfRdr_ReadSample, &g_mfRdrRead);
+        }
+        MfRdrForget(*out);
+        IMFSourceReaderCallback* cb = nullptr;
+        if (a && SUCCEEDED(a->GetUnknown(kGhMfRdrAsyncCb, IID_PPV_ARGS(&cb))) && cb){
+            cb->Release();   // the reader holds it for as long as the reader lives
+            AcquireSRWLockExclusive(&g_mfSkipLk);
+            if (!g_mfRdrCb) g_mfRdrCb = new std::vector<std::pair<IMFSourceReader*, IMFSourceReaderCallback*>>();
+            g_mfRdrCb->push_back({*out, cb});
+            ReleaseSRWLockExclusive(&g_mfSkipLk);
+        }
+    }
+    if (!MfLogOk()) return;
+    UINT32 adv = 0xFFFFFFFF, vp = 0xFFFFFFFF, hw = 0xFFFFFFFF; IUnknown* mgr = nullptr;
+    if (a){ a->GetUINT32(kGhMfRdrAdvVp, &adv); a->GetUINT32(kGhMfRdrVp, &vp); a->GetUINT32(kGhMfRwHwMft, &hw);
+            if (SUCCEEDED(a->GetUnknown(kGhMfRdrD3dMgr, IID_PPV_ARGS(&mgr))) && mgr) mgr->Release(); }
+    Diag(std::string("MF reader ") + how + " hr=" + Hex((uint32_t)hr) + " d3dmgr=" + (mgr ? "1" : "0") +
+         " advVP=" + Hex(adv) + " VP=" + Hex(vp) + " hwMFT=" + Hex(hw));
+}
+static HRESULT WINAPI Bed_MFCreateSourceReaderFromMediaSource(IMFMediaSource* src, IMFAttributes* a, IMFSourceReader** out)
+{
+    using Fn = HRESULT (WINAPI*)(IMFMediaSource*, IMFAttributes*, IMFSourceReader**);
+    auto f = (Fn)MfReal(L"mfreadwrite.dll", "MFCreateSourceReaderFromMediaSource");
+    const HRESULT hr = f ? f(src, a, out) : E_NOTIMPL;
+    MfRdrHook(a, out, hr, "FromMediaSource");
+    return hr;
+}
+static HRESULT WINAPI Bed_MFCreateSourceReaderFromByteStream(IMFByteStream* bs, IMFAttributes* a, IMFSourceReader** out)
+{
+    using Fn = HRESULT (WINAPI*)(IMFByteStream*, IMFAttributes*, IMFSourceReader**);
+    auto f = (Fn)MfReal(L"mfreadwrite.dll", "MFCreateSourceReaderFromByteStream");
+    const HRESULT hr = f ? f(bs, a, out) : E_NOTIMPL;
+    MfRdrHook(a, out, hr, "FromByteStream");
+    return hr;
+}
+static HRESULT WINAPI Bed_MFCreateSourceReaderFromURL(LPCWSTR url, IMFAttributes* a, IMFSourceReader** out)
+{
+    using Fn = HRESULT (WINAPI*)(LPCWSTR, IMFAttributes*, IMFSourceReader**);
+    auto f = (Fn)MfReal(L"mfreadwrite.dll", "MFCreateSourceReaderFromURL");
+    const HRESULT hr = f ? f(url, a, out) : E_NOTIMPL;
+    MfRdrHook(a, out, hr, "FromURL");
+    return hr;
+}
+
 // #236 LG1: defined after CrashObserverVeh; keeps our pager ahead of guest VEHs.
 static PVOID WINAPI Bed_AddVectoredExceptionHandler(ULONG first, PVECTORED_EXCEPTION_HANDLER h);
 static BOOL WINAPI Bed_RemoveVectoredExceptionHandler(PVOID reg);
@@ -44545,6 +46164,15 @@ static const std::unordered_map<std::string, void*>& ShimTable()
 {
     static const std::unordered_map<std::string, void*> t = {
         {"GetCommandLineW",            (void*)&Bed_GetCommandLineW},
+        {"CoInitialize",               (void*)&Bed_CoInitialize},
+        {"MFStartup",                  (void*)&Bed_MFStartup},
+        {"MFCreateSourceResolver",     (void*)&Bed_MFCreateSourceResolver},
+        {"MFCreateMediaSession",       (void*)&Bed_MFCreateMediaSession},
+        {"MFCreateDXGIDeviceManager",  (void*)&Bed_MFCreateDXGIDeviceManager},
+        {"MFCreateSampleGrabberSinkActivate", (void*)&Bed_MFCreateSampleGrabberSinkActivate},
+        {"MFCreateSourceReaderFromMediaSource", (void*)&Bed_MFCreateSourceReaderFromMediaSource},
+        {"MFCreateSourceReaderFromByteStream",  (void*)&Bed_MFCreateSourceReaderFromByteStream},
+        {"MFCreateSourceReaderFromURL",         (void*)&Bed_MFCreateSourceReaderFromURL},
         {"AddVectoredExceptionHandler", (void*)&Bed_AddVectoredExceptionHandler},
         {"RemoveVectoredExceptionHandler", (void*)&Bed_RemoveVectoredExceptionHandler},
         {"GetCommandLineA",            (void*)&Bed_GetCommandLineA},
@@ -44664,6 +46292,10 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"SetWindowRgn",       (void*)&Bed_SetWindowRgn},
         {"GetModuleFileNameW", (void*)&Bed_GetModuleFileNameW},
         {"GetModuleFileNameA", (void*)&Bed_GetModuleFileNameA},
+        {"GetModuleHandleW",   (void*)&Bed_GetModuleHandleW},
+        {"GetModuleHandleA",   (void*)&Bed_GetModuleHandleA},
+        {"GetModuleHandleExW", (void*)&Bed_GetModuleHandleExW},
+        {"GetModuleHandleExA", (void*)&Bed_GetModuleHandleExA},
         {"GetModuleFileNameExW", (void*)&Bed_GetModuleFileNameExW}, {"K32GetModuleFileNameExW", (void*)&Bed_GetModuleFileNameExW},
         {"GetModuleBaseNameW", (void*)&Bed_GetModuleBaseNameW}, {"K32GetModuleBaseNameW", (void*)&Bed_GetModuleBaseNameW},
         {"GetModuleFileNameExA", (void*)&Bed_GetModuleFileNameExA}, {"K32GetModuleFileNameExA", (void*)&Bed_GetModuleFileNameExA},
@@ -44682,6 +46314,8 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"VirtualProtect",     (void*)&Bed_VirtualProtect},
         {"ReadFile",           (void*)&Bed_ReadFile},
         {"ReadFileEx",         (void*)&Bed_ReadFileEx},
+        {"GetOverlappedResult",   (void*)&Bed_GetOverlappedResult},
+        {"GetOverlappedResultEx", (void*)&Bed_GetOverlappedResultEx},
         {"HeapCreate",         (void*)&Bed_HeapCreate},
         {"GlobalMemoryStatusEx", (void*)&Bed_GlobalMemoryStatusEx},
         {"GlobalMemoryStatus",   (void*)&Bed_GlobalMemoryStatus},
@@ -44734,6 +46368,7 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"GetRawInputDeviceList",   (void*)&Bed_GetRawInputDeviceList},
         {"GetRawInputData",         (void*)&Bed_GetRawInputData},
         {"GetRawInputDeviceInfoW",  (void*)&Bed_GetRawInputDeviceInfoW},
+        {"GetRawInputDeviceInfoA",  (void*)&Bed_GetRawInputDeviceInfoA},
 #ifdef GH_LAUNCHER
         {"waveInGetNumDevs",       (void*)&Bed_waveInGetNumDevs},
         {"waveInGetDevCapsA",      (void*)&Bed_waveInGetDevCapsA},
@@ -44785,8 +46420,10 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"GetKeyState",        (void*)&Bed_GetKeyState},
         {"GetKeyboardState",   (void*)&Bed_GetKeyboardState},
         {"GetCursorPos",       (void*)&Bed_GetCursorPos},
+        {"GetPointerType",     (void*)&Bed_GetPointerType},   // §60: UnityPlayer resolves it by GetProcAddress
         {"SetCursorPos",       (void*)&Bed_SetCursorPos},
         {"ShowCursor",         (void*)&Bed_ShowCursor},
+        {"SetCursor",          (void*)&Bed_SetCursor},
         {"ClipCursor",         (void*)&Bed_ClipCursor},
         {"GetFileType",        (void*)&Hook_GetFileType},
         {"LoadLibraryA",               (void*)&Bed_LoadLibraryA},
@@ -44854,6 +46491,8 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"SHGetKnownFolderPath",       (void*)&Bed_SHGetKnownFolderPath},
         {"SHGetFolderPathW",           (void*)&Bed_SHGetFolderPathW},
         {"SHCreateDirectoryExW",       (void*)&Bed_SHCreateDirectoryExW},
+        {"ShellExecuteW",              (void*)&Bed_ShellExecuteW},        // #279
+        {"ShellExecuteExW",            (void*)&Bed_ShellExecuteExW},
         // Registry + security
         {"RegOpenKeyExW",              (void*)&Bed_RegOpenKeyExW},
         {"RegOpenKeyExA",              (void*)&Bed_RegOpenKeyExA},
@@ -44953,6 +46592,8 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"SHGetKnownFolderPath", (void*)&Bed_SHGetKnownFolderPath},      // [DIAG] log persistent-data path build
         {"SHGetFolderPathW", (void*)&Bed_SHGetFolderPathW},              // the CSIDL fallback for the same folders
         {"SHCreateDirectoryExW", (void*)&Bed_SHCreateDirectoryExW},      // shell32's recursive mkdir
+        {"ShellExecuteW", (void*)&Bed_ShellExecuteW},                    // #279: log it, never run it
+        {"ShellExecuteExW", (void*)&Bed_ShellExecuteExW},
         {"DeleteFileW", (void*)&Bed_DeleteFileW}, {"MoveFileW", (void*)&Bed_MoveFileW},
         {"MoveFileExW", (void*)&Bed_MoveFileExW}, {"ReplaceFileW", (void*)&Bed_ReplaceFileW},
         {"CreateDirectoryW", (void*)&Bed_CreateDirectoryW}, {"RemoveDirectoryW", (void*)&Bed_RemoveDirectoryW},
@@ -44990,6 +46631,10 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         // gets the host's path and can't locate its assets.
         {"GetModuleFileNameW", (void*)&Bed_GetModuleFileNameW},
         {"GetModuleFileNameA", (void*)&Bed_GetModuleFileNameA},
+        {"GetModuleHandleW",   (void*)&Bed_GetModuleHandleW},
+        {"GetModuleHandleA",   (void*)&Bed_GetModuleHandleA},
+        {"GetModuleHandleExW", (void*)&Bed_GetModuleHandleExW},
+        {"GetModuleHandleExA", (void*)&Bed_GetModuleHandleExA},
         {"GetModuleFileNameExW", (void*)&Bed_GetModuleFileNameExW}, {"K32GetModuleFileNameExW", (void*)&Bed_GetModuleFileNameExW},
         {"GetModuleBaseNameW", (void*)&Bed_GetModuleBaseNameW}, {"K32GetModuleBaseNameW", (void*)&Bed_GetModuleBaseNameW},
         {"GetModuleFileNameExA", (void*)&Bed_GetModuleFileNameExA}, {"K32GetModuleFileNameExA", (void*)&Bed_GetModuleFileNameExA},
@@ -45093,6 +46738,8 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"VirtualProtect",     (void*)&Bed_VirtualProtect},
         {"ReadFile",           (void*)&Bed_ReadFile},
         {"ReadFileEx",         (void*)&Bed_ReadFileEx},
+        {"GetOverlappedResult",   (void*)&Bed_GetOverlappedResult},
+        {"GetOverlappedResultEx", (void*)&Bed_GetOverlappedResultEx},
         {"HeapCreate",         (void*)&Bed_HeapCreate},
         {"GlobalMemoryStatusEx", (void*)&Bed_GlobalMemoryStatusEx},
         {"GlobalMemoryStatus",   (void*)&Bed_GlobalMemoryStatus},
@@ -45165,6 +46812,7 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"GetRawInputDeviceList",    (void*)&Bed_GetRawInputDeviceList},
         {"GetRawInputData",          (void*)&Bed_GetRawInputData},
         {"GetRawInputDeviceInfoW",   (void*)&Bed_GetRawInputDeviceInfoW},
+        {"GetRawInputDeviceInfoA",   (void*)&Bed_GetRawInputDeviceInfoA},
         // Display surrogate: one primary g_winW x g_winH monitor, one mode.
         // Prevents the garbage-count TempOverflow in the game's resolution setup.
         {"EnumDisplaySettingsW",     (void*)&Bed_EnumDisplaySettingsW},
@@ -45201,6 +46849,9 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
             // Peak Unity 6: import-name placeholders (see PatchGuestTreeForContainer).
             {"CharLowerW",     (void*)&Bed_AdjustWindowRectExForDpi},
             {"CharPrevW",      (void*)&Bed_IsMouseInPointerEnabled},
+            // §60: Unity 6 Input System mouse buttons ride WM_POINTER.
+            {"EnableMouseInPointer", (void*)&Bed_EnableMouseInPointer},
+            {"GetPointerInfo",       (void*)&Bed_GetPointerInfo},
         };
         for (auto& r : extra) n += PatchModuleImport(h, r.fn, r.bed);
     }
@@ -45796,6 +47447,17 @@ static HMODULE LoadGuestDll(const char* dll)
             Diag(std::string("LoadGuestDll(") + dll + ") -> xaudio2_9 " + Hex((uintptr_t)d));
             if (d){ g_dsAlias = d; return d; }
         }
+        // No mfplay.dll either. UE4's WmfMedia refuses to start without it
+        // (LoadRequiredLibraries: shlwapi, mf, mfplat, mfplay) but never calls
+        // into it, so every UE4 movie stayed black (Transience s908). mfplat is
+        // a real module the name can stand on; its GetProcAddress for MFP*
+        // names misses, as a stub would.
+        if (g_guestSessionLive &&
+            (0 == _stricmp(base, "mfplay.dll") || 0 == _stricmp(base, "mfplay"))){
+            HMODULE d = LoadGuestDll("mfplat.dll");
+            Diag(std::string("LoadGuestDll(") + dll + ") -> mfplat " + Hex((uintptr_t)d));
+            if (d) return d;
+        }
 #endif
     }
 
@@ -45860,10 +47522,14 @@ static HMODULE LoadGuestDll(const char* dll)
                 // becomes a stub returning 0, and Tsushima's Streamline then divided
                 // by a zero QueryPerformanceFrequency forever on a fresh console.
                 std::wstring vcrt = g_installDir + L"guest\\vcrt\\" + base;
-                // M4.4: guest\vcrt14\ is the 14.5x runtime, used only while UE4SS is
-                // armed: UE4SS needs msvcp140 14.4x and msvcp140_atomic_wait /
-                // _codecvt_ids, which vcrt lacks, and the game shares whichever
-                // msvcp140 loads first. Every other launch keeps vcrt as it was.
+                // #287: guest\vcrt IS the 14.51 set now, the whole of it, for every
+                // launch -- so the two branches below are both no-ops unless the
+                // package is older than this loader. They stay because a MIXED
+                // runtime is the failure they describe: 14.27 MSVCP140 beside 14.51
+                // MSVCP140_1 in one process dies in _Mtx_lock on a constexpr
+                // std::mutex (Dead as Disco, UE5/VS 17.10+, MSVCP140+0x12E20).
+                // M4.4 history: vcrt14 existed because UE4SS needs msvcp140 14.4x
+                // and msvcp140_atomic_wait / _codecvt_ids, which the old vcrt lacked.
                 const std::wstring vcrt14 = g_installDir + L"guest\\vcrt14\\" + base;
                 if (!g_ue4ssDll.empty() && GetFileAttributesW(vcrt14.c_str()) != INVALID_FILE_ATTRIBUTES)
                     vcrt = vcrt14;
@@ -46317,6 +47983,33 @@ static void* GhCefWrapExport(const char* fn, void* real)
         return (void*)&ghcef::Exec;
     }
     return real;
+}
+
+// XInput's DLLs are imported by ordinal (UE4: XINPUT1_3 #2/#3), and the DX June
+// 2010 xinput1_3.dll is not on the console, so the ordinals went to stubs and the
+// pad beds were never reached (Transience, s901). The ordinals are fixed across
+// xinput1_1..1_4; map them to names so ShimTable answers them.
+static const char* GhImportOrdinalName(const char* dll, unsigned ord)
+{
+    // §60. Unity 6 delay-loads d3d12.dll by ORDINAL (101, 102), so its device came
+    // from the real D3D12CreateDevice: the same per-adapter singleton as ours, but
+    // with none of our device hooks installed. Ordinals verified on the console's
+    // d3d12.dll and the PC one.
+    if (0 == _stricmp(dll, "d3d12.dll") || 0 == _stricmp(dll, "d3d12")){
+        switch (ord){
+        case 101: return "D3D12CreateDevice";
+        case 102: return "D3D12GetDebugInterface";
+        }
+        return nullptr;
+    }
+    if (0 != _strnicmp(dll, "xinput1_", 8)) return nullptr;
+    switch (ord){
+    case 2: return "XInputGetState";
+    case 3: return "XInputSetState";
+    case 4: return "XInputGetCapabilities";
+    case 5: return "XInputEnable";
+    }
+    return nullptr;
 }
 
 static void* ResolveImport(const char* dll, const char* fn)
@@ -46785,13 +48478,75 @@ static bool GhNewbeScanFault(EXCEPTION_POINTERS* ep)
 // thrown object in [1], the ThrowInfo in [2] and the module base in [3]; every
 // pointer inside the ThrowInfo chain is an RVA against that base.
 //
+// #292b. Two helpers for a throw whose ThrowInfo we cannot read. The magic
+// 0x01994000 (EH_PURE_MAGIC_NUMBER1) kills Dead as Disco and its ThrowInfo
+// fields are not RVAs against ExceptionInformation[3] -- the decode's own
+// "a type name starts with '.'" check refused it three runs running. So stop
+// guessing the layout and ask the OBJECT what it is.
+//
+// GhRttiNameOf reads the name straight off the object's vtable, which does not
+// involve the throw record at all: MSVC puts an RTTICompleteObjectLocator at
+// vtable[-1], and on x64 (signature 1) the locator carries its own RVA, so the
+// image base is (locator address - pSelf) and needs nothing from the throw.
+static bool GhRttiNameOf(const void* obj, char* out, size_t cap)
+{
+    if (out && cap) out[0] = 0;
+    if (!obj || !out || cap < 4) return false;
+    bool ok = false;
+    __try {
+        const void* const* vt = *(const void* const* const*)obj;
+        if (!vt) return false;
+        const uint32_t* loc = (const uint32_t*)vt[-1];
+        if (!loc || loc[0] != 1) return false;              // x64 locator only
+        const uintptr_t base = (uintptr_t)loc - loc[5];     // pSelf is its own RVA
+        const char* nm = (const char*)(base + loc[3]) + 16; // TypeDescriptor.name
+        size_t k = 0; while (nm[k] && k + 1 < cap){ out[k] = nm[k]; ++k; }
+        out[k] = 0;
+        ok = (out[0] == '.' && k > 1);
+        if (!ok) out[0] = 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { if (out && cap) out[0] = 0; }
+    return ok;
+}
+
+// And when even that fails, print the bytes rather than a theory: whoever reads
+// the log next can work the layout out offline instead of paying another
+// build-deploy-launch cycle to ask one more question.
+static void GhHexAt(const void* p, int n, char* out, size_t cap)
+{
+    static const char hexd[] = "0123456789ABCDEF";
+    if (!out || !cap) return;
+    out[0] = 0;
+    if (!p) { if (cap > 5) { memcpy(out, "NULL", 5); } return; }
+    __try {
+        const BYTE* b = (const BYTE*)p;
+        size_t z = 0;
+        for (int q = 0; q < n && z + 3 < cap; ++q){
+            out[z++] = hexd[b[q] >> 4]; out[z++] = hexd[b[q] & 0xF];
+            if ((q & 7) == 7) out[z++] = ' ';
+        }
+        out[z] = 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        size_t z = 0; while (z + 1 < cap && "FAULT"[z]){ out[z] = "FAULT"[z]; ++z; } out[z] = 0;
+    }
+}
+
 // Raw pointer walking with no C++ object live, because __try may hold none.
 static bool GhCxxThrowInfo(const EXCEPTION_RECORD* er, char* type, size_t typeCap,
                            char* what, size_t whatCap, char* raw = nullptr, size_t rawCap = 0)
 {
     type[0] = 0; what[0] = 0; if (raw && rawCap) raw[0] = 0;
     if (!er || er->ExceptionCode != 0xE06D7363 || er->NumberParameters < 4) return false;
-    if (er->ExceptionInformation[0] != 0x19930520) return false;
+    // #292. MSVC has four throw magics, not one: EH_MAGIC_NUMBER1 0x19930520
+    // and its two siblings, plus EH_PURE_MAGIC_NUMBER1 0x01994000. Dead as
+    // Disco's last event of any kind before WER dumped it was a throw from the
+    // guest carrying the PURE magic (s1001, GUEST+0x7EC9815 tid 3764), and this
+    // one line returned false on it: the only throw that mattered was the only
+    // one we would not read. The record's shape is the same -- the ThrowInfo
+    // fields stay RVAs against ExceptionInformation[3] -- so decode it and let
+    // the name itself say whether the layout held.
+    const uint32_t magic = (uint32_t)er->ExceptionInformation[0];
+    if (magic != 0x19930520 && magic != 0x19930521 && magic != 0x19930522 &&
+        magic != 0x01994000) return false;
     bool ok = false;
     __try {
         const BYTE* base = (const BYTE*)er->ExceptionInformation[3];
@@ -46807,6 +48562,12 @@ static bool GhCxxThrowInfo(const EXCEPTION_RECORD* er, char* type, size_t typeCa
         const char* nm = (const char*)(base + ct[1]) + 16;
         size_t k = 0; while (nm[k] && k + 1 < typeCap){ type[k] = nm[k]; ++k; }
         type[k] = 0;
+        // #292. Every MSVC type-descriptor name begins '.' ('.?AV<class>@@'),
+        // so this is the decode checking itself: with a magic whose layout we
+        // are inferring, a name that does not look like one means the RVAs were
+        // not RVAs, and printing it would be worse than failing. Fall through to
+        // the UNDECODED line instead, which prints the magic and the stack.
+        if (type[0] != '.' || k < 2) { type[0] = 0; return false; }
         ok = true;
         // #183. The first pass read the HRESULT from offset 0 and got
         // 0xAD6DF468 -- the low half of a vptr, not an HRESULT. The console's
@@ -47525,8 +49286,57 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
                         Diag("  throw#" + std::to_string(b) + " " +
                              NameForCodeAddr((uintptr_t)bt[b]));
                 }
-            } else if (kt <= 4){
-                Diag("CXXTHROW n=" + std::to_string((long)kt) + " ThrowInfo unreadable");
+            } else {
+                // #292. A throw we cannot read is exactly the kind that kills a
+                // title, and the old "first four throws of the run" rule meant
+                // the one that killed Dead as Disco -- throw 3482 of the run --
+                // printed nothing at all. Say so once per (magic, site), which a
+                // storm cannot flood, and print the magic so the next layout
+                // question is answerable from the log.
+                void* bt[40] = {};
+                const USHORT nb = RtlCaptureStackBackTrace(0, 40, bt, nullptr);
+                const uintptr_t site = GhRaiseSite(bt, nb);
+                const uint32_t magic = (uint32_t)(ep->ExceptionRecord->NumberParameters > 0
+                                                  ? ep->ExceptionRecord->ExceptionInformation[0] : 0);
+                static SRWLOCK ml = SRWLOCK_INIT;
+                static struct { uint32_t magic; uintptr_t site; } seenM[16] = {};
+                static int nM = 0;
+                bool freshM = false;
+                AcquireSRWLockExclusive(&ml);
+                int q = 0;
+                for (; q < nM; ++q) if (seenM[q].magic == magic && seenM[q].site == site) break;
+                if (q == nM && nM < 16){ seenM[nM].magic = magic; seenM[nM].site = site; ++nM; freshM = true; }
+                ReleaseSRWLockExclusive(&ml);
+                if (freshM){
+                    // #292b. Which parameter is the object is part of what we do
+                    // not know, so ask the RTTI of each candidate: the one that
+                    // answers with a type name IS the object, and names the throw.
+                    const ULONG_PTR* pp = ep->ExceptionRecord->ExceptionInformation;
+                    const ULONG np = ep->ExceptionRecord->NumberParameters;
+                    char rn[256] = {}; int rslot = -1;
+                    for (ULONG s = 1; s < np && s < 4; ++s)
+                        if (GhRttiNameOf((const void*)pp[s], rn, sizeof(rn))){ rslot = (int)s; break; }
+                    std::string ps;
+                    for (ULONG s = 0; s < np && s < 4; ++s)
+                        ps += " p" + std::to_string(s) + "=" + Hex((uint64_t)pp[s]);
+                    Diag("CXXTHROW n=" + std::to_string((long)kt) + " UNDECODED magic=" + Hex(magic) +
+                         " nparm=" + std::to_string(np) +
+                         " tid=" + std::to_string(GetCurrentThreadId()) +
+                         (rslot >= 0 ? " RTTI(p" + std::to_string(rslot) + ")=" + rn
+                                     : std::string(" RTTI=none")) +
+                         " site=" + NameForCodeAddr(site));
+                    Diag("  undecp" + ps);
+                    // 48 bytes at each parameter that could be a pointer, so the
+                    // layout is readable offline without another launch.
+                    for (ULONG s = 1; s < np && s < 4; ++s){
+                        char hx[160];
+                        GhHexAt((const void*)pp[s], 48, hx, sizeof(hx));
+                        Diag("  undecmem p" + std::to_string(s) + " @" + Hex((uint64_t)pp[s]) + " = " + hx);
+                    }
+                    for (USHORT b = 0; b < nb; ++b)
+                        Diag("  undec#" + std::to_string(b) + " " +
+                             NameForCodeAddr((uintptr_t)bt[b]));
+                }
             }
         }
 
@@ -48008,6 +49818,22 @@ static LONG CrashObserverVehInner(EXCEPTION_POINTERS* ep)
         for (int k = 0; k < 16; ++k)
             ib += " " + Hex((uint32_t)((const unsigned char*)(uintptr_t)c->Rip)[k]);
         Diag(ib);
+    }
+    // #285: the bytes AT rip name the faulting instruction; they never say where its
+    // operand came from. The thirty-two bytes BEFORE it usually do -- the load, the
+    // call whose return value it is, or the field read that produced the bad register
+    // is almost always inside that window. Only dumped when the page holding rip-32 is
+    // committed and executable, because rip-32 can cross into an unmapped page.
+    {
+        const uintptr_t lo = (uintptr_t)c->Rip - 32;
+        MEMORY_BASIC_INFORMATION pmbi{};
+        const DWORD kX = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if (VirtualQuery((void*)lo, &pmbi, sizeof(pmbi)) && pmbi.State == MEM_COMMIT && (pmbi.Protect & kX)){
+            std::string pb = "  pre ";
+            for (int k = 0; k < 32; ++k)
+                pb += " " + Hex((uint32_t)((const unsigned char*)lo)[k]);
+            Diag(pb);
+        }
     }
     uintptr_t ret = 0;
     if (!SafeQword((uintptr_t)c->Rsp, &ret)) ret = 0;   // clang 23: no __try beside std::string
@@ -50485,13 +52311,48 @@ static void GhSeedGuestCookie(uint8_t* base, IMAGE_NT_HEADERS64* nt)
     v ^= v >> 31;
     v &= 0x0000FFFFFFFFFFFFULL;
     if (!v || v == kDefault) v = kDefault + 1;
+    // __security_cookie_complement is a separate CRT global, initialised at
+    // compile time to ~default; the LINKER places it, not the CRT. It is NOT
+    // reliably the word below the cookie: in FPS Chess (UE4) that word is
+    // _Init_global_epoch, and writing ~v there handed every magic static a
+    // random epoch -- a positive one (half the launches) made the guard look
+    // initialised and returned a NULL static (EnterCriticalSection(NULL) in
+    // static init). Find the complement by its value, nearest to the cookie in
+    // the cookie's own section; if there is none, leave it alone (x64
+    // __security_check_cookie never reads it).
+    uint64_t* cmp = nullptr;
+    {
+        auto* sec = IMAGE_FIRST_SECTION(nt);
+        const uint32_t rva = (uint32_t)(va - pref);
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec){
+            const uint32_t sz = sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData;
+            if (rva < sec->VirtualAddress || rva >= sec->VirtualAddress + sz) continue;
+            const uint32_t init = std::min<uint32_t>(sz, sec->SizeOfRawData);   // zero-fill tail can't hold it
+            auto* lo = (uint64_t*)(base + sec->VirtualAddress);
+            auto* hi = (uint64_t*)(base + sec->VirtualAddress + (init & ~7u));
+            uint64_t best = ~0ULL;
+            for (uint64_t* p = lo; p < hi; ++p){
+                if (*p != ~kDefault) continue;
+                const uint64_t dist = p < ck ? (uint64_t)(ck - p) : (uint64_t)(p - ck);
+                if (dist < best){ best = dist; cmp = p; }
+            }
+            break;
+        }
+    }
     DWORD old = 0;
-    VirtualProtect(ck, 16, PAGE_READWRITE, &old);
-    *(ck - 1) = ~v;      // the complement MSVC keeps in the word below
+    VirtualProtect(ck, 8, PAGE_READWRITE, &old);
     *ck = v;
-    if (old) VirtualProtect(ck, 16, old, &old);
+    if (old) VirtualProtect(ck, 8, old, &old);
+    if (cmp){
+        DWORD o2 = 0;
+        VirtualProtect(cmp, 8, PAGE_READWRITE, &o2);
+        *cmp = ~v;
+        if (o2) VirtualProtect(cmp, 8, o2, &o2);
+    }
     Diag("GSSEED cookie at " + Hex((uint64_t)(uintptr_t)ck) + " GUEST+" +
-         Hex((uint32_t)(va - pref)) + " " + Hex(kDefault) + " -> " + Hex(v));
+         Hex((uint32_t)(va - pref)) + " " + Hex(kDefault) + " -> " + Hex(v) +
+         (cmp ? " complement at GUEST+" + Hex((uint32_t)((uint8_t*)cmp - base))
+              : std::string(" complement not found (left alone)")));
 }
 
 static bool MapAndRun(std::vector<uint8_t>& file)
@@ -50603,6 +52464,10 @@ static bool MapAndRun(std::vector<uint8_t>& file)
             auto* ft  = (IMAGE_THUNK_DATA64*)(base + imp->FirstThunk);
             for (; oft->u1.AddressOfData; ++oft, ++ft){
                 if (IMAGE_SNAP_BY_ORDINAL64(oft->u1.Ordinal)){
+                    if (const char* on = GhImportOrdinalName(dll, (unsigned)(oft->u1.Ordinal & 0xFFFF))){
+                        auto it = ShimTable().find(on);
+                        if (it != ShimTable().end()){ ft->u1.Function = (ULONGLONG)it->second; continue; }
+                    }
                     HMODULE m = LoadGuestDll(dll);
                     if (m) PinGuestModule(m, dll);
                     void* p = m ? (void*)GetProcAddress(m, (LPCSTR)(oft->u1.Ordinal & 0xFFFF)) : nullptr;
@@ -50806,6 +52671,10 @@ static bool MapChildImage(const std::vector<uint8_t>& file, uint8_t** outBase, v
             auto* ft  = (IMAGE_THUNK_DATA64*)(base + imp->FirstThunk);
             for (; oft->u1.AddressOfData; ++oft, ++ft){
                 if (IMAGE_SNAP_BY_ORDINAL64(oft->u1.Ordinal)){
+                    if (const char* on = GhImportOrdinalName(dll, (unsigned)(oft->u1.Ordinal & 0xFFFF))){
+                        auto it = ShimTable().find(on);
+                        if (it != ShimTable().end()){ ft->u1.Function = (ULONGLONG)it->second; continue; }
+                    }
                     HMODULE m = LoadGuestDll(dll);
                     if (m) PinGuestModule(m, dll);
                     void* p = m ? (void*)GetProcAddress(m, (LPCSTR)(oft->u1.Ordinal & 0xFFFF)) : nullptr;
@@ -50946,9 +52815,13 @@ static HMODULE GhSelfMapDll(const std::wstring& full, const char* dll, bool (*pr
         Diag("SELFMAP " + nm + " map failed");
         return nullptr;
     }
-    AcquireSRWLockExclusive(&g_selfModLock);
-    g_selfMods.push_back(GhSelfMod{ base, nm, full });
-    ReleaseSRWLockExclusive(&g_selfModLock);
+    {
+        auto* d0 = (IMAGE_DOS_HEADER*)base;
+        auto* n0 = (IMAGE_NT_HEADERS64*)(base + d0->e_lfanew);
+        AcquireSRWLockExclusive(&g_selfModLock);
+        g_selfMods.push_back(GhSelfMod{ base, nm, full, (size_t)n0->OptionalHeader.SizeOfImage });
+        ReleaseSRWLockExclusive(&g_selfModLock);
+    }
     Diag("SELFMAP " + nm + " mapped base=" + Hex((uintptr_t)base) +
          " entry=" + Hex((uintptr_t)entry) + " size=" + Hex((uint64_t)bytes.size()));
     // Slot 0 is the guest's main image (TryRealGuestTls); the rest are handed
@@ -51154,6 +53027,18 @@ static BOOL WINAPI Bed_CreateProcessA(
 
 static BOOL WINAPI Bed_GetExitCodeProcess(HANDLE h, LPDWORD ec)
 {
+    // Our child "processes" are threads, but a REAL process handle (OpenProcess on the
+    // seeded Steam ActiveProcess pid, i.e. ourselves) must get the real answer: S_API's
+    // IsSteamRunning() asks it, and GetExitCodeThread on a process handle fails, so
+    // SteamStub-wrapped exes decided "no running Steam" (Dead as Disco, s892).
+    if (GetProcessId(h) != 0){
+        const BOOL ok = GetExitCodeProcess(h, ec);
+        static LONG n = 0;
+        if (InterlockedIncrement(&n) <= 3)
+            Diag("BED GetExitCodeProcess real process pid=" + std::to_string(GetProcessId(h)) +
+                 " ok=" + std::to_string(ok) + " code=" + std::to_string(ec ? *ec : 0));
+        return ok;
+    }
     return GetExitCodeThread(h, ec);    // our "processes" are threads
 }
 
@@ -51188,8 +53073,9 @@ static std::wstring GuestExtraArgs(const std::wstring& exePath)
     size_t sl = exePath.find_last_of(L"\\/");
     std::wstring base = (sl == std::wstring::npos) ? exePath : exePath.substr(sl + 1);
     for (auto& c : base) if (c >= L'A' && c <= L'Z') c = (wchar_t)(c + 32);
-    for (const GhTitle& t : GhTitles()){
-        if (_wcsicmp(base.c_str(), t.exe.c_str()) != 0 || t.args.empty()) continue;
+    if (const GhTitle* tp = GhTitleByExe(base)){
+        const GhTitle& t = *tp;
+        if (t.args.empty()) return L"";
         std::wstring args(t.args);
         // The command line is exe + args as they stand: "-condebug" without its
         // leading space became "gmod.exe-condebug".
@@ -51330,6 +53216,7 @@ static void PollSyntheticPad()
     { std::lock_guard<std::mutex> lk(g_padMutex); up = g_padConnected || g_synSticky; }
     if (up != s_padWasUp){
         s_padWasUp = up;
+        g_padEpoch.fetch_add(1);
         if (g_guestRunning){
             KM_Push(WM_DEVICECHANGE, 0x0007 /*DBT_DEVNODES_CHANGED*/, 0);
             Diag(std::string("INPUT pad ") + (up ? "connected" : "gone") + " -> WM_DEVICECHANGE to guest");
@@ -51579,6 +53466,8 @@ static void FinishGuestSession()
     // Keep whatever the guest wrote to the registry. A crash is exactly when this
     // matters most: the settings a game chose on the way to dying are the record
     // of what it thought this machine could do.
+    g_regHiveReady = false;   // the flusher must not write this hive under the next guest's name
+    g_regDirty = false;
     RegHiveSave();
 
     Diag("EXITCODE=" + std::to_string(g_guestExitCode));
@@ -52090,7 +53979,21 @@ static void RunGuest()
             char buf[16]; std::snprintf(buf, sizeof(buf), "%u", app);
             SetEnvironmentVariableA("SteamAppId", buf);
             SetEnvironmentVariableA("SteamGameId", buf);
-            Diag(std::string("STAGE=steam_appid ") + buf);
+            // #280: SetEnvironmentVariable writes the PEB block, but ucrtbase keeps
+            // its OWN cached copy, materialized when the Launcher process started --
+            // long before a game is picked. A guest that reads the environment through
+            // the SHARED ucrtbase therefore sees getenv("SteamAppId") == NULL, and that
+            // is precisely the test Valve's SteamAPI_RestartAppIfNecessary makes: Dead
+            // as Disco's SteamStub concluded it had not been launched by Steam and
+            // ShellExecute'd steam://run/3763830//-dx11 instead of starting (s975).
+            // _putenv_s updates the CRT copy as well as the PEB, so both views agree.
+            const char* pre = getenv("SteamAppId");
+            _putenv_s("SteamAppId", buf);
+            _putenv_s("SteamGameId", buf);
+            const char* post = getenv("SteamAppId");
+            Diag(std::string("STAGE=steam_appid ") + buf +
+                 " crt_before=" + (pre ? pre : "(null)") +
+                 " crt_after="  + (post ? post : "(null)"));
         }
     }
     GhInputOnGuestStart(g_launcherSelectedApp, g_guestDir.c_str());
@@ -52615,34 +54518,179 @@ static void GhStartGuestWorker()
 // Knob-gated (default OFF) because it is a candidate FIX, not an instrument: the
 // PLM handlers in App::Run are the instrument and they cost nothing. A value
 // above 1 is the interval in ms.
+//
+// ---------------------------------------------------------------------------
+// #291. The same presenter, RESUMED when a running guest goes quiet.
+// ---------------------------------------------------------------------------
+// The one-shot above was built for the window before the guest's first frame,
+// and switched itself off there permanently. This is the general form: if the
+// presenter RESUMES after gh_keepalive_gap ms of guest silence, a render thread
+// that stalls -- in a driver compile, a level load, anything -- cannot cost us
+// the app, because the swapchain keeps receiving frames while it is away.
+//
+// The interlock is g_swapDance (see its declaration): GfxPresent holds it across
+// the whole release/Present/re-acquire dance, and this is the only other code
+// that runs that dance, so a TRY-lock here is both necessary and sufficient.
+// Try, never wait: if the guest is wedged INSIDE GfxPresent the lock is held and
+// we skip the tick -- blocking the UI pump on it would turn one dead title into
+// a dead launcher. Silence is measured on g_presentDoneTick, not g_presentTick:
+// see #291b at that declaration for why the top-of-function stamp cannot answer
+// "did a frame come out".
+//
+// ---------------------------------------------------------------------------
+// #291c. DEFAULT OFF, and the reason is the whole of #291's own evidence.
+// ---------------------------------------------------------------------------
+// This branch was written for s996's reading of Dead as Disco: "the render
+// thread is inside CreateGraphicsPipelineState and the driver takes 87.9 s over
+// one pipeline, so the shell suspends an app that has not presented". BOTH
+// halves of that are retracted:
+//
+//   * s997 froze 94 s with psoDrvMs pinned at 28294 and s998 froze 86 s with it
+//     pinned at 8769 -- no compile at all. s996's 5016 -> 92812 was the render
+//     thread measuring the freeze from inside whatever call it was in.
+//   * s998: not one thread in the process ran for 86.2 s (FRAME n=356
+//     dt=86156ms, and NO diag line of any kind timestamped between 70 s and
+//     156.6 s), 32,736 faults, 2.18 GB physical free. "PLM Suspending" arrives
+//     AFTER the freeze. Missed presents never caused the suspend.
+//
+// So in the case this was built for, the UI thread is frozen too and this code
+// cannot run -- s998 logged zero keepalive lines. In s997, where the UI thread
+// was alive, the guest held the swap dance and the try-lock correctly declined.
+// Measured benefit across both: none.
+//
+// Measured cost, s999 regression on 0.0.901.0: Half-Life 2 loading its first map
+// goes quiet for 31.9 s (FRAME n=5 dt=31860ms), tripped the 20 s gap at 91969ms,
+// and had 12 "Loading ..." status frames painted over its own loading screen
+// before the guest came back and the episode closed cleanly at 103813ms. MECCHA
+// CHAMELEON (3367 frames), Cheese Rolling (6100) and GMod (3379) were untouched:
+// zero episodes, zero DROPPED, zero MORE THAN ONE THREAD anywhere.
+//
+// A branch with no observed benefit and one observed false positive does not
+// belong on by default. The code and the knob stay, because a render-thread-only
+// stall with a live UI thread is a real shape we may yet meet -- and then
+// gh_keepalive_gap.txt turns it on. Picking a bigger default instead would just
+// be a guess dressed as a fix: HL2 needs >31.9 s, and nothing says the next
+// title's load is shorter.
 static void GhKeepAlivePresent()
 {
-    static int mode = -1;
+    static int      mode = -1;
+    static unsigned gap  = 0;
     if (mode < 0){
         mode = (int)GhCfgNum(L"gh_keepalive.txt", "GH_KEEPALIVE", 0);
         if (mode) Diag("KEEPALIVE armed, interval=" +
                        std::to_string(mode > 1 ? mode : 1000) + "ms");
+        // GhCfgNumZ, not GhCfgNum: GhCfgNum's `return v ? v : dflt` cannot
+        // express zero, so with it a knob file saying 0 would silently read back
+        // as the default. Kept even though the default is now 0 itself -- the
+        // asymmetry is what bit #291b, and the next person to change this
+        // default should not have to rediscover it.
+        gap = GhCfgNumZ(L"gh_keepalive_gap.txt", "GH_KEEPALIVE_GAP", 0);   // #291c: OFF
+        // Below a couple of seconds this would fire on ordinary frame hitches.
+        if (gap && gap < 2000) gap = 2000;
+        // Say which way round it is, in words, both ways: "gap=off" followed by a
+        // sentence describing what the ON behaviour does read as a contradiction
+        // in every log it appeared in.
+        Diag(gap ? ("KEEPALIVE resume gap=" + std::to_string(gap) +
+                    "ms -- a guest silent for this long gets a status frame (#291)")
+                 : std::string("KEEPALIVE resume off (#291c: default; "
+                               "gh_keepalive_gap.txt turns it on)"));
     }
-    if (mode <= 0) return;
     if (!g_guestRunning || g_overlayOpen) return;
-    if (InterlockedCompareExchange(&g_presentN, 0, 0) != 0) return;
+    if (!g_gfx.ready || !g_gfx.swap) return;
+
+    const LONG      pres = InterlockedCompareExchange(&g_presentN, 0, 0);
+    const ULONGLONG now  = GetTickCount64();
+
+    // Reason 1 (#165): the guest has never presented.
+    const bool pre = (pres == 0) && (mode > 0);
+
+    // Reason 2 (#291): it has, and then went quiet.
+    // #291b: g_presentDoneTick, NOT g_presentTick. The entry stamp is refreshed
+    // by a present that never completes, which in s997 kept this branch asleep
+    // through the whole 94-second stall it exists to cover.
+    bool resume = false;
+    ULONGLONG silentMs = 0;
+    if (!pre && pres != 0 && gap){
+        const ULONGLONG lastDone =
+            (ULONGLONG)InterlockedCompareExchange64(&g_presentDoneTick, 0, 0);
+        if (lastDone && now > lastDone) silentMs = now - lastDone;
+        if (silentMs >= (ULONGLONG)gap) resume = true;
+    }
+
+    // One episode = one continuous run of silence. Everything per-episode is
+    // reset the moment the guest presents again.
+    static int       epN    = 0;       // episodes so far
+    static bool      epOpen = false;   // inside one now
+    static int       epPres = 0;       // our presents in this episode
+    static ULONGLONG epSaidBusy = 0;   // last "cannot present" line (tick)
+    if (!resume && epOpen){
+        epOpen = false;
+        Diag("KEEPALIVE resume: guest #" + std::to_string(epN) +
+             " is presenting again at " + std::to_string(GhUpMs()) +
+             "ms after " + std::to_string(epPres) + " status frame(s)" +
+             " -- the title survived a stall that used to end it");
+    }
+    if (!pre && !resume) return;
+
     static ULONGLONG last = 0;
-    const ULONGLONG now = GetTickCount64();
-    const ULONGLONG iv  = (ULONGLONG)(mode > 1 ? mode : 1000);
+    const ULONGLONG  iv   = (ULONGLONG)(mode > 1 ? mode : 1000);
     if (last && now - last < iv) return;
+
+    // The d12-blit probe path hands the standing 11on12 acquire back for good, so
+    // LuiPresent's release/re-acquire would be unbalanced. That path is a
+    // diagnostic; refuse rather than corrupt it.
+    if (g_gfx.blitStandingReleased){
+        static bool said = false;
+        if (!said){ said = true; Diag("KEEPALIVE not presenting: gh_d12_blit released the standing acquire"); }
+        return;
+    }
+
+    // Try, never wait -- on either lock, and in GfxPresent's order.
+    // #291b: on a cadence (at once, then every 15 s), never once per episode.
+    // A single line cannot be told from a stall that lasted a moment, and that
+    // is exactly how s997's timeline was lost.
+    std::unique_lock<std::timed_mutex> dance(g_swapDance, std::try_to_lock);
+    if (!dance.owns_lock()){
+        if (resume && (epSaidBusy == 0 || now - epSaidBusy >= 15000)){
+            epSaidBusy = now;
+            Diag("KEEPALIVE cannot present: the guest has been silent " +
+                 std::to_string(silentMs) + "ms and is INSIDE GfxPresent holding the"
+                 " swap dance, at " + std::to_string(GhUpMs()) + "ms -- nothing on this"
+                 " thread can reach the swapchain");
+        }
+        return;
+    }
+    std::unique_lock<std::mutex> l11(g_d11Mutex, std::try_to_lock);
+    if (!l11.owns_lock()) return;
+
     last = now;
     static int n = 0;
     ++n;
+
+    if (resume && !epOpen){
+        epOpen = true; epPres = 0; epSaidBusy = 0;
+        ++epN;
+        Diag("KEEPALIVE resume: guest #" + std::to_string(epN) +
+             " silent for " + std::to_string(silentMs) + "ms at frame " +
+             std::to_string((long)pres) + " (" + std::to_string(GhUpMs()) +
+             "ms) -- presenting for it so the shell does not suspend us");
+        // Re-bake: the "Starting" frame baked before the first guest frame is long
+        // gone from uiTex's point of view, and this is a different message anyway.
+        // Once per episode, not once per tick: the draw costs D2D + DirectWrite.
+        LuiDrawStatus(L"Loading \u2026");
+    }
     // Bake the status frame ONCE. Drawing it costs D2D and DirectWrite work that
     // can take the Windows loader lock, and the loader lock is exactly what the
     // guest's 17-second LoadLibrary is holding -- runs 42/43/44 all stop this
     // presenter dead at frame #4, the moment the SDK load starts. Presenting an
     // already-baked texture only touches resident d3d11on12/dxgi code.
-    if (n == 1) LuiDrawStatus(L"Starting \u2026");
+    else if (pre && n == 1) LuiDrawStatus(L"Starting \u2026");
+
     LuiPresent();
+    if (resume) ++epPres;
     if (n <= 8 || (n % 10) == 0)
         Diag("KEEPALIVE present #" + std::to_string(n) + " at " +
-             std::to_string(GhUpMs()) + "ms");
+             std::to_string(GhUpMs()) + "ms" + (resume ? " (resume)" : ""));
 }
 #endif
 
@@ -52913,8 +54961,12 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
             struct UiStep {
                 const char* const name;
                 const ULONGLONG   t0;
-                explicit UiStep(const char* n) : name(n), t0(GetTickCount64()) {}
+                explicit UiStep(const char* n) : name(n), t0(GetTickCount64()) {
+                    g_uiStepName = n;                                     // #290
+                    InterlockedExchange64(&g_uiStepT0, (LONG64)t0);
+                }
                 ~UiStep(){
+                    InterlockedExchange64(&g_uiStepT0, 0);                // #290
                     const ULONGLONG dt = GetTickCount64() - t0;
                     if (dt >= 300)
                         Diag(std::string("UIPUMP ") + name + " blocked " +

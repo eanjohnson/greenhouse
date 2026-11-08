@@ -1057,6 +1057,24 @@ static LONG CALLBACK gh_marshal_veh(EXCEPTION_POINTERS* ep)
                 if (body && *(volatile int*)(body + 0x20) == 0) drop = true;   // games_played.count == 0
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) { drop = false; }
+        // Outbound CM census: the first 3 sends of each EMsg (64 distinct at most), so a
+        // missing message (e.g. ClientAuthList after GetAuthSessionTicket) is visible.
+        __try {
+            static volatile LONG s_seen[64][2];   // {emsg, count}
+            uint32_t em = *(volatile uint32_t*)((uintptr_t)c->Rcx + 0x20) & 0x7fffffff;
+            for (int i = 0; i < 64; ++i) {
+                LONG cur = s_seen[i][0];
+                if (cur == 0) {
+                    const LONG prev = InterlockedCompareExchange(&s_seen[i][0], (LONG)em, 0);
+                    cur = prev ? prev : (LONG)em;
+                }
+                if ((uint32_t)cur == em) {
+                    LONG n = InterlockedIncrement(&s_seen[i][1]);
+                    if (n <= 3) gh_diag_writef("CMSEND emsg=%u (0x%x) #%ld drop=%d tid=%lu", em, em, n, drop ? 1 : 0, GetCurrentThreadId());
+                    break;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
         if (drop) {
             uint64_t retaddr = *(uint64_t*)c->Rsp;   // BAsyncSend not entered yet: [rsp] = caller return
             c->Rsp += 8;

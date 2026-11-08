@@ -1,0 +1,8 @@
+{
+  "schema": "greenhouse.title/1",
+  "id": "scratchcreek",
+  "name": "Fears to Fathom - Scratch Creek",
+  "match": { "exe": "Fears to Fathom - Scratch Creek.exe", "steamAppId": 4121170 },
+  "requires": { "loader": "0.0.873.0", "services": ["steam-runtime"] },
+  "args": "-force-d3d12"
+}

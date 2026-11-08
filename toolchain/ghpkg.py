@@ -334,23 +334,35 @@ def cmd_vendor(a):
         spec = json.load(f)
     if spec.get('schema') != 'greenhouse.vendor/1':
         die(f'{a.spec} is not greenhouse.vendor/1')
-    src = spec['source']
-    if not src['url'].startswith('https://'):
-        die('the vendor URL must be https')
-    if a.zip:
-        zb = open(a.zip, 'rb').read()
-    else:
-        print(f'fetching {src["url"]} to measure it (kept in memory only)')
-        zb = urllib.request.urlopen(src['url']).read()
-    if len(zb) != src['size'] or sha256(zb) != src['sha256']:
-        die('the vendor zip is not the one the spec pins (size/sha256 differ)')
-    zf = zipfile.ZipFile(io.BytesIO(zb))
+    # One spec may pin several vendor zips: the top-level "source", plus a "source"
+    # on any file entry (#277 -- steamclient64 comes from SteamCMD's bins package,
+    # steam.exe from the client bootstrapper package). Each is fetched once.
+    zips = {}          # url -> (zipfile, raw bytes)
+
+    def vendor_zip(src):
+        if not src['url'].startswith('https://'):
+            die('the vendor URL must be https')
+        if src['url'] in zips:
+            return zips[src['url']]
+        local = (a.zip if src is spec.get('source') else None) or src.get('zip')
+        if local:
+            zb = open(local, 'rb').read()
+        else:
+            print(f'fetching {src["url"]} to measure it (kept in memory only)')
+            zb = urllib.request.urlopen(src['url']).read()
+        if len(zb) != src['size'] or sha256(zb) != src['sha256']:
+            die(f'{src["url"]} is not the zip the spec pins (size/sha256 differ)')
+        zips[src['url']] = (zipfile.ZipFile(io.BytesIO(zb)), zb)
+        return zips[src['url']]
+
     pid, version = spec['id'], a.version
     if not ID_RE.match(pid):
         die(f'id {pid!r} is not a safe id')
     ver_tuple(version)
     entries = []
     for fs in spec['files']:
+        src = fs.get('source') or spec.get('source') or die(f'{fs["entry"]}: no source, and the spec has no top-level one')
+        zf, zb = vendor_zip(src)
         info = zf.getinfo(fs['entry'])
         if info.flag_bits & 1:
             die(f'{fs["entry"]} is encrypted')
