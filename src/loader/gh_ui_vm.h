@@ -107,6 +107,7 @@ enum GhUiGlyph {
     GH_GLYPH_LB, GH_GLYPH_RB, GH_GLYPH_LT, GH_GLYPH_RT,
     GH_GLYPH_START, GH_GLYPH_VIEW,     // VIEW is the two-square glyph LuiDrawViewBtn draws
     GH_GLYPH_DPAD, GH_GLYPH_LS, GH_GLYPH_RS,
+    GH_GLYPH_UPDOWN, GH_GLYPH_LEFTRIGHT,   // one axis of the pad, for "Move" / "Jump 5"
     GH_GLYPH_COUNT
 };
 
@@ -118,7 +119,8 @@ struct GhUiHint {
 inline const char* GhUiGlyphName(int g)
 {
     static const char* kN[GH_GLYPH_COUNT] = {
-        "", "A", "B", "X", "Y", "LB", "RB", "LT", "RT", "START", "VIEW", "DPAD", "LS", "RS"
+        "", "A", "B", "X", "Y", "LB", "RB", "LT", "RT", "START", "VIEW", "DPAD", "LS", "RS",
+        "UPDOWN", "LEFTRIGHT"
     };
     return (g > 0 && g < GH_GLYPH_COUNT) ? kN[g] : "";
 }
@@ -139,6 +141,10 @@ struct GhUiChrome {
     GhUiLabel title;
     GhUiText  status;             // the line under the title (counts, account state, errors)
     int       statusRole = GH_ROLE_TEXT_DIM;
+    // A dot before the status, in statusRole. The launcher used to put a literal
+    // '*' at the front of the string; here the page says "this state has an
+    // indicator" and the layout draws whatever it draws.
+    bool      statusDot = false;
 
     GhUiBadge badges[4];
     int       badgeCount = 0;
@@ -150,6 +156,17 @@ struct GhUiChrome {
 
     GhUiHint  hints[8];
     int       hintCount = 0;
+
+    // Controls that are not footer hints because they are always available and
+    // belong with the header: the picker's "MENU  Packages". Still a glyph plus
+    // a label, so a layout is free to put them in its own footer instead.
+    GhUiHint  actions[2];
+    int       actionCount = 0;
+
+    // A transient second line beside the actions -- the shader bake's progress,
+    // a background index check. Not `status`, which describes the page itself.
+    GhUiText  note;
+    int       noteRole = GH_ROLE_ACCENT;
 
     bool      busy = false;       // a layout may show a spinner next to the title
 
@@ -167,6 +184,13 @@ struct GhUiChrome {
         hints[hintCount].glyph = glyph;
         hints[hintCount].label.set(label);
         ++hintCount;
+    }
+    void addAction(int glyph, const wchar_t* label)
+    {
+        if (actionCount >= 2) return;
+        actions[actionCount].glyph = glyph;
+        actions[actionCount].label.set(label);
+        ++actionCount;
     }
 };
 
@@ -241,8 +265,9 @@ struct GhUiModalVM {
     bool       overPage = true;
 
     GhUiLabel  heading;
-    GhUiBody   body;
-    GhUiText   detail;          // a path, an id, a size: smaller type under the body
+    GhUiBody   body;            // the question
+    GhUiText   detail;          // what it is about: the title, the path, the id
+    GhUiText   note;            // the consequence, in fine print under the detail
     bool       danger = false;  // uninstall and friends: the layout uses WARN
 
     // Up to four choices. The selected one is `sel`; a layout may render them

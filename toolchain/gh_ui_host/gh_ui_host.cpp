@@ -37,6 +37,7 @@
 #include "gh_theme.h"
 #include "gh_ui_vm.h"
 #include "gh_ui.h"
+#include "gh_ui_layout_list.h"
 
 // ---------------------------------------------------------------------------
 static void LogLine(const std::string& s) { printf("%s\n", s.c_str()); }
@@ -165,6 +166,82 @@ static GhUiListVM MakeListFixture()
     vm.fill = &FixFillRow;
     vm.emptyText.set(L"No titles installed yet");
     vm.emptySub.set(L"Sign in to see the games on your Steam account");
+    return vm;
+}
+
+// ---------------------------------------------------------------------------
+// The PICKER fixture: the real launcher page, with the real device's content.
+//
+// This one is not "plausible content". It reproduces, row for row, what the
+// console showed on 0.0.923.0 so that the ported page can be compared against a
+// screenshot of the launcher as it is today. That comparison is the whole point
+// of U1: it retires the risk of the token/view-model/layout seam before a
+// single console deploy, and anything the port changes shows up as a visible
+// difference rather than as an opinion.
+// ---------------------------------------------------------------------------
+struct PickRow { const wchar_t* name; const wchar_t* state; };
+
+static const PickRow kPickRows[] = {
+    { L"Lethal Company",                 L"installed"  },
+    { L"FPS Chess",                      L"installed"  },
+    { L"Transience",                     L"installed"  },
+    { L"Half-Life 2",                    L"installed"  },
+    { L"Ghost of Tsushima DIRECTOR'S CUT", L"incomplete" },
+    { L"Chained Together",               L"incomplete" },
+    { L"Gang Beasts",                    L"incomplete" },
+    { L"20XX",                           L"incomplete" },
+    { L"R.E.P.O.",                       L"installed"  },
+    { L"Dead as Disco Demo",             L"installed"  },
+    { L"Cheese Rolling",                 L"installed"  },
+    { L"RV There Yet?",                  L"installed"  },
+};
+static const int kPickRowCount = (int)(sizeof kPickRows / sizeof kPickRows[0]);
+
+static void PickFillRow(void*, int i, GhUiRow& out)
+{
+    if (i < 0 || i >= kPickRowCount) return;
+    out.title.setElided(kPickRows[i].name);
+    out.right.set(kPickRows[i].state);
+}
+
+static GhUiListVM MakePickerFixture()
+{
+    GhUiListVM vm;
+    vm.chrome.title.set(L"GREENHOUSE");
+    // The account name is deliberately NOT in the fixture: a harness render is
+    // a file that gets looked at and passed around, and the device screenshot it
+    // is compared with is the one that carries the real one.
+    vm.chrome.status.set(L"signed in");
+    vm.chrome.statusRole = GH_ROLE_ACCENT;
+    vm.chrome.statusDot = true;
+    vm.chrome.addBadge(L"MEMBER", GH_ROLE_ACCENT, false);
+    vm.chrome.addAction(GH_GLYPH_START, L"Packages");
+    vm.chrome.counter.set(L"1 / 171");
+    vm.chrome.addHint(GH_GLYPH_UPDOWN,    L"Move");
+    vm.chrome.addHint(GH_GLYPH_LEFTRIGHT, L"Jump 5");
+    vm.chrome.addHint(GH_GLYPH_A,         L"Launch");
+    vm.chrome.addHint(GH_GLYPH_X,         L"Uninstall");
+    vm.chrome.addHint(GH_GLYPH_VIEW,      L"Verify");
+    vm.chrome.addHint(GH_GLYPH_RB,        L"Mods");
+    vm.chrome.addHint(GH_GLYPH_Y,         L"Search");
+    vm.chrome.addHint(GH_GLYPH_B,         L"Back");
+    vm.count = kPickRowCount;
+    vm.sel = 0;
+    vm.fill = &PickFillRow;
+    return vm;
+}
+
+static GhUiModalVM MakeUninstallFixture()
+{
+    GhUiModalVM vm;
+    vm.overPage = false;          // the launcher's prompt covers the page, as today
+    vm.danger = true;
+    vm.heading.set(L"UNINSTALL");
+    vm.body.set(L"Remove this game from the console?");
+    vm.detail.set(L"Gang Beasts");
+    vm.note.set(L"The install folder will be deleted. This cannot be undone.");
+    vm.addChoice(L"A  Yes, uninstall");
+    vm.addChoice(L"B  Cancel");
     return vm;
 }
 
@@ -395,6 +472,7 @@ int wmain(int argc, wchar_t** argv)
     std::wstring state = L".\\";
     std::wstring out   = L".\\";
     std::string  want  = "all";
+    std::string  page  = "tokens";
     UINT w = 1920, h = 1080;
 
     for (int i = 1; i < argc; ++i) {
@@ -405,8 +483,11 @@ int wmain(int argc, wchar_t** argv)
         else if (a == L"--theme" && more) { const std::wstring t = argv[++i]; want.clear();
                                             for (wchar_t c : t) if (c < 0x80) want.push_back((char)c); }
         else if (a == L"--size" && more)  { swscanf(argv[++i], L"%ux%u", &w, &h); }
+        else if (a == L"--page" && more) { const std::wstring t = argv[++i]; page.clear();
+                                            for (wchar_t c : t) if (c < 0x80) page.push_back((char)c); }
         else if (a == L"--help") {
-            printf("gh_ui_host [--state <dir>] [--out <dir>] [--theme <id|all>] [--size WxH]\n");
+            printf("gh_ui_host [--state <dir>] [--out <dir>] [--theme <id|all>] [--size WxH]\n"
+                   "           [--page tokens|picker|uninstall]\n");
             return 0;
         }
     }
@@ -419,6 +500,7 @@ int wmain(int argc, wchar_t** argv)
 
     GhThemeInit(state.c_str(), &LogLine);
     GhThemeLoad();
+    GhUiLayoutsInit();
 
     int made = 0, failed = 0;
     for (size_t i = 0; i < g_ghThemes.size(); ++i) {
@@ -433,7 +515,15 @@ int wmain(int argc, wchar_t** argv)
         }
 
         g_host.rt->BeginDraw();
-        PaintTokenSheet(t);
+        if (page == "picker") {
+            const GhUiListVM pvm = MakePickerFixture();
+            GhUiPageList(pvm);
+        } else if (page == "uninstall") {
+            const GhUiModalVM mvm = MakeUninstallFixture();
+            GhUiPageModal(mvm);
+        } else {
+            PaintTokenSheet(t);
+        }
         const HRESULT hr = g_host.rt->EndDraw();
         if (FAILED(hr)) {
             printf("FAIL %-16s EndDraw 0x%08lX\n", t.id, (unsigned long)hr);
@@ -441,13 +531,13 @@ int wmain(int argc, wchar_t** argv)
             continue;
         }
 
-        const std::wstring path = out + L"tokens-" + Widen(t.id) + L".png";
+        const std::wstring path = out + Widen(page) + L"-" + Widen(t.id) + L".png";
         if (!g_host.SavePng(path)) {
             printf("FAIL %-16s could not write the PNG\n", t.id);
             ++failed;
             continue;
         }
-        printf("OK   %-16s tokens-%s.png  layout=%s  %ux%u\n", t.id, t.id, t.layout, w, h);
+        printf("OK   %-16s %s-%s.png  layout=%s  %ux%u\n", t.id, page.c_str(), t.id, t.layout, w, h);
         ++made;
     }
 

@@ -114,7 +114,12 @@ struct GhTheme {
     // that (device-confirmed: "LAUNCHER LuiInit OK 1920x1080"), so these are
     // real pixels and no DPI scaling is involved.
     float radius  = 10.f;    // row/panel corner; 0 = square
-    float rowH    = 76.f;
+    // rowH is the HEIGHT OF A ROW'S BOX and rowGap the space between two boxes,
+    // so a list advances by rowH + rowGap. The launcher's old code folded the
+    // gap into its row pitch (76 = 64 + 12) and subtracted it again at every
+    // draw; splitting them is what lets a theme close the gap to nothing and
+    // ask for separators instead.
+    float rowH    = 64.f;
     float rowGap  = 12.f;    // 0 with separators = a continuous list
     float gutter  = 80.f;    // outer margin, before the safe-area inset
     float stroke  = 1.7f;
@@ -129,6 +134,12 @@ struct GhTheme {
     bool gloss      = false;     // a sheen over the top half of rows/panels
     bool innerEdge  = false;     // a light 1px inner border
     bool separators = false;     // a rule between rows instead of a gap
+    // Footer hints: a boxed keycap around each pad letter, or the bare letter.
+    // Today's launcher draws bare letters, so this is off in the dark theme and
+    // U1 keeps it that way; the capability is here because a chrome-heavy theme
+    // wants the cap, and the choice is a motif rather than something a layout
+    // should decide on every page's behalf.
+    bool keycaps    = false;
 
     // The theme's own suggestion for these two; the user's setting wins when
     // they have expressed one (GhThemeSettings).
@@ -186,7 +197,7 @@ inline void GhThemeMakeDark(GhTheme& t)
     t.face[GH_TYPE_LOG]   = { 16.f, 400 };
     t.face[GH_TYPE_KEY]   = { 14.f, 600 };
 
-    t.radius = 10.f; t.rowH = 76.f; t.rowGap = 12.f; t.gutter = 80.f; t.stroke = 1.7f;
+    t.radius = 10.f; t.rowH = 64.f; t.rowGap = 12.f; t.gutter = 80.f; t.stroke = 1.7f;
     t.bgKind = GH_BG_FLAT;
 }
 
@@ -516,6 +527,7 @@ inline bool GhThemeParse(const char* json, size_t n, GhTheme& out, std::string& 
         if (const ghjson::Value* b = v->get("gloss");      b && b->isBool()) out.gloss      = b->b;
         if (const ghjson::Value* b = v->get("innerEdge");  b && b->isBool()) out.innerEdge  = b->b;
         if (const ghjson::Value* b = v->get("separators"); b && b->isBool()) out.separators = b->b;
+        if (const ghjson::Value* b = v->get("keycaps");    b && b->isBool()) out.keycaps    = b->b;
     }
 
     return true;

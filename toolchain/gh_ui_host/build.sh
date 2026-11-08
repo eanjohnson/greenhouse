@@ -52,9 +52,10 @@ cd "$OUT" || exit 1
 WINEDEBUG="${WINEDEBUG:--all}" wine "$EXE" \
     --state "Z:${STATE//\//\\}\\" \
     --out   "Z:${OUT//\//\\}\\" \
-    --theme "$THEME"
+    --theme "$THEME" \
+    --page  "${GH_UI_PAGE:-tokens}"
 rc=$?
 
 echo
-ls -la "$OUT"/tokens-*.png 2>/dev/null || echo "(no PNGs produced)"
+ls -la "$OUT"/"${GH_UI_PAGE:-tokens}"-*.png 2>/dev/null || echo "(no PNGs produced)"
 exit $rc

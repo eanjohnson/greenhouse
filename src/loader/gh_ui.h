@@ -363,12 +363,36 @@ inline D2D1_RECT_F GhUiCenterBox(const D2D1_RECT_F& r, float w, float h)
 
 // How many rows of the theme's height fit in `h`. A layout asks this instead of
 // the old hand-computed `nfit = (H - 90 - top) / rowH`.
-inline int GhUiRowsThatFit(float h)
+inline float GhUiLineHeight(int type);   // defined with the text primitives below
+
+// The effective row box height. The theme's rowH is a floor-checked request,
+// not the last word: a theme that raises the text scale without raising rowH
+// would otherwise clip its own rows, and a downloaded theme must not be able to
+// do that. The floor only bites in that case -- every theme we ship, and both
+// harness fixtures, already clear it.
+inline float GhUiRowH()
 {
     const GhTheme& t = GhThemeCurrent();
-    const float step = t.rowH + (t.separators ? 0.f : t.rowGap);
+    const float floorH = GhUiLineHeight(GH_TYPE_ITEM) + 18.f * g_ghUi.textScale;
+    return t.rowH > floorH ? t.rowH : floorH;
+}
+
+inline float GhUiRowGap()
+{
+    const GhTheme& t = GhThemeCurrent();
+    return t.separators ? 0.f : t.rowGap;
+}
+
+// What a list advances by, from one row's top to the next.
+inline float GhUiRowStep(){ return GhUiRowH() + GhUiRowGap(); }
+
+inline int GhUiRowsThatFit(float h)
+{
+    const float step = GhUiRowStep();
     if (step <= 1.f) return 1;
-    const int n = (int)((h + (t.separators ? 0.f : t.rowGap)) / step);
+    // The last row needs no gap after it, so the gap is added back before
+    // dividing: at 1920x1080 this is the launcher's own nfit = 10.
+    const int n = (int)((h + GhUiRowGap()) / step);
     return n < 1 ? 1 : n;
 }
 
@@ -612,18 +636,29 @@ inline const wchar_t* GhUiGlyphCap(int glyph)
     // those controls. One of the de-dev-mode fixes, fixed once, here.
     case GH_GLYPH_START: return L"MENU";
     case GH_GLYPH_DPAD:  return L"D-PAD";
+    // Drawn as the arrows themselves rather than named, which is what the
+    // launcher already did and what a pad direction reads as fastest.
+    case GH_GLYPH_UPDOWN:    return L"▲ ▼";
+    case GH_GLYPH_LEFTRIGHT: return L"◀ ▶";
     default: return nullptr;
     }
 }
+
+// The arrow pairs are glyphs in their own right, never boxed in a keycap.
+inline bool GhUiGlyphIsArrows(int g){ return g == GH_GLYPH_UPDOWN || g == GH_GLYPH_LEFTRIGHT; }
 
 inline float GhUiGlyphHeight(){ return 30.f * g_ghUi.textScale; }
 
 inline float GhUiGlyphWidth(int glyph)
 {
     if (glyph <= GH_GLYPH_NONE || glyph >= GH_GLYPH_COUNT) return 0.f;
-    if (glyph == GH_GLYPH_VIEW) return GhUiGlyphHeight() * 1.05f;
+    if (glyph == GH_GLYPH_VIEW) return 14.f * g_ghUi.textScale;   // the two squares, offset
     const wchar_t* cap = GhUiGlyphCap(glyph);
     if (!cap) return 0.f;
+    // A bare letter is measured in the footer's own type, not in GH_TYPE_KEY:
+    // without a cap around it the letter sits in the line of text beside it.
+    if (GhUiGlyphIsArrows(glyph) || !GhThemeCurrent().keycaps)
+        return GhUiMeasure(cap, GH_TYPE_SMALL);
     return GhUiMeasure(cap, GH_TYPE_KEY) + 20.f * g_ghUi.textScale;
 }
 
@@ -636,19 +671,27 @@ inline float GhUiGlyphDraw(int glyph, float x, float cy)
     const float h = GhUiGlyphHeight();
 
     if (glyph == GH_GLYPH_VIEW) {
-        // The two stacked rounded squares of the Xbox View button: a shape, not
-        // a character, so it is drawn rather than typed.
-        const float w = h * 1.05f, sw = w * 0.42f, sh = h * 0.30f, gap = h * 0.14f;
-        const float left = x + (w - sw) * 0.5f;
-        GhUiFill(D2D1::RectF(left, cy - sh - gap * 0.5f, left + sw, cy - gap * 0.5f), GH_ROLE_TEXT_DIM_ON_BG, 2.f);
-        GhUiFill(D2D1::RectF(left, cy + gap * 0.5f, left + sw, cy + sh + gap * 0.5f), GH_ROLE_TEXT_DIM_ON_BG, 2.f);
-        return w;
+        // The Xbox View button: two overlapping rounded squares, OUTLINED, the
+        // same motif as the physical button. Segoe UI has no character for it,
+        // so it is drawn. The numbers are the launcher's own, scaled.
+        const float sc = g_ghUi.textScale;
+        const float sq = 10.f * sc, off = 4.f * sc, rad = 1.8f * sc;
+        const float top = cy - sq * 0.5f - off * 0.35f;
+        GhUiStroke(D2D1::RectF(x, top, x + sq, top + sq),
+                   GH_ROLE_TEXT_DIM_ON_BG, rad, t.stroke);
+        GhUiStroke(D2D1::RectF(x + off, top + off, x + off + sq, top + off + sq),
+                   GH_ROLE_TEXT_DIM_ON_BG, rad, t.stroke);
+        return off + sq;
     }
 
     const wchar_t* lbl = GhUiGlyphCap(glyph);
     if (!lbl) return 0.f;
     const float w = GhUiGlyphWidth(glyph);
     const D2D1_RECT_F r = D2D1::RectF(x, cy - h * 0.5f, x + w, cy + h * 0.5f);
+    if (GhUiGlyphIsArrows(glyph) || !t.keycaps) {   // the bare letter, in the footer's own type
+        GhUiTextDraw(lbl, GH_TYPE_SMALL, r, GH_ROLE_TEXT_DIM_ON_BG, DWRITE_TEXT_ALIGNMENT_LEADING);
+        return w;
+    }
     // A keycap is part of the footer, which sits on the page background.
     GhUiStroke(GhUiInset(r, 0.5f, 0.5f), GH_ROLE_TEXT_DIM_ON_BG, t.radius <= 0.5f ? 0.f : h * 0.5f, t.stroke);
     GhUiTextDraw(lbl, GH_TYPE_KEY, r, GH_ROLE_TEXT_DIM_ON_BG, DWRITE_TEXT_ALIGNMENT_CENTER);

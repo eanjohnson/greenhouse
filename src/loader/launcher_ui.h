@@ -43,6 +43,15 @@
 #include "qrcodegen.h"       // the membership QR (corpus/vendor/qrcodegen, MIT)
 static std::wstring LuiEntBadge();   // membership section, below
 #include "gh_addon_abi.h"    // add-on DLL ABI (Step 4): an installed add-on is one more library source
+// Theming (U0/U1). gh_theme.h is the token model, gh_ui.h the primitives that
+// read it, gh_ui_layout*.h the renderers. A page built on these draws through
+// GhUiPage*, not through the g_lui brushes below; the two coexist while the
+// pages are ported one at a time.
+#include "gh_theme.h"
+#include "gh_ui.h"
+#include "gh_ui_vm.h"
+#include "gh_ui_layout.h"
+#include "gh_ui_layout_list.h"
 // Packages startup check (LuiRepoStartupCheck): -2 not started, -1 no repository /
 // failed, else the number of updates available. Read by the picker's header badge.
 static std::atomic<int> g_repoUpdates{-2};
@@ -238,6 +247,21 @@ static bool LuiInit()
     mkbr(0xF85149, 1.f, g_lui.brWarn);
     mkbr(0xFFFFFF, 1.f, g_lui.brWhite);
     mkbr(0x000000, 1.f, g_lui.brBlack);
+
+    // Theming. The theme core builds its OWN brushes and formats on the same
+    // device; the legacy g_lui set above stays until the last page is ported.
+    // This runs before OverlayBakePanels because a theme can change the panel
+    // metrics the bake uses, and the bake happens exactly once.
+    GhThemeInit(kLocalState, [](const std::string& s){ Diag("THEME " + s); });
+    GhThemeLoad();
+    GhUiLayoutsInit();
+    if (!GhUiInit(g_lui.dc.get(), g_lui.dw.get(), (float)g_lui.w, (float)g_lui.h)) {
+        Diag("LAUNCHER GhUiInit FAILED");
+    } else {
+        const GhUiLayout* la = GhUiLayoutActive();
+        Diag(std::string("LAUNCHER theme '") + GhThemeCurrent().id +
+             "' layout '" + (la ? la->id : "none") + "'");
+    }
 
     g_lui.ready = true;
     OverlayBakePanels();
@@ -696,144 +720,122 @@ static bool LuiModsOffered(const LauncherItem& it);       // RB opens Mods for t
 static const GhTitle* LuiWorkshopTitle(const LauncherItem& it);   // ...or the Workshop, for a "workshop" title
 static std::wstring LuiModsBadge(const LauncherItem& it); // "Mods: <profile>", or empty
 
+// The picker's row provider. The view-model never holds the rows: it holds this
+// callback and a context, and the layout calls it only for the rows it is about
+// to draw. With 171 owned titles that is ten calls a frame instead of 171
+// string copies, and the row struct it fills is a single reused stack object.
+struct LuiPickCtx {
+    const std::vector<LauncherItem>* items;
+};
+
+static void LuiPickFillRow(void* ctx, int index, GhUiRow& out)
+{
+    out.reset();
+    const LuiPickCtx* c = (const LuiPickCtx*)ctx;
+    if (!c || !c->items || index < 0 || index >= (int)c->items->size()) return;
+    const LauncherItem& it = (*c->items)[index];
+    out.title.setElided(it.display.c_str());
+    out.right.setElided(it.sub.c_str());
+    const std::wstring mods = LuiModsBadge(it);
+    if (!mods.empty()) {
+        out.hasBadge = true;
+        out.badge.label.setElided(mods.c_str());
+        out.badge.role = GH_ROLE_ACCENT;
+    }
+}
+
+// The picker, the first page on the theming layer (U1). Nothing here places a
+// pixel: it fills a GhUiListVM and hands it to the active layout, which is why
+// the same code renders under `list` on the console and in the preview harness
+// on the laptop.
 static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const std::wstring& status,
                         const std::wstring& query, int matchN, int allN,
                         int promptKind, const wchar_t* promptName)
 {
     auto* dc = g_lui.dc.get();
-    const float W = (float)g_lui.w, H = (float)g_lui.h;
     dc->BeginDraw();
-    dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
 
-    // Header
-    LuiText(L"GREENHOUSE", g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
-    {   // status, then the membership badge (§43) when this build has a gate
-        std::wstring st = L"\u25CF  " + status;
+    const int total = (int)items.size();
+    LuiPickCtx ctx{ &items };
+
+    GhUiListVM vm;
+    vm.count = total;
+    vm.sel   = sel;
+    vm.fill  = &LuiPickFillRow;
+    vm.ctx   = &ctx;
+    vm.emptyText.set(L"Nothing to show");
+    vm.emptySub.set(L"Sign in to see the games on your Steam account.");
+
+    GhUiChrome& ch = vm.chrome;
+    ch.title.set(L"GREENHOUSE");
+    ch.statusDot  = true;
+    ch.statusRole = GH_ROLE_ACCENT;
+    ch.status.setElided(status.c_str());
+    {   // membership (§43), as a badge rather than more text in the status line
         const std::wstring eb = LuiEntBadge();
-        if (!eb.empty()) st += L"   \u00B7   " + eb;
-        LuiText(st.c_str(), g_lui.fmtSmall.get(), D2D1::RectF(84, 140, W - 780, 182), g_lui.brAccent.get());
+        if (!eb.empty()) ch.addBadge(eb.c_str(), GH_ROLE_ACCENT, false);
     }
-    {   // Packages badge (START). The count comes from LuiRepoStartupCheck's background fetch.
+    {   // Packages. The count comes from LuiRepoStartupCheck's background fetch.
         const int up = g_repoUpdates.load();
-        std::wstring pk = L"\u2261  START  Packages";
-        if (up > 0) pk += L" \u00B7 " + std::to_wstring(up) + (up == 1 ? L" update" : L" updates");
-        LuiText(pk.c_str(), g_lui.fmtSmall.get(), D2D1::RectF(W - 760, 140, W - 80, 182),
-                up > 0 ? g_lui.brAccent.get() : g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
+        std::wstring pk = L"Packages";
+        if (up > 0) pk += L" · " + std::to_wstring(up) + (up == 1 ? L" update" : L" updates");
+        ch.addAction(GH_GLYPH_START, pk.c_str());
     }
-
     if (g_bake.phase == 1 && g_bake.pending.load()) {   // §47: the shader bake, while it has work
         const uint64_t tot = g_bake.scanTotal.load(), got = g_bake.scanBytes.load();
         const int pct = tot ? (int)(got * 100 / tot) : 0;
-        const std::wstring bl = L"Preparing shaders  " + std::to_wstring(pct) + L"%  \u00B7  " +
+        const std::wstring bl = L"Preparing shaders  " + std::to_wstring(pct) + L"%  ·  " +
                                 std::to_wstring(g_bake.baked.load()) + L" built";
-        LuiText(bl.c_str(), g_lui.fmtSmall.get(), D2D1::RectF(W - 760, 182, W - 80, 218), g_lui.brAccent.get(),
-                DWRITE_TEXT_ALIGNMENT_TRAILING);
+        ch.note.setElided(bl.c_str());
+        ch.noteRole = GH_ROLE_ACCENT;
     }
-    std::wstring sline = query.empty()
-        ? (g_pickOskOpen ? L"Search:  _" : L"Search:  Y for on-screen keyboard")
-        : (L"Search:  " + query + L"_");
-    LuiText(sline.c_str(), g_lui.fmtSmall.get(),
-            D2D1::RectF(84, 182, W - 280, 218),
-            (query.empty() && !g_pickOskOpen) ? g_lui.brDim.get() : g_lui.brFg.get());
 
-    // Item list, with a scroll window so a long (owned-library) list stays fully
-    // navigable: keep the selected row inside [top, footer). Compute how many rows fit,
-    // then a first-visible index that scrolls to follow sel.
-    const float x0 = 80, x1 = W - 80, rowH = 76, top = 228;
-    const int nfit = (int)((H - 90 - top) / rowH); if (nfit < 1) return;
-    int total = (int)items.size();
-    int first = 0;
-    if (total > nfit) {
-        first = sel - nfit / 2;                     // center the selection
-        if (first < 0) first = 0;
-        if (first > total - nfit) first = total - nfit;
-    }
-    for (int vi = 0; vi < nfit && first + vi < total; ++vi) {
-        int i = first + vi;
-        float y = top + (float)vi * rowH;
-        bool cur = (i == sel);
-        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(D2D1::RectF(x0, y, x1, y + rowH - 12), 10, 10);
-        dc->FillRoundedRectangle(rr, cur ? g_lui.brSel.get() : g_lui.brPanel.get());
-        const std::wstring mods = LuiModsBadge(items[i]);
-        LuiText(items[i].display.c_str(), g_lui.fmtItem.get(),
-                D2D1::RectF(x0 + 28, y, x1 - (mods.empty() ? 220 : 600), y + rowH - 12), g_lui.brFg.get());
-        if (!mods.empty())
-            LuiText(mods.c_str(), g_lui.fmtSmall.get(), D2D1::RectF(x1 - 580, y, x1 - 260, y + rowH - 12),
-                    cur ? g_lui.brFg.get() : g_lui.brAccent.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
-        LuiText(items[i].sub.c_str(), g_lui.fmtSmall.get(),
-                D2D1::RectF(x1 - 240, y, x1 - 24, y + rowH - 12),
-                cur ? g_lui.brFg.get() : g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
-    }
+    ch.searchLine.setElided(query.c_str());
+    ch.searchActive = g_pickOskOpen || !query.empty();
+
     {
         wchar_t pos[48];
-        if (query.empty())
-            swprintf(pos, 48, L"%d / %d", sel + 1, allN > 0 ? allN : total);
-        else
-            swprintf(pos, 48, L"%d / %d match", matchN > 0 ? sel + 1 : 0, matchN);
-        LuiText(pos, g_lui.fmtSmall.get(), D2D1::RectF(x0, 182, x1, 218),
-                g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
+        if (query.empty()) swprintf(pos, 48, L"%d / %d", sel + 1, allN > 0 ? allN : total);
+        else               swprintf(pos, 48, L"%d / %d match", matchN > 0 ? sel + 1 : 0, matchN);
+        ch.counter.set(pos);
     }
 
-    // Footer. View has no face-button letter, so draw the two-square glyph
-    // (same motif as the physical button) and keep the "X  Action" rhythm.
-    {
-        const float y0 = H - 70.f, y1 = H - 30.f, cy = (y0 + y1) * 0.5f;
-        float x = 84.f;
-        IDWriteTextFormat* fs = g_lui.fmtSmall.get();
-        ID2D1Brush* dim = g_lui.brDim.get();
-        const wchar_t* left = L"\u25B2 \u25BC  Move      \u25C0 \u25B6  Jump 5      A  Launch      X  Uninstall      ";
-        // Verify re-downloads through a source that offers it (the Steam add-on), so
-        // the View glyph is shown only when one does.
-        const bool verify = GhSteamRuntimeProvided();
-        const bool mods = sel >= 0 && sel < total && LuiModsOffered(items[sel]);
-        const bool ws = sel >= 0 && sel < total && !mods && LuiWorkshopTitle(items[sel]);
-        const std::wstring right = std::wstring(verify ? L"  Verify      " : L"") + (mods ? L"RB  Mods      " : ws ? L"RB  Workshop      " : L"") +
-                                   L"Y  Search      B  Back";
-        float wl = LuiMeasure(left, fs);
-        LuiText(left, fs, D2D1::RectF(x, y0, x + wl + 2.f, y1), dim);
-        x += wl;
-        if (verify) x += LuiDrawViewBtn(x, cy, dim);
-        LuiText(right.c_str(), fs, D2D1::RectF(x, y0, W - 80.f, y1), dim);
-    }
+    // Footer. Verify re-downloads through a source that offers it (the Steam
+    // add-on), so its hint is shown only when one does.
+    ch.addHint(GH_GLYPH_UPDOWN,    L"Move");
+    ch.addHint(GH_GLYPH_LEFTRIGHT, L"Jump 5");
+    ch.addHint(GH_GLYPH_A,         L"Launch");
+    ch.addHint(GH_GLYPH_X,         L"Uninstall");
+    if (GhSteamRuntimeProvided()) ch.addHint(GH_GLYPH_VIEW, L"Verify");
+    const bool mods = sel >= 0 && sel < total && LuiModsOffered(items[sel]);
+    const bool ws   = sel >= 0 && sel < total && !mods && LuiWorkshopTitle(items[sel]);
+    if (mods)     ch.addHint(GH_GLYPH_RB, L"Mods");
+    else if (ws)  ch.addHint(GH_GLYPH_RB, L"Workshop");
+    ch.addHint(GH_GLYPH_Y, L"Search");
+    ch.addHint(GH_GLYPH_B, L"Back");
+
+    GhUiPageList(vm);
 
     if (promptName && promptName[0] && promptKind != 0) {
-        dc->FillRectangle(D2D1::RectF(0, 0, W, H), g_lui.brBg.get());
-        float cx = W * 0.5f, cy = H * 0.5f;
-        D2D1_ROUNDED_RECT box = D2D1::RoundedRect(D2D1::RectF(cx - 460, cy - 200, cx + 460, cy + 200), 16, 16);
-        dc->FillRoundedRectangle(box, g_lui.brPanel.get());
+        GhUiModalVM mv;
+        mv.overPage = false;        // today's prompt repaints the whole screen
+        mv.sel = 0;
         if (promptKind == 2) {
-            LuiText(L"VERIFY FILES", g_lui.fmtTitle.get(),
-                    D2D1::RectF(cx - 430, cy - 180, cx + 430, cy - 100),
-                    g_lui.brAccent.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-            LuiText(L"Check this install against Steam and repair it?", g_lui.fmtItem.get(),
-                    D2D1::RectF(cx - 430, cy - 90, cx + 430, cy - 30),
-                    g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-            LuiText(promptName, g_lui.fmtItem.get(),
-                    D2D1::RectF(cx - 430, cy - 20, cx + 430, cy + 40),
-                    g_lui.brAccent.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-            LuiText(L"Matching files are hashed, not re-downloaded. This can take a while.", g_lui.fmtSmall.get(),
-                    D2D1::RectF(cx - 430, cy + 50, cx + 430, cy + 100),
-                    g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-            LuiText(L"A  Verify            B  Cancel", g_lui.fmtSmall.get(),
-                    D2D1::RectF(cx - 430, cy + 110, cx + 430, cy + 170),
-                    g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            mv.heading.set(L"VERIFY FILES");
+            mv.body.set(L"Check this install against Steam and repair it?");
+            mv.detail.setElided(promptName);
+            mv.note.set(L"Matching files are hashed, not re-downloaded. This can take a while.");
+            mv.addChoice(L"A  Verify");
         } else {
-            LuiText(L"UNINSTALL", g_lui.fmtTitle.get(),
-                    D2D1::RectF(cx - 430, cy - 180, cx + 430, cy - 100),
-                    g_lui.brWarn.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-            LuiText(L"Remove this game from the console?", g_lui.fmtItem.get(),
-                    D2D1::RectF(cx - 430, cy - 90, cx + 430, cy - 30),
-                    g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-            LuiText(promptName, g_lui.fmtItem.get(),
-                    D2D1::RectF(cx - 430, cy - 20, cx + 430, cy + 40),
-                    g_lui.brAccent.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-            LuiText(L"The install folder will be deleted. This cannot be undone.", g_lui.fmtSmall.get(),
-                    D2D1::RectF(cx - 430, cy + 50, cx + 430, cy + 100),
-                    g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-            LuiText(L"A  Yes, uninstall            B  Cancel", g_lui.fmtSmall.get(),
-                    D2D1::RectF(cx - 430, cy + 110, cx + 430, cy + 170),
-                    g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            mv.danger = true;
+            mv.heading.set(L"UNINSTALL");
+            mv.body.set(L"Remove this game from the console?");
+            mv.detail.setElided(promptName);
+            mv.note.set(L"The install folder will be deleted. This cannot be undone.");
+            mv.addChoice(L"A  Yes, uninstall");
         }
+        mv.addChoice(L"B  Cancel");
+        GhUiPageModal(mv);
     }
 
     dc->EndDraw();
