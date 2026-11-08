@@ -7,6 +7,7 @@
 #pragma once
 
 #include "gh_x86_beds_gen.h"
+#include "gh_x86_stubs.h"
 
 namespace ghx86 {
 
@@ -208,6 +209,7 @@ inline bool RunPe32Guest(const std::vector<uint8_t>& file, uint32_t& result, std
     }
     RegisterStdBeds(m);
     RegisterGeneratedBeds(m);
+    RegisterStubBeds(m);
     if (!m.bind_imports())        { why = m.err; return false; }
     m.timing_mark("mapped and bound");
 

@@ -48,6 +48,7 @@
 #include "gh_x86_com_d3d9.h"
 #include "gh_x86_gdi.h"
 #include "gh_x86_dsound.h"
+#include "gh_x86_ddraw.h"
 #include "gh_x86_input.h"
 #include "gh_x86_wndq.h"
 
@@ -711,6 +712,41 @@ inline std::string x86_class_key(uint32_t p, bool wide)
     return k;
 }
 
+// A window-property name as SetProp and GetProp agree on it. Below 0x10000 the
+// argument IS the atom (the MAKEINTATOM form); above it, a string. Win32 keeps
+// property names as atoms, and atoms are case-insensitive, so lowercasing is
+// what matches the real behaviour.
+inline std::string x86_prop_key(uint32_t p, bool wide)
+{
+    if (p < 0x10000) return "#" + std::to_string(p);
+    return x86_class_key(p, wide);
+}
+
+inline uint64_t x86_get_prop(Machine& m, uint32_t hwnd, uint32_t name, bool wide)
+{
+    auto w = m.bed.win_props.find(hwnd);
+    if (w == m.bed.win_props.end()) return 0;
+    auto it = w->second.find(x86_prop_key(name, wide));
+    return it == w->second.end() ? 0 : it->second;
+}
+
+inline uint64_t x86_set_prop(Machine& m, uint32_t hwnd, uint32_t name, uint32_t data, bool wide)
+{
+    m.bed.win_props[hwnd][x86_prop_key(name, wide)] = data;
+    return 1;
+}
+
+inline uint64_t x86_remove_prop(Machine& m, uint32_t hwnd, uint32_t name, bool wide)
+{
+    auto w = m.bed.win_props.find(hwnd);
+    if (w == m.bed.win_props.end()) return 0;
+    auto it = w->second.find(x86_prop_key(name, wide));
+    if (it == w->second.end()) return 0;
+    const uint32_t v = it->second;
+    w->second.erase(it);
+    return v;
+}
+
 inline uint64_t x86_register_class(Machine& m, uint32_t proc, uint32_t name, bool wide, const char* who)
 {
     const uint32_t atom = m.bed.next_atom++;
@@ -1053,6 +1089,20 @@ inline void RegisterPtrToPtrBeds(ThunkRegistry& R)
             if (!a[0]) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
             return 1;
         });
+    // SystemFunction036 is RtlGenRandom: BOOLEAN(PVOID buf, ULONG len), and it
+    // is Chromium's only randomness source on Windows, so libcef cannot start
+    // without it. windows.h does not declare it, so the 8 popbytes are written
+    // out rather than taken from GH_X86_POP. It returns TRUE/FALSE and sets no
+    // last error of its own.
+    GH_X86_BED(R, "advapi32.dll", "SystemFunction036", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            using Fn = LONG (WINAPI*)(void*, PUCHAR, ULONG, ULONG);
+            static Fn gen = (Fn)dyn_resolve("bcrypt.dll", "BCryptGenRandom");
+            if (!a[1]) return 1;                      // zero bytes: trivially done
+            if (!a[0] || !gen) return 0;
+            return gen(nullptr, (PUCHAR)(uintptr_t)a[0], a[1],
+                       2 /*BCRYPT_USE_SYSTEM_PREFERRED_RNG*/) == 0 ? 1 : 0;
+        });
     static_assert(thunk_bytes_of(&::CryptCreateHash) == 20, "CryptCreateHash");
     GH_X86_BED(R, "advapi32.dll", "CryptCreateHash", 20,
         [](Machine&, const uint32_t* a) -> uint64_t {
@@ -1255,6 +1305,32 @@ inline void RegisterSourceGapBeds(ThunkRegistry& R)
             return (uint32_t)g_reg.DeleteValueA(hkey32(a[0]), (LPCSTR)(uintptr_t)a[1]);
         });
 
+    // RegNotifyChangeKeyValue(hKey, bWatchSubtree, dwFilter, hEvent, fAsync).
+    // The hive is ours and lives in this process: nothing outside it can change
+    // a key, so no notification can ever be due. Accepting the registration and
+    // never signalling the event is therefore the true answer, not a stub --
+    // Chromium (libcef, inside Half-Life's gameui) registers for changes to
+    // "Internet Settings" to watch for a proxy change that will never come.
+    //
+    // The synchronous form is refused instead of answered: it is defined to
+    // block until something changes, and here nothing ever will, so returning
+    // would either hang that thread forever or send the caller round a loop
+    // re-reading an unchanged key.
+    static_assert(GH_X86_POP(RegNotifyChangeKeyValue) == 20, "RegNotifyChangeKeyValue");
+    GH_X86_BED(R, "advapi32.dll", "RegNotifyChangeKeyValue", 20,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            static bool once = false;
+            if (!once) {
+                once = true;
+                log("X86 REG RegNotifyChangeKeyValue filter=" + hex(a[2]) +
+                    " subtree=" + std::to_string(a[1]) +
+                    (a[4] ? " async -> ERROR_SUCCESS; the event is never signalled"
+                          : " SYNCHRONOUS -> ERROR_CALL_NOT_IMPLEMENTED (it would block forever)"));
+            }
+            if (!a[4]) return (uint32_t)ERROR_CALL_NOT_IMPLEMENTED;
+            return (uint32_t)ERROR_SUCCESS;
+        });
+
     // Two PHANDLE outs (vstdlib's process pipes).
     static_assert(GH_X86_POP(CreatePipe) == 16, "CreatePipe");
     GH_X86_BED(R, "kernel32.dll", "CreatePipe", 16,
@@ -1443,50 +1519,32 @@ inline void RegisterSourceGapBeds(ThunkRegistry& R)
 
     // PAINTSTRUCT: HDC first, so every later field moves (64 bytes on x86, 72
     // on x64). The paint DC is the host's; handles fit in 32 bits.
+    // These three used to pass the guest's HWND to the host, which has never
+    // heard of it: BeginPaint answered a NULL HDC and TrackMouseEvent FALSE.
+    // The window is ours, so they are answered here instead -- the paint DC is
+    // the same one GetDC hands out, and the whole window is always the paint
+    // rectangle because nothing here keeps an update region.
     static_assert(GH_X86_POP(BeginPaint) == 8, "BeginPaint");
     GH_X86_BED(R, "user32.dll", "BeginPaint", 8,
-        [](Machine&, const uint32_t* a) -> uint64_t {
-            PAINTSTRUCT ps{};
-            HDC dc = BeginPaint((HWND)(uintptr_t)a[0], &ps);
+        [](Machine& m, const uint32_t* a) -> uint64_t {
             if (a[1]) {
                 uint8_t* d = (uint8_t*)(uintptr_t)a[1];
                 std::memset(d, 0, 64);
-                const uint32_t h = (uint32_t)(uintptr_t)ps.hdc, erase = (uint32_t)ps.fErase;
-                std::memcpy(d + 0, &h, 4);
-                std::memcpy(d + 4, &erase, 4);
-                std::memcpy(d + 8, &ps.rcPaint, 16);
+                const uint32_t v[6] = { kFakeHdc, 0, 0, 0, m.bed.win_w, m.bed.win_h };
+                std::memcpy(d, v, sizeof(v));   // hdc, fErase, then rcPaint
             }
-            return (uint32_t)(uintptr_t)dc;
+            return kFakeHdc;
         });
     static_assert(GH_X86_POP(EndPaint) == 8, "EndPaint");
     GH_X86_BED(R, "user32.dll", "EndPaint", 8,
-        [](Machine&, const uint32_t* a) -> uint64_t {
-            PAINTSTRUCT ps{};
-            if (a[1]) {
-                const uint8_t* s = (const uint8_t*)(uintptr_t)a[1];
-                uint32_t h = 0;
-                std::memcpy(&h, s, 4);
-                ps.hdc = (HDC)(uintptr_t)h;
-                std::memcpy(&ps.rcPaint, s + 8, 16);
-            }
-            return EndPaint((HWND)(uintptr_t)a[0], &ps);
-        });
+        [](Machine&, const uint32_t*) -> uint64_t { return 1; });
 
     // TRACKMOUSEEVENT {cbSize, dwFlags, HWND, dwHoverTime}: 16 bytes on x86.
+    // There is no cursor leaving or hovering over a surrogate window, so the
+    // request is accepted and no WM_MOUSELEAVE is ever posted.
     static_assert(GH_X86_POP(TrackMouseEvent) == 4, "TrackMouseEvent");
     GH_X86_BED(R, "user32.dll", "TrackMouseEvent", 4,
-        [](Machine&, const uint32_t* a) -> uint64_t {
-            if (!a[0]) return 0;
-            uint32_t g[4] = {};
-            std::memcpy(g, (void*)(uintptr_t)a[0], 16);
-            TRACKMOUSEEVENT t{ sizeof(t), g[1], (HWND)(uintptr_t)g[2], g[3] };
-            const BOOL ok = TrackMouseEvent(&t);
-            if (ok && (g[1] & TME_QUERY)) {
-                const uint32_t out[4] = { 16, t.dwFlags, (uint32_t)(uintptr_t)t.hwndTrack, t.dwHoverTime };
-                std::memcpy((void*)(uintptr_t)a[0], out, 16);
-            }
-            return ok;
-        });
+        [](Machine&, const uint32_t* a) -> uint64_t { return a[0] ? 1 : 0; });
 
     // Structures with handles in them, for features with no console analogue.
     static_assert(GH_X86_POP(FlashWindowEx) == 4, "FlashWindowEx");
@@ -1881,12 +1939,842 @@ inline void RegisterSourceGapBeds(ThunkRegistry& R)
         [](Machine&, const uint32_t*) -> uint64_t { SetLastError(ERROR_INVALID_HANDLE); return 0; });
     GH_X86_BED(R, "wininet.dll", "HttpQueryInfoA", 20,
         [](Machine&, const uint32_t*) -> uint64_t { SetLastError(ERROR_INVALID_HANDLE); return 0; });
+
+    // -- the Half-Life 1 gap --------------------------------------------------
+    //
+    // Nineteen names the HL1 binaries on the -soft path import and no bed
+    // implemented; four of those (the condition variables) turned out to be
+    // native-mode beds already, leaving these fifteen. They go in one batch on
+    // purpose: an unresolved import is only fatal at the moment it is called,
+    // so finding them one console deploy at a time costs a deploy per name.
+    //
+    // None of them are in the bulk-generated forward table because the UWP
+    // filtering in the SDK headers does not declare them, and GH_X86_FWD_DYN
+    // needs a declaration for decltype. dyn_resolve by string does not, which
+    // is why several of these are hand beds over a call that is in fact present
+    // on the console -- the same shape as the MapVirtualKeyExA bed below.
+    //
+    // Pop sizes are written out rather than static_assert'ed for the same
+    // reason: the function the assert would measure is not declared here.
+
+    // SDL2 builds its scancode table with this (WIN_UpdateKeymap), and with an
+    // empty table every WM_KEYDOWN becomes SDLK_UNKNOWN -- so the pad, which
+    // reaches the guest as keys, would press nothing. The console's user32 does
+    // export it; only the header hides it.
+    GH_X86_BED(R, "user32.dll", "MapVirtualKeyW", 8,            // (uCode, uMapType)
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            using Fn = UINT (WINAPI*)(UINT, UINT);
+            static Fn p = (Fn)dyn_resolve("user32.dll", "MapVirtualKeyW");
+            static bool warned = false;
+            if (!p) {
+                if (!warned) { warned = true; log("X86 MapVirtualKeyW: absent, keymap will be empty"); }
+                return 0;
+            }
+            return (uint32_t)p(a[0], a[1]);
+        });
+
+    // CharLowerW has two signatures in one: a pointer when the high word is
+    // set, and a single character packed into the low word when it is not.
+    // Lowering ASCII and Latin-1 in place covers every caller here (vgui's
+    // text fields) and keeps the bed free of a locale the console does not have.
+    GH_X86_BED(R, "user32.dll", "CharLowerW", 4,                // (lpsz)
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            auto low = [](wchar_t c) -> wchar_t {
+                if (c >= L'A' && c <= L'Z') return (wchar_t)(c - L'A' + L'a');
+                if (c >= 0xC0 && c <= 0xDE && c != 0xD7) return (wchar_t)(c + 0x20);
+                return c;
+            };
+            if (!(a[0] >> 16)) return (uint32_t)low((wchar_t)(a[0] & 0xFFFFu));   // a character, not a string
+            if (!a[0]) return 0;
+            for (wchar_t* w = (wchar_t*)(uintptr_t)a[0]; *w; ++w) *w = low(*w);
+            return a[0];
+        });
+
+    GH_X86_BED(R, "user32.dll", "IntersectRect", 12,            // (dst, src1, src2)
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (!a[0] || !a[1] || !a[2]) return 0;
+            const RECT* p = (const RECT*)(uintptr_t)a[1];
+            const RECT* q = (const RECT*)(uintptr_t)a[2];
+            RECT* d = (RECT*)(uintptr_t)a[0];
+            d->left   = p->left   > q->left   ? p->left   : q->left;
+            d->top    = p->top    > q->top    ? p->top    : q->top;
+            d->right  = p->right  < q->right  ? p->right  : q->right;
+            d->bottom = p->bottom < q->bottom ? p->bottom : q->bottom;
+            if (d->right <= d->left || d->bottom <= d->top) { *d = RECT{}; return 0; }
+            return 1;
+        });
+
+    // FoldStringW's only job for these callers is case/compatibility folding
+    // ahead of a comparison. Without the real call, passing the string through
+    // unchanged is the one wrong answer that cannot break a comparison the
+    // guest then makes against another string folded the same way.
+    GH_X86_BED(R, "kernel32.dll", "FoldStringW", 20,            // (flags, src, cchSrc, dst, cchDst)
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            using Fn = int (WINAPI*)(DWORD, LPCWSTR, int, LPWSTR, int);
+            static Fn p = (Fn)dyn_resolve("kernel32.dll", "FoldStringW");
+            if (p) return (uint32_t)p(a[0], (LPCWSTR)(uintptr_t)a[1], (int)a[2],
+                                      (LPWSTR)(uintptr_t)a[3], (int)a[4]);
+            const wchar_t* src = (const wchar_t*)(uintptr_t)a[1];
+            if (!src) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+            int n = (int)a[2];
+            if (n < 0) { n = 0; while (src[n]) ++n; ++n; }       // negative: NUL-terminated, NUL included
+            if (!(int)a[4]) return (uint32_t)n;                  // size query
+            if ((int)a[4] < n || !a[3]) { SetLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
+            std::memcpy((void*)(uintptr_t)a[3], src, (size_t)n * 2);
+            return (uint32_t)n;
+        });
+
+    // Every guest address below 4GB in this process is ours, and a bed that
+    // genuinely probed would have to fault to find out. A null pointer is the
+    // only answer this can give honestly, and it is the one callers test for.
+    GH_X86_BED(R, "kernel32.dll", "IsBadStringPtrA", 8,         // (lpsz, ucchMax)
+        [](Machine&, const uint32_t* a) -> uint64_t { return a[0] ? 0 : 1; });
+
+    // The 16-bit-era open. HL1's filesystem goes through CreateFile; this is
+    // here so the import resolves, and it logs if it is ever really called so
+    // the next session knows to implement it rather than guess.
+    GH_X86_BED(R, "kernel32.dll", "OpenFile", 12,               // (name, ofstruct, style)
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            log(std::string("X86 OpenFile(legacy) style=") + hex(a[2]) + " " +
+                ((const char*)(uintptr_t)a[0] ? (const char*)(uintptr_t)a[0] : "(null)") +
+                " -- not implemented, returning HFILE_ERROR");
+            if (a[1]) {
+                // OFSTRUCT is BYTE cBytes, BYTE fFixedDisk, WORD nErrCode,
+                // WORD Reserved1, WORD Reserved2, CHAR szPathName[128]: so
+                // nErrCode sits at offset 2 and the whole thing is 136 bytes.
+                std::memset((void*)(uintptr_t)a[1], 0, 136);
+                *(uint8_t*)(uintptr_t)a[1] = 136;               // cBytes
+                const uint16_t e = 2;                           // ERROR_FILE_NOT_FOUND
+                std::memcpy((void*)(uintptr_t)(a[1] + 2), &e, 2);
+            }
+            return 0xFFFFFFFFu;                                 // HFILE_ERROR
+        });
+
+    // The Ex forms of the font calls, degraded to the non-Ex ones that the
+    // console does export (AddFontResourceA is already a generated forward).
+    // Dropping the flags loses FR_PRIVATE, which only means a font the guest
+    // added stays visible process-wide -- harmless in a container with one app.
+    GH_X86_BED(R, "gdi32.dll", "AddFontResourceExA", 12,        // (name, fl, res)
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            using Ex = int (WINAPI*)(LPCSTR, DWORD, PVOID);
+            using Fn = int (WINAPI*)(LPCSTR);
+            static Ex pex = (Ex)dyn_resolve("gdi32.dll", "AddFontResourceExA");
+            if (pex) return (uint32_t)pex((LPCSTR)(uintptr_t)a[0], a[1], (PVOID)(uintptr_t)a[2]);
+            static Fn p = (Fn)dyn_resolve("gdi32.dll", "AddFontResourceA");
+            return p ? (uint32_t)p((LPCSTR)(uintptr_t)a[0]) : 0;
+        });
+    GH_X86_BED(R, "gdi32.dll", "RemoveFontResourceExA", 12,     // (name, fl, pdv)
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            using Ex = BOOL (WINAPI*)(LPCSTR, DWORD, PVOID);
+            using Fn = BOOL (WINAPI*)(LPCSTR);
+            static Ex pex = (Ex)dyn_resolve("gdi32.dll", "RemoveFontResourceExA");
+            if (pex) return (uint32_t)pex((LPCSTR)(uintptr_t)a[0], a[1], (PVOID)(uintptr_t)a[2]);
+            static Fn p = (Fn)dyn_resolve("gdi32.dll", "RemoveFontResourceA");
+            return p ? (uint32_t)p((LPCSTR)(uintptr_t)a[0]) : 1;
+        });
+
+    // No colour management on the console: there is no ICM profile to name, and
+    // FALSE with ERROR_FILE_NOT_FOUND is what a display without one returns.
+    GH_X86_BED(R, "gdi32.dll", "GetICMProfileW", 12,            // (hdc, pBufSize, pszFilename)
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (a[1]) { const uint32_t z = 0; std::memcpy((void*)(uintptr_t)a[1], &z, 4); }
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return 0;
+        });
+
+    // -- cfgmgr32, reached through setupapi -----------------------------------
+    // SDL2's HIDAPI walks a device's parent chain for its VID/PID this way.
+    // The device list above is already empty, so the only consistent answer is
+    // that there is no such devnode -- and Registry::find matches on the name
+    // alone, so one registration serves both setupapi and cfgmgr32 imports.
+    GH_X86_BED(R, "setupapi.dll", "CM_Locate_DevNodeA", 12,     // (pdnDevInst, pDeviceID, ulFlags)
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (a[0]) { const uint32_t z = 0; std::memcpy((void*)(uintptr_t)a[0], &z, 4); }
+            return 0x0000000Du;                                 // CR_NO_SUCH_DEVNODE
+        });
+    GH_X86_BED(R, "setupapi.dll", "CM_Get_Parent", 12,          // (pdnDevInst, dnDevInst, ulFlags)
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (a[0]) { const uint32_t z = 0; std::memcpy((void*)(uintptr_t)a[0], &z, 4); }
+            return 0x0000000Du;                                 // CR_NO_SUCH_DEVNODE
+        });
+    GH_X86_BED(R, "setupapi.dll", "CM_Get_Device_IDA", 16,      // (dnDevInst, Buffer, BufferLen, ulFlags)
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (a[1] && a[2]) *(char*)(uintptr_t)a[1] = '\0';
+            return 0x0000000Du;                                 // CR_NO_SUCH_DEVNODE
+        });
+
+    // -- ddraw ----------------------------------------------------------------
+    // 0.0.914.0 answered DDERR_GENERIC here, and that one failure cost HL1 the
+    // renderer it already had: sw.dll reported "unsupported video", hl.exe
+    // reloaded itself with hw.dll, and hw.dll wants 31 OpenGL entry points this
+    // console does not have. sw.dll blits through SDL2 (and so through our
+    // D3D9 layer); DirectDraw is only how GoldSrc claims the display. So the
+    // object is ours now -- see gh_x86_ddraw.h for what each method answers and
+    // why.
+    GH_X86_BED(R, "ddraw.dll", "DirectDrawCreate", 12,          // (lpGUID, lplpDD, pUnkOuter)
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            if (!a[1] || !m.cpu.ptr(a[1], 4)) {
+                log("X86 DirectDrawCreate with no output pointer -> DDERR_INVALIDPARAMS");
+                return kDdErrInvalidParams;
+            }
+            const uint32_t obj = ddraw_create(m);
+            std::memcpy((void*)(uintptr_t)a[1], &obj, 4);
+            if (!obj) {
+                log("X86 DirectDrawCreate could not build the object -> DDERR_GENERIC");
+                return 0x80004005u;
+            }
+            log("X86 DirectDrawCreate -> DD_OK, synthetic IDirectDraw at " + hex(obj));
+            return kDdOk;
+        });
+    // Same object for the Ex entry point: its extra argument is the IID, and
+    // the only one this vtable IS is IID_IDirectDraw. Anything else has to say
+    // so rather than be handed a vtable whose SetDisplayMode pops 16 bytes.
+    GH_X86_BED(R, "ddraw.dll", "DirectDrawCreateEx", 16,        // (lpGUID, lplpDD, iid, pUnkOuter)
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            if (a[1] && m.cpu.ptr(a[1], 4)) {
+                const uint32_t z = 0; std::memcpy((void*)(uintptr_t)a[1], &z, 4);
+            }
+            log("X86 DirectDrawCreateEx -> E_NOINTERFACE (only IID_IDirectDraw is answered here)");
+            return kDdErrNoInterface;
+        });
+
+    // -- winmm: MCI and the wave-in error text --------------------------------
+    // MCI is HL1's CD audio. There is no CD, and "invalid device" is what a
+    // machine without one returns, which the engine already handles by playing
+    // no track music.
+    GH_X86_BED(R, "winmm.dll", "mciSendCommandA", 16,           // (id, msg, dwParam1, dwParam2)
+        [](Machine&, const uint32_t*) -> uint64_t { return 257; });   // MCIERR_INVALID_DEVICE_ID
+    GH_X86_BED(R, "winmm.dll", "mciGetErrorStringA", 12,        // (mcierr, pszText, cchText)
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (a[1] && a[2]) *(char*)(uintptr_t)a[1] = '\0';
+            return 0;                                           // FALSE: no text for this code
+        });
+    // An empty string with NOERROR, not a failure: the caller is formatting a
+    // message, and a failure here would make it print its own garbage instead.
+    GH_X86_BED(R, "winmm.dll", "waveInGetErrorTextA", 12,       // (mmrError, pszText, cchText)
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (a[1] && a[2]) *(char*)(uintptr_t)a[1] = '\0';
+            return MMSYSERR_NOERROR;
+        });
 }
 
 
 // ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// The 32-bit Steam bridge (gh_x86_steam=1)
+// ---------------------------------------------------------------------------
+// Valve's 32-bit steam_api.dll cannot work on this console: SteamAPI_Init looks
+// for a running Steam client, does not find one, and says so --
+//
+//   [S_API] SteamAPI_Init(): SteamAPI_IsSteamRunning() did not locate a running
+//           instance of Steam.
+//   [S_API] SteamAPI_Init(): Could not determine Steam client install directory.
+//
+// -- at which point Half-Life's engine prints "Failed to initalize
+// authentication interface. Exiting..." and calls ExitProcess(-1). The console
+// DOES have a Steam session; it belongs to the x64 engine inside the loader,
+// which a 32-bit guest has no way to call. These beds are that bridge, and
+// g_x86_bed_only_steam stops the game's own copy being mapped so they are
+// reached at all (resolve_for_module prefers a mapped guest DLL to a bed).
+//
+// The whole surface is cdecl: Steamworks' S_CALLTYPE is __cdecl, so the CALLER
+// pops and GH_X86_BED_CDECL is the right macro. Getting that wrong would
+// unbalance the guest's stack on the very first call.
+//
+// This first pass answers the flat entry points only and returns no interfaces.
+// That is deliberate: it is what turns "we do not know what Half-Life wants
+// from Steam" into a diag that NAMES each interface version it asks for, which
+// is what the proxy vtables have to be built against. Expect the engine to get
+// past its authentication check and then find a null interface.
+// -- 32-bit Steam interface stubs -------------------------------------------
+//
+// The 0.0.909.0 probe answered the question it was built to ask: HL1 gets past
+// the authentication gate once SteamAPI_Init says yes, and then asks for
+// SteamInput006 and STEAMAPPS_INTERFACE_VERSION008 -- exactly the two the
+// engine consults first. Returning null for them is survivable only where the
+// engine happens to test the pointer, and a static read of sw.dll says it
+// usually does not: 26 of its 49 interface uses dereference the pointer with no
+// null check at all. So the next step cannot be another null.
+//
+// These stubs are a guest object whose vtable is ours. Zero is the default
+// answer, and the right one nearly everywhere -- it is "no", "none", "invalid
+// handle" and "unavailable" across this API. Two slots are the exception, and
+// they are the whole reason HL1 would not start; see `ret` below.
+//
+// The ONLY thing a stub has to get right is the stack. Windows Steam interfaces
+// are thiscall: `this` is in ECX (which a stub that ignores it never needs) and
+// the CALLEE pops the arguments. Pop the wrong number and the guest's stack is
+// silently wrong from then on. So the pop counts below are not guesses: each
+// one was read off sw.dll's own call sites by counting the bytes pushed between
+// the accessor and the vtable call, and every site for a given slot agreed.
+//
+// This table was built WRONG twice, and both times the gap was the bug.
+//
+// The first version matched `call dword ptr [reg+disp]`, so it saw only the
+// sites where the compiler called straight through the vtable and missed every
+// site that loads the slot into a register first (`mov eax,[reg+0x18]; call
+// eax`) -- which is how the ownership gate is called. The second followed the
+// pointer instead of matching one instruction shape, and resolved 25 slots.
+//
+// 25 was still not all of them, because both scans anchored on the CALL to
+// SteamInternal_ContextInit, found by searching for the bytes `FF 15 <iat
+// slot>`. sw.dll also loads that import into a register once and calls it
+// through the register -- `mov esi,[iat]` and then ten times `push ctx; call
+// esi` -- and no byte search for FF 15 can see any of those. That is the whole
+// of ISteamInput, and cell 910 died on the first call through it: the stub had
+// no pop count for the slot, popped nothing, and the guest's stack was wrong
+// from that instruction on.
+//
+// The third scan anchors on the ctx ARRAY instead, which cannot hide. Valve's
+// accessor is `static void* ctx[3] = { &Init_<iface>, 0, 0 }; return
+// *(T**)SteamInternal_ContextInit(ctx);`, so: find the Init_ bodies (the only
+// functions that call FindOrCreate*Interface, each pushing its version string),
+// find the dwords in the image that point at one, and find every `push <that
+// address>` in .text. Whatever shape the call takes, eax afterwards is &iface.
+// That is 113 accessor uses and 56 slots, every slot agreeing with itself
+// across all of its sites.
+//
+// Getting the pop counts to agree took three corrections, each of which had
+// been silently wrong before:
+//   - `sub esp, N` is how MSVC passes a small struct by value. Those bytes are
+//     arguments too (ISteamGameServer slot 41 is 16, not 8).
+//   - `add esp, N` after an intervening cdecl helper is that helper's cleanup.
+//     Counting its arguments made STEAMHTTP slot 0 look like 20 when it is 8 --
+//     CreateHTTPRequest(EHTTPMethod, const char*).
+//   - a helper with NO such cleanup is callee-pop, and its pushes have to be
+//     dropped (ISteamNetworkingUtils slot 14 is 4 at both of its sites).
+// A blanket reset at every intervening call is wrong in the other direction: a
+// compiler pushes some arguments, calls a helper to compute another, and pushes
+// the result after, so the run spans the call.
+//
+// Shape-matching a compiler's output tells you what it usually emits; only
+// following the data tells you what it emitted here.
+//
+// Slot numbers are vtable indices, which are identical between the x86 and x64
+// builds of one interface version; the version strings come from the image, not
+// from an SDK header.
+//
+// `ret` is what the slot answers in EAX. It is 0 unless there is a reason, and
+// there is exactly one reason here: ISteamApps slots 0 and 6 are the engine
+// asking "do you own this game?", and a false answer is fatal in a way that
+// leaves no trace. The chain, read out of sw.dll:
+//
+//   hl.exe                      calls IEngineAPI::Run, exits with what it gets
+//   CEngineAPI::Run     1021ea20  __except returns 0 -> silent, clean exit
+//   RunListenServer     1021efb0  FileSystem_Init == 0 -> return 0
+//   FileSystem_Init     101c6610  tail call == 0 -> return 0
+//                       101b92e0  parses -basedir/-game, then
+//                       101c6840  the gamedir/appid setup, which ends in
+//                       10217330  if (!SteamApps()) return false;
+//                                 return SteamApps()->BIsSubscribedApp(appid)
+//
+// The appid comes from a table in sw.dll mapping gamedir to app: valve->70,
+// cstrike->10, gearbox->50, bshift->130, and so on. So "false" here means the
+// engine believes this account does not own Half-Life, and every layer above
+// turns that into ExitProcess(0) with no message, no log line and no fault.
+//
+// The x64 shim already reached this exact conclusion from the other direction:
+// cell ENGOFF2 watched a 64-bit guest call ISteamApps slots 0 and 6, get false
+// twice, and quit cleanly, and corpus/shims/steam_api64.cpp has answered TRUE
+// there ever since. This is the same answer on the 32-bit side, for the same
+// reason, and it is a true one: the title was downloaded from Steam with the
+// user's own sign-in, so the account does own it.
+//
+// `retstr` is for the handful of slots that answer with a `const char*`. Zero
+// is NOT a safe answer for those: the caller hands the result straight to
+// strlen or strcpy, so a null is an access violation one frame later. When it
+// is set, the slot answers a pointer to a guest copy of this string instead.
+//
+// `custom` is for a slot whose answer has to be computed from its arguments.
+// It runs instead of `ret`/`retstr`, and `argbytes` still decides the pop, so
+// a custom slot is exactly as safe as a constant one.
+
+// ---------------------------------------------------------------------------
+// Half-Life 1's listen-server authentication handshake
+// ---------------------------------------------------------------------------
+// GoldSrc single-player IS a listen server, and its CLIENT half will not send
+// its own connect packet until Steam has given it a certificate:
+//
+//     len = ISteamUser::InitiateGameConnection(blob, 1024, gsID, ip, port, sec)
+//
+// A zero length prints "STEAM certificate length error! 0/1024" and the engine
+// unloads the map it has just finished loading. That is what 921 did, with
+// c0a0.bsp, its .nod graph and every model already in memory.
+//
+// `sv_lan 1` does NOT avoid it. 921 proved that on the device: the cvar reached
+// the command line (the diag shows "+sv_lan 1" in CMDLINE) and the call still
+// happened. sv_lan only changes which auth protocol the SERVER advertises; the
+// client asks for its certificate whenever SteamUser() is non-null, and leaving
+// SteamUser() null is not an option -- the engine fatals without it.
+//
+// So we issue a certificate of our own. The engine treats it as opaque: it
+// copies the bytes into the connect packet and the server hands them straight
+// back to ISteamGameServer. Nothing reads inside it but us. Two consequences
+// shape the format:
+//
+//  - It is printable ASCII with no NUL, no quote and no backslash, because
+//    GoldSrc appends it to a text connect packet.
+//  - It carries a magic, which is how the game-server side identifies itself
+//    below without guessing at a vtable layout.
+inline constexpr char     kGhAuthMagic[]  = "GHSTEAM1";
+inline constexpr uint32_t kGhAuthBlobLen  = 64;
+// The same identity the x64 shim answers with: Public/Individual/Desktop/1.
+// See the kFakeSteamID identity defect -- one shared id is wrong for real
+// multiplayer and exactly right for a single-player listen server.
+inline constexpr uint64_t kGhAuthSteamID  = 0x0110000100000001ULL;
+inline int g_gh_auth_issued = 0;
+inline int g_gh_auth_trace  = 0;
+
+// True for an address that is safe to touch in the guest: every guest mapping
+// lives below 4 GB and above the NULL page, and in native mode a guest pointer
+// is also a host pointer, so this is the whole of the check.
+inline bool gh_guest_ptr_ok(uint32_t p, uint32_t len)
+{
+    return p >= 0x10000u && (uint64_t)p + len <= 0xFFFF0000ull;
+}
+
+// ISteamUser::InitiateGameConnection(void* pAuthBlob, int cbMaxAuthBlob,
+//     CSteamID steamIDGameServer, uint32 unIPServer, uint16 usPortServer,
+//     bool bSecure) -- SteamUser023 slot 3, 28 argument bytes
+//     (4 + 4 + 8 + 4 + 4 + 4; `this` rides in ECX and is not on the stack).
+// Answers the number of bytes written, which is what the engine compares.
+inline uint64_t gh_steam_initiate_game_connection(Machine&, const uint32_t* a)
+{
+    const uint32_t blob = a[0];
+    const int32_t  cap  = (int32_t)a[1];
+    if (!gh_guest_ptr_ok(blob, kGhAuthBlobLen) || cap < (int32_t)kGhAuthBlobLen) {
+        log("X86 STEAM InitiateGameConnection: no room for a certificate (buf " +
+            hex(blob) + " cap " + std::to_string(cap) + ") -> 0");
+        return 0;
+    }
+    char buf[kGhAuthBlobLen];
+    std::memcpy(buf, kGhAuthMagic, 8);
+    // The id goes in as 16 hex characters rather than 8 raw bytes, because the
+    // raw form contains NULs and this blob travels inside a text packet.
+    static const char kHex[] = "0123456789ABCDEF";
+    for (int i = 0; i < 16; ++i)
+        buf[8 + i] = kHex[(kGhAuthSteamID >> (60 - 4 * i)) & 0xF];
+    for (uint32_t i = 24; i < kGhAuthBlobLen; ++i)
+        buf[i] = (char)('a' + (i % 26));
+    std::memcpy((void*)(uintptr_t)blob, buf, kGhAuthBlobLen);
+    ++g_gh_auth_issued;
+    log("X86 STEAM InitiateGameConnection -> a " + std::to_string(kGhAuthBlobLen) +
+        " byte Greenhouse certificate at " + hex(blob) + " (cap " +
+        std::to_string(cap) + ")");
+    return kGhAuthBlobLen;
+}
+
+// ISteamGameServer::SendUserConnectAndAuthenticate(uint32 unIPClient,
+//     const void* pvAuthBlob, uint32 cubAuthBlobSize, CSteamID* pSteamIDUser)
+//     -- 16 argument bytes.
+//
+// It is slot 38, which 922 established at run time: the trace caught it being
+// called with 0x7F000001 one instruction after the certificate went out.
+//
+// The handler stays on the other two 16-byte slots as well, because the
+// certificate is what identifies the call rather than the slot index. Those two
+// are the packet relay, which carries a length where this one carries a
+// pointer, so the test cannot confuse them, and for them the handler answers 0
+// exactly as the table did.
+inline uint64_t gh_steam_gs_connect_and_auth(Machine&, const uint32_t* a)
+{
+    const uint32_t ip = a[0], blob = a[1], len = a[2], out = a[3];
+    const bool ours = len == kGhAuthBlobLen &&
+                      gh_guest_ptr_ok(blob, kGhAuthBlobLen) &&
+                      std::memcmp((const void*)(uintptr_t)blob, kGhAuthMagic, 8) == 0;
+    if (!ours) return 0;
+    if (gh_guest_ptr_ok(out, 8))
+        std::memcpy((void*)(uintptr_t)out, &kGhAuthSteamID, 8);
+    // hex() prefixes "0x" itself, so the two halves of the id are joined by
+    // hand rather than concatenated through it.
+    char id[24];
+    std::snprintf(id, sizeof id, "0x%08X%08X",
+                  (unsigned)(kGhAuthSteamID >> 32), (unsigned)kGhAuthSteamID);
+    log("X86 STEAM SendUserConnectAndAuthenticate: our own certificate came "
+        "back from client ip " + hex(ip) + " -- approving it as " + id);
+    return 1;
+}
+
+struct SteamSlotSpec {
+    const char* iface; uint16_t slot; uint16_t argbytes; uint32_t ret;
+    const char* retstr = nullptr;
+    uint64_t (*custom)(Machine&, const uint32_t*) = nullptr;
+};
+
+inline constexpr SteamSlotSpec kSteamSlots[] = {
+    // STEAMAPPS_INTERFACE_VERSION008
+        // BIsSubscribed. No call site reaches it, but the signature is
+        // certain and it asks the same question as slot 6, so it must not
+        // answer differently if some path we did not find gets here.
+    { "STEAMAPPS_INTERFACE_VERSION008",   0,   0, 1 },
+        // BIsLowViolence(). Found at run time, not by the scan: cell 911 logged
+        // it as an unknown slot called from 0x101c6923, inside the same gamedir
+        // setup that holds the ownership gate. It takes no arguments, so the
+        // unknown-slot thunk's "pop nothing" happened to be right -- this time.
+    { "STEAMAPPS_INTERFACE_VERSION008",   1,   0, 0 },
+        // GetCurrentGameLanguage. Null is safe: the call site falls back to
+        // "english" when it is 0.
+    { "STEAMAPPS_INTERFACE_VERSION008",   4,   0, 0 },
+        // BIsSubscribedApp(AppId_t) -- the ownership gate. See above.
+    { "STEAMAPPS_INTERFACE_VERSION008",   6,   4, 1 },
+    { "STEAMAPPS_INTERFACE_VERSION008",  26,   8, 0 },
+    // STEAMHTTP_INTERFACE_VERSION003
+    { "STEAMHTTP_INTERFACE_VERSION003",   0,   8, 0 },
+    { "STEAMHTTP_INTERFACE_VERSION003",   3,  12, 0 },
+    { "STEAMHTTP_INTERFACE_VERSION003",   5,   8, 0 },
+    { "STEAMHTTP_INTERFACE_VERSION003",  11,   8, 0 },
+    { "STEAMHTTP_INTERFACE_VERSION003",  12,  12, 0 },
+    { "STEAMHTTP_INTERFACE_VERSION003",  14,   4, 0 },
+    { "STEAMHTTP_INTERFACE_VERSION003",  15,   8, 0 },
+    // SteamFriends017
+        // GetPersonaName. Returns a string, so see `retstr`: a null here
+        // faults in the caller's strlen.
+    { "SteamFriends017",   0,   0, 0, "Player" },
+    { "SteamFriends017",  43,   8, 0 },
+    // SteamInput006
+        // SteamInput006 is here only because of the rescan that found it:
+        // sw.dll calls ContextInit for it through a register, so no byte
+        // search for `FF 15 <iat>` ever saw these five slots.
+    { "SteamInput006",   0,   4, 0 },
+    { "SteamInput006",   9,   4, 0 },
+    { "SteamInput006",  10,  16, 0 },
+    { "SteamInput006",  12,  16, 0 },
+    { "SteamInput006",  14,   8, 0 },
+    // SteamNetworkingSockets012
+    { "SteamNetworkingSockets012",  42,   4, 0 },
+    { "SteamNetworkingSockets012",  43,   8, 0 },
+    { "SteamNetworkingSockets012",  46,   4, 0 },
+    // SteamNetworkingUtils004
+    { "SteamNetworkingUtils004",  13,   8, 0 },
+    { "SteamNetworkingUtils004",  14,   4, 0 },
+    { "SteamNetworkingUtils004",  20,  16, 0 },
+    { "SteamNetworkingUtils004",  23,  12, 0 },
+    // SteamGameServer015
+    { "SteamGameServer015",   3,   4, 0 },
+    { "SteamGameServer015",   4,   4, 0 },
+    { "SteamGameServer015",   6,   0, 0 },
+    { "SteamGameServer015",   7,   0, 0 },
+    { "SteamGameServer015",   8,   0, 0 },
+    { "SteamGameServer015",   9,   0, 0 },
+    { "SteamGameServer015",  10,   4, 0 },
+    { "SteamGameServer015",  11,   0, 0 },
+    { "SteamGameServer015",  12,   4, 0 },
+    { "SteamGameServer015",  13,   4, 0 },
+    { "SteamGameServer015",  14,   4, 0 },
+    { "SteamGameServer015",  15,   4, 0 },
+    { "SteamGameServer015",  16,   4, 0 },
+    { "SteamGameServer015",  19,   0, 0 },
+    { "SteamGameServer015",  20,   8, 0 },
+    { "SteamGameServer015",  24,   4, 0 },
+        // The three 16-byte slots. One of them is SendUserConnectAndAuthenticate
+        // and the other two are the packet relay; the certificate decides which
+        // is which at the call, so no slot here is guessed at. See
+        // gh_steam_gs_connect_and_auth.
+    { "SteamGameServer015",  34,  16, 0, nullptr, &gh_steam_gs_connect_and_auth },
+    { "SteamGameServer015",  35,  16, 0, nullptr, &gh_steam_gs_connect_and_auth },
+        // SendUserConnectAndAuthenticate, and the only slot here that the
+        // static scan got WRONG: it read 4 bytes, and 922 showed what that
+        // costs. The run traced the call as `slot 38 args 0x7F000001` -- the
+        // loopback client's own address, arriving one instruction after the
+        // certificate went out -- and popped 4 of its 16 bytes, so the guest
+        // stack was short by 12 from that return on and the very next engine
+        // line was "EDICT_NUM: bad number 5350113". 16 is the signature:
+        // (uint32 unIPClient, const void* pvAuthBlob, uint32 cubAuthBlobSize,
+        //  CSteamID* pSteamIDUser).
+    { "SteamGameServer015",  38,  16, 0, nullptr, &gh_steam_gs_connect_and_auth },
+    { "SteamGameServer015",  39,   4, 0 },
+    { "SteamGameServer015",  40,   4, 0 },
+    { "SteamGameServer015",  41,  16, 0, nullptr, &gh_steam_gs_connect_and_auth },
+    // SteamUser023
+        // InitiateGameConnection -- the certificate the client will not connect
+        // without. See gh_steam_initiate_game_connection.
+    { "SteamUser023",   3,  28, 0, nullptr, &gh_steam_initiate_game_connection },
+    { "SteamUser023",   4,   8, 0 },
+    { "SteamUser023",   7,   0, 0 },
+    { "SteamUser023",   8,   0, 0 },
+    { "SteamUser023",   9,  12, 0 },
+    { "SteamUser023",  10,  36, 0 },
+    { "SteamUser023",  11,  24, 0 },
+    { "SteamUser023",  20,  16, 0 },
+    // SteamUtils010
+    { "SteamUtils010",  34,   0, 0 },
+    { "SteamUtils010",  35,  20, 0 },
+};
+inline constexpr size_t kSteamSlotCount =
+    sizeof(kSteamSlots) / sizeof(kSteamSlots[0]);
+
+inline int g_steam_slot_hits[kSteamSlotCount] = { 0 };
+
+template <size_t I>
+inline uint64_t steam_slot_invoke(Machine& m, const uint32_t* args)
+{
+    // Once a certificate is out, the next thing to happen is the connect packet
+    // and the server's answer to it. Trace the game-server calls over that
+    // window with their arguments: if the approval does not land on one of the
+    // three 16-byte slots, this is what names the slot that it did land on,
+    // without another run.
+    if (g_gh_auth_issued && g_gh_auth_trace < 32 &&
+        std::strcmp(kSteamSlots[I].iface, "SteamGameServer015") == 0) {
+        ++g_gh_auth_trace;
+        std::string s = "X86 STEAM auth-window SteamGameServer015 slot " +
+                        std::to_string(kSteamSlots[I].slot) + " args";
+        for (uint32_t i = 0; i * 4 < kSteamSlots[I].argbytes && i < 4; ++i)
+            s += " " + hex(args[i]);
+        log(s);
+    }
+    if (kSteamSlots[I].custom) return kSteamSlots[I].custom(m, args);
+    uint32_t r = kSteamSlots[I].ret;
+    if (kSteamSlots[I].retstr) {
+        // One guest copy per slot, made on first use and kept for the life of
+        // the process: the guest may hold the pointer for as long as it likes.
+        // `static` here is per-instantiation, so each slot gets its own.
+        static uint32_t cached = 0;
+        if (!cached) {
+            const size_t n = std::strlen(kSteamSlots[I].retstr) + 1;
+            cached = m.heap_alloc((uint32_t)n, true);
+            if (cached) std::memcpy((void*)(uintptr_t)cached, kSteamSlots[I].retstr, n);
+            else log("X86 STEAM no guest heap for a string return");
+        }
+        r = cached;
+    }
+    // Loud for the first few, then quiet: some of these sit in the frame loop
+    // and the point of the log is to show WHICH slots a run reaches, once.
+    if (++g_steam_slot_hits[I] <= 4)
+        log(std::string("X86 STEAM call ") + kSteamSlots[I].iface + " slot " +
+            std::to_string(kSteamSlots[I].slot) + " (pops " +
+            std::to_string(kSteamSlots[I].argbytes) + ") -> " +
+            (kSteamSlots[I].retstr ? std::string("\"") + kSteamSlots[I].retstr + "\" at " + hex(r)
+                                   : std::to_string(r)));
+    return r;
+}
+
+// A slot no call site in sw.dll reaches. We do not know the slot's argument
+// count, so we cannot pop for it, and popping nothing leaves the guest's stack
+// wrong from then on. Cell 910 is what that looks like: the first unknown slot
+// was called, the stack went sideways, a C++ throw arrived with no handler, and
+// the run spun on one faulting instruction for 88,000 diag lines.
+//
+// So this log has to be enough to FIX the slot without another run. It names
+// the slot index and the guest return address; `args` points one dword past the
+// return address the call pushed, so args[-1] is the call site, and that is the
+// address to disassemble to count the pushes.
+inline int g_steam_unknown_hits = 0;
+template <uint32_t S>
+inline uint64_t steam_slot_unknown(Machine&, const uint32_t* args)
+{
+    if (++g_steam_unknown_hits <= 16)
+        log("X86 STEAM call to UNKNOWN slot " + std::to_string(S) +
+            " from guest " + hex(args[-1]) +
+            " -- returning 0 and popping nothing; the guest's stack is now "
+            "suspect. Disassemble that address to read the pop count.");
+    return 0;
+}
+
+using SteamInvokeFn0 = uint64_t (*)(Machine&, const uint32_t*);
+template <uint32_t... Ss>
+inline const SteamInvokeFn0* steam_unknowns(std::integer_sequence<uint32_t, Ss...>)
+{
+    static const SteamInvokeFn0 t[] = { &steam_slot_unknown<Ss>... };
+    return t;
+}
+
+using SteamInvokeFn = uint64_t (*)(Machine&, const uint32_t*);
+template <size_t... Is>
+inline const SteamInvokeFn* steam_invokes(std::index_sequence<Is...>)
+{
+    static const SteamInvokeFn t[] = { &steam_slot_invoke<Is>... };
+    return t;
+}
+
+// 80 slots covers every version here with room to spare; the largest index any
+// call site uses is 46, and a vtable costs four bytes a slot.
+inline constexpr uint32_t kSteamVtableSlots = 80;
+
+inline uint32_t steam_stub_for(Machine& m, const char* ver)
+{
+    if (!ver || !*ver) return 0;
+    static std::vector<std::pair<std::string, uint32_t>> cache;
+    for (auto& e : cache) if (e.first == ver) return e.second;
+
+    // An interface we know NO slot of is better left null, and that is measured,
+    // not assumed. Cell 909 answered every accessor null: the engine asked for
+    // SteamInput006, took the null without complaint, went on to ask ISteamApps
+    // the ownership question and exited cleanly there. Cell 910 gave the same
+    // SteamInput006 an 80-slot stub with no known pop counts, and the first call
+    // through it destroyed the guest stack before the engine ever reached the
+    // ownership question. A stub is only safer than null where we can pop
+    // correctly; where we cannot, it is strictly more dangerous.
+    int cover = 0;
+    for (size_t i = 0; i < kSteamSlotCount; ++i)
+        if (std::strcmp(kSteamSlots[i].iface, ver) == 0) ++cover;
+    if (!cover) {
+        log(std::string("X86 STEAM ") + ver +
+            ": no slot of this interface is in the table, so returning null "
+            "rather than a stub we cannot pop for (909 survived the null here)");
+        cache.emplace_back(ver, 0u);
+        return 0;
+    }
+
+    const uint32_t vt = m.heap_alloc(kSteamVtableSlots * 4, true);
+    if (!vt) { log(std::string("X86 STEAM no guest heap for ") + ver); return 0; }
+
+    const SteamInvokeFn* inv =
+        steam_invokes(std::make_index_sequence<kSteamSlotCount>{});
+    const SteamInvokeFn0* unk =
+        steam_unknowns(std::make_integer_sequence<uint32_t, kSteamVtableSlots>{});
+    int known = 0;
+    for (uint32_t s = 0; s < kSteamVtableSlots; ++s) {
+        // HostFn and its name must outlive the guest, so they are allocated and
+        // never freed on purpose: one per slot, for the life of the process.
+        HostFn* f = new HostFn();
+        f->dll  = "steam_api.dll";
+        f->name = (new std::string(std::string(ver) + "::slot" +
+                                   std::to_string(s)))->c_str();
+        f->invoke = unk[s];
+        f->stack_bytes = 0;
+        for (size_t i = 0; i < kSteamSlotCount; ++i)
+            if (kSteamSlots[i].slot == s && std::strcmp(kSteamSlots[i].iface, ver) == 0) {
+                f->invoke = inv[i];
+                f->stack_bytes = kSteamSlots[i].argbytes;
+                ++known;
+                break;
+            }
+        const uint32_t t = m.make_thunk("steam_api.dll", f->name, f);
+        if (!t) { log(std::string("X86 STEAM thunk pool exhausted on ") + ver); return 0; }
+        std::memcpy((void*)(uintptr_t)(vt + s * 4), &t, 4);
+    }
+
+    const uint32_t obj = m.heap_alloc(4, true);
+    if (!obj) { log(std::string("X86 STEAM no guest heap for a ") + ver); return 0; }
+    std::memcpy((void*)(uintptr_t)obj, &vt, 4);
+
+    log(std::string("X86 STEAM stub ") + ver + " at " + hex(obj) + " vtable " + hex(vt) +
+        " (" + std::to_string(known) + " slots with a known stack, " +
+        std::to_string(kSteamVtableSlots - (uint32_t)known) + " without)");
+    cache.emplace_back(ver, obj);
+    return obj;
+}
+
+inline void RegisterSteamBridgeBeds(ThunkRegistry& R)
+{
+    // SteamAPI_Init: the call the whole exit path hangs on. The loader's own
+    // engine is already signed in by the time a guest runs -- the title config
+    // requires the steam-runtime service -- so the honest answer is yes.
+    GH_X86_BED_CDECL(R, "steam_api.dll", "SteamAPI_Init",
+        [](Machine&, const uint32_t*) -> uint64_t {
+            log("X86 STEAM SteamAPI_Init -> true (bridged to the loader's x64 engine)");
+            return 1;
+        });
+    GH_X86_BED_CDECL(R, "steam_api.dll", "SteamAPI_Shutdown",
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+
+    // A pipe/user handle has to be non-zero to read as valid; 1 is what a
+    // single-user client hands out, and nothing in the guest dereferences it.
+    GH_X86_BED_CDECL(R, "steam_api.dll", "SteamAPI_GetHSteamUser",
+        [](Machine&, const uint32_t*) -> uint64_t { return 1; });
+    // Single-player GoldSrc IS a listen server: the engine builds a CSteam3Server,
+    // and CSteam3Server::Activate() raises a fatal Sys_Error("Unable to initialize
+    // Steam.") the moment the game-server init says no. Saying no therefore kills
+    // Half-Life at the end of its first map load, after the .bsp is already in.
+    // So the server half answers exactly as the client half does. 2 keeps it a
+    // distinct non-zero handle from the client's 1, which is all any caller reads
+    // it for; the interface it goes on to ask for is already stubbed by
+    // SteamInternal_FindOrCreateGameServerInterface.
+    GH_X86_BED_CDECL(R, "steam_api.dll", "SteamGameServer_GetHSteamUser",
+        [](Machine&, const uint32_t*) -> uint64_t { return 2; });
+    // Which of these two the engine calls depends on how old its copy of the SDK
+    // header is -- the flat SteamGameServer_Init is an inline wrapper over
+    // SteamInternal_GameServer_Init in recent ones -- so both are bedded and both
+    // say which was used.
+    for (const char* n : { "SteamInternal_GameServer_Init", "SteamGameServer_Init" })
+        GH_X86_BED_CDECL(R, "steam_api.dll", n,
+            [](Machine&, const uint32_t*) -> uint64_t {
+                log("X86 STEAM GameServer_Init -> true (bridged to the loader's x64 engine)");
+                return 1;
+            });
+    GH_X86_BED_CDECL(R, "steam_api.dll", "SteamGameServer_RunCallbacks",
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+    GH_X86_BED_CDECL(R, "steam_api.dll", "SteamGameServer_Shutdown",
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+
+    // Callbacks. Nothing is dispatched yet, but WHICH callbacks the engine
+    // registers is exactly the list the next pass has to be able to deliver, so
+    // each id is logged once.
+    GH_X86_BED_CDECL(R, "steam_api.dll", "SteamAPI_RegisterCallback",
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            log("X86 STEAM RegisterCallback id=" + std::to_string(a[1]) + " at " + hex(a[0]));
+            return 0;
+        });
+    GH_X86_BED_CDECL(R, "steam_api.dll", "SteamAPI_UnregisterCallback",
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+    GH_X86_BED_CDECL(R, "steam_api.dll", "SteamAPI_RegisterCallResult",
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+    GH_X86_BED_CDECL(R, "steam_api.dll", "SteamAPI_UnregisterCallResult",
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+    GH_X86_BED_CDECL(R, "steam_api.dll", "SteamAPI_RunCallbacks",
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+
+    // Breakpad. The engine installs its own crash handler and hands Steam the
+    // app id and a minidump comment; none of it has anywhere to go on a console,
+    // and the loader has its own crash observer.
+    GH_X86_BED_CDECL(R, "steam_api.dll", "SteamAPI_SetBreakpadAppID",
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+    GH_X86_BED_CDECL(R, "steam_api.dll", "SteamAPI_SetMiniDumpComment",
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+    GH_X86_BED_CDECL(R, "steam_api.dll", "SteamAPI_UseBreakpadCrashHandler",
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+    GH_X86_BED_CDECL(R, "steam_api.dll", "SteamAPI_WriteMiniDump",
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+
+    // SteamInternal_ContextInit( void *pContextInitData )
+    //
+    //   struct { void (*pFn)( void *pCtx ); uintp counter; CSteamAPIContext ctx; }
+    //
+    // It calls pFn once per counter generation to fill ctx, then returns &ctx.
+    // The callback is GUEST code, so this is a host->guest call back across the
+    // boundary -- call_guest32 with the guest address of ctx, which is the
+    // struct plus two 32-bit fields.
+    //
+    // Running it even though the interfaces below are still null is the point:
+    // it is what makes the engine ASK for them by name.
+    GH_X86_BED_CDECL(R, "steam_api.dll", "SteamInternal_ContextInit",
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            const uint32_t p = a[0];
+            if (!p) return 0;
+            uint32_t fn = 0, counter = 0;
+            std::memcpy(&fn, (void*)(uintptr_t)p, 4);
+            std::memcpy(&counter, (void*)(uintptr_t)(p + 4), 4);
+            const uint32_t ctx = p + 8;
+            if (fn && !counter) {
+                const uint32_t args[1] = { ctx };
+                log("X86 STEAM ContextInit -> calling guest filler " + hex(fn) + " ctx " + hex(ctx));
+                m.call_guest32(fn, args, 1, false /* cdecl callee */);
+                const uint32_t one = 1;
+                std::memcpy((void*)(uintptr_t)(p + 4), &one, 4);
+            }
+            return ctx;
+        });
+
+    // The two that hand out interfaces. The previous pass returned null here to
+    // make the engine NAME what it wants; it named them, so now it gets an
+    // object. The game-server interface is stubbed on the same terms as the
+    // client ones: the engine already learns there is no server from
+    // SteamGameServer_GetHSteamUser returning 0, and sw.dll dereferences the
+    // game-server pointer without a null check at six sites, so null is the
+    // more dangerous answer of the two.
+    for (const char* n : { "SteamInternal_FindOrCreateUserInterface",
+                           "SteamInternal_FindOrCreateGameServerInterface" })
+        GH_X86_BED_CDECL(R, "steam_api.dll", n,
+            [](Machine& m, const uint32_t* a) -> uint64_t {
+                const char* v = (const char*)(uintptr_t)a[1];
+                log(std::string("X86 STEAM interface WANTED: ") + (v ? v : "(null)") +
+                    " user=" + std::to_string(a[0]));
+                return steam_stub_for(m, v);
+            });
+}
+
 inline void RegisterStdBeds(Machine& m)
 {
     m.dll_loaded_hook = &mono_probe::install;
@@ -3439,6 +4327,20 @@ inline void RegisterStdBeds(Machine& m)
             const uint32_t* params = argv ? (const uint32_t*)(uintptr_t)argv : nullptr;
             uint32_t np = params ? nargs : 0;
 
+            // Say that a raise happened at all. Only the UNHANDLED case was
+            // logged before, so an exception that a guest frame swallowed left
+            // no trace -- and when the process then died for another reason,
+            // there was no way to tell whether a throw had been involved.
+            // A C++ throw carries the magic, the object and its throw_info.
+            if (static int n = 0; n++ < 12)
+                log("X86 RaiseException code=" + hex(code) + " flags=" + hex(flags) +
+                    " from guest " + hex(m.hostcall_ret) +
+                    " on tid " + std::to_string(m.cur_tid()) +
+                    (code == 0xE06D7363u && np >= 3
+                         ? " -- C++ throw, object " + hex(params[1]) +
+                               " throw_info " + hex(params[2])
+                         : std::string()));
+
             // Present the CALLER, not the thunk, as the faulting location and as
             // the state to resume from. A handler that continues execution would
             // otherwise resume at the RaiseException thunk and raise again,
@@ -3678,7 +4580,104 @@ inline void RegisterStdBeds(Machine& m)
     GH_X86_BED(R, "user32.dll", "CreateWindowExA", 48,
         [](Machine& m, const uint32_t* a) -> uint64_t { return x86_create_window(m, a, false, "CreateWindowExA"); });
     GH_X86_BED(R, "user32.dll", "DestroyWindow", 4,
-        [](Machine& m, const uint32_t* a) -> uint64_t { m.bed.sub_windows.erase(a[0]); return 1; });
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            m.bed.sub_windows.erase(a[0]);
+            m.bed.win_props.erase(a[0]);
+            return 1;
+        });
+
+    // Window properties. Our windows are synthetic, so their properties must be
+    // ours as well: see BedState::win_props for what forwarding these cost.
+    // GetProp on a name nobody set is NULL, and NULL is exactly what a caller
+    // like SDL2 tests for.
+    GH_X86_BED(R, "user32.dll", "GetPropW", 8,
+        [](Machine& m, const uint32_t* a) -> uint64_t { return x86_get_prop(m, a[0], a[1], true); });
+    GH_X86_BED(R, "user32.dll", "GetPropA", 8,
+        [](Machine& m, const uint32_t* a) -> uint64_t { return x86_get_prop(m, a[0], a[1], false); });
+    GH_X86_BED(R, "user32.dll", "SetPropW", 12,
+        [](Machine& m, const uint32_t* a) -> uint64_t { return x86_set_prop(m, a[0], a[1], a[2], true); });
+    GH_X86_BED(R, "user32.dll", "SetPropA", 12,
+        [](Machine& m, const uint32_t* a) -> uint64_t { return x86_set_prop(m, a[0], a[1], a[2], false); });
+    GH_X86_BED(R, "user32.dll", "RemovePropW", 8,
+        [](Machine& m, const uint32_t* a) -> uint64_t { return x86_remove_prop(m, a[0], a[1], true); });
+    GH_X86_BED(R, "user32.dll", "RemovePropA", 8,
+        [](Machine& m, const uint32_t* a) -> uint64_t { return x86_remove_prop(m, a[0], a[1], false); });
+
+    // -- the rest of the window surface, for the same reason ----------------
+    // Everything below used to forward to the host user32 with one of OUR
+    // HWNDs. There is no such window on the host, so each of these asked the
+    // real window manager about a handle it has never seen: the answer is at
+    // best a failure the guest did not expect, and at worst -- GetPropW -- a
+    // value the guest trusts and dereferences. The window is ours, so the
+    // answers about it have to be ours. Each one answers for the surrogate:
+    // one window, exactly the framebuffer, always visible, never minimised,
+    // with nothing to repaint.
+    GH_X86_BED(R, "user32.dll", "IsWindow", 4,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            return a[0] == kFakeHwnd || m.bed.sub_windows.count(a[0]) ? 1 : 0;
+        });
+    // One at a time, because a wrong pop count is a silent four-byte stack
+    // drift per call and these five do not agree on one.
+    GH_X86_BED(R, "user32.dll", "IsWindowEnabled", 4,
+        [](Machine&, const uint32_t*) -> uint64_t { return 1; });
+    GH_X86_BED(R, "user32.dll", "SetWindowRgn", 12,
+        [](Machine&, const uint32_t*) -> uint64_t { return 1; });
+    GH_X86_BED(R, "user32.dll", "MoveWindow", 24,
+        [](Machine&, const uint32_t*) -> uint64_t { return 1; });
+    GH_X86_BED(R, "user32.dll", "InvalidateRect", 12,
+        [](Machine&, const uint32_t*) -> uint64_t { return 1; });
+    GH_X86_BED(R, "user32.dll", "SetLayeredWindowAttributes", 16,
+        [](Machine&, const uint32_t*) -> uint64_t { return 1; });
+    // Client space IS screen space here, so points pass through untouched and
+    // the offset the function reports is zero.
+    GH_X86_BED(R, "user32.dll", "MapWindowPoints", 16,
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+    for (const char* n : { "GetTopWindow", "GetMenu", "GetWindowTextLengthW", "GetWindowTextLengthA" })
+        GH_X86_BED(R, "user32.dll", n, 4,
+            [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+    GH_X86_BED(R, "user32.dll", "SetActiveWindow", 4,
+        [](Machine&, const uint32_t*) -> uint64_t { return kFakeHwnd; });
+    GH_X86_BED(R, "user32.dll", "SetCapture", 4,
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });   // nobody had it
+    GH_X86_BED(R, "user32.dll", "ReleaseCapture", 0,
+        [](Machine&, const uint32_t*) -> uint64_t { return 1; });
+    GH_X86_BED(R, "user32.dll", "GetWindow", 8,
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });   // no siblings, no owner
+    GH_X86_BED(R, "user32.dll", "GetClassLongA", 8,
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+    GH_X86_BED(R, "user32.dll", "GetClassLongW", 8,
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+    GH_X86_BED(R, "user32.dll", "FlashWindow", 8,
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+    // The window belongs to this process and to the thread that made it. A
+    // forward answered 0 and wrote nothing, which reads as "no such window".
+    GH_X86_BED(R, "user32.dll", "GetWindowThreadProcessId", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (a[1]) *(uint32_t*)(uintptr_t)a[1] = GetCurrentProcessId();
+            return GetCurrentThreadId();
+        });
+    // Nothing is ever invalid: we do not paint through GDI, D3D presents.
+    GH_X86_BED(R, "user32.dll", "GetUpdateRect", 12,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (a[1]) std::memset((void*)(uintptr_t)a[1], 0, 16);
+            return 0;
+        });
+    for (const char* n : { "GetWindowTextW", "GetWindowTextA" })
+        GH_X86_BED(R, "user32.dll", n, 12,
+            [](Machine&, const uint32_t* a) -> uint64_t {
+                if (a[1] && (int32_t)a[2] > 0) std::memset((void*)(uintptr_t)a[1], 0, 2);
+                return 0;
+            });
+    // WINDOWPLACEMENT is 44 bytes at 32-bit: length, flags, showCmd, two POINTs,
+    // then the normal RECT.
+    GH_X86_BED(R, "user32.dll", "GetWindowPlacement", 8,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            if (!a[1]) return 0;
+            const uint32_t v[11] = { 44, 0, SW_SHOWNORMAL, 0, 0, 0, 0,
+                                     0, 0, m.bed.win_w, m.bed.win_h };
+            std::memcpy((void*)(uintptr_t)a[1], v, sizeof(v));
+            return 1;
+        });
 
     // The rest of the window lifecycle: there is nothing to do, and saying so
     // truthfully (TRUE, "it worked") is what keeps the guest on its happy path.
@@ -3954,6 +4953,129 @@ inline void RegisterStdBeds(Machine& m)
             [](Machine&, const uint32_t*) -> uint64_t { return 0; });
     GH_X86_BED(R, "user32.dll", "RegisterWindowMessageA", 4,
         [](Machine&, const uint32_t*) -> uint64_t { return 0xC001; });   // any private message id
+
+    // -- the few names gh_x86_stubs.h must NOT answer with a constant -------
+    // Everything else Chromium binds and nothing implements is answered by the
+    // generated stub table, which registers after this one and loses every
+    // name already here. These are the ones where a constant would be a lie
+    // the caller acts on: a comparison that says "equal", a path helper that
+    // returns NULL where the caller will dereference, a wait that returns
+    // instantly on a thread whose whole job is to wait.
+
+    // WaitMessage blocks until the queue is not empty. Our queue is fed by the
+    // host's window thread, so there is nothing to wait ON here -- but
+    // returning immediately turns a CEF pump thread into a spin that eats a
+    // core of a four-core console. A short sleep is the honest shape of "wait":
+    // the caller loops back into PeekMessage either way.
+    GH_X86_BED(R, "user32.dll", "WaitMessage", 0,
+        [](Machine&, const uint32_t*) -> uint64_t { Sleep(2); return TRUE; });
+
+    // CharUpperW is two functions behind one name: with a high word, a string
+    // uppercased IN PLACE and returned; without one, a single character in the
+    // low word. Both have to work -- vgui2 uses the string form on names it
+    // then compares.
+    GH_X86_BED(R, "user32.dll", "CharUpperW", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if ((a[0] >> 16) == 0) {
+                uint32_t c = a[0] & 0xFFFF;
+                if (c >= 'a' && c <= 'z') c -= 32;
+                return c;
+            }
+            for (wchar_t* p = (wchar_t*)(uintptr_t)a[0]; p && *p; ++p)
+                if (*p >= L'a' && *p <= L'z') *p = (wchar_t)(*p - 32);
+            return a[0];
+        });
+
+    GH_X86_BED(R, "user32.dll", "InflateRect", 12,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            RECT* r = (RECT*)(uintptr_t)a[0];
+            if (!r) return FALSE;
+            r->left -= (LONG)(int32_t)a[1]; r->right  += (LONG)(int32_t)a[1];
+            r->top  -= (LONG)(int32_t)a[2]; r->bottom += (LONG)(int32_t)a[2];
+            return TRUE;
+        });
+
+    // A dark-on-light scheme, because every caller of this is drawing a
+    // control we are not otherwise painting. A single constant for all indices
+    // would put white text on a white background.
+    GH_X86_BED(R, "user32.dll", "GetSysColor", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            switch (a[0]) {
+                case COLOR_WINDOW:          return 0x00FFFFFF;
+                case COLOR_WINDOWTEXT:
+                case COLOR_BTNTEXT:
+                case COLOR_MENUTEXT:        return 0x00000000;
+                case COLOR_BTNFACE:
+                case COLOR_MENU:
+                case COLOR_SCROLLBAR:       return 0x00F0F0F0;
+                case COLOR_HIGHLIGHT:       return 0x00D77800;
+                case COLOR_HIGHLIGHTTEXT:   return 0x00FFFFFF;
+                case COLOR_GRAYTEXT:        return 0x006D6D6D;
+                default:                    return 0x00808080;
+            }
+        });
+
+    GH_X86_BED(R, "kernel32.dll", "lstrcmpiA", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            const unsigned char* p = (const unsigned char*)(uintptr_t)a[0];
+            const unsigned char* q = (const unsigned char*)(uintptr_t)a[1];
+            if (!p || !q) return (uint32_t)(p == q ? 0 : (p ? 1 : -1));
+            auto low = [](unsigned char c) { return (unsigned char)(c >= 'A' && c <= 'Z' ? c + 32 : c); };
+            for (; *p && low(*p) == low(*q); ++p, ++q) {}
+            return (uint32_t)(int32_t)(low(*p) - low(*q));
+        });
+
+    // The guest never sees the real one, and nothing it does with the answer
+    // reaches a host path: the VFS maps what it opens. A plausible, stable
+    // string is what callers want -- several build a DLL path from it and then
+    // LoadLibrary that, which resolve_dll_path answers from the corpus.
+    GH_X86_BED(R, "kernel32.dll", "GetSystemDirectoryW", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            static const wchar_t kSys[] = L"C:\\Windows\\system32";
+            const uint32_t need = (uint32_t)(sizeof kSys / sizeof kSys[0]);   // with the NUL
+            if (!a[0] || a[1] < need) return need;                            // chars INCLUDING the NUL
+            std::memcpy((void*)(uintptr_t)a[0], kSys, sizeof kSys);
+            return need - 1;                                                  // chars EXCLUDING it
+        });
+
+    // PathFindExtensionW / PathFindFileNameW return a pointer INTO the caller's
+    // own string, so they are safe to answer here (guest memory is below 4 GB)
+    // and unsafe to answer with a constant: NULL is not a value either of them
+    // can return, and the caller dereferences what it gets.
+    GH_X86_BED(R, "shlwapi.dll", "PathFindExtensionW", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            const wchar_t* s = (const wchar_t*)(uintptr_t)a[0];
+            if (!s) return 0;
+            const wchar_t* dot = nullptr;
+            for (const wchar_t* p = s; *p; ++p) {
+                if (*p == L'\\' || *p == L'/') dot = nullptr;
+                else if (*p == L'.') dot = p;
+            }
+            if (dot) return (uint32_t)(uintptr_t)dot;
+            const wchar_t* e = s; while (*e) ++e;
+            return (uint32_t)(uintptr_t)e;                 // the NUL, never NULL
+        });
+    GH_X86_BED(R, "shlwapi.dll", "PathFindFileNameW", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            const wchar_t* s = (const wchar_t*)(uintptr_t)a[0];
+            if (!s) return 0;
+            const wchar_t* last = s;
+            for (const wchar_t* p = s; *p; ++p)
+                if (*p == L'\\' || *p == L'/' || *p == L':') last = p + 1;
+            return (uint32_t)(uintptr_t)last;
+        });
+    GH_X86_BED(R, "shlwapi.dll", "PathRemoveExtensionW", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            wchar_t* s = (wchar_t*)(uintptr_t)a[0];
+            if (!s) return 0;
+            wchar_t* dot = nullptr;
+            for (wchar_t* p = s; *p; ++p) {
+                if (*p == L'\\' || *p == L'/') dot = nullptr;
+                else if (*p == L'.') dot = p;
+            }
+            if (dot) *dot = 0;
+            return 0;
+        });
 
     // -- WS2_32: the whole socket surface, failing by contract --------------
     // Thirty-two WS2_32 imports were unresolved, and Stick Fight walks into
@@ -4366,6 +5488,13 @@ inline void RegisterStdBeds(Machine& m)
     RegisterPtrToPtrBeds(R);
     // What HL2's modules need that is neither of the above nor a forward.
     RegisterSourceGapBeds(R);
+
+    // Only when the title asks for it: without the knob the guest keeps using
+    // the steam_api.dll it ships, which is right for every title that does not
+    // need SteamAPI_Init to SUCCEED (Half-Life 2 runs happily with it failing).
+    // Registering these unconditionally would change that for a game whose own
+    // copy is simply absent.
+    if (g_x86_bed_only_steam) RegisterSteamBridgeBeds(R);
 
     // DXGI and D3D11. Kept in their own file: they are not Win32 calls but a
     // COM vtable boundary, and the marshalling they need has nothing in common

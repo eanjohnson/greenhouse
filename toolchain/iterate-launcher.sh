@@ -196,6 +196,9 @@ done
 # (g_x86_sys_dir, resolve_dll_path's last stop). Our own builds, from source.
 mkdir -p "$STAGE/guest/x86"
 "$GH/corpus/x86sys/msvcrt/build.sh" "$STAGE/guest/x86" || { echo "FATAL: guest x86 msvcrt build"; exit 1; }
+# ucrtbase.dll + the api-ms-win-crt-*/vcruntime140/msvcp140 forwarders: what an
+# MSVC-2015-or-later 32-bit game imports instead of msvcrt.dll (Half-Life 1).
+"$GH/corpus/x86sys/ucrt/build.sh" "$STAGE/guest/x86" || { echo "FATAL: guest x86 ucrt build"; exit 1; }
 # §47: the on-device shader bake's toolchain. dxcompiler.dll (DXC 1.9.2607, the
 # same release as the host's Linux build, so its disassembly and assembly match
 # the recipe byte for byte) with the C++ runtime it imports beside it, because

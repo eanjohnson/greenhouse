@@ -48,6 +48,7 @@
 #include <vector>
 
 #include "gh_x86_beds_gen.h"
+#include "gh_x86_stubs.h"
 #include "gh_x86_native_gates.h"
 
 namespace ghx86 {
@@ -468,9 +469,43 @@ inline uint32_t host_fault(NativeCtl* c)
     m.cpu.eflags = (uint32_t)c->eflags;
     m.cpu.eip = c->f_eip;
 
+    // A fault loop. The guest's handler is allowed to return "continue", which
+    // re-runs the faulting instruction, and that is how most SEH repairs end --
+    // but if nothing about the fault changed, it will fault again at the same
+    // address, for ever. Nothing downstream notices: 910 wrote 88,000 identical
+    // diag lines and had to be killed from outside. So count repeats at one
+    // address and end the guest when the count says the handler is not making
+    // progress. 64 is far above any legitimate repair of the same instruction
+    // (the pager and the TLS patch each take one or two).
+    static thread_local uint32_t t_loop_eip = 0;
+    static thread_local uint32_t t_loop_n   = 0;
+    if (c->f_eip == t_loop_eip) ++t_loop_n; else { t_loop_eip = c->f_eip; t_loop_n = 1; }
+    if (t_loop_n == 64) {
+        log("X86N fault loop: " + hex(c->f_code) + " at " + m.describe_addr(c->f_eip) +
+            " has repeated 64 times and the guest's handler is not making progress"
+            " -- ending the guest instead of spinning");
+        S.gil.unlock();
+        fpu.leave();
+        request_exit(c->f_code);
+        return abort_frames(c);
+    }
+
     const uint32_t code = c->f_code;
     uint32_t params[2] = { c->f_rw, c->f_addr };
     const uint32_t np = (code == 0xC0000005u || code == 0xC0000006u) ? 2 : 0;
+    // Say what the fault WAS before dispatching it. The summary below is
+    // deferred until the gil is free, which is the right default -- but it
+    // costs us the one line that matters when the dispatch itself never
+    // returns, because a guest handler we call runs away or faults again
+    // (HL1 0.0.911.0 died that way: the walk reached __CxxFrameHandler3 and
+    // the diag simply stopped, with no record of the exception behind it).
+    // The dbg channel already logs from inside the walk, so logging here is
+    // no newer a hazard than that.
+    if (static std::atomic<uint32_t> pre{0}; pre.fetch_add(1, std::memory_order_relaxed) < 8)
+        log("X86N dispatching guest exception " + hex(code) + " at " + m.describe_addr(c->f_eip) +
+            (np ? std::string(c->f_rw == 1 ? " writing " : c->f_rw == 8 ? " executing " : " reading ") +
+                      hex(c->f_addr) : std::string()) +
+            " on tid " + std::to_string(GetCurrentThreadId()));
     const bool handled = m.dispatch_guest_exception(code, 0, np, params);
     // A fault the guest's own SEH swallows is otherwise invisible: only the
     // total reaches the log, and only when the guest exits.
@@ -601,15 +636,18 @@ using Enter64Fn = void (*)(NativeCtl*);
 inline uint32_t native_call(Machine& m, uint32_t func, const uint32_t* args, int nargs)
 {
     NativeThread* nt = t_nt;
+    g_x86_call_refused = false;
     if (!nt) {
         log("X86N guest call to " + hex(func) + " from host thread " +
             std::to_string(GetCurrentThreadId()) + ", which has no guest context; returning 0");
+        g_x86_call_refused = true;
         return 0;
     }
-    if (t_abort) return 0;                           // this thread is unwinding; run nothing more
+    if (t_abort) { g_x86_call_refused = true; return 0; }   // unwinding; run nothing more
     NativeCtl& c = *nt->ctl;
     if (c.depth + 1 >= kMaxNativeDepth) {
         log("X86N guest call to " + hex(func) + " nested too deep (" + std::to_string(c.depth) + ")");
+        g_x86_call_refused = true;
         return 0;
     }
 
@@ -723,6 +761,13 @@ inline DWORD WINAPI NativeThreadProc(void* p)
     if (!report.empty()) log(report);
 
     uint32_t r = 0;
+    // The exe's own DLL dependencies, mapped and DllMain'd here because this is
+    // the first moment guest code may run: bind_imports() could only bind beds.
+    if (nt->root && !t_abort) {
+        S.gil.lock();
+        m.load_exe_dependencies();
+        S.gil.unlock();
+    }
     if (nt->root && m.exe_tls >= 0 && !t_abort) {   // the loader runs these before the entry point
         S.gil.lock();
         const Machine::TlsModule exe = m.tls_mods[(size_t)m.exe_tls];
@@ -1456,6 +1501,7 @@ inline bool RunPe32Native(const std::vector<uint8_t>& file, uint32_t& result, st
     RegisterNativeBeds(m);
     RegisterStdBeds(m);
     RegisterGeneratedBeds(m);
+    RegisterStubBeds(m);
     if (!m.bind_imports()) { why = m.err; end_run(m); return false; }
 
     // The gates, and every thunk slot (static and spare) pointed at common32.

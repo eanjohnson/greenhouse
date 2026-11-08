@@ -52226,6 +52226,15 @@ static bool MapAndRun32(const std::vector<uint8_t>& file)
     const bool native = GhCfgNum(L"gh_x86_native.txt", "GH_X86_NATIVE", 0) != 0;
     Diag(std::string("X86 runtime: ") + (native ? "native (compat mode)" : "interpreter"));
     ghx86::g_x86_sys_dir = g_installDir + L"guest\\x86\\";
+    // gh_x86_steam.txt=1: answer steam_api.dll from our beds, bridged to the
+    // loader's x64 Steam engine, instead of mapping the copy the game ships.
+    // Half-Life's engine exits unless SteamAPI_Init succeeds, and Valve's
+    // 32-bit steam_api.dll can only fail on a console. See g_x86_bed_only_steam.
+    ghx86::g_x86_bed_only_steam = GhCfgNum(L"gh_x86_steam.txt", "GH_X86_STEAM", 0) != 0;
+    // gh_x86_seh_trace.txt=1: name every frame of the guest's FS:[0] chain as
+    // it is walked. Off by default -- a fault the guest swallows on purpose
+    // would otherwise cost a line per frame, every time it happens.
+    ghx86::g_x86_seh_trace = GhCfgNum(L"gh_x86_seh_trace.txt", "GH_X86_SEH_TRACE", 0) != 0;
     // gh_x86_sample.txt=N: every N s, log where each guest thread is (stalls).
     ghx86::native::S.sample_ms = (uint32_t)GhCfgNum(L"gh_x86_sample.txt", "GH_X86_SAMPLE", 0) * 1000u;
     ghx86::native::S.host_stack_mb = (uint32_t)GhCfgNum(L"gh_x86_host_stack_mb.txt", "GH_X86_HOST_STACK_MB", 32);

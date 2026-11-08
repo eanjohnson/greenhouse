@@ -160,6 +160,24 @@ inline bool pe32_map_into(const uint8_t* file, size_t size, const Pe32Info& info
     return true;
 }
 
+// True for an image that holds no instructions: not one section is executable.
+// Such a file is a container -- a resource or data blob with an export table
+// pointing into it -- and the only base-dependent thing it could contain is an
+// absolute pointer written into its own data, which a relocs-stripped image has
+// by definition promised not to have. It is therefore safe to map anywhere,
+// while a code image without fixups is not.
+//
+// This is what ICU ships its locale tables as (icudt*.dll, which Chromium needs
+// and Half-Life's gameui pulls in through libcef): one huge read-only blob with
+// a single exported symbol and no .reloc, which our bump allocator can never
+// place at its preferred base.
+inline bool pe32_is_data_only(const Pe32Info& info)
+{
+    for (const pe::Section& s : info.sections)
+        if (s.characteristics & pe::SCN_MEM_EXECUTE) return false;
+    return !info.sections.empty();
+}
+
 // Applies base relocations for a load at `actual_base`. PE32 uses HIGHLOW --
 // a whole 32-bit patch -- where the x64 path uses DIR64.
 inline bool pe32_relocate(uint8_t* image, const Pe32Info& info, uint32_t actual_base,
@@ -171,7 +189,9 @@ inline bool pe32_relocate(uint8_t* image, const Pe32Info& info, uint32_t actual_
 
     const pe::DataDir& d = info.dir[pe::DIR_BASERELOC];
     if (!d.rva || !d.size) {
-        // No .reloc and not at the preferred base: the image cannot be fixed up.
+        // No .reloc and not at the preferred base. A code image cannot be fixed
+        // up and has to fail here; a data-only one needs no fixing up at all.
+        if (pe32_is_data_only(info)) return true;
         err = "image needs relocation but has no .reloc directory";
         return false;
     }

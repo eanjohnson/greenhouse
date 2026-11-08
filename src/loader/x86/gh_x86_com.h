@@ -65,6 +65,20 @@ constexpr uint32_t kComMask = 0xFFFF0000u;
 
 struct ComObj32 { uint32_t vtbl, host_lo, host_hi, tag; };
 
+// The live host IDirect3DDevice9 the guest created, as a void* so that headers
+// without <d3d9.h> can still see the slot. There is exactly one presenter in
+// this process -- gh_d3d9rt's Dev, reached through whatever device the guest
+// made -- and a layer that owns CPU pixels but no device needs to borrow it.
+// Half-Life 1's software engine is that case: SDL2 creates the D3D9 device for
+// the window, the engine paints into DirectDraw surfaces that are plain memory
+// (gh_x86_ddraw.h), and Flip has to put them somewhere. Set by the d3d9
+// CreateDevice override, cleared when that device's last reference goes.
+inline void*& com_live_d3d9()
+{
+    static void* dev = nullptr;
+    return dev;
+}
+
 // Maps a host interface TYPE to its registered interface id, so that a wrapped
 // out-parameter knows which vtable to give the guest without the call site
 // having to say. Set by com_register_<Iface>(); -1 until then, which is how an

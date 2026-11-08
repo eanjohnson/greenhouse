@@ -301,7 +301,15 @@ inline uint64_t d9_release(Machine& m, const uint32_t* a)
 {
     void* host = com().unwrap(a[0]);
     const uint64_t r = com_release(m, a);
-    if (host && (uint32_t)r == 0) d9_bounce_forget(m, host);
+    if (host && (uint32_t)r == 0) {
+        d9_bounce_forget(m, host);
+        // Anything still holding the borrowed device (the DirectDraw bed's
+        // present path) must stop using it the moment the guest drops it.
+        if (com_live_d3d9() == host) {
+            com_live_d3d9() = nullptr;
+            log("X86 D3D9 the live device was released; the DirectDraw present path has none");
+        }
+    }
     return r;
 }
 
@@ -334,6 +342,9 @@ inline void com_apply_d3d9_overrides(ComState& c)
                                                   a[4], &pp, &dev);
             write_pp32(a[5], pp);
             p32(a[6], 0, dev ? com().wrap(m, dev, ComTypeId<IDirect3DDevice9>::v) : 0);
+            // The one device in the process, lent to layers with none of their
+            // own: see com_live_d3d9() in gh_x86_com.h.
+            if (dev) com_live_d3d9() = dev;
             log("X86 D3D9 CreateDevice " + std::to_string(pp.BackBufferWidth) + "x" +
                 std::to_string(pp.BackBufferHeight) + " fmt " + hex((uint32_t)pp.BackBufferFormat) +
                 " windowed " + std::to_string(pp.Windowed) + " -> " + hex((uint32_t)hr));

@@ -1284,6 +1284,9 @@ void qsort(void* base, size_t n, size_t sz, int (*cmp)(const void*, const void*)
 }
 
 // setjmp/longjmp on MSVC's x86 jmp_buf: Ebp, Ebx, Edi, Esi, Esp, Eip,
+// _setjmp and _setjmp3 share this code: _setjmp3's second argument is a frame
+// count the caller does not pop (both are cdecl), and filling all eight fields
+// is a superset of what _setjmp promises.
 // Registration (fs:[0] at the time of the setjmp). longjmp restores the SEH
 // chain head rather than unwinding through it: C code has no handlers to run,
 // and leaving fs:[0] pointing into the abandoned frames would be fatal at the
@@ -1291,6 +1294,10 @@ void qsort(void* base, size_t n, size_t sz, int (*cmp)(const void*, const void*)
 __asm__(
     ".att_syntax prefix\n"
     ".text\n"
+    ".globl _setjmp\n"
+    "_setjmp:\n"
+    ".globl __setjmp\n"
+    "__setjmp:\n"
     ".globl __setjmp3\n"
     "__setjmp3:\n"
     "  movl 4(%esp), %edx\n"
@@ -1325,6 +1332,539 @@ __asm__(
     "  jmpl *20(%edx)\n"
 );
 
+// ---- the rest of libm, and the msvcrt data exports -------------------------
+// Half-Life 1's video path (avutil-51/avcodec, a mingw FFmpeg build) and its
+// gameui want the whole of msvcrt's math surface plus the ctype table. None of
+// this can be a host bed: the callers pass and return doubles on the x87 stack
+// and index _pctype directly.
+
+// x87 single-instruction primitives, in the shape log10() above already proved
+// correct: one input in st(0) via the "0" constraint, the result in st(0).
+double sqrt(double x)  { return fsqrt(x); }
+double sin(double x)   { double r; __asm__("fsin" : "=t"(r) : "0"(x)); return r; }
+double cos(double x)   { double r; __asm__("fcos" : "=t"(r) : "0"(x)); return r; }
+double log(double x)   { double r; __asm__("fldln2\n\tfxch\n\tfyl2x" : "=t"(r) : "0"(x)); return r; }
+// fpatan takes st(1)/st(0), so the 1.0 has to go on top of x.
+double atan(double x)  { double r; __asm__("fld1\n\tfpatan" : "=t"(r) : "0"(x)); return r; }
+static double flog2(double x) { double r; __asm__("fld1\n\tfxch\n\tfyl2x" : "=t"(r) : "0"(x)); return r; }
+
+// Truncation toward zero by clearing the fraction bits: a (long long) cast
+// would lower to _ftol2, which a CRT-less DLL has no one to link against.
+static double ftrunc(double x)
+{
+    union { double d; u64 u; } v; v.d = x;
+    int e = (int)((v.u >> 52) & 0x7FF) - 1023;
+    if (e < 0)  return (v.u >> 63) ? -0.0 : 0.0;
+    if (e >= 52) return x;                       // already integral, or inf/NaN
+    v.u &= ~(((u64)1 << (52 - e)) - 1);
+    return v.d;
+}
+double floor(double x) { double t = ftrunc(x); return (t > x) ? t - 1.0 : t; }
+double ceil(double x)  { double t = ftrunc(x); return (t < x) ? t + 1.0 : t; }
+
+double ldexp(double x, int e)
+{
+    // At most three steps, so the scaling factor is always a normal double.
+    while (e >  1023) { x *= 8.98846567431158e307;    e -= 1023; }   // 2^1023
+    while (e < -1022) { x *= 2.2250738585072014e-308; e += 1022; }   // 2^-1022
+    union { double d; u64 u; } f; f.u = (u64)(u32)(e + 1023) << 52;
+    return x * f.d;
+}
+
+double frexp(double x, int* e)
+{
+    union { double d; u64 u; } v; v.d = x;
+    int ex = (int)((v.u >> 52) & 0x7FF);
+    if (ex == 0x7FF) { if (e) *e = 0; return x; }                 // inf or NaN
+    if (ex == 0) {
+        if (x == 0.0) { if (e) *e = 0; return x; }
+        v.d = x * 18446744073709551616.0;                         // 2^64
+        ex = (int)((v.u >> 52) & 0x7FF) - 64;
+    }
+    if (e) *e = ex - 1022;
+    v.u = (v.u & ~((u64)0x7FF << 52)) | ((u64)1022 << 52);
+    return v.d;
+}
+
+// 2^x. f2xm1 only accepts |x| <= 1 and needs fscale to put the integer part
+// back, which is two x87 stack slots to get right in inline asm; the series is
+// shorter to read and good to about 1 ulp over the half-open interval it sees.
+static double fexp2(double x)
+{
+    if (x >  1100.0) return 1.0e308 * 1.0e308;    // +inf
+    if (x < -1100.0) return 0.0;
+    double n = floor(x + 0.5);
+    double y = (x - n) * 0.69314718055994530942;  // ln 2; |y| <= 0.3466
+    double r = 1.0;
+    for (int k = 14; k >= 1; --k) r = 1.0 + y * r / (double)k;
+    return ldexp(r, (int)n);
+}
+double exp(double x) { return fexp2(x * 1.4426950408889634074); }  // log2 e
+
+double pow(double x, double y)
+{
+    if (y == 0.0) return 1.0;
+    if (x == 1.0) return 1.0;
+    if (x == 0.0) return (y > 0.0) ? 0.0 : 1.0e308 * 1.0e308;
+    if (x > 0.0) return fexp2(y * flog2(x));
+    // Negative base: defined only for an integral exponent, and the sign comes
+    // from its parity. Anything else is a domain error, and msvcrt returns a
+    // NaN for it rather than trapping.
+    double iy = ftrunc(y);
+    if (iy != y) { double z = 0.0; return z / z; }
+    double mag = fexp2(y * flog2(-x));
+    return (ftrunc(iy * 0.5) * 2.0 == iy) ? mag : -mag;
+}
+
+double asin(double x)
+{
+    if (x >=  1.0) return  1.57079632679489661923;
+    if (x <= -1.0) return -1.57079632679489661923;
+    return atan(x / fsqrt(1.0 - x * x));
+}
+double acos(double x) { return 1.57079632679489661923 - asin(x); }
+
+double sinh(double x) { double e = exp(x); return (e - 1.0 / e) * 0.5; }
+double cosh(double x) { double e = exp(x); return (e + 1.0 / e) * 0.5; }
+double tanh(double x)
+{
+    if (x >  20.0) return  1.0;                   // exp(40) already saturates
+    if (x < -20.0) return -1.0;
+    double e = exp(x + x);
+    return (e - 1.0) / (e + 1.0);
+}
+
+// ---- ctype table ----------------------------------------------------------
+// _pctype points at the entry for 0 and is indexed with EOF (-1) as well as
+// 0..255, so the storage starts 128 below it. The "C" locale only: nothing
+// above 0x7F is a letter.
+enum { _CT_UPPER = 0x01, _CT_LOWER = 0x02, _CT_DIGIT = 0x04, _CT_SPACE = 0x08,
+       _CT_PUNCT = 0x10, _CT_CNTRL = 0x20, _CT_BLANK = 0x40, _CT_HEX = 0x80 };
+static unsigned short g_ctype[384];
+unsigned short* _pctype = g_ctype + 128;
+unsigned short* pctype  = g_ctype + 128;
+static void init_ctype(void)
+{
+    for (int c = 0; c < 256; ++c) {
+        unsigned short f = 0;
+        if (c < 0x20 || c == 0x7F) { f |= _CT_CNTRL; if (c >= 0x09 && c <= 0x0D) f |= _CT_SPACE; }
+        else if (c == ' ')         f |= _CT_SPACE | _CT_BLANK;
+        else if (c >= '0' && c <= '9') f |= _CT_DIGIT | _CT_HEX;
+        else if (c >= 'A' && c <= 'Z') { f |= _CT_UPPER; if (c <= 'F') f |= _CT_HEX; }
+        else if (c >= 'a' && c <= 'z') { f |= _CT_LOWER; if (c <= 'f') f |= _CT_HEX; }
+        else if (c < 0x7F)         f |= _CT_PUNCT;
+        g_ctype[128 + c] = f;
+    }
+}
+int _isctype(int c, int mask) { return (c >= -1 && c <= 255) ? (_pctype[c] & mask) : 0; }
+int isctype(int c, int mask)  { return _isctype(c, mask); }
+
+// The codepage the narrow CRT converts with, and the Windows version the CRT
+// recorded at startup. Both are read, never written, by the libraries that
+// import them. 1252 is what our MultiByteToWideChar bed answers for CP_ACP.
+u32 __lc_codepage = 1252;
+u32 _lc_codepage  = 1252;
+u32 _winmajor = 6;
+u32 winmajor  = 6;
+
+// ---- strings --------------------------------------------------------------
+int _stricmp(const char* a, const char* b)
+{
+    const unsigned char* p = (const unsigned char*)a;
+    const unsigned char* q = (const unsigned char*)b;
+    while (*p && tolower(*p) == tolower(*q)) { ++p; ++q; }
+    return tolower(*p) - tolower(*q);
+}
+int stricmp(const char* a, const char* b) { return _stricmp(a, b); }
+int _strnicmp(const char* a, const char* b, size_t n)
+{
+    const unsigned char* p = (const unsigned char*)a;
+    const unsigned char* q = (const unsigned char*)b;
+    for (; n; --n, ++p, ++q) {
+        int d = tolower(*p) - tolower(*q);
+        if (d || !*p) return d;
+    }
+    return 0;
+}
+int strnicmp(const char* a, const char* b, size_t n) { return _strnicmp(a, b, n); }
+size_t strspn(const char* s, const char* accept)
+{
+    size_t n = 0;
+    for (; s[n]; ++n) {
+        const char* a = accept;
+        while (*a && *a != s[n]) ++a;
+        if (!*a) break;
+    }
+    return n;
+}
+
+// ---- time -----------------------------------------------------------------
+// The console has no timezone database we can reach from here, so local time
+// IS UTC. Saying so once is better than inventing an offset: every caller that
+// matters here is timestamping a log line or measuring an interval.
+struct tm* localtime(const long* t) { return gmtime(t); }
+
+static const int g_mdays[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+static int leap_year(int y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
+long mktime(struct tm* m)
+{
+    if (!m) return -1;
+    int y = m->year + 1900, mo = m->mon;
+    y += mo / 12; mo %= 12;
+    if (mo < 0) { mo += 12; --y; }
+    if (y < 1970 || y > 2200) return -1;
+    u32 days = 0;
+    for (int i = 1970; i < y; ++i) days += 365u + (u32)leap_year(i);
+    for (int i = 0; i < mo; ++i) days += (u32)g_mdays[i] + (u32)((i == 1) ? leap_year(y) : 0);
+    days += (u32)(m->mday - 1);
+    // 32-bit time_t, so this wraps past 2038 exactly as msvcrt's own does.
+    long s = (long)((u32)days * 86400u + (u32)m->hour * 3600u +
+                    (u32)m->min * 60u + (u32)m->sec);
+    long back = s;
+    struct tm* n = gmtime(&back);        // mktime also normalises its argument
+    if (n) *m = *n;
+    return s;
+}
+
+struct timeb32 { long time; unsigned short millitm; short timezone; short dstflag; };
+void _ftime(struct timeb32* b)
+{
+    if (!b) return;
+    FILETIME ft; GetSystemTimeAsFileTime(&ft);
+    u64 v = ((u64)ft.hi << 32) | ft.lo;
+    if (v < 116444736000000000ull) v = 116444736000000000ull;
+    u64 ms = udiv64(v - 116444736000000000ull, 10000u, NULL);
+    u32 r2; b->time = (long)udiv64(ms, 1000u, &r2);
+    b->millitm = (unsigned short)r2;
+    b->timezone = 0; b->dstflag = 0;
+}
+void ftime(struct timeb32* b) { _ftime(b); }
+
+static u64 g_clock_base;
+static u64 now_ms(void)
+{
+    FILETIME ft; GetSystemTimeAsFileTime(&ft);
+    u64 v = ((u64)ft.hi << 32) | ft.lo;
+    return udiv64(v, 10000u, NULL);
+}
+long clock(void) { return (long)(now_ms() - g_clock_base); }   // CLOCKS_PER_SEC 1000
+
+// The "C" locale only, which is what every caller reaching us is formatting a
+// log stamp or a file name with. An unknown specifier is copied through verbatim
+// rather than dropped, so a format we do not know still shows what it asked for.
+// Returns 0 and leaves the buffer unusable when it will not fit, as the CRT does.
+static const char* const g_wd[7]  = { "Sunday", "Monday", "Tuesday", "Wednesday",
+                                      "Thursday", "Friday", "Saturday" };
+static const char* const g_mo[12] = { "January", "February", "March", "April",
+                                      "May", "June", "July", "August",
+                                      "September", "October", "November", "December" };
+size_t strftime(char* out, size_t cap, const char* fmt, const struct tm* m)
+{
+    size_t n = 0;
+    char tmp[64];
+    if (!out || !cap || !fmt || !m) return 0;
+    #define PUTC(ch) do { if (n + 1 >= cap) { out[0] = 0; return 0; } out[n++] = (char)(ch); } while (0)
+    #define PUTS(s)  do { const char* q_ = (s); while (*q_) PUTC(*q_++); } while (0)
+    for (const char* p = fmt; *p; ++p) {
+        if (*p != '%') { PUTC(*p); continue; }
+        switch (*++p) {
+        case 'a': tmp[0] = 0; { const char* w = g_wd[m->wday % 7];
+                  tmp[0] = w[0]; tmp[1] = w[1]; tmp[2] = w[2]; tmp[3] = 0; } PUTS(tmp); break;
+        case 'A': PUTS(g_wd[m->wday % 7]); break;
+        case 'b': case 'h': { const char* w = g_mo[m->mon % 12];
+                  tmp[0] = w[0]; tmp[1] = w[1]; tmp[2] = w[2]; tmp[3] = 0; } PUTS(tmp); break;
+        case 'B': PUTS(g_mo[m->mon % 12]); break;
+        case 'c': sprintf(tmp, "%.3s %.3s %2d %02d:%02d:%02d %d",
+                          g_wd[m->wday % 7], g_mo[m->mon % 12], m->mday,
+                          m->hour, m->min, m->sec, m->year + 1900); PUTS(tmp); break;
+        case 'd': sprintf(tmp, "%02d", m->mday); PUTS(tmp); break;
+        case 'e': sprintf(tmp, "%2d",  m->mday); PUTS(tmp); break;
+        case 'H': sprintf(tmp, "%02d", m->hour); PUTS(tmp); break;
+        case 'I': sprintf(tmp, "%02d", m->hour % 12 ? m->hour % 12 : 12); PUTS(tmp); break;
+        case 'j': sprintf(tmp, "%03d", m->yday + 1); PUTS(tmp); break;
+        case 'm': sprintf(tmp, "%02d", m->mon + 1); PUTS(tmp); break;
+        case 'M': sprintf(tmp, "%02d", m->min);  PUTS(tmp); break;
+        case 'p': PUTS(m->hour < 12 ? "AM" : "PM"); break;
+        case 'S': sprintf(tmp, "%02d", m->sec);  PUTS(tmp); break;
+        // Week of the year counted from the first Sunday (%U) or Monday (%W).
+        case 'U': sprintf(tmp, "%02d", (m->yday + 7 - m->wday) / 7); PUTS(tmp); break;
+        case 'W': sprintf(tmp, "%02d", (m->yday + 7 - ((m->wday + 6) % 7)) / 7); PUTS(tmp); break;
+        case 'w': sprintf(tmp, "%d",   m->wday % 7); PUTS(tmp); break;
+        case 'x': sprintf(tmp, "%02d/%02d/%02d", m->mon + 1, m->mday,
+                          ((m->year + 1900) % 100 + 100) % 100); PUTS(tmp); break;
+        case 'X': sprintf(tmp, "%02d:%02d:%02d", m->hour, m->min, m->sec); PUTS(tmp); break;
+        case 'y': sprintf(tmp, "%02d", ((m->year + 1900) % 100 + 100) % 100); PUTS(tmp); break;
+        case 'Y': sprintf(tmp, "%d",   m->year + 1900); PUTS(tmp); break;
+        case 'Z': PUTS("UTC"); break;       // local time IS UTC here; see localtime
+        case 'z': PUTS("+0000"); break;
+        case 'n': PUTC('\n'); break;
+        case 't': PUTC('\t'); break;
+        case '%': PUTC('%');  break;
+        case 0:   PUTC('%');  --p; break;   // a trailing '%' is literal
+        default:  PUTC('%');  PUTC(*p); break;
+        }
+    }
+    #undef PUTS
+    #undef PUTC
+    out[n] = 0;
+    return n;
+}
+
+// ---- descriptors ----------------------------------------------------------
+// fds 0..2 have no handle behind them (there is no console), which is exactly
+// what a character device looks like to a caller: not seekable, no size.
+int _isatty(int fd) { return (fd >= 0 && fd <= 2) ? 1 : 0; }
+int isatty(int fd)  { return _isatty(fd); }
+
+int _fstati64(int fd, struct stati64* s)
+{
+    if (!fd_ok(fd) || !s) { errno = EBADF; return -1; }
+    for (u32 i = 0; i < sizeof *s; ++i) ((char*)s)[i] = 0;
+    s->nlink = 1;
+    if (fd <= 2) { s->mode = 0x2000 | 0x1B6; return 0; }          // _S_IFCHR | rw-rw-rw-
+    s->mode = 0x8000 | 0x1B6;                                     // _S_IFREG | rw-rw-rw-
+    i64 cur = 0, end = 0;
+    if (!SetFilePointerEx(g_fd[fd].h, 0, &cur, 1) ||
+        !SetFilePointerEx(g_fd[fd].h, 0, &end, 2)) { set_errno_from_win32(); return -1; }
+    SetFilePointerEx(g_fd[fd].h, cur, NULL, 0);
+    s->size = end;
+    return 0;
+}
+int _fstat(int fd, struct stat32* s)
+{
+    struct stati64 w;
+    if (_fstati64(fd, &w) < 0) return -1;
+    narrow_stat(&w, s);
+    return 0;
+}
+int fstat(int fd, struct stat32* s) { return _fstat(fd, s); }
+
+// ---- per-DLL atexit -------------------------------------------------------
+// __dllonexit grows the calling DLL's own table, whose head and tail pointers
+// it is handed. The table starts empty (both NULL) in every mingw and MSVC
+// DLL startup that imports this, so realloc owns it from the first call.
+typedef void (*PVFV)(void);
+PVFV __dllonexit(PVFV func, PVFV** pbegin, PVFV** pend)
+{
+    if (!func || !pbegin || !pend) return NULL;
+    u32 n = (*pbegin && *pend) ? (u32)(*pend - *pbegin) : 0;
+    PVFV* nb = (PVFV*)realloc(n ? *pbegin : NULL, (n + 1) * sizeof(PVFV));
+    if (!nb) return NULL;
+    nb[n] = func;
+    *pbegin = nb; *pend = nb + n + 1;
+    return func;
+}
+PVFV _dllonexit(PVFV func, PVFV** pbegin, PVFV** pend) { return __dllonexit(func, pbegin, pend); }
+
+// ---- scanf ----------------------------------------------------------------
+// One scanner over either a string or a FILE, so fscanf and sscanf share it.
+typedef struct { const char* s; size_t len, pos; FILE* f; int back; } Src;
+static int src_get(Src* r)
+{
+    if (r->back >= 0) { int c = r->back; r->back = -1; return c; }
+    if (r->f) return getc(r->f);
+    if (r->pos >= r->len || !r->s[r->pos]) return -1;
+    return (unsigned char)r->s[r->pos++];
+}
+static void src_unget(Src* r, int c)
+{
+    if (c < 0) return;
+    if (r->f) { r->back = c; return; }
+    if (r->pos) --r->pos; else r->back = c;
+}
+static int scan_num(Src* r, int base, int width, i64* out, int* neg)
+{
+    int c = src_get(r), got = 0, n = 0;
+    *neg = 0;
+    if (c == '+' || c == '-') { *neg = (c == '-'); c = src_get(r); ++n; }
+    if (base == 16 && c == '0') {
+        int c2 = src_get(r);
+        if (c2 == 'x' || c2 == 'X') { c = src_get(r); n += 2; }
+        else { src_unget(r, c2); }
+    }
+    u64 v = 0;
+    for (; c >= 0 && (width <= 0 || n < width); c = src_get(r), ++n) {
+        int d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (base > 10 && c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (base > 10 && c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else break;
+        if (d >= base) break;
+        v = v * (u64)(unsigned)base + (u64)(unsigned)d;
+        got = 1;
+    }
+    src_unget(r, c);
+    *out = (i64)v;
+    return got;
+}
+static int gh_vscan(Src* r, const char* f, va_list ap)
+{
+    int assigned = 0;
+    for (; *f; ++f) {
+        if (isspace((unsigned char)*f)) {
+            int c;
+            do { c = src_get(r); } while (c >= 0 && isspace(c));
+            src_unget(r, c);
+            continue;
+        }
+        if (*f != '%') {
+            int c = src_get(r);
+            if (c != (unsigned char)*f) { src_unget(r, c); return assigned; }
+            continue;
+        }
+        ++f;
+        if (*f == '%') {
+            int c = src_get(r);
+            if (c != '%') { src_unget(r, c); return assigned; }
+            continue;
+        }
+        int skip = 0, width = 0, lng = 0;
+        if (*f == '*') { skip = 1; ++f; }
+        for (; isdig((unsigned char)*f); ++f) width = width * 10 + (*f - '0');
+        for (;; ++f) {
+            if (*f == 'l' || *f == 'L') lng++;
+            else if (*f == 'h' || *f == 'I' || *f == '6' || *f == '4' || *f == '3' || *f == '2') {}
+            else break;
+        }
+        int c;
+        switch (*f) {
+        case 'd': case 'i': case 'u': case 'x': case 'X': case 'o': {
+            do { c = src_get(r); } while (c >= 0 && isspace(c));
+            src_unget(r, c);
+            i64 v; int neg;
+            int base = (*f == 'x' || *f == 'X') ? 16 : (*f == 'o' ? 8 : 10);
+            if (!scan_num(r, base, width, &v, &neg)) return assigned;
+            if (neg) v = -v;
+            if (!skip) {
+                if (lng >= 2) *va_arg(ap, i64*) = v;
+                else *va_arg(ap, int*) = (int)v;
+                ++assigned;
+            }
+            break;
+        }
+        case 'e': case 'E': case 'f': case 'g': case 'G': {
+            do { c = src_get(r); } while (c >= 0 && isspace(c));
+            char b[64];
+            int n = 0;
+            for (; c >= 0 && n < 63 && (width <= 0 || n < width); c = src_get(r)) {
+                if (isdig(c) || c == '+' || c == '-' || c == '.' ||
+                    c == 'e' || c == 'E') b[n++] = (char)c;
+                else break;
+            }
+            src_unget(r, c);
+            b[n] = 0;
+            if (!n) return assigned;
+            double d = strtod(b, NULL);
+            if (!skip) {
+                if (lng) *va_arg(ap, double*) = d;
+                else *va_arg(ap, float*) = (float)d;
+                ++assigned;
+            }
+            break;
+        }
+        case 's': {
+            do { c = src_get(r); } while (c >= 0 && isspace(c));
+            char* d = skip ? NULL : va_arg(ap, char*);
+            int n = 0;
+            for (; c >= 0 && !isspace(c) && (width <= 0 || n < width); c = src_get(r), ++n)
+                if (d) d[n] = (char)c;
+            src_unget(r, c);
+            if (!n) return assigned;
+            if (d) { d[n] = 0; ++assigned; }
+            break;
+        }
+        case 'c': {
+            int n = width > 0 ? width : 1;
+            char* d = skip ? NULL : va_arg(ap, char*);
+            for (int i = 0; i < n; ++i) {
+                c = src_get(r);
+                if (c < 0) return assigned;
+                if (d) d[i] = (char)c;
+            }
+            if (d) ++assigned;
+            break;
+        }
+        case '[': {
+            int invert = 0;
+            ++f;
+            if (*f == '^') { invert = 1; ++f; }
+            const char* set = f;
+            if (*f == ']') ++f;
+            for (; *f && *f != ']'; ++f) {}
+            size_t setlen = (size_t)(f - set);
+            char* d = skip ? NULL : va_arg(ap, char*);
+            int n = 0;
+            for (;;) {
+                c = src_get(r);
+                if (c < 0 || (width > 0 && n >= width)) break;
+                int in = 0;
+                for (size_t i = 0; i < setlen; ++i) {
+                    if (set[i] == '-' && i && i + 1 < setlen) {
+                        if (c > (unsigned char)set[i - 1] && c < (unsigned char)set[i + 1]) in = 1;
+                    } else if ((unsigned char)set[i] == c) in = 1;
+                }
+                if (in == invert) break;
+                if (d) d[n] = (char)c;
+                ++n;
+            }
+            src_unget(r, c);
+            if (!n) return assigned;
+            if (d) { d[n] = 0; ++assigned; }
+            break;
+        }
+        case 'n':
+            if (!skip) { *va_arg(ap, int*) = (int)r->pos; ++assigned; }
+            break;
+        default:
+            return assigned;
+        }
+    }
+    return assigned;
+}
+int __stdio_common_vfscanf(u64 options, FILE* f, const char* fmt, void* loc, va_list ap)
+{
+    (void)options; (void)loc;
+    if (!f || !fmt) return -1;
+    Src r = { NULL, 0, 0, f, -1 };
+    return gh_vscan(&r, fmt, ap);
+}
+int __stdio_common_vsscanf(u64 options, const char* buf, size_t cap, const char* fmt, void* loc, va_list ap)
+{
+    (void)options; (void)loc;
+    if (!buf || !fmt) return -1;
+    Src r = { buf, cap == (size_t)-1 ? strlen(buf) : cap, 0, NULL, -1 };
+    return gh_vscan(&r, fmt, ap);
+}
+
+// msvcrt names them plainly; the UCRT spells them __stdio_common_v*scanf and
+// has its own headers inline the narrow wrappers, so only msvcrt exports these.
+int vsscanf(const char* buf, const char* fmt, va_list ap)
+{
+    if (!buf || !fmt) return -1;
+    Src r = { buf, strlen(buf), 0, NULL, -1 };
+    return gh_vscan(&r, fmt, ap);
+}
+int sscanf(const char* buf, const char* fmt, ...)
+{
+    va_list ap; va_start(ap, fmt);
+    int n = vsscanf(buf, fmt, ap);
+    va_end(ap);
+    return n;
+}
+int vfscanf(FILE* f, const char* fmt, va_list ap)
+{
+    if (!f || !fmt) return -1;
+    Src r = { NULL, 0, 0, f, -1 };
+    return gh_vscan(&r, fmt, ap);
+}
+int fscanf(FILE* f, const char* fmt, ...)
+{
+    va_list ap; va_start(ap, fmt);
+    int n = vfscanf(f, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
 // ---- entry ----------------------------------------------------------------
 int __stdcall DllMainCRTStartup(void* inst, u32 reason, void* reserved)
 {
@@ -1336,6 +1876,8 @@ int __stdcall DllMainCRTStartup(void* inst, u32 reason, void* reserved)
         InitializeCriticalSection(&g_envlock);
         for (int i = 0; i < 36; ++i) InitializeCriticalSection(&g_locks[i]);
         for (int i = 0; i < 3; ++i) { g_fd[i].open = 1; g_fd[i].h = NULL; }
+        init_ctype();
+        g_clock_base = now_ms();
     }
     return 1;
 }

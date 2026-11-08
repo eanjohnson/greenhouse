@@ -22,6 +22,7 @@
 #include <functional>
 #include <thread>
 #include <string>
+#include <set>
 #include <mutex>
 #include <unordered_map>
 #include <deque>
@@ -223,6 +224,19 @@ struct BedState {
         std::unordered_map<int32_t, uint32_t> longs;
     };
     std::unordered_map<uint32_t, SubWindow> sub_windows;    // HWND -> window; never kFakeHwnd
+    // SetProp/GetProp/RemoveProp, per window, keyed by the property name
+    // (lowercased, or "#<atom>" for an integer atom).
+    //
+    // These used to be plain forwards to the host user32, which is asking the
+    // real window manager about a window that does not exist: our HWNDs are
+    // synthetic (kFakeHwnd and friends). In this container that answered
+    // 0xFFFFFFFF rather than NULL, and SDL2's WIN_WindowProc reads
+    // GetPropW(hwnd, L"SDL_WindowData") and dereferences anything non-NULL --
+    // so Half-Life 1 faulted on `mov eax,[ebx+0x74]` with ebx = -1 the first
+    // time a message reached its window (0.0.913.0). A property store of our
+    // own is the only correct answer: the windows are ours, so the properties
+    // hung on them have to be ours too.
+    std::unordered_map<uint32_t, std::unordered_map<std::string, uint32_t>> win_props;
     std::unordered_map<std::string, uint32_t> class_proc;   // lowercased name, or "#atom" -> WndProc
     uint32_t next_atom = 0xC000, next_sub_hwnd = 2;
     bool     main_window_made = false;
@@ -490,6 +504,29 @@ struct SyncObj {
 // package); see resolve_dll_path. Set by the host before a run, with its
 // trailing backslash.
 inline std::wstring g_x86_sys_dir;
+
+// gh_x86_steam=1: answer the guest's steam_api.dll out of our own beds instead
+// of mapping the copy the game ships.
+//
+// It has to be a shadow rather than an override because resolve_for_module
+// prefers a mapped guest DLL to a bed -- that is the right order for every
+// other DLL a game ships, and the wrong one here. Valve's 32-bit steam_api.dll
+// looks for a running Steam client, finds none on a console, and tells the game
+// so; Half-Life's engine then prints "Failed to initalize authentication
+// interface. Exiting..." and calls ExitProcess(-1). The Steam session this
+// console does have belongs to the x64 engine in the loader, which a 32-bit
+// guest cannot call directly, so the beds are the bridge to it.
+inline bool g_x86_bed_only_steam = false;
+// gh_x86_seh_trace.txt=1: name each frame of the FS:[0] chain as it is walked.
+// Off by default -- a fault the guest swallows would otherwise cost a diag
+// line per frame, every time.
+inline bool g_x86_seh_trace = false;
+// Set by the host->guest call path when it REFUSES to run the guest (no guest
+// context on this thread, the thread is unwinding, or the nesting limit is
+// reached). Such a call returns 0, which an SEH walk would otherwise read as
+// ExceptionContinueExecution -- "handled, resume" -- and resume straight back
+// onto the faulting instruction, for ever. A refusal is not an answer.
+inline thread_local bool g_x86_call_refused = false;
 
 struct Machine {
     // The watchdog is a real host thread, so it has to be joined before the
@@ -2378,6 +2415,18 @@ struct Machine {
             log("X86 thunk pool exhausted resolving " + name);
             return 0;
         }
+        // A slot with no host function behind it is a landmine: it is fatal the
+        // moment the guest calls it, and until then nothing says it exists. Say
+        // so here, at bind time, once per name -- so ONE run lists everything a
+        // newly loaded module will need, instead of one deploy per missing
+        // import. (Chromium inside Half-Life's gameui brought 633 imports and
+        // died on the first one of them we lacked.)
+        if (!fn) {
+            static std::set<std::string> told;
+            if (told.insert(dll + "!" + name).second)
+                log("X86 import NOT IMPLEMENTED: " + dll + "!" + name +
+                    "  <-- fatal if the guest calls it");
+        }
         ThunkSlot slot;
         slot.dll = dll; slot.name = name; slot.fn = fn;
         slot.invalidates_code = import_invalidates_code(name);
@@ -2520,6 +2569,69 @@ struct Machine {
             if (!line.empty()) log("X86   " + line);
         }
         return true;
+    }
+
+    // The exe's own dependencies, the way Windows' loader resolves them before
+    // the entry point. bind_imports() can only consult the beds, because it
+    // runs before any guest code may execute and load_guest_dll() calls
+    // DllMain -- so a name no bed implements leaves an unresolved slot there.
+    // That is right for a name nobody implements and wrong for a DLL the game
+    // ships beside its exe, or one we ship in guest\x86\: Half-Life 1 is an
+    // MSVC-2015 build whose exe imports the split UCRT
+    // (api-ms-win-crt-*-l1-1-0.dll, vcruntime140.dll), 54 names of it, none of
+    // them beds and all of them exports of the ucrtbase.dll we build. A mapped
+    // guest DLL's own imports already go this way (resolve_for_module); this
+    // gives the exe the same treatment, once the runtime can run guest code.
+    //
+    // Call it on the guest's entry thread, before the entry point.
+    int load_exe_dependencies()
+    {
+        auto lower = [](std::string s) {
+            for (auto& c : s) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            return s;
+        };
+        // Only DLLs that actually left something unresolved: a game that ships
+        // its own copy of a DLL we bed (steam_api) must keep the bed.
+        std::vector<std::string> want;
+        for (size_t i = 0; i < imports.size() && i < thunks.size(); ++i) {
+            if (thunks[i].fn) continue;
+            std::string d = lower(imports[i].dll);
+            bool seen = false;
+            for (auto& w : want) if (w == d) { seen = true; break; }
+            if (!seen) want.push_back(d);
+        }
+        int loaded = 0;
+        for (const std::string& d : want) {
+            if (dll_by_name(d)) { loaded++; continue; }
+            std::wstring p = resolve_dll_path(std::wstring(d.begin(), d.end()), guest_dir());
+            if (p.empty()) continue;
+            if (load_guest_dll(p)) loaded++;
+        }
+        if (!loaded) return 0;
+
+        int rebound = 0;
+        for (size_t i = 0; i < imports.size() && i < thunks.size(); ++i) {
+            if (thunks[i].fn) continue;
+            const Pe32Import& imp = imports[i];
+            GuestDll* g = dll_by_name(lower(imp.dll));
+            if (!g) continue;
+            uint32_t a = 0;
+            if (imp.name.empty()) {
+                a = export_addr(*g, std::string(), imp.ordinal);
+            } else {
+                const std::string nm = undecorate(imp.name);
+                if (nm != imp.name) a = export_addr(*g, imp.name, 0);
+                if (!a) a = export_addr(*g, nm, 0);
+            }
+            if (!a) continue;
+            if (imp.iat_rva && (uint64_t)imp.iat_rva + 4 <= info.image_size)
+                std::memcpy((void*)(uintptr_t)(image_base + imp.iat_rva), &a, 4);
+            thunks[i].name += " -> guest";       // so a stale slot cannot be mistaken for a live one
+            rebound++;
+        }
+        log("X86 exe dependencies: " + std::to_string(loaded) + " guest DLL(s), " +
+            std::to_string(rebound) + " import(s) re-pointed at guest code");
+        return rebound;
     }
 
     // Renders one traced argument. A bare hex value says almost nothing; the
@@ -2743,6 +2855,15 @@ struct Machine {
         if (GuestDll* have = dll_by_name(nm)) { have->refs++; return have->base; }
         if (depth > 8) return 0;
 
+        // Not mapped on purpose, so that resolve_for_module falls through to the
+        // bed registry. A failed load here is not fatal to the importer: its
+        // slots are bound by resolve_for_module either way. See
+        // g_x86_bed_only_steam.
+        if (g_x86_bed_only_steam && nm == "steam_api.dll") {
+            log("X86 steam_api.dll: shadowed by the bed bridge, the game's copy is not mapped");
+            return 0;
+        }
+
         std::vector<uint8_t> file;
         if (!read_file(path, file)) { log("X86 LoadLibrary: cannot read " + nm); return 0; }
 
@@ -2765,6 +2886,17 @@ struct Machine {
             return 0;
         }
         d.entry = d.info.entry_rva ? d.base + d.info.entry_rva : 0;
+
+        // A data-only image (no executable section -- see pe32_is_data_only)
+        // was mapped at whatever base the bump allocator had free, with no
+        // fixups, because it has none and needs none. Whatever its header calls
+        // an entry point is not code, so it must not be called: the only thing
+        // at that RVA is data that happens to be at the front of the blob.
+        if (pe32_is_data_only(d.info)) {
+            log("X86 " + nm + " is data only (no executable section): mapped at " +
+                hex(d.base) + " without relocation, no DllMain");
+            d.entry = 0;
+        }
 
         // Registered BEFORE its imports are bound, so a dependency cycle
         // terminates instead of recursing forever.
@@ -3053,7 +3185,9 @@ struct Machine {
             for (const auto& v : bed.veh) {
                 if (v.first_handler != (pass == 0)) continue;
                 uint32_t a[1] = { exc_pointers };
-                if ((int32_t)call_guest32(v.handler, a, 1) == -1) {   // CONTINUE_EXECUTION
+                const int32_t vd = (int32_t)call_guest32(v.handler, a, 1);
+                if (g_x86_call_refused) return false;
+                if (vd == -1) {                                       // CONTINUE_EXECUTION
                     read_context(exc_context);
                     return true;
                 }
@@ -3069,9 +3203,36 @@ struct Machine {
             uint32_t prev    = get(node + 0);
             uint32_t handler = get(node + 4);
             if (!handler) break;
+            // A frame pointer can be in range and still hold rubbish -- a
+            // stack slot the guest has reused, or a chain we picked up mid
+            // update. Calling a "handler" that is not code turns one guest
+            // fault into a fault inside the fault, and the run dies with no
+            // record of either. Reject anything not mapped executable.
+            {
+                MEMORY_BASIC_INFORMATION mbi = {};
+                const bool ok =
+                    VirtualQuery((void*)(uintptr_t)handler, &mbi, sizeof mbi) == sizeof mbi &&
+                    mbi.State == MEM_COMMIT &&
+                    (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                    PAGE_EXECUTE_WRITECOPY)) != 0;
+                if (!ok) {
+                    log("X86 SEH frame " + hex(node) + " names handler " + hex(handler) +
+                        ", which is not mapped executable -- stopping the walk rather than"
+                        " calling it");
+                    break;
+                }
+            }
+            if (g_x86_seh_trace && depth < 8)
+                log("X86 SEH frame " + hex(node) + " -> handler " + describe_addr(handler));
 
             uint32_t args[4] = { exc_record, node, exc_context, 0 };
             uint32_t disp = call_guest32(handler, args, 4);
+            if (g_x86_call_refused) {
+                log("X86 SEH handler " + hex(handler) + " could not be run, so this"
+                    " exception has no answer -- reporting it unhandled rather than"
+                    " resuming onto the same fault");
+                return false;
+            }
             if (disp == 0) {                             // ExceptionContinueExecution
                 read_context(exc_context);
                 return true;

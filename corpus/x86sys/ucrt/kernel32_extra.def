@@ -1,0 +1,5 @@
+SetCurrentDirectoryA@4
+GetCommandLineA@0
+DeleteCriticalSection@4
+RaiseException@16
+RtlUnwind@16

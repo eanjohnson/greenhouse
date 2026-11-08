@@ -1,0 +1,23 @@
+{
+  "schema": "greenhouse.title/1",
+  "id": "hl",
+  "name": "Half-Life",
+  "match": {
+    "exe": "hl.exe",
+    "launch": "hl.exe",
+    "steamAppId": 70
+  },
+  "requires": {
+    "loader": "0.0.824.0",
+    "services": [
+      "steam-runtime"
+    ]
+  },
+  "args": "-game valve -soft -condebug -novid",
+  "input": "builtin-wasd",
+  "knobs": {
+    "gh_dsound": 1,
+    "gh_x86_native": 1,
+    "gh_x86_steam": 1
+  }
+}
