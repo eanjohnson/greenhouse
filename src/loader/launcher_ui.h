@@ -349,12 +349,36 @@ static DWORD LuiFileSize(const std::wstring& path)
     return (sz == INVALID_FILE_SIZE) ? 0 : sz;
 }
 
+// The title id of an installed tree, from the first source that still has it:
+//   1. steam_appid.txt  -- the game's own file, and the only one before #302;
+//   2. gh_install.txt   -- ours, written by the downloader, survives the game's files;
+//   3. the folder name  -- app_<id>, the last resort.
+// Without 2 and 3 a tree whose exe and steam_appid.txt are gone resolves to app=0.
+// That looks cosmetic and is not: the Steam row for the same title merges onto an
+// installed row by app id (LuiAddonCollect), so an id-less row never receives an
+// `acq` source, and the resume branch then reports "no library source can repair".
+// The one row that needs repairing was the only one that could not ask for it.
 static uint32_t LuiReadAppIdFile(const std::wstring& dir)
 {
     std::vector<uint8_t> b;
-    if (!ReadWholeFile(dir + L"steam_appid.txt", b) || b.empty()) return 0;
-    std::string s(b.begin(), b.end());
-    return (uint32_t)strtoul(s.c_str(), nullptr, 10);
+    if (ReadWholeFile(dir + L"steam_appid.txt", b, true) && !b.empty()) {
+        std::string s(b.begin(), b.end());
+        if (uint32_t a = (uint32_t)strtoul(s.c_str(), nullptr, 10)) return a;
+    }
+    b.clear();
+    if (ReadWholeFile(dir + L"gh_install.txt", b, true) && !b.empty()) {
+        std::string s(b.begin(), b.end());
+        size_t k = s.find("app=");
+        if (k != std::string::npos)
+            if (uint32_t a = (uint32_t)strtoul(s.c_str() + k + 4, nullptr, 10)) return a;
+    }
+    std::wstring d = dir;                                   // ...\gh_games\app_1966720\ -> 1966720
+    while (!d.empty() && (d.back() == L'\\' || d.back() == L'/')) d.pop_back();
+    size_t slash = d.find_last_of(L"\\/");
+    std::wstring leaf = (slash == std::wstring::npos) ? d : d.substr(slash + 1);
+    if (leaf.size() > 4 && StartsWithNoCase(leaf, L"app_"))
+        if (uint32_t a = (uint32_t)wcstoul(leaf.c_str() + 4, nullptr, 10)) return a;
+    return 0;
 }
 
 
@@ -5730,6 +5754,73 @@ static void OverlayBlit(ID3D11Resource* dst)
 }
 
 // ---------------------------------------------------------------------------
+// #303: LocalState\gh_cmd.txt -- the game/package command channel.
+//
+// Until this existed, every install, repair and uninstall had to be driven
+// through the picker with synthetic pad presses and screenshot gating. That
+// addresses SCREEN POSITION, not title identity: on 2026-11-08 a two-letter
+// query put the highlight on the wrong title with A one press away from a
+// multi-gigabyte download nobody asked for. Every command here takes an app id.
+//
+// Lifecycle copies gh_mods_cmd.txt (§51 M1): one command per line, read only
+// while the picker is up, renamed *.done on consumption, every result line to
+// the diag and to LocalState\gh_cmd_out.txt.
+//
+//   list                              app id, state, name, for every row
+//   install   <appid>                 acquire(kAcqNew)    -- fills holes only
+//   resume    <appid>                 acquire(kAcqResume)
+//   verify    <appid>                 acquire(kAcqVerify) -- hashes, repairs in place
+//   uninstall <appid> --confirm <appid>   delete the tree; the id MUST appear twice
+//   help                              the command list
+//
+// Not in v1, and deliberately: `cancel` (acquire blocks the UI thread that would
+// have to service it) and `theme`/`pkg` (the theme system does not exist yet).
+//
+// The poll thread only PARSES and hands the batch to the picker; the picker's UI
+// thread runs it. acquire() blocks and draws progress on that thread, and `all`
+// /`items` belong to it, so running commands anywhere else would race the render.
+struct LuiCmdJob {
+    std::string      text;            // the whole command file
+    std::string      out;             // result lines, written back to gh_cmd_out.txt
+    std::atomic<bool> done{false};
+};
+static std::mutex                 g_cmdMu;
+static std::shared_ptr<LuiCmdJob> g_cmdJob;          // handed from the poll thread to the picker
+static std::atomic<bool>          g_cmdPickerUp{false};
+
+static void LuiCmdStart()
+{
+#ifdef GH_RELEASE
+    // A channel that can delete a member's games does not ship unconditionally.
+    // On a dev-mode console WDP is already effectively root, so the channel costs
+    // nothing there; on a distributed build there is no authenticated caller yet,
+    // so there is no channel. Revisit when one exists (membership token, §2/T4).
+    Diag("CMD channel disabled in this build");
+    return;
+#else
+    static std::atomic<bool> started{false};
+    if (started.exchange(true)) return;
+    std::thread([] {
+        const std::wstring cmdPath = std::wstring(kLocalState) + L"gh_cmd.txt";
+        for (;;) {
+            Sleep(2000);
+            if (!g_cmdPickerUp || GetFileAttributesW(cmdPath.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+            { std::lock_guard<std::mutex> lk(g_cmdMu); if (g_cmdJob) continue; }   // one batch at a time
+            std::string text;
+            ghmods::ReadAll(cmdPath, text, 1 << 20);
+            MoveFileExW(cmdPath.c_str(), (cmdPath + L".done").c_str(), MOVEFILE_REPLACE_EXISTING);
+            auto job = std::make_shared<LuiCmdJob>();
+            job->text = text;
+            { std::lock_guard<std::mutex> lk(g_cmdMu); g_cmdJob = job; }
+            // acquire() can run for many minutes; just wait for the picker.
+            while (!job->done) Sleep(250);
+            ghmods::WriteAll(std::wstring(kLocalState) + L"gh_cmd_out.txt", job->out);
+        }
+    }).detach();
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // The picker loop. Runs on the UI thread. Returns the chosen guest string
 // (empty => launch the default guest). Falls through (returns empty) if the
 // bridge/D2D cannot init, so a bad UI never blocks launching.
@@ -5791,18 +5882,126 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
     auto notice = [&](const std::wstring& msg) {
         for (int i = 0; i < 120; ++i) { LuiDrawStatus(msg); LuiPresent(); Sleep(16); }
     };
+
+    // #303: run one gh_cmd.txt batch. Every op addresses an app id -- nothing here
+    // can act on the current selection, which is the whole point of the channel.
+    auto runCmd = [&](LuiCmdJob& job) {
+        auto log = [&](const std::string& s) { Diag("CMD " + s); job.out += s + "\n"; };
+        // The same app id can be both an installed row and the library's "owned"
+        // row. install wants the acquire row, everything else the installed one.
+        auto find = [&](uint32_t app, bool wantInstalled) -> const LauncherItem* {
+            const LauncherItem* other = nullptr;
+            for (const auto& it : all) {
+                if (it.app != app || it.kind == LauncherItem::kPlaceholder) continue;
+                if ((it.kind != LauncherItem::kAcquire) == wantInstalled) return &it;
+                if (!other) other = &it;
+            }
+            return other;
+        };
+        for (auto line : ghmods::Split(job.text, '\n')) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
+                line.pop_back();
+            size_t b = line.find_first_not_of(" \t");
+            if (b == std::string::npos) continue;
+            line = line.substr(b);
+            if (line[0] == '#') continue;
+            std::vector<std::string> a;
+            for (auto& t : ghmods::Split(line, ' ')) if (!t.empty()) a.push_back(t);
+            if (a.empty()) continue;
+            const std::string op = a[0];
+            log("> " + line);
+
+            if (op == "help") {
+                log("list | install <appid> | resume <appid> | verify <appid> | "
+                    "uninstall <appid> --confirm <appid> | help");
+                continue;
+            }
+            if (op == "list") {
+                for (const auto& it : all) {
+                    if (it.kind == LauncherItem::kPlaceholder) continue;
+                    const char* st = (it.kind == LauncherItem::kAcquire) ? "owned"
+                                   : (it.incomplete ? "incomplete" : "installed");
+                    log("app " + std::to_string(it.app) + " " + st + " " + LuiNarrow(it.display));
+                }
+                continue;
+            }
+            const uint32_t app = (a.size() >= 2) ? (uint32_t)strtoul(a[1].c_str(), nullptr, 10) : 0;
+            if (!app) { log("! " + op + ": needs an app id"); continue; }
+
+            if (op == "install" || op == "resume" || op == "verify") {
+                const LauncherItem* found = find(app, op != "install");
+                if (!found) { log("! " + op + " " + std::to_string(app) + ": no row with that app id"); continue; }
+                if (!found->acq || !found->acq->acquire) {
+                    log("! " + op + " " + std::to_string(app) + ": no library source can serve '" +
+                        LuiNarrow(found->display) + "'");
+                    continue;
+                }
+                const int mode = (op == "install") ? kAcqNew : (op == "resume" ? kAcqResume : kAcqVerify);
+                LauncherItem copy = *found;        // acquire() + rebuild() invalidate `all`
+                log(op + " " + std::to_string(app) + " '" + LuiNarrow(copy.display) + "' ...");
+                const bool ok = copy.acq->acquire(copy, mode);
+                rebuild();
+                log(std::string(ok ? "ok " : "FAILED ") + op + " " + std::to_string(app));
+                continue;
+            }
+            if (op == "uninstall") {
+                // The id must appear twice. A typo deletes nothing.
+                if (a.size() < 4 || a[2] != "--confirm" || (uint32_t)strtoul(a[3].c_str(), nullptr, 10) != app) {
+                    log("! uninstall: needs 'uninstall " + std::to_string(app) +
+                        " --confirm " + std::to_string(app) + "'");
+                    continue;
+                }
+                const LauncherItem* found = find(app, true);
+                if (!found || found->kind == LauncherItem::kAcquire) {
+                    log("! uninstall " + std::to_string(app) + ": not installed"); continue;
+                }
+                if (!LuiCanUninstall(*found)) {
+                    log("! uninstall " + std::to_string(app) + ": '" + LuiNarrow(found->display) +
+                        "' is not a Greenhouse-managed tree"); continue;
+                }
+                const std::wstring dir = LuiInstallFolder(*found);
+                log("uninstall '" + LuiNarrow(found->display) + "' dir='" + LuiNarrow(dir) + "'");
+                const bool ok = LuiDeleteTree(dir);
+                rebuild();
+                log(std::string(ok ? "ok" : "FAILED") + " uninstall " + std::to_string(app));
+                continue;
+            }
+            log("! unknown command '" + op + "' (try help)");
+        }
+    };
+
     rebuild();
     Diag("LAUNCHER picker items=" + std::to_string(all.size()));
     LuiRepoStartupCheck();              // background index check -> "Packages · N update(s)" badge
     LuiShaderBakeStart();               // §47: gh_shbake knob
     LuiModsCmdStart();                  // §51 M1: LocalState\gh_mods_cmd.txt jobs
     LuiModsMapStart();                  // §51 M2: which titles offer Mods (RB)
-    struct PickerUp { PickerUp() { g_modsPickerUp = true; } ~PickerUp() { g_modsPickerUp = false; } } pickerUp;
+    LuiCmdStart();                      // §303: LocalState\gh_cmd.txt game/package commands
+    struct PickerUp {
+        PickerUp()  { g_modsPickerUp = true;  g_cmdPickerUp = true;  }
+        ~PickerUp() { g_modsPickerUp = false; g_cmdPickerUp = false; }
+    } pickerUp;
     for (;;) {
         if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
         PollGamepadOnUi();
         PollSyntheticPad();
         GhAudioTick();
+
+        // §303: one gh_cmd.txt batch per iteration, on this thread -- acquire()
+        // blocks and draws its own progress, and `all` belongs to us.
+        {
+            std::shared_ptr<LuiCmdJob> job;
+            { std::lock_guard<std::mutex> lk(g_cmdMu); job = g_cmdJob; }
+            if (job && !job->done) {
+                runCmd(*job);
+                { std::lock_guard<std::mutex> lk(g_cmdMu); g_cmdJob.reset(); }
+                job->done = true;       // only after the pointer is clear: the poll
+                                        // thread may hand over the next batch at once
+                prev = 0xFFFF;          // drop anything held down while the batch ran
+                lastNav = GetTickCount();
+                continue;
+            }
+        }
 
         bool qdirty = g_pickQueryChanged;
         g_pickQueryChanged = false;
