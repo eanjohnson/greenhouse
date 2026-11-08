@@ -1,0 +1,669 @@
+// gh_theme.h -- the launcher's theme model: what a theme IS, and where one comes from.
+//
+// Header-only and deliberately free of launcher state. It knows nothing about
+// g_gfx, g_lui, kLocalState or Diag(): the host hands it a state directory and a
+// log sink at GhThemeInit. That is what lets the same header serve both the
+// on-console launcher (launcher_ui.h) and the off-console preview harness
+// (toolchain/gh_ui_host), which is the whole point -- a theme is checked on a
+// desktop in seconds instead of in a nine-minute console deploy.
+//
+// The model follows gh_input.h exactly, because that file already solved this
+// shape once: a few built-ins compiled in, user copies on disk, and an
+// active.txt naming the current pick. Anything that reads oddly here is
+// probably reading the same way in gh_input.h, on purpose.
+//
+// ---------------------------------------------------------------------------
+// LAYOUTS ARE CODE. THEMES ARE DATA.
+// ---------------------------------------------------------------------------
+// A theme may NOT lay a screen out arbitrarily, and this is the central
+// decision of the whole design rather than a shortcut. Themes are downloadable
+// (gh_repo.h, package type "theme"), so if a theme could place its own widgets
+// a theme would be a program, and installing one would be running native code
+// from the repository. Add-ons already ship signed first-party DLLs; a theme
+// that anybody can publish is a different thing to open.
+//
+// So structure comes from a LAYOUT -- `list`, `blades`, `grid` -- which is
+// compiled into the app and named by `layout` below. A theme chooses one and
+// then skins it hard: palette, type, metrics, background and motifs. Two themes
+// on two different layouts look nothing alike, and neither of them can execute.
+// The cost, accepted knowingly: a genuinely new structure needs an app update.
+#pragma once
+#include <windows.h>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
+#include "gh_json.h"
+
+// ---------------------------------------------------------------------------
+// Semantic roles. Call sites ask for a ROLE, never for a colour.
+// ---------------------------------------------------------------------------
+// The old code named its brushes after what they looked like (brFg, brDim) and
+// then used them for whatever happened to suit, so "dim" meant both "secondary
+// text" and "footer hint" and a theme could not tell them apart. These are
+// named for the job instead.
+enum GhRole {
+    GH_ROLE_BG = 0,        // the page behind everything
+    GH_ROLE_PANEL,         // a row or card at rest
+    GH_ROLE_PANEL_ALT,     // alternating rows / a nested panel (chrome-heavy themes)
+    GH_ROLE_EDGE,          // hairlines, separators, inner borders
+    GH_ROLE_TEXT,          // primary text
+    GH_ROLE_TEXT_DIM,      // secondary text and footer hints
+    GH_ROLE_TEXT_ON_SEL,   // text drawn ON the selection fill
+    // Text drawn straight onto the page BACKGROUND rather than onto a panel:
+    // the page title, section labels, the footer hints. These default to TEXT
+    // and TEXT_DIM, and most themes never set them. They exist because the
+    // first Aero-style theme written against this model was unreadable: its
+    // "text" is near-black, correct on its pale glass panels and invisible on
+    // its dark blue background. A theme whose panels contrast with its
+    // background genuinely needs two text colours, and finding that out on the
+    // console would have cost a deploy.
+    GH_ROLE_TEXT_ON_BG,
+    GH_ROLE_TEXT_DIM_ON_BG,
+    GH_ROLE_ACCENT,        // the brand colour: status, badges, confirmations
+    GH_ROLE_SELECTION,     // the selected row's fill
+    GH_ROLE_WARN,          // destructive and error
+    // Fixed, NEVER themed -- see GhThemeIsFixedRole.
+    GH_ROLE_WHITE,
+    GH_ROLE_BLACK,
+    GH_ROLE_COUNT
+};
+
+// A QR code is read by a phone camera, not by a person, so its two colours are
+// a function of the scanner and not of taste. A theme that could tint them
+// would be a theme that could stop sign-in working. Pure black on pure white,
+// always, in every theme.
+inline bool GhThemeIsFixedRole(int r)
+{
+    return r == GH_ROLE_WHITE || r == GH_ROLE_BLACK;
+}
+
+// Type roles. The five the launcher already had, under names that say where
+// they go rather than how big they are.
+enum GhType {
+    GH_TYPE_TITLE = 0,   // the page title
+    GH_TYPE_ITEM,        // a row's name
+    GH_TYPE_SMALL,       // sub-text, status, footer hints
+    GH_TYPE_LOG,         // dense multi-line text (mod logs, crash detail)
+    GH_TYPE_KEY,         // keycaps and glyph labels
+    GH_TYPE_COUNT
+};
+
+enum GhBgKind { GH_BG_FLAT = 0, GH_BG_VGRADIENT, GH_BG_IMAGE };
+
+struct GhThemeFace { float size = 16.f; int weight = 400; };   // weight: DWRITE_FONT_WEIGHT's number
+
+struct GhTheme {
+    char     id[32]     = {};
+    wchar_t  name[48]   = {};
+    char     layout[16] = {};      // a compiled layout's id; unknown falls back to "list"
+    bool     builtin    = false;
+
+    uint32_t color[GH_ROLE_COUNT] = {};    // 0xRRGGBB
+    float    alpha[GH_ROLE_COUNT] = {};    // 0..1
+
+    // The family CHAIN, first hit wins. A theme may also ship its own font file
+    // (relative to the theme directory); gh_ui.h loads it into its own DWrite
+    // collection -- never the guest's, so a theme can never change how a game's
+    // own GDI text renders (see gh_gdifont.h, which owns the guest's collection).
+    std::vector<std::wstring> families;
+    std::wstring              fontFile;
+    GhThemeFace               face[GH_TYPE_COUNT] = {};
+
+    // Metrics, in 1920x1080 units -- the launcher's canvas is always exactly
+    // that (device-confirmed: "LAUNCHER LuiInit OK 1920x1080"), so these are
+    // real pixels and no DPI scaling is involved.
+    float radius  = 10.f;    // row/panel corner; 0 = square
+    float rowH    = 76.f;
+    float rowGap  = 12.f;    // 0 with separators = a continuous list
+    float gutter  = 80.f;    // outer margin, before the safe-area inset
+    float stroke  = 1.7f;
+
+    int      bgKind  = GH_BG_FLAT;
+    uint32_t bg2     = 0;        // GH_BG_VGRADIENT: the bottom stop
+    std::wstring bgImage;        // GH_BG_IMAGE: relative to the theme directory
+
+    // Motifs. Cheap flags that buy a lot of visual distance for a layout that
+    // is otherwise shared: Aero wants gloss + innerEdge, iOS 6 wants
+    // separators, the current dark look wants none of them.
+    bool gloss      = false;     // a sheen over the top half of rows/panels
+    bool innerEdge  = false;     // a light 1px inner border
+    bool separators = false;     // a rule between rows instead of a gap
+
+    // The theme's own suggestion for these two; the user's setting wins when
+    // they have expressed one (GhThemeSettings).
+    float textScale = 1.f;       // 0.8 .. 1.4
+    float safePct   = 0.f;       // extra TV safe-area inset, % of the short edge
+};
+
+// User overrides, persisted next to active.txt. Separate from GhTheme because
+// they survive a change of theme: someone who needs bigger text needs it in
+// every theme, and should not have to set it again after switching.
+struct GhThemeSettings {
+    bool  hasTextScale = false; float textScale = 1.f;
+    bool  hasSafePct   = false; float safePct   = 0.f;
+};
+
+inline float GhClampF(float v, float lo, float hi){ return v < lo ? lo : (v > hi ? hi : v); }
+
+// ---------------------------------------------------------------------------
+// The built-ins
+// ---------------------------------------------------------------------------
+
+// "Greenhouse Dark" -- today's launcher, to the exact value. It is written out
+// here rather than tidied so that the first ported page can be compared against
+// a screenshot of the old one and any difference is a bug in the port, not a
+// change of taste. The nine colours are LuiInit's nine brushes
+// (launcher_ui.h:231-239) and the five sizes are its five text formats.
+inline void GhThemeMakeDark(GhTheme& t)
+{
+    t = GhTheme{};
+    std::strncpy(t.id, "dark", sizeof t.id - 1);
+    wcsncpy(t.name, L"Greenhouse Dark", 47);
+    std::strncpy(t.layout, "list", sizeof t.layout - 1);
+    t.builtin = true;
+
+    t.color[GH_ROLE_BG]          = 0x0E1116;
+    t.color[GH_ROLE_PANEL]       = 0x161B22;
+    t.color[GH_ROLE_PANEL_ALT]   = 0x161B22;
+    t.color[GH_ROLE_EDGE]        = 0x30363D;
+    t.color[GH_ROLE_TEXT]        = 0xE8EAED;
+    t.color[GH_ROLE_TEXT_DIM]    = 0x8B949E;
+    t.color[GH_ROLE_TEXT_ON_SEL] = 0xE8EAED;   // the old code used brFg on selected rows
+    t.color[GH_ROLE_TEXT_ON_BG]     = 0xE8EAED;
+    t.color[GH_ROLE_TEXT_DIM_ON_BG] = 0x8B949E;
+    t.color[GH_ROLE_ACCENT]      = 0x3FB950;
+    t.color[GH_ROLE_SELECTION]   = 0x1F6FEB;
+    t.color[GH_ROLE_WARN]        = 0xF85149;
+    t.color[GH_ROLE_WHITE]       = 0xFFFFFF;
+    t.color[GH_ROLE_BLACK]       = 0x000000;
+    for (int i = 0; i < GH_ROLE_COUNT; ++i) t.alpha[i] = 1.f;
+
+    t.families.push_back(L"Segoe UI");
+    t.face[GH_TYPE_TITLE] = { 66.f, 700 };   // BOLD
+    t.face[GH_TYPE_ITEM]  = { 34.f, 600 };   // SEMI_BOLD
+    t.face[GH_TYPE_SMALL] = { 22.f, 400 };
+    t.face[GH_TYPE_LOG]   = { 16.f, 400 };
+    t.face[GH_TYPE_KEY]   = { 14.f, 600 };
+
+    t.radius = 10.f; t.rowH = 76.f; t.rowGap = 12.f; t.gutter = 80.f; t.stroke = 1.7f;
+    t.bgKind = GH_BG_FLAT;
+}
+
+// A light companion, so the very first build can prove that the role indirection
+// actually reaches every call site: anything still hardcoded stays dark and is
+// visible immediately. It is a diagnostic as much as a theme.
+inline void GhThemeMakeLight(GhTheme& t)
+{
+    GhThemeMakeDark(t);
+    std::strncpy(t.id, "light", sizeof t.id - 1);
+    wcsncpy(t.name, L"Greenhouse Light", 47);
+    t.color[GH_ROLE_BG]          = 0xF4F6F2;
+    t.color[GH_ROLE_PANEL]       = 0xFFFFFF;
+    t.color[GH_ROLE_PANEL_ALT]   = 0xEDF1E9;
+    t.color[GH_ROLE_EDGE]        = 0xC9D3C4;
+    t.color[GH_ROLE_TEXT]        = 0x15301C;
+    t.color[GH_ROLE_TEXT_DIM]    = 0x5C7A60;
+    t.color[GH_ROLE_TEXT_ON_SEL] = 0xFFFFFF;
+    t.color[GH_ROLE_TEXT_ON_BG]     = 0x15301C;
+    t.color[GH_ROLE_TEXT_DIM_ON_BG] = 0x5C7A60;
+    t.color[GH_ROLE_ACCENT]      = 0x2F7D22;
+    t.color[GH_ROLE_SELECTION]   = 0x4A9B31;
+    t.color[GH_ROLE_WARN]        = 0xAD3317;
+    t.innerEdge = true;
+}
+
+inline int GhThemeBuiltinCount(){ return 2; }
+
+inline bool GhThemeMakeBuiltin(int i, GhTheme& t)
+{
+    switch (i) {
+    case 0: GhThemeMakeDark(t);  return true;
+    case 1: GhThemeMakeLight(t); return true;
+    default: return false;
+    }
+}
+
+inline bool GhThemeIsBuiltinId(const char* id)
+{
+    if (!id || !*id) return false;
+    GhTheme t;
+    for (int i = 0; GhThemeMakeBuiltin(i, t); ++i)
+        if (std::strcmp(t.id, id) == 0) return true;
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Host wiring
+// ---------------------------------------------------------------------------
+using GhThemeLogFn = void (*)(const std::string&);
+
+inline std::wstring  g_ghThemeStateDir;                 // the gh_theme directory, trailing slash
+inline GhThemeLogFn  g_ghThemeLog = nullptr;
+
+inline void GhThemeLog(const std::string& s){ if (g_ghThemeLog) g_ghThemeLog(s); }
+
+// stateDir is the PARENT (LocalState, or any directory on a desktop host); the
+// theme store is <stateDir>\gh_theme\, mirroring gh_input.h's gh_input\.
+inline void GhThemeInit(const wchar_t* stateDir, GhThemeLogFn log)
+{
+    g_ghThemeStateDir = std::wstring(stateDir ? stateDir : L"") + L"gh_theme\\";
+    g_ghThemeLog = log;
+}
+
+inline std::wstring GhThemeDir()        { return g_ghThemeStateDir; }
+inline std::wstring GhThemeActivePath() { return g_ghThemeStateDir + L"active.txt"; }
+inline std::wstring GhThemeSettingsPath(){ return g_ghThemeStateDir + L"settings.txt"; }
+
+// A theme's own directory. The id is ASCII by construction (GhThemeCheckId), so
+// the widen is a cast rather than a conversion.
+inline std::wstring GhThemeOwnDir(const char* id)
+{
+    std::wstring w = g_ghThemeStateDir;
+    for (const char* p = id; p && *p; ++p) w.push_back((wchar_t)(unsigned char)*p);
+    return w + L"\\";
+}
+
+// ---------------------------------------------------------------------------
+// Small file helpers. Local on purpose: guest_loader's ReadWholeFile is not
+// available to the preview harness, and a theme file is never large.
+// ---------------------------------------------------------------------------
+inline bool GhThemeReadFile(const std::wstring& path, std::string& out)
+{
+    out.clear();
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz{};
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart < 0 || sz.QuadPart > (4 << 20)) { CloseHandle(h); return false; }
+    out.resize((size_t)sz.QuadPart);
+    DWORD got = 0;
+    const BOOL ok = out.empty() ? TRUE : ReadFile(h, &out[0], (DWORD)out.size(), &got, nullptr);
+    CloseHandle(h);
+    if (!ok || got != out.size()) { out.clear(); return false; }
+    return true;
+}
+
+inline bool GhThemeWriteFile(const std::wstring& path, const std::string& body)
+{
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD put = 0;
+    const BOOL ok = body.empty() ? TRUE : WriteFile(h, body.data(), (DWORD)body.size(), &put, nullptr);
+    CloseHandle(h);
+    return ok && put == body.size();
+}
+
+// ---------------------------------------------------------------------------
+// theme.json -> GhTheme
+// ---------------------------------------------------------------------------
+// Every field is optional and every absent field keeps the built-in dark value,
+// so the smallest valid theme is `{"schema":"greenhouse.theme/1","id":"x"}` and
+// a theme written against a later loader still loads on an earlier one. The
+// refusals below are only for things that would make the UI unusable or
+// unreadable, never for things we merely did not expect.
+
+inline bool GhThemeCheckId(const std::string& id, std::string& why)
+{
+    if (id.empty() || id.size() > 31) { why = "id must be 1..31 characters"; return false; }
+    for (char c : id)
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_')) {
+            why = "id may only hold a-z, 0-9, '-' and '_'"; return false;
+        }
+    return true;
+}
+
+inline bool GhThemeParseColor(const std::string& s, uint32_t& rgb, float& a)
+{
+    // "#RRGGBB" or "#RRGGBBAA"; the leading '#' is optional.
+    const char* p = s.c_str();
+    if (*p == '#') ++p;
+    const size_t n = std::strlen(p);
+    if (n != 6 && n != 8) return false;
+    uint32_t v = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const char c = p[i];
+        int d;
+        if (c >= '0' && c <= '9')      d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else return false;
+        v = (v << 4) | (uint32_t)d;
+    }
+    if (n == 6) { rgb = v; a = 1.f; }
+    else        { rgb = v >> 8; a = (float)(v & 0xFF) / 255.f; }
+    return true;
+}
+
+inline const char* kGhRoleNames[GH_ROLE_COUNT] = {
+    "bg", "panel", "panelAlt", "edge", "text", "textDim", "textOnSel",
+    "textOnBg", "textDimOnBg",
+    "accent", "selection", "warn", "white", "black"
+};
+inline const char* kGhTypeNames[GH_TYPE_COUNT] = { "title", "item", "small", "log", "key" };
+
+inline bool GhThemeNum(const ghjson::Value* v, float& out)
+{
+    if (!v || !v->isNum()) return false;
+    out = (float)v->d;
+    return true;
+}
+
+// `dir` is where this theme's own files live, used only to reject a font or
+// image path that tries to leave it. Pass an empty string for a built-in.
+inline bool GhThemeRelPathOk(const std::string& p, std::string& why)
+{
+    if (p.empty() || p.size() > 128) { why = "asset path must be 1..128 characters"; return false; }
+    if (p[0] == '/' || p[0] == '\\') { why = "asset path must be relative"; return false; }
+    if (p.find(':') != std::string::npos) { why = "asset path may not name a drive"; return false; }
+    if (p.find("..") != std::string::npos) { why = "asset path may not contain '..'"; return false; }
+    return true;
+}
+
+inline std::wstring GhThemeWiden(const std::string& s)
+{
+    // Theme asset paths and family names are checked ASCII, so this is a widen
+    // and not a decode. A non-ASCII byte is dropped rather than mis-decoded.
+    std::wstring w;
+    w.reserve(s.size());
+    for (unsigned char c : s) if (c < 0x80) w.push_back((wchar_t)c);
+    return w;
+}
+
+inline bool GhThemeParse(const char* json, size_t n, GhTheme& out, std::string& why)
+{
+    ghjson::Value j;
+    std::string err;
+    if (!ghjson::Parse(json, n, j, err)) { why = "theme.json: " + err; return false; }
+    if (!j.isObj()) { why = "theme.json is not an object"; return false; }
+
+    if (const ghjson::Value* s = j.get("schema"))
+        if (!s->isStr() || s->s.rfind("greenhouse.theme/", 0) != 0) {
+            why = "schema is not greenhouse.theme/1"; return false;
+        }
+
+    // Start from dark, so every unspecified field has a sane, readable value.
+    GhThemeMakeDark(out);
+    out.builtin = false;
+    out.id[0] = 0;
+    out.name[0] = 0;
+
+    const ghjson::Value* v = j.get("id");
+    if (!v || !v->isStr()) { why = "theme.json has no \"id\""; return false; }
+    if (!GhThemeCheckId(v->s, why)) return false;
+    std::strncpy(out.id, v->s.c_str(), sizeof out.id - 1);
+
+    if ((v = j.get("name")) && v->isStr()) {
+        const std::wstring w = GhThemeWiden(v->s);
+        wcsncpy(out.name, w.c_str(), 47);
+    }
+    if (!out.name[0]) {
+        const std::wstring w = GhThemeWiden(out.id);
+        wcsncpy(out.name, w.c_str(), 47);
+    }
+
+    if ((v = j.get("layout")) && v->isStr()) {
+        if (v->s.size() > 15) { why = "layout id too long"; return false; }
+        std::strncpy(out.layout, v->s.c_str(), sizeof out.layout - 1);
+    }
+
+    // --- colours ---
+    bool setOnBg = false, setDimOnBg = false;
+    if ((v = j.get("colors")) && v->isObj()) {
+        for (int r = 0; r < GH_ROLE_COUNT; ++r) {
+            const ghjson::Value* c = v->get(kGhRoleNames[r]);
+            if (!c || !c->isStr()) continue;
+            if (r == GH_ROLE_TEXT_ON_BG)     setOnBg = true;
+            if (r == GH_ROLE_TEXT_DIM_ON_BG) setDimOnBg = true;
+            if (GhThemeIsFixedRole(r)) {
+                // Not an error: a hand-written theme may well list every role.
+                // It is simply ignored, because a tinted QR does not scan.
+                GhThemeLog(std::string("THEME ") + out.id + ": \"" + kGhRoleNames[r] +
+                           "\" is fixed for QR contrast -- ignored");
+                continue;
+            }
+            uint32_t rgb = 0; float a = 1.f;
+            if (!GhThemeParseColor(c->s, rgb, a)) {
+                why = std::string("colors.") + kGhRoleNames[r] + " is not #RRGGBB or #RRGGBBAA";
+                return false;
+            }
+            out.color[r] = rgb;
+            out.alpha[r] = a;
+        }
+    }
+    // A theme that names "text" but not "textOnBg" means the one colour for
+    // both -- which is right for every theme whose panels sit close to its
+    // background. Inheriting here, rather than leaving the built-in default in
+    // place, is what stops a theme silently keeping Greenhouse Dark's near-white
+    // page title.
+    if (!setOnBg) {
+        out.color[GH_ROLE_TEXT_ON_BG] = out.color[GH_ROLE_TEXT];
+        out.alpha[GH_ROLE_TEXT_ON_BG] = out.alpha[GH_ROLE_TEXT];
+    }
+    if (!setDimOnBg) {
+        out.color[GH_ROLE_TEXT_DIM_ON_BG] = out.color[GH_ROLE_TEXT_DIM];
+        out.alpha[GH_ROLE_TEXT_DIM_ON_BG] = out.alpha[GH_ROLE_TEXT_DIM];
+    }
+
+    // --- type ---
+    if ((v = j.get("font")) && v->isObj()) {
+        if (const ghjson::Value* f = v->get("families")) {
+            if (!f->isArr()) { why = "font.families is not an array"; return false; }
+            std::vector<std::wstring> fams;
+            for (const auto& e : f->arr) {
+                if (!e.isStr() || e.s.empty() || e.s.size() > 64) { why = "font.families has a bad entry"; return false; }
+                fams.push_back(GhThemeWiden(e.s));
+            }
+            if (!fams.empty()) out.families = fams;
+        }
+        if (const ghjson::Value* f = v->get("file")) {
+            if (!f->isStr() || !GhThemeRelPathOk(f->s, why)) {
+                if (why.empty()) why = "font.file is not a string";
+                return false;
+            }
+            out.fontFile = GhThemeWiden(f->s);
+        }
+        if (const ghjson::Value* sz = v->get("sizes"); sz && sz->isObj())
+            for (int k = 0; k < GH_TYPE_COUNT; ++k) {
+                float f = 0;
+                if (GhThemeNum(sz->get(kGhTypeNames[k]), f))
+                    out.face[k].size = GhClampF(f, 8.f, 160.f);
+            }
+        if (const ghjson::Value* wt = v->get("weights"); wt && wt->isObj())
+            for (int k = 0; k < GH_TYPE_COUNT; ++k) {
+                float f = 0;
+                if (GhThemeNum(wt->get(kGhTypeNames[k]), f))
+                    out.face[k].weight = (int)GhClampF(f, 100.f, 950.f);
+            }
+    }
+
+    // --- metrics ---
+    if ((v = j.get("metrics")) && v->isObj()) {
+        float f = 0;
+        if (GhThemeNum(v->get("radius"), f)) out.radius = GhClampF(f, 0.f, 48.f);
+        if (GhThemeNum(v->get("rowH"),   f)) out.rowH   = GhClampF(f, 28.f, 240.f);
+        if (GhThemeNum(v->get("rowGap"), f)) out.rowGap = GhClampF(f, 0.f, 48.f);
+        if (GhThemeNum(v->get("gutter"), f)) out.gutter = GhClampF(f, 16.f, 320.f);
+        if (GhThemeNum(v->get("stroke"), f)) out.stroke = GhClampF(f, 0.5f, 8.f);
+        if (GhThemeNum(v->get("textScale"), f)) out.textScale = GhClampF(f, 0.8f, 1.4f);
+        if (GhThemeNum(v->get("safePct"),   f)) out.safePct   = GhClampF(f, 0.f, 10.f);
+    }
+
+    // --- background ---
+    if ((v = j.get("background")) && v->isObj()) {
+        if (const ghjson::Value* k = v->get("kind"); k && k->isStr()) {
+            if      (k->s == "flat")     out.bgKind = GH_BG_FLAT;
+            else if (k->s == "gradient") out.bgKind = GH_BG_VGRADIENT;
+            else if (k->s == "image")    out.bgKind = GH_BG_IMAGE;
+            else { why = "background.kind is not flat, gradient or image"; return false; }
+        }
+        if (const ghjson::Value* c = v->get("to"); c && c->isStr()) {
+            float a = 1.f;
+            if (!GhThemeParseColor(c->s, out.bg2, a)) { why = "background.to is not a colour"; return false; }
+        }
+        if (const ghjson::Value* p = v->get("image"); p && p->isStr()) {
+            if (!GhThemeRelPathOk(p->s, why)) return false;
+            out.bgImage = GhThemeWiden(p->s);
+        }
+        // An image background with no image is a flat one, not a failure: the
+        // file may simply not have shipped. Fall back rather than refuse.
+        if (out.bgKind == GH_BG_IMAGE && out.bgImage.empty()) out.bgKind = GH_BG_FLAT;
+    }
+
+    // --- motifs ---
+    if ((v = j.get("motifs")) && v->isObj()) {
+        if (const ghjson::Value* b = v->get("gloss");      b && b->isBool()) out.gloss      = b->b;
+        if (const ghjson::Value* b = v->get("innerEdge");  b && b->isBool()) out.innerEdge  = b->b;
+        if (const ghjson::Value* b = v->get("separators"); b && b->isBool()) out.separators = b->b;
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// The registry: built-ins, then every theme on disk
+// ---------------------------------------------------------------------------
+inline std::vector<GhTheme> g_ghThemes;
+inline int                  g_ghThemeActive = 0;      // index into g_ghThemes
+inline GhThemeSettings      g_ghThemeSettings;
+
+inline void GhThemeLoadSettings()
+{
+    g_ghThemeSettings = GhThemeSettings{};
+    std::string body;
+    if (!GhThemeReadFile(GhThemeSettingsPath(), body)) return;
+    // One `key=value` per line, as gh_input.h's own stores do.
+    size_t i = 0;
+    while (i < body.size()) {
+        size_t e = body.find('\n', i);
+        if (e == std::string::npos) e = body.size();
+        std::string line = body.substr(i, e - i);
+        i = e + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string k = line.substr(0, eq), val = line.substr(eq + 1);
+        if (k == "textScale") { g_ghThemeSettings.hasTextScale = true; g_ghThemeSettings.textScale = GhClampF((float)atof(val.c_str()), 0.8f, 1.4f); }
+        else if (k == "safePct") { g_ghThemeSettings.hasSafePct = true; g_ghThemeSettings.safePct = GhClampF((float)atof(val.c_str()), 0.f, 10.f); }
+    }
+}
+
+inline bool GhThemeSaveSettings()
+{
+    std::string body;
+    char buf[64];
+    if (g_ghThemeSettings.hasTextScale) { snprintf(buf, sizeof buf, "textScale=%.3f\n", g_ghThemeSettings.textScale); body += buf; }
+    if (g_ghThemeSettings.hasSafePct)   { snprintf(buf, sizeof buf, "safePct=%.3f\n",   g_ghThemeSettings.safePct);   body += buf; }
+    return GhThemeWriteFile(GhThemeSettingsPath(), body);
+}
+
+// The values actually in force: the user's setting if they have one, else the
+// theme's own suggestion.
+inline float GhThemeEffTextScale(const GhTheme& t)
+{
+    return g_ghThemeSettings.hasTextScale ? g_ghThemeSettings.textScale : t.textScale;
+}
+inline float GhThemeEffSafePct(const GhTheme& t)
+{
+    return g_ghThemeSettings.hasSafePct ? g_ghThemeSettings.safePct : t.safePct;
+}
+
+inline void GhThemeScanDisk()
+{
+    if (g_ghThemeStateDir.empty()) return;
+    WIN32_FIND_DATAW fd{};
+    HANDLE d = FindFirstFileW((g_ghThemeStateDir + L"*").c_str(), &fd);
+    if (d == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (fd.cFileName[0] == L'.') continue;
+        std::string body;
+        if (!GhThemeReadFile(g_ghThemeStateDir + fd.cFileName + L"\\theme.json", body)) continue;
+        GhTheme t;
+        std::string why;
+        if (!GhThemeParse(body.c_str(), body.size(), t, why)) {
+            GhThemeLog("THEME refused a theme on disk: " + why);
+            continue;
+        }
+        // The directory name is the authority on identity, so a theme cannot
+        // claim to be a built-in (or another installed theme) by saying so in
+        // its own file. Same rule gh_input.h applies to profile files.
+        const std::wstring dirName = fd.cFileName;
+        std::string want;
+        for (wchar_t c : dirName) if (c < 0x80) want.push_back((char)c);
+        if (want != t.id) {
+            GhThemeLog("THEME refused '" + want + "': its theme.json says id=\"" + t.id + "\"");
+            continue;
+        }
+        if (GhThemeIsBuiltinId(t.id)) {
+            GhThemeLog("THEME refused '" + want + "': that id is built in");
+            continue;
+        }
+        bool dup = false;
+        for (const auto& e : g_ghThemes) if (std::strcmp(e.id, t.id) == 0) dup = true;
+        if (dup) continue;
+        g_ghThemes.push_back(t);
+    } while (FindNextFileW(d, &fd));
+    FindClose(d);
+}
+
+inline int GhThemeIndexOf(const char* id)
+{
+    if (!id || !*id) return -1;
+    for (size_t i = 0; i < g_ghThemes.size(); ++i)
+        if (std::strcmp(g_ghThemes[i].id, id) == 0) return (int)i;
+    return -1;
+}
+
+inline const GhTheme& GhThemeCurrent()
+{
+    if (g_ghThemes.empty()) {
+        // Nothing has loaded yet (an early draw, or a host that never called
+        // GhThemeLoad). Answer dark rather than a null reference: a UI that
+        // draws in the default theme is always better than one that cannot draw.
+        static GhTheme fallback;
+        static bool once = false;
+        if (!once) { GhThemeMakeDark(fallback); once = true; }
+        return fallback;
+    }
+    const int i = (g_ghThemeActive >= 0 && g_ghThemeActive < (int)g_ghThemes.size()) ? g_ghThemeActive : 0;
+    return g_ghThemes[(size_t)i];
+}
+
+// Build the registry and resolve active.txt. Safe to call again; it rescans.
+inline void GhThemeLoad()
+{
+    g_ghThemes.clear();
+    GhTheme t;
+    for (int i = 0; GhThemeMakeBuiltin(i, t); ++i) g_ghThemes.push_back(t);
+    GhThemeScanDisk();
+    GhThemeLoadSettings();
+
+    std::string want;
+    if (GhThemeReadFile(GhThemeActivePath(), want)) {
+        while (!want.empty() && (want.back() == '\n' || want.back() == '\r' || want.back() == ' ')) want.pop_back();
+    }
+    const int k = GhThemeIndexOf(want.c_str());
+    g_ghThemeActive = k >= 0 ? k : 0;
+    if (!want.empty() && k < 0)
+        GhThemeLog("THEME active.txt names '" + want + "', which is not installed -- using '" +
+                   std::string(g_ghThemes[0].id) + "'");
+    GhThemeLog("THEME " + std::to_string(g_ghThemes.size()) + " loaded, active '" +
+               std::string(GhThemeCurrent().id) + "' layout '" + std::string(GhThemeCurrent().layout) + "'");
+}
+
+// Does NOT itself rebuild resources: the caller applies the change, because
+// only the caller knows whether it is safe to re-bake right now (the overlay's
+// panels cannot be re-baked once a guest owns the device -- see gh_ui.h).
+inline bool GhThemeSetActive(const char* id)
+{
+    const int k = GhThemeIndexOf(id);
+    if (k < 0) return false;
+    g_ghThemeActive = k;
+    if (!g_ghThemeStateDir.empty()) {
+        CreateDirectoryW(g_ghThemeStateDir.c_str(), nullptr);
+        GhThemeWriteFile(GhThemeActivePath(), std::string(id) + "\n");
+    }
+    return true;
+}
