@@ -129,7 +129,19 @@ static uint64_t JwtSubject(const std::string& jwt)
 }
 
 // ---- owned library (gh_owned.txt) ------------------------------------------------
-struct Owned { uint32_t app; std::wstring name; };
+// Five tab-separated columns: appid, name, playtime_forever, playtime_2weeks,
+// rtime_last_played. The first two are the original format and the reader still
+// accepts a file with only those -- gh_owned.txt is also written by the shim's
+// own library dump (corpus/shims/steam_api64.cpp), which has two columns, and by
+// every build before this one. A missing figure is zero, which reads as "never
+// played" and is exactly right for a title Steam has no play record for.
+struct Owned {
+    uint32_t     app = 0;
+    std::wstring name;
+    uint32_t     playForever = 0;
+    uint32_t     play2Weeks  = 0;
+    uint32_t     lastPlayed  = 0;
+};
 static std::vector<Owned> g_owned;
 static std::mutex g_ownedLk;
 
@@ -143,12 +155,25 @@ static void OwnedLoad()
             size_t e = s.find_first_of("\r\n", p);
             std::string line = s.substr(p, e == std::string::npos ? std::string::npos : e - p);
             p = e == std::string::npos ? s.size() : e + 1;
-            size_t tab = line.find('\t');
-            if (tab == std::string::npos) continue;
-            uint32_t app = (uint32_t)strtoul(line.c_str(), nullptr, 10);
-            std::string name = line.substr(tab + 1);
-            while (!name.empty() && name.back() == ' ') name.pop_back();
-            if (app && !name.empty()) v.push_back({ app, W(name) });
+            // Split on tabs: col 0 appid, col 1 name, cols 2-4 the play figures.
+            std::string col[5];
+            int nc = 0;
+            for (size_t i = 0, start = 0; nc < 5; ++i) {
+                if (i == line.size() || line[i] == '\t') {
+                    col[nc++] = line.substr(start, i - start);
+                    start = i + 1;
+                    if (i == line.size()) break;
+                }
+            }
+            if (nc < 2) continue;
+            Owned o;
+            o.app = (uint32_t)strtoul(col[0].c_str(), nullptr, 10);
+            while (!col[1].empty() && col[1].back() == ' ') col[1].pop_back();
+            o.name = W(col[1]);
+            o.playForever = (uint32_t)strtoul(col[2].c_str(), nullptr, 10);
+            o.play2Weeks  = (uint32_t)strtoul(col[3].c_str(), nullptr, 10);
+            o.lastPlayed  = (uint32_t)strtoul(col[4].c_str(), nullptr, 10);
+            if (o.app && !o.name.empty()) v.push_back(o);
         }
     }
     std::sort(v.begin(), v.end(), [](const Owned& a, const Owned& b) { return _wcsicmp(a.name.c_str(), b.name.c_str()) < 0; });
@@ -158,16 +183,22 @@ static void OwnedLoad()
 
 static int FetchLibrary(const Cred& c)
 {
-    std::vector<std::pair<uint32_t, std::string>> games;
+    std::vector<ghdl::OwnedGame> games;
     int rc = ghdl::ListOwnedGames(c.sid, c.token, c.account, games);
     Log("ListOwnedGames rc=" + std::to_string(rc) + " games=" + std::to_string(games.size()));
     if (rc != 0 || games.empty()) return rc ? rc : -4;
     std::string out;
+    int played = 0;
     for (auto& g : games) {
-        out += std::to_string(g.first) + "\t";
-        for (char ch : g.second) out.push_back((ch == '\t' || ch == '\r' || ch == '\n') ? ' ' : ch);
-        out += "\n";
+        out += std::to_string(g.app) + "\t";
+        for (char ch : g.name) out.push_back((ch == '\t' || ch == '\r' || ch == '\n') ? ' ' : ch);
+        out += "\t" + std::to_string(g.playForever) +
+               "\t" + std::to_string(g.play2Weeks) +
+               "\t" + std::to_string(g.lastPlayed) + "\n";
+        if (g.playForever) ++played;
     }
+    Log("owned games with a play record: " + std::to_string(played) + " of " +
+        std::to_string(games.size()));
     if (WriteFileBytes(g_ls + L"gh_owned.txt", out)) Log("wrote gh_owned.txt (" + std::to_string(games.size()) + " games)");
     OwnedLoad();
     return 0;
@@ -314,6 +345,9 @@ static void Enumerate(void* ctx, void (*emit)(void*, const GhAddonRow*))
         r.app = o.app;
         r.display = o.name.c_str();
         r.sub = L"owned";
+        r.playForever = o.playForever;
+        r.play2Weeks  = o.play2Weeks;
+        r.lastPlayed  = o.lastPlayed;
         emit(ctx, &r);
     }
     Log("enumerate -> " + std::to_string(v.size()) + " owned");

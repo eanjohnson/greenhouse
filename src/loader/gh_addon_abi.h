@@ -104,7 +104,20 @@ typedef struct GhAddonRow {
     const wchar_t* display;           /* row text */
     const wchar_t* sub;               /* dim right-hand hint, may be NULL */
     const wchar_t* guest;             /* exe path for GH_ROW_LAUNCH, else NULL */
+    /* Appended in loader 0.0.935.0 (still ABI 1): the play record the source
+     * already knows, read only when `size` covers them. Minutes for the two
+     * play figures, unix seconds for lastPlayed; 0 means "no record", which the
+     * launcher shows as "never played" rather than as "0 hours". Steam gets
+     * these from the same Player.GetOwnedGames reply that carries the names. */
+    uint32_t playForever;             /* total minutes played, ever */
+    uint32_t play2Weeks;              /* minutes played in the last two weeks */
+    uint32_t lastPlayed;              /* unix seconds of the last session */
 } GhAddonRow;
+
+/* True when a row the other side filled in carries field f. The same rule as
+ * GH_HOST_HAS, minus the non-NULL test: 0 is a legitimate value for a figure. */
+#define GH_ROW_HAS(row, f) \
+    ((row)->size >= offsetof(GhAddonRow, f) + sizeof((row)->f))
 
 enum { GH_ACQ_NEW = 0, GH_ACQ_RESUME = 1, GH_ACQ_VERIFY = 2 };
 

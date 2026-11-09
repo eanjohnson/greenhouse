@@ -397,6 +397,19 @@ struct VdfParser {
         else { std::string v; tok(v); VdfNode c; c.value=std::move(v); n.kids.emplace_back(std::move(k),std::move(c)); } } }
 };
 struct DepotInfo { uint32_t depot=0; uint64_t manifest=0; std::string branch; uint32_t app=0; };   // branch the manifest came from; app = owning app for depotfromapp (0 = this app)
+
+// One owned title, as Player.GetOwnedGames#1 reports it. The play figures are
+// NOT a second request: the response we already ask for carries them (the call
+// sets include_appinfo=2 and include_extended_appinfo=8), and the parse loop
+// used to skip past them. Minutes, as Steam counts them; `lastPlayed` is a unix
+// time, 0 when the title has never been started.
+struct OwnedGame {
+    uint32_t    app = 0;
+    std::string name;
+    uint32_t    playForever = 0;    // playtime_forever  (field 4), minutes
+    uint32_t    play2Weeks  = 0;    // playtime_2weeks   (field 3), minutes
+    uint32_t    lastPlayed  = 0;    // rtime_last_played (field 11), unix seconds
+};
 inline bool vdf_all_digits(const std::string& s){ if(s.empty())return false; for(char c:s) if(c<'0'||c>'9')return false; return true; }
 // Resolve the downloadable depots (numeric depot id + public-branch manifest gid) from
 // an appinfo VDF. Skips: named sub-sections (branches/baselanguages/...), depots with an
@@ -651,8 +664,9 @@ struct CmClient {
     // header carries our authenticated steamid+session -- the engine's own unified-message
     // path returns InvalidSteamID). include_appinfo=true -> names in the same response.
     // CPlayer_GetOwnedGames_Request { fixed64 steamid=1; bool include_appinfo=2;
-    //   bool include_played_free_games=3; }  Response { repeated Game games=2 { int32 appid=1; string name=2 } }.
-    bool list_owned_games(uint64_t sid,std::vector<std::pair<uint32_t,std::string>>& out){
+    //   bool include_played_free_games=3; }  Response { repeated Game games=2 { int32 appid=1;
+    //   string name=2; uint32 playtime_2weeks=3; uint32 playtime_forever=4; uint32 rtime_last_played=11 } }.
+    bool list_owned_games(uint64_t sid,std::vector<OwnedGame>& out){
         ghlog("list_owned licenses(pkgs)="+std::to_string(licenses.size())+" conn.steamid="+std::to_string(steamid));
         // Player.GetOwnedGames#1 (matches GameNative/JavaSteam): appid + name in one call.
         // CRITICAL: request-body steamid is `uint64` = VARINT (pb_u64), NOT fixed64 -- unlike the
@@ -663,9 +677,18 @@ struct CmClient {
         Bytes resp; if(!um("Player.GetOwnedGames#1",body,resp))return false;
         PbReader r(resp.data(),resp.size()); uint32_t f,w;
         while(r.next(f,w)){
-            if(f==2&&w==2){ Bytes g=r.lendelim(); PbReader gr(g.data(),g.size()); uint32_t gf,gw; uint32_t appid=0; std::string name;
-                while(gr.next(gf,gw)){ if(gf==1&&gw==0)appid=(uint32_t)gr.varint(); else if(gf==2&&gw==2){Bytes b=gr.lendelim();name.assign(b.begin(),b.end());} else gr.skip(gw); }
-                if(appid)out.push_back(std::make_pair(appid,name)); }
+            if(f==2&&w==2){ Bytes g=r.lendelim(); PbReader gr(g.data(),g.size()); uint32_t gf,gw; OwnedGame og;
+                while(gr.next(gf,gw)){
+                    if(gf==1&&gw==0)og.app=(uint32_t)gr.varint();
+                    else if(gf==2&&gw==2){Bytes b=gr.lendelim();og.name.assign(b.begin(),b.end());}
+                    // The three figures that used to be skipped. Varints, all of
+                    // them; a wiretype that is not varint means a field we have
+                    // guessed wrong about, so it is skipped rather than coerced.
+                    else if(gf==3&&gw==0)og.play2Weeks=(uint32_t)gr.varint();
+                    else if(gf==4&&gw==0)og.playForever=(uint32_t)gr.varint();
+                    else if(gf==11&&gw==0)og.lastPlayed=(uint32_t)gr.varint();
+                    else gr.skip(gw); }
+                if(og.app)out.push_back(og); }
             else r.skip(w);
         }
         ghlog("list_owned games="+std::to_string(out.size()));
@@ -675,7 +698,7 @@ struct CmClient {
 
 // One-shot: connect + token-login + enumerate owned games. Returns 0 on success (out filled),
 // negative on failure. The token stays local; only public appids+names come back.
-inline int ListOwnedGames(uint64_t sid,const std::string& token,const std::string& account,std::vector<std::pair<uint32_t,std::string>>& out){
+inline int ListOwnedGames(uint64_t sid,const std::string& token,const std::string& account,std::vector<OwnedGame>& out){
     if(!sid||token.empty())return -10;
     CmClient c; if(!c.connect_and_secure())return -1;
     if(!c.login_token(sid,token,account)){ if(c.s!=INVALID_SOCKET)closesocket(c.s); return -2; }
