@@ -1,0 +1,42 @@
+{
+  "schema": "greenhouse.theme/1",
+  "id": "ios6",
+  "name": "Linen",
+  "desc": "Linen behind, bright cells in front, a bar top and bottom.",
+  "layout": "grid",
+
+  "_note": [
+    "Ported from design/mockups/ios6.html: dark linen behind, bright cells",
+    "in front, a bar at the top and a bar at the bottom. It selects `grid`,",
+    "which is the layout that puts the library in a field of tiles and the",
+    "settings in a centred grouped table -- the two shapes this era is actually",
+    "made of. Helvetica Neue is not on the console, so the chain ends at Segoe UI.",
+    "The accent is a mid green rather than the mockup's dark --detail, because",
+    "the same token lands on a near-white cell AND on the linen."
+  ],
+
+  "colors": {
+    "bg":          "#17231A",
+    "panel":       "#FAFBF7",
+    "panelAlt":    "#F1F6EC",
+    "edge":        "#C6D4BD",
+    "text":        "#101410",
+    "textDim":     "#5A6B58",
+    "textOnSel":   "#FFFFFF",
+    "textOnBg":    "#FFFFFF",
+    "textDimOnBg": "#C2D6B8",
+    "accent":      "#3F8F2A",
+    "selection":   "#357F22",
+    "warn":        "#D9452E"
+  },
+
+  "font": {
+    "families": ["Helvetica Neue", "Segoe UI"],
+    "sizes":   { "title": 56, "item": 30, "small": 21 },
+    "weights": { "title": 600, "item": 500 }
+  },
+
+  "metrics": { "radius": 10, "rowH": 74, "rowGap": 0, "gutter": 72, "stroke": 1.2 },
+  "background": { "kind": "flat" },
+  "motifs": { "gloss": true, "separators": true }
+}

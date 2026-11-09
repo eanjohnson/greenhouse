@@ -7,8 +7,13 @@
 #
 #   toolchain/gh_ui_host/build.sh            build and render every theme
 #   toolchain/gh_ui_host/build.sh dark       just one theme
+#   GH_UI_PAGE=picker ...                    one page (default: the token sheet)
+#   GH_UI_PAGE=all ...                       every page -- the sheet to review
+#                                            before a console deploy
 #   GH_UI_OUT=/some/dir  ...                 where the PNGs go
 #   GH_UI_STATE=/some/dir ...                where gh_theme/<id>/theme.json is read from
+#
+# `gh_ui_host.exe --help` lists the page names.
 set -uo pipefail
 
 GH="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -22,10 +27,22 @@ THEME="${1:-all}"
 
 mkdir -p "$OUT" "$STATE/gh_theme" || exit 1
 
-# The checked-in sample themes are the harness's fixtures: not themes we ship,
-# but ones chosen to stress the model -- "aero" is a dark background with pale
-# glass panels (the case that forced the textOnBg role to exist) and "bigsafe"
-# turns the text scale and the TV safe area up to where clipping shows.
+# The themes we actually ship, so the harness previews the real set and not a
+# set of stand-ins. These are the ones that go into the MSIX corpus and, later,
+# into theme packages.
+cp -r "$GH"/corpus/themes/. "$STATE/gh_theme/" 2>/dev/null
+
+# Themes that ship as PACKAGES (§63e) rather than inside the MSIX. On the console
+# they arrive from the repository; here they are just another theme directory, so
+# a theme we are about to publish is reviewed in the same sheet as the built-ins.
+cp -r "$GH"/corpus/theme_packages/. "$STATE/gh_theme/" 2>/dev/null
+
+# Then the fixtures, which are NOT themes we ship: ones chosen to stress the
+# model where no shipped theme does. "bigsafe" turns the text scale and the TV
+# safe area up to where clipping shows. (There used to be an "aero" fixture
+# here for the dark-background/pale-panel case that forced the textOnBg role to
+# exist; the shipped `nge` covers that case now, and a fixture sharing an id
+# with a shipped theme would be dropped by GhThemeScanDisk's dedup anyway.)
 cp -r "$GH"/toolchain/gh_ui_host/themes/. "$STATE/gh_theme/" 2>/dev/null
 
 EXE="$OUT/gh_ui_host.exe"
@@ -57,5 +74,10 @@ WINEDEBUG="${WINEDEBUG:--all}" wine "$EXE" \
 rc=$?
 
 echo
-ls -la "$OUT"/"${GH_UI_PAGE:-tokens}"-*.png 2>/dev/null || echo "(no PNGs produced)"
+# GH_UI_PAGE=all renders every page, so there is no one prefix to list.
+if [ "${GH_UI_PAGE:-tokens}" = all ]; then
+  ls -la "$OUT"/*.png 2>/dev/null || echo "(no PNGs produced)"
+else
+  ls -la "$OUT"/"${GH_UI_PAGE:-tokens}"-*.png 2>/dev/null || echo "(no PNGs produced)"
+fi
 exit $rc

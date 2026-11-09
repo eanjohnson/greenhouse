@@ -1,0 +1,41 @@
+{
+  "schema": "greenhouse.theme/1",
+  "id": "bulletin",
+  "name": "Bulletin",
+  "desc": "Newsprint: ruled rows, square corners, one spot of green.",
+  "layout": "list",
+
+  "_note": [
+    "Ported from design/mockups/bulletin.html: newsprint, one spot green,",
+    "rules instead of gaps, square corners. It shares `list` with aero and with",
+    "the default, and the three are not mistakable for one another -- rowGap 0",
+    "plus separators turns the same layout from floating cards into a ruled",
+    "table, which is the metric pair that exists for exactly this.",
+    "Selection is the ink itself, which is how print marks a line."
+  ],
+
+  "colors": {
+    "bg":          "#E9E5DB",
+    "panel":       "#F2EFE7",
+    "panelAlt":    "#E3DFD3",
+    "edge":        "#B7B1A3",
+    "text":        "#16140F",
+    "textDim":     "#7D7869",
+    "textOnSel":   "#F2EFE7",
+    "textOnBg":    "#16140F",
+    "textDimOnBg": "#4A463C",
+    "accent":      "#0B7A33",
+    "selection":   "#16140F",
+    "warn":        "#8C1D0E"
+  },
+
+  "font": {
+    "families": ["Archivo", "Segoe UI"],
+    "sizes":   { "title": 64, "item": 30, "small": 20, "log": 16 },
+    "weights": { "title": 800, "item": 600 }
+  },
+
+  "metrics": { "radius": 0, "rowH": 70, "rowGap": 0, "gutter": 96, "stroke": 1.4 },
+  "background": { "kind": "flat" },
+  "motifs": { "separators": true }
+}

@@ -37,7 +37,9 @@
 #include "gh_theme.h"
 #include "gh_ui_vm.h"
 #include "gh_ui.h"
-#include "gh_ui_layout_list.h"
+#include "gh_ui_layouts.h"
+#include "gh_ui_page_themes.h"
+#include "gh_ui_page_onboard.h"
 
 // ---------------------------------------------------------------------------
 static void LogLine(const std::string& s) { printf("%s\n", s.c_str()); }
@@ -113,6 +115,117 @@ struct Host {
 static Host g_host;
 
 // ---------------------------------------------------------------------------
+// Synthetic key art
+// ---------------------------------------------------------------------------
+// The wall and the title screen draw cover art and a banner, and on the console
+// both come from gh_art.h: a worker thread, WinHTTP, Steam's CDN and a disk
+// cache under D:\DevelopmentFiles. None of that can exist here, and none of it
+// should: a harness render is a file that gets looked at and passed around, and
+// REAL GAME ART MUST NEVER BE IN ONE. Art lives in the launcher, on the
+// console, downloaded through the signed-in account's own Steam -- never in the
+// repo, never in a preview, never in anything we publish.
+//
+// So the harness plugs its own provider into the same seam the launcher uses
+// (GhUiSetArtProvider, gh_ui.h), keyed by the same app ids the fixture rows
+// carry. What it hands back is an abstract plate generated from the id: two
+// tones, a diagonal, a disc. It is not a picture of anything. What it proves is
+// exactly what the sheet is for -- the crop, the scrim, the dimming of a title
+// that is not installed, the legibility of a name set over a banner -- and it
+// proves it without a single byte of anybody's artwork.
+//
+// One app id in the fixture is deliberately NOT served, because "Steam has no
+// asset for this title" is a path that has to work: the layout falls back to
+// the typographic plate, which is the only fallback there is (never another
+// picture).
+static uint32_t ArtHash(uint32_t x)
+{
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+static int ArtClamp(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
+
+// Integer arithmetic only, and no <cmath>: the same PNG has to come out of this
+// on every machine that runs the harness, or the sheet stops being comparable.
+static void ArtPixels(uint32_t app, int kind, int w, int h, std::vector<uint32_t>& px)
+{
+    const uint32_t a = ArtHash(app * 2654435761u + (uint32_t)kind * 101u);
+    const uint32_t b = ArtHash(a ^ 0x9e3779b9u);
+
+    const int r0 = 18 + (int)(a & 0x3f),        g0 = 18 + (int)((a >> 6) & 0x3f),
+              b0 = 26 + (int)((a >> 12) & 0x3f);
+    const int r1 = 70 + (int)((b) & 0x7f),      g1 = 70 + (int)((b >> 7) & 0x7f),
+              b1 = 80 + (int)((b >> 14) & 0x7f);
+    const int r2 = 200 + (int)((a >> 20) & 0x37), g2 = 190 + (int)((b >> 21) & 0x3f),
+              b2 = 170 + (int)((a >> 25) & 0x3f);
+
+    const int cx = w / 2 + (int)((a >> 3) % (uint32_t)(w / 3)) - w / 6;
+    const int cy = h / 3 + (int)((b >> 3) % (uint32_t)(h / 4)) - h / 8;
+    const int rr = (w < h ? w : h) / 3;
+    const int ro = rr * rr, ri = (rr * 7 / 10) * (rr * 7 / 10);
+    const int band = 40 + (int)((a >> 9) & 0x3f);
+
+    px.assign((size_t)w * h, 0u);
+    for (int y = 0; y < h; ++y) {
+        const int t = (h > 1) ? (y * 255 / (h - 1)) : 0;
+        for (int x = 0; x < w; ++x) {
+            int r = (r0 * (255 - t) + r1 * t) / 255;
+            int g = (g0 * (255 - t) + g1 * t) / 255;
+            int bl = (b0 * (255 - t) + b1 * t) / 255;
+
+            if ((((x * 3 + y * 5) / band) & 1) != 0) { r += 10; g += 10; bl += 12; }
+
+            const int dx = x - cx, dy = y - cy;
+            const int d2 = dx * dx + dy * dy;
+            if (d2 < ro) {
+                int k = 255;                                  // inside: the full tone
+                if (d2 > ri) k = (ro - d2) * 255 / (ro - ri); // a soft edge, not a hard circle
+                r  = (r  * (255 - k) + r2 * k) / 255;
+                g  = (g  * (255 - k) + g2 * k) / 255;
+                bl = (bl * (255 - k) + b2 * k) / 255;
+            }
+            px[(size_t)y * w + x] = 0xFF000000u | ((uint32_t)ArtClamp(r) << 16) |
+                                    ((uint32_t)ArtClamp(g) << 8) | (uint32_t)ArtClamp(bl);
+        }
+    }
+}
+
+// Steam's own asset sizes, so the crop the layout performs here is the crop it
+// performs on the console: library_600x900.jpg is 600x900, library_hero.jpg is
+// 1920x620.
+struct ArtEntry { uint32_t app; int kind; GhCom<ID2D1Bitmap> bm; };
+static std::vector<ArtEntry> g_art;
+
+// Titles the provider refuses, so the typographic plate is in every sheet.
+static const uint32_t kArtMissing[] = { 3809440u };
+
+static ID2D1Bitmap* SynthArt(void*, uint32_t app, int kind)
+{
+    if (!app || !g_host.rt) return nullptr;
+    for (uint32_t m : kArtMissing) if (m == app) return nullptr;
+
+    for (ArtEntry& e : g_art)
+        if (e.app == app && e.kind == kind) return e.bm.get();
+
+    const int w = (kind == GH_ART_HERO) ? 1920 : 600;
+    const int h = (kind == GH_ART_HERO) ?  620 : 900;
+    std::vector<uint32_t> px;
+    ArtPixels(app, kind, w, h, px);
+
+    const D2D1_BITMAP_PROPERTIES bp = D2D1::BitmapProperties(
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    GhCom<ID2D1Bitmap> bm;
+    if (FAILED(g_host.rt->CreateBitmap(D2D1::SizeU((UINT32)w, (UINT32)h), px.data(),
+                                       (UINT32)(w * 4), bp, bm.put())))
+        return nullptr;
+
+    g_art.push_back(ArtEntry{ app, kind, std::move(bm) });
+    return g_art.back().bm.get();
+}
+
+// ---------------------------------------------------------------------------
 // Fixtures. Plausible content, deliberately including the awkward cases: a name
 // longer than its row, a disabled row, a mid-download row, a zero-selection
 // state. A sheet that only ever shows short tidy strings proves nothing.
@@ -164,44 +277,70 @@ static GhUiListVM MakeListFixture()
     vm.count = kFixRowCount;
     vm.sel = 4;
     vm.fill = &FixFillRow;
-    vm.emptyText.set(L"No titles installed yet");
-    vm.emptySub.set(L"Sign in to see the games on your Steam account");
+    vm.emptyText.set(L"No games yet");
+    vm.emptySub.set(L"Sign in to see the games on your Steam account.");
     return vm;
 }
 
 // ---------------------------------------------------------------------------
-// The PICKER fixture: the real launcher page, with the real device's content.
+// THE WALL: the picker as the launcher now builds it.
 //
-// This one is not "plausible content". It reproduces, row for row, what the
-// console showed on 0.0.923.0 so that the ported page can be compared against a
-// screenshot of the launcher as it is today. That comparison is the whole point
-// of U1: it retires the risk of the token/view-model/layout seam before a
-// single console deploy, and anything the port changes shows up as a visible
-// difference rather than as an opinion.
+// This fixture is not "plausible content" -- it mirrors LuiDrawMenu field for
+// field, because that is what makes the sheet worth looking at: three drawers
+// with their counts, the breadcrumb naming the one in front, the search band,
+// the counter, and a footer of FOUR controls (uninstall, verify, mods and
+// workshop moved to the title screen). If this render and the device disagree,
+// one of the two is wrong and the difference is visible rather than arguable.
+//
+// The app ids are the real ones -- they are the launcher's own keys, and here
+// they are only hash inputs for the synthetic plates above. The rows cover the
+// three states the ladder actually has (installed / part copied / owned), one
+// title Steam has no asset for, one update mark, and the two longest names in
+// the library.
 // ---------------------------------------------------------------------------
-struct PickRow { const wchar_t* name; const wchar_t* state; };
+struct PickRow {
+    const wchar_t* name;
+    const wchar_t* state;     // what a LIST layout shows on the right
+    uint32_t       app;
+    int            kind;      // 0 installed, 1 part copied, 2 owned (not here yet)
+    bool           flag;      // an update is waiting -- fixture only (see below)
+};
 
 static const PickRow kPickRows[] = {
-    { L"Lethal Company",                 L"installed"  },
-    { L"FPS Chess",                      L"installed"  },
-    { L"Transience",                     L"installed"  },
-    { L"Half-Life 2",                    L"installed"  },
-    { L"Ghost of Tsushima DIRECTOR'S CUT", L"incomplete" },
-    { L"Chained Together",               L"incomplete" },
-    { L"Gang Beasts",                    L"incomplete" },
-    { L"20XX",                           L"incomplete" },
-    { L"R.E.P.O.",                       L"installed"  },
-    { L"Dead as Disco Demo",             L"installed"  },
-    { L"Cheese Rolling",                 L"installed"  },
-    { L"RV There Yet?",                  L"installed"  },
+    { L"Lethal Company",                   L"installed",   1966720, 0, false },
+    { L"R.E.P.O.",                         L"installed",   3241660, 0, false },
+    { L"Half-Life 2",                      L"installed",       220, 0, false },
+    // The update mark exists in the layout and in GhUiRow::flag, and NOTHING
+    // sets it on the console: g_repoUpdates counts packages, and no source
+    // reports a game update at all. The fixture is the only place it can be
+    // looked at, which is why one row carries it.
+    { L"Half-Life",                        L"installed",        70, 0, true  },
+    { L"Garry's Mod",                      L"installed",      4000, 0, false },
+    // Served by nothing: kArtMissing refuses this id, so this capsule is the
+    // typographic plate -- the one and only no-art fallback.
+    { L"Cheese Rolling",                   L"installed",   3809440, 0, false },
+    { L"Ghost of Tsushima DIRECTOR'S CUT", L"incomplete",  2215430, 1, false },
+    { L"Marvel's Spider-Man Remastered",   L"incomplete",  1817070, 1, false },
+    { L"Fears to Fathom - Scratch Creek",  L"owned",       4121170, 2, false },
+    { L"Gang Beasts",                      L"owned",        285900, 2, false },
+    { L"FPS Chess",                        L"owned",       2021910, 2, false },
+    { L"Dead as Disco Demo",               L"installed",   3763830, 0, false },
 };
 static const int kPickRowCount = (int)(sizeof kPickRows / sizeof kPickRows[0]);
 
 static void PickFillRow(void*, int i, GhUiRow& out)
 {
     if (i < 0 || i >= kPickRowCount) return;
-    out.title.setElided(kPickRows[i].name);
-    out.right.set(kPickRows[i].state);
+    const PickRow& r = kPickRows[i];
+    out.title.setElided(r.name);
+    out.right.set(r.state);
+    out.appId = r.app;
+    out.muted = (r.kind == 2);              // owned, not copied here yet
+    if (r.kind == 1) out.tray.set(L"Part copied");
+    out.flag = r.flag;
+    // `progress` is deliberately left at -1: gh_install.txt records complete=0|1
+    // and nothing persists a byte count, so a part-copied title says the words
+    // and does not draw a bar it would have to invent.
 }
 
 static GhUiListVM MakePickerFixture()
@@ -215,19 +354,79 @@ static GhUiListVM MakePickerFixture()
     vm.chrome.statusRole = GH_ROLE_ACCENT;
     vm.chrome.statusDot = true;
     vm.chrome.addBadge(L"MEMBER", GH_ROLE_ACCENT, false);
-    vm.chrome.addAction(GH_GLYPH_START, L"Packages");
-    vm.chrome.counter.set(L"1 / 171");
-    vm.chrome.addHint(GH_GLYPH_UPDOWN,    L"Move");
-    vm.chrome.addHint(GH_GLYPH_LEFTRIGHT, L"Jump 5");
-    vm.chrome.addHint(GH_GLYPH_A,         L"Launch");
-    vm.chrome.addHint(GH_GLYPH_X,         L"Uninstall");
-    vm.chrome.addHint(GH_GLYPH_VIEW,      L"Verify");
-    vm.chrome.addHint(GH_GLYPH_RB,        L"Mods");
-    vm.chrome.addHint(GH_GLYPH_Y,         L"Search");
-    vm.chrome.addHint(GH_GLYPH_B,         L"Back");
+    vm.chrome.addAction(GH_GLYPH_LB, L"Themes");
+
+    // The drawers, and the breadcrumb for the one in front. Three, not four:
+    // there is no "Updates" drawer because nothing reports a game update.
+    vm.chrome.addTab(L"All titles",    L"171");
+    vm.chrome.addTab(L"Installed",     L"12");
+    vm.chrome.addTab(L"Not installed", L"159");
+    vm.chrome.tab = 0;
+    vm.chrome.subline.set(L"Library  ›  All titles");
+
+    vm.chrome.search = true;                 // this page CAN search, so the band exists
+    vm.chrome.counter.set(L"3 / 171");
+
+    vm.chrome.addHint(GH_GLYPH_ARROWS, L"Move");
+    vm.chrome.addHint(GH_GLYPH_A,      L"Open");
+    vm.chrome.addHint(GH_GLYPH_Y,      L"Search");
+    vm.chrome.addHint(GH_GLYPH_START,  L"Packages · 2 updates");
+
     vm.count = kPickRowCount;
-    vm.sel = 0;
+    vm.sel = 2;
     vm.fill = &PickFillRow;
+    vm.emptyText.set(L"No games yet");
+    vm.emptySub.set(L"Sign in to see the games on your Steam account.");
+    return vm;
+}
+
+// ---------------------------------------------------------------------------
+// THE TITLE SCREEN: what A on the wall opens.
+//
+// Built the way LuiDrawTitlePage builds it -- a MODAL with `titlePage`, which
+// is why a layout with no title screen of its own still draws something usable.
+// Two renders, because the two that matter are the two ends of the ladder: an
+// installed title with a banner and a play record, and one that is on the
+// account but not on the console AND has no Steam asset at all, so the hero and
+// the capsule are both the typographic plate.
+static GhUiModalVM MakeTitleFixture()
+{
+    GhUiModalVM vm;
+    vm.overPage  = false;                    // this page owns the screen
+    vm.titlePage = true;
+    vm.appId     = 220;
+    vm.heading.setElided(L"Half-Life 2");
+    vm.chip.label.set(L"Installed");
+    vm.chip.role   = GH_ROLE_ACCENT;
+    vm.chip.filled = true;
+    vm.hasChip     = true;
+    // The figures come with the library (Player.GetOwnedGames carries
+    // playtime_forever, playtime_2weeks and rtime_last_played), so this line
+    // costs no request on the console either.
+    vm.detail.set(L"7.4 hours played  ·  38 min in the last two weeks  ·  played 3 days ago");
+    vm.addChoice(L"Play");
+    vm.addHint(GH_GLYPH_VIEW, L"Verify files");
+    vm.addHint(GH_GLYPH_X,    L"Uninstall");
+    vm.addHint(GH_GLYPH_RB,   L"Mods");
+    vm.addHint(GH_GLYPH_B,    L"Back");
+    return vm;
+}
+
+static GhUiModalVM MakeTitleOwnedFixture()
+{
+    GhUiModalVM vm;
+    vm.overPage  = false;
+    vm.titlePage = true;
+    vm.appId     = 3809440;                  // refused by kArtMissing: the plate
+    vm.heading.setElided(L"Cheese Rolling");
+    vm.chip.label.set(L"Not installed");
+    vm.chip.role   = GH_ROLE_TEXT_DIM;
+    vm.chip.filled = false;
+    vm.hasChip     = true;
+    vm.detail.set(L"Never played");
+    vm.note.set(L"On your Steam account. Installing copies it to this console.");
+    vm.addChoice(L"Install");
+    vm.addHint(GH_GLYPH_B, L"Back");
     return vm;
 }
 
@@ -267,6 +466,338 @@ static void MakeFakeQr(std::vector<uint8_t>& mods, int size)
             if (!mods[(size_t)y * size + x] && ((x * 7 + y * 13 + x * y) % 3 == 0))
                 set(x, y, 1);
     for (int i = 8; i < size - 8; ++i) { set(6, i, (i % 2) ? 0 : 1); set(i, 6, (i % 2) ? 0 : 1); }
+}
+
+// ---------------------------------------------------------------------------
+// The U2 pages
+// ---------------------------------------------------------------------------
+// One fixture per page ported in U2, each built the way the launcher's own
+// controller builds it -- same fields, same roles, same hint sets -- so that
+// what the sheet shows is what the console will show. The content is taken from
+// real device state where there is any (the Packages page's rows are the repo as
+// it stands), and where it is invented it is invented AWKWARD: a mod name that
+// overruns its row, a status line that is an error, a tab count that pushes the
+// header down, an indeterminate bar with no total. A fixture of short tidy
+// strings proves nothing.
+//
+// What is NOT here: the thirteen overlay panels. They paint into g_lui.dc and
+// g_gfx at a fixed 920x540 through the bake path, which this harness has no
+// device for; re-expressing them would mean testing a copy of the code rather
+// than the code. The overlay is verified on the console, where its bake
+// actually happens.
+
+// ---- Packages -------------------------------------------------------------
+struct PkgFix { const wchar_t* name; const wchar_t* state; bool member; };
+
+static const PkgFix kPkgRows[] = {
+    { L"Steam",            L"signed in \u00B7 update 0.0.4 \u2192 0.0.5", false },
+    { L"Greenhouse Dark",  L"installed 1.0.0  (theme)",                   false },
+    { L"Half-Life",        L"installed 0.0.2",                            false },
+    { L"BepInEx",          L"available 5.4.23",                           false },
+    { L"Membership",       L"Member \u2713  \u00B7  renews in 23 days",   true  },
+};
+static const int kPkgRowCount = (int)(sizeof kPkgRows / sizeof kPkgRows[0]);
+
+static void PkgFillRow(void*, int i, GhUiRow& out)
+{
+    if (i < 0 || i >= kPkgRowCount) return;
+    out.title.setElided(kPkgRows[i].name);
+    out.right.setElided(kPkgRows[i].state);
+}
+
+static GhUiListVM MakePackagesFixture()
+{
+    GhUiListVM vm;
+    vm.chrome.title.set(L"PACKAGES");
+    vm.chrome.statusDot  = true;
+    vm.chrome.statusRole = GH_ROLE_ACCENT;
+    // The strings LuiDrawPackages actually sets after the \u00A763f pass. The dev
+    // build appends " \u00B7 serial N \u00B7 key <fp>" here; the release build does not,
+    // and the preview shows the sentence every user sees.
+    vm.chrome.status.set(L"Checked and signed by Greenhouse");
+    vm.count = kPkgRowCount;
+    vm.sel   = 0;
+    vm.fill  = &PkgFillRow;
+    vm.emptyText.set(L"Nothing to install");
+    vm.emptySub.set(L"Nothing is installed on this console, and there is nothing on offer yet.");
+    vm.chrome.addHint(GH_GLYPH_A,     L"Install / update");
+    vm.chrome.addHint(GH_GLYPH_X,     L"Remove");
+    vm.chrome.addHint(GH_GLYPH_Y,     L"Refresh");
+    vm.chrome.addHint(GH_GLYPH_START, L"Sign out");
+    vm.chrome.addHint(GH_GLYPH_B,     L"Back");
+    return vm;
+}
+
+// ---- Mods -----------------------------------------------------------------
+struct ModFix { const wchar_t* name; const wchar_t* right; bool on; bool check; };
+
+// Every row on the Installed tab is a toggle, so every row has the box; the
+// turned-off ones are the case that matters, because they used to be marked
+// `disabled` and lose the cursor.
+static const ModFix kModRows[] = {
+    { L"BepInExPack",                          L"5.4.2100  \u00B7  mod loader  \u00B7  BepInEx", true,  true },
+    { L"LethalCompanyVariableSizePlayers",     L"1.1.2  \u00B7  ButteryStancakes",  true,  true },
+    { L"MoreCompany",                          L"1.11.0  \u00B7  notnotnotswipez",  true,  true },
+    { L"A mod whose name is far longer than the row it has to fit inside of",
+                                               L"0.4.1  \u00B7  somebody",          false, true },
+    { L"LateCompany",                          L"1.0.14 \u2192 1.0.15  \u00B7  anormaltwig", false, true },
+};
+static const int kModRowCount = (int)(sizeof kModRows / sizeof kModRows[0]);
+
+static void ModFillRow(void*, int i, GhUiRow& out)
+{
+    if (i < 0 || i >= kModRowCount) return;
+    const ModFix& m = kModRows[i];
+    out.title.setElided(m.name);
+    out.right.setElided(m.right);
+    out.hasCheck = m.check;
+    out.checked  = m.on;
+    if (m.check && !m.on) out.titleRole = GH_ROLE_TEXT_DIM;
+}
+
+static GhUiListVM MakeModsFixture()
+{
+    GhUiListVM vm;
+    vm.chrome.title.set(L"MODS  \u00B7  Lethal Company");
+    vm.chrome.statusDot  = true;
+    vm.chrome.statusRole = GH_ROLE_ACCENT;
+    vm.chrome.status.set(L"5 mods installed  \u00B7  4 turned on");
+    vm.chrome.addTab(L"Installed (5)");
+    vm.chrome.addTab(L"Browse");
+    vm.chrome.addTab(L"Profiles");
+    vm.chrome.addTab(L"Settings");
+    vm.chrome.tab = 0;
+    vm.chrome.note.set(L"Next launch:  coop");
+    vm.chrome.noteRole = GH_ROLE_ACCENT;
+    vm.chrome.subline.set(L"Profile coop  \u00B7  turned-off mods stay installed");
+    vm.count = kModRowCount;
+    // Deliberately a TURNED-OFF row: the selection highlight has to be on it.
+    vm.sel   = 4;
+    vm.fill  = &ModFillRow;
+    vm.detail.set(L"Lets players join after the ship has landed, instead of only in orbit.");
+    vm.detail2.set(L"by anormaltwig  \u00B7  2.1M downloads  \u00B7  works with this game");
+    vm.chrome.addHint(GH_GLYPH_A,  L"Turn on / off");
+    vm.chrome.addHint(GH_GLYPH_X,  L"Remove");
+    vm.chrome.addHint(GH_GLYPH_Y,  L"Update all");
+    vm.chrome.addHint(GH_GLYPH_LB, L"");
+    vm.chrome.addHint(GH_GLYPH_RB, L"Tabs");
+    vm.chrome.addHint(GH_GLYPH_B,  L"Back");
+    return vm;
+}
+
+// ---- Workshop -------------------------------------------------------------
+// The SEARCH tab, so the search band and the tab strip are both on screen at
+// once -- the case that has the least vertical room left for rows.
+struct WsFix { const wchar_t* name; const wchar_t* right; };
+
+static const WsFix kWsRows[] = {
+    { L"Half-Life 2 Campaign Collection", L"\u2713 on console  \u00B7  812.4 MB  \u00B7  214,903 subscribers" },
+    { L"PlayX",                           L"subscribed  \u00B7  12.1 MB  \u00B7  1,204,551 subscribers" },
+    { L"Wiremod",                         L"44.8 MB  \u00B7  3,980,112 subscribers" },
+    { L"VJ Base",                         L"196.0 MB  \u00B7  2,114,006 subscribers" },
+};
+static const int kWsRowCount = (int)(sizeof kWsRows / sizeof kWsRows[0]);
+
+static void WsFillRow(void*, int i, GhUiRow& out)
+{
+    if (i < 0 || i >= kWsRowCount) return;
+    out.title.setElided(kWsRows[i].name);
+    out.right.setElided(kWsRows[i].right);
+}
+
+static GhUiListVM MakeWorkshopFixture()
+{
+    GhUiListVM vm;
+    vm.chrome.title.set(L"WORKSHOP  \u00B7  Garry's Mod");
+    vm.chrome.statusDot  = true;
+    vm.chrome.statusRole = GH_ROLE_WARN;
+    vm.chrome.status.set(L"2 items could not be downloaded");
+    vm.chrome.addTab(L"Subscribed (23)");
+    vm.chrome.addTab(L"Popular");
+    vm.chrome.addTab(L"Search");
+    vm.chrome.tab = 2;
+    vm.chrome.search = true;
+    vm.chrome.searchActive = true;
+    vm.chrome.searchLine.set(L"wire");
+    vm.count = kWsRowCount;
+    vm.sel   = 1;
+    vm.fill  = &WsFillRow;
+    vm.detail.set(L"Lets you place working screens, cameras and web panels. Requires Wiremod "
+                  L"for the advanced entities.");
+    vm.chrome.addHint(GH_GLYPH_A,  L"Unsubscribe");
+    vm.chrome.addHint(GH_GLYPH_LB, L"");
+    vm.chrome.addHint(GH_GLYPH_RB, L"Tabs");
+    vm.chrome.addHint(GH_GLYPH_X,  L"Sync now");
+    vm.chrome.addHint(GH_GLYPH_Y,  L"Search");
+    vm.chrome.addHint(GH_GLYPH_B,  L"Back");
+    return vm;
+}
+
+// ---- Progress -------------------------------------------------------------
+static GhUiProgressVM MakeProgressFixture()
+{
+    GhUiProgressVM vm;
+    vm.chrome.title.set(L"GREENHOUSE");
+    vm.chrome.statusDot  = true;
+    vm.chrome.statusRole = GH_ROLE_ACCENT;
+    vm.chrome.status.set(L"Downloading Half-Life 2");
+    vm.chrome.footer.set(L"B  Stop \u00B7 the download resumes where it left off");
+    vm.heading.set(L"Depot 221 of 4  \u00B7  writing files");
+    vm.frac = 0.42f;
+    vm.amount.set(L"42%   1807.3 MB");
+    vm.rate.set(L"files 1204 / 2871");
+    return vm;
+}
+
+// A download that has no total: the indeterminate bar, and a detail line that
+// is a path long enough to need eliding.
+static GhUiProgressVM MakeProgressBusyFixture()
+{
+    GhUiProgressVM vm;
+    vm.chrome.title.set(L"MODS  \u00B7  R.E.P.O.");
+    vm.chrome.addHint(GH_GLYPH_B, L"Cancel");
+    vm.heading.set(L"Installing MoreUpgrades and 4 dependencies");
+    vm.frac = -1.f;
+    vm.amount.set(L"7.4 MB");
+    vm.detail.setElided(L"BepInEx/plugins/Th3Fo0l-MoreUpgrades/MoreUpgrades/assets/"
+                        L"bundles/moreupgrades_shared_assets.bundle");
+    return vm;
+}
+
+// ---- Sign-in (QrPage) -----------------------------------------------------
+static GhUiQrVM MakeLoginFixture(const uint8_t* mods, int n)
+{
+    GhUiQrVM vm;
+    vm.chrome.title.set(L"GREENHOUSE");
+    // Controls are hints, never a baked string: the glyph is a token so a theme
+    // with keycaps draws caps and one without draws bare letters.
+    vm.chrome.addHint(GH_GLYPH_A, L"Refresh the code");
+    vm.chrome.addHint(GH_GLYPH_B, L"Skip for now");
+    vm.heading.set(L"Sign in to Steam");
+    vm.modules = mods;
+    vm.size    = n;
+    vm.caption.set(L"Scan this with the Steam mobile app");
+    return vm;
+}
+
+// Membership with NO code: the layout is supposed to centre the two lines
+// rather than leave an empty panel, and this is the render that proves it.
+static GhUiQrVM MakeEntFixture()
+{
+    GhUiQrVM vm;
+    vm.chrome.title.set(L"GREENHOUSE");
+    vm.chrome.addHint(GH_GLYPH_A, L"Try again");
+    vm.chrome.addHint(GH_GLYPH_B, L"Continue to the library");
+    vm.heading.set(L"Membership");
+    vm.caption.set(L"Checking this console's membership\u2026");
+    vm.sub.set(L"No network. The console keeps playing for 6 more days.");
+    return vm;
+}
+
+// ---- Status (MessagePage) -------------------------------------------------
+static GhUiMessageVM MakeStatusFixture()
+{
+    GhUiMessageVM vm;
+    vm.chrome.title.set(L"GREENHOUSE");
+    vm.centered = true;
+    vm.body.set(L"Asking Steam for your library\u2026");
+    vm.bodyRole = GH_ROLE_TEXT_ON_BG;
+    return vm;
+}
+
+// ---- Modals ---------------------------------------------------------------
+static GhUiModalVM MakeVerifyFixture()
+{
+    GhUiModalVM vm;
+    vm.overPage = false;
+    vm.heading.set(L"VERIFY FILES");
+    vm.body.set(L"Check this install against Steam and repair it?");
+    vm.detail.set(L"Ghost of Tsushima DIRECTOR'S CUT");
+    vm.note.set(L"Matching files are hashed, not re-downloaded. This can take a while.");
+    vm.addChoice(L"A  Verify");
+    vm.addChoice(L"B  Cancel");
+    return vm;
+}
+
+// The text-entry modal: a prompt whose body is the live string with its caret,
+// and whose controls are hints rather than choices.
+static GhUiModalVM MakeEntryFixture()
+{
+    GhUiModalVM vm;
+    vm.overPage = false;
+    vm.heading.set(L"NEW PROFILE");
+    vm.body.set(L"coop_");
+    vm.note.set(L"The profile the next launch uses.");
+    vm.addHint(GH_GLYPH_START, L"Done");
+    vm.addHint(GH_GLYPH_B,     L"Cancel");
+    return vm;
+}
+
+// ---- Crash ----------------------------------------------------------------
+// The one page whose body is its own: a scrolling window onto arbitrary log
+// bytes. This reproduces LauncherShowCrash's draw body exactly -- chrome,
+// then lines at the theme's log pitch, then the position counter in the band
+// the chrome left -- because the point is to check that a theme which raises
+// the log size shows fewer lines rather than overlapping them.
+static const char* kCrashLog[] = {
+    "LAUNCH app=220 'Half-Life 2' dir=U:\\gh_games\\app_220",
+    "X86 N1 runtime up: gs-alias substrate, 1 guest thread",
+    "X86 STEAM bridge: SteamClient020 slot 9 -> 1",
+    "D3D9 COM layer: CreateDevice hwnd=0x00010044 1920x1080 fmt=22",
+    "GUEST module hl2.exe base=0x00400000 size=0x0004A000",
+    "GUEST module engine.dll base=0x1D000000 size=0x0051C000",
+    "FRAME 1 present ok  gpu=4.1 ms  cpu=5.9 ms",
+    "FRAME 60 present ok  gpu=4.0 ms  cpu=5.7 ms",
+    "GUEST VEH c0000005 at 0x1D1A4C31 read 0x00000018",
+    "GUEST VEH not handled by the guest: passing to the fault-loop guard",
+    "X86 fault-loop guard: 1 fault, first at this rip, no loop",
+    "GUEST exit code 0xC0000005 after 3.2 s",
+    "LAUNCH teardown: 0 leaked heaps, 0 pinned ranges, pager idle",
+    "LAUNCH relaunching the launcher",
+};
+static const int kCrashLines = (int)(sizeof kCrashLog / sizeof kCrashLog[0]);
+
+static void PaintCrashFixture()
+{
+    GhUiChrome ch;
+    ch.title.set(L"GAME CRASHED");
+    ch.titleRole = GH_ROLE_WARN;
+    ch.status.set(L"Half-Life 2 stopped with 0xC0000005 (access violation)");
+    // Mirrors LauncherShowCrash after the §63f string pass: the reason reads as
+    // plain text under the headline (it used to be ACCENT -- a green sentence
+    // under a red one), and the header says what the band IS rather than naming
+    // the file on our disk that it came out of.
+    ch.statusRole = GH_ROLE_TEXT_ON_BG;
+    ch.subline.set(L"What the game reported, most recent last");
+    ch.addHint(GH_GLYPH_A, L"Play without mods");
+    ch.addHint(GH_GLYPH_B, L"Back to library");
+    ch.addHint(GH_GLYPH_UPDOWN, L"Scroll log");
+
+    const D2D1_RECT_F body = GhUiPageChrome(ch);
+
+    const float lineH = GhUiLineHeight(GH_TYPE_LOG);
+    int nfit = (int)(GhUiH(body) / lineH);
+    if (nfit < 1) nfit = 1;
+    const int n = kCrashLines;
+    const int maxs = (n > nfit) ? n - nfit : 0;
+    const int scroll = maxs;                       // the launcher opens at the tail
+    int last = scroll + nfit;
+    if (last > n) last = n;
+    for (int i = scroll; i < last; ++i) {
+        const float y = body.top + (float)(i - scroll) * lineH;
+        GhUiTextDraw(Widen(kCrashLog[i]).c_str(), GH_TYPE_LOG,
+                     D2D1::RectF(body.left, y, body.right, y + lineH),
+                     GH_ROLE_TEXT_ON_BG, DWRITE_TEXT_ALIGNMENT_LEADING,
+                     DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+    }
+    if (n > nfit) {
+        wchar_t pos[40];
+        swprintf(pos, 40, L"%d\u2013%d / %d", scroll + 1, last, n);
+        GhUiTextDraw(pos, GH_TYPE_SMALL,
+                     D2D1::RectF(body.left, body.top - 50.f * g_ghUi.textScale,
+                                 body.right, body.top - 10.f * g_ghUi.textScale),
+                     GH_ROLE_TEXT_DIM_ON_BG, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -467,6 +998,102 @@ static void PaintTokenSheet(const GhTheme& t)
 }
 
 // ---------------------------------------------------------------------------
+// Page dispatch
+// ---------------------------------------------------------------------------
+// One name per render. `--page all` walks this table, which is the sheet to
+// review before a deploy: every page the launcher draws, in one theme, in one
+// command. The caller owns BeginDraw/EndDraw, as the launcher's own pages do.
+static const char* kPages[] = {
+    "tokens", "picker", "title", "title-owned", "empty", "packages", "mods", "workshop",
+    "progress", "busy", "qr", "ent", "status", "uninstall", "verify",
+    "entry", "crash", "themes", "themes-big",
+    "onboard1", "onboard4",
+};
+static const int kPageCount = (int)(sizeof kPages / sizeof kPages[0]);
+
+static bool PaintPage(const std::string& page, const GhTheme& t)
+{
+    if (page == "tokens")   { PaintTokenSheet(t); return true; }
+    // The picker is the one page that asks for TILES: it is the library, every
+    // row is the same shape, and a layout with a grid shows twenty names where a
+    // list shows ten. GhUiPageGrid falls back to the list renderer for `list`
+    // and `blades`, which have no tile view, so one call covers all three.
+    if (page == "picker" || page == "wall") { GhUiPageGrid(MakePickerFixture()); return true; }
+    // The title screen, which is a MODAL with `titlePage` -- see MakeTitleFixture.
+    if (page == "title")       { GhUiPageModal(MakeTitleFixture()); return true; }
+    if (page == "title-owned") { GhUiPageModal(MakeTitleOwnedFixture()); return true; }
+    if (page == "empty") {
+        // The same page with nothing in it. An empty list is a state the device
+        // reaches on a first run, before sign-in, and it is drawn by the layout
+        // rather than by the page, so it needs its own render.
+        GhUiListVM vm = MakePickerFixture();
+        vm.count = 0;
+        vm.sel   = -1;
+        vm.chrome.status.set(L"not signed in");
+        vm.chrome.statusRole = GH_ROLE_TEXT_DIM;
+        vm.chrome.counter.set(L"0 / 0");
+        vm.emptyText.set(L"No games yet");
+        vm.emptySub.set(L"Sign in to see the games on your Steam account.");
+        GhUiPageGrid(vm);
+        return true;
+    }
+    // The Themes page is not a fixture: gh_ui_page_themes.h builds the real
+    // rows from the real g_ghThemes and the real settings, and the launcher's
+    // own page calls the same two functions. There is no copy to drift.
+    if (page == "themes" || page == "themes-big") {
+        std::vector<GhThRow> rows;
+        GhThBuildRows(rows);
+        GhThCtx ctx{ &rows };
+        // Selected: the theme in use, so the IN USE badge and the caption for a
+        // selected theme row are both on screen.
+        int sel = 1;
+        for (size_t i = 0; i < rows.size(); ++i)
+            if (rows[i].kind == GH_TH_THEME && rows[i].theme == g_ghThemeActive) { sel = (int)i; break; }
+        // ...and, in the -big render, the "Text size" row instead, at the top of
+        // its range with the override set: the Reset hint, the percentage and
+        // the "Set by you" caption are all states only this page can reach, and
+        // 140% is the one that clips a layout if any of them does.
+        if (page == "themes-big") {
+            for (size_t i = 0; i < rows.size(); ++i) if (rows[i].kind == GH_TH_TEXT) sel = (int)i;
+            g_ghThemeSettings.hasTextScale = true;
+            g_ghThemeSettings.textScale = 1.4f;
+            GhUiApply(t);                       // the page draws at the size it reports
+        }
+        GhUiPageList(GhThPageVM(rows, sel, ctx, nullptr, false));
+        if (page == "themes-big") {             // leave the next render alone
+            g_ghThemeSettings.hasTextScale = false;
+            GhUiApply(t);
+        }
+        return true;
+    }
+    // Onboarding, like the Themes page, is the REAL page: gh_ui_page_onboard.h
+    // supplies the steps and the launcher's own loop calls the same function.
+    // Two of the four are rendered -- the first, whose B is "Skip", and the
+    // last, whose A is the long "Start using Greenhouse" label and whose body
+    // is the longest of the four. Those are the two that can overflow.
+    if (page == "onboard1") { GhUiPageMessage(GhOnbPageVM(0)); return true; }
+    if (page == "onboard4") { GhUiPageMessage(GhOnbPageVM(GhOnbCount() - 1)); return true; }
+    if (page == "packages") { GhUiPageList(MakePackagesFixture()); return true; }
+    if (page == "mods")     { GhUiPageList(MakeModsFixture()); return true; }
+    if (page == "workshop") { GhUiPageList(MakeWorkshopFixture()); return true; }
+    if (page == "progress") { GhUiPageProgress(MakeProgressFixture()); return true; }
+    if (page == "busy")     { GhUiPageProgress(MakeProgressBusyFixture()); return true; }
+    if (page == "qr") {
+        std::vector<uint8_t> mods;
+        MakeFakeQr(mods, 41);                  // a version-6 code, as Steam's is
+        GhUiPageQr(MakeLoginFixture(mods.data(), 41));
+        return true;
+    }
+    if (page == "ent")       { GhUiPageQr(MakeEntFixture()); return true; }
+    if (page == "status")    { GhUiPageMessage(MakeStatusFixture()); return true; }
+    if (page == "uninstall") { GhUiPageModal(MakeUninstallFixture()); return true; }
+    if (page == "verify")    { GhUiPageModal(MakeVerifyFixture()); return true; }
+    if (page == "entry")     { GhUiPageModal(MakeEntryFixture()); return true; }
+    if (page == "crash")     { PaintCrashFixture(); return true; }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 int wmain(int argc, wchar_t** argv)
 {
     std::wstring state = L".\\";
@@ -487,7 +1114,10 @@ int wmain(int argc, wchar_t** argv)
                                             for (wchar_t c : t) if (c < 0x80) page.push_back((char)c); }
         else if (a == L"--help") {
             printf("gh_ui_host [--state <dir>] [--out <dir>] [--theme <id|all>] [--size WxH]\n"
-                   "           [--page tokens|picker|uninstall]\n");
+                   "           [--page <name>|all]\n"
+                   "pages:");
+            for (int k = 0; k < kPageCount; ++k) printf(" %s", kPages[k]);
+            printf("\n");
             return 0;
         }
     }
@@ -498,9 +1128,24 @@ int wmain(int argc, wchar_t** argv)
     }
     if (!g_host.Init(w, h)) return 2;
 
+    // Freeze the marquee: a preview render has to be the same PNG every time,
+    // and a third of the way along is where an indeterminate bar is visible.
+    g_ghUiAnimPin = 0.35f;
+
     GhThemeInit(state.c_str(), &LogLine);
     GhThemeLoad();
     GhUiLayoutsInit();
+
+    // The art seam. On the console gh_art.h plugs the real Steam cache in here;
+    // the harness plugs in abstract plates keyed by the same app ids, so the
+    // drawing code has no idea which host it is in -- and no real game art is
+    // ever in a preview PNG. See SynthArt.
+    GhUiSetArtProvider(&SynthArt, nullptr);
+
+    // The pages to render: one, or the whole table.
+    std::vector<std::string> pages;
+    if (page == "all") for (int k = 0; k < kPageCount; ++k) pages.push_back(kPages[k]);
+    else               pages.push_back(page);
 
     int made = 0, failed = 0;
     for (size_t i = 0; i < g_ghThemes.size(); ++i) {
@@ -514,31 +1159,30 @@ int wmain(int argc, wchar_t** argv)
             continue;
         }
 
-        g_host.rt->BeginDraw();
-        if (page == "picker") {
-            const GhUiListVM pvm = MakePickerFixture();
-            GhUiPageList(pvm);
-        } else if (page == "uninstall") {
-            const GhUiModalVM mvm = MakeUninstallFixture();
-            GhUiPageModal(mvm);
-        } else {
-            PaintTokenSheet(t);
-        }
-        const HRESULT hr = g_host.rt->EndDraw();
-        if (FAILED(hr)) {
-            printf("FAIL %-16s EndDraw 0x%08lX\n", t.id, (unsigned long)hr);
-            ++failed;
-            continue;
-        }
+        for (const std::string& p : pages) {
+            g_host.rt->BeginDraw();
+            const bool known = PaintPage(p, t);
+            const HRESULT hr = g_host.rt->EndDraw();
+            if (!known) {
+                printf("FAIL %-16s unknown page \"%s\" (--help lists them)\n", t.id, p.c_str());
+                ++failed;
+                continue;
+            }
+            if (FAILED(hr)) {
+                printf("FAIL %-16s %-10s EndDraw 0x%08lX\n", t.id, p.c_str(), (unsigned long)hr);
+                ++failed;
+                continue;
+            }
 
-        const std::wstring path = out + Widen(page) + L"-" + Widen(t.id) + L".png";
-        if (!g_host.SavePng(path)) {
-            printf("FAIL %-16s could not write the PNG\n", t.id);
-            ++failed;
-            continue;
+            const std::wstring path = out + Widen(p) + L"-" + Widen(t.id) + L".png";
+            if (!g_host.SavePng(path)) {
+                printf("FAIL %-16s %-10s could not write the PNG\n", t.id, p.c_str());
+                ++failed;
+                continue;
+            }
+            printf("OK   %-16s %s-%s.png  layout=%s  %ux%u\n", t.id, p.c_str(), t.id, t.layout, w, h);
+            ++made;
         }
-        printf("OK   %-16s %s-%s.png  layout=%s  %ux%u\n", t.id, page.c_str(), t.id, t.layout, w, h);
-        ++made;
     }
 
     if (!made && !failed) printf("no theme matched \"%s\"\n", want.c_str());

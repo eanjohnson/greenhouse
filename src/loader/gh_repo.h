@@ -223,6 +223,77 @@ inline bool IsTitleSeedPath(const std::string& p)
     return a != std::string::npos && a > 5 && a + 1 < p.size();
 }
 
+// ---- theme packages (§63e) ---------------------------------------------------------
+// A theme is DATA: it names a layout that is compiled into the loader and supplies
+// tokens. A theme package therefore contains nothing executable, and that is the whole
+// reason a theme is safe to download, so it is checked twice and neither check can be
+// skipped by a host that forgets a hook:
+//   * the manifest's paths must be in the allow-list below (ParseManifest), and
+//   * every staged file's BYTES must be the kind its extension claims (Install).
+// It is an allow-list on both sides, not a list of refused magics: a file that is not
+// provably a theme.json, a font or an image does not install.
+static const uint64_t kMaxThemeFile = 16ull << 20;     // one font or image
+static const uint64_t kMaxThemePkg  = 64ull << 20;     // a whole theme
+
+enum ThemePart { TP_NONE = 0, TP_JSON, TP_FONT, TP_PNG, TP_JPG, TP_BMP };
+
+inline std::string LowerExt(const std::string& p)
+{
+    const size_t d = p.rfind('.'), s = p.rfind('/');
+    if (d == std::string::npos || (s != std::string::npos && d < s)) return std::string();
+    std::string e = p.substr(d);
+    for (char& c : e) c = (char)(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
+    return e;
+}
+
+inline ThemePart ThemePartOf(const std::string& p)
+{
+    if (p == "theme.json") return TP_JSON;              // exactly one, at the top level
+    const std::string e = LowerExt(p);
+    if (e == ".ttf" || e == ".otf" || e == ".ttc") return TP_FONT;
+    if (e == ".png") return TP_PNG;
+    if (e == ".jpg" || e == ".jpeg") return TP_JPG;
+    if (e == ".bmp") return TP_BMP;
+    return TP_NONE;                                      // everything else, .dll included
+}
+
+inline const char* ThemePartName(ThemePart t)
+{
+    switch (t){
+    case TP_JSON: return "theme.json"; case TP_FONT: return "a font";
+    case TP_PNG: return "a PNG"; case TP_JPG: return "a JPEG"; case TP_BMP: return "a BMP";
+    default: return "not a theme file";
+    }
+}
+
+inline bool CheckThemeBytes(const std::string& path, const std::vector<uint8_t>& b, std::string& why)
+{
+    auto magic = [&](const char* sig, size_t n){ return b.size() >= n && memcmp(b.data(), sig, n) == 0; };
+    switch (ThemePartOf(path)){
+    case TP_JSON: {
+        ghjson::Value j; std::string err;
+        if (!ghjson::Parse((const char*)b.data(), b.size(), j, err)){ why = "is not JSON (" + err + ")"; return false; }
+        if (!j.isObj()){ why = "is not a JSON object"; return false; }
+        return true;
+    }
+    case TP_FONT:
+        // sfnt 1.0, 'true' (Apple), 'OTTO' (CFF outlines), 'ttcf' (collection).
+        if (magic("\x00\x01\x00\x00", 4) || magic("true", 4) || magic("OTTO", 4) || magic("ttcf", 4)) return true;
+        why = "is not a TrueType/OpenType font"; return false;
+    case TP_PNG:
+        if (magic("\x89PNG\r\n\x1a\n", 8)) return true;
+        why = "is not a PNG"; return false;
+    case TP_JPG:
+        if (magic("\xFF\xD8\xFF", 3)) return true;
+        why = "is not a JPEG"; return false;
+    case TP_BMP:
+        if (magic("BM", 2)) return true;
+        why = "is not a BMP"; return false;
+    default:
+        why = "is not a theme.json, a font or an image"; return false;
+    }
+}
+
 inline bool StrList(const ghjson::Value& o, const char* k, std::vector<std::string>& out, std::string& why)
 {
     out.clear();
@@ -238,8 +309,8 @@ inline bool StrList(const ghjson::Value& o, const char* k, std::vector<std::stri
 
 inline bool CheckType(const std::string& t, std::string& why)
 {
-    if (t == "title" || t == "addon") return true;
-    why = "type \"" + t + "\" is not title or addon"; return false;
+    if (t == "title" || t == "addon" || t == "theme") return true;
+    why = "type \"" + t + "\" is not title, addon or theme"; return false;
 }
 
 inline bool ParseIndex(const char* p, size_t n, Index& out, std::string& why)
@@ -366,7 +437,22 @@ inline bool ParseManifest(const char* p, size_t n, Manifest& m, std::string& why
                 why = "title package file \"" + f.path + "\" is not a flat *.ghtitle.json or seed/<Name>/..."; return false; }
             if (f.size > kMaxDoc){ why = f.path + ": a title file is larger than 1 MiB"; return false; }
         }
+        if (m.type == "theme"){
+            // Nothing executable: theme.json, fonts, images. See ThemePartOf.
+            const ThemePart tp = ThemePartOf(f.path);
+            if (tp == TP_NONE){
+                why = "theme package file \"" + f.path + "\" is not a theme.json, a font "
+                      "(.ttf/.otf/.ttc) or an image (.png/.jpg/.bmp)"; return false; }
+            if (f.size > (tp == TP_JSON ? kMaxDoc : kMaxThemeFile)){
+                why = f.path + ": a theme file is larger than " + (tp == TP_JSON ? "1" : "16") + " MiB"; return false; }
+        }
         m.files.push_back(std::move(f));
+    }
+    if (m.type == "theme"){
+        int roots = 0; uint64_t tot = 0;
+        for (const auto& f : m.files){ if (f.path == "theme.json") ++roots; tot += f.size; }
+        if (roots != 1){ why = "a theme package holds exactly one top-level theme.json"; return false; }
+        if (tot > kMaxThemePkg){ why = "the theme package is larger than 64 MiB"; return false; }
     }
     return true;
 }
@@ -720,6 +806,8 @@ struct Config {
     std::wstring stateDir;      // installed.json (LocalState\gh_packages\)
     std::wstring titleDir;      // title packages' files (LocalState\titles\)
     std::wstring addonRoot;     // add-ons: <addonRoot>\<id>\<version>\ (D:\DevelopmentFiles\gh_packages\)
+    std::wstring themeRoot;     // themes:  <themeRoot>\<id>\<version>\  (D:\DevelopmentFiles\gh_themes\)
+                                // Empty = this loader does not take theme packages (they are refused).
     uint64_t     loaderVersion = 0;   // 0 = unknown (minLoader not enforced)
     void (*log)(const std::string&) = nullptr;
     // Optional extra check of a downloaded title file (the loader parses it as
@@ -859,16 +947,21 @@ inline bool Install(const Config& c, const Index& idx, const std::string& id, st
     if (c.progTotal) *c.progTotal = (LONG64)total;
     if (c.progDone) *c.progDone = 0;
 
-    // Stage: title files as <titleDir>\<name>.part; an add-on as one
-    // <addonRoot>\<id>\<version>.part\ directory renamed into place at the end.
+    // Stage: title files as <titleDir>\<name>.part; an add-on or a theme as one
+    // <root>\<id>\<version>.part\ directory renamed into place at the end. A theme
+    // takes the same path as an add-on, out of its own root, so it gets the atomic
+    // rename, the free update and the orphan sweep without a second code path.
     const bool title = (m.type == "title");
+    const bool theme = (m.type == "theme");
+    if (theme && c.themeRoot.empty()){ why = id + " is a theme package and this loader has no theme root"; return false; }
+    const std::wstring& root = theme ? c.themeRoot : c.addonRoot;
     const std::wstring wid = Widen(m.id), wver = Widen(m.version);
     std::wstring stageDir, finalDir;
     if (title){ CreateDirectoryW(c.titleDir.c_str(), nullptr); }
     else {
-        finalDir = c.addonRoot + wid + L"\\" + wver;
+        finalDir = root + wid + L"\\" + wver;
         stageDir = finalDir + L".part";
-        if (!MakeDirs(c.addonRoot + wid + L"\\")){ why = "cannot create " + Narrow(c.addonRoot); return false; }
+        if (!MakeDirs(root + wid + L"\\")){ why = "cannot create " + Narrow(root); return false; }
         DeleteTree(stageDir);
         if (!CreateDirectoryW(stageDir.c_str(), nullptr)){ why = "cannot create the staging folder"; return false; }
     }
@@ -910,6 +1003,14 @@ inline bool Install(const Config& c, const Index& idx, const std::string& id, st
             std::vector<uint8_t> tb;
             if (!ReadFileAll(part, tb, kMaxDoc) || !c.checkTitle(tb, m.id, why)){ why = f.path + ": " + why; cleanup(); return false; }
         }
+        if (theme){
+            // The second half of the no-executables boundary, on the bytes that are
+            // about to be committed (after unseal, so a members-only theme is checked
+            // as plaintext too). The extension said what this is; now prove it.
+            std::vector<uint8_t> tb;
+            if (!ReadFileAll(part, tb, kMaxThemeFile)){ why = f.path + ": cannot re-read the staged file"; cleanup(); return false; }
+            if (!CheckThemeBytes(f.path, tb, why)){ why = f.path + " " + why; cleanup(); return false; }
+        }
         done += n; if (c.progDone) *c.progDone = (LONG64)done;
         Log(c, "REPO file ok " + m.id + "/" + f.path + " " + std::to_string(n) + " B sha256=" + got.substr(0, 16) +
                (f.sealed ? " (sealed, opened)" : ""));
@@ -921,7 +1022,9 @@ inline bool Install(const Config& c, const Index& idx, const std::string& id, st
     const std::string wasVer = old ? " (was " + old->version + ")" : std::string();
     Installed rec; rec.id = m.id; rec.type = m.type; rec.version = m.version; rec.ver = m.ver;
     if (!title) for (const auto& f : m.files){
-        if (f.path == "addon.dll") rec.entrySha256 = f.sha256;
+        // A theme has no entry point: "addon.dll" is not in its allow-list, so it
+        // could not carry one, and nothing ever asks a theme for an entrySha256.
+        if (!theme && f.path == "addon.dll") rec.entrySha256 = f.sha256;
         rec.sha.push_back({f.path, f.sha256});
     }
     if (title){
@@ -975,24 +1078,16 @@ inline bool Remove(const Config& c, const std::string& id, std::string& why)
     return true;
 }
 
-// Add-on version folders no installed record points to: left by a Remove or an
-// update while the old addon.dll was loaded. Run before any add-on is loaded.
-inline void CleanOrphans(const Config& c)
+// Add-on (or theme) version folders no installed record points to: left by a Remove
+// or an update while the old addon.dll was loaded. Run before any add-on is loaded.
+inline void CleanOrphanRoot(const Config& c, const State& st, const std::wstring& root)
 {
-    // No installed.json at all is a lost LocalState (a wiped package), not an
-    // empty install: every folder would look orphaned. Keep them so restoring
-    // the record brings the add-ons back (0.0.727.0 swept steam this way).
-    if (GetFileAttributesW((c.stateDir + L"installed.json").c_str()) == INVALID_FILE_ATTRIBUTES){
-        Log(c, "REPO no installed.json: orphan sweep skipped");
-        return;
-    }
-    State st = LoadState(c.stateDir);
     WIN32_FIND_DATAW fd;
-    HANDLE d = FindFirstFileW((c.addonRoot + L"*").c_str(), &fd);
+    HANDLE d = FindFirstFileW((root + L"*").c_str(), &fd);
     if (d == INVALID_HANDLE_VALUE) return;
     do {
         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.') continue;
-        const std::wstring pkg = c.addonRoot + fd.cFileName + L"\\";
+        const std::wstring pkg = root + fd.cFileName + L"\\";
         WIN32_FIND_DATAW vd;
         HANDLE v = FindFirstFileW((pkg + L"*").c_str(), &vd);
         int kept = 0;
@@ -1016,21 +1111,29 @@ inline void CleanOrphans(const Config& c)
     FindClose(d);
 }
 
-// Leftovers of a killed install: *.part title files and *.part add-on folders.
-inline void CleanStaging(const Config& c)
+inline void CleanOrphans(const Config& c)
+{
+    // No installed.json at all is a lost LocalState (a wiped package), not an
+    // empty install: every folder would look orphaned. Keep them so restoring
+    // the record brings the add-ons back (0.0.727.0 swept steam this way).
+    if (GetFileAttributesW((c.stateDir + L"installed.json").c_str()) == INVALID_FILE_ATTRIBUTES){
+        Log(c, "REPO no installed.json: orphan sweep skipped");
+        return;
+    }
+    const State st = LoadState(c.stateDir);
+    CleanOrphanRoot(c, st, c.addonRoot);
+    if (!c.themeRoot.empty()) CleanOrphanRoot(c, st, c.themeRoot);
+}
+
+// Leftovers of a killed install: *.part title files and *.part package folders.
+inline void CleanStagingRoot(const Config& c, const std::wstring& root)
 {
     WIN32_FIND_DATAW fd;
-    HANDLE f = FindFirstFileW((c.titleDir + L"*.part").c_str(), &fd);
-    if (f != INVALID_HANDLE_VALUE){
-        do { DeleteFileW((c.titleDir + fd.cFileName).c_str()); Log(c, "REPO cleaned " + Narrow(fd.cFileName)); }
-        while (FindNextFileW(f, &fd));
-        FindClose(f);
-    }
-    HANDLE d = FindFirstFileW((c.addonRoot + L"*").c_str(), &fd);
+    HANDLE d = FindFirstFileW((root + L"*").c_str(), &fd);
     if (d != INVALID_HANDLE_VALUE){
         do {
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.') continue;
-            std::wstring pkg = c.addonRoot + fd.cFileName + L"\\";
+            std::wstring pkg = root + fd.cFileName + L"\\";
             WIN32_FIND_DATAW vd;
             HANDLE v = FindFirstFileW((pkg + L"*.part").c_str(), &vd);
             if (v == INVALID_HANDLE_VALUE) continue;
@@ -1040,6 +1143,19 @@ inline void CleanStaging(const Config& c)
         } while (FindNextFileW(d, &fd));
         FindClose(d);
     }
+}
+
+inline void CleanStaging(const Config& c)
+{
+    WIN32_FIND_DATAW fd;
+    HANDLE f = FindFirstFileW((c.titleDir + L"*.part").c_str(), &fd);
+    if (f != INVALID_HANDLE_VALUE){
+        do { DeleteFileW((c.titleDir + fd.cFileName).c_str()); Log(c, "REPO cleaned " + Narrow(fd.cFileName)); }
+        while (FindNextFileW(f, &fd));
+        FindClose(f);
+    }
+    CleanStagingRoot(c, c.addonRoot);
+    if (!c.themeRoot.empty()) CleanStagingRoot(c, c.themeRoot);
 }
 
 // Packages the index has newer than what is installed (installed ones only).

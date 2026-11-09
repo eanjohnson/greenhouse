@@ -38,6 +38,16 @@ struct GhUiLayout {
     void        (*qr)      (const GhUiQrVM& vm,       const D2D1_RECT_F& body);
     void        (*progress)(const GhUiProgressVM& vm, const D2D1_RECT_F& body);
     void        (*message) (const GhUiMessageVM& vm,  const D2D1_RECT_F& body);
+
+    // How many tiles `grid` puts in a row, for the page's own input handling:
+    // RIGHT on a wall of covers moves by one and DOWN moves by a row, and only
+    // the layout knows how wide a row is. May be null -- a layout without a
+    // tile view, or one whose tile count is whatever `gridCols` asked for.
+    //
+    // Added after the first three layouts shipped, which is safe: their table
+    // literals are positional aggregates, so the new member null-initialises
+    // in each of them rather than shifting anything.
+    int         (*cols)    (const GhUiListVM& vm);
 };
 
 // ---------------------------------------------------------------------------
@@ -84,6 +94,18 @@ inline const GhUiLayout* GhUiLayoutActive()
 // Each one paints a whole frame: background, chrome, body. The caller owns
 // BeginDraw/EndDraw, because the launcher draws a page and then sometimes a
 // modal over it inside one frame.
+// Background and chrome only, returning the body rectangle. For the one page
+// whose body is genuinely its own: the crash screen's log viewport, which is
+// neither a row list at row pitch nor a paragraph -- it is a scrolling window
+// onto kilobytes of arbitrary bytes. Everything that frames it still comes from
+// the layout, so a structural theme reshapes the crash screen like any other.
+inline D2D1_RECT_F GhUiPageChrome(const GhUiChrome& c)
+{
+    const GhUiLayout* l = GhUiLayoutActive();
+    GhUiBackground();
+    return (l && l->chrome) ? l->chrome(c) : GhUiFrame();
+}
+
 inline void GhUiPageList(const GhUiListVM& vm)
 {
     const GhUiLayout* l = GhUiLayoutActive();
@@ -100,6 +122,18 @@ inline void GhUiPageGrid(const GhUiListVM& vm)
     const D2D1_RECT_F body = l->chrome ? l->chrome(vm.chrome) : GhUiFrame();
     if (l->grid) l->grid(vm, body);
     else if (l->list) l->list(vm, body);
+}
+
+// How wide a row of tiles is under the active layout, so that a page can map a
+// pad direction onto an index without knowing which layout drew it. One under
+// every layout that has no tile view at all, which is exactly right: there the
+// grid rendered as a list, and a list is one column wide.
+inline int GhUiPageCols(const GhUiListVM& vm)
+{
+    const GhUiLayout* l = GhUiLayoutActive();
+    if (l && l->cols) { const int n = l->cols(vm); return n > 0 ? n : 1; }
+    if (l && l->grid && vm.gridCols > 0) return vm.gridCols;
+    return 1;
 }
 
 inline void GhUiPageModal(const GhUiModalVM& vm)

@@ -75,6 +75,13 @@ struct GhUiState {
     GhCom<IDWriteFontCollection1> themeColl;
     std::wstring                  themeFamily;    // resolved family actually in use
 
+    // The resolved SYSTEM family, which is NOT always the family the formats
+    // above were built with: a theme shipping its own font file renders through
+    // the private collection, and GDI cannot see a private collection at all.
+    // The overlay's row bake falls back to GDI when WIC is unavailable, so it
+    // asks for this and gets a family that really is installed.
+    std::wstring                  sysFamily = L"Segoe UI";
+
     float textScale = 1.f;
     float safeX = 0.f, safeY = 0.f;               // resolved safe-area inset, pixels
     bool  ready = false;
@@ -106,6 +113,20 @@ inline IDWriteTextFormat* GhUiFormat(int type)
 {
     const int k = (type >= 0 && type < GH_TYPE_COUNT) ? type : GH_TYPE_ITEM;
     return g_ghUi.fmt[k].get();
+}
+
+// A role as a packed 0xRRGGBB, for the two call sites that cannot be handed a
+// brush: the overlay's GDI row bake, which wants a COLORREF, and its WIC
+// fallback, which builds its own brushes on its own render target. Everything
+// else asks for the brush.
+inline uint32_t GhUiColorRgb(int role)
+{
+    const D2D1_COLOR_F c = GhUiColorOf(GhThemeCurrent(), role);
+    auto b8 = [](float v) {
+        const int i = (int)(v * 255.f + 0.5f);
+        return (uint32_t)(i < 0 ? 0 : (i > 255 ? 255 : i));
+    };
+    return (b8(c.r) << 16) | (b8(c.g) << 8) | b8(c.b);
 }
 
 // ---------------------------------------------------------------------------
@@ -206,14 +227,17 @@ inline bool GhUiApply(const GhTheme& t)
     // Resolve the family once, not per format.
     GhCom<IDWriteFontCollection> sysColl;
     g_ghUi.dw->GetSystemFontCollection((IDWriteFontCollection**)sysColl.put(), FALSE);
-    std::wstring family = L"Segoe UI";
+    // The system family is resolved even when a theme font file wins, because
+    // the GDI row bake needs an installed family whatever DWrite is using.
+    g_ghUi.sysFamily = L"Segoe UI";
+    for (const auto& f : t.families)
+        if (GhUiFamilyExists(sysColl.get(), f.c_str())) { g_ghUi.sysFamily = f; break; }
+
+    std::wstring family = g_ghUi.sysFamily;
     IDWriteFontCollection* useColl = nullptr;
     if (g_ghUi.themeColl && !g_ghUi.themeFamily.empty()) {
         family = g_ghUi.themeFamily;
         useColl = (IDWriteFontCollection*)g_ghUi.themeColl.get();
-    } else {
-        for (const auto& f : t.families)
-            if (GhUiFamilyExists(sysColl.get(), f.c_str())) { family = f; break; }
     }
 
     for (int k = 0; k < GH_TYPE_COUNT; ++k) {
@@ -315,6 +339,35 @@ inline D2D1_RECT_F GhUiFrame()
     const D2D1_RECT_F s = GhUiSafe();
     return D2D1::RectF(s.left + t.gutter, s.top, s.right - t.gutter, s.bottom);
 }
+
+// Point the UI system at a surface that is NOT the launcher's canvas, for as
+// long as this object lives. The in-game overlay is the only user: its panels
+// are painted into 920x540 bitmaps, so GhUiScreen() and everything derived from
+// it has to mean the PANEL while one is being painted and has to mean the screen
+// again the moment it is done -- including when a paint returns early, which is
+// why this is a scope guard and not a pair of calls.
+//
+// The safe-area inset is passed in rather than kept, because a floating panel
+// is already inset by being centred on the screen: insetting it again would eat
+// into the only 920 pixels it has.
+struct GhUiCanvasScope {
+    float w, h, sx, sy;
+    GhUiCanvasScope(float cw, float ch, float safeX = 0.f, float safeY = 0.f)
+        : w(g_ghUi.canvasW), h(g_ghUi.canvasH), sx(g_ghUi.safeX), sy(g_ghUi.safeY)
+    {
+        if (cw > 0.f) g_ghUi.canvasW = cw;
+        if (ch > 0.f) g_ghUi.canvasH = ch;
+        g_ghUi.safeX = safeX;
+        g_ghUi.safeY = safeY;
+    }
+    ~GhUiCanvasScope()
+    {
+        g_ghUi.canvasW = w; g_ghUi.canvasH = h;
+        g_ghUi.safeX   = sx; g_ghUi.safeY   = sy;
+    }
+    GhUiCanvasScope(const GhUiCanvasScope&)            = delete;
+    GhUiCanvasScope& operator=(const GhUiCanvasScope&) = delete;
+};
 
 inline float GhUiW(const D2D1_RECT_F& r){ return r.right - r.left; }
 inline float GhUiH(const D2D1_RECT_F& r){ return r.bottom - r.top; }
@@ -441,9 +494,24 @@ inline void GhUiGloss(const D2D1_RECT_F& r, float radius)
     const float h = GhUiH(r);
     if (h <= 1.f) return;
 
-    const int   kBands = 8;
-    const float kBand  = 0.037f;        // compounds to ~0.26 at the very top
-    const float span   = h * 0.62f;
+    // 62% of the height is right for a 64-pixel row: eight bands of 5 pixels
+    // read as a smooth sheen. On a 960-pixel modal panel the same fraction
+    // gives eight bands of 74 pixels, which read as STRIPES -- found in the
+    // blades uninstall render. A sheen is a highlight on the top edge, so the
+    // span is capped in absolute pixels; past that height the gloss simply
+    // stops being proportional, which is what a real one does.
+    float span = h * 0.62f;
+    const float cap = 150.f * g_ghUi.textScale;
+    if (span > cap) span = cap;
+
+    // Then the COUNT follows the span, for the same reason GhUiScrimUp's does:
+    // a band taller than about four pixels is a step, not a gradient. The top
+    // opacity stays what it has always been (~0.26) whatever the count is.
+    const float kTop = 0.26f;
+    int kBands = (int)(span / 4.f + 0.5f);
+    if (kBands < 8)  kBands = 8;
+    if (kBands > 48) kBands = 48;
+    const float kBand = 1.f - std::pow(1.f - kTop, 1.f / (float)kBands);
 
     g_ghUi.brushGloss->SetOpacity(kBand);
     for (int i = 0; i < kBands; ++i) {
@@ -514,6 +582,61 @@ inline void GhUiBackground()
 inline void GhUiScrim()
 {
     if (g_ghUi.dc && g_ghUi.brushDim) g_ghUi.dc->FillRectangle(GhUiScreen(), g_ghUi.brushDim.get());
+}
+
+// A wash of the scrim's colour over an arbitrary rectangle, at `alpha`
+// ABSOLUTE (0..1) rather than as a fraction of the scrim. The scrim brush
+// carries a fixed alpha of its own, so that is divided back out and the caller
+// gets what it asked for -- which matters here, because the thing being covered
+// is a picture downloaded from a store and not a colour this file chose.
+inline void GhUiShade(const D2D1_RECT_F& r, float alpha, float radius = 0.f)
+{
+    if (!g_ghUi.dc || !g_ghUi.brushDim) return;
+    const float base = g_ghUi.brushDim->GetColor().a;
+    if (base <= 0.01f) return;
+    g_ghUi.brushDim->SetOpacity(GhClampF(alpha / base, 0.f, 1.f));
+    if (radius <= 0.5f) g_ghUi.dc->FillRectangle(r, g_ghUi.brushDim.get());
+    else                g_ghUi.dc->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius),
+                                                        g_ghUi.brushDim.get());
+    g_ghUi.brushDim->SetOpacity(1.f);
+}
+
+// The gloss trick upside down and in the scrim's colour: bands anchored on the
+// BOTTOM edge, each reaching a little further up, so the overlap fades the wash
+// out towards the top. `alpha` is what it reaches at the very bottom.
+//
+// This exists for the same measured reason GhUiGloss is a band stack and not a
+// gradient brush -- wine's D2D ignores a gradient stop's alpha, so a themed
+// render would look right on the console and wrong in the harness that is
+// supposed to prove it. A name set over key art needs the fade regardless of
+// what the art is, so the fade cannot be the thing that only works on-device.
+inline void GhUiScrimUp(const D2D1_RECT_F& r, float alpha)
+{
+    if (!g_ghUi.dc || !g_ghUi.brushDim) return;
+    const float h = GhUiH(r);
+    if (h <= 1.f) return;
+    const float base = g_ghUi.brushDim->GetColor().a;
+    if (base <= 0.01f) return;
+
+    // The band COUNT has to follow the height, not be a constant. Eight bands
+    // is right for the 60-pixel name strip on a poster; the title screen's
+    // banner fade is 260 pixels, and eight bands there are 32 pixels apart with
+    // a 22% alpha step at every boundary -- measured on the console as eight
+    // visible stripes across the key art, the same stripe bug GhUiGloss already
+    // hit on a tall panel. Keep each band about four pixels and the step falls
+    // to ~3%, which is under the dither of the art it sits on.
+    int kBands = (int)(h / 4.f + 0.5f);
+    if (kBands < 8)  kBands = 8;
+    if (kBands > 96) kBands = 96;        // 96 fills is nothing; a stripe is not
+    // Per-band alpha whose kBands overlaps compound to `alpha`.
+    const float want = GhClampF(alpha, 0.f, 0.98f);
+    const float per  = 1.f - std::pow(1.f - want, 1.f / (float)kBands);
+    g_ghUi.brushDim->SetOpacity(GhClampF(per / base, 0.f, 1.f));
+    for (int i = 0; i < kBands; ++i)
+        g_ghUi.dc->FillRectangle(
+            D2D1::RectF(r.left, r.bottom - h * (float)(i + 1) / (float)kBands, r.right, r.bottom),
+            g_ghUi.brushDim.get());
+    g_ghUi.brushDim->SetOpacity(1.f);
 }
 
 // ---------------------------------------------------------------------------
@@ -640,12 +763,19 @@ inline const wchar_t* GhUiGlyphCap(int glyph)
     // launcher already did and what a pad direction reads as fastest.
     case GH_GLYPH_UPDOWN:    return L"▲ ▼";
     case GH_GLYPH_LEFTRIGHT: return L"◀ ▶";
+    // Moving around a GRID is both axes at once, and four arrows say that in
+    // the width of one keycap. The wall of covers is the only page that moves
+    // in two dimensions, so it is the only one that uses this.
+    case GH_GLYPH_ARROWS:    return L"↑↓←→";
     default: return nullptr;
     }
 }
 
 // The arrow pairs are glyphs in their own right, never boxed in a keycap.
-inline bool GhUiGlyphIsArrows(int g){ return g == GH_GLYPH_UPDOWN || g == GH_GLYPH_LEFTRIGHT; }
+inline bool GhUiGlyphIsArrows(int g)
+{
+    return g == GH_GLYPH_UPDOWN || g == GH_GLYPH_LEFTRIGHT || g == GH_GLYPH_ARROWS;
+}
 
 inline float GhUiGlyphHeight(){ return 30.f * g_ghUi.textScale; }
 
@@ -658,13 +788,24 @@ inline float GhUiGlyphWidth(int glyph)
     // A bare letter is measured in the footer's own type, not in GH_TYPE_KEY:
     // without a cap around it the letter sits in the line of text beside it.
     if (GhUiGlyphIsArrows(glyph) || !GhThemeCurrent().keycaps)
-        return GhUiMeasure(cap, GH_TYPE_SMALL);
+        // The two pixels are not slack: GhUiTextDraw trims to an ellipsis when
+        // the text does not fit, and a rect of exactly the measured width is a
+        // coin toss once DWrite rounds. Without them a bare "LB" came out as
+        // "..." in the Workshop footer (seen in the ios6 render).
+        return GhUiMeasure(cap, GH_TYPE_SMALL) + 2.f * g_ghUi.textScale;
     return GhUiMeasure(cap, GH_TYPE_KEY) + 20.f * g_ghUi.textScale;
 }
 
 // One pad glyph. A keycap by default; a theme with square corners gets a square
 // cap, and the VIEW glyph keeps its two-square shape because it has no letter.
-inline float GhUiGlyphDraw(int glyph, float x, float cy)
+//
+// `dimRole` is the secondary-text role to draw in. It defaults to the
+// on-background one because a page footer sits on the page background -- but
+// the in-game overlay's footer sits on a PANEL, and in a theme whose panels
+// contrast with its background those are two different colours. A hint bar that
+// could not be told which one it was on would go invisible in exactly the
+// themes the role split was added for.
+inline float GhUiGlyphDraw(int glyph, float x, float cy, int dimRole = GH_ROLE_TEXT_DIM_ON_BG)
 {
     if (glyph <= GH_GLYPH_NONE || glyph >= GH_GLYPH_COUNT) return 0.f;
     const GhTheme& t = GhThemeCurrent();
@@ -678,9 +819,9 @@ inline float GhUiGlyphDraw(int glyph, float x, float cy)
         const float sq = 10.f * sc, off = 4.f * sc, rad = 1.8f * sc;
         const float top = cy - sq * 0.5f - off * 0.35f;
         GhUiStroke(D2D1::RectF(x, top, x + sq, top + sq),
-                   GH_ROLE_TEXT_DIM_ON_BG, rad, t.stroke);
+                   dimRole, rad, t.stroke);
         GhUiStroke(D2D1::RectF(x + off, top + off, x + off + sq, top + off + sq),
-                   GH_ROLE_TEXT_DIM_ON_BG, rad, t.stroke);
+                   dimRole, rad, t.stroke);
         return off + sq;
     }
 
@@ -689,12 +830,12 @@ inline float GhUiGlyphDraw(int glyph, float x, float cy)
     const float w = GhUiGlyphWidth(glyph);
     const D2D1_RECT_F r = D2D1::RectF(x, cy - h * 0.5f, x + w, cy + h * 0.5f);
     if (GhUiGlyphIsArrows(glyph) || !t.keycaps) {   // the bare letter, in the footer's own type
-        GhUiTextDraw(lbl, GH_TYPE_SMALL, r, GH_ROLE_TEXT_DIM_ON_BG, DWRITE_TEXT_ALIGNMENT_LEADING);
+        GhUiTextDraw(lbl, GH_TYPE_SMALL, r, dimRole, DWRITE_TEXT_ALIGNMENT_LEADING);
         return w;
     }
     // A keycap is part of the footer, which sits on the page background.
-    GhUiStroke(GhUiInset(r, 0.5f, 0.5f), GH_ROLE_TEXT_DIM_ON_BG, t.radius <= 0.5f ? 0.f : h * 0.5f, t.stroke);
-    GhUiTextDraw(lbl, GH_TYPE_KEY, r, GH_ROLE_TEXT_DIM_ON_BG, DWRITE_TEXT_ALIGNMENT_CENTER);
+    GhUiStroke(GhUiInset(r, 0.5f, 0.5f), dimRole, t.radius <= 0.5f ? 0.f : h * 0.5f, t.stroke);
+    GhUiTextDraw(lbl, GH_TYPE_KEY, r, dimRole, DWRITE_TEXT_ALIGNMENT_CENTER);
     return w;
 }
 
@@ -723,7 +864,8 @@ inline float GhUiHintsWidth(const GhUiHint* hints, int count)
 // code and a theme may move or restyle it in one place. `align` is the layout's
 // choice, not a page's.
 inline void GhUiHintBar(const GhUiHint* hints, int count, const D2D1_RECT_F& bar,
-                        DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING)
+                        DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING,
+                        int dimRole = GH_ROLE_TEXT_DIM_ON_BG)
 {
     if (!hints || count <= 0) return;
     const float cy = (bar.top + bar.bottom) * 0.5f;
@@ -738,17 +880,33 @@ inline void GhUiHintBar(const GhUiHint* hints, int count, const D2D1_RECT_F& bar
 
     for (int i = 0; i < count; ++i) {
         if (hints[i].glyph == GH_GLYPH_NONE && hints[i].label.empty()) continue;
-        const float gw = GhUiGlyphDraw(hints[i].glyph, x, cy);
+        const float gw = GhUiGlyphDraw(hints[i].glyph, x, cy, dimRole);
         x += gw;
         if (!hints[i].label.empty()) {
             if (gw > 0.f) x += gapGlyph;
             const float w = GhUiMeasure(hints[i].label.c_str(), GH_TYPE_SMALL);
             GhUiTextDraw(hints[i].label.c_str(), GH_TYPE_SMALL,
-                         D2D1::RectF(x, bar.top, x + w + 4.f, bar.bottom), GH_ROLE_TEXT_DIM_ON_BG);
+                         D2D1::RectF(x, bar.top, x + w + 4.f, bar.bottom), dimRole);
             x += w;
         }
         x += gapItem;
     }
+}
+
+// The phase of a repeating animation, 0..1 over `periodMs`. The clock lives
+// here and not in a view-model, because a marquee is a presentation detail: a
+// page that had to carry one would make every caller of every progress screen
+// animate it, and the first version of the Progress layout simply forgot --
+// which drew the indeterminate bar at phase 0 forever, i.e. empty.
+//
+// g_ghUiAnimPin freezes it, so the preview harness renders the same PNG twice.
+inline float g_ghUiAnimPin = -1.f;        // < 0 = use the clock
+
+inline float GhUiAnimPhase(float periodMs = 1400.f)
+{
+    if (g_ghUiAnimPin >= 0.f) return GhClampF(g_ghUiAnimPin, 0.f, 1.f);
+    if (periodMs <= 1.f) return 0.f;
+    return (float)(GetTickCount64() % (unsigned long long)periodMs) / periodMs;
 }
 
 // A progress bar. `frac` negative means indeterminate: the theme's accent fills
@@ -773,6 +931,79 @@ inline void GhUiProgressBar(const D2D1_RECT_F& r, float frac, float phase = 0.f)
                                               (x + sw > r.right) ? r.right : x + sw, r.bottom);
         if (slice.right > slice.left) GhUiFill(slice, GH_ROLE_ACCENT, rad);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Game art
+// ---------------------------------------------------------------------------
+// A PROVIDER, not a cache. Everything a cache needs -- WinHTTP, the LocalState
+// path, a worker thread, a byte budget -- belongs to the launcher
+// (src/loader/gh_art.h), and none of it can exist in the preview harness. So
+// this file knows only how to ASK for a bitmap by app id, and a layout that
+// draws a cover is identical in both hosts: the launcher plugs in the real
+// Steam cache, the harness plugs in synthetic plates keyed by the same app id,
+// and neither one is a special case in the drawing code.
+//
+// The returned bitmap is BORROWED for the current frame: the provider owns it,
+// a layout must not hold it past the draw, and nullptr is the normal answer --
+// no art is a path that has to work (not signed in, offline, a fetch that has
+// not landed, a title Steam has no asset for), and the caller falls back to the
+// typographic plate.
+enum { GH_ART_COVER = 0, GH_ART_HERO = 1, GH_ART_KINDS = 2 };
+
+using GhUiArtFn = ID2D1Bitmap* (*)(void* ctx, uint32_t app, int kind);
+inline GhUiArtFn g_ghUiArtFn  = nullptr;
+inline void*     g_ghUiArtCtx = nullptr;
+
+inline void GhUiSetArtProvider(GhUiArtFn fn, void* ctx)
+{
+    g_ghUiArtFn = fn; g_ghUiArtCtx = ctx;
+}
+
+inline ID2D1Bitmap* GhUiArt(uint32_t app, int kind)
+{
+    if (!app || !g_ghUiArtFn) return nullptr;
+    if (kind < 0 || kind >= GH_ART_KINDS) return nullptr;
+    return g_ghUiArtFn(g_ghUiArtCtx, app, kind);
+}
+
+// Draw art to fill `dst`, cropping rather than stretching. A capsule is 2:3 and
+// a hero is about 3:1, but the box they go in is whatever the layout's
+// arithmetic produced at this text scale -- and a stretched cover is instantly
+// recognisable as wrong, while a cover cropped by a few per cent is not. The
+// crop is centred horizontally and biased to the TOP vertically, because key
+// art puts its subject high and its ground low.
+//
+// Returns false when there is no art, which is the caller's cue to draw the
+// plate. `opacity` is how "not installed" is expressed: g_ghUi.dc is an
+// ID2D1RenderTarget on purpose (see GhUiState), so there is no D2D effect graph
+// here and therefore no true desaturation -- a quieter picture over a panel
+// fill is the honest equivalent, and it costs one draw call.
+inline bool GhUiArtDraw(const D2D1_RECT_F& dst, uint32_t app, int kind, float opacity = 1.f,
+                        float topBias = 0.5f)
+{
+    ID2D1Bitmap* bm = GhUiArt(app, kind);
+    if (!bm || !g_ghUi.dc) return false;
+    const D2D1_SIZE_F bs = bm->GetSize();
+    if (bs.width <= 1.f || bs.height <= 1.f) return false;
+
+    const float dw = GhUiW(dst), dh = GhUiH(dst);
+    if (dw <= 1.f || dh <= 1.f) return false;
+
+    D2D1_RECT_F src = D2D1::RectF(0, 0, bs.width, bs.height);
+    const float want = dw / dh, have = bs.width / bs.height;
+    if (have > want) {                       // too wide: take a centred column
+        const float sw = bs.height * want;
+        const float x = (bs.width - sw) * 0.5f;
+        src = D2D1::RectF(x, 0, x + sw, bs.height);
+    } else if (have < want) {                // too tall: take a band near the top
+        const float sh = bs.width / want;
+        float y = (bs.height - sh) * GhClampF(topBias, 0.f, 1.f);
+        src = D2D1::RectF(0, y, bs.width, y + sh);
+    }
+    g_ghUi.dc->DrawBitmap(bm, dst, GhClampF(opacity, 0.f, 1.f),
+                          D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, &src);
+    return true;
 }
 
 // A QR code. Pure black modules on a pure white quiet zone, by rule: a theme

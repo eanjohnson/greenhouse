@@ -1,0 +1,43 @@
+{
+  "schema": "greenhouse.theme/1",
+  "id": "catalogue",
+  "name": "Catalogue",
+  "desc": "A printed catalogue: paper, a serif, and wide margins.",
+  "layout": "grid",
+
+  "_note": [
+    "Ported from design/mockups/catalogue.html: paper, a serif, wide",
+    "margins, one spot colour. It shares `grid` with ios6 and reads nothing like",
+    "it -- the plainest proof that the structure is the layout's and the",
+    "character is the theme's. Paper at both ends means the accent can be the",
+    "mockup's own dark spot red without a compromise. Playfair Display and Libre",
+    "Baskerville are the mockup's faces and are not on the console; the chain",
+    "ends at Segoe UI, so this theme degrades to its layout and its palette,",
+    "which is exactly what a family chain is for."
+  ],
+
+  "colors": {
+    "bg":          "#F4EFE2",
+    "panel":       "#FBF7EE",
+    "panelAlt":    "#EFE9DA",
+    "edge":        "#C6BFAB",
+    "text":        "#14241B",
+    "textDim":     "#7C8A7F",
+    "textOnSel":   "#FBF7EE",
+    "textOnBg":    "#14241B",
+    "textDimOnBg": "#405045",
+    "accent":      "#B4462A",
+    "selection":   "#3E5A3E",
+    "warn":        "#9B2E12"
+  },
+
+  "font": {
+    "families": ["Playfair Display", "Libre Baskerville", "Segoe UI"],
+    "sizes":   { "title": 68, "item": 32, "small": 21, "log": 17 },
+    "weights": { "title": 700, "item": 500 }
+  },
+
+  "metrics": { "radius": 3, "rowH": 76, "rowGap": 10, "gutter": 110, "stroke": 1.2 },
+  "background": { "kind": "flat" },
+  "motifs": { "innerEdge": true }
+}

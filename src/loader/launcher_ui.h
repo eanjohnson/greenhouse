@@ -49,9 +49,16 @@ static std::wstring LuiEntBadge();   // membership section, below
 // pages are ported one at a time.
 #include "gh_theme.h"
 #include "gh_ui.h"
+// Steam key art (covers and banners) for the owned library, behind the provider
+// seam in gh_ui.h. Launcher-only: it owns a worker thread, WinHTTP and a disk
+// cache, none of which the preview harness can have -- the harness supplies its
+// own synthetic provider instead, so the layouts below stay buildable there.
+#include "gh_art.h"
 #include "gh_ui_vm.h"
 #include "gh_ui_layout.h"
-#include "gh_ui_layout_list.h"
+#include "gh_ui_layouts.h"
+#include "gh_ui_page_themes.h"  // the Themes page, shared with the preview harness
+#include "gh_ui_page_onboard.h" // the first-run sequence, likewise
 // Packages startup check (LuiRepoStartupCheck): -2 not started, -1 no repository /
 // failed, else the number of updates available. Read by the picker's header badge.
 static std::atomic<int> g_repoUpdates{-2};
@@ -68,7 +75,7 @@ struct LauncherGfx {
     com_ptr<ID2D1Device>          device;
     com_ptr<ID2D1DeviceContext>   dc;
     com_ptr<IDWriteFactory>       dw;
-    com_ptr<IDWriteTextFormat>    fmtTitle, fmtItem, fmtSmall, fmtLog, fmtKey;
+
     com_ptr<ID3D11Texture2D>      uiTex;      // R8G8B8A8_UNORM target D2D draws into
     com_ptr<ID3D11Texture2D>      ovlSnap[2]; // unused leftover; blit uses baked panels
     com_ptr<ID3D11Texture2D>      ovlMenu[4][2]; // [sel][remapOn] baked at LuiInit
@@ -81,8 +88,6 @@ struct LauncherGfx {
     com_ptr<ID3D11Texture2D>      ovlProfilesChrome, ovlLayoutChrome, ovlOptionsChrome;
     com_ptr<ID3D11Texture2D>      ovlBindChrome, ovlDelAsk;
     com_ptr<ID2D1Bitmap1>         uiTarget;   // D2D target wrapping uiTex
-    com_ptr<ID2D1SolidColorBrush> brFg, brDim, brBg, brSel, brAccent, brPanel, brWarn;
-    com_ptr<ID2D1SolidColorBrush> brWhite, brBlack;   // pure B/W for QR scanner contrast
     UINT  w = 0, h = 0;
     bool  ready = false, failed = false;
 };
@@ -145,6 +150,14 @@ struct LauncherItem {
     const char*  source = "";               // id of the LibrarySource that made the row
     const struct LibrarySource* acq = nullptr;  // source that can download/repair/verify it
     std::wstring blocked;    // non-empty: not launchable, and why ("needs the Steam add-on")
+    // The play record, when the source that reported the row knows one (Steam does;
+    // the console's own installed-games scan does not). Minutes for the two play
+    // figures, unix seconds for lastPlayed; 0 means "no record", shown as
+    // "never played" rather than as "0 hours". An installed row inherits these
+    // from the library's owned row for the same app id (LuiAddonEnum).
+    uint32_t     playForever = 0;
+    uint32_t     play2Weeks = 0;
+    uint32_t     lastPlayed = 0;
 };
 
 static std::string LuiNarrow(const std::wstring& w) { return std::string(w.begin(), w.end()); }
@@ -167,6 +180,38 @@ static std::wstring LuiDecode(const std::vector<uint8_t>& b)
     std::wstring w; w.reserve(b.size() - off);
     for (size_t i = off; i < b.size(); ++i) w.push_back((wchar_t)(unsigned char)b[i]);
     return w;
+}
+
+// §63e: register every installed theme package as a theme source. Rebuilt from
+// installed.json each time, so an update does not leave the old version's folder
+// registered and a removal does not leave a dead one. Must run before
+// GhThemeLoad(); GhThemeScanDisk decides the precedence, not the call order.
+static void LuiAddThemePackages()
+{
+    GhThemeClearThemes();
+    const ghrepo::State st = ghrepo::LoadState(std::wstring(kLocalState) + L"gh_packages\\");
+    int n = 0;
+    for (const ghrepo::Installed& p : st.pkgs) {
+        if (p.type != "theme" || p.files.empty() || p.files[0].empty()) continue;
+        std::wstring d = p.files[0];
+        if (d.back() != L'\\') d += L'\\';
+        GhThemeAddTheme(d, p.id);
+        ++n;
+    }
+    if (n) Diag("THEME " + std::to_string(n) + " theme package(s) registered");
+}
+
+static bool LauncherApplyTheme(const char* id);   // defined with the Themes page
+
+// After a theme package is installed, updated or removed: rebuild the sources,
+// rescan, and re-apply whatever is active now. A theme package that replaces the
+// theme in use therefore takes effect without a restart, and one that removes it
+// falls back the way GhThemeLoad already falls back.
+static void LuiReloadThemes()
+{
+    LuiAddThemePackages();
+    GhThemeLoad();
+    LauncherApplyTheme(GhThemeCurrent().id);
 }
 
 static void OverlayBakePanels(); // defined with the overlay; called from LuiInit
@@ -225,34 +270,20 @@ static bool LuiInit()
     hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
                              reinterpret_cast<IUnknown**>(g_lui.dw.put()));
     if (FAILED(hr)) return bail("DWriteCreateFactory", hr);
-    auto mkfmt = [&](float size, DWRITE_FONT_WEIGHT wt, com_ptr<IDWriteTextFormat>& out){
-        return g_lui.dw->CreateTextFormat(L"Segoe UI", nullptr, wt, DWRITE_FONT_STYLE_NORMAL,
-                                          DWRITE_FONT_STRETCH_NORMAL, size, L"en-us", out.put());
-    };
-    mkfmt(66.f, DWRITE_FONT_WEIGHT_BOLD,      g_lui.fmtTitle);
-    mkfmt(34.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, g_lui.fmtItem);
-    mkfmt(22.f, DWRITE_FONT_WEIGHT_NORMAL,    g_lui.fmtSmall);
-    mkfmt(16.f, DWRITE_FONT_WEIGHT_NORMAL,    g_lui.fmtLog);
-    mkfmt(14.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, g_lui.fmtKey);
-
-    auto mkbr = [&](uint32_t rgb, float a, com_ptr<ID2D1SolidColorBrush>& out){
-        return g_lui.dc->CreateSolidColorBrush(D2D1::ColorF(rgb, a), out.put());
-    };
-    mkbr(0xE8EAED, 1.f, g_lui.brFg);
-    mkbr(0x8B949E, 1.f, g_lui.brDim);
-    mkbr(0x0E1116, 1.f, g_lui.brBg);
-    mkbr(0x1F6FEB, 1.f, g_lui.brSel);
-    mkbr(0x3FB950, 1.f, g_lui.brAccent);
-    mkbr(0x161B22, 1.f, g_lui.brPanel);
-    mkbr(0xF85149, 1.f, g_lui.brWarn);
-    mkbr(0xFFFFFF, 1.f, g_lui.brWhite);
-    mkbr(0x000000, 1.f, g_lui.brBlack);
-
-    // Theming. The theme core builds its OWN brushes and formats on the same
-    // device; the legacy g_lui set above stays until the last page is ported.
-    // This runs before OverlayBakePanels because a theme can change the panel
+    // Theming. Every brush and text format the launcher draws with belongs to
+    // the theme core now -- the nine hand-made brushes and five fixed formats
+    // that used to be created here went when the last page was ported, and with
+    // them the eighteen inline colour literals that duplicated two of them.
+    // This runs before OverlayBakePanels because a theme decides the panel
     // metrics the bake uses, and the bake happens exactly once.
     GhThemeInit(kLocalState, [](const std::string& s){ Diag("THEME " + s); });
+    // The themes we ship are data, not compiled-in built-ins, so they live in
+    // the package next to the loader and are read from there. A theme the user
+    // edits, or one a theme package installs, goes in LocalState\gh_theme and
+    // shadows the shipped one of the same id.
+    EnsureInstallDir();                 // LuiInit can run before any guest does
+    GhThemeAddRoot(g_installDir + L"themes\\");
+    LuiAddThemePackages();
     GhThemeLoad();
     GhUiLayoutsInit();
     if (!GhUiInit(g_lui.dc.get(), g_lui.dw.get(), (float)g_lui.w, (float)g_lui.h)) {
@@ -262,6 +293,18 @@ static bool LuiInit()
         Diag(std::string("LAUNCHER theme '") + GhThemeCurrent().id +
              "' layout '" + (la ? la->id : "none") + "'");
     }
+
+    // Steam key art for the owned library. The cache goes on D:\DevelopmentFiles
+    // -- gigabytes, no quota -- and NOT in LocalState, which is a 3.0 GB volume
+    // shared by every package on the console and has been measured with 4 MiB
+    // free; when it fills, the diag and the game's own log both stop reaching
+    // disk while the process runs on. Beside gh_games, never inside it: that
+    // tree is mapped into the guest's VFS and this is ours. LocalState is the
+    // fallback, with a cap small enough to be harmless there.
+    if (!ghart::Init(std::wstring(kDevRoot) + L"gh_art\\", ghart::kDiskCapDev,
+                     [](const std::string& s){ Diag("ART " + s); }))
+        ghart::Init(std::wstring(kLocalState) + L"gh_art\\", ghart::kDiskCapLocal,
+                    [](const std::string& s){ Diag("ART " + s); });
 
     g_lui.ready = true;
     OverlayBakePanels();
@@ -538,42 +581,6 @@ static std::wstring LuiPickExe(const std::wstring& dir, const std::wstring& fold
     return prefer;                                     // folder exists; use <folder>.exe even if missing
 }
 
-// ---------------------------------------------------------------------------
-// Draw one frame of the menu into uiTex.
-// ---------------------------------------------------------------------------
-static void LuiText(const wchar_t* s, IDWriteTextFormat* f, D2D1_RECT_F r,
-                    ID2D1Brush* b, DWRITE_TEXT_ALIGNMENT al = DWRITE_TEXT_ALIGNMENT_LEADING)
-{
-    f->SetTextAlignment(al);
-    f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    g_lui.dc->DrawText(s, (UINT32)wcslen(s), f, r, b);
-}
-
-static float LuiMeasure(const wchar_t* s, IDWriteTextFormat* f)
-{
-    if (!s || !f || !g_lui.dw) return 0;
-    com_ptr<IDWriteTextLayout> tl;
-    if (FAILED(g_lui.dw->CreateTextLayout(s, (UINT32)wcslen(s), f, 8000.f, 200.f, tl.put())) || !tl)
-        return 0;
-    DWRITE_TEXT_METRICS m{};
-    tl->GetMetrics(&m);
-    return m.widthIncludingTrailingWhitespace;
-}
-
-// Physical Xbox View button (two overlapping rounded squares). Segoe UI has no
-// letter for it, so a one-line "View  Verify" looked like two unlabeled actions.
-static float LuiDrawViewBtn(float x, float cy, ID2D1Brush* br)
-{
-    auto* dc = g_lui.dc.get();
-    const float s = 10.f, r = 1.8f, dx = 4.f, dy = 4.f;
-    float y = cy - s * 0.5f - dy * 0.35f;
-    D2D1_ROUNDED_RECT back  = D2D1::RoundedRect(D2D1::RectF(x, y, x + s, y + s), r, r);
-    D2D1_ROUNDED_RECT front = D2D1::RoundedRect(D2D1::RectF(x + dx, y + dy, x + dx + s, y + dy + s), r, r);
-    dc->DrawRoundedRectangle(back, br, 1.7f);
-    dc->DrawRoundedRectangle(front, br, 1.7f);
-    return dx + s;
-}
-
 // Xbox system on-screen keyboard (gamepad). DirectX/UWP apps don't have a
 // XAML TextBox, so the OSK is summoned via CoreTextEditContext + InputPane /
 // CoreInputView — the same path Microsoft documents for custom-renderer UWP
@@ -719,6 +726,7 @@ static std::atomic<bool> g_modsArmedDirty{true};          // gh_mod_profile.txt 
 static bool LuiModsOffered(const LauncherItem& it);       // RB opens Mods for this row
 static const GhTitle* LuiWorkshopTitle(const LauncherItem& it);   // ...or the Workshop, for a "workshop" title
 static std::wstring LuiModsBadge(const LauncherItem& it); // "Mods: <profile>", or empty
+static bool LuiCanVerify(const LauncherItem& it);         // a source can re-check its files
 
 // The picker's row provider. The view-model never holds the rows: it holds this
 // callback and a context, and the layout calls it only for the rows it is about
@@ -736,6 +744,11 @@ static void LuiPickFillRow(void* ctx, int index, GhUiRow& out)
     const LauncherItem& it = (*c->items)[index];
     out.title.setElided(it.display.c_str());
     out.right.setElided(it.sub.c_str());
+    // What a TILE layout needs, and a row layout ignores: the art key, and the
+    // two states a picture can carry on its own rather than in words.
+    out.appId = it.app;
+    out.muted = (it.kind == LauncherItem::kAcquire);   // owned, not here yet
+    if (it.incomplete) out.tray.set(L"Part copied");
     const std::wstring mods = LuiModsBadge(it);
     if (!mods.empty()) {
         out.hasBadge = true;
@@ -744,26 +757,177 @@ static void LuiPickFillRow(void* ctx, int index, GhUiRow& out)
     }
 }
 
+// Which slice of the library the wall is showing, and where the focus is. The
+// drawers are a FILTER over the rows LuiEnumerate already returned -- not a
+// source, not a second enumeration -- which is why this is three integers and
+// a flag rather than a list of its own.
+struct LuiWallState {
+    int  drawer = 0;        // 0 all, 1 installed, 2 not installed
+    int  count[3] = {};     // what each drawer holds, shown beside its name
+    bool inDrawers = false; // the focus is in the column, not on the wall
+};
+
+// The play record as one line. The figures arrive with the library
+// (Player.GetOwnedGames carries playtime_forever, playtime_2weeks and
+// rtime_last_played), so this costs no request -- and a console that has never
+// run the game still shows the hours from the account, which is the honest
+// answer to "have I played this".
+static std::wstring LuiPlayLine(const LauncherItem& it)
+{
+    auto span = [](uint32_t mins) -> std::wstring {
+        if (mins < 60) return std::to_wstring(mins) + L" min";
+        const uint32_t h = mins / 60;
+        if (h < 10) {
+            const uint32_t tenths = ((mins % 60) * 10 + 30) / 60;   // one decimal, rounded
+            if (tenths > 0 && tenths < 10)
+                return std::to_wstring(h) + L"." + std::to_wstring(tenths) + L" hours";
+        }
+        return std::to_wstring(h) + (h == 1 ? L" hour" : L" hours");
+    };
+    std::wstring s = it.playForever ? (span(it.playForever) + L" played") : std::wstring(L"Never played");
+    if (it.play2Weeks) s += L"  \u00B7  " + span(it.play2Weeks) + L" in the last two weeks";
+    if (it.lastPlayed) {
+        // Days ago, not a date: a date needs a locale and a format the user
+        // never chose, and "three days ago" is what the question actually was.
+        const int64_t now = (int64_t)::time(nullptr);
+        int64_t d = (now - (int64_t)it.lastPlayed) / 86400;
+        if (d < 0) d = 0;
+        if (d == 0)       s += L"  \u00B7  played today";
+        else if (d == 1)  s += L"  \u00B7  played yesterday";
+        else if (d < 60)  s += L"  \u00B7  played " + std::to_wstring(d) + L" days ago";
+        else              s += L"  \u00B7  played " + std::to_wstring(d / 30) + L" months ago";
+    }
+    return s;
+}
+
+// The state a title is in, as a chip, plus what A does to it. THREE states, not
+// four: "an update is waiting" is a flag on an installed title, and there is no
+// source for it yet -- g_repoUpdates counts PACKAGES, and nothing reports a
+// game update at all. GhUiRow::flag is where it will go when something can.
+static void LuiTitleState(const LauncherItem& it, GhUiBadge& chip, std::wstring& verb)
+{
+    if (it.kind == LauncherItem::kAcquire) {
+        chip.label.set(L"Not installed"); chip.role = GH_ROLE_TEXT_DIM; chip.filled = false;
+        verb = L"Install";
+    } else if (it.incomplete) {
+        chip.label.set(L"Part copied");   chip.role = GH_ROLE_WARN;     chip.filled = false;
+        verb = L"Resume";
+    } else {
+        chip.label.set(L"Installed");     chip.role = GH_ROLE_ACCENT;   chip.filled = true;
+        verb = L"Play";
+    }
+}
+
+// The uninstall / verify question, over whichever screen asked it. Built once
+// and used from both the wall and the title screen, so the two cannot drift.
+static void LuiDrawPrompt(int kind, const wchar_t* name)
+{
+    if (!name || !name[0] || kind == 0) return;
+    GhUiModalVM mv;
+    mv.overPage = false;        // today's prompt repaints the whole screen
+    mv.sel = 0;
+    if (kind == 2) {
+        mv.heading.set(L"VERIFY FILES");
+        mv.body.set(L"Check this install against Steam and repair it?");
+        mv.detail.setElided(name);
+        mv.note.set(L"Matching files are hashed, not re-downloaded. This can take a while.");
+        mv.addChoice(L"A  Verify");
+    } else {
+        mv.danger = true;
+        mv.heading.set(L"UNINSTALL");
+        mv.body.set(L"Remove this game from the console?");
+        mv.detail.setElided(name);
+        mv.note.set(L"The install folder will be deleted. This cannot be undone.");
+        mv.addChoice(L"A  Yes, uninstall");
+    }
+    mv.addChoice(L"B  Cancel");
+    GhUiPageModal(mv);
+}
+
+// THE TITLE SCREEN -- what A opens on the wall.
+//
+// The archetype is MODAL because everything a modal has is what this page
+// needs: a heading, a line of facts, a state, and a short list of choices over
+// a page the user came from and returns to with B. A layout with no title page
+// of its own draws it as the detail modal it already draws, and the page still
+// works -- which is what keeps `list` and `blades` usable while `cabinet` is
+// the default.
+//
+// Everything that used to be a panel beside the library lives here now, and
+// almost nothing that used to be in that panel survived: no "on this console"
+// section, no notes on what works, no size, no engine. One state, one line of
+// play record, one sentence when there is something to say, one button.
+static void LuiDrawTitlePage(const LauncherItem& it, int promptKind, const wchar_t* promptName)
+{
+    auto* dc = g_lui.dc.get();
+    dc->BeginDraw();
+    ghart::BeginFrame();
+
+    GhUiModalVM mv;
+    mv.overPage  = false;       // this page owns the screen; B goes back to the wall
+    mv.titlePage = true;
+    mv.appId = it.app;
+    mv.heading.setElided(it.display.c_str());
+
+    std::wstring verb;
+    LuiTitleState(it, mv.chip, verb);
+    mv.hasChip = true;
+    mv.detail.setElided(LuiPlayLine(it).c_str());
+
+    if (!it.blocked.empty())
+        mv.note.setElided((it.display + L" " + it.blocked +
+                           L".  Install it from Packages, then try again.").c_str());
+    else if (it.kind == LauncherItem::kAcquire)
+        mv.note.set(L"On your Steam account. Installing copies it to this console.");
+    else if (it.incomplete)
+        mv.note.set(L"The last copy did not finish. Resuming continues where it stopped.");
+
+    if (it.kind != LauncherItem::kPlaceholder && it.blocked.empty())
+        mv.addChoice(verb.c_str());
+
+    // The rest of what this title can do: controls in the footer, where a pad
+    // user looks for them, rather than a row of four buttons.
+    if (LuiCanVerify(it))    mv.addHint(GH_GLYPH_VIEW, L"Verify files");
+    if (LuiCanUninstall(it)) mv.addHint(GH_GLYPH_X,    L"Uninstall");
+    if (LuiModsOffered(it))             mv.addHint(GH_GLYPH_RB, L"Mods");
+    else if (LuiWorkshopTitle(it))      mv.addHint(GH_GLYPH_RB, L"Workshop");
+    mv.addHint(GH_GLYPH_B, L"Back");
+
+    GhUiPageModal(mv);
+    LuiDrawPrompt(promptKind, promptName);
+    dc->EndDraw();
+}
+
 // The picker, the first page on the theming layer (U1). Nothing here places a
 // pixel: it fills a GhUiListVM and hands it to the active layout, which is why
 // the same code renders under `list` on the console and in the preview harness
 // on the laptop.
 static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const std::wstring& status,
                         const std::wstring& query, int matchN, int allN,
-                        int promptKind, const wchar_t* promptName)
+                        int promptKind, const wchar_t* promptName,
+                        const LuiWallState& ws = LuiWallState{})
 {
     auto* dc = g_lui.dc.get();
     dc->BeginDraw();
+    // One frame's art budget: a handful of decoded covers may become D2D
+    // bitmaps here, and the rest wait for the next frame rather than stalling
+    // this one. Covers that are not ready yet draw as their plate.
+    ghart::BeginFrame();
 
     const int total = (int)items.size();
     LuiPickCtx ctx{ &items };
 
     GhUiListVM vm;
     vm.count = total;
-    vm.sel   = sel;
+    // No selection at all while the focus is in the drawers: the ring on a
+    // cover is what says "this one", so it has to go when the press of A would
+    // choose a drawer instead.
+    vm.sel   = ws.inDrawers ? -1 : sel;
     vm.fill  = &LuiPickFillRow;
     vm.ctx   = &ctx;
-    vm.emptyText.set(L"Nothing to show");
+    // This is the library, so say so. "Nothing to show" is what a widget says
+    // when it has no data; "No games yet" is what the person is looking at.
+    vm.emptyText.set(L"No games yet");
     vm.emptySub.set(L"Sign in to see the games on your Steam account.");
 
     GhUiChrome& ch = vm.chrome;
@@ -775,12 +939,22 @@ static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const s
         const std::wstring eb = LuiEntBadge();
         if (!eb.empty()) ch.addBadge(eb.c_str(), GH_ROLE_ACCENT, false);
     }
-    {   // Packages. The count comes from LuiRepoStartupCheck's background fetch.
-        const int up = g_repoUpdates.load();
-        std::wstring pk = L"Packages";
-        if (up > 0) pk += L" · " + std::to_wstring(up) + (up == 1 ? L" update" : L" updates");
-        ch.addAction(GH_GLYPH_START, pk.c_str());
-    }
+    // Themes. An action rather than a footer hint: the footer of the wall is
+    // four controls by design, and a control that is always available belongs
+    // with the header anyway.
+    ch.addAction(GH_GLYPH_LB, L"Themes");
+
+    // The drawers, and the breadcrumb naming the one in front. Three, not
+    // four: there is no "Updates" drawer because nothing reports a game update
+    // (see LuiTitleState). A layout with no sidebar draws these as a tab strip
+    // and is none the worse for it.
+    ch.addTab(L"All titles",    std::to_wstring(ws.count[0]).c_str());
+    ch.addTab(L"Installed",     std::to_wstring(ws.count[1]).c_str());
+    ch.addTab(L"Not installed", std::to_wstring(ws.count[2]).c_str());
+    ch.tab = ws.drawer;
+    ch.subline.set(ws.drawer == 1 ? L"Library  ›  Installed"
+                 : ws.drawer == 2 ? L"Library  ›  Not installed"
+                                  : L"Library  ›  All titles");
     if (g_bake.phase == 1 && g_bake.pending.load()) {   // §47: the shader bake, while it has work
         const uint64_t tot = g_bake.scanTotal.load(), got = g_bake.scanBytes.load();
         const int pct = tot ? (int)(got * 100 / tot) : 0;
@@ -790,6 +964,9 @@ static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const s
         ch.noteRole = GH_ROLE_ACCENT;
     }
 
+    // This page CAN search, which it had never actually said: `search` gates the
+    // whole band, so the picker's query line was not being drawn at all.
+    ch.search = true;
     ch.searchLine.setElided(query.c_str());
     ch.searchActive = g_pickOskOpen || !query.empty();
 
@@ -800,43 +977,28 @@ static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const s
         ch.counter.set(pos);
     }
 
-    // Footer. Verify re-downloads through a source that offers it (the Steam
-    // add-on), so its hint is shown only when one does.
-    ch.addHint(GH_GLYPH_UPDOWN,    L"Move");
-    ch.addHint(GH_GLYPH_LEFTRIGHT, L"Jump 5");
-    ch.addHint(GH_GLYPH_A,         L"Launch");
-    ch.addHint(GH_GLYPH_X,         L"Uninstall");
-    if (GhSteamRuntimeProvided()) ch.addHint(GH_GLYPH_VIEW, L"Verify");
-    const bool mods = sel >= 0 && sel < total && LuiModsOffered(items[sel]);
-    const bool ws   = sel >= 0 && sel < total && !mods && LuiWorkshopTitle(items[sel]);
-    if (mods)     ch.addHint(GH_GLYPH_RB, L"Mods");
-    else if (ws)  ch.addHint(GH_GLYPH_RB, L"Workshop");
-    ch.addHint(GH_GLYPH_Y, L"Search");
-    ch.addHint(GH_GLYPH_B, L"Back");
-
-    GhUiPageList(vm);
-
-    if (promptName && promptName[0] && promptKind != 0) {
-        GhUiModalVM mv;
-        mv.overPage = false;        // today's prompt repaints the whole screen
-        mv.sel = 0;
-        if (promptKind == 2) {
-            mv.heading.set(L"VERIFY FILES");
-            mv.body.set(L"Check this install against Steam and repair it?");
-            mv.detail.setElided(promptName);
-            mv.note.set(L"Matching files are hashed, not re-downloaded. This can take a while.");
-            mv.addChoice(L"A  Verify");
-        } else {
-            mv.danger = true;
-            mv.heading.set(L"UNINSTALL");
-            mv.body.set(L"Remove this game from the console?");
-            mv.detail.setElided(promptName);
-            mv.note.set(L"The install folder will be deleted. This cannot be undone.");
-            mv.addChoice(L"A  Yes, uninstall");
-        }
-        mv.addChoice(L"B  Cancel");
-        GhUiPageModal(mv);
+    // FOUR controls, and that is the whole footer. Uninstall, Verify, Mods and
+    // Workshop moved to the title screen, where the user has already said which
+    // game they mean and where there is room to say what each one does. A
+    // footer of eight controls under a library was half of the overload this
+    // design exists to undo.
+    ch.addHint(GH_GLYPH_ARROWS, L"Move");
+    ch.addHint(GH_GLYPH_A,      ws.inDrawers ? L"Show these" : L"Open");
+    ch.addHint(GH_GLYPH_Y,      L"Search");
+    {   // The count comes from LuiRepoStartupCheck's background fetch.
+        const int up = g_repoUpdates.load();
+        std::wstring pk = L"Packages";
+        if (up > 0) pk += L" · " + std::to_wstring(up) + (up == 1 ? L" update" : L" updates");
+        ch.addHint(GH_GLYPH_START, pk.c_str());
     }
+
+    // The picker is the one page that asks for TILES when the theme's layout
+    // has them: a library is the natural grid. GhUiPageGrid falls back to the
+    // list renderer for `list` and `blades`, which have no tile view, so one
+    // call covers all three layouts.
+    GhUiPageGrid(vm);
+
+    LuiDrawPrompt(promptKind, promptName);
 
     dc->EndDraw();
 }
@@ -863,63 +1025,36 @@ static void LuiPresent()
 // host only draws it. Integer module scaling on a white panel with the spec quiet
 // zone keeps the squares crisp for a phone camera.
 // ---------------------------------------------------------------------------
-static void LuiBlitQr(const uint8_t* m, int n, float cx, float cy, float box)
-{
-    auto* dc = g_lui.dc.get();
-    const int quiet = 4;                     // required quiet zone (modules)
-    int total = n + quiet * 2;
-    int scale = (int)(box / total); if (scale < 1) scale = 1;
-    float side = (float)(total * scale);
-    float x0 = cx - side / 2, y0 = cy - side / 2;
-    D2D1_ROUNDED_RECT panel = D2D1::RoundedRect(
-        D2D1::RectF(x0 - 20, y0 - 20, x0 + side + 20, y0 + side + 20), 16, 16);
-    dc->FillRoundedRectangle(panel, g_lui.brWhite.get());
-    float mx0 = x0 + quiet * scale, my0 = y0 + quiet * scale;
-    for (int y = 0; y < n; ++y)
-        for (int x = 0; x < n; ++x)
-            if (m[(size_t)y * n + x])
-                dc->FillRectangle(D2D1::RectF(mx0 + x*scale, my0 + y*scale,
-                                              mx0 + (x+1)*scale, my0 + (y+1)*scale),
-                                  g_lui.brBlack.get());
-}
-
 static void LuiDrawLogin(const wchar_t* title, const uint8_t* m, int n,
                          const wchar_t* status, const wchar_t* hint)
 {
-    auto* dc = g_lui.dc.get();
-    const float W = (float)g_lui.w, H = (float)g_lui.h;
-    dc->BeginDraw();
-    dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
-    LuiText(L"GREENHOUSE", g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
-    LuiText(title ? title : L"Sign in", g_lui.fmtItem.get(), D2D1::RectF(84, 150, W - 80, 206),
-            g_lui.brAccent.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-    const float cy = H * 0.52f, boxHalf = 300.f;
-    if (m && n > 0 && n <= 177) LuiBlitQr(m, n, W * 0.5f, cy, 2 * boxHalf);
-    else {
-        D2D1_ROUNDED_RECT p = D2D1::RoundedRect(
-            D2D1::RectF(W*0.5f - boxHalf, cy - boxHalf, W*0.5f + boxHalf, cy + boxHalf), 16, 16);
-        dc->FillRoundedRectangle(p, g_lui.brPanel.get());
-    }
-    LuiText(status ? status : L"", g_lui.fmtItem.get(),
-            D2D1::RectF(80, cy + boxHalf + 24, W - 80, cy + boxHalf + 84),
-            g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-    LuiText(hint ? hint : L"", g_lui.fmtSmall.get(), D2D1::RectF(80, H - 70, W - 80, H - 30),
-            g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-    dc->EndDraw();
+    GhUiQrVM vm;
+    vm.chrome.title.set(L"GREENHOUSE");
+    vm.chrome.footer.set(hint ? hint : L"");
+    vm.heading.set(title ? title : L"Sign in");
+    // 177 is QR version 40: anything larger is not a code this ABI can carry,
+    // and the layout then draws the text alone rather than a blank panel.
+    if (m && n > 0 && n <= 177) { vm.modules = m; vm.size = n; }
+    vm.caption.setElided(status ? status : L"");
+
+    g_lui.dc->BeginDraw();
+    GhUiPageQr(vm);
+    g_lui.dc->EndDraw();
 }
 
 // A centered full-screen status line (used while a blocking step runs, e.g. fetching
 // the library). Draws its own frame; caller Presents.
 static void LuiDrawStatus(const std::wstring& msg)
 {
-    auto* dc = g_lui.dc.get();
-    const float W = (float)g_lui.w, H = (float)g_lui.h;
-    dc->BeginDraw();
-    dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
-    LuiText(L"GREENHOUSE", g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
-    LuiText(msg.c_str(), g_lui.fmtItem.get(), D2D1::RectF(80, H * 0.5f - 40, W - 80, H * 0.5f + 40),
-            g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-    dc->EndDraw();
+    GhUiMessageVM vm;
+    vm.chrome.title.set(L"GREENHOUSE");
+    vm.centered = true;                  // a blocking line belongs in the middle
+    vm.body.setElided(msg.c_str());
+    vm.bodyRole = GH_ROLE_TEXT_ON_BG;
+
+    g_lui.dc->BeginDraw();
+    GhUiPageMessage(vm);
+    g_lui.dc->EndDraw();
 }
 
 // Progress state shared with the download callback and the add-on host API
@@ -929,37 +1064,33 @@ static LauncherDlProg g_dlProg;
 
 static void LuiDrawProgress()
 {
-    auto* dc = g_lui.dc.get();
-    const float W = (float)g_lui.w, H = (float)g_lui.h;
-    dc->BeginDraw();
-    dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
-    LuiText(L"GREENHOUSE", g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
-    LuiText((!g_dlProg.head.empty() ? L"●  " + g_dlProg.head
-             : std::wstring(g_dlProg.verify ? L"●  Verifying " : L"●  Downloading ") + g_dlProg.name).c_str(), g_lui.fmtSmall.get(),
-            D2D1::RectF(84, 140, W - 80, 182), g_lui.brAccent.get());
-    // progress bar
-    const float x0 = 84, x1 = W - 84, y = H * 0.5f - 20, hgt = 40;
-    D2D1_ROUNDED_RECT track = D2D1::RoundedRect(D2D1::RectF(x0, y, x1, y + hgt), 8, 8);
-    dc->FillRoundedRectangle(track, g_lui.brPanel.get());
-    float frac = g_dlProg.percent / 100.f; if (frac < 0) frac = 0; if (frac > 1) frac = 1;
-    if (frac > 0.001f) {
-        D2D1_ROUNDED_RECT fill = D2D1::RoundedRect(D2D1::RectF(x0, y, x0 + (x1 - x0) * frac, y + hgt), 8, 8);
-        dc->FillRoundedRectangle(fill, g_lui.brAccent.get());
+    GhUiProgressVM vm;
+    vm.chrome.title.set(L"GREENHOUSE");
+    // The status line is what is being fetched. The literal bullet the launcher
+    // used to put at the front of the string is a chrome indicator now, so a
+    // theme that wants a bar, a ring or nothing at all can say so.
+    vm.chrome.statusDot  = true;
+    vm.chrome.statusRole = GH_ROLE_ACCENT;
+    vm.chrome.status.setElided(
+        (!g_dlProg.head.empty()
+             ? g_dlProg.head
+             : std::wstring(g_dlProg.verify ? L"Verifying " : L"Downloading ") + g_dlProg.name).c_str());
+    vm.chrome.footer.setElided(g_dlProg.hint.c_str());
+
+    vm.heading.setElided(g_dlProg.phase.c_str());
+    vm.frac = GhClampF(g_dlProg.percent / 100.f, 0.f, 1.f);
+
+    wchar_t buf[64];
+    swprintf(buf, 64, L"%d%%   %.1f MB", g_dlProg.percent, g_dlProg.bytes / (1024.0 * 1024.0));
+    vm.amount.set(buf);
+    if (g_dlProg.ftot > 0) {                 // add-on progress has no file count
+        swprintf(buf, 64, L"files %d / %d", g_dlProg.fdone, g_dlProg.ftot);
+        vm.rate.set(buf);
     }
-    wchar_t line[256];
-    if (g_dlProg.ftot > 0)
-        swprintf(line, 256, L"%ls   %d%%   files %d/%d   %.1f MB",
-                 g_dlProg.phase.c_str(), g_dlProg.percent, g_dlProg.fdone, g_dlProg.ftot,
-                 g_dlProg.bytes / (1024.0 * 1024.0));
-    else                                             // add-on progress: no file count
-        swprintf(line, 256, L"%ls   %d%%   %.1f MB",
-                 g_dlProg.phase.c_str(), g_dlProg.percent, g_dlProg.bytes / (1024.0 * 1024.0));
-    LuiText(line, g_lui.fmtSmall.get(), D2D1::RectF(x0, y + hgt + 16, x1, y + hgt + 60),
-            g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-    if (!g_dlProg.hint.empty())
-        LuiText(g_dlProg.hint.c_str(), g_lui.fmtSmall.get(), D2D1::RectF(x0, H - 120, x1, H - 76),
-                g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-    dc->EndDraw();
+
+    g_lui.dc->BeginDraw();
+    GhUiPageProgress(vm);
+    g_lui.dc->EndDraw();
 }
 
 
@@ -1052,7 +1183,7 @@ static void LuiSrcInstalledScan(std::vector<LauncherItem>& out, const std::wstri
         it.display = LuiRowName(it);
         if (it.display.empty()) it.display = sub;
         if (it.display.empty()) {
-            wchar_t fb[32]; swprintf(fb, 32, L"App %u", app); it.display = fb;
+            wchar_t fb[48]; swprintf(fb, 48, L"Unnamed game %u", app); it.display = fb;
         }
         int inst = LuiInstallComplete(gameDir + sub + L"\\");
         DWORD gsz = LuiFileSize(it.guest);
@@ -1141,6 +1272,12 @@ static LauncherItem LuiAddonRowToItem(int k, const GhAddonRow* r)
     if (r->sub) it.sub = r->sub;
     it.app = r->app;
     it.source = g_luiAddons[k].api.id;
+    // Appended fields: an add-on built against an older header stops short of them.
+    if (GH_ROW_HAS(r, lastPlayed)) {
+        it.playForever = r->playForever;
+        it.play2Weeks  = r->play2Weeks;
+        it.lastPlayed  = r->lastPlayed;
+    }
     if (r->kind == GH_ROW_LAUNCH && r->guest && *r->guest) { it.kind = LauncherItem::kLaunch; it.guest = r->guest; }
     else if (r->kind == GH_ROW_ACQUIRE) { it.kind = LauncherItem::kAcquire; it.guest = L"@@addon"; }
     else { it.kind = LauncherItem::kPlaceholder; it.guest = L"@@none"; }
@@ -1155,10 +1292,30 @@ static GhAddonRow LuiItemToAddonRow(const LauncherItem& it)
     r.display = it.display.c_str();
     r.sub = it.sub.c_str();
     r.guest = (it.kind == LauncherItem::kLaunch) ? it.guest.c_str() : nullptr;
+    r.playForever = it.playForever;
+    r.play2Weeks  = it.play2Weeks;
+    r.lastPlayed  = it.lastPlayed;
     return r;
 }
 
 static const LibrarySource* LuiAddonSource(int k);
+
+// The app ids the signed-in account's library reported in this enumeration, and
+// the ONLY ids art may ever be fetched for (gh_art.h). It is collected here, in
+// the one place rows come off an add-on's library, rather than inferred from the
+// finished list: the console's own installed-games scan knows nothing about
+// ownership, and a title-config acquire row (a free-to-play game Steam leaves
+// out of the owned list until it has playtime) is not ownership either. A title
+// with no entry here draws the typographic plate, which is the designed
+// fallback -- never a picture from anywhere else.
+static std::vector<uint32_t> g_luiArtOwned;
+static void LuiArtOwn(uint32_t app)
+{
+    if (!app) return;
+    for (uint32_t a : g_luiArtOwned) if (a == app) return;
+    g_luiArtOwned.push_back(app);
+}
+
 struct LuiAddonEmitCtx { int k; std::vector<LauncherItem>* out; };
 template <int K> static void LuiAddonEnum(std::vector<LauncherItem>& out)
 {
@@ -1167,8 +1324,13 @@ template <int K> static void LuiAddonEnum(std::vector<LauncherItem>& out)
     LuiAddonEmitCtx ctx{ K, &out };
     a.api.enumerate(&ctx, [](void* c, const GhAddonRow* r) {
         auto* x = (LuiAddonEmitCtx*)c;
-        if (!r || r->size < sizeof(GhAddonRow)) return;
+        // The ABI's rule is "read only the fields the other side's size covers", so the
+        // bar is the original field set, NOT sizeof(GhAddonRow) -- that would reject
+        // every row from an add-on package built before the play figures were appended
+        // (i.e. the one already installed on the console), emptying the Steam library.
+        if (!r || r->size < offsetof(GhAddonRow, guest) + sizeof(r->guest)) return;
         LauncherItem it = LuiAddonRowToItem(x->k, r);
+        LuiArtOwn(it.app);          // the library said so: art may be fetched for it
         // A library title the console already has (same app id, or the same name as
         // the row, its folder or its exe) is not listed twice: the earlier row gets the
         // id and name instead, and the source claims it for resume / verify.
@@ -1183,6 +1345,12 @@ template <int K> static void LuiAddonEnum(std::vector<LauncherItem>& out)
                 if (!e.app) e.app = it.app;
                 if (e.display.empty()) e.display = it.display;
                 if (!e.acq) e.acq = LuiAddonSource(x->k);
+                // The play record only the library knows, onto the row that is kept.
+                // The installed-games scan has no figures of its own, so there is
+                // nothing to overwrite; a 0 from the library is left as 0 (never played).
+                if (!e.playForever) e.playForever = it.playForever;
+                if (!e.play2Weeks)  e.play2Weeks  = it.play2Weeks;
+                if (!e.lastPlayed)  e.lastPlayed  = it.lastPlayed;
                 return;
             }
         }
@@ -1709,6 +1877,7 @@ static bool LuiCanVerify(const LauncherItem& it)
 static std::vector<LauncherItem> LuiEnumerate()
 {
     std::vector<LauncherItem> out;
+    g_luiArtOwned.clear();          // refilled by LuiAddonEnum as the library reports
     size_t n = 0; const LibrarySource* src = LuiSources(n);
     for (size_t k = 0; k < n; ++k) src[k].enumerate(out);
 
@@ -1758,6 +1927,10 @@ static std::vector<LauncherItem> LuiEnumerate()
     // ends and CoreApplication::Exit() closes the whole app (looked like "pressing A on the
     // launch button closes the launcher"). The caller adds a non-launchable "No games
     // installed" placeholder instead when the library is empty.
+
+    // Hand the art layer the ownership set this enumeration established. Before
+    // this call it has none, so nothing has been fetched; after it, only these.
+    ghart::Allow(g_luiArtOwned);
     return out;
 }
 
@@ -1880,6 +2053,10 @@ static ghrepo::Config LuiRepoConfig()
     c.stateDir  = std::wstring(kLocalState) + L"gh_packages\\";
     c.titleDir  = std::wstring(kLocalState) + L"titles\\";
     c.addonRoot = std::wstring(kDevRoot) + L"gh_packages\\";
+    // §63e: theme packages get their own root. Not under gh_packages\ because an
+    // add-on root is a place addon.dll is loaded from and a theme root never is;
+    // keeping them apart means a theme can never land where an add-on is sought.
+    c.themeRoot = std::wstring(kDevRoot) + L"gh_themes\\";
     c.loaderVersion = GhOwnPackageVersion();
     c.log = LuiRepoLog;
     c.checkTitle = LuiRepoCheckTitle;
@@ -1930,6 +2107,7 @@ static void LuiRepoStartupCheck()
     std::thread([] {
         ghrepo::Config c = LuiRepoConfig();
         CreateDirectoryW(c.addonRoot.c_str(), nullptr);
+        CreateDirectoryW(c.themeRoot.c_str(), nullptr);
         ghrepo::CleanStaging(c);
         if (ghent::Enabled()) LuiKeepInstalledKeys(c);
         if (c.indexUrl.empty()) { Diag("REPO check: no repository (gh_repo_url.txt absent)"); g_repoUpdates = -1; return; }
@@ -2251,6 +2429,46 @@ static std::wstring LuiModsCount(int64_t n)
     return b;
 }
 
+// A setting's default and what it will accept, as one line. At file scope for
+// the same reason as LuiModsMB: the detail caption is built outside the draw
+// lambda now, and this is the only place that knows how to word it.
+static std::wstring LuiModsCfgRange(const ghmods::CfgEntry& e)
+{
+    std::wstring s = L"Default: " + (e.def.empty() ? std::wstring(L"(empty)") : ghrepo::Widen(e.def));
+    if (e.isBool()) s += L"  ·  true or false";
+    else if (e.hasRange) {
+        wchar_t r[96];
+        swprintf(r, 96, L"  ·  from %g to %g", e.lo, e.hi);
+        s += r;
+    } else if (!e.values.empty()) {
+        std::string all;
+        for (const auto& v : e.values) all += (all.empty() ? "" : ", ") + v;
+        s += (e.flags ? L"  ·  any of: " : L"  ·  one of: ") + ghrepo::Widen(all.substr(0, 140));
+    } else if (!e.type.empty()) {
+        s += L"  ·  " + ghrepo::Widen(e.type);
+    }
+    return s;
+}
+
+// "by <owner>  ·  thunderstore.io/c/<game>/p/<owner>/<mod>", without the scheme.
+static std::wstring LuiModsByLine(bool haveGame, const ghmods::Game& game,
+                                  const std::string& owner, const std::string& name)
+{
+    std::string page = haveGame ? ghmods::PackagePage(game.community, owner, name) : std::string();
+    if (page.size() >= 8 && page.compare(0, 8, "https://") == 0) page.erase(0, 8);
+    return L"by " + ghrepo::Widen(owner) + (page.empty() ? std::wstring() : L"  ·  " + ghrepo::Widen(page));
+}
+
+// A byte count as a size. At file scope, not a captured lambda, because the
+// row providers the layout calls back into are captureless by construction.
+static std::wstring LuiModsMB(uint64_t b)
+{
+    wchar_t buf[32];
+    if (b >= (1ull << 30)) swprintf_s(buf, L"%.1f GB", b / 1073741824.0);
+    else                   swprintf_s(buf, L"%.1f MB", b / 1048576.0);
+    return std::wstring(buf);
+}
+
 static std::wstring LuiModsThousands(size_t n)          // 39469 -> "39,469"
 {
     std::wstring s = std::to_wstring(n);
@@ -2337,12 +2555,6 @@ static void LauncherWorkshop(const GhTitle& title)
             job->done = true;
         }).detach();
     };
-    auto mb = [](uint64_t b) {
-        wchar_t buf[32];
-        if (b >= (1ull << 30)) swprintf_s(buf, L"%.1f GB", b / 1073741824.0);
-        else swprintf_s(buf, L"%.1f MB", b / 1048576.0);
-        return std::wstring(buf);
-    };
     auto subscribe = [&](const Item& it, bool to) {
         busy = (to ? L"Subscribing to " : L"Unsubscribing from ") + it.title + L"…";
         auto j = std::make_shared<Job>();
@@ -2372,73 +2584,101 @@ static void LauncherWorkshop(const GhTitle& title)
         Diag("WORKSHOP UI sync app=" + std::to_string(app) + " rc=" + std::to_string(rc) + " in " + std::to_string(GetTickCount() - t0) + " ms");
         bad = rc != 0;
         status = rc == 0 ? L"Subscribed items are on this console" : rc > 0 ? std::to_wstring(rc) + L" items could not be downloaded"
-               : L"Sync failed (signed in? network?)";
+               : L"Could not sync — check the console is online and still signed in";
         if (rc == 0) dirty = false;
         load(kSubscribed, false);
     };
+    // The row provider. A captureless lambda is a GhUiRowFn, and it can still
+    // name this function's own Item type, which a file-scope helper could not.
+    struct WsCtx { const std::vector<Item>* l; };
+    WsCtx wctx{ nullptr };
+    const GhUiRowFn wsFill = [](void* c, int i, GhUiRow& out) {
+        const WsCtx* x = (const WsCtx*)c;
+        if (!x || !x->l || i < 0 || i >= (int)x->l->size()) return;
+        const Item& it = (*x->l)[i];
+        out.title.setElided(it.title.c_str());
+        std::wstring sub = LuiModsMB(it.bytes) + L"  ·  " + LuiModsThousands(it.subs) + L" subscribers";
+        if (it.flags & GH_WS_INSTALLED)       sub = L"✓ on console  ·  " + sub;
+        else if (it.flags & GH_WS_SUBSCRIBED) sub = L"subscribed  ·  " + sub;
+        out.right.setElided(sub.c_str());
+    };
+
     auto draw = [&] {
-        auto* dc = g_lui.dc.get();
-        const float W = (float)g_lui.w, H = (float)g_lui.h;
-        IDWriteTextFormat* fs = g_lui.fmtSmall.get();
-        dc->BeginDraw();
-        dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
-        LuiText((L"WORKSHOP  ·  " + tname).c_str(), g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
-        LuiText((L"●  " + status).c_str(), fs, D2D1::RectF(84, 140, W - 80, 182), bad ? g_lui.brWarn.get() : g_lui.brAccent.get());
-        float x = 84;
+        const std::vector<Item>& l = list[tab];
+        const int n = (int)l.size(), cur = sel[tab];
+
+        g_lui.dc->BeginDraw();
+
+        // An unsubscribe prompt and a load both take the screen; everything
+        // under them was already hidden behind an opaque panel.
+        if (!ask.empty()) {
+            GhUiModalVM mv;
+            mv.overPage = false;
+            mv.danger   = true;
+            mv.heading.set(L"UNSUBSCRIBE");
+            mv.detail.setElided(ask.c_str());
+            mv.addChoice(L"A  Yes, unsubscribe");
+            mv.addChoice(L"B  Cancel");
+            GhUiPageModal(mv);
+            g_lui.dc->EndDraw();
+            LuiPresent();
+            return;
+        }
+        if (!busy.empty()) {
+            GhUiMessageVM sv;
+            sv.chrome.title.setElided((L"WORKSHOP  ·  " + tname).c_str());
+            sv.centered = true;
+            sv.body.setElided(busy.c_str());
+            sv.bodyRole = GH_ROLE_TEXT_ON_BG;
+            GhUiPageMessage(sv);
+            g_lui.dc->EndDraw();
+            LuiPresent();
+            return;
+        }
+
+        wctx.l = &l;
+        GhUiListVM vm;
+        vm.chrome.title.setElided((L"WORKSHOP  ·  " + tname).c_str());
+        vm.chrome.statusDot  = true;
+        vm.chrome.statusRole = bad ? GH_ROLE_WARN : GH_ROLE_ACCENT;
+        vm.chrome.status.setElided(status.c_str());
         for (int t = 0; t < kTabs; ++t) {
             std::wstring s = kTabName[t];
             if (t == kSubscribed && page[t]) s += L" (" + std::to_wstring(total[t]) + L")";
-            const float w = LuiMeasure(s.c_str(), g_lui.fmtItem.get());
-            LuiText(s.c_str(), g_lui.fmtItem.get(), D2D1::RectF(x, 186, x + w + 4, 236), t == tab ? g_lui.brFg.get() : g_lui.brDim.get());
-            if (t == tab) dc->FillRectangle(D2D1::RectF(x, 238, x + w, 242), g_lui.brAccent.get());
-            x += w + 56;
+            vm.chrome.addTab(s.c_str());
         }
-        std::wstring line = tab == kSearch ? L"Search:  " + (typing ? g_pickQuery + L"_" : query.empty() ? std::wstring(L"Y to search") : query)
-                          : tab == kSubscribed ? std::wstring(L"Your account's subscriptions  ·  they download to this console before the game starts")
-                          : std::to_wstring(total[tab]) + L" items";
-        LuiText(line.c_str(), fs, D2D1::RectF(84, 252, W - 80, 290), typing ? g_lui.brFg.get() : g_lui.brDim.get());
+        vm.chrome.tab = tab;
 
-        const float x0 = 80, x1 = W - 80, rowH = 70, top = 300, detail = H - 160;
-        const std::vector<Item>& l = list[tab];
-        const int nfit = (int)((detail - top) / rowH), n = (int)l.size(), cur = sel[tab];
-        int first = 0;
-        if (nfit > 0 && n > nfit) { first = cur - nfit / 2; if (first < 0) first = 0; if (first > n - nfit) first = n - nfit; }
-        for (int vi = 0; vi < nfit && first + vi < n; ++vi) {
-            const int i = first + vi; const Item& it = l[i];
-            const float y = top + (float)vi * rowH; const bool on = i == cur;
-            dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x0, y, x1, y + rowH - 10), 10, 10), on ? g_lui.brSel.get() : g_lui.brPanel.get());
-            std::wstring sub = mb(it.bytes) + L"  ·  " + LuiModsThousands(it.subs) + L" subscribers";
-            if (it.flags & GH_WS_INSTALLED) sub = L"✓ on console  ·  " + sub;
-            else if (it.flags & GH_WS_SUBSCRIBED) sub = L"subscribed  ·  " + sub;
-            LuiText(it.title.c_str(), g_lui.fmtItem.get(), D2D1::RectF(x0 + 28, y, x1 - 560, y + rowH - 10), g_lui.brFg.get());
-            LuiText(sub.c_str(), fs, D2D1::RectF(x1 - 600, y, x1 - 24, y + rowH - 10), on ? g_lui.brFg.get() : g_lui.brDim.get(),
-                    DWRITE_TEXT_ALIGNMENT_TRAILING);
+        if (tab == kSearch) {
+            vm.chrome.search = true;
+            vm.chrome.searchActive = typing;
+            vm.chrome.searchLine.setElided((typing ? g_pickQuery : query).c_str());
+        } else if (tab == kSubscribed) {
+            vm.chrome.subline.set(L"Your account's subscriptions  ·  they download to this "
+                                  L"console before the game starts");
+        } else {
+            vm.chrome.subline.set((std::to_wstring(total[tab]) + L" items").c_str());
         }
-        if (l.empty() && busy.empty())
-            LuiText(tab == kSubscribed ? L"No subscriptions yet: find something in Popular or Search" : L"Nothing here",
-                    g_lui.fmtItem.get(), D2D1::RectF(x0, top, x1, top + 60), g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-        if (cur >= 0 && cur < n && !l[cur].desc.empty())
-            LuiText(l[cur].desc.c_str(), fs, D2D1::RectF(84, detail, W - 80, H - 80), g_lui.brDim.get());
+
+        vm.count = n;
+        vm.sel   = cur;
+        vm.fill  = wsFill;
+        vm.ctx   = &wctx;
+        vm.emptyText.set(tab == kSubscribed ? L"No subscriptions yet"
+                                            : L"Nothing here");
+        if (tab == kSubscribed) vm.emptySub.set(L"Find something in Popular or Search.");
+        if (cur >= 0 && cur < n) vm.detail.setElided(l[cur].desc.c_str());
+
         const bool subd = cur >= 0 && cur < n && (l[cur].flags & GH_WS_SUBSCRIBED);
-        const std::wstring hint = std::wstring(subd ? L"A  Unsubscribe" : L"A  Subscribe") + L"      LB RB  Tabs      X  Sync now      " +
-                                  (tab == kSearch ? L"Y  Search      " : L"") + L"B  Back";
-        LuiText(hint.c_str(), fs, D2D1::RectF(84, H - 70, W - 80, H - 30), g_lui.brDim.get());
-        if (!busy.empty() || !ask.empty()) {
-            dc->FillRectangle(D2D1::RectF(0, 0, W, H), g_lui.brBg.get());
-            const float cx = W * 0.5f, cy = H * 0.5f;
-            dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 460, cy - 140, cx + 460, cy + 140), 16, 16), g_lui.brPanel.get());
-            if (!ask.empty()) {
-                LuiText(L"UNSUBSCRIBE", g_lui.fmtTitle.get(), D2D1::RectF(cx - 430, cy - 120, cx + 430, cy - 40), g_lui.brWarn.get(),
-                        DWRITE_TEXT_ALIGNMENT_CENTER);
-                LuiText(ask.c_str(), g_lui.fmtItem.get(), D2D1::RectF(cx - 430, cy - 30, cx + 430, cy + 30), g_lui.brAccent.get(),
-                        DWRITE_TEXT_ALIGNMENT_CENTER);
-                LuiText(L"A  Yes, unsubscribe            B  Cancel", fs, D2D1::RectF(cx - 430, cy + 60, cx + 430, cy + 110), g_lui.brFg.get(),
-                        DWRITE_TEXT_ALIGNMENT_CENTER);
-            } else
-                LuiText(busy.c_str(), g_lui.fmtItem.get(), D2D1::RectF(cx - 430, cy - 30, cx + 430, cy + 30), g_lui.brFg.get(),
-                        DWRITE_TEXT_ALIGNMENT_CENTER);
-        }
-        dc->EndDraw();
+        vm.chrome.addHint(GH_GLYPH_A, subd ? L"Unsubscribe" : L"Subscribe");
+        vm.chrome.addHint(GH_GLYPH_LB, L"");
+        vm.chrome.addHint(GH_GLYPH_RB, L"Tabs");
+        vm.chrome.addHint(GH_GLYPH_X, L"Sync now");
+        if (tab == kSearch) vm.chrome.addHint(GH_GLYPH_Y, L"Search");
+        vm.chrome.addHint(GH_GLYPH_B, L"Back");
+
+        GhUiPageList(vm);
+        g_lui.dc->EndDraw();
         LuiPresent();
     };
 
@@ -2792,7 +3032,7 @@ static void LauncherMods(const GhTitle& title)
         std::string code;                        // kTxtCode: r2modman / Gale codes are lower-case UUIDs
         for (wchar_t c : s) code += c < 128 ? (char)tolower((int)c) : '?';
         if (!ghmods::ValidCode(code)) { bad = true; status = L"That is not a profile code (it looks like 0a1b2c3d-…)"; return; }
-        if (!haveGame) { bad = true; status = L"Importing needs Thunderstore (no network?)"; return; }
+        if (!haveGame) { bad = true; status = L"Importing a profile needs a connection to Thunderstore"; return; }
         std::string prof = "Imported";
         for (int k = 2; std::any_of(profs.begin(), profs.end(), [&](const std::string& p) { return ghmods::EqI(p, prof); }); ++k)
             prof = "Imported-" + std::to_string(k);
@@ -2809,199 +3049,260 @@ static void LauncherMods(const GhTitle& title)
               });
     };
 
+    // What a row needs to render itself. The provider the layout calls back
+    // into is captureless by construction, so everything it reads is reached
+    // through this rather than captured -- and it reads only what the rows
+    // show: the detail caption for the selected row is built once, below,
+    // because the layout draws the caption before it asks for any row.
+    struct ModsCtx {
+        int tab = 0, cfgOpen = -1;
+        const std::vector<ghmods::Installed>*     inst  = nullptr;
+        const std::vector<ghmods::Pkg>*           found = nullptr;
+        const std::vector<CfgFile>*               cfgs  = nullptr;
+        const std::vector<ghmods::CfgEntry>*      cfgEs = nullptr;
+        const std::vector<std::string>*           profs = nullptr;
+        const std::vector<size_t>*                profN = nullptr;
+        const std::map<std::string, ghmods::Pkg>* latest = nullptr;
+        const ghmods::Game*                       game  = nullptr;
+        bool                                      haveGame = false;
+        const std::string*                        profile = nullptr;
+        int kInstalled = 0, kBrowse = 1, kProfiles = 2, kSettings = 3;
+    };
+    ModsCtx mctx;
+    const GhUiRowFn modsFill = [](void* c, int i, GhUiRow& out) {
+        const ModsCtx* x = (const ModsCtx*)c;
+        if (!x) return;
+        std::wstring name, sub;
+
+        if (x->tab == x->kInstalled) {
+            if (!x->inst || i < 0 || i >= (int)x->inst->size()) return;
+            const ghmods::Installed& m = (*x->inst)[i];
+            std::string owner, nm;
+            ghmods::SplitFull(m.fullName, owner, nm);
+            name = LuiModsName(nm);
+            sub  = ghrepo::Widen(m.ver);
+            if (x->latest) {
+                auto f = x->latest->find(ghmods::Lower(m.fullName));
+                if (f != x->latest->end() && ghmods::CmpVer(f->second.latest, m.ver) > 0)
+                    sub += L" → " + ghrepo::Widen(f->second.latest);
+            }
+            if (x->haveGame && x->game && ghmods::LoaderFor(*x->game, m.fullName)) sub += L"  ·  mod loader";
+            // On or off is a row STATE, drawn by the layout as a box in the
+            // gutter -- not the word "off" appended to the row's text, and not
+            // `disabled`, which means "the cursor cannot land here" and cost a
+            // turned-off mod its selection highlight.
+            out.hasCheck = true;
+            out.checked  = m.enabled;
+            if (!m.enabled) out.titleRole = GH_ROLE_TEXT_DIM;
+            sub += L"  ·  " + ghrepo::Widen(owner);
+        } else if (x->tab == x->kBrowse) {
+            if (!x->found || i < 0 || i >= (int)x->found->size()) return;
+            const ghmods::Pkg& p = (*x->found)[i];
+            name = LuiModsName(p.name);
+            sub  = ghrepo::Widen(p.latest) + L"  ·  " + ghrepo::Widen(p.owner) +
+                   L"  ·  ↓ " + LuiModsCount(p.downloads);
+            if (x->inst)
+                for (const auto& m : *x->inst)
+                    if (ghmods::EqI(m.fullName, p.fullName))
+                        sub += (m.ver == p.latest) ? L"  ·  installed" : L"  ·  update";
+        } else if (x->tab == x->kSettings && x->cfgOpen < 0) {
+            if (!x->cfgs || i < 0 || i >= (int)x->cfgs->size()) return;
+            const CfgFile& f = (*x->cfgs)[i];
+            name = f.name;
+            sub  = std::to_wstring(f.n) + (f.n == 1 ? L" setting" : L" settings") +
+                   L"  ·  " + ghrepo::Widen(f.file);
+        } else if (x->tab == x->kSettings) {
+            if (!x->cfgEs || i < 0 || i >= (int)x->cfgEs->size()) return;
+            const ghmods::CfgEntry& e = (*x->cfgEs)[i];
+            name = ghrepo::Widen(e.key);
+            sub  = (e.value.empty() ? std::wstring(L"(empty)") : ghrepo::Widen(e.value.substr(0, 60))) +
+                   L"  ·  " + ghrepo::Widen(e.section);
+            if (!e.def.empty() && e.value != e.def) sub = L"changed  ·  " + sub;
+        } else {
+            const int np = x->profs ? (int)x->profs->size() : 0;
+            const std::string prof = x->profile ? *x->profile : std::string();
+            if (i == 0)            { name = L"No mods";               sub = L"plays the game as it is"; }
+            else if (i <= np)      { name = ghrepo::Widen((*x->profs)[i - 1]);
+                                     const size_t k = (x->profN && (size_t)(i - 1) < x->profN->size())
+                                                    ? (*x->profN)[i - 1] : 0;
+                                     sub = std::to_wstring(k) + (k == 1 ? L" mod" : L" mods"); }
+            else if (i == np + 1)  { name = L"New profile";           sub = L"an empty one, named with the keyboard"; }
+            else                   { name = L"Import a profile code"; sub = L"from r2modman or Gale"; }
+            if ((i == 0 && prof.empty()) ||
+                (i >= 1 && i <= np && (*x->profs)[i - 1] == prof)) sub = L"in use  ·  " + sub;
+        }
+
+        out.title.setElided(name.c_str());
+        out.right.setElided(sub.c_str());
+    };
+
     auto draw = [&] {
-        auto* dc = g_lui.dc.get();
-        const float W = (float)g_lui.w, H = (float)g_lui.h;
-        IDWriteTextFormat* fs = g_lui.fmtSmall.get();
-        dc->BeginDraw();
-        dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
-        LuiText((L"MODS  ·  " + tname).c_str(), g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
-        LuiText((L"●  " + status).c_str(), fs, D2D1::RectF(84, 140, W - 80, 182), bad ? g_lui.brWarn.get() : g_lui.brAccent.get());
+        const int total = count(tab), cur = sel[tab];
 
-        float x = 84;
-        for (int t = 0; t < kTabs; ++t) {
-            std::wstring s = t == kInstalled ? L"Installed (" + std::to_wstring(inst.size()) + L")"
-                           : t == kBrowse    ? std::wstring(L"Browse") : t == kProfiles ? std::wstring(L"Profiles") : std::wstring(L"Settings");
-            const float w = LuiMeasure(s.c_str(), g_lui.fmtItem.get());
-            LuiText(s.c_str(), g_lui.fmtItem.get(), D2D1::RectF(x, 186, x + w + 4, 236), t == tab ? g_lui.brFg.get() : g_lui.brDim.get());
-            if (t == tab) dc->FillRectangle(D2D1::RectF(x, 238, x + w, 242), g_lui.brAccent.get());
-            x += w + 56;
+        g_lui.dc->BeginDraw();
+
+        // Text entry sits above the on-screen keyboard; a prompt and a running
+        // job take the screen. All three used to paint the background opaque
+        // behind their panel, so none of them ever showed the page under it.
+        if (txt == kTxtProfile || txt == kTxtCode || txt == kTxtValue) {
+            GhUiModalVM mv;
+            mv.overPage = false;
+            mv.heading.set(txt == kTxtProfile ? L"NEW PROFILE"
+                         : txt == kTxtCode    ? L"PROFILE CODE"
+                         : (cfgOpen >= 0 && sel[kSettings] < (int)cfgEs.size())
+                               ? ghrepo::Widen(cfgEs[sel[kSettings]].key).c_str()
+                               : L"SETTING");
+            mv.body.setElided((g_pickQuery + L"_").c_str());
+            if (txt == kTxtCode)
+                mv.note.set(L"The code a friend shared from r2modman or Gale.");
+            else if (txt == kTxtValue && cfgOpen >= 0 && sel[kSettings] < (int)cfgEs.size())
+                mv.note.setElided(LuiModsCfgRange(cfgEs[sel[kSettings]]).c_str());
+            mv.addHint(GH_GLYPH_START, L"Done");
+            mv.addHint(GH_GLYPH_B, L"Cancel");
+            GhUiPageModal(mv);
+            g_lui.dc->EndDraw();
+            LuiPresent();
+            return;
         }
-        LuiText((L"Next launch:  " + (profile.empty() ? std::wstring(L"no mods") : ghrepo::Widen(profile))).c_str(), fs,
-                D2D1::RectF(W - 760, 186, W - 80, 236), profile.empty() ? g_lui.brDim.get() : g_lui.brAccent.get(),
-                DWRITE_TEXT_ALIGNMENT_TRAILING);
-
-        std::wstring line;
-        if (tab == kBrowse)
-            line = L"Search:  " + (txt == kTxtSearch ? g_pickQuery + L"_" : query.empty() ? std::wstring(L"Y to search") : query) +
-                   L"      Sort:  " + kSortName[(int)sort] + (haveIndex ? L"      " + LuiModsThousands(seen) + L" mods" : L"");
-        else if (tab == kInstalled)
-            line = profile.empty() ? L"Mods are off for this game. Install one from Browse, or pick a profile."
-                                   : L"Profile " + ghrepo::Widen(profile) + L"  ·  turned-off mods stay installed";
-        else if (tab == kProfiles)
-            line = L"The profile you pick is the one the next launch uses.";
-        else if (profile.empty())
-            line = L"Settings belong to a profile: pick one in Profiles.";
-        else if (cfgOpen >= 0)
-            line = cfgs[cfgOpen].name + L"  ·  " + ghrepo::Widen(cfgs[cfgOpen].file) + L"  ·  saved as you change them, used at the next launch";
-        else
-            line = L"Profile " + ghrepo::Widen(profile) + L"  ·  a mod's settings appear here after the game has run once with it";
-        LuiText(line.c_str(), fs, D2D1::RectF(84, 252, W - 80, 290), txt == kTxtSearch ? g_lui.brFg.get() : g_lui.brDim.get());
-
-        const float x0 = 80, x1 = W - 80, rowH = 70, top = 300, detail = H - 160;
-        const int nfit = (int)((detail - top) / rowH), total = count(tab), cur = sel[tab];
-        int first = 0;
-        if (nfit > 0 && total > nfit) {
-            first = cur - nfit / 2;
-            if (first < 0) first = 0;
-            if (first > total - nfit) first = total - nfit;
+        if (!ask.empty()) {
+            GhUiModalVM mv;
+            mv.overPage = false;
+            mv.danger   = true;
+            mv.heading.setElided(askTitle.c_str());
+            mv.detail.setElided(ask.c_str());
+            mv.addChoice(L"A  Yes");
+            mv.addChoice(L"B  Cancel");
+            GhUiPageModal(mv);
+            g_lui.dc->EndDraw();
+            LuiPresent();
+            return;
         }
-        std::string dOwner, dName, dDesc;              // the detail strip: the selected mod's author and page
-        std::wstring dSet1, dSet2;                     // ...or the selected setting's description and allowed values
-        for (int vi = 0; vi < nfit && first + vi < total; ++vi) {
-            const int i = first + vi;
-            const float y = top + (float)vi * rowH;
-            const bool on = i == cur;
-            dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x0, y, x1, y + rowH - 10), 10, 10),
-                                     on ? g_lui.brSel.get() : g_lui.brPanel.get());
-            std::wstring name, sub;
-            bool dim = false;
-            if (tab == kInstalled) {
-                const ghmods::Installed& m = inst[i];
+        if (!busy.empty()) {
+            GhUiProgressVM pv;
+            pv.chrome.title.setElided((L"MODS  ·  " + tname).c_str());
+            pv.chrome.addHint(GH_GLYPH_B, L"Cancel");
+            pv.heading.setElided(busy.c_str());
+            pv.frac = -1.f;                       // a mod fetch has no total
+            std::wstring ln;
+            { std::lock_guard<std::mutex> lk(g_modsMapMu); ln = ghrepo::Widen(g_modsUiLine.substr(0, 120)); }
+            const LONG64 got = job->prog;
+            if (got > 0) {
+                wchar_t b[48];
+                swprintf(b, 48, L"%.1f MB", (double)got / 1048576.0);
+                pv.amount.set(b);
+            }
+            pv.detail.setElided(ln.c_str());
+            GhUiPageProgress(pv);
+            g_lui.dc->EndDraw();
+            LuiPresent();
+            return;
+        }
+
+        mctx.tab = tab; mctx.cfgOpen = cfgOpen;
+        mctx.inst = &inst; mctx.found = &found; mctx.cfgs = &cfgs; mctx.cfgEs = &cfgEs;
+        mctx.profs = &profs; mctx.profN = &profN; mctx.latest = &latest;
+        mctx.game = &game; mctx.haveGame = haveGame; mctx.profile = &profile;
+        mctx.kInstalled = kInstalled; mctx.kBrowse = kBrowse;
+        mctx.kProfiles = kProfiles;   mctx.kSettings = kSettings;
+
+        GhUiListVM vm;
+        vm.chrome.title.setElided((L"MODS  ·  " + tname).c_str());
+        vm.chrome.statusDot  = true;
+        vm.chrome.statusRole = bad ? GH_ROLE_WARN : GH_ROLE_ACCENT;
+        vm.chrome.status.setElided(status.c_str());
+
+        vm.chrome.addTab((L"Installed (" + std::to_wstring(inst.size()) + L")").c_str());
+        vm.chrome.addTab(L"Browse");
+        vm.chrome.addTab(L"Profiles");
+        vm.chrome.addTab(L"Settings");
+        vm.chrome.tab = tab;
+
+        vm.chrome.note.set((L"Next launch:  " +
+                            (profile.empty() ? std::wstring(L"no mods") : ghrepo::Widen(profile))).c_str());
+        vm.chrome.noteRole = profile.empty() ? GH_ROLE_TEXT_DIM_ON_BG : GH_ROLE_ACCENT;
+
+        if (tab == kBrowse) {
+            vm.chrome.search = true;
+            vm.chrome.searchActive = (txt == kTxtSearch);
+            vm.chrome.searchLine.setElided((txt == kTxtSearch ? g_pickQuery : query).c_str());
+            std::wstring sl = L"Sort:  ";
+            sl += kSortName[(int)sort];
+            if (haveIndex) sl += L"      " + LuiModsThousands(seen) + L" mods";
+            vm.chrome.counter.setElided(sl.c_str());
+        } else {
+            std::wstring line;
+            if (tab == kInstalled)
+                line = profile.empty()
+                     ? L"Mods are off for this game. Install one from Browse, or pick a profile."
+                     : L"Profile " + ghrepo::Widen(profile) + L"  ·  turned-off mods stay installed";
+            else if (tab == kProfiles)
+                line = L"The profile you pick is the one the next launch uses.";
+            else if (profile.empty())
+                line = L"Settings belong to a profile: pick one in Profiles.";
+            else if (cfgOpen >= 0)
+                line = cfgs[cfgOpen].name + L"  ·  " + ghrepo::Widen(cfgs[cfgOpen].file) +
+                       L"  ·  saved as you change them, used at the next launch";
+            else
+                line = L"Profile " + ghrepo::Widen(profile) +
+                       L"  ·  a mod's settings appear here after the game has run once with it";
+            vm.chrome.subline.setElided(line.c_str());
+        }
+
+        vm.count = total;
+        vm.sel   = cur;
+        vm.fill  = modsFill;
+        vm.ctx   = &mctx;
+        vm.emptyText.set(tab == kInstalled ? (profile.empty() ? L"No mods" : L"This profile is empty")
+                       : tab == kSettings  ? (profile.empty() ? L"No profile in use" : L"No settings files yet")
+                       : haveIndex         ? L"No mods match"
+                                           : L"The mod index is not loaded");
+
+        // The caption for the selected row. Built here, for one row, because
+        // the layout draws the caption before it asks for any row at all.
+        if (cur >= 0 && cur < total) {
+            if (tab == kSettings && cfgOpen >= 0 && cur < (int)cfgEs.size()) {
+                const ghmods::CfgEntry& e = cfgEs[cur];
+                vm.detail.setElided(ghrepo::Widen(e.desc).c_str());
+                vm.detail2.setElided(LuiModsCfgRange(e).c_str());
+            } else if (tab == kInstalled && cur < (int)inst.size()) {
                 std::string owner, nm;
-                ghmods::SplitFull(m.fullName, owner, nm);
-                auto f = latest.find(ghmods::Lower(m.fullName));
-                name = LuiModsName(nm);
-                sub = ghrepo::Widen(m.ver);
-                if (f != latest.end() && ghmods::CmpVer(f->second.latest, m.ver) > 0) sub += L" → " + ghrepo::Widen(f->second.latest);
-                if (haveGame && ghmods::LoaderFor(game, m.fullName)) sub += L"  ·  mod loader";
-                if (!m.enabled) { sub += L"  ·  off"; dim = true; }
-                sub += L"  ·  " + ghrepo::Widen(owner);
-                if (on) { dOwner = owner; dName = nm; if (f != latest.end()) dDesc = f->second.desc; }
-            } else if (tab == kBrowse) {
-                const ghmods::Pkg& p = found[i];
-                name = LuiModsName(p.name);
-                sub = ghrepo::Widen(p.latest) + L"  ·  " + ghrepo::Widen(p.owner) + L"  ·  ↓ " + LuiModsCount(p.downloads);
-                for (const auto& m : inst)
-                    if (ghmods::EqI(m.fullName, p.fullName)) sub += m.ver == p.latest ? L"  ·  installed" : L"  ·  update";
-                if (on) { dOwner = p.owner; dName = p.name; dDesc = p.desc; }
-            } else if (tab == kSettings && cfgOpen < 0) {
-                name = cfgs[i].name;
-                sub = std::to_wstring(cfgs[i].n) + (cfgs[i].n == 1 ? L" setting" : L" settings") + L"  ·  " + ghrepo::Widen(cfgs[i].file);
-            } else if (tab == kSettings) {
-                const ghmods::CfgEntry& e = cfgEs[i];
-                name = ghrepo::Widen(e.key);
-                sub = (e.value.empty() ? std::wstring(L"(empty)") : ghrepo::Widen(e.value.substr(0, 60))) + L"  ·  " + ghrepo::Widen(e.section);
-                if (!e.def.empty() && e.value != e.def) sub = L"changed  ·  " + sub;
-                if (on) {
-                    dSet1 = ghrepo::Widen(e.desc.substr(0, 200));
-                    dSet2 = L"Default: " + (e.def.empty() ? std::wstring(L"(empty)") : ghrepo::Widen(e.def));
-                    if (e.isBool()) dSet2 += L"  ·  true or false";
-                    else if (e.hasRange) {
-                        wchar_t r[96];
-                        swprintf(r, 96, L"  ·  from %g to %g", e.lo, e.hi);
-                        dSet2 += r;
-                    } else if (!e.values.empty()) {
-                        std::string all;
-                        for (const auto& v : e.values) all += (all.empty() ? "" : ", ") + v;
-                        dSet2 += (e.flags ? L"  ·  any of: " : L"  ·  one of: ") + ghrepo::Widen(all.substr(0, 140));
-                    } else if (!e.type.empty()) dSet2 += L"  ·  " + ghrepo::Widen(e.type);
-                }
-            } else {
-                const int np = (int)profs.size();
-                if (i == 0) { name = L"No mods"; sub = L"plays the game as it is"; }
-                else if (i <= np) {
-                    name = ghrepo::Widen(profs[i - 1]);
-                    sub = std::to_wstring(profN[i - 1]) + (profN[i - 1] == 1 ? L" mod" : L" mods");
-                } else if (i == np + 1) { name = L"New profile"; sub = L"an empty one, named with the keyboard"; }
-                else { name = L"Import a profile code"; sub = L"from r2modman or Gale"; }
-                if ((i == 0 && profile.empty()) || (i >= 1 && i <= np && profs[i - 1] == profile)) sub = L"in use  ·  " + sub;
-            }
-            LuiText(name.c_str(), g_lui.fmtItem.get(), D2D1::RectF(x0 + 28, y, x1 - 640, y + rowH - 10),
-                    dim && !on ? g_lui.brDim.get() : g_lui.brFg.get());
-            LuiText(sub.c_str(), fs, D2D1::RectF(x1 - 680, y, x1 - 24, y + rowH - 10), on ? g_lui.brFg.get() : g_lui.brDim.get(),
-                    DWRITE_TEXT_ALIGNMENT_TRAILING);
-        }
-        if (total == 0) {
-            const wchar_t* e = tab == kInstalled ? (profile.empty() ? L"No mods" : L"This profile is empty")
-                             : tab == kSettings ? (profile.empty() ? L"No profile in use" : L"No settings files yet")
-                             : haveIndex ? L"No mods match" : L"The mod index is not loaded";
-            LuiText(e, g_lui.fmtItem.get(), D2D1::RectF(x0, top, x1, top + 60), g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-        }
-        if (!dSet2.empty()) {
-            LuiText(dSet1.c_str(), fs, D2D1::RectF(84, detail + 6, W - 80, detail + 44), g_lui.brFg.get());
-            LuiText(dSet2.c_str(), fs, D2D1::RectF(84, detail + 44, W - 80, detail + 82), g_lui.brDim.get());
-        }
-        if (!dName.empty()) {
-            std::wstring d = ghrepo::Widen(dDesc.substr(0, 180));
-            LuiText(d.c_str(), fs, D2D1::RectF(84, detail + 6, W - 80, detail + 44), g_lui.brFg.get());
-            std::string page = haveGame ? ghmods::PackagePage(game.community, dOwner, dName) : std::string();
-            if (page.compare(0, 8, "https://") == 0) page.erase(0, 8);
-            LuiText((L"by " + ghrepo::Widen(dOwner) + (page.empty() ? L"" : L"  ·  " + ghrepo::Widen(page))).c_str(), fs,
-                    D2D1::RectF(84, detail + 44, W - 80, detail + 82), g_lui.brDim.get());
-        }
-
-        {   // footer
-            const float y0 = H - 70.f, y1 = H - 30.f;
-            float fx = 84.f;
-            std::wstring l, r;
-            if (tab == kInstalled) l = L"A  Turn on / off      X  Remove      Y  Update all      LB RB  Tabs      B  Back";
-            else if (tab == kProfiles) l = L"A  Use      X  Delete      LB RB  Tabs      B  Back";
-            else if (tab == kSettings && cfgOpen >= 0) l = L"A  Change      ◀ ▶  Step      Y  Default      B  Done";
-            else if (tab == kSettings) l = L"A  Open      LB RB  Tabs      B  Back";
-            else { l = L"A  Install      Y  Search      "; r = L"  Sort      LB RB  Tabs      B  Back"; }
-            const float wl = LuiMeasure(l.c_str(), fs);
-            LuiText(l.c_str(), fs, D2D1::RectF(fx, y0, fx + wl + 2.f, y1), g_lui.brDim.get());
-            if (!r.empty()) {
-                fx += wl;
-                fx += LuiDrawViewBtn(fx, (y0 + y1) * 0.5f, g_lui.brDim.get());
-                LuiText(r.c_str(), fs, D2D1::RectF(fx, y0, W - 80.f, y1), g_lui.brDim.get());
+                ghmods::SplitFull(inst[cur].fullName, owner, nm);
+                auto f = latest.find(ghmods::Lower(inst[cur].fullName));
+                if (f != latest.end()) vm.detail.setElided(ghrepo::Widen(f->second.desc).c_str());
+                vm.detail2.setElided(LuiModsByLine(haveGame, game, owner, nm).c_str());
+            } else if (tab == kBrowse && cur < (int)found.size()) {
+                vm.detail.setElided(ghrepo::Widen(found[cur].desc).c_str());
+                vm.detail2.setElided(LuiModsByLine(haveGame, game, found[cur].owner, found[cur].name).c_str());
             }
         }
 
-        const float cx = W * 0.5f;
-        if (txt == kTxtProfile || txt == kTxtCode || txt == kTxtValue) {   // above the on-screen keyboard
-            const float cy = H * 0.3f;
-            dc->FillRectangle(D2D1::RectF(0, 0, W, H), g_lui.brBg.get());
-            dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 560, cy - 150, cx + 560, cy + 150), 16, 16), g_lui.brPanel.get());
-            const std::wstring head = txt == kTxtProfile ? std::wstring(L"NEW PROFILE") : txt == kTxtCode ? std::wstring(L"PROFILE CODE")
-                                    : cfgOpen >= 0 && sel[kSettings] < (int)cfgEs.size() ? ghrepo::Widen(cfgEs[sel[kSettings]].key)
-                                                                                          : std::wstring(L"SETTING");
-            LuiText(head.c_str(), g_lui.fmtTitle.get(),
-                    D2D1::RectF(cx - 530, cy - 140, cx + 530, cy - 60), g_lui.brAccent.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-            LuiText((g_pickQuery + L"_").c_str(), g_lui.fmtItem.get(), D2D1::RectF(cx - 530, cy - 40, cx + 530, cy + 20),
-                    g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-            LuiText(txt == kTxtCode ? L"The code a friend shared from r2modman or Gale.      ≡  Done      B  Cancel"
-                    : txt == kTxtValue ? (dSet2 + L"      ≡  Done      B  Cancel").c_str()
-                                       : L"≡  Done      B  Cancel",
-                    fs, D2D1::RectF(cx - 530, cy + 50, cx + 530, cy + 110), g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-        } else if (!ask.empty() || !busy.empty()) {
-            const float cy = H * 0.5f;
-            dc->FillRectangle(D2D1::RectF(0, 0, W, H), g_lui.brBg.get());
-            dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 560, cy - 160, cx + 560, cy + 160), 16, 16), g_lui.brPanel.get());
-            if (!ask.empty()) {
-                LuiText(askTitle.c_str(), g_lui.fmtTitle.get(), D2D1::RectF(cx - 530, cy - 140, cx + 530, cy - 60), g_lui.brWarn.get(),
-                        DWRITE_TEXT_ALIGNMENT_CENTER);
-                LuiText(ask.c_str(), g_lui.fmtItem.get(), D2D1::RectF(cx - 530, cy - 40, cx + 530, cy + 20), g_lui.brAccent.get(),
-                        DWRITE_TEXT_ALIGNMENT_CENTER);
-                LuiText(L"A  Yes            B  Cancel", fs, D2D1::RectF(cx - 530, cy + 70, cx + 530, cy + 130), g_lui.brFg.get(),
-                        DWRITE_TEXT_ALIGNMENT_CENTER);
-            } else {
-                std::wstring ln;
-                { std::lock_guard<std::mutex> lk(g_modsMapMu); ln = ghrepo::Widen(g_modsUiLine.substr(0, 120)); }
-                const LONG64 got = job->prog;
-                if (got > 0) {
-                    wchar_t mb[48];
-                    swprintf(mb, 48, L"   %.1f MB", (double)got / 1048576.0);
-                    ln += mb;
-                }
-                LuiText(busy.c_str(), g_lui.fmtItem.get(), D2D1::RectF(cx - 530, cy - 110, cx + 530, cy - 40), g_lui.brFg.get(),
-                        DWRITE_TEXT_ALIGNMENT_CENTER);
-                LuiText(ln.c_str(), fs, D2D1::RectF(cx - 530, cy - 20, cx + 530, cy + 40), g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-                LuiText(L"B  Cancel", fs, D2D1::RectF(cx - 530, cy + 80, cx + 530, cy + 130), g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-            }
+        if (tab == kInstalled) {
+            vm.chrome.addHint(GH_GLYPH_A, L"Turn on / off");
+            vm.chrome.addHint(GH_GLYPH_X, L"Remove");
+            vm.chrome.addHint(GH_GLYPH_Y, L"Update all");
+        } else if (tab == kProfiles) {
+            vm.chrome.addHint(GH_GLYPH_A, L"Use");
+            vm.chrome.addHint(GH_GLYPH_X, L"Delete");
+        } else if (tab == kSettings && cfgOpen >= 0) {
+            vm.chrome.addHint(GH_GLYPH_A, L"Change");
+            vm.chrome.addHint(GH_GLYPH_LEFTRIGHT, L"Step");
+            vm.chrome.addHint(GH_GLYPH_Y, L"Default");
+            vm.chrome.addHint(GH_GLYPH_B, L"Done");
+        } else if (tab == kSettings) {
+            vm.chrome.addHint(GH_GLYPH_A, L"Open");
+        } else {
+            vm.chrome.addHint(GH_GLYPH_A, L"Install");
+            vm.chrome.addHint(GH_GLYPH_Y, L"Search");
+            vm.chrome.addHint(GH_GLYPH_VIEW, L"Sort");
         }
-        dc->EndDraw();
+        if (!(tab == kSettings && cfgOpen >= 0)) {
+            vm.chrome.addHint(GH_GLYPH_LB, L"");
+            vm.chrome.addHint(GH_GLYPH_RB, L"Tabs");
+            vm.chrome.addHint(GH_GLYPH_B, L"Back");
+        }
+
+        GhUiPageList(vm);
+        g_lui.dc->EndDraw();
         LuiPresent();
     };
 
@@ -3134,7 +3435,7 @@ static void LauncherMods(const GhTitle& title)
             const bool loader = haveGame && ghmods::LoaderFor(game, m.fullName);
             const std::wstring name = LuiModsName(m.fullName.substr(m.fullName.rfind('-') + 1));
             if (pressed & XINPUT_GAMEPAD_A) {
-                if (!haveGame) { bad = true; status = L"Turning mods on and off needs Thunderstore's game list (no network?)"; }
+                if (!haveGame) { bad = true; status = L"Turning mods on and off needs a connection to Thunderstore"; }
                 else if (loader) { bad = true; status = L"BepInEx starts the other mods; pick No mods in Profiles to play without it"; }
                 else {
                     const bool to = !m.enabled;
@@ -3165,7 +3466,7 @@ static void LauncherMods(const GhTitle& title)
         }
         if (tab == kInstalled && (pressed & XINPUT_GAMEPAD_Y)) {
             if (profile.empty() || inst.empty()) { bad = true; status = L"Nothing to update"; }
-            else if (!haveIndex) { bad = true; status = L"Updating needs the mod index (no network?)"; }
+            else if (!haveIndex) { bad = true; status = L"Updating mods needs a connection to Thunderstore"; }
             else {
                 const ghmods::Game g = game;
                 const std::string prof = profile;
@@ -3378,86 +3679,117 @@ static int LuiAddonSignOutFor(const std::string& id)
     return -1;
 }
 
+// A Packages row, for the row provider below. The page builds the state clause
+// once per visible row rather than for all of them, so a long repository index
+// costs nothing to draw.
+struct LuiPkgCtx {
+    const std::vector<LuiPkgRow>* rows;
+};
+
+static void LuiPkgFillRow(void* ctx, int index, GhUiRow& out)
+{
+    out.reset();
+    const LuiPkgCtx* c = (const LuiPkgCtx*)ctx;
+    if (!c || !c->rows || index < 0 || index >= (int)c->rows->size()) return;
+    const LuiPkgRow& r = (*c->rows)[index];
+
+    if (r.member) {                      // the Membership row is not a package
+        out.title.set(L"Membership");
+        out.right.setElided(LuiEntBadge().c_str());
+        return;
+    }
+
+    out.title.setElided(ghrepo::Widen(r.name.empty() ? r.id : r.name).c_str());
+    // The type used to be a "(add-on)" suffix glued onto the name. As a badge
+    // it is the layout's to place, and U5's theme packages get a row that
+    // already reads correctly without touching this page again.
+    if (r.type != "title" && !r.type.empty()) {
+        out.hasBadge = true;
+        out.badge.label.set(ghrepo::Widen(r.type == "addon" ? "add-on" : r.type).c_str());
+        out.badge.role = GH_ROLE_TEXT_DIM;
+    }
+
+    std::wstring st;
+    // "not in repository" named our data structure. What the row means to the
+    // person reading it is that this one is on the console but is not on offer
+    // any more -- so it stays installed, and there is nothing to update to.
+    if (r.repo.empty())            st = L"installed " + ghrepo::Widen(r.inst) + L" · no longer offered";
+    else if (r.inst.empty())       st = L"available " + ghrepo::Widen(r.repo);
+    else if (r.repoV > r.instV)    st = L"update " + ghrepo::Widen(r.inst) + L" → " + ghrepo::Widen(r.repo);
+    else                           st = L"installed " + ghrepo::Widen(r.inst);
+    if (!r.account.empty()) st = L"signed in · " + r.account + L"   " + st;
+    out.right.setElided(st.c_str());
+}
+
 static void LuiDrawPackages(const std::vector<LuiPkgRow>& rows, int sel, const std::wstring& status,
                             bool statusBad, const std::wstring& busy, double frac,
                             const std::wstring& ask, bool askSignOut = false)
 {
-    auto* dc = g_lui.dc.get();
-    const float W = (float)g_lui.w, H = (float)g_lui.h;
-    dc->BeginDraw();
-    dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
-    LuiText(L"PACKAGES", g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
-    LuiText((L"\u25CF  " + status).c_str(), g_lui.fmtSmall.get(), D2D1::RectF(84, 140, W - 80, 182),
-            statusBad ? g_lui.brWarn.get() : g_lui.brAccent.get());
+    const int total = (int)rows.size();
 
-    const float x0 = 80, x1 = W - 80, rowH = 76, top = 228;
-    const int nfit = (int)((H - 90 - top) / rowH);
-    int total = (int)rows.size(), first = 0;
-    if (nfit > 0 && total > nfit) {
-        first = sel - nfit / 2; if (first < 0) first = 0; if (first > total - nfit) first = total - nfit;
-    }
-    for (int vi = 0; vi < nfit && first + vi < total; ++vi) {
-        const int i = first + vi; const LuiPkgRow& r = rows[i];
-        const float y = top + (float)vi * rowH; const bool cur = (i == sel);
-        dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x0, y, x1, y + rowH - 12), 10, 10),
-                                 cur ? g_lui.brSel.get() : g_lui.brPanel.get());
-        std::wstring name = ghrepo::Widen(r.name.empty() ? r.id : r.name) +
-                            (r.type == "addon" ? L"   (add-on)" : L"");
-        std::wstring sub;
-        if (r.member)                  { name = L"Membership"; sub = LuiEntBadge(); }
-        else if (r.repo.empty())       sub = L"installed " + ghrepo::Widen(r.inst) + L" \u00B7 not in repository";
-        else if (r.inst.empty())       sub = L"available " + ghrepo::Widen(r.repo);
-        else if (r.repoV > r.instV)    sub = L"update " + ghrepo::Widen(r.inst) + L" \u2192 " + ghrepo::Widen(r.repo);
-        else                           sub = L"installed " + ghrepo::Widen(r.inst);
-        if (!r.account.empty()) sub = L"signed in \u00B7 " + r.account + L"   " + sub;
-        LuiText(name.c_str(), g_lui.fmtItem.get(), D2D1::RectF(x0 + 28, y, x1 - 420, y + rowH - 12), g_lui.brFg.get());
-        LuiText(sub.c_str(), g_lui.fmtSmall.get(), D2D1::RectF(x1 - 460, y, x1 - 24, y + rowH - 12),
-                cur ? g_lui.brFg.get() : g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
-    }
-    if (rows.empty() && busy.empty())
-        LuiText(L"No packages", g_lui.fmtItem.get(), D2D1::RectF(x0, top, x1, top + 60), g_lui.brDim.get(),
-                DWRITE_TEXT_ALIGNMENT_CENTER);
-    const bool canSignOut = sel >= 0 && sel < total && rows[sel].addon >= 0 && !rows[sel].account.empty();
-    if (sel >= 0 && sel < total && rows[sel].member)
-        LuiText(L"A  Open      Y  Refresh      B  Back", g_lui.fmtSmall.get(),
-                D2D1::RectF(84, H - 70, W - 80, H - 30), g_lui.brDim.get());
-    else
-    LuiText(canSignOut ? L"A  Install / update      X  Remove      Y  Refresh      \u2261  Sign out      B  Back"
-                       : L"A  Install / update      X  Remove      Y  Refresh      B  Back", g_lui.fmtSmall.get(),
-            D2D1::RectF(84, H - 70, W - 80, H - 30), g_lui.brDim.get());
+    // An install or a repository fetch takes over the screen -- it already did,
+    // because the old panel painted the background opaque behind itself first.
+    // As a ProgressPage it is the same screen every other download uses.
+    if (!busy.empty() && ask.empty()) {
+        GhUiProgressVM pv;
+        pv.chrome.title.set(L"PACKAGES");
+        pv.chrome.statusDot  = true;
+        pv.chrome.statusRole = statusBad ? GH_ROLE_WARN : GH_ROLE_ACCENT;
+        pv.chrome.status.setElided(status.c_str());
+        pv.chrome.addHint(GH_GLYPH_B, L"Cancel");
+        pv.heading.setElided(busy.c_str());
+        pv.frac = (frac >= 0) ? GhClampF((float)frac, 0.f, 1.f) : -1.f;
 
-    if (!busy.empty() || !ask.empty()) {
-        dc->FillRectangle(D2D1::RectF(0, 0, W, H), g_lui.brBg.get());
-        const float cx = W * 0.5f, cy = H * 0.5f;
-        dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 460, cy - 160, cx + 460, cy + 160), 16, 16),
-                                 g_lui.brPanel.get());
-        if (!ask.empty()) {
-            LuiText(askSignOut ? L"SIGN OUT" : L"REMOVE", g_lui.fmtTitle.get(),
-                    D2D1::RectF(cx - 430, cy - 140, cx + 430, cy - 60), g_lui.brWarn.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-            LuiText(ask.c_str(), g_lui.fmtItem.get(), D2D1::RectF(cx - 430, cy - 40, cx + 430, cy + 20),
-                    g_lui.brAccent.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-            if (askSignOut)
-                LuiText(L"Greenhouse forgets this sign-in. The next time it starts, scan a QR code to sign in again.",
-                        g_lui.fmtSmall.get(), D2D1::RectF(cx - 430, cy + 20, cx + 430, cy + 64), g_lui.brDim.get(),
-                        DWRITE_TEXT_ALIGNMENT_CENTER);
-            LuiText(askSignOut ? L"A  Yes, sign out            B  Cancel" : L"A  Yes, remove            B  Cancel",
-                    g_lui.fmtSmall.get(), D2D1::RectF(cx - 430, cy + 70, cx + 430, cy + 130), g_lui.brFg.get(),
-                    DWRITE_TEXT_ALIGNMENT_CENTER);
-        } else {
-            LuiText(busy.c_str(), g_lui.fmtItem.get(), D2D1::RectF(cx - 430, cy - 110, cx + 430, cy - 40),
-                    g_lui.brFg.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-            if (frac >= 0) {
-                const float bx0 = cx - 400, bx1 = cx + 400, by = cy, bh = 32;
-                dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(bx0, by, bx1, by + bh), 8, 8), g_lui.brBg.get());
-                if (frac > 0.001)
-                    dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(bx0, by, bx0 + (bx1 - bx0) * (float)(frac > 1 ? 1 : frac),
-                                                                           by + bh), 8, 8), g_lui.brAccent.get());
-            }
-            LuiText(L"B  Cancel", g_lui.fmtSmall.get(), D2D1::RectF(cx - 430, cy + 80, cx + 430, cy + 130),
-                    g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-        }
+        g_lui.dc->BeginDraw();
+        GhUiPageProgress(pv);
+        g_lui.dc->EndDraw();
+        return;
     }
-    dc->EndDraw();
+
+    LuiPkgCtx pctx{ &rows };
+    GhUiListVM vm;
+    vm.chrome.title.set(L"PACKAGES");
+    vm.chrome.statusDot  = true;
+    vm.chrome.statusRole = statusBad ? GH_ROLE_WARN : GH_ROLE_ACCENT;
+    vm.chrome.status.setElided(status.c_str());
+
+    vm.count = total;
+    vm.sel   = sel;
+    vm.fill  = &LuiPkgFillRow;
+    vm.ctx   = &pctx;
+    vm.emptyText.set(L"Nothing to install");
+    vm.emptySub.set(L"Nothing is installed on this console, and there is nothing on offer yet.");
+
+    if (sel >= 0 && sel < total && rows[sel].member) {
+        vm.chrome.addHint(GH_GLYPH_A, L"Open");
+        vm.chrome.addHint(GH_GLYPH_Y, L"Refresh");
+        vm.chrome.addHint(GH_GLYPH_B, L"Back");
+    } else {
+        vm.chrome.addHint(GH_GLYPH_A, L"Install / update");
+        vm.chrome.addHint(GH_GLYPH_X, L"Remove");
+        vm.chrome.addHint(GH_GLYPH_Y, L"Refresh");
+        if (sel >= 0 && sel < total && rows[sel].addon >= 0 && !rows[sel].account.empty())
+            vm.chrome.addHint(GH_GLYPH_START, L"Sign out");
+        vm.chrome.addHint(GH_GLYPH_B, L"Back");
+    }
+
+    g_lui.dc->BeginDraw();
+    GhUiPageList(vm);
+
+    if (!ask.empty()) {
+        GhUiModalVM mv;
+        mv.overPage = false;             // the old panel hid the list behind it
+        mv.danger   = true;
+        mv.heading.set(askSignOut ? L"SIGN OUT" : L"REMOVE");
+        mv.detail.setElided(ask.c_str());
+        if (askSignOut)
+            mv.note.set(L"Greenhouse forgets this sign-in. The next time it starts, "
+                        L"scan a QR code to sign in again.");
+        mv.addChoice(askSignOut ? L"A  Yes, sign out" : L"A  Yes, remove");
+        mv.addChoice(L"B  Cancel");
+        GhUiPageModal(mv);
+    }
+    g_lui.dc->EndDraw();
 }
 
 // ---------------------------------------------------------------------------
@@ -3520,31 +3852,23 @@ static void LuiEntStart()
     }).detach();
 }
 
-// LuiDrawLogin's layout with a second, smaller line; with no QR the two lines sit
-// in the middle of the screen instead of under an empty panel.
+// The sign-in archetype with a second, smaller line; with no QR the two lines
+// sit in the middle of the screen instead of under an empty panel, which the
+// QrPage layout does on its own once `modules` is null.
 static void LuiDrawEnt(const wchar_t* title, const uint8_t* m, int n,
                        const std::wstring& line1, const std::wstring& line2, const wchar_t* hint)
 {
-    auto* dc = g_lui.dc.get();
-    const float W = (float)g_lui.w, H = (float)g_lui.h;
-    dc->BeginDraw();
-    dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
-    LuiText(L"GREENHOUSE", g_lui.fmtTitle.get(), D2D1::RectF(80, 44, W - 80, 140), g_lui.brFg.get());
-    LuiText(title, g_lui.fmtItem.get(), D2D1::RectF(84, 150, W - 80, 206), g_lui.brAccent.get(),
-            DWRITE_TEXT_ALIGNMENT_CENTER);
-    float y = H * 0.5f - 60.f;
-    if (m && n > 0 && n <= 177) {
-        const float cy = H * 0.50f, boxHalf = 280.f;
-        LuiBlitQr(m, n, W * 0.5f, cy, 2 * boxHalf);
-        y = cy + boxHalf + 24.f;
-    }
-    LuiText(line1.c_str(), g_lui.fmtItem.get(), D2D1::RectF(80, y, W - 80, y + 60), g_lui.brFg.get(),
-            DWRITE_TEXT_ALIGNMENT_CENTER);
-    LuiText(line2.c_str(), g_lui.fmtSmall.get(), D2D1::RectF(80, y + 60, W - 80, y + 100), g_lui.brDim.get(),
-            DWRITE_TEXT_ALIGNMENT_CENTER);
-    LuiText(hint ? hint : L"", g_lui.fmtSmall.get(), D2D1::RectF(80, H - 70, W - 80, H - 30),
-            g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-    dc->EndDraw();
+    GhUiQrVM vm;
+    vm.chrome.title.set(L"GREENHOUSE");
+    vm.chrome.footer.set(hint ? hint : L"");
+    vm.heading.set(title ? title : L"Membership");
+    if (m && n > 0 && n <= 177) { vm.modules = m; vm.size = n; }
+    vm.caption.setElided(line1.c_str());
+    vm.sub.setElided(line2.c_str());
+
+    g_lui.dc->BeginDraw();
+    GhUiPageQr(vm);
+    g_lui.dc->EndDraw();
 }
 
 // The pad's newly pressed buttons this frame (B/A/X), with the events pumped.
@@ -3589,7 +3913,9 @@ static bool LuiEntLink(WORD& prev)
         Diag("ENT link: no membership server configured");
         for (;;) {
             if (LuiEntPressed(prev) & XINPUT_GAMEPAD_B) return false;
-            LuiDrawEnt(L"Membership", nullptr, 0, L"No membership server is configured in this build",
+            // In a shipped build this state cannot be reached, so the sentence
+            // is about the service rather than about which binary is running.
+            LuiDrawEnt(L"Membership", nullptr, 0, L"Memberships are unavailable right now — try again later",
                        L"", L"B  Back");
             LuiPresent(); Sleep(30);
         }
@@ -3817,7 +4143,18 @@ static void LauncherPackages()
     };
     auto fetch = [&] {
         if (cfg.indexUrl.empty()) {
-            status = L"No repository: link a membership, or put the URL of its index.json in gh_repo_url.txt"; bad = true;
+            // The old line told the user to create a file. The membership link
+            // is the only route a person has; the file is ours, for testing.
+            //
+            // But a MEMBER reading "link a membership" is being told to do a
+            // thing they have already done -- which is what 0.0.933.0 showed on
+            // the TV, because a dev-minted token carries no server claim. So ask
+            // the entitlement first: it knows whether the advice applies.
+            const ghent::St st = ghent::Current().st;
+            status = (st == ghent::St::Entitled || st == ghent::St::Grace)
+                       ? std::wstring(L"Nothing is on offer right now")
+                       : std::wstring(L"Link a membership to see what there is to install");
+            bad = true;
             Diag("REPO page: no repository (gh_repo_url.txt absent, no membership server)");
             buildRows(); return;
         }
@@ -3843,11 +4180,18 @@ static void LauncherPackages()
                     haveIdx = job->ok;
                     if (job->ok) {
                         idx = job->idx; bad = false;
-                        status = L"Signed index OK \u00B7 serial " + std::to_wstring(idx.serial) + L" \u00B7 key " +
-                                 ghrepo::Widen(job->key);
+                        // The signature check is the point of this page, so the
+                        // user is told it passed -- but the serial and the key
+                        // fingerprint are ours, and only a dev build shows them.
+                        status = L"Checked and signed by Greenhouse";
+#ifndef GH_RELEASE
+                        status += L" \u00B7 serial " + std::to_wstring(idx.serial) +
+                                  L" \u00B7 key " + ghrepo::Widen(job->key);
+#endif
                         g_repoUpdates = ghrepo::CountUpdates(ghrepo::LoadState(cfg.stateDir), idx);
                     } else {
-                        bad = true; status = L"Repository refused: " + ghrepo::Widen(job->why);
+                        // "Repository" is our word for it; the user sees a list.
+                        bad = true; status = L"This list could not be trusted: " + ghrepo::Widen(job->why);
                         Diag("REPO page fetch FAILED: " + job->why);
                     }
                 } else {
@@ -3856,7 +4200,14 @@ static void LauncherPackages()
                         status = (was == kInstall ? L"Install failed: " : L"Remove failed: ") + ghrepo::Widen(job->why);
                         Diag(std::string("REPO page ") + (was == kInstall ? "install " : "remove ") + target + " FAILED: " + job->why);
                     } else {
-                        bool title = false; for (const auto& r : rows) if (r.id == target && r.type == "title") title = true;
+                        bool title = false, theme = false;
+                        for (const auto& r : rows) if (r.id == target) {
+                            if (r.type == "title") title = true;
+                            if (r.type == "theme") theme = true;
+                        }
+                        // \u00A763e: a theme takes effect at once -- it is data, and
+                        // re-reading it is a rescan and a re-bake, not a restart.
+                        if (theme) LuiReloadThemes();
                         status = (was == kInstall ? L"Installed " : L"Removed ") + ghrepo::Widen(target) +
                                  (title ? L" \u00B7 applies the next time Greenhouse starts" : L"");
                         if (haveIdx) g_repoUpdates = ghrepo::CountUpdates(ghrepo::LoadState(cfg.stateDir), idx);
@@ -3882,7 +4233,7 @@ static void LauncherPackages()
                 bad = !rc;
                 status = rc ? L"Signed out of " + ghrepo::Widen(askRow.name.empty() ? askRow.id : askRow.name) +
                                   L" \u00B7 sign in again the next time Greenhouse starts"
-                            : L"Sign out failed (see the log)";
+                            : L"Could not sign out — try again";
                 ask.clear(); askSignOut = false;
                 buildRows();
             } else if (pressed & XINPUT_GAMEPAD_B) { ask.clear(); askSignOut = false; Diag("REPO page sign-out cancelled"); }
@@ -3954,12 +4305,11 @@ static bool LauncherShowCrash(const std::wstring& title, const std::wstring& rea
         }
     }
     if (!LuiInit()) return false;
-    const float W = (float)g_lui.w, H = (float)g_lui.h;
-    const float lineH = 20.f, top = 220.f, bot = H - 80.f;
-    const int nfit = (int)((bot - top) / lineH);
-    int scroll = 0;
+    // How many log lines fit is the LAYOUT's answer, not this page's, so it is
+    // settled on the first frame once the chrome has handed back a body rect.
+    int nfit = 1, scroll = 0;
+    bool placed = false;
     int n = (int)lines.size();
-    if (n > nfit) scroll = n - nfit;          // start at the tail (the crash)
     WORD prev = 0xFFFF;
     DWORD lastNav = 0;
     // Log text is arbitrary bytes (stack dumps run to kilobytes; game logs
@@ -4040,41 +4390,59 @@ static bool LauncherShowCrash(const std::wstring& title, const std::wstring& rea
         if (alt && (pressed & XINPUT_GAMEPAD_A)) return true;
         if (pressed & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B)) return false;
 
+        const bool fail = (title.find(L"FAIL") != std::wstring::npos ||
+                           title.find(L"CRASH") != std::wstring::npos);
+        GhUiChrome ch;
+        ch.title.setElided(title.c_str());
+        ch.titleRole  = fail ? GH_ROLE_WARN : GH_ROLE_TEXT_ON_BG;
+        ch.status.setElided(reason.c_str());
+        // The reason continues the title, so it reads as plain text under it.
+        // It used to be GH_ROLE_ACCENT, which on every theme is the colour of
+        // something having gone RIGHT -- a green sentence under a red headline.
+        ch.statusRole = GH_ROLE_TEXT_ON_BG;
+        // What follows is a log, and saying so is enough. Naming the file it
+        // came out of told the user about our filesystem, not about their game.
+        ch.subline.set(logLabel ? logLabel : L"What the game reported, most recent last");
+        if (alt) ch.addHint(GH_GLYPH_A, alt);
+        if (alt) ch.addHint(GH_GLYPH_B, L"Back to library");
+        else     ch.addHint(GH_GLYPH_A, L"Back to library");    // A or B, one hint
+        ch.addHint(GH_GLYPH_UPDOWN, L"Scroll");
+
+        // The chrome runs before the line count is known, so the viewport's
+        // geometry decides the counter -- which means the counter is drawn
+        // after, into the band the chrome left for it.
         auto* dc = g_lui.dc.get();
         dc->BeginDraw();
-        dc->Clear(D2D1::ColorF(0x0E1116, 1.f));
-        bool fail = (title.find(L"FAIL") != std::wstring::npos ||
-                     title.find(L"CRASH") != std::wstring::npos);
-        LuiText(title.c_str(), g_lui.fmtTitle.get(), D2D1::RectF(80, 36, W - 80, 120),
-                fail ? g_lui.brWarn.get() : g_lui.brFg.get());
-        LuiText(reason.c_str(), g_lui.fmtSmall.get(), D2D1::RectF(84, 124, W - 80, 172),
-                g_lui.brAccent.get());
-#ifdef GH_RELEASE
-        LuiText(logLabel ? logLabel : L"recent log  (last lines)", g_lui.fmtSmall.get(),
-#else
-        LuiText(logLabel ? logLabel : L"loader_diag.txt  (last lines)", g_lui.fmtSmall.get(),
-#endif
-                D2D1::RectF(84, 176, W - 80, 212), g_lui.brDim.get());
+        const D2D1_RECT_F body = GhUiPageChrome(ch);
 
-        g_lui.fmtLog->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-        g_lui.fmtLog->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        // The log viewport. Its pitch is the theme's log line height, so raising
+        // the text size shows fewer lines instead of overlapping them.
+        const float lineH = GhUiLineHeight(GH_TYPE_LOG);
+        nfit = (int)(GhUiH(body) / lineH);
+        if (nfit < 1) nfit = 1;
+        const int maxs = (n > nfit) ? n - nfit : 0;
+        if (!placed) { placed = true; scroll = maxs; }     // open at the tail
+        if (scroll > maxs) scroll = maxs;
+        if (scroll < 0)    scroll = 0;
+
         int last = scroll + nfit;
         if (last > n) last = n;
         for (int i = scroll; i < last; ++i) {
-            float y = top + (float)(i - scroll) * lineH;
-            std::wstring w = widen(lines[i]);
-            dc->DrawText(w.c_str(), (UINT32)w.size(), g_lui.fmtLog.get(),
-                         D2D1::RectF(84, y, W - 80, y + lineH), g_lui.brFg.get());
+            const float y = body.top + (float)(i - scroll) * lineH;
+            const std::wstring w = widen(lines[i]);
+            GhUiTextDraw(w.c_str(), GH_TYPE_LOG,
+                         D2D1::RectF(body.left, y, body.right, y + lineH),
+                         GH_ROLE_TEXT_ON_BG, DWRITE_TEXT_ALIGNMENT_LEADING,
+                         DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
         }
         if (n > nfit) {
             wchar_t pos[40];
             swprintf(pos, 40, L"%d–%d / %d", scroll + 1, last, n);
-            LuiText(pos, g_lui.fmtSmall.get(), D2D1::RectF(80, 176, W - 80, 212),
-                    g_lui.brDim.get(), DWRITE_TEXT_ALIGNMENT_TRAILING);
+            GhUiTextDraw(pos, GH_TYPE_SMALL,
+                         D2D1::RectF(body.left, body.top - 50.f * g_ghUi.textScale,
+                                     body.right, body.top - 10.f * g_ghUi.textScale),
+                         GH_ROLE_TEXT_DIM_ON_BG, DWRITE_TEXT_ALIGNMENT_TRAILING);
         }
-        const std::wstring foot = alt ? std::wstring(L"A  ") + alt + L"      B  Back to library      \u25B2 \u25BC  Scroll log"
-                                      : std::wstring(L"A / B  Back to library      \u25B2 \u25BC  Scroll log");
-        LuiText(foot.c_str(), g_lui.fmtSmall.get(), D2D1::RectF(84, H - 70, W - 80, H - 30), g_lui.brDim.get());
         dc->EndDraw();
         LuiPresent();
         Sleep(16);
@@ -4176,8 +4544,11 @@ static bool LuiModsCrashScreen(const std::wstring& title, const std::wstring& re
     lines.push_back(tail.empty() ? "---- " + rel8 + ": none written ----"
                                  : "---- " + rel8 + " (last " + std::to_string(tail.size()) + " lines) ----");
     lines.insert(lines.end(), tail.begin(), tail.end());
-    const std::wstring label = L"loader log, then " + rel;
-    const bool v = LauncherShowCrash(title, reason, lines, L"Start without mods", label.c_str());
+    // The mod loader's own log is appended after ours, and the separator line
+    // inside the body already names the file for whoever is reading the mod's
+    // output. The header says what the band is, not where it lives on disk.
+    const bool v = LauncherShowCrash(title, reason, lines, L"Start without mods",
+                                     L"What Greenhouse and the mods reported");
     Diag(std::string("MODS crash screen: ") + (v ? "Start without mods" : "back to library"));
     return v;
 }
@@ -4821,266 +5192,271 @@ static void OverlayTick()
     OverlayDraw();
 }
 
+// ---------------------------------------------------------------------------
+// The overlay's panels, painted through the theme
+// ---------------------------------------------------------------------------
+// THE GEOMETRY HERE IS NOT THEME-OWNED, AND THAT IS DELIBERATE. Everything
+// below paints into a 920x540 bitmap that is later COPIED over the guest's back
+// buffer, and some of what sits on top of it -- friend rows, profile rows,
+// keycaps -- are separate textures baked at fixed sizes and copied to fixed
+// offsets (kOvlRowX / kOvlRowY0 / kOvlRowH, in OverlayBlit). Paint and blit
+// therefore share one set of coordinates, and a theme that moved the panel's
+// rows without moving the blit would tear the page in half. So a theme changes
+// how the overlay LOOKS -- colour, type, radius, gloss, inner edge, keycaps --
+// and the overlay's own layout stays where the blit can find it. (A structural
+// theme that wants different overlay geometry bakes at its own size instead;
+// that means moving kOvl* onto the theme, which is a change to the bake path,
+// and this phase deliberately leaves the bake path alone.)
+//
+// Two further consequences of "copied, not blended":
+//   * a panel is cleared OPAQUE, to GH_ROLE_PANEL -- it floats over a running
+//     game, so its text uses the on-panel roles (TEXT / TEXT_DIM) and not the
+//     _ON_BG pair. That distinction is the whole reason those four roles exist.
+//   * a row or keycap texture is filled SQUARE, edge to edge. CopySubresource-
+//     Region does not blend, so a rounded corner would arrive as the
+//     transparent pixel behind it rather than as the game.
+static const float kOvlPad    = 28.f;   // the panel's gutter; equals kOvlRowX
+static const float kOvlEdge   = 3.f;    // the accent rule down each side
+static const float kOvlTopBar = 6.f;
+static const float kOvlSubY   = 96.f;   // the line under the wordmark
+static const float kOvlFootY  = 64.f;   // the hint band, measured up from kOvlH
+
+// A panel paint in progress: the canvas override, the opaque clear, and the
+// flushes the bake needs afterwards. A scope guard because several of these
+// paints have early returns.
+struct OverlayPaint {
+    GhUiCanvasScope canvas;
+    explicit OverlayPaint(float w = kOvlW, float h = kOvlH, bool clear = true)
+        : canvas(w, h)
+    {
+        g_lui.dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        g_lui.dc->BeginDraw();
+        if (clear) g_lui.dc->Clear(GhUiColorOf(GhThemeCurrent(), GH_ROLE_PANEL));
+        else       g_lui.dc->Clear(D2D1::ColorF(0, 0.f));
+    }
+    ~OverlayPaint()
+    {
+        g_lui.dc->EndDraw();
+        g_lui.dc->Flush();
+        if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+    }
+    OverlayPaint(const OverlayPaint&)            = delete;
+    OverlayPaint& operator=(const OverlayPaint&) = delete;
+};
+
+// The frame and the wordmark. Assumes an open draw, which is why it is not an
+// OverlayPaint of its own: every panel calls it first.
 static void OverlayPaintChrome()
 {
-    auto* dc = g_lui.dc.get();
-    const float W = kOvlW, H = kOvlH;
-    dc->FillRectangle(D2D1::RectF(0, 0, W, 6.f), g_lui.brAccent.get());
-    dc->FillRectangle(D2D1::RectF(0, 0, 3.f, H), g_lui.brAccent.get());
-    dc->FillRectangle(D2D1::RectF(W - 3.f, 0, W, H), g_lui.brAccent.get());
-    dc->FillRectangle(D2D1::RectF(0, H - 3.f, W, H), g_lui.brAccent.get());
-    LuiText(L"GREENHOUSE", g_lui.fmtTitle.get(),
-            D2D1::RectF(36, 16, W - 36, 96), g_lui.brFg.get());
+    GhUiFill(D2D1::RectF(0, 0, kOvlW, kOvlTopBar), GH_ROLE_ACCENT, 0.f);
+    GhUiFill(D2D1::RectF(0, 0, kOvlEdge, kOvlH), GH_ROLE_ACCENT, 0.f);
+    GhUiFill(D2D1::RectF(kOvlW - kOvlEdge, 0, kOvlW, kOvlH), GH_ROLE_ACCENT, 0.f);
+    GhUiFill(D2D1::RectF(0, kOvlH - kOvlEdge, kOvlW, kOvlH), GH_ROLE_ACCENT, 0.f);
+    GhUiTextDraw(L"GREENHOUSE", GH_TYPE_TITLE,
+                 D2D1::RectF(36.f, 16.f, kOvlW - 36.f, 96.f), GH_ROLE_TEXT);
+}
+
+// The line under the wordmark: what this panel is.
+static void OverlayPaintSub(const wchar_t* s)
+{
+    GhUiTextDraw(s, GH_TYPE_SMALL,
+                 D2D1::RectF(40.f, kOvlSubY, kOvlW - 40.f, kOvlSubY + 40.f), GH_ROLE_TEXT_DIM);
+}
+
+// The hint band at the foot of a panel. Hints, not a pre-written sentence, so
+// the keycap motif and the console's own control names ("MENU", the View
+// button's two squares) come from the same place as every page's footer -- and
+// so the dim role is the on-PANEL one, because that is what this sits on.
+static void OverlayPaintHints(const GhUiHint* h, int n, float footY = kOvlFootY)
+{
+    GhUiHintBar(h, n, D2D1::RectF(40.f, kOvlH - footY, kOvlW - 40.f, kOvlH - 20.f),
+                DWRITE_TEXT_ALIGNMENT_LEADING, GH_ROLE_TEXT_DIM);
+}
+
+// A row inside a panel -- these ARE part of the 920x540 bitmap, so they get the
+// theme's row treatment (radius, gloss, inner edge) exactly like a launcher
+// page's rows. The trailing cell keeps the accent for "ON", because that is the
+// one piece of state on the menu, but takes the on-selection text role rather
+// than the old dim grey when its row is selected: dim-on-selection was legible
+// against one hardcoded blue and is not legible in general.
+static void OverlayPaintRow(float y, float h, bool on, const wchar_t* label,
+                            const wchar_t* trail, bool accentTrail)
+{
+    const D2D1_RECT_F box = D2D1::RectF(kOvlPad, y, kOvlW - kOvlPad, y + h);
+    GhUiRowBg(box, on);
+    GhUiTextDraw(label, GH_TYPE_ITEM,
+                 D2D1::RectF(box.left + 20.f, y, box.right - 192.f, y + h),
+                 GhUiRowTextRole(on, GH_ROLE_TEXT_DIM));
+    if (trail && *trail)
+        GhUiTextDraw(trail, GH_TYPE_ITEM,
+                     D2D1::RectF(box.right - 182.f, y, box.right - 20.f, y + h),
+                     accentTrail ? GH_ROLE_ACCENT : GhUiRowTextRole(on, GH_ROLE_TEXT_DIM),
+                     DWRITE_TEXT_ALIGNMENT_TRAILING);
+}
+
+// A full-width button inside a panel: the confirm and the delete prompt. Filled
+// in a role the theme owns, with its text in the on-fill role.
+static void OverlayPaintButton(float top, float bot, int fillRole, const wchar_t* label)
+{
+    const D2D1_RECT_F r = D2D1::RectF(kOvlPad, top, kOvlW - kOvlPad, bot);
+    GhUiFill(r, fillRole, GhThemeCurrent().radius);
+    GhUiTextDraw(label, GH_TYPE_ITEM,
+                 D2D1::RectF(r.left + 20.f, top, r.right - 20.f, bot), GH_ROLE_TEXT_ON_SEL);
 }
 
 static void OverlayPaintMenu(int sel, bool remapOn)
 {
-    auto* dc = g_lui.dc.get();
-    const float W = kOvlW, H = kOvlH;
-    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-    dc->BeginDraw();
-    dc->Clear(D2D1::ColorF(0x161B22, 1.f));
+    OverlayPaint p;
     OverlayPaintChrome();
-    LuiText(L"Start + Select to close", g_lui.fmtSmall.get(),
-            D2D1::RectF(40, 96, W - 40, 136), g_lui.brDim.get());
+    // Those buttons have been called Menu and View on this console for a decade
+    // -- GH_GLYPH_START already spells the first one "MENU". A baked panel is
+    // plain text, so this one says the names rather than drawing the glyphs.
+    OverlayPaintSub(L"Menu + View to close");
     const float rowH = 64.f;
-    auto row = [&](float y, bool on, const wchar_t* label, const wchar_t* trail, bool accentTrail) {
-        D2D1_RECT_F r = D2D1::RectF(28, y, W - 28, y + rowH);
-        dc->FillRectangle(r, on ? g_lui.brSel.get() : g_lui.brPanel.get());
-        LuiText(label, g_lui.fmtItem.get(),
-                D2D1::RectF(48, y, W - 220, y + rowH),
-                on ? g_lui.brFg.get() : g_lui.brDim.get());
-        if (trail)
-            LuiText(trail, g_lui.fmtItem.get(),
-                    D2D1::RectF(W - 210, y, W - 48, y + rowH),
-                    on ? (accentTrail ? g_lui.brAccent.get() : g_lui.brDim.get())
-                        : g_lui.brDim.get(),
-                    DWRITE_TEXT_ALIGNMENT_TRAILING);
-    };
-    row(140.f, sel == 0, L"Controller remap", remapOn ? L"ON" : L"OFF", remapOn);
-    row(208.f, sel == 1, L"Input settings", nullptr, false);
+    OverlayPaintRow(140.f, rowH, sel == 0, L"Controller remap", remapOn ? L"ON" : L"OFF", remapOn);
+    OverlayPaintRow(208.f, rowH, sel == 1, L"Input settings", nullptr, false);
     if (GhSteamRuntimeProvided()) {
-        row(276.f, sel == 2, L"Invite friends", nullptr, false);
-        row(344.f, sel == 3, L"Return to Greenhouse", nullptr, false);
-    } else row(276.f, sel == 3, L"Return to Greenhouse", nullptr, false);
-    LuiText(L"A  Select      B  Close",
-            g_lui.fmtSmall.get(),
-            D2D1::RectF(40, H - 64, W - 40, H - 20), g_lui.brDim.get());
-    dc->EndDraw();
-    dc->Flush();
-    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+        OverlayPaintRow(276.f, rowH, sel == 2, L"Invite friends", nullptr, false);
+        OverlayPaintRow(344.f, rowH, sel == 3, L"Return to Greenhouse", nullptr, false);
+    } else {
+        OverlayPaintRow(276.f, rowH, sel == 3, L"Return to Greenhouse", nullptr, false);
+    }
+    const GhUiHint h[] = { { GH_GLYPH_A, L"Select" }, { GH_GLYPH_B, L"Close" } };
+    OverlayPaintHints(h, 2);
 }
 
 static void OverlayPaintConfirm()
 {
-    auto* dc = g_lui.dc.get();
-    const float W = kOvlW, H = kOvlH;
-    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-    dc->BeginDraw();
-    dc->Clear(D2D1::ColorF(0x161B22, 1.f));
+    OverlayPaint p;
     OverlayPaintChrome();
-    LuiText(L"Leave this game?", g_lui.fmtItem.get(),
-            D2D1::RectF(40, 160, W - 40, 230), g_lui.brFg.get());
-    LuiText(L"Unsaved progress in the title may be lost.", g_lui.fmtSmall.get(),
-            D2D1::RectF(40, 230, W - 40, 280), g_lui.brDim.get());
-    D2D1_RECT_F yes = D2D1::RectF(28, 310, W - 28, 390);
-    dc->FillRectangle(yes, g_lui.brWarn.get());
-    LuiText(L"A   Yes, return to Greenhouse", g_lui.fmtItem.get(),
-            D2D1::RectF(48, 310, W - 48, 390), g_lui.brFg.get());
-    LuiText(L"B   Cancel", g_lui.fmtSmall.get(),
-            D2D1::RectF(40, H - 64, W - 40, H - 20), g_lui.brDim.get());
-    dc->EndDraw();
-    dc->Flush();
-    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+    GhUiTextDraw(L"Leave this game?", GH_TYPE_ITEM,
+                 D2D1::RectF(40.f, 160.f, kOvlW - 40.f, 230.f), GH_ROLE_TEXT);
+    GhUiTextDraw(L"Unsaved progress in the title may be lost.", GH_TYPE_SMALL,
+                 D2D1::RectF(40.f, 230.f, kOvlW - 40.f, 280.f), GH_ROLE_TEXT_DIM);
+    OverlayPaintButton(310.f, 390.f, GH_ROLE_WARN, L"A   Yes, return to Greenhouse");
+    const GhUiHint h[] = { { GH_GLYPH_B, L"Cancel" } };
+    OverlayPaintHints(h, 1);
 }
 
 static void OverlayPaintInputHub(int sel)
 {
-    auto* dc = g_lui.dc.get();
-    const float W = kOvlW, H = kOvlH;
-    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-    dc->BeginDraw();
-    dc->Clear(D2D1::ColorF(0x161B22, 1.f));
+    OverlayPaint p;
     OverlayPaintChrome();
-    LuiText(L"Controller input", g_lui.fmtSmall.get(),
-            D2D1::RectF(40, 96, W - 40, 136), g_lui.brDim.get());
+    OverlayPaintSub(L"Controller input");
     const float rowH = 72.f;
-    auto row = [&](float y, bool on, const wchar_t* label) {
-        dc->FillRectangle(D2D1::RectF(28, y, W - 28, y + rowH),
-                          on ? g_lui.brSel.get() : g_lui.brPanel.get());
-        LuiText(label, g_lui.fmtItem.get(),
-                D2D1::RectF(48, y, W - 48, y + rowH),
-                on ? g_lui.brFg.get() : g_lui.brDim.get());
-    };
-    row(148.f, sel == 0, L"Profiles");
-    row(228.f, sel == 1, L"Layout");
-    row(308.f, sel == 2, L"Options");
-    LuiText(L"A  Open      B  Back",
-            g_lui.fmtSmall.get(),
-            D2D1::RectF(40, H - 64, W - 40, H - 20), g_lui.brDim.get());
-    dc->EndDraw();
-    dc->Flush();
-    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+    OverlayPaintRow(148.f, rowH, sel == 0, L"Profiles", nullptr, false);
+    OverlayPaintRow(228.f, rowH, sel == 1, L"Layout",   nullptr, false);
+    OverlayPaintRow(308.f, rowH, sel == 2, L"Options",  nullptr, false);
+    const GhUiHint h[] = { { GH_GLYPH_A, L"Open" }, { GH_GLYPH_B, L"Back" } };
+    OverlayPaintHints(h, 2);
 }
 
-static void OverlayPaintListChrome(const wchar_t* sub, const wchar_t* hints)
+// The frame for a page whose rows are blitted on top of it as their own
+// textures: Profiles, Layout, Options.
+static void OverlayPaintListChrome(const wchar_t* sub, const GhUiHint* hints, int n)
 {
-    auto* dc = g_lui.dc.get();
-    const float W = kOvlW, H = kOvlH;
-    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-    dc->BeginDraw();
-    dc->Clear(D2D1::ColorF(0x161B22, 1.f));
+    OverlayPaint p;
     OverlayPaintChrome();
-    LuiText(sub, g_lui.fmtSmall.get(),
-            D2D1::RectF(40, 96, W - 40, 136), g_lui.brDim.get());
-    LuiText(hints, g_lui.fmtSmall.get(),
-            D2D1::RectF(40, H - 64, W - 40, H - 20), g_lui.brDim.get());
-    dc->EndDraw();
-    dc->Flush();
-    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+    OverlayPaintSub(sub);
+    OverlayPaintHints(hints, n);
 }
 
 static void OverlayPaintDelAsk()
 {
-    auto* dc = g_lui.dc.get();
-    const float W = kOvlW, H = kOvlH;
-    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-    dc->BeginDraw();
-    dc->Clear(D2D1::ColorF(0x161B22, 1.f));
+    OverlayPaint p;
     OverlayPaintChrome();
-    LuiText(L"Delete this profile?", g_lui.fmtItem.get(),
-            D2D1::RectF(40, 160, W - 40, 230), g_lui.brFg.get());
-    LuiText(L"Games using it fall back to Mouse.", g_lui.fmtSmall.get(),
-            D2D1::RectF(40, 230, W - 40, 280), g_lui.brDim.get());
-    dc->FillRectangle(D2D1::RectF(28, 310, W - 28, 390), g_lui.brWarn.get());
-    LuiText(L"A   Delete      B   Cancel", g_lui.fmtItem.get(),
-            D2D1::RectF(48, 310, W - 48, 390), g_lui.brFg.get());
-    dc->EndDraw();
-    dc->Flush();
-    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+    GhUiTextDraw(L"Delete this profile?", GH_TYPE_ITEM,
+                 D2D1::RectF(40.f, 160.f, kOvlW - 40.f, 230.f), GH_ROLE_TEXT);
+    GhUiTextDraw(L"Games using it fall back to Mouse.", GH_TYPE_SMALL,
+                 D2D1::RectF(40.f, 230.f, kOvlW - 40.f, 280.f), GH_ROLE_TEXT_DIM);
+    OverlayPaintButton(310.f, 390.f, GH_ROLE_WARN, L"A   Delete      B   Cancel");
 }
 
 static void OverlayPaintBindChrome()
 {
-    auto* dc = g_lui.dc.get();
-    const float W = kOvlW, H = kOvlH;
-    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-    dc->BeginDraw();
-    dc->Clear(D2D1::ColorF(0x161B22, 1.f));
+    OverlayPaint p;
     OverlayPaintChrome();
-    LuiText(L"Assign input", g_lui.fmtSmall.get(),
-            D2D1::RectF(40, 96, W - 40, 128), g_lui.brDim.get());
-    LuiText(L"A  Bind      B  Cancel      X  Clear      \u25C0 \u25B6 \u25B2 \u25BC  Move",
-            g_lui.fmtSmall.get(),
-            D2D1::RectF(40, H - 52, W - 40, H - 16), g_lui.brDim.get());
-    dc->EndDraw();
-    dc->Flush();
-    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+    GhUiTextDraw(L"Assign input", GH_TYPE_SMALL,
+                 D2D1::RectF(40.f, kOvlSubY, kOvlW - 40.f, 128.f), GH_ROLE_TEXT_DIM);
+    // The keyboard fills this panel, so its hint band is tighter than the rest.
+    const GhUiHint h[] = {
+        { GH_GLYPH_A, L"Bind" }, { GH_GLYPH_B, L"Cancel" }, { GH_GLYPH_X, L"Clear" },
+        { GH_GLYPH_LEFTRIGHT, L"" }, { GH_GLYPH_UPDOWN, L"Move" },
+    };
+    OverlayPaintHints(h, 5, 52.f);
 }
 
+// A keycap, baked as its OWN texture at its own size -- so the canvas is that
+// size for the duration, and the fill is square and full-bleed (see the note at
+// the top: the blit copies, it does not blend).
 static void OverlayPaintKeycap(const wchar_t* label, bool on, float w, float h)
 {
-    auto* dc = g_lui.dc.get();
-    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-    dc->BeginDraw();
-    dc->Clear(D2D1::ColorF(0, 0.f));
-    dc->FillRectangle(D2D1::RectF(0, 0, w, h),
-                      on ? g_lui.brSel.get() : g_lui.brPanel.get());
-    IDWriteTextFormat* fmt = g_lui.fmtKey.get() ? g_lui.fmtKey.get() : g_lui.fmtSmall.get();
-    LuiText(label ? label : L"?", fmt,
-            D2D1::RectF(1, 0, w - 1, h),
-            on ? g_lui.brFg.get() : g_lui.brDim.get(),
-            DWRITE_TEXT_ALIGNMENT_CENTER);
-    dc->EndDraw();
-    dc->Flush();
-    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+    OverlayPaint p(w, h, /*clear=*/false);
+    GhUiFill(D2D1::RectF(0, 0, w, h), on ? GH_ROLE_SELECTION : GH_ROLE_PANEL, 0.f);
+    GhUiTextDraw(label ? label : L"?", GH_TYPE_KEY,
+                 D2D1::RectF(1.f, 0, w - 1.f, h),
+                 GhUiRowTextRole(on, GH_ROLE_TEXT_DIM), DWRITE_TEXT_ALIGNMENT_CENTER);
+}
+
+// Assumes an open draw: the empty state paints this and then its message into
+// the same bitmap, which used to cost a second BeginDraw over a target that had
+// already been cleared.
+static void OverlayPaintFriendsBody(bool lobbyLive, int nfriends)
+{
+    OverlayPaintChrome();
+    wchar_t sub[96];
+    if (lobbyLive) swprintf(sub, 96, L"%d friends  ·  A invites", nfriends);
+    else           swprintf(sub, 96, L"%d friends  ·  host a lobby to invite", nfriends);
+    OverlayPaintSub(sub);
+    const GhUiHint h[] = {
+        { GH_GLYPH_A, L"Invite" }, { GH_GLYPH_B, L"Back" }, { GH_GLYPH_UPDOWN, L"Scroll" },
+    };
+    OverlayPaintHints(h, 3);
 }
 
 static void OverlayPaintFriendsChrome(bool lobbyLive, int nfriends)
 {
-    auto* dc = g_lui.dc.get();
-    const float W = kOvlW, H = kOvlH;
-    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-    dc->BeginDraw();
-    dc->Clear(D2D1::ColorF(0x161B22, 1.f));
-    OverlayPaintChrome();
-    wchar_t sub[96];
-    if (lobbyLive) swprintf(sub, 96, L"%d friends  ·  A invites", nfriends);
-    else swprintf(sub, 96, L"%d friends  ·  host a lobby to invite", nfriends);
-    LuiText(sub, g_lui.fmtSmall.get(),
-            D2D1::RectF(40, 96, W - 40, 136), g_lui.brDim.get());
-    LuiText(L"A  Invite      B  Back      \u25B2 \u25BC  Scroll",
-            g_lui.fmtSmall.get(),
-            D2D1::RectF(40, H - 64, W - 40, H - 20), g_lui.brDim.get());
-    dc->EndDraw();
-    dc->Flush();
-    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+    OverlayPaint p;
+    OverlayPaintFriendsBody(lobbyLive, nfriends);
 }
 
 static void OverlayPaintFriendsEmpty(const wchar_t* msg)
 {
-    OverlayPaintFriendsChrome(false, 0);
-    auto* dc = g_lui.dc.get();
-    dc->BeginDraw();
-    LuiText(msg, g_lui.fmtItem.get(),
-            D2D1::RectF(48, 200, kOvlW - 48, 280), g_lui.brDim.get());
-    dc->EndDraw();
-    dc->Flush();
-    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+    OverlayPaint p;
+    OverlayPaintFriendsBody(false, 0);
+    GhUiTextDraw(msg, GH_TYPE_ITEM,
+                 D2D1::RectF(48.f, 200.f, kOvlW - 48.f, 280.f), GH_ROLE_TEXT_DIM);
 }
 
 static void OverlayPaintIncoming()
 {
-    auto* dc = g_lui.dc.get();
-    const float W = kOvlW, H = kOvlH;
-    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-    dc->BeginDraw();
-    dc->Clear(D2D1::ColorF(0x161B22, 1.f));
+    OverlayPaint p;
     OverlayPaintChrome();
-    LuiText(L"Lobby invite", g_lui.fmtSmall.get(),
-            D2D1::RectF(40, 96, W - 40, 136), g_lui.brDim.get());
-    LuiText(L"A friend invited you", g_lui.fmtItem.get(),
-            D2D1::RectF(40, 160, W - 40, 240), g_lui.brFg.get());
-    D2D1_RECT_F yes = D2D1::RectF(28, 280, W - 28, 360);
-    dc->FillRectangle(yes, g_lui.brSel.get());
-    LuiText(L"A   Accept and join", g_lui.fmtItem.get(),
-            D2D1::RectF(48, 280, W - 48, 360), g_lui.brFg.get());
-    LuiText(L"B   Decline", g_lui.fmtSmall.get(),
-            D2D1::RectF(40, H - 64, W - 40, H - 20), g_lui.brDim.get());
-    dc->EndDraw();
-    dc->Flush();
-    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+    OverlayPaintSub(L"Lobby invite");
+    GhUiTextDraw(L"A friend invited you", GH_TYPE_ITEM,
+                 D2D1::RectF(40.f, 160.f, kOvlW - 40.f, 240.f), GH_ROLE_TEXT);
+    OverlayPaintButton(280.f, 360.f, GH_ROLE_SELECTION, L"A   Accept and join");
+    const GhUiHint h[] = { { GH_GLYPH_B, L"Decline" } };
+    OverlayPaintHints(h, 1);
 }
 
+// A list row, baked as its own texture. Square and full-bleed, for the same
+// reason as the keycap.
 static void OverlayPaintFriendRow(const wchar_t* name, bool on)
 {
-    auto* dc = g_lui.dc.get();
     const float W = (float)kOvlRowW, H = (float)kOvlRowPh;
-    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-    dc->BeginDraw();
-    dc->Clear(D2D1::ColorF(0, 0.f));
-    dc->FillRectangle(D2D1::RectF(0, 0, W, H),
-                      on ? g_lui.brSel.get() : g_lui.brPanel.get());
-    LuiText(name ? name : L"?", g_lui.fmtItem.get(),
-            D2D1::RectF(20, 0, W - 16, H),
-            on ? g_lui.brFg.get() : g_lui.brDim.get());
-    dc->EndDraw();
-    dc->Flush();
-    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+    OverlayPaint p(W, H, /*clear=*/false);
+    GhUiFill(D2D1::RectF(0, 0, W, H), on ? GH_ROLE_SELECTION : GH_ROLE_PANEL, 0.f);
+    GhUiTextDraw(name ? name : L"?", GH_TYPE_ITEM,
+                 D2D1::RectF(20.f, 0, W - 16.f, H), GhUiRowTextRole(on, GH_ROLE_TEXT_DIM));
 }
 
 static void OverlayPaintStatus(const wchar_t* s, bool accent)
 {
-    auto* dc = g_lui.dc.get();
-    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-    dc->BeginDraw();
-    dc->Clear(D2D1::ColorF(0x161B22, 1.f));
-    LuiText(s, g_lui.fmtSmall.get(),
-            D2D1::RectF(0, 0, (float)kOvlRowW, 40.f),
-            accent ? g_lui.brAccent.get() : g_lui.brDim.get());
-    dc->EndDraw();
-    dc->Flush();
-    if (g_gfx.d11ctx) g_gfx.d11ctx->Flush();
+    const float W = (float)kOvlRowW;
+    OverlayPaint p(W, 40.f);
+    GhUiTextDraw(s, GH_TYPE_SMALL, D2D1::RectF(0, 0, W, 40.f),
+                 accent ? GH_ROLE_ACCENT : GH_ROLE_TEXT_DIM);
 }
 
 // Rasterize into a dedicated texture. Must run at LuiInit, before Unity.
@@ -5130,17 +5506,34 @@ static bool OverlayGdiBakeRow(const wchar_t* name, bool on, com_ptr<ID3D11Textur
     HBITMAP hbmp = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     if (!hbmp || !bits) { DeleteDC(hdc); return false; }
     HGDIOBJ oldb = SelectObject(hdc, hbmp);
-    COLORREF bg = on ? RGB(0x1F, 0x6F, 0xEB) : RGB(0x16, 0x1B, 0x22);
-    COLORREF fg = on ? RGB(0xE8, 0xEA, 0xED) : RGB(0x8B, 0x94, 0x9E);
+    // The theme's colours, not the four hardcoded ones this used to carry: a
+    // blitted row that stayed dark while the panel under it followed the theme
+    // was a visible seam, and GDI is the one path that cannot take a brush.
+    auto cref = [](int role) {
+        const uint32_t c = GhUiColorRgb(role);
+        return RGB((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+    };
+    COLORREF bg = cref(on ? GH_ROLE_SELECTION : GH_ROLE_PANEL);
+    COLORREF fg = cref(GhUiRowTextRole(on, GH_ROLE_TEXT_DIM));
     HBRUSH br = CreateSolidBrush(bg);
     RECT rc{0, 0, W, H};
     FillRect(hdc, &rc, br);
     DeleteObject(br);
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, fg);
-    HFONT font = CreateFontW(-26, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+    // The theme's row type, in the family GDI can actually see: a theme that
+    // ships its own font file renders through a private DWrite collection, and
+    // GDI cannot look into one, so this asks for the resolved SYSTEM family.
+    // The 0.765 is not a conversion factor -- a DWrite em size and a negative
+    // GDI height are the same unit. It is the ratio the hand-written -26 had
+    // against the row type's 34, kept so the dark theme bakes the same pixels
+    // it baked before and a theme that raises its row type still scales.
+    const GhThemeFace& rowFace = GhThemeCurrent().face[GH_TYPE_ITEM];
+    HFONT font = CreateFontW(-(int)(rowFace.size * g_ghUi.textScale * 0.765f), 0, 0, 0,
+                             rowFace.weight, FALSE, FALSE, FALSE,
                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                             g_ghUi.sysFamily.c_str());
     HGDIOBJ oldf = SelectObject(hdc, font);
     RECT tr{20, 0, W - 16, H};
     DrawTextW(hdc, name, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -5198,17 +5591,25 @@ static bool OverlayWicBakeRow(const wchar_t* name, bool on, com_ptr<ID3D11Textur
         Diag("OVERLAY WIC RT FAIL hr=" + Hex((uint32_t)hr));
         return false;
     }
+    // This target is not g_ghUi.dc, so it needs its own brushes -- but the
+    // COLOURS and the format are the theme's, so a row baked here matches the
+    // panel it lands on. GhUiColorOf rather than GhUiBrush for exactly that
+    // reason: a brush belongs to the device that made it.
+    const GhTheme& th = GhThemeCurrent();
     com_ptr<ID2D1SolidColorBrush> brBg, brFg;
-    rt->CreateSolidColorBrush(D2D1::ColorF(on ? 0x1F6FEBu : 0x161B22u), brBg.put());
-    rt->CreateSolidColorBrush(D2D1::ColorF(on ? 0xE8EAEDu : 0x8B949Eu), brFg.put());
+    rt->CreateSolidColorBrush(GhUiColorOf(th, on ? GH_ROLE_SELECTION : GH_ROLE_PANEL), brBg.put());
+    rt->CreateSolidColorBrush(GhUiColorOf(th, GhUiRowTextRole(on, GH_ROLE_TEXT_DIM)), brFg.put());
     if (!brBg || !brFg) return false;
+    IDWriteTextFormat* rowFmt = GhUiFormat(GH_TYPE_ITEM);
+    if (!rowFmt) return false;
     rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     rt->BeginDraw();
     rt->FillRectangle(D2D1::RectF(0, 0, (float)W, (float)H), brBg.get());
-    g_lui.fmtItem->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-    g_lui.fmtItem->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    rt->DrawText(name, (UINT32)wcslen(name), g_lui.fmtItem.get(),
-                 D2D1::RectF(20.f, 0.f, (float)W - 16.f, (float)H), brFg.get());
+    rowFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    rowFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    rt->DrawText(name, (UINT32)wcslen(name), rowFmt,
+                 D2D1::RectF(20.f, 0.f, (float)W - 16.f, (float)H), brFg.get(),
+                 D2D1_DRAW_TEXT_OPTIONS_CLIP);
     if (FAILED(rt->EndDraw())) return false;
 
     WICRect wr{0, 0, (INT)W, (INT)H};
@@ -5305,7 +5706,10 @@ static void OverlayBakeFriendsSnapshot()
         if (OvlNameReady(name))
             MultiByteToWideChar(CP_UTF8, 0, name, -1, f.name, 64);
         else
-            swprintf(f.name, 64, L"Friend %llu", sid % 100000ull);
+            // Five digits of a Steam ID is not a name, and it is not a number
+            // the user could do anything with either. An ordinal at least tells
+            // two still-unnamed rows apart until the real names arrive.
+            swprintf(f.name, 64, L"Friend %d", i + 1);
         if (OverlayBakeTo(kOvlRowW, kOvlRowPh, f.row))
             OverlayPaintFriendRow(f.name, false);
         if (OverlayBakeTo(kOvlRowW, kOvlRowPh, f.rowOn))
@@ -5502,9 +5906,11 @@ static void OverlayRefreshProfRows()
     for (int i = 0; i < n; ++i) {
         OvlTexRow r{};
         bool cur = (strcmp(list[i].id, g_ghProf.id) == 0);
+        // A bare dot and a bare "on" were two unlabelled markers in one row.
+        // The rest of the launcher says "in use"; so does this.
         swprintf(r.text, 80, L"%s%s%s", list[i].name,
-                 cur ? L"   \u25CF" : L"",
-                 (cur && g_kmRemapOn) ? L"  on" : L"");
+                 cur ? L"   \u00B7  in use" : L"",
+                 (cur && g_kmRemapOn) ? L"  \u00B7  remapped" : L"");
         OverlayBakeRowAny(r.text, false, r.off);
         OverlayBakeRowAny(r.text, true,  r.on);
         g_ovlProfRows.push_back(std::move(r));
@@ -5594,18 +6000,31 @@ static void OverlayBakePanels()
         }
     }
     if (OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlProfilesChrome)) {
-        OverlayPaintListChrome(L"Profiles  ·  remembered per game",
-            L"A  Use      X  Rename      Y  Duplicate      LB  New      View  Delete      B  Back");
+        // The View button used to be spelled out as the word "View" because the
+        // footer was one hand-written string. As a hint it is the two-square
+        // glyph the physical button carries, drawn by the layout.
+        static const GhUiHint kProf[] = {
+            { GH_GLYPH_A, L"Use" }, { GH_GLYPH_X, L"Rename" }, { GH_GLYPH_Y, L"Duplicate" },
+            { GH_GLYPH_LB, L"New" }, { GH_GLYPH_VIEW, L"Delete" }, { GH_GLYPH_B, L"Back" },
+        };
+        OverlayPaintListChrome(L"Profiles  ·  remembered per game", kProf, 6);
         ++ok;
     }
     if (OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlLayoutChrome)) {
-        OverlayPaintListChrome(L"Layout  ·  A binds   X clears",
-            L"A  Assign      X  Clear      B  Back      \u25B2 \u25BC  Scroll");
+        static const GhUiHint kLay[] = {
+            { GH_GLYPH_A, L"Assign" }, { GH_GLYPH_X, L"Clear" }, { GH_GLYPH_B, L"Back" },
+            { GH_GLYPH_UPDOWN, L"Scroll" },
+        };
+        OverlayPaintListChrome(L"Layout  ·  A binds   X clears", kLay, 4);
         ++ok;
     }
     if (OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlOptionsChrome)) {
-        OverlayPaintListChrome(L"Options  ·  \u25C0 \u25B6  adjust",
-            L"A  Toggle      B  Back");
+        static const GhUiHint kOpt[] = {
+            { GH_GLYPH_A, L"Toggle" }, { GH_GLYPH_LEFTRIGHT, L"Adjust" }, { GH_GLYPH_B, L"Back" },
+        };
+        // The sub-line used to carry "\u25C0 \u25B6 adjust" because there was no
+        // footer to put it in; it is a control, so it belongs in the hints.
+        OverlayPaintListChrome(L"Options  ·  per profile", kOpt, 3);
         ++ok;
     }
     if (OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlBindChrome)) {
@@ -5644,6 +6063,183 @@ static void OverlayBakeFriendsNow(bool /*wait*/)
                                                        : L"Friends list unavailable"));
     g_lui.dc->SetTarget(g_lui.uiTarget.get());
     Diag("OVERLAY bake friends=" + std::to_string(nf) + " (names GDI-refreshed in-game)");
+}
+
+// ---------------------------------------------------------------------------
+// Switch theme. The only place a theme change is applied.
+// ---------------------------------------------------------------------------
+// Two things have to happen, in this order, and the second is the reason this
+// function exists rather than a call to GhUiApply at the Themes page:
+//
+//   1. GhUiApply rebuilds every brush and text format from the new theme.
+//   2. The overlay's eighteen panel textures were PAINTED with the old ones.
+//      They are bitmaps, so they do not follow a brush; they have to be painted
+//      again.
+//
+// And (2) can only happen while the launcher still owns the D2D device. Once a
+// guest is running, DrawText on that device keeps no glyphs at all (the whole
+// reason the panels are baked up front), so re-baking in-game would replace the
+// overlay with eighteen panels of empty rectangles. This refuses instead -- a
+// theme switch is launcher-only by construction, which is also why there is no
+// theme control in the overlay itself.
+// Step 2 on its own, because the Themes page needs it without step 1: changing
+// the text size or the safe-area inset rebuilds the formats through GhUiApply
+// and leaves the overlay's textures painted at the old size, exactly as a theme
+// switch does. Caller has already run GhUiApply, and must own the device.
+static void LauncherRebakeOverlay()
+{
+    if (!g_lui.ready || !g_lui.dc) return;
+    OverlayBakePanels();
+    // The friend, profile, layout and option rows are textures too, and they
+    // are baked outside OverlayBakePanels because their text comes from live
+    // state. Re-bake the ones that already exist; the friends list re-bakes
+    // itself on the next sign-in.
+    OverlayRefreshProfRows();
+    OverlayRefreshLayRows();
+    OverlayRefreshOptRows();
+    if (!g_ovlFriends.empty()) OverlayBakeFriendsNow(true);
+    g_lui.dc->SetTarget(g_lui.uiTarget.get());
+}
+
+static bool LauncherApplyTheme(const char* id)
+{
+    if (!id || !*id) return false;
+    if (g_guestRunning) {
+        Diag(std::string("THEME refused '") + id + "': a guest owns the device, "
+             "so the overlay cannot be re-baked");
+        return false;
+    }
+    if (!GhThemeSetActive(id)) {
+        Diag(std::string("THEME unknown id '") + id + "'");
+        return false;
+    }
+    if (!g_lui.ready || !g_lui.dc) return true;      // applied at LuiInit instead
+    if (!GhUiApply(GhThemeCurrent())) {
+        Diag("THEME GhUiApply FAILED");
+        return false;
+    }
+    LauncherRebakeOverlay();
+    const GhUiLayout* la = GhUiLayoutActive();
+    Diag(std::string("THEME applied '") + GhThemeCurrent().id +
+         "' layout '" + (la ? la->id : "none") + "' (overlay re-baked)");
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// §63d -- the Themes page. LB from the picker.
+//
+// THE PAGE IS ITS OWN PREVIEW. A on a theme row applies that theme for real, so
+// what the user sees next is this page redrawn by the new theme, in the new
+// theme's layout. The plan said "ListPage plus a live preview panel"; a panel
+// would have shown a postage stamp of one archetype, while applying for real
+// shows the chrome, the type scale, the row shape, the motifs and the structure
+// at once. It also means the page exercises the apply path -- the one that
+// re-bakes the overlay -- rather than a second, parallel rendering of a theme
+// that could drift out of step with it.
+//
+// Text size and the safe-area inset live here too, because they are the other
+// two things that change how every screen looks, and because they are stored
+// beside active.txt rather than inside a theme (GhThemeSettings): someone who
+// needs bigger text needs it in every theme, not again after each switch.
+//
+// They apply in two halves, deliberately. LEFT/RIGHT calls GhUiApply, which
+// rebuilds the brushes and the text formats, so the page redraws at the new
+// size on the very next frame. The OVERLAY's eighteen baked textures are not
+// repainted until the user leaves the page: re-baking them between two presses
+// of the d-pad would stutter, and doing it once on the way out costs the same
+// and is invisible. Same for writing settings.txt.
+// ---------------------------------------------------------------------------
+static void LauncherThemes()
+{
+    if (!LuiInit()) return;
+
+    std::vector<GhThRow> rows;
+    GhThBuildRows(rows);
+    GhThCtx ctx{ &rows };
+
+    // Open on the theme in use, not on the first row -- the list is a dozen
+    // long and the one the user came to change is the one they are looking at.
+    int sel = 1;
+    for (size_t i = 0; i < rows.size(); ++i)
+        if (rows[i].kind == GH_TH_THEME && rows[i].theme == g_ghThemeActive) { sel = (int)i; break; }
+
+    std::wstring status;
+    bool bad = false;
+    // Set by either display setting. The save and the overlay re-bake happen
+    // once, on the way out; see the note above.
+    bool dirty = false;
+    WORD prev = 0xFFFF;
+
+    auto step = [&](int dir) {
+        for (int i = sel + dir; i >= 0 && i < (int)rows.size(); i += dir)
+            if (rows[i].kind != GH_TH_HEAD) { sel = i; return; }
+    };
+
+    Diag("THEMES page open: " + std::to_string(g_ghThemes.size()) + " themes, active '" +
+         std::string(GhThemeCurrent().id) + "'");
+
+    for (;;) {
+        if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+        PollGamepadOnUi();
+        PollSyntheticPad();
+        // The left stick counts as the d-pad, one step per push, like the
+        // picker and the Packages page. Both axes here: LEFT/RIGHT is a control
+        // on this page, not just navigation.
+        WORD b; { std::lock_guard<std::mutex> lk(g_padMutex); b = g_padState.wButtons;
+                  if (g_padState.sThumbLY >  16000) b |= XINPUT_GAMEPAD_DPAD_UP;
+                  if (g_padState.sThumbLY < -16000) b |= XINPUT_GAMEPAD_DPAD_DOWN;
+                  if (g_padState.sThumbLX >  16000) b |= XINPUT_GAMEPAD_DPAD_RIGHT;
+                  if (g_padState.sThumbLX < -16000) b |= XINPUT_GAMEPAD_DPAD_LEFT; }
+        const WORD pressed = b & ~prev; prev = b;
+
+        if (pressed & XINPUT_GAMEPAD_DPAD_UP)   step(-1);
+        if (pressed & XINPUT_GAMEPAD_DPAD_DOWN) step(+1);
+        if (pressed & (XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_RIGHT)) {
+            const int dir = (pressed & XINPUT_GAMEPAD_DPAD_RIGHT) ? +1 : -1;
+            if (GhThNudge(rows[(size_t)sel], dir)) {
+                dirty = true;
+                GhUiApply(GhThemeCurrent());   // formats and the safe rect; the overlay waits
+                status.clear(); bad = false;
+            }
+        }
+        if (pressed & XINPUT_GAMEPAD_X) {
+            if (GhThReset(rows[(size_t)sel])) {
+                dirty = true;
+                GhUiApply(GhThemeCurrent());
+                status.clear(); bad = false;
+            }
+        }
+        if (pressed & XINPUT_GAMEPAD_A) {
+            const GhThRow& r = rows[(size_t)sel];
+            if (r.kind == GH_TH_THEME && r.theme >= 0 && r.theme < (int)g_ghThemes.size() &&
+                r.theme != g_ghThemeActive) {
+                // Copies, not references: LauncherApplyTheme does not move
+                // g_ghThemes today, but reading a name out of it afterwards is
+                // the kind of thing that would be fatal if it ever did.
+                const std::string  id = g_ghThemes[(size_t)r.theme].id;
+                const std::wstring nm = g_ghThemes[(size_t)r.theme].name;
+                if (LauncherApplyTheme(id.c_str())) { status = L"Using " + nm; bad = false; }
+                else { status = nm + L" could not be applied. The log has the reason."; bad = true; }
+            }
+        }
+        if (pressed & XINPUT_GAMEPAD_B) {
+            if (dirty) {
+                GhThemeSaveSettings();
+                LauncherRebakeOverlay();
+                Diag("THEMES saved textScale=" +
+                     std::to_string(GhThemeEffTextScale(GhThemeCurrent())) + " safePct=" +
+                     std::to_string(GhThemeEffSafePct(GhThemeCurrent())) + ", overlay re-baked");
+            }
+            Diag("THEMES page closed");
+            return;
+        }
+
+        g_lui.dc->BeginDraw();
+        GhUiPageList(GhThPageVM(rows, sel, ctx, status.c_str(), bad));
+        g_lui.dc->EndDraw();
+        LuiPresent();
+        Sleep(16);
+    }
 }
 
 static void OverlayDraw()
@@ -5823,6 +6419,59 @@ static void LuiCmdStart()
 }
 
 // ---------------------------------------------------------------------------
+// First run (§63f). The content is gh_ui_page_onboard.h; this is the loop and
+// the marker.
+// ---------------------------------------------------------------------------
+static std::wstring LuiOnboardMarkerPath()
+{
+    return std::wstring(kLocalState) + kGhOnbMarker;
+}
+
+// Written whether the user read the sequence or skipped it: the question the
+// marker answers is "has this console been set up before", and skipping is an
+// answer. Written BEFORE the picker draws, so a crash in the first frame of a
+// first launch does not hand the user the same four screens again.
+static void LuiOnboardDone()
+{
+    ghmods::WriteAll(LuiOnboardMarkerPath(), "1\r\n");
+    Diag("ONBOARD done");
+}
+
+// Four MessagePages, A forward and B back. Draws nothing and returns at once on
+// a console that has run before, which is every launch after the first.
+static void LuiOnboardIfFirstRun()
+{
+    if (GetFileAttributesW(LuiOnboardMarkerPath().c_str()) != INVALID_FILE_ATTRIBUTES) return;
+    Diag("ONBOARD first run: " + std::to_string(GhOnbCount()) + " steps");
+
+    int step = 0;
+    WORD prev = 0xFFFF;                 // ignore buttons already held on entry
+    for (;;) {
+        if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+        PollGamepadOnUi();
+        PollSyntheticPad();
+        WORD b; { std::lock_guard<std::mutex> lk(g_padMutex); b = g_padState.wButtons; }
+        const WORD pressed = b & ~prev; prev = b;
+
+        if (pressed & XINPUT_GAMEPAD_A) {
+            if (step + 1 >= GhOnbCount()) break;
+            ++step;
+        } else if (pressed & XINPUT_GAMEPAD_B) {
+            if (step == 0) { Diag("ONBOARD skipped at step 1"); break; }
+            --step;
+        }
+
+        const GhUiMessageVM vm = GhOnbPageVM(step);
+        g_lui.dc->BeginDraw();
+        GhUiPageMessage(vm);
+        g_lui.dc->EndDraw();
+        LuiPresent();
+        Sleep(16);
+    }
+    LuiOnboardDone();
+}
+
+// ---------------------------------------------------------------------------
 // The picker loop. Runs on the UI thread. Returns the chosen guest string
 // (empty => launch the default guest). Falls through (returns empty) if the
 // bridge/D2D cannot init, so a bad UI never blocks launching.
@@ -5831,6 +6480,9 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
 {
     if (!g_gfx.ready) { try { BuildBridgeOnUi(); } catch (...) {} }
     if (!LuiInit()) return L"";
+    // Before anything is enumerated: the first thing a new console shows is an
+    // explanation, not a library that is empty because nobody has signed in.
+    LuiOnboardIfFirstRun();
     OverlayBakeFriendsNow();
 
     std::vector<LauncherItem> all, items;
@@ -5841,6 +6493,11 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
     g_pickQueryChanged = false;
     g_pickSelStart = g_pickSelEnd = 0;
     int matchN = 0;
+    // The wall: which drawer is open, what each one holds, and whether the
+    // focus is in the column. And whether the TITLE screen is up -- A opens it,
+    // A again acts, B goes back.
+    LuiWallState ws;
+    bool titleOpen = false;
     bool uninstallAsk = false;
     LauncherItem uninstallIt;
     bool verifyAsk = false;
@@ -5848,10 +6505,21 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
 
     auto applyFilter = [&]() {
         items.clear();
-        if (g_pickQuery.empty()) items = all;
-        else {
-            for (const auto& it : all)
-                if (LuiContainsI(it.display, g_pickQuery)) items.push_back(it);
+        // What each drawer holds, counted over every row the sources reported
+        // rather than over what is on screen -- a count that changed with the
+        // search box would be telling the user about the search, not about
+        // their library.
+        ws.count[0] = ws.count[1] = ws.count[2] = 0;
+        for (const auto& it : all) {
+            if (it.kind == LauncherItem::kPlaceholder) continue;
+            ++ws.count[0];
+            if (it.kind == LauncherItem::kAcquire) ++ws.count[2]; else ++ws.count[1];
+        }
+        for (const auto& it : all) {
+            if (!g_pickQuery.empty() && !LuiContainsI(it.display, g_pickQuery)) continue;
+            if (ws.drawer == 1 && it.kind == LauncherItem::kAcquire) continue;
+            if (ws.drawer == 2 && it.kind != LauncherItem::kAcquire) continue;
+            items.push_back(it);
         }
         matchN = (int)items.size();
         if (items.empty()) {
@@ -5915,7 +6583,22 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
 
             if (op == "help") {
                 log("list | install <appid> | resume <appid> | verify <appid> | "
-                    "uninstall <appid> --confirm <appid> | help");
+                    "uninstall <appid> --confirm <appid> | theme [id] | help");
+                continue;
+            }
+            // `theme` is the only op here that does not address an app id. It
+            // predates the Themes page (LB from the picker) and is kept because
+            // a switch driven from here needs no pad at all, which is what
+            // makes a twelve-theme sweep scriptable. The picker is up, so no
+            // guest owns the device and the switch is safe by construction.
+            if (op == "theme") {
+                if (a.size() < 2) {
+                    for (const auto& th : g_ghThemes)
+                        log(std::string(th.id == std::string(GhThemeCurrent().id) ? "* " : "  ") +
+                            th.id + "  layout=" + th.layout + (th.builtin ? "  built-in" : ""));
+                    continue;
+                }
+                log(std::string(LauncherApplyTheme(a[1].c_str()) ? "ok theme " : "FAILED theme ") + a[1]);
                 continue;
             }
             if (op == "list") {
@@ -6072,6 +6755,7 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
                     if (LuiCanUninstall(uninstallIt)) ok = LuiDeleteTree(folder);
                     Diag(std::string("LAUNCHER uninstall ") + (ok ? "ok" : "FAIL"));
                     uninstallAsk = false;
+                    titleOpen = false;          // the title it was about is gone
                     rebuild();
                 } else {
                     Diag("LAUNCHER verify '" + LuiNarrow(verifyIt.display) +
@@ -6082,59 +6766,101 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
                 }
                 prev = b;
             }
-            LuiDrawMenu(items, sel, status, g_pickQuery, matchN, (int)all.size(),
-                        uninstallAsk ? 1 : 2,
-                        uninstallAsk ? uninstallIt.display.c_str() : verifyIt.display.c_str());
+            {
+                const int      pk = uninstallAsk ? 1 : 2;
+                const wchar_t* pn = uninstallAsk ? uninstallIt.display.c_str()
+                                                 : verifyIt.display.c_str();
+                if (titleOpen) LuiDrawTitlePage(items[sel], pk, pn);
+                else LuiDrawMenu(items, sel, status, g_pickQuery, matchN, (int)all.size(), pk, pn, ws);
+            }
             LuiPresent();
             Sleep(16);
             continue;
         }
-        if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) jump(-1);
-        if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) jump(+1);
-        if ((pressed & XINPUT_GAMEPAD_DPAD_LEFT) || (lx_lo && navGate)) jump(-5);
-        if ((pressed & XINPUT_GAMEPAD_DPAD_RIGHT) || (lx_hi && navGate)) jump(+5);
+        // How wide a row of covers is, only the LAYOUT knows -- so ask it.
+        // Under `cabinet` the wall is six across, so UP/DOWN move by a row and
+        // LEFT/RIGHT by one; under `list` or `blades` the same lines give back
+        // exactly the old behaviour (one row, jump five), because a layout with
+        // no tile view renders the grid as a list and a list is one column wide.
+        const int cols = [] { GhUiListVM probe; return GhUiPageCols(probe); }();
+        const bool navUp    = (pressed & XINPUT_GAMEPAD_DPAD_UP)    || (ly_hi && navGate);
+        const bool navDown  = (pressed & XINPUT_GAMEPAD_DPAD_DOWN)  || (ly_lo && navGate);
+        const bool navLeft  = (pressed & XINPUT_GAMEPAD_DPAD_LEFT)  || (lx_lo && navGate);
+        const bool navRight = (pressed & XINPUT_GAMEPAD_DPAD_RIGHT) || (lx_hi && navGate);
+        if (titleOpen) {
+            // One button and a footer of controls: nothing to move between.
+        } else if (ws.inDrawers) {
+            if (navUp   && ws.drawer > 0) { --ws.drawer; sel = 0; applyFilter(); lastNav = now; }
+            if (navDown && ws.drawer < 2) { ++ws.drawer; sel = 0; applyFilter(); lastNav = now; }
+            if (navRight) { ws.inDrawers = false; lastNav = now; }
+        } else {
+            if (navUp)   jump(cols > 1 ? -cols : -1);
+            if (navDown) jump(cols > 1 ? +cols : +1);
+            if (navLeft) {
+                // LEFT off the first column is the way into the drawers, and
+                // the only way in: they are chrome, so they have no row of
+                // their own in the list the pad walks.
+                if (cols > 1 && (sel % cols) == 0) { ws.inDrawers = true; lastNav = now; }
+                else jump(cols > 1 ? -1 : -5);
+            }
+            if (navRight) jump(cols > 1 ? +1 : +5);
+        }
         if (pressed & XINPUT_GAMEPAD_Y) {
             if (g_pickOskOpen) PickerOskHide();
             else PickerOskShow();
         }
         if (pressed & XINPUT_GAMEPAD_B) {
             if (g_pickOskOpen) PickerOskHide();
+            else if (titleOpen) titleOpen = false;          // back to the wall
+            else if (ws.inDrawers) ws.inDrawers = false;
             else if (!g_pickQuery.empty()) {
                 g_pickQuery.clear();
                 g_pickSelStart = g_pickSelEnd = 0;
                 sel = 0; applyFilter();
             }
         }
+        // Uninstall and Verify belong to ONE title, so they are offered on that
+        // title's screen and nowhere else. On the wall X did an irreversible
+        // thing that the footer no longer advertises -- and a destructive key
+        // that is not on screen is a key that gets pressed by accident.
         if (pressed & XINPUT_GAMEPAD_X) {
-            if (!g_pickOskOpen && LuiCanUninstall(items[sel])) {
+            if (titleOpen && !g_pickOskOpen && LuiCanUninstall(items[sel])) {
                 uninstallAsk = true;
                 uninstallIt = items[sel];
                 Diag("LAUNCHER uninstall prompt '" + LuiNarrow(uninstallIt.display) + "'");
             }
         }
         if (pressed & XINPUT_GAMEPAD_BACK) {
-            if (!g_pickOskOpen && LuiCanVerify(items[sel])) {
+            if (titleOpen && !g_pickOskOpen && LuiCanVerify(items[sel])) {
                 verifyAsk = true;
                 verifyIt = items[sel];
                 Diag("LAUNCHER verify prompt '" + LuiNarrow(verifyIt.display) +
                      "' app=" + std::to_string(verifyIt.app));
             }
         }
-        if ((pressed & XINPUT_GAMEPAD_RIGHT_SHOULDER) && !g_pickOskOpen && LuiWorkshopTitle(items[sel])) {
+        if ((pressed & XINPUT_GAMEPAD_RIGHT_SHOULDER) && titleOpen && !g_pickOskOpen &&
+            LuiWorkshopTitle(items[sel])) {
             const GhTitle* t = LuiWorkshopTitle(items[sel]);
             Diag("LAUNCHER workshop '" + LuiNarrow(items[sel].display) + "' title=" + t->id);
             LauncherWorkshop(*t);
             prev = 0xFFFF;
             continue;
         }
-        if ((pressed & XINPUT_GAMEPAD_RIGHT_SHOULDER) && !g_pickOskOpen && LuiModsOffered(items[sel])) {
+        if ((pressed & XINPUT_GAMEPAD_RIGHT_SHOULDER) && titleOpen && !g_pickOskOpen &&
+            LuiModsOffered(items[sel])) {
             const GhTitle* t = LuiModsTitle(items[sel]);
             Diag("LAUNCHER mods '" + LuiNarrow(items[sel].display) + "' title=" + t->id);
             LauncherMods(*t);
             prev = 0xFFFF;              // buttons held when the Mods screen closed
             continue;
         }
-        if ((pressed & XINPUT_GAMEPAD_START) && !g_pickOskOpen) {
+        if ((pressed & XINPUT_GAMEPAD_LEFT_SHOULDER) && !titleOpen && !g_pickOskOpen) {
+            Diag("LAUNCHER themes");
+            LauncherThemes();
+            prev = 0xFFFF;              // buttons held when the Themes page closed
+            continue;
+        }
+        if ((pressed & XINPUT_GAMEPAD_START) && !titleOpen && !g_pickOskOpen) {
             Diag("LAUNCHER packages");
             const uint32_t gen0 = g_packGen.load();
             LauncherPackages();
@@ -6142,7 +6868,18 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
             rebuild();                  // a removed/installed title config changes nothing until restart,
             continue;                   // but rows are rebuilt so the picker state is fresh
         }
-        if (pressed & XINPUT_GAMEPAD_A) {
+        if ((pressed & XINPUT_GAMEPAD_A) && ws.inDrawers) {
+            ws.inDrawers = false;       // this drawer it is; back to the wall
+        } else if ((pressed & XINPUT_GAMEPAD_A) && !titleOpen) {
+            // A on the wall OPENS the title; it does not act on it. One press
+            // to see what a cover is, a second to play it -- which is the whole
+            // reason the per-title detail came off the library screen.
+            if (!g_pickOskOpen && items[sel].kind != LauncherItem::kPlaceholder) {
+                titleOpen = true;
+                Diag("LAUNCHER open [" + std::to_string(sel) + "] '" +
+                     LuiNarrow(items[sel].display) + "' app=" + std::to_string(items[sel].app));
+            }
+        } else if (pressed & XINPUT_GAMEPAD_A) {
             const LauncherItem& it = items[sel];
             Diag("LAUNCHER selected [" + std::to_string(sel) + "] '" + LuiNarrow(it.display) +
                  "' guest='" + LuiNarrow(it.guest) + "' app=" + std::to_string(it.app));
@@ -6152,11 +6889,15 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
                 // owned title, or a staged gh_download.txt request). Acquire it, then
                 // refresh so it shows as installed and launchable.
                 if (it.acq && it.acq->acquire) { it.acq->acquire(it, kAcqNew); rebuild(); }
+                titleOpen = false;      // the row this screen was about has moved
                 continue;
             }
             if (!it.blocked.empty()) {
                 Diag("LAUNCHER refused '" + LuiNarrow(it.display) + "': " + LuiNarrow(it.blocked));
-                notice(it.display + L" " + it.blocked + L", which this build does not have.");
+                // "which this build does not have" is a sentence about our
+                // build. The user's question is what to do, and the answer is
+                // on the Packages page, which is where add-ons come from.
+                notice(it.display + L" " + it.blocked + L".\nInstall it from Packages, then try again.");
                 continue;
             }
             // Incomplete install (marker or <64-byte PE): resume instead of launching
@@ -6172,8 +6913,11 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
                     Diag("LAUNCHER resume guest='" + LuiNarrow(it.guest) +
                          "' app=" + std::to_string(it.app) + " incomplete=" +
                          std::to_string((int)it.incomplete) + " sz=" + std::to_string(sz));
-                    if (it.acq && it.acq->acquire) { it.acq->acquire(it, kAcqResume); rebuild(); }
-                    else {
+                    if (it.acq && it.acq->acquire) {
+                        it.acq->acquire(it, kAcqResume);
+                        rebuild();
+                        titleOpen = false;
+                    } else {
                         // No library source can repair this tree (a USB copy, or a build
                         // with no Steam): say so instead of silently doing nothing.
                         Diag("LAUNCHER resume: no library source can repair '" + LuiNarrow(it.display) + "'");
@@ -6188,7 +6932,8 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
             return it.guest;
         }
 
-        LuiDrawMenu(items, sel, status, g_pickQuery, matchN, (int)all.size(), 0, nullptr);
+        if (titleOpen) LuiDrawTitlePage(items[sel], 0, nullptr);
+        else LuiDrawMenu(items, sel, status, g_pickQuery, matchN, (int)all.size(), 0, nullptr, ws);
         LuiPresent();
         Sleep(16);
     }

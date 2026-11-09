@@ -83,5 +83,93 @@ PY
   python3 "$GH/toolchain/ghpkg.py" index --repo "$W/repo" --key "$KEY" --serial 9 >/dev/null
   run vendorbad y || rc=1
 fi
+# §63e: theme packages. A theme is DATA, so the repository must install it like an
+# add-on out of its own root, and must refuse anything that is not a theme.json, a
+# font or an image -- by its PATH in the manifest and by its BYTES on disk.
+kill $SRV 2>/dev/null; wait $SRV 2>/dev/null || true
+rm -rf "$W/repo"; mkdir -p "$W/repo" "$W/th"
+cat > "$W/th/theme.json" <<'JSON'
+{ "schema": "greenhouse.theme/1", "id": "testtheme", "name": "Test Theme", "layout": "list" }
+JSON
+python3 - "$W/th/bg.png" <<'PY'
+import struct, sys, zlib
+def chunk(t, d): return struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d))
+png = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0))
+       + chunk(b'IDAT', zlib.compress(b'\x00\x20\x40\x60')) + chunk(b'IEND', b''))
+open(sys.argv[1], 'wb').write(png)
+PY
+python3 "$GH/toolchain/ghpkg.py" theme --repo "$W/repo" --version 1.0.0.0 --dir "$W/th" >/dev/null
+python3 "$GH/toolchain/ghpkg.py" index --repo "$W/repo" --key "$KEY" --serial 10 >/dev/null
+python3 "$GH/toolchain/ghpkg.py" serve --repo "$W/repo" --port $PORT 2>/dev/null & SRV=$!
+sleep 1
+run theme t || rc=1
+# The update, into the same state directory: 1.0.1.0 replaces 1.0.0.0.
+python3 "$GH/toolchain/ghpkg.py" theme --repo "$W/repo" --version 1.0.1.0 --dir "$W/th" >/dev/null
+python3 "$GH/toolchain/ghpkg.py" index --repo "$W/repo" --key "$KEY" --serial 11 >/dev/null
+run theme2 t || rc=1
+
+# ghpkg.py itself refuses to BUILD a theme package that the console would refuse.
+# The build-side check is a convenience; the console's is the boundary. Check both.
+echo "== ghpkg refuses =="
+mkdir -p "$W/thbad"
+cp "$W/th/theme.json" "$W/thbad/theme.json"
+# A throwaway repo: a refused build still leaves its (empty) version folder behind,
+# and two attempts in one repo would collide on "versions are immutable" instead.
+rej() {   # $1 = expected message fragment, $2 = what was wrong
+  rm -rf "$W/repo_rej"
+  # Captured, not piped: ghpkg exits non-zero when it refuses, and under pipefail
+  # a pipeline into grep reports THAT, so a correct refusal would read as a failure.
+  local out
+  out=$(python3 "$GH/toolchain/ghpkg.py" theme --repo "$W/repo_rej" --version 1.0.0.0 --dir "$W/thbad" 2>&1 || true)
+  if printf '%s' "$out" | grep -q "$1"; then
+    echo "  ghpkg refused $2: ok"
+  else echo "  FAIL: ghpkg built a theme package with $2 ($out)"; rc=1; fi
+}
+echo 'not a png at all' > "$W/thbad/bg.png"
+rej 'not png' 'a .png that is not a PNG'
+rm -f "$W/thbad/bg.png"; : > "$W/thbad/helper.dll"
+rej 'is not a theme.json' 'a .dll in it'
+rm -f "$W/thbad/helper.dll"; echo 'id = testtheme' > "$W/thbad/theme.json"
+rej 'is not a JSON object' 'a theme.json that is not JSON'
+rm -rf "$W/repo_rej" "$W/thbad"
+
+# Now the console's own refusal, which is the one that matters: a VALIDLY SIGNED
+# repository whose manifest honestly describes its bytes -- and those bytes are not
+# what the file name claims. The sha256 check cannot catch this; only the content
+# allow-list can. Built by rewriting a good package and re-signing the index, which
+# is exactly what a repository operator with the signing key could do.
+kill $SRV 2>/dev/null; wait $SRV 2>/dev/null || true
+rm -rf "$W/repo" "$W/tb"; mkdir -p "$W/repo"
+python3 "$GH/toolchain/ghpkg.py" theme --repo "$W/repo" --version 1.0.0.0 --dir "$W/th" >/dev/null
+cp -r "$W/repo/packages/testtheme" "$W/repo/packages/badpath"
+python3 - "$W/repo/packages" <<'PY'
+import hashlib, json, os, sys
+pk = sys.argv[1]
+# badbytes: the image is served as text, and the manifest says so honestly.
+d = os.path.join(pk, 'testtheme', '1.0.0.0')
+b = b'<html>this is not an image</html>'
+open(os.path.join(d, 'bg.png'), 'wb').write(b)
+m = json.load(open(os.path.join(d, 'manifest.json')))
+m['id'] = 'badbytes'
+for e in m['files']:
+    if e['path'] == 'bg.png':
+        e['size'], e['sha256'] = len(b), hashlib.sha256(b).hexdigest()
+json.dump(m, open(os.path.join(d, 'manifest.json'), 'w'), indent=2)
+os.rename(os.path.join(pk, 'testtheme'), os.path.join(pk, 'badbytes'))
+# badpath: the manifest lists a file that is not a theme file at all.
+d = os.path.join(pk, 'badpath', '1.0.0.0')
+b = b'anything'
+open(os.path.join(d, 'addon.dll'), 'wb').write(b)
+m = json.load(open(os.path.join(d, 'manifest.json')))
+m['id'] = 'badpath'
+m['files'].append({'path': 'addon.dll', 'size': len(b),
+                   'sha256': hashlib.sha256(b).hexdigest(), 'url': 'addon.dll'})
+json.dump(m, open(os.path.join(d, 'manifest.json'), 'w'), indent=2)
+PY
+python3 "$GH/toolchain/ghpkg.py" index --repo "$W/repo" --key "$KEY" --serial 12 >/dev/null
+python3 "$GH/toolchain/ghpkg.py" serve --repo "$W/repo" --port $PORT 2>/dev/null & SRV=$!
+sleep 1
+run themebad b || rc=1
+
 echo "ALL $([ $rc = 0 ] && echo PASSED || echo FAILED)"
 exit $rc

@@ -3,13 +3,17 @@
 
   ghpkg.py keygen  --key ~/.greenhouse-keys/dev-repo-p256.pem --label dev [--inc src/loader/gh_repo_devkey.inc]
   ghpkg.py pubinc  --key KEY --label dev --inc FILE           # re-emit the public key include
-  ghpkg.py add     --repo DIR --id ID --type title|addon --version a.b.c.d [--name N]
+  ghpkg.py add     --repo DIR --id ID --type title|addon|theme --version a.b.c.d [--name N]
                    [--min-loader a.b.c.d] [--provides X]... [--requires X]... FILE[=PATH] ...
   ghpkg.py title   --repo DIR --version a.b.c.d corpus/titles/<id>.ghtitle.json
                    (add/title --sealed: members-only. Each file is AES-256-GCM encrypted with a
                    fresh key; the key goes to --keys-dir, OUTSIDE the tree, for greenhouse-site's
                    scripts/register-artifact.ts. Consoles get it from /api/payload, GREENHOUSE.md §43)
   ghpkg.py title   ... --seed-dir corpus/seed/<Name>   # + the title's settings seed (seed/<Name>/...)
+  ghpkg.py theme   --repo DIR --version a.b.c.d --dir corpus/themes/<id>
+                   # a theme package: theme.json plus its fonts and images, and NOTHING
+                   # executable. The id comes from theme.json; the allow-list is checked
+                   # here and again, as the real boundary, on the console (§63e)
   ghpkg.py corpus  --repo DIR --id ID --version a.b.c.d --dir corpus/redist/ghlo [--overlay DIR] [--pack-mb 64]
                    # a members-only data add-on of *.ghpak packs: every record AES-256-GCM under ONE
                    # package key (path "@package" in --keys-dir); the console keeps the packs
@@ -193,12 +197,64 @@ def title_path_ok(rel):
     return '/' not in rel and rel.endswith('.ghtitle.json')
 
 
+# A theme package is DATA: theme.json, fonts, images, and nothing else. The loader
+# enforces this twice (gh_repo.h ThemePartOf + CheckThemeBytes); the same allow-list
+# is applied HERE so a theme package that the console would refuse cannot be built
+# and published by accident. The build-side check is a convenience; the console's is
+# the boundary. Keep the two in step.
+THEME_MAGIC = {
+    'json': None,                                     # must parse as a JSON object
+    'font': (b'\x00\x01\x00\x00', b'true', b'OTTO', b'ttcf'),
+    'png':  (b'\x89PNG\r\n\x1a\n',),
+    'jpg':  (b'\xff\xd8\xff',),
+    'bmp':  (b'BM',),
+}
+THEME_MAX_JSON = 1 << 20
+THEME_MAX_FILE = 16 << 20
+THEME_MAX_PKG = 64 << 20
+
+
+def theme_part(rel):
+    """Which kind of theme file this path claims to be, or None (gh_repo.h ThemePartOf)."""
+    if rel == 'theme.json':
+        return 'json'
+    e = os.path.splitext(rel)[1].lower()
+    if e in ('.ttf', '.otf', '.ttc'):
+        return 'font'
+    if e == '.png':
+        return 'png'
+    if e in ('.jpg', '.jpeg'):
+        return 'jpg'
+    if e == '.bmp':
+        return 'bmp'
+    return None
+
+
+def theme_file_ok(rel, b):
+    kind = theme_part(rel)
+    if kind is None:
+        die(f'theme package file {rel!r} is not a theme.json, a font (.ttf/.otf/.ttc) '
+            f'or an image (.png/.jpg/.bmp)')
+    cap = THEME_MAX_JSON if kind == 'json' else THEME_MAX_FILE
+    if len(b) > cap:
+        die(f'{rel}: a theme file is larger than {cap >> 20} MiB')
+    if kind == 'json':
+        try:
+            if not isinstance(json.loads(b), dict):
+                raise ValueError('not an object')
+        except Exception as e:
+            die(f'{rel}: is not a JSON object ({e})')
+        return
+    if not any(b.startswith(sig) for sig in THEME_MAGIC[kind]):
+        die(f'{rel}: its bytes are not {kind} (the console checks this too, and would refuse it)')
+
+
 def add_package(repo, pid, ptype, version, name, min_loader, provides, requires, files, sealed=False, keys_dir=None,
                 auto=False, blobs=None):
     if not ID_RE.match(pid) or pid in ('.', '..'):
         die(f'id {pid!r} is not a safe id')
-    if ptype not in ('title', 'addon'):
-        die('type must be title or addon')
+    if ptype not in ('title', 'addon', 'theme'):
+        die('type must be title, addon or theme')
     ver_tuple(version)
     if min_loader:
         ver_tuple(min_loader)
@@ -220,6 +276,8 @@ def add_package(repo, pid, ptype, version, name, min_loader, provides, requires,
         else:
             with open(src, 'rb') as f:
                 b = f.read()
+        if ptype == 'theme':
+            theme_file_ok(rel, b)           # on the PLAINTEXT, which is what the console checks
         if sealed:
             b, kf = seal_file(b, pid, version, rel, keys_dir)
             key_files.append(kf)
@@ -231,6 +289,12 @@ def add_package(repo, pid, ptype, version, name, min_loader, provides, requires,
         if sealed:
             e['sealed'] = True
         entries.append(e)
+    if ptype == 'theme':
+        if sum(1 for e in entries if e['path'] == 'theme.json') != 1:
+            die('a theme package holds exactly one top-level theme.json')
+        tot = sum(e['size'] for e in entries)
+        if tot > THEME_MAX_PKG:
+            die(f'the theme package is {tot >> 20} MiB, over the 64 MiB limit')
     m = {'schema': 'greenhouse.package/1', 'id': pid, 'type': ptype, 'version': version,
          'name': name or pid, 'publisher': 'Greenhouse'}
     if min_loader:
@@ -272,6 +336,36 @@ def cmd_title(a):
             die(f'{a.seed_dir} has no files')
     add_package(a.repo, t['id'], 'title', a.version, t.get('name'), need,
                 ['title:' + t['id']], [], files, a.sealed, a.keys_dir, a.auto)
+
+
+def cmd_theme(a):
+    """A theme package from a theme directory: <dir>/theme.json plus its fonts and images.
+    The package id is the id inside theme.json, which is also what the loader's
+    GhThemeScanOne demands of an installed theme package, so the two cannot disagree."""
+    jpath = os.path.join(a.dir, 'theme.json')
+    if not os.path.exists(jpath):
+        die(f'{a.dir} has no theme.json')
+    with open(jpath, 'rb') as f:
+        raw = f.read()
+    try:
+        t = json.loads(raw)
+        if not isinstance(t, dict):
+            raise ValueError('not an object')
+    except Exception as e:
+        die(f'{jpath}: is not a JSON object ({e})')
+    pid = t.get('id') or die(f'{jpath} names no "id"')
+    if t.get('schema') not in (None, 'greenhouse.theme/1'):
+        die(f'{jpath} schema {t["schema"]!r} is not greenhouse.theme/1')
+    files = [f'{jpath}=theme.json']
+    for root, _, names in sorted(os.walk(a.dir)):
+        for n in sorted(names):
+            src = os.path.join(root, n)
+            rel = os.path.relpath(src, a.dir).replace(os.sep, '/')
+            if rel == 'theme.json':
+                continue
+            files.append(f'{src}={rel}')
+    add_package(a.repo, pid, 'theme', a.version, t.get('name') or pid, a.min_loader,
+                ['theme:' + pid], [], files, a.sealed, a.keys_dir, a.auto)
 
 
 def corpus_records(dir_, overlay):
@@ -540,6 +634,10 @@ def main():
     s = sp.add_parser('title'); s.add_argument('--repo', required=True); s.add_argument('--version', required=True)
     s.add_argument('--sealed', action='store_true'); s.add_argument('--keys-dir'); s.add_argument('--auto', action='store_true')
     s.add_argument('--seed-dir'); s.add_argument('file'); s.set_defaults(fn=cmd_title)
+    s = sp.add_parser('theme'); s.add_argument('--repo', required=True); s.add_argument('--version', required=True)
+    s.add_argument('--dir', required=True); s.add_argument('--min-loader')
+    s.add_argument('--sealed', action='store_true'); s.add_argument('--keys-dir'); s.add_argument('--auto', action='store_true')
+    s.set_defaults(fn=cmd_theme)
     s = sp.add_parser('corpus'); s.add_argument('--repo', required=True); s.add_argument('--id', required=True)
     s.add_argument('--version', required=True); s.add_argument('--name'); s.add_argument('--min-loader')
     s.add_argument('--dir', required=True); s.add_argument('--overlay'); s.add_argument('--pack-mb', type=int, default=64)

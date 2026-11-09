@@ -11,6 +11,10 @@
 //                     ("from" entries: range fetch + inflate + patch), all must match
 //     mode "vendorbad" the same, but the signed manifest pins something the vendor
 //                     does not serve: every install refused, nothing in place
+//     mode "theme"    §63e: install a dev-key-signed theme package into the theme root
+//     mode "theme2"   the same package, a version up: update, sweeps, then remove
+//     mode "themebad" a validly signed theme package whose files are not what their
+//                     names claim, or are not theme files at all: every one refused
 #include "../src/loader/gh_repo.h"
 #include <cstdio>
 
@@ -28,11 +32,13 @@ static ghrepo::Config Cfg(const std::string& url, const std::wstring& work)
     c.stateDir = work + L"state\\";
     c.titleDir = work + L"titles\\";
     c.addonRoot = work + L"addons\\";
+    c.themeRoot = work + L"themes\\";
     c.loaderVersion = (0ull << 48) | (0ull << 32) | (673ull << 16) | 0;
     c.log = Log;
     CreateDirectoryW(work.c_str(), nullptr);
     CreateDirectoryW(c.stateDir.c_str(), nullptr);
     CreateDirectoryW(c.addonRoot.c_str(), nullptr);
+    CreateDirectoryW(c.themeRoot.c_str(), nullptr);
     return c;
 }
 
@@ -75,6 +81,54 @@ static void Unit(const std::string& url)
         "{\"schema\":\"greenhouse.package/1\",\"id\":\"a\",\"type\":\"title\",\"version\":\"1.0.0.0\",\"files\":[{\"path\":\"seed/X/../../a.dll\",\"size\":1,\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}]}",
     };
     for (const char* s : badMan2){ CHECK(!ParseManifest(s, strlen(s), m, why)); printf("  refused manifest: %s\n", why.c_str()); }
+
+    // §63e: a theme package is data. The allow-list is the security boundary that
+    // makes a downloadable theme safe, so these refusals matter more than the rest
+    // of this file: every one of them is a theme package that would otherwise put a
+    // file the launcher never asked for into a directory the launcher reads.
+#define THEME_MAN(files) "{\"schema\":\"greenhouse.package/1\",\"id\":\"t\",\"type\":\"theme\",\"version\":\"1.0.0.0\",\"files\":[" files "]}"
+#define THEME_F(path, size) "{\"path\":\"" path "\",\"size\":" size ",\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}"
+    const char* badTheme[] = {
+        THEME_MAN(THEME_F("theme.json", "1") "," THEME_F("addon.dll", "1")),      // the one that matters
+        THEME_MAN(THEME_F("theme.json", "1") "," THEME_F("sub/evil.exe", "1")),
+        THEME_MAN(THEME_F("theme.json", "1") "," THEME_F("run.bat", "1")),
+        THEME_MAN(THEME_F("theme.json", "1") "," THEME_F("payload.scr", "1")),
+        THEME_MAN(THEME_F("theme.json", "1") "," THEME_F("more.json", "1")),      // only theme.json
+        THEME_MAN(THEME_F("theme.json", "1") "," THEME_F("notes.txt", "1")),
+        THEME_MAN(THEME_F("sub/theme.json", "1")),                                // not at the top level
+        THEME_MAN(THEME_F("bg.png", "1")),                                        // no theme.json at all
+        THEME_MAN(THEME_F("theme.json", "1") "," THEME_F("sub/theme.json", "1")), // exactly one
+        THEME_MAN(THEME_F("theme.json", "2097153")),                              // over 1 MiB
+        THEME_MAN(THEME_F("theme.json", "1") "," THEME_F("huge.png", "17825793")),// over 16 MiB
+    };
+    for (const char* s : badTheme){ CHECK(!ParseManifest(s, strlen(s), m, why)); printf("  refused theme: %s\n", why.c_str()); }
+    const char* okTheme = THEME_MAN(THEME_F("theme.json", "900") "," THEME_F("bg.png", "4096") ","
+                                    THEME_F("type/Body.ttf", "40000") "," THEME_F("paper.JPG", "9000"));
+    CHECK(ParseManifest(okTheme, strlen(okTheme), m, why));
+    printf("  theme manifest ok: %u file(s)\n", (unsigned)m.files.size());
+#undef THEME_F
+#undef THEME_MAN
+
+    // The second half of the boundary: the BYTES, not the extension. A signed
+    // manifest can honestly describe a file whose name says image and whose
+    // content says something else; that is what this refuses.
+    auto bytes = [](const char* s, size_t n){ return std::vector<uint8_t>((const uint8_t*)s, (const uint8_t*)s + n); };
+    CHECK(CheckThemeBytes("theme.json", bytes("{\"id\":\"t\"}", 10), why));
+    CHECK(!CheckThemeBytes("theme.json", bytes("[1,2]", 5), why));              // JSON, but not an object
+    CHECK(!CheckThemeBytes("theme.json", bytes("MZ\x90\x00", 4), why));
+    CHECK(CheckThemeBytes("bg.png", bytes("\x89PNG\r\n\x1a\n....", 12), why));
+    CHECK(!CheckThemeBytes("bg.png", bytes("MZ\x90\x00", 4), why));             // the one that matters
+    CHECK(!CheckThemeBytes("bg.png", bytes("\x7f" "ELF\x02\x01", 6), why));
+    CHECK(!CheckThemeBytes("bg.png", bytes("#!/bin/sh\n", 10), why));
+    CHECK(!CheckThemeBytes("bg.png", bytes("hello", 5), why));
+    CHECK(!CheckThemeBytes("bg.png", std::vector<uint8_t>(), why));
+    CHECK(CheckThemeBytes("t.ttf", bytes("\x00\x01\x00\x00\x00\x0c", 6), why));
+    CHECK(CheckThemeBytes("t.otf", bytes("OTTOxx", 6), why));
+    CHECK(!CheckThemeBytes("t.ttf", bytes("MZ\x90\x00", 4), why));
+    CHECK(CheckThemeBytes("p.jpg", bytes("\xff\xd8\xff\xe0", 4), why));
+    CHECK(CheckThemeBytes("p.bmp", bytes("BM\x00\x00", 4), why));
+    CHECK(!CheckThemeBytes("addon.dll", bytes("MZ\x90\x00", 4), why));          // not a theme file at all
+    printf("  theme byte checks done\n");
 
     // Signature over the live test index: good, one flipped byte, unknown key, garbage.
     std::vector<uint8_t> ib, sb; std::string sigUrl;
@@ -195,6 +249,65 @@ int main(int argc, char** argv)
         CHECK(ghrepo::Install(c, idx, "ghostoftsushima", why));
         CHECK(Exists(c.titleDir + L"ghostoftsushima.ghtitle.json"));
         CHECK(Exists(c.titleDir + L"seed\\GhostOfTsushima\\hive.txt"));
+    }
+    else if (mode == "theme"){
+        // §63e: a dev-key-signed theme package installs, updates and removes, out of
+        // its OWN root -- never the add-on root, which is where addon.dll is sought.
+        ghrepo::Index idx;
+        CHECK(ghrepo::FetchIndex(c, idx, why));
+        CHECK(ghrepo::Install(c, idx, "testtheme", why));
+        const std::wstring v1 = c.themeRoot + L"testtheme\\1.0.0.0";
+        CHECK(Exists(v1 + L"\\theme.json") && Exists(v1 + L"\\bg.png"));
+        CHECK(!Exists(v1 + L".part") && !Exists(c.addonRoot + L"testtheme"));
+        // LoadState returns by value and FindInstalled points INTO it, so the state
+        // has to outlive the pointer -- naming it is not a style choice here.
+        const ghrepo::State ts = ghrepo::LoadState(c.stateDir);
+        const ghrepo::Installed* p = ghrepo::FindInstalled(ts, "testtheme");
+        CHECK(p && p->type == "theme" && p->entrySha256.empty());   // a theme has no entry point
+        CHECK(p && p->files.size() == 1);
+        CHECK(p && p->files.size() == 1 && p->files[0] == v1);
+        // A theme with no theme root is refused outright, whatever it holds.
+        ghrepo::Config nr = c; nr.themeRoot.clear();
+        CHECK(!ghrepo::Install(nr, idx, "testtheme", why)); printf("  no theme root: %s\n", why.c_str());
+        printf("  installed 1.0.0.0, updating\n");
+    }
+    else if (mode == "theme2"){
+        // The update: a second version, out of the same root, with 1.0.0.0 gone.
+        ghrepo::Index idx;
+        CHECK(ghrepo::FetchIndex(c, idx, why));
+        CHECK(ghrepo::Install(c, idx, "testtheme", why));
+        CHECK(Exists(c.themeRoot + L"testtheme\\1.0.1.0\\theme.json"));
+        CHECK(!Exists(c.themeRoot + L"testtheme\\1.0.0.0"));
+        CHECK(ghrepo::LoadState(c.stateDir).pkgs.size() == 1);
+        // Staging and orphans are swept in the theme root too, not only the add-on root.
+        CreateDirectoryW((c.themeRoot + L"testtheme\\9.9.9.9.part").c_str(), nullptr);
+        ghrepo::CleanStaging(c);
+        CHECK(!Exists(c.themeRoot + L"testtheme\\9.9.9.9.part"));
+        CreateDirectoryW((c.themeRoot + L"stale").c_str(), nullptr);
+        CreateDirectoryW((c.themeRoot + L"stale\\1.0.0.0").c_str(), nullptr);
+        ghrepo::CleanOrphans(c);
+        CHECK(!Exists(c.themeRoot + L"stale"));
+        CHECK(Exists(c.themeRoot + L"testtheme\\1.0.1.0\\theme.json"));   // never the live one
+        CHECK(ghrepo::Remove(c, "testtheme", why));
+        CHECK(!Exists(c.themeRoot + L"testtheme\\1.0.1.0"));
+        CHECK(ghrepo::LoadState(c.stateDir).pkgs.empty());
+        printf("  updated and removed\n");
+    }
+    else if (mode == "themebad"){
+        // The test that matters. The index is validly signed with the dev key and the
+        // manifest honestly describes the bytes served -- but a file whose name says
+        // image holds something else, or the manifest lists a path that is not a theme
+        // file at all. Nothing may be installed, and nothing may be left behind.
+        ghrepo::Index idx;
+        if (!ghrepo::FetchIndex(c, idx, why)){ printf("  index refused: %s\n", why.c_str()); CHECK(false); }
+        for (const auto& e : idx.packages){
+            const bool ok = ghrepo::Install(c, idx, e.id, why);
+            printf("  install %s: %s\n", e.id.c_str(), ok ? "ok (UNEXPECTED)" : why.c_str());
+            CHECK(!ok);
+            const std::wstring dir = c.themeRoot + ghrepo::Widen(e.id) + L"\\" + ghrepo::Widen(e.version);
+            CHECK(!Exists(dir) && !Exists(dir + L".part"));
+        }
+        CHECK(ghrepo::LoadState(c.stateDir).pkgs.empty());
     }
     else if (mode == "rollback"){
         ghrepo::Index idx;

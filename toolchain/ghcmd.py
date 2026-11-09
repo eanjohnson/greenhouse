@@ -21,6 +21,8 @@ Commands (one per line; '#' comments and blank lines are ignored):
   resume    <appid>                     repair an incomplete install
   verify    <appid>                     hash every file and repair in place
   uninstall <appid> --confirm <appid>   delete the tree; the id must appear twice
+  theme [id]                            list the themes, or switch to one (and
+                                        re-bake the in-game overlay with it)
   help                                  the command list, from the Launcher
 
 Usage:
@@ -47,7 +49,14 @@ CTX = ssl._create_unverified_context()
 
 # The verbs the Launcher knows. Checked here so a typo costs one line of output
 # instead of a round trip; the Launcher validates again on its side.
-VERBS = {"list": 0, "help": 0, "install": 1, "resume": 1, "verify": 1, "uninstall": 3}
+#
+# `theme` is the one verb that does not address an app id: bare, it lists the
+# themes the build knows and marks the active one; with an id it switches, which
+# is also the only thing that re-bakes the overlay's textures. It lives here
+# because the Themes page does not exist yet (U4), and a whitelist that did not
+# know it rejected it before it ever reached the device.
+VERBS = {"list": 0, "help": 0, "install": 1, "resume": 1, "verify": 1,
+         "uninstall": 3, "theme": 0}
 
 
 class WDP:

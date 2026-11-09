@@ -1,0 +1,45 @@
+{
+  "schema": "greenhouse.theme/1",
+  "id": "phosphor",
+  "name": "Phosphor",
+  "desc": "A green monochrome CRT: one hue, hard edges, no gloss.",
+  "layout": "list",
+
+  "_note": [
+    "NOT shipped in the app package -- this is the theme that proves §63e, the",
+    "`theme` package type: it is built by `ghpkg.py theme`, signed with the dev",
+    "key, and installed from the Packages page like an add-on. Keep it OUT of",
+    "corpus/themes/, which iterate-launcher.sh copies into <install>\\themes:",
+    "a theme that already ships cannot test downloading one.",
+    "It carries sweep.png so a theme package's BINARY asset path is exercised",
+    "end to end on the console -- the manifest allow-list, the sha256, the",
+    "content check and the install. Nothing renders it yet: background.kind",
+    "\"image\" parses in gh_theme.h but no layout reads bgImage, so this theme",
+    "draws its gradient. That gap is U3's, not the package type's."
+  ],
+
+  "colors": {
+    "bg":          "#04120A",
+    "panel":       "#0A2314",
+    "panelAlt":    "#07190E",
+    "edge":        "#1E6B3A",
+    "text":        "#86F2A8",
+    "textDim":     "#3F8F5C",
+    "textOnSel":   "#04120A",
+    "textOnBg":    "#86F2A8",
+    "textDimOnBg": "#4CA76C",
+    "accent":      "#B6FFC9",
+    "selection":   "#53D97C",
+    "warn":        "#FFD166"
+  },
+
+  "font": {
+    "families": ["Consolas", "Lucida Console", "Segoe UI"],
+    "sizes":   { "title": 58, "item": 30, "small": 20, "log": 17 },
+    "weights": { "title": 600, "item": 400 }
+  },
+
+  "metrics": { "radius": 0, "rowH": 72, "rowGap": 6, "gutter": 88, "stroke": 1.0 },
+  "background": { "kind": "gradient", "to": "#0A2314" },
+  "motifs": { "innerEdge": true, "gloss": false }
+}

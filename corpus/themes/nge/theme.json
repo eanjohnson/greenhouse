@@ -1,0 +1,43 @@
+{
+  "schema": "greenhouse.theme/1",
+  "id": "nge",
+  "name": "Three Eras",
+  "desc": "Three eras at once: a blade stage, pale glass, bright cells.",
+  "layout": "blades",
+
+  "_note": [
+    "The mash from design/mockups/nge.html: the blade stage of 2008, the",
+    "pale glass of 2009, the bright cells of 2012. It shares the `blades` layout",
+    "with nxe, which is the point -- two themes over one layout that do not look",
+    "related, because the tokens carry the era and the layout only carries the",
+    "shape. Its glass panels are pale over a dark stage, so the accent has to",
+    "work at BOTH ends: #3F8F2A clears 3.9:1 on the cells and 4.0:1 on the stage,",
+    "where the mockup's own bright gel would vanish on paper and its dark detail",
+    "green would vanish on the stage."
+  ],
+
+  "colors": {
+    "bg":          "#143D1C",
+    "panel":       "#E2F0DEB8",
+    "panelAlt":    "#F1F6ECCC",
+    "edge":        "#6E8F6B",
+    "text":        "#17391F",
+    "textDim":     "#4E6B4F",
+    "textOnSel":   "#EAFBE6",
+    "textOnBg":    "#EAFBE6",
+    "textDimOnBg": "#9DB89A",
+    "accent":      "#3F8F2A",
+    "selection":   "#2F7320",
+    "warn":        "#D9452E"
+  },
+
+  "font": {
+    "families": ["Titillium Web", "Segoe UI"],
+    "sizes":   { "title": 64, "item": 32, "small": 21 },
+    "weights": { "title": 600 }
+  },
+
+  "metrics": { "radius": 8, "rowH": 70, "rowGap": 0, "gutter": 72, "stroke": 1.4 },
+  "background": { "kind": "gradient", "to": "#020904" },
+  "motifs": { "gloss": true, "innerEdge": true, "separators": true }
+}

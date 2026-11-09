@@ -55058,7 +55058,11 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
             std::wstring title = bad ? L"LAUNCH FAILED" : L"SESSION ENDED";
             std::wstring reason;
             if (!g_guestFailWhy.empty())
-                reason.assign(g_guestFailWhy.begin(), g_guestFailWhy.end());
+                // Not a byte-for-byte widen: these reasons are built by snprintf
+                // from source literals, and the source is UTF-8, so a `—` or `·`
+                // in one of them became two garbage glyphs on the crash page
+                // (seen for real: "not PE32+ ... ¬夘 x64 guests only").
+                reason = GhUtf8ToW(g_guestFailWhy);
             else
                 reason = L"exit code " + std::to_wstring(g_guestExitCode);
             if (stubbed && g_guestFailWhy.empty())

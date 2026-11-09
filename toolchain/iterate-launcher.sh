@@ -62,6 +62,14 @@ fi
 NSDEF=""
 [ "${GH_REPO_DEV_KEY:-1}" = "1" ] && NSDEF="/DGH_REPO_DEV_KEY"
 [ "${GH_ENT_DEV:-1}" = "1" ] && NSDEF="$NSDEF /DGH_ENT_DEV"
+# The 32-bit guest route is ON by default here, and was not: it used to be
+# reachable only by passing EXTRACL=/DGH_X86_GUEST by hand, and 0.0.925.0 and
+# 0.0.926.0 both shipped without it. Nothing complains at build time -- the
+# Launcher still lists Half-Life and Half-Life 2 in the library, and a launch
+# dies at the dispatch with "not PE32+ ... x64 guests only". Two titles that
+# play are two titles that do not, from a forgotten flag. GH_X86_GUEST=0 opts
+# out (smaller package, x64 guests only); the JIT stays unlinked either way.
+[ "${GH_X86_GUEST:-1}" = "1" ] && NSDEF="$NSDEF /DGH_X86_GUEST"
 echo "== build launcher loader ($SRC)${NSDEF:+ $NSDEF} =="
 clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \
   /std:c++20 /EHsc /MT /O2 "/DGH_PKG_FAMILY=\"$FAM\"" /DGH_LAUNCHER $NSDEF $EXTRACL \
@@ -235,6 +243,29 @@ clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link /MT /O2 /LD \
         kernel32.lib libcmt.lib libvcruntime.lib libucrt.lib /DLL \
   || { echo "FATAL: tbs_stub build failed"; exit 1; }
 rm -f "$PSPC/tbs.lib" "$PSPC/tbs.exp"
+# The themes we ship (greenhouse.theme/1). These are the app's own look, not
+# first-party VALUE, so they are staged in every build, GH_RELEASE included --
+# GhThemeAddRoot points the scan at <install>\themes and LocalState\gh_theme\<id>
+# shadows any of them. Validated here so a malformed theme fails the build
+# instead of being silently refused at startup.
+rm -rf "$STAGE/themes"; mkdir -p "$STAGE/themes"
+python3 - "$GH"/corpus/themes/*/theme.json <<'PYEOF' || { echo "FATAL: bad theme"; exit 1; }
+import json, os, sys
+def nodup(pairs):
+    keys = [k for k, _ in pairs]
+    if len(keys) != len(set(keys)): raise ValueError("duplicate key")
+    return dict(pairs)
+for f in sys.argv[1:]:
+    d = json.load(open(f, encoding="utf-8"), object_pairs_hook=nodup)
+    assert d.get("schema") == "greenhouse.theme/1", f + ": schema"
+    # The DIRECTORY name is the identity on device (GhThemeScanRoot refuses a
+    # mismatch), so a theme whose json disagrees would just vanish.
+    dirn = os.path.basename(os.path.dirname(f))
+    assert d.get("id") == dirn, "%s: id=%r but directory is %r" % (f, d.get("id"), dirn)
+    print("  theme %-12s layout %-8s %s" % (d["id"], d.get("layout", "list"), f.rsplit("/", 1)[-1]))
+PYEOF
+cp -r "$GH"/corpus/themes/. "$STAGE/themes/"
+
 rm -rf "$STAGE/guest/titles" "$STAGE/guest/ghlo" "$TSEED/hive.txt"
 if [ "$BUNDLE" = "1" ]; then
 cp "$GH/corpus/seed/GhostOfTsushima/hive.txt" "$TSEED/hive.txt" || { echo "FATAL: missing Tsushima hive seed"; exit 1; }

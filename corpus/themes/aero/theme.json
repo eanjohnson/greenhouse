@@ -1,0 +1,44 @@
+{
+  "schema": "greenhouse.theme/1",
+  "id": "aero",
+  "name": "Glass",
+  "desc": "Glass panels with a sheen, the way a desktop looked in 2009.",
+  "layout": "list",
+
+  "_note": [
+    "Ported from design/mockups/aero.html: glass panels, a gloss over the",
+    "top of everything, small radii, hairline edges. It keeps `list`, because",
+    "that era's shape IS a list of rows in a window -- the theme's work here is",
+    "all palette and motif, which is the case the token model has to handle as",
+    "well as it handles a structural change.",
+    "The mockup floats its windows over a dark green desk. Here the page itself",
+    "is pale, because the page is not a desk: with a dark background and pale",
+    "panels, one accent token cannot be read on both, and the pale page lets the",
+    "accent be the mockup's own dark grass green."
+  ],
+
+  "colors": {
+    "bg":          "#C9DEF2",
+    "panel":       "#FFFFFFD9",
+    "panelAlt":    "#F0F7FDD9",
+    "edge":        "#A8C3DB",
+    "text":        "#14314A",
+    "textDim":     "#5C7893",
+    "textOnSel":   "#FFFFFF",
+    "textOnBg":    "#14314A",
+    "textDimOnBg": "#43607C",
+    "accent":      "#1F6B12",
+    "selection":   "#1F72C8",
+    "warn":        "#A32B14"
+  },
+
+  "font": {
+    "families": ["Segoe UI"],
+    "sizes":   { "title": 58, "item": 32, "small": 21 },
+    "weights": { "title": 300, "item": 400 }
+  },
+
+  "metrics": { "radius": 5, "rowH": 72, "rowGap": 8, "gutter": 72, "stroke": 1.0 },
+  "background": { "kind": "gradient", "to": "#8FB6DC" },
+  "motifs": { "gloss": true, "innerEdge": true, "keycaps": true }
+}

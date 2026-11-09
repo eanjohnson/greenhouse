@@ -96,6 +96,11 @@ struct GhThemeFace { float size = 16.f; int weight = 400; };   // weight: DWRITE
 struct GhTheme {
     char     id[32]     = {};
     wchar_t  name[48]   = {};
+    // One sentence, shown under the name on the Themes page. A theme is picked
+    // by eye, but the list is read before anything is picked, and "NGE" means
+    // nothing on a TV; this is the only place a theme gets to say what it is.
+    // Optional: a theme without one simply shows its layout.
+    wchar_t  desc[112]  = {};
     char     layout[16] = {};      // a compiled layout's id; unknown falls back to "list"
     bool     builtin    = false;
 
@@ -171,6 +176,7 @@ inline void GhThemeMakeDark(GhTheme& t)
     t = GhTheme{};
     std::strncpy(t.id, "dark", sizeof t.id - 1);
     wcsncpy(t.name, L"Greenhouse Dark", 47);
+    wcsncpy(t.desc, L"The plain dark list the launcher started with.", 111);
     std::strncpy(t.layout, "list", sizeof t.layout - 1);
     t.builtin = true;
 
@@ -209,6 +215,7 @@ inline void GhThemeMakeLight(GhTheme& t)
     GhThemeMakeDark(t);
     std::strncpy(t.id, "light", sizeof t.id - 1);
     wcsncpy(t.name, L"Greenhouse Light", 47);
+    wcsncpy(t.desc, L"The same list on a white page, for a bright room.", 111);
     t.color[GH_ROLE_BG]          = 0xF4F6F2;
     t.color[GH_ROLE_PANEL]       = 0xFFFFFF;
     t.color[GH_ROLE_PANEL_ALT]   = 0xEDF1E9;
@@ -224,13 +231,83 @@ inline void GhThemeMakeLight(GhTheme& t)
     t.innerEdge = true;
 }
 
-inline int GhThemeBuiltinCount(){ return 2; }
+// "Greenhouse" -- the default, and the identity the website shares.
+//
+// Ported from design/mockups/glasshouse.html, which is the concept the
+// user picked: a green-tinted glass look, gloss on the panels, generous radii.
+// Two things changed on the way in, both for reasons the mockup did not have to
+// care about.
+//
+// IT IS DARK, where the mockup's cards are pale. Not taste -- the role model has
+// ONE accent, and it is used both on the page background (a status line) and on
+// a panel (a modal's heading, a progress fill, a ticked box). A pale-card port
+// forces a dark green accent, which then fails against a dark desk; a dark desk
+// with pale cards needs two accents, which the model does not have. Keeping the
+// panels in the desk's tonal family means one green, #76CB4F, clears 4.5:1 on
+// both: 5.3:1 on the background and 6.6:1 on a panel. A living room is also a
+// dark room, which is the other half of the argument.
+//
+// IT SHIPS NO FONT FILE. The mockup renders in
+// `"Segoe UI", Tahoma, Geneva, Verdana, sans-serif` with no webfont import at
+// all -- Playfair Display belongs to catalogue.html and Archivo to
+// bulletin.html, which are themes, not the default. So the identity is already
+// expressed in the one family the console reliably has (gh_gdifont.h:110-112:
+// no Tahoma, no Verdana, no Courier New on this device), and the font-file path
+// in gh_ui.h stays unexercised until a theme PACKAGE carries one.
+inline void GhThemeMakeGreenhouse(GhTheme& t)
+{
+    t = GhTheme{};
+    std::strncpy(t.id, "greenhouse", sizeof t.id - 1);
+    wcsncpy(t.name, L"Greenhouse", 47);
+    wcsncpy(t.desc, L"The standard look, shared with the Greenhouse website.", 111);
+    // The default look is the cabinet: a glass window, drawers down the left,
+    // and the library as its own cover art rather than as rows of text.
+    std::strncpy(t.layout, "cabinet", sizeof t.layout - 1);
+    t.builtin = true;
 
+    // The desk, straight from the mockup: --desk-1 over --desk-2.
+    t.color[GH_ROLE_BG]          = 0x16463A;
+    t.bgKind                     = GH_BG_VGRADIENT;
+    t.bg2                        = 0x05211C;
+    // Glass, in the desk's family rather than the mockup's pale --glass.
+    t.color[GH_ROLE_PANEL]       = 0x11362C;
+    t.color[GH_ROLE_PANEL_ALT]   = 0x0D2B23;
+    t.color[GH_ROLE_EDGE]        = 0x2C6B50;
+    t.color[GH_ROLE_TEXT]        = 0xEAF5E4;
+    t.color[GH_ROLE_TEXT_DIM]    = 0x9BBFA0;
+    t.color[GH_ROLE_TEXT_ON_SEL] = 0xFFFFFF;
+    t.color[GH_ROLE_TEXT_ON_BG]     = 0xEAF5E4;
+    t.color[GH_ROLE_TEXT_DIM_ON_BG] = 0x9BBFA0;
+    t.color[GH_ROLE_ACCENT]      = 0x76CB4F;   // --go-gloss, lightened to clear 4.5:1 on both
+    t.color[GH_ROLE_SELECTION]   = 0x357F22;   // the mockup's darkest bar green; 5.0:1 under white
+    t.color[GH_ROLE_WARN]        = 0xFF6F55;   // --red (#9C2411) cannot be read on a dark desk
+    t.color[GH_ROLE_WHITE]       = 0xFFFFFF;
+    t.color[GH_ROLE_BLACK]       = 0x000000;
+    for (int i = 0; i < GH_ROLE_COUNT; ++i) t.alpha[i] = 1.f;
+
+    t.families.push_back(L"Segoe UI");
+    t.face[GH_TYPE_TITLE] = { 62.f, 700 };
+    t.face[GH_TYPE_ITEM]  = { 32.f, 600 };
+    t.face[GH_TYPE_SMALL] = { 22.f, 400 };
+    t.face[GH_TYPE_LOG]   = { 16.f, 400 };
+    t.face[GH_TYPE_KEY]   = { 15.f, 600 };
+
+    t.radius = 12.f; t.rowH = 68.f; t.rowGap = 10.f; t.gutter = 80.f; t.stroke = 1.6f;
+    t.gloss = true; t.innerEdge = true; t.keycaps = true;
+}
+
+inline int GhThemeBuiltinCount(){ return 3; }
+
+// Index 0 is the DEFAULT: GhThemeLoad resolves an absent or unreadable
+// active.txt to g_ghThemes[0]. Nothing outside this file depends on the
+// order (checked by grep over the tree), so the default moves by moving
+// this case.
 inline bool GhThemeMakeBuiltin(int i, GhTheme& t)
 {
     switch (i) {
-    case 0: GhThemeMakeDark(t);  return true;
-    case 1: GhThemeMakeLight(t); return true;
+    case 0: GhThemeMakeGreenhouse(t); return true;
+    case 1: GhThemeMakeDark(t);       return true;
+    case 2: GhThemeMakeLight(t);      return true;
     default: return false;
     }
 }
@@ -252,6 +329,33 @@ using GhThemeLogFn = void (*)(const std::string&);
 inline std::wstring  g_ghThemeStateDir;                 // the gh_theme directory, trailing slash
 inline GhThemeLogFn  g_ghThemeLog = nullptr;
 
+// Every directory a theme may be scanned out of, in priority order. [0] is
+// always the writable store under LocalState; the rest are read-only roots the
+// host adds, and the one that matters is the package's own `themes\`.
+//
+// The themes we SHIP are data files, not compiled-in built-ins, so they need a
+// home on the device. Reading them straight out of the install directory is
+// better than copying them into LocalState at first run: there is no staleness
+// (an app update ships new theme files and they take effect at once), no risk
+// of overwriting a theme the user edited, and nothing to clean up. The dedup in
+// GhThemeScanDisk means a theme in LocalState with the same id SHADOWS the
+// shipped one, which is the behaviour we want for a user's own edit of a
+// shipped theme and, later, for a theme package that updates one.
+//
+// §63e: a theme PACKAGE is a second kind of source. A root is scanned whole and a
+// subdirectory's NAME is the theme's identity, but an installed theme package lives
+// at <themeRoot>\<id>\<version>\theme.json, where the containing directory is a
+// version string -- so the directory-name rule cannot apply to it. Its identity is
+// the id in the signed installed.json record, which is a stronger authority than a
+// folder name, not a weaker one. Both kinds go through GhThemeScanOne, so there is
+// one copy of the parse/refuse/dedup rules and not two.
+struct GhThemeSource {
+    std::wstring dir;    // ends in a separator
+    std::string  id;     // the id the repository signed for this package
+};
+inline std::vector<std::wstring>  g_ghThemeRoots;   // [0] is always the writable store
+inline std::vector<GhThemeSource> g_ghThemePkgs;    // installed theme packages
+
 inline void GhThemeLog(const std::string& s){ if (g_ghThemeLog) g_ghThemeLog(s); }
 
 // stateDir is the PARENT (LocalState, or any directory on a desktop host); the
@@ -260,7 +364,35 @@ inline void GhThemeInit(const wchar_t* stateDir, GhThemeLogFn log)
 {
     g_ghThemeStateDir = std::wstring(stateDir ? stateDir : L"") + L"gh_theme\\";
     g_ghThemeLog = log;
+    g_ghThemeRoots.clear();
+    g_ghThemeRoots.push_back(g_ghThemeStateDir);
+    g_ghThemePkgs.clear();
 }
+
+// A read-only root, scanned after the writable store. `dir` must end in a
+// separator. Idempotent, so a host may call it on every GhThemeLoad.
+inline void GhThemeAddRoot(const std::wstring& dir)
+{
+    if (dir.empty()) return;
+    for (const auto& r : g_ghThemeRoots) if (r == dir) return;
+    g_ghThemeRoots.push_back(dir);
+}
+
+// One installed theme package: <dir> holds the theme.json and `id` is the package
+// id the repository signed. Registering an id twice REPLACES the earlier entry, so
+// an update to a new version directory cannot leave the old one ahead of it.
+// Precedence does not depend on the order these are called in -- GhThemeScanDisk
+// decides it.
+inline void GhThemeAddTheme(const std::wstring& dir, const std::string& id)
+{
+    if (dir.empty() || id.empty()) return;
+    for (auto& s : g_ghThemePkgs) if (s.id == id) { s.dir = dir; return; }
+    g_ghThemePkgs.push_back({dir, id});
+}
+
+// Forget every theme package. The host re-registers from installed.json after an
+// install or a remove, so a removed package's directory does not linger.
+inline void GhThemeClearThemes() { g_ghThemePkgs.clear(); }
 
 inline std::wstring GhThemeDir()        { return g_ghThemeStateDir; }
 inline std::wstring GhThemeActivePath() { return g_ghThemeStateDir + L"active.txt"; }
@@ -412,6 +544,12 @@ inline bool GhThemeParse(const char* json, size_t n, GhTheme& out, std::string& 
     if (!out.name[0]) {
         const std::wstring w = GhThemeWiden(out.id);
         wcsncpy(out.name, w.c_str(), 47);
+    }
+
+    out.desc[0] = 0;        // never inherited from GhThemeMakeDark
+    if ((v = j.get("desc")) && v->isStr()) {
+        const std::wstring w = GhThemeWiden(v->s);
+        wcsncpy(out.desc, w.c_str(), 111);
     }
 
     if ((v = j.get("layout")) && v->isStr()) {
@@ -581,43 +719,59 @@ inline float GhThemeEffSafePct(const GhTheme& t)
     return g_ghThemeSettings.hasSafePct ? g_ghThemeSettings.safePct : t.safePct;
 }
 
-inline void GhThemeScanDisk()
+// One theme directory (ending in a separator) whose identity the CALLER states:
+// `want` is the directory name for a root scan, or the signed package id for an
+// installed theme package. A theme can never name its own id -- that is what
+// stops a theme on disk from claiming to be a built-in, or shadowing another
+// installed theme by saying so in its own file. Same rule gh_input.h applies to
+// profile files.
+inline void GhThemeScanOne(const std::wstring& dir, const std::string& want)
 {
-    if (g_ghThemeStateDir.empty()) return;
+    std::string body;
+    if (!GhThemeReadFile(dir + L"theme.json", body)) return;
+    GhTheme t;
+    std::string why;
+    if (!GhThemeParse(body.c_str(), body.size(), t, why)) {
+        GhThemeLog("THEME refused '" + want + "' on disk: " + why);
+        return;
+    }
+    if (want != t.id) {
+        GhThemeLog("THEME refused '" + want + "': its theme.json says id=\"" + t.id + "\"");
+        return;
+    }
+    if (GhThemeIsBuiltinId(t.id)) {
+        GhThemeLog("THEME refused '" + want + "': that id is built in");
+        return;
+    }
+    for (const auto& e : g_ghThemes) if (std::strcmp(e.id, t.id) == 0) return;   // an earlier source won
+    g_ghThemes.push_back(t);
+}
+
+inline void GhThemeScanRoot(const std::wstring& root)
+{
+    if (root.empty()) return;
     WIN32_FIND_DATAW fd{};
-    HANDLE d = FindFirstFileW((g_ghThemeStateDir + L"*").c_str(), &fd);
+    HANDLE d = FindFirstFileW((root + L"*").c_str(), &fd);
     if (d == INVALID_HANDLE_VALUE) return;
     do {
         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
         if (fd.cFileName[0] == L'.') continue;
-        std::string body;
-        if (!GhThemeReadFile(g_ghThemeStateDir + fd.cFileName + L"\\theme.json", body)) continue;
-        GhTheme t;
-        std::string why;
-        if (!GhThemeParse(body.c_str(), body.size(), t, why)) {
-            GhThemeLog("THEME refused a theme on disk: " + why);
-            continue;
-        }
-        // The directory name is the authority on identity, so a theme cannot
-        // claim to be a built-in (or another installed theme) by saying so in
-        // its own file. Same rule gh_input.h applies to profile files.
-        const std::wstring dirName = fd.cFileName;
         std::string want;
-        for (wchar_t c : dirName) if (c < 0x80) want.push_back((char)c);
-        if (want != t.id) {
-            GhThemeLog("THEME refused '" + want + "': its theme.json says id=\"" + t.id + "\"");
-            continue;
-        }
-        if (GhThemeIsBuiltinId(t.id)) {
-            GhThemeLog("THEME refused '" + want + "': that id is built in");
-            continue;
-        }
-        bool dup = false;
-        for (const auto& e : g_ghThemes) if (std::strcmp(e.id, t.id) == 0) dup = true;
-        if (dup) continue;
-        g_ghThemes.push_back(t);
+        for (const wchar_t* p = fd.cFileName; *p; ++p) if (*p < 0x80) want.push_back((char)*p);
+        GhThemeScanOne(root + fd.cFileName + L"\\", want);
     } while (FindNextFileW(d, &fd));
     FindClose(d);
+}
+
+// The precedence, highest first, stated once and in one place rather than left to
+// the order a host happens to register things in: a theme the user edited by hand
+// in LocalState, then an installed theme package, then the themes we ship in the
+// app package. First one to claim an id keeps it (GhThemeScanOne dedups).
+inline void GhThemeScanDisk()
+{
+    if (!g_ghThemeRoots.empty()) GhThemeScanRoot(g_ghThemeRoots[0]);
+    for (const auto& p : g_ghThemePkgs) GhThemeScanOne(p.dir, p.id);
+    for (size_t i = 1; i < g_ghThemeRoots.size(); ++i) GhThemeScanRoot(g_ghThemeRoots[i]);
 }
 
 inline int GhThemeIndexOf(const char* id)

@@ -108,6 +108,7 @@ enum GhUiGlyph {
     GH_GLYPH_START, GH_GLYPH_VIEW,     // VIEW is the two-square glyph LuiDrawViewBtn draws
     GH_GLYPH_DPAD, GH_GLYPH_LS, GH_GLYPH_RS,
     GH_GLYPH_UPDOWN, GH_GLYPH_LEFTRIGHT,   // one axis of the pad, for "Move" / "Jump 5"
+    GH_GLYPH_ARROWS,                   // both axes: moving around a grid, not a list
     GH_GLYPH_COUNT
 };
 
@@ -120,7 +121,7 @@ inline const char* GhUiGlyphName(int g)
 {
     static const char* kN[GH_GLYPH_COUNT] = {
         "", "A", "B", "X", "Y", "LB", "RB", "LT", "RT", "START", "VIEW", "DPAD", "LS", "RS",
-        "UPDOWN", "LEFTRIGHT"
+        "UPDOWN", "LEFTRIGHT", "ARROWS"
     };
     return (g > 0 && g < GH_GLYPH_COUNT) ? kN[g] : "";
 }
@@ -139,23 +140,64 @@ struct GhUiBadge {
 // ---------------------------------------------------------------------------
 struct GhUiChrome {
     GhUiLabel title;
+    // Normally the page title is just the page title. The crash screen's is the
+    // failure itself, and it is red; that is a role, not a colour, so a theme
+    // still decides what red means.
+    int       titleRole = GH_ROLE_TEXT_ON_BG;
     GhUiText  status;             // the line under the title (counts, account state, errors)
     int       statusRole = GH_ROLE_TEXT_DIM;
     // A dot before the status, in statusRole. The launcher used to put a literal
     // '*' at the front of the string; here the page says "this state has an
     // indicator" and the layout draws whatever it draws.
     bool      statusDot = false;
+    // A dot is the INDICATOR of the state the status line describes, so with no
+    // line it indicates nothing -- which is what the Packages page showed while
+    // its first fetch was in flight: a bare dot and no words. A layout asks here
+    // instead of reading `statusDot`, so the rule is stated once rather than
+    // once per layout, and a page is still free to set the flag early and fill
+    // the text in later.
+    bool showDot() const { return statusDot && !status.empty(); }
 
     GhUiBadge badges[4];
     int       badgeCount = 0;
 
+    // Whether this page HAS a search affordance at all. The picker does; the
+    // Packages page, the sign-in screen and a status message do not, and a
+    // layout must not invent a "Search:" line for a page that cannot search.
+    bool      search = false;
     GhUiText  searchLine;         // the live search string, without decoration
     bool      searchActive = false;
 
+    // The same band, for a page that does not search: the crash screen's
+    // "loader_diag.txt  (last lines)". One LEFT occupant, so a layout never has
+    // to fit two left-aligned lines into one row of the header -- a layout that
+    // puts the search field at the far end of that band (`cabinet`) may show
+    // both, because they do not compete for the same space.
+    GhUiText  subline;
+
     GhUiTag   counter;            // "12 / 171"
+
+    // Tabs, for the pages that have them (Mods, Workshop). The page says what
+    // the tabs are and which is current; the layout decides whether that is a
+    // strip, a blade column or a segmented control, and makes room for it in
+    // the body rect it hands back.
+    GhUiTag   tabs[6];
+    // A figure belonging to the tab of the same index -- how many titles are in
+    // that drawer. A strip of tabs ignores it; a sidebar of drawers right-aligns
+    // it, which is the only reason a count beside a tab name is worth anything.
+    GhUiTag   tabRight[6];
+    int       tabCount = 0;
+    int       tab      = 0;
 
     GhUiHint  hints[8];
     int       hintCount = 0;
+
+    // A free-text footer line, for the pages whose footer is a sentence rather
+    // than a set of controls -- the sign-in screen's instruction, a download's
+    // "Skipping -- finishing the current request". Drawn in the hint band when
+    // there are no hints; `hints` wins when a page supplies both, because a
+    // control the user can press matters more than prose.
+    GhUiText  footer;
 
     // Controls that are not footer hints because they are always available and
     // belong with the header: the picker's "MENU  Packages". Still a glyph plus
@@ -177,6 +219,13 @@ struct GhUiChrome {
         badges[badgeCount].role = role;
         badges[badgeCount].filled = filled;
         ++badgeCount;
+    }
+    void addTab(const wchar_t* label, const wchar_t* right = nullptr)
+    {
+        if (tabCount >= 6) return;
+        tabs[tabCount].set(label);
+        tabRight[tabCount].set(right);
+        ++tabCount;
     }
     void addHint(int glyph, const wchar_t* label)
     {
@@ -200,7 +249,32 @@ struct GhUiChrome {
 struct GhUiRow {
     GhUiText  title;
     GhUiText  sub;             // the second line: path, publisher, state
-    GhUiTag   right;           // right-aligned trailing text: size, version, fps
+
+    // The store app id, when the row has one. A tile layout uses it to ask the
+    // art provider (gh_ui.h) for this title's key art; a row layout ignores it.
+    // It is NOT a licence to fetch anything -- the provider has its own
+    // ownership rule -- it is just the key.
+    uint32_t  appId = 0;
+    // The row is present but not here yet (owned, not installed). A list layout
+    // already says so in words; a tile layout says it with the picture, which
+    // is the whole point of a wall of covers: dim it and the eye skips it.
+    bool      muted = false;
+    // A short word in a strip across the foot of a tile: "Part copied". It is a
+    // word and not a bar because gh_install.txt records only `complete=0|1` --
+    // there is no persisted byte count to make a percentage out of. If a row
+    // does have a real fraction it sets `progress` as well, and a layout that
+    // can draw both draws both.
+    GhUiTag   tray;
+    // A mark in the corner of a tile: an update is waiting for this title.
+    // Nothing sets it yet, deliberately -- g_repoUpdates covers PACKAGES, and
+    // there is no update signal for a GAME at all. The field exists so the
+    // layout's mark is written once, now, rather than retro-fitted the day a
+    // source can report it.
+    bool      flag = false;
+    // Right-aligned trailing text: a size, a version, an fps figure -- or, on
+    // the Packages page, a whole state clause ("update 0.0.1 -> 0.0.2"), which
+    // is why this is a full text field and not a tag.
+    GhUiText  right;
     GhUiBadge badge;           // optional; empty label = none
     bool      hasBadge  = false;
 
@@ -245,6 +319,13 @@ struct GhUiListVM {
     GhUiText   emptyText;
     GhUiText   emptySub;
 
+    // A caption under the list describing the SELECTED row: a mod's summary and
+    // author, a setting's allowed values. Two lines at most -- it is a caption
+    // for one row, not a second page -- and the layout takes the room for it
+    // out of the list rather than drawing over it.
+    GhUiText   detail;
+    GhUiText   detail2;
+
     // A grid layout's preference; a list layout ignores it. 0 lets the layout
     // choose from the theme's metrics.
     int        gridCols = 0;
@@ -269,6 +350,19 @@ struct GhUiModalVM {
     GhUiText   detail;          // what it is about: the title, the path, the id
     GhUiText   note;            // the consequence, in fine print under the detail
     bool       danger = false;  // uninstall and friends: the layout uses WARN
+
+    // ---- the title page ---------------------------------------------------
+    // A modal with `titlePage` is not a dialog at all: it is one title, filling
+    // the screen, which is what pressing A on the wall opens. The archetype is
+    // still MODAL because everything a modal has is what this page needs -- a
+    // heading (the name), a line of facts, a state, and a short list of
+    // choices, over a page the user came from and goes back to with B. A layout
+    // that has no title page of its own draws it as the detail modal it already
+    // draws, and the page still works.
+    bool       titlePage = false;
+    uint32_t   appId = 0;       // the art key: banner behind, capsule in front
+    GhUiBadge  chip;            // the state: Installed / Not installed / Part copied
+    bool       hasChip = false;
 
     // Up to four choices. The selected one is `sel`; a layout may render them
     // as buttons, as a row list, or as footer hints.
@@ -301,6 +395,11 @@ struct GhUiModalVM {
 // by a phone camera and not by a person (GhThemeIsFixedRole).
 struct GhUiQrVM {
     GhUiChrome chrome;
+
+    // A line above the code, centred, naming what is being signed in to:
+    // "Sign in to Steam", "Membership". The chrome's own status line is
+    // left-aligned and belongs to the page; this belongs to the code.
+    GhUiText       heading;
 
     const uint8_t* modules = nullptr;   // size*size, non-zero = dark
     int            size    = 0;
@@ -339,7 +438,18 @@ struct GhUiMessageVM {
 
     GhUiLabel  heading;
     GhUiBody   body;
-    int        bodyRole = GH_ROLE_TEXT;
+    // ON_BG, not TEXT: every layout draws a MessagePage's body straight onto
+    // the page background, never inside a panel. The two roles are close on a
+    // theme whose panels are a shade of its background, which is why this went
+    // unnoticed until a theme with PALE panels over a DARK stage (`ios6`) drew
+    // the onboarding body in near-black on near-black. Each page that happened
+    // to notice had been overriding it locally; the default was the bug.
+    int        bodyRole = GH_ROLE_TEXT_ON_BG;
+
+    // A short blocking status ("Starting Steam...") belongs in the middle of
+    // the screen; a crash report or an onboarding step belongs under the
+    // header. One archetype serves both, and this is which one it is.
+    bool       centered = false;
 
     // Onboarding uses these; a status or crash page leaves them at zero.
     int        stepIndex = 0;

@@ -1,0 +1,13 @@
+{
+  "schema": "greenhouse.theme/1",
+  "id": "bigcabinet",
+  "name": "Large Text (cabinet)",
+  "layout": "cabinet",
+  "_note": "A fixture, not a theme we ship: the same text-scale and safe-area extreme as bigsafe and biggrid, over the DEFAULT layout. The cabinet drops a column when a tile would fall under kTileMinW, and the title screen's capsule, chip and single button all have to survive 125% type -- this is where that shows up, instead of on a TV.",
+  "colors": { "bg": "#0B0F0C", "panel": "#15201A", "panelAlt": "#1C2A22",
+              "edge": "#39493F", "text": "#FFFFFF", "textDim": "#BDCFC4",
+              "textOnSel": "#06120B", "accent": "#7CE084", "selection": "#2E7D4F",
+              "warn": "#FFB357" },
+  "metrics": { "rowH": 96, "rowGap": 10, "textScale": 1.25, "safePct": 3.5 },
+  "motifs": { "separators": true }
+}
