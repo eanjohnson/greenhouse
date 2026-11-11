@@ -56,9 +56,24 @@
 namespace ghlayout_cabinet {
 
 // --- the window ------------------------------------------------------------
-constexpr float kWinX   = 72.f;   // inside the safe area, not inside the screen
-constexpr float kWinY   = 40.f;
-constexpr float kWinRad = 8.f;
+// FLUSH WITH THE SAFE AREA, not floating inside it.
+//
+// This used to inset the window by 72x40, which is what a window does on a
+// desktop: it sits ON a wallpaper and the wallpaper is part of the look. On a
+// television it is not. Those margins cost 144 columns and 80 rows of a 1920x
+// 1080 screen -- a whole row of covers on the wall, a whole row of a list --
+// and bought a band of background gradient around the edge that nobody sitting
+// three metres away reads as a window frame. The look belongs on the website,
+// which is a page in a browser; here the app IS the screen.
+//
+// Zero rather than "small": any non-zero value reintroduces the band, and the
+// user's own Screen edges setting (GhThemeSettings::safePct) is the control for
+// pulling the whole screen in on a TV that overscans. That setting insets
+// GhUiSafe(), which this is measured from, so it still works exactly as before
+// -- it is just no longer paid twice.
+constexpr float kWinX   = 0.f;
+constexpr float kWinY   = 0.f;
+constexpr float kWinRad = 8.f;   // only used when the window is NOT flush; see Window()
 
 // --- the title bar ---------------------------------------------------------
 constexpr float kBarH    = 84.f;
@@ -153,13 +168,27 @@ inline D2D1_RECT_F Window()
     return w;
 }
 
+// True when the window reaches the edge of the canvas on all four sides, i.e.
+// nothing of the page background can be seen past it. Rounded corners then have
+// to go: a radius on a shape flush with the screen does not read as a soft
+// corner, it reads as four notches of a different colour cut out of the picture.
+inline bool WindowIsFlush(const D2D1_RECT_F& win)
+{
+    return win.left <= 0.5f && win.top <= 0.5f &&
+           win.right >= g_ghUi.canvasW - 0.5f && win.bottom >= g_ghUi.canvasH - 0.5f;
+}
+
 inline void PaintWindow(const D2D1_RECT_F& win)
 {
     const GhTheme& t = GhThemeCurrent();
-    const float r = Rad(kWinRad);
+    const float r = WindowIsFlush(win) ? 0.f : Rad(kWinRad);
     GhUiFill(win, GH_ROLE_PANEL, r);
     if (t.gloss)     GhUiGloss(win, r);
-    if (t.innerEdge) GhUiStroke(GhUiInset(win, 0.5f, 0.5f), GH_ROLE_EDGE, r, t.stroke);
+    // The inner edge is the window's own border. Flush against the screen it is
+    // a hairline the TV may or may not show at all, depending on overscan, and
+    // it is bordering nothing -- so it goes with the corners.
+    if (t.innerEdge && r > 0.f)
+        GhUiStroke(GhUiInset(win, 0.5f, 0.5f), GH_ROLE_EDGE, r, t.stroke);
 }
 
 // A hairline across a band's lower edge. Structural, not a motif: the bands of
@@ -499,6 +528,23 @@ inline void Poster(const D2D1_RECT_F& tile, const GhUiRow& row, bool cur)
                       GH_ROLE_WHITE);
     }
 
+    // What we know about this title running here (§64). The other three layouts
+    // put the dot inside the row's text block, where the type sits; a cover has
+    // no text block, so it goes in the corner opposite the update mark -- and
+    // over a BLACK halo, because the dot's role colour is picked to read against
+    // a themed panel and this one lands on a bitmap from a store.
+    if (row.hasDot) {
+        const float d = kMarkSz * s * 0.72f;
+        const float cx = tile.left + kMarkIn * s + d * 0.5f;
+        const float cy = tile.top  + kMarkIn * s + d * 0.5f;
+        // The halo is always SOLID, whatever the mark's own shape is: a ring's
+        // hole would otherwise show the cover art through the middle of it,
+        // and the point of the halo is that the mark reads on any bitmap.
+        GhUiStatusDot(cx, cy, d * 0.5f + 2.f * s, GH_ROLE_BLACK,
+                      row.dotShape == GH_DOT_BLOCK ? GH_DOT_BLOCK : GH_DOT_FILLED);
+        GhUiStatusDot(cx, cy, d * 0.5f, row.dotRole, row.dotShape);
+    }
+
     // An update waits for this title. Nothing sets row.flag yet, deliberately:
     // g_repoUpdates covers PACKAGES and there is no update signal for a GAME at
     // all, so the mark is written once here rather than retro-fitted the day a
@@ -670,9 +716,9 @@ inline void TitlePage(const GhUiModalVM& vm)
     }
     const float btnH = kBtnH * s;
     if (!vm.note.empty())
-        GhUiParagraph(vm.note.c_str(), GH_TYPE_SMALL,
-                      D2D1::RectF(meat.left, y, meat.right, meat.bottom - btnH - 20.f * s),
-                      GH_ROLE_TEXT_DIM);
+        y += GhUiParagraph(vm.note.c_str(), GH_TYPE_SMALL,
+                           D2D1::RectF(meat.left, y, meat.right, meat.bottom - btnH - 20.f * s),
+                           GH_ROLE_TEXT_DIM) + 18.f * s;
 
     // ONE button. Everything else this screen can do is a control in the
     // footer, which is where a pad user looks for it anyway; a row of four
@@ -682,8 +728,13 @@ inline void TitlePage(const GhUiModalVM& vm)
         const float gw = GhUiGlyphWidth(GH_GLYPH_A);
         float bw = lw + gw + 12.f * s + kBtnPad * 2.f * s;
         if (bw > GhUiW(meat)) bw = GhUiW(meat);
-        const D2D1_RECT_F b = D2D1::RectF(meat.left, meat.bottom - btnH,
-                                          meat.left + bw, meat.bottom);
+        // The button belongs under the facts it acts on, not on the bottom edge.
+        // The mockup's `margin-top:auto` put it there, and on a TV that left a
+        // lake of empty panel between "Never played" and "Play". Still clamped,
+        // so a long note or 140% text can never push it into the footer.
+        float by = y + 4.f * s;
+        if (by + btnH > meat.bottom) by = meat.bottom - btnH;
+        const D2D1_RECT_F b = D2D1::RectF(meat.left, by, meat.left + bw, by + btnH);
         GhUiFill(b, GH_ROLE_SELECTION, Rad(kFindRad));
         if (t.gloss) GhUiGloss(b, Rad(kFindRad));
         GhUiStroke(GhUiInset(b, 0.5f, 0.5f), GH_ROLE_ACCENT, Rad(kFindRad), t.stroke * 1.5f);

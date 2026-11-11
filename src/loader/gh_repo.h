@@ -55,7 +55,18 @@ struct Key { const char* id; const char* label; uint8_t xy[64]; };   // P-256 X|
 // GH_REPO_DEV_KEY: the development test key (private half on the dev host
 // only, ~/.greenhouse-keys). A release build must be compiled without it and
 // with the production key, whose custody is the maintainer's decision.
+// Trusted repository signing keys. The production key comes first so it is the
+// one a release build has; the dev key is additive and only in dev builds.
+//
+// This table used to hold ONLY the dev key, which meant a GH_RELEASE build --
+// where GH_REPO_DEV_KEY is required to be 0 -- trusted no signing key at all and
+// every index verify failed closed. A build with an empty table has no
+// repository: no themes, no title configs, no compat package. Fixed 2026-11-09
+// with the production drop-in, mirroring kEntKeys in gh_ent.h.
 static const Key kGhRepoKeys[] = {
+#if __has_include("gh_repo_keys.inc")
+#include "gh_repo_keys.inc"
+#endif
 #ifdef GH_REPO_DEV_KEY
 #include "gh_repo_devkey.inc"
 #endif
@@ -307,10 +318,19 @@ inline bool StrList(const ghjson::Value& o, const char* k, std::vector<std::stri
     return true;
 }
 
+// ---- compat packages -----------------------------------------------------------------
+// The compatibility dataset (greenhouse.compat/1, corpus/compat/compat.json): what
+// Greenhouse is known to do with a title, keyed by Steam app id. ONE file, named
+// compat.json, nothing else -- not an allow-list of several kinds like a theme's, a
+// single name. It is read by gh_compat.h, which can only answer a status, a version and
+// a date, so the package cannot carry anything the loader would execute or display
+// beyond that.
+inline bool IsCompatPath(const std::string& p){ return p == "compat.json"; }
+
 inline bool CheckType(const std::string& t, std::string& why)
 {
-    if (t == "title" || t == "addon" || t == "theme") return true;
-    why = "type \"" + t + "\" is not title, addon or theme"; return false;
+    if (t == "title" || t == "addon" || t == "theme" || t == "compat") return true;
+    why = "type \"" + t + "\" is not title, addon, theme or compat"; return false;
 }
 
 inline bool ParseIndex(const char* p, size_t n, Index& out, std::string& why)
@@ -437,6 +457,11 @@ inline bool ParseManifest(const char* p, size_t n, Manifest& m, std::string& why
                 why = "title package file \"" + f.path + "\" is not a flat *.ghtitle.json or seed/<Name>/..."; return false; }
             if (f.size > kMaxDoc){ why = f.path + ": a title file is larger than 1 MiB"; return false; }
         }
+        if (m.type == "compat"){
+            if (!IsCompatPath(f.path)){
+                why = "compat package file \"" + f.path + "\" is not compat.json"; return false; }
+            if (f.size > kMaxDoc){ why = f.path + ": the dataset is larger than 1 MiB"; return false; }
+        }
         if (m.type == "theme"){
             // Nothing executable: theme.json, fonts, images. See ThemePartOf.
             const ThemePart tp = ThemePartOf(f.path);
@@ -447,6 +472,10 @@ inline bool ParseManifest(const char* p, size_t n, Manifest& m, std::string& why
                 why = f.path + ": a theme file is larger than " + (tp == TP_JSON ? "1" : "16") + " MiB"; return false; }
         }
         m.files.push_back(std::move(f));
+    }
+    if (m.type == "compat"){
+        // Exactly one file, so "compat.json plus something else" is not expressible.
+        if (m.files.size() != 1){ why = "a compat package holds exactly one file, compat.json"; return false; }
     }
     if (m.type == "theme"){
         int roots = 0; uint64_t tot = 0;
@@ -808,11 +837,16 @@ struct Config {
     std::wstring addonRoot;     // add-ons: <addonRoot>\<id>\<version>\ (D:\DevelopmentFiles\gh_packages\)
     std::wstring themeRoot;     // themes:  <themeRoot>\<id>\<version>\  (D:\DevelopmentFiles\gh_themes\)
                                 // Empty = this loader does not take theme packages (they are refused).
+    std::wstring compatRoot;    // compat:  <compatRoot>\<id>\<version>\compat.json (LocalState\gh_compat\)
+                                // Empty = this loader does not take compat packages.
     uint64_t     loaderVersion = 0;   // 0 = unknown (minLoader not enforced)
     void (*log)(const std::string&) = nullptr;
     // Optional extra check of a downloaded title file (the loader parses it as
     // greenhouse.title/1); false + why refuses the package.
     bool (*checkTitle)(const std::vector<uint8_t>&, const std::string& id, std::string& why) = nullptr;
+    // The same extra check for a downloaded compat.json (the loader parses it as
+    // greenhouse.compat/1). Not set = the bytes are taken on the manifest's word.
+    bool (*checkCompat)(const std::vector<uint8_t>&, const std::string& id, std::string& why) = nullptr;
     // Progress for the UI: bytes done / total of the package being installed.
     volatile LONG64* progDone = nullptr; volatile LONG64* progTotal = nullptr;
     volatile LONG* cancel = nullptr;
@@ -951,10 +985,14 @@ inline bool Install(const Config& c, const Index& idx, const std::string& id, st
     // <root>\<id>\<version>.part\ directory renamed into place at the end. A theme
     // takes the same path as an add-on, out of its own root, so it gets the atomic
     // rename, the free update and the orphan sweep without a second code path.
-    const bool title = (m.type == "title");
-    const bool theme = (m.type == "theme");
+    const bool title  = (m.type == "title");
+    const bool theme  = (m.type == "theme");
+    const bool compat = (m.type == "compat");
     if (theme && c.themeRoot.empty()){ why = id + " is a theme package and this loader has no theme root"; return false; }
-    const std::wstring& root = theme ? c.themeRoot : c.addonRoot;
+    if (compat && c.compatRoot.empty()){ why = id + " is a compat package and this loader has no compat root"; return false; }
+    // A compat package takes the add-on path out of its own root, like a theme: the
+    // atomic rename, the free update and the orphan sweep for nothing extra.
+    const std::wstring& root = theme ? c.themeRoot : compat ? c.compatRoot : c.addonRoot;
     const std::wstring wid = Widen(m.id), wver = Widen(m.version);
     std::wstring stageDir, finalDir;
     if (title){ CreateDirectoryW(c.titleDir.c_str(), nullptr); }
@@ -1003,6 +1041,12 @@ inline bool Install(const Config& c, const Index& idx, const std::string& id, st
             std::vector<uint8_t> tb;
             if (!ReadFileAll(part, tb, kMaxDoc) || !c.checkTitle(tb, m.id, why)){ why = f.path + ": " + why; cleanup(); return false; }
         }
+        if (compat && c.checkCompat){
+            // The dataset is parsed before it is committed, so a compat.json the loader
+            // could not read never replaces one it can.
+            std::vector<uint8_t> tb;
+            if (!ReadFileAll(part, tb, kMaxDoc) || !c.checkCompat(tb, m.id, why)){ why = f.path + ": " + why; cleanup(); return false; }
+        }
         if (theme){
             // The second half of the no-executables boundary, on the bytes that are
             // about to be committed (after unseal, so a members-only theme is checked
@@ -1024,7 +1068,9 @@ inline bool Install(const Config& c, const Index& idx, const std::string& id, st
     if (!title) for (const auto& f : m.files){
         // A theme has no entry point: "addon.dll" is not in its allow-list, so it
         // could not carry one, and nothing ever asks a theme for an entrySha256.
-        if (!theme && f.path == "addon.dll") rec.entrySha256 = f.sha256;
+        // Neither a theme nor a compat package can carry an "addon.dll": it is not in
+        // the theme allow-list, and a compat package's one file is named compat.json.
+        if (!theme && !compat && f.path == "addon.dll") rec.entrySha256 = f.sha256;
         rec.sha.push_back({f.path, f.sha256});
     }
     if (title){
@@ -1122,7 +1168,8 @@ inline void CleanOrphans(const Config& c)
     }
     const State st = LoadState(c.stateDir);
     CleanOrphanRoot(c, st, c.addonRoot);
-    if (!c.themeRoot.empty()) CleanOrphanRoot(c, st, c.themeRoot);
+    if (!c.themeRoot.empty())  CleanOrphanRoot(c, st, c.themeRoot);
+    if (!c.compatRoot.empty()) CleanOrphanRoot(c, st, c.compatRoot);
 }
 
 // Leftovers of a killed install: *.part title files and *.part package folders.
@@ -1155,7 +1202,8 @@ inline void CleanStaging(const Config& c)
         FindClose(f);
     }
     CleanStagingRoot(c, c.addonRoot);
-    if (!c.themeRoot.empty()) CleanStagingRoot(c, c.themeRoot);
+    if (!c.themeRoot.empty())  CleanStagingRoot(c, c.themeRoot);
+    if (!c.compatRoot.empty()) CleanStagingRoot(c, c.compatRoot);
 }
 
 // Packages the index has newer than what is installed (installed ones only).

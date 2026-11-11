@@ -49,6 +49,16 @@ static std::wstring LuiEntBadge();   // membership section, below
 // pages are ported one at a time.
 #include "gh_theme.h"
 #include "gh_ui.h"
+// What Greenhouse is known to do with a title (greenhouse.compat/1). One reviewed
+// file, corpus/compat/compat.json: the website is pushed from it and this reads it.
+// Shipped in the package and updatable as a signed `compat` package; nothing here
+// ever reports anything back.
+#include "gh_compat.h"
+// The one-button crash report (§64). This is the ONLY outbound path the console
+// has, and it never opens by itself: the user presses Y on a crash screen, sees
+// what will be sent, and confirms. gh_compat.h above is read-only by design --
+// this is the deliberate, consented exception to it, not a contradiction.
+#include "gh_crash.h"
 // Steam key art (covers and banners) for the owned library, behind the provider
 // seam in gh_ui.h. Launcher-only: it owns a worker thread, WinHTTP and a disk
 // cache, none of which the preview harness can have -- the harness supplies its
@@ -58,6 +68,7 @@ static std::wstring LuiEntBadge();   // membership section, below
 #include "gh_ui_layout.h"
 #include "gh_ui_layouts.h"
 #include "gh_ui_page_themes.h"  // the Themes page, shared with the preview harness
+#include "gh_ui_themegrid.h"   // the Themes page's wall of live previews
 #include "gh_ui_page_onboard.h" // the first-run sequence, likewise
 // Packages startup check (LuiRepoStartupCheck): -2 not started, -1 no repository /
 // failed, else the number of updates available. Read by the picker's header badge.
@@ -201,6 +212,78 @@ static void LuiAddThemePackages()
     if (n) Diag("THEME " + std::to_string(n) + " theme package(s) registered");
 }
 
+// Which console this is, for picking the right row out of the dataset: it carries a
+// result per console model, and an Xbox One and a Series X do not behave the same
+// (Tsushima: ~13 fps against ~30). DXGI's adapter description is how the loader
+// already tells them apart in its own notes -- SraKmd on an Xbox One, SraKmd_arden on
+// a Series X -- so that is what this reads, once. Unknown is a fine answer: a result
+// then says which console it came from instead of implying this one.
+static ghcompat::Model LuiConsoleModel()
+{
+    static const ghcompat::Model m = []{
+        ghcompat::Model r = ghcompat::MdUnknown;
+        GhCom<IDXGIFactory1> f;
+        if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)f.put()))) return r;
+        for (UINT i = 0;; ++i) {
+            GhCom<IDXGIAdapter1> a;
+            if (f->EnumAdapters1(i, a.put()) == DXGI_ERROR_NOT_FOUND) break;
+            DXGI_ADAPTER_DESC1 d{};
+            if (FAILED(a->GetDesc1(&d))) continue;
+            if (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+            std::wstring n = d.Description;
+            for (wchar_t& c : n) if (c >= L'A' && c <= L'Z') c = (wchar_t)(c - L'A' + L'a');
+            if (n.find(L"arden")    != std::wstring::npos) { r = ghcompat::MdSeriesX; break; }
+            if (n.find(L"lockhart") != std::wstring::npos) { r = ghcompat::MdSeriesS; break; }
+            if (n.find(L"srakmd")   != std::wstring::npos) { r = ghcompat::MdOne;     break; }
+        }
+        Diag(std::string("COMPAT console model ") + ghcompat::ModelName(r));
+        return r;
+    }();
+    return m;
+}
+
+// The extra check gh_repo.h runs on a downloaded compat.json before committing it:
+// the loader's own parser, so a dataset this build cannot read never replaces one it
+// can. Nothing inside the file is matched against the package id -- the dataset has
+// no id of its own, by design: it is one record, not one per publisher.
+static bool LuiRepoCheckCompat(const std::vector<uint8_t>& b, const std::string&, std::string& why)
+{
+    size_t n = b.size(); std::string lic;   // an unsealed file ends in its license (§46)
+    ghent::SplitLicense(b.data(), b.size(), n, lic);
+    ghcompat::Data d;
+    return ghcompat::Parse((const char*)b.data(), n, d, why);
+}
+
+// Load the dataset: the copy in the package, then every installed `compat` package.
+// ghcompat::Offer keeps the HIGHEST SERIAL, so neither source can shadow the other by
+// accident -- a console that has never synced its packages keeps the shipped dataset,
+// and one that has gets the newer one without the loader having to rank them here.
+// Rebuilt from installed.json on every call, like LuiAddThemePackages.
+static void LuiLoadCompat()
+{
+    ghcompat::Init([](const std::string& s){ Diag(s); });
+    ghcompat::SetModel(LuiConsoleModel());
+    EnsureInstallDir();
+    auto offer = [](const std::wstring& path, const std::string& where, bool pkg) {
+        std::vector<uint8_t> b;
+        if (!ReadWholeFile(path, b, true) || b.empty()) return false;
+        if (b.size() > (1u << 20)) { Diag("COMPAT " + where + " REJECTED larger than 1 MiB"); return false; }
+        size_t n = b.size(); std::string lic;
+        ghent::SplitLicense(b.data(), b.size(), n, lic);
+        return ghcompat::Offer((const char*)b.data(), n, where, pkg);
+    };
+    offer(g_installDir + L"guest\\compat.json", "package", false);
+    for (const ghrepo::Installed& p : ghrepo::LoadState(std::wstring(kLocalState) + L"gh_packages\\").pkgs) {
+        if (p.type != "compat" || p.files.empty() || p.files[0].empty()) continue;
+        std::wstring d = p.files[0];
+        if (d.back() != L'\\') d += L'\\';
+        offer(d + L"compat.json", "pkg:" + p.id + "@" + p.version, true);
+    }
+    if (!ghcompat::Have()) Diag("COMPAT no dataset: the library shows no playability marks");
+    else Diag("COMPAT using " + ghcompat::From() + ", " +
+              std::to_string(ghcompat::Get().titles.size()) + " title(s) with a result");
+}
+
 static bool LauncherApplyTheme(const char* id);   // defined with the Themes page
 
 // After a theme package is installed, updated or removed: rebuild the sources,
@@ -285,6 +368,10 @@ static bool LuiInit()
     GhThemeAddRoot(g_installDir + L"themes\\");
     LuiAddThemePackages();
     GhThemeLoad();
+    // The dataset behind the library's playability marks. Read here, once, on the
+    // same pass that reads the themes: both are data in the package that an
+    // installed package may replace.
+    LuiLoadCompat();
     GhUiLayoutsInit();
     if (!GhUiInit(g_lui.dc.get(), g_lui.dw.get(), (float)g_lui.w, (float)g_lui.h)) {
         Diag("LAUNCHER GhUiInit FAILED");
@@ -736,6 +823,32 @@ struct LuiPickCtx {
     const std::vector<LauncherItem>* items;
 };
 
+// The dataset says what a title does; the theme says what colour that is, and the
+// SHAPE says it whatever the theme does. Three roles, because a theme is only
+// guaranteed to have these three apart -- the accent, the warning and dim text --
+// and three silhouettes, because that guarantee is weaker than it sounds: the
+// shipped `catalogue` paints accent #B4462A and warn #9B2E12, which are the same
+// dot at ten pixels. Disc / ring / square is what a person actually reads.
+static int LuiCompatDotRole(ghcompat::Dot d)
+{
+    switch (d) {
+    case ghcompat::DotGood:    return GH_ROLE_ACCENT;
+    case ghcompat::DotPartial: return GH_ROLE_TEXT_DIM;
+    case ghcompat::DotBad:     return GH_ROLE_WARN;
+    default:                   return GH_ROLE_ACCENT;
+    }
+}
+
+static int LuiCompatDotShape(ghcompat::Dot d)
+{
+    switch (d) {
+    case ghcompat::DotGood:    return GH_DOT_FILLED;   // it runs
+    case ghcompat::DotPartial: return GH_DOT_RING;     // it runs part way
+    case ghcompat::DotBad:     return GH_DOT_BLOCK;    // it does not run
+    default:                   return GH_DOT_FILLED;
+    }
+}
+
 static void LuiPickFillRow(void* ctx, int index, GhUiRow& out)
 {
     out.reset();
@@ -747,6 +860,16 @@ static void LuiPickFillRow(void* ctx, int index, GhUiRow& out)
     // What a TILE layout needs, and a row layout ignores: the art key, and the
     // two states a picture can carry on its own rather than in words.
     out.appId = it.app;
+    // The playability mark. GhUiRow::hasDot was built for this and has been empty
+    // since: three states a person can read across a room (plays / partly / will
+    // not run) and nothing at all for a title we have never checked, which is most
+    // of a 171-title library and is the honest answer for them.
+    const ghcompat::Dot cd = ghcompat::DotFor(it.app);
+    if (cd != ghcompat::DotNone) {
+        out.hasDot   = true;
+        out.dotRole  = LuiCompatDotRole(cd);
+        out.dotShape = LuiCompatDotShape(cd);
+    }
     out.muted = (it.kind == LauncherItem::kAcquire);   // owned, not here yet
     if (it.incomplete) out.tray.set(L"Part copied");
     const std::wstring mods = LuiModsBadge(it);
@@ -874,9 +997,22 @@ static void LuiDrawTitlePage(const LauncherItem& it, int promptKind, const wchar
     mv.hasChip = true;
     mv.detail.setElided(LuiPlayLine(it).c_str());
 
+    // ONE line about what this title does here, and it goes in the note -- the field
+    // that already exists for "one sentence when there is something to say". The
+    // dataset's prose note is NOT shown: verbose "what works in this game" text was
+    // reviewed on the TV and rejected as information overload, so that stays on the
+    // website and this is a clause.
+    //
+    // Order is by what the person needs most. A missing add-on is actionable and wins.
+    // A compat result beats the two boilerplate lines below it, and that matters most
+    // where it replaces "Installing copies it to this console" on a title we know does
+    // not run -- which was, until now, advice to spend forty gigabytes on nothing.
+    const std::wstring compatLine = ghcompat::LineFor(it.app);
     if (!it.blocked.empty())
         mv.note.setElided((it.display + L" " + it.blocked +
                            L".  Install it from Packages, then try again.").c_str());
+    else if (!compatLine.empty())
+        mv.note.setElided(compatLine.c_str());
     else if (it.kind == LauncherItem::kAcquire)
         mv.note.set(L"On your Steam account. Installing copies it to this console.");
     else if (it.incomplete)
@@ -1931,6 +2067,11 @@ static std::vector<LauncherItem> LuiEnumerate()
     // Hand the art layer the ownership set this enumeration established. Before
     // this call it has none, so nothing has been fetched; after it, only these.
     ghart::Allow(g_luiArtOwned);
+    // ...and then fetch all of them, rather than waiting for each one to be
+    // scrolled into view. Same list, so this adds no title the line above did
+    // not already permit; it only stops the fetch being tied to what happens to
+    // be on screen. Disk only -- the in-memory budget is unchanged.
+    ghart::Prefetch(g_luiArtOwned);
     return out;
 }
 
@@ -1958,6 +2099,12 @@ static std::wstring LauncherAddonsSignIn()
         label[127] = 0;
         Diag("ADDON " + a.pkg + " signIn -> " + std::to_string(ok) + " in " +
              std::to_string(GetTickCount() - t0) + " ms label='" + LuiNarrow(label) + "'");
+        // ...and that line is the measured reason gh_crash.h exists: the account
+        // name is in the diag we would upload. The scrub already kills it by
+        // SHAPE (quoted text never survives), but tell it the string too, so a
+        // label that turns up somewhere unquoted later is still removed. Every
+        // add-on's label, not just the one that becomes the header.
+        if (label[0]) ghcrash::AddSensitive(LuiNarrow(label));
         if (!signedIn && label[0]) header = label;
         if (ok) signedIn = true;
     }
@@ -2057,9 +2204,14 @@ static ghrepo::Config LuiRepoConfig()
     // add-on root is a place addon.dll is loaded from and a theme root never is;
     // keeping them apart means a theme can never land where an add-on is sought.
     c.themeRoot = std::wstring(kDevRoot) + L"gh_themes\\";
+    // The compat dataset goes in LocalState, not on D:\DevelopmentFiles: it is six
+    // kilobytes, and DevelopmentFiles is scratch, while this has to survive to answer
+    // "does this run" on the next cold start.
+    c.compatRoot = std::wstring(kLocalState) + L"gh_compat\\";
     c.loaderVersion = GhOwnPackageVersion();
     c.log = LuiRepoLog;
     c.checkTitle = LuiRepoCheckTitle;
+    c.checkCompat = LuiRepoCheckCompat;
     // Members-only files: a loader with no entitlement keys cannot open them (Install refuses).
     if (ghent::Enabled()) { c.unseal = ghent::Unseal; c.packageKey = ghent::StorePackageKey; }
     return c;
@@ -2108,6 +2260,7 @@ static void LuiRepoStartupCheck()
         ghrepo::Config c = LuiRepoConfig();
         CreateDirectoryW(c.addonRoot.c_str(), nullptr);
         CreateDirectoryW(c.themeRoot.c_str(), nullptr);
+        CreateDirectoryW(c.compatRoot.c_str(), nullptr);
         ghrepo::CleanStaging(c);
         if (ghent::Enabled()) LuiKeepInstalledKeys(c);
         if (c.indexUrl.empty()) { Diag("REPO check: no repository (gh_repo_url.txt absent)"); g_repoUpdates = -1; return; }
@@ -4200,14 +4353,18 @@ static void LauncherPackages()
                         status = (was == kInstall ? L"Install failed: " : L"Remove failed: ") + ghrepo::Widen(job->why);
                         Diag(std::string("REPO page ") + (was == kInstall ? "install " : "remove ") + target + " FAILED: " + job->why);
                     } else {
-                        bool title = false, theme = false;
+                        bool title = false, theme = false, compat = false;
                         for (const auto& r : rows) if (r.id == target) {
-                            if (r.type == "title") title = true;
-                            if (r.type == "theme") theme = true;
+                            if (r.type == "title")  title  = true;
+                            if (r.type == "theme")  theme  = true;
+                            if (r.type == "compat") compat = true;
                         }
                         // \u00A763e: a theme takes effect at once -- it is data, and
-                        // re-reading it is a rescan and a re-bake, not a restart.
-                        if (theme) LuiReloadThemes();
+                        // re-reading it is a rescan and a re-bake, not a restart. The
+                        // compat dataset is data too: re-read it and the library's
+                        // marks are right on the way back to the wall.
+                        if (theme)  LuiReloadThemes();
+                        if (compat) LuiLoadCompat();
                         status = (was == kInstall ? L"Installed " : L"Removed ") + ghrepo::Widen(target) +
                                  (title ? L" \u00B7 applies the next time Greenhouse starts" : L"");
                         if (haveIdx) g_repoUpdates = ghrepo::CountUpdates(ghrepo::LoadState(cfg.stateDir), idx);
@@ -4283,9 +4440,37 @@ static void LauncherPackages()
 }
 
 // ---------------------------------------------------------------------------
+// §64. What a crash report is FILED UNDER. The site keys CrashReport on a title
+// name, so this is the whole chain, best first:
+//   the picked row's display name  ->  the dataset's Steam name for the app id
+//   ->  the mod run record's title id  ->  "app <id>".
+// Empty only when nothing at all was picked, and Upload() refuses that.
+// ---------------------------------------------------------------------------
+static std::string LuiCrashTitleName()
+{
+    std::string n;
+    if (!g_launcherSelectedName.empty()) n = LuiNarrow(g_launcherSelectedName);
+    if (n.empty()) {
+        const ghcompat::View v = ghcompat::Find(g_launcherSelectedApp);
+        if (!v.name.empty()) n = v.name;
+    }
+    if (n.empty()) { GhModRun r; if (GhModRunRead(r)) n = r.title; }
+    if (n.empty() && g_launcherSelectedApp) n = "app " + std::to_string(g_launcherSelectedApp);
+    if (n.size() > 120) n.resize(120);        // the site's own limit on the field
+    return n;
+}
+
+// ---------------------------------------------------------------------------
 // Post-guest crash / session-ended screen. The launcher stays up: A or B
 // dismisses back to the picker. D-pad scrolls the last Diag lines. With `alt`
 // (§52: "Start without mods"), A takes that action instead and returns true.
+//
+// Y offers to send the log to the site (§64). It is the console's only outbound
+// path and it opens for nobody but the user: Y asks, and the question names the
+// four things that go and the three kinds of thing that are removed first. The
+// upload runs on its own thread, because this screen follows a dead guest whose
+// threads may still hold locks and a blocking WinHTTP call here would read as
+// the launcher having died too.
 // ---------------------------------------------------------------------------
 static bool LauncherShowCrash(const std::wstring& title, const std::wstring& reason,
                               const std::vector<std::string>& entries, const wchar_t* alt = nullptr,
@@ -4312,6 +4497,18 @@ static bool LauncherShowCrash(const std::wstring& title, const std::wstring& rea
     int n = (int)lines.size();
     WORD prev = 0xFFFF;
     DWORD lastNav = 0;
+
+    // §64 report state. kOff is the log page; the other three are modals over it.
+    enum { kOff = 0, kAsk, kSending, kDone };
+    int rep = kOff;
+    const std::string repTitle = LuiCrashTitleName();
+    // The site must exist and the title must have a name, or there is nothing to
+    // offer -- a dev build with no GH_ENT_SERVER included. Decided once, so the
+    // hint does not appear and then fail.
+    const bool canReport = !ghent::Server().empty() && !repTitle.empty();
+    auto repState = std::make_shared<std::atomic<int>>(0);     // 0 running, 1 ok, 2 failed
+    auto repWhy   = std::make_shared<std::string>();
+    auto repWhyMu = std::make_shared<std::mutex>();
     // Log text is arbitrary bytes (stack dumps run to kilobytes; game logs
     // carry escapes and UTF-8). Draw printable ASCII only, one screen width.
     auto widen = [](const std::string& s) {
@@ -4380,15 +4577,104 @@ static bool LauncherShowCrash(const std::wstring& title, const std::wstring& rea
         if (ly_lo && navGate) synth |= XINPUT_GAMEPAD_DPAD_DOWN;
         WORD pressed = synth & ~prev;
         prev = b;
-        if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) {
-            if (scroll > 0) { scroll--; lastNav = now; }
+        // ---- §64 the report, when one of its modals owns the screen ----------
+        // Handled BEFORE the log page's own keys, and every one of them returns:
+        // A on the ask must not also be the alt action or the dismiss below.
+        if (rep != kOff) {
+            if (rep == kAsk) {
+                if (pressed & XINPUT_GAMEPAD_A) {
+                    rep = kSending;
+                    *repState = 0;
+                    Diag("CRASHREPORT sending title='" + repTitle + "' app=" +
+                         std::to_string(g_launcherSelectedApp));
+                    // `entries`, not `lines`: Scrub() does its own splitting, and
+                    // the copy is deliberate -- this thread outlives the frame.
+                    std::thread([repState, repWhy, repWhyMu, repTitle,
+                                 ent = entries, ver = LuiVersionStr(GhOwnPackageVersion())]{
+                        ghcrash::Result r = ghcrash::Upload(repTitle, ent, ver);
+                        { std::lock_guard<std::mutex> lk(*repWhyMu); *repWhy = r.why; }
+                        *repState = r.ok ? 1 : 2;
+                        Diag(std::string("CRASHREPORT ") + (r.ok ? "ok" : "failed: " + r.why));
+                    }).detach();
+                } else if (pressed & XINPUT_GAMEPAD_B) {
+                    rep = kOff;
+                    Diag("CRASHREPORT declined");
+                }
+            } else if (rep == kSending) {
+                if (*repState != 0) rep = kDone;          // B does not cancel an in-flight POST
+            } else {  // kDone
+                if (pressed & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B)) rep = kOff;
+            }
+        } else {
+            if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) {
+                if (scroll > 0) { scroll--; lastNav = now; }
+            }
+            if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) {
+                int maxs = (n > nfit) ? n - nfit : 0;
+                if (scroll < maxs) { scroll++; lastNav = now; }
+            }
+            // One report per screen. After a success Y is gone; after a failure it
+            // comes back, because the usual failure is the network.
+            if ((pressed & XINPUT_GAMEPAD_Y) && canReport && *repState != 1) rep = kAsk;
+            if (alt && (pressed & XINPUT_GAMEPAD_A)) return true;
+            if (pressed & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B)) return false;
         }
-        if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) {
-            int maxs = (n > nfit) ? n - nfit : 0;
-            if (scroll < maxs) { scroll++; lastNav = now; }
+
+        // ---- §64 the report's three modals ----------------------------------
+        // Drawn INSTEAD of the log page, and each owns the screen (overPage is
+        // false), so the page under it is not scrimmed but replaced -- the same
+        // archetype the uninstall prompt uses.
+        if (rep != kOff) {
+            GhUiModalVM mv;
+            mv.overPage = false;
+            mv.sel = 0;
+            if (rep == kAsk) {
+                mv.heading.set(L"SEND A REPORT");
+                mv.body.set(L"Send this log to the Greenhouse team?");
+                mv.detail.setElided(ghrepo::Widen(repTitle).c_str());
+                // The consent: WHAT GOES, then what is taken out first. Both
+                // halves matter -- "we remove personal data" with no list is a
+                // promise the person cannot check.
+                mv.note.set(L"Sends the end of this log, the game's name, the console model and the "
+                            L"Greenhouse version. Account names, file paths and anything key-shaped "
+                            L"are removed first.");
+                mv.addChoice(L"A  Send");
+                mv.addChoice(L"B  Cancel");
+            } else if (rep == kSending) {
+                mv.heading.set(L"SENDING…");
+                mv.body.setElided(ghrepo::Widen(repTitle).c_str());
+                mv.note.set(L"Talking to the site.");
+            } else {
+                const bool ok = (*repState == 1);
+                std::string why;
+                { std::lock_guard<std::mutex> lk(*repWhyMu); why = *repWhy; }
+                mv.danger = !ok;
+                mv.heading.set(ok ? L"REPORT SENT" : L"NOT SENT");
+                mv.body.set(ok ? L"Thank you — this is how the compatibility list grows."
+                               : L"The report did not go through.");
+                // The reason goes in the NOTE, not the detail. A modal's detail is
+                // drawn in ACCENT, which on every theme is the colour of something
+                // having gone RIGHT -- the same mistake the crash screen's own
+                // `reason` line made and had fixed: a green sentence under a red
+                // headline. The note is dim text, which is what a reason is.
+                if (ok) {
+                    mv.note.set(L"Nothing else was sent, and nothing was kept on the console.");
+                } else {
+                    std::wstring nw = ghrepo::Widen(why);
+                    if (!nw.empty()) nw += L". ";
+                    nw += L"Nothing was sent. The log is still on screen behind this.";
+                    mv.note.setElided(nw.c_str());
+                }
+                mv.addChoice(ok ? L"A  Back to the log" : L"A  Back, try again with Y");
+            }
+            auto* dcm = g_lui.dc.get();
+            dcm->BeginDraw();
+            GhUiPageModal(mv);
+            dcm->EndDraw();
+            LuiPresent();
+            Sleep(16);
+            continue;
         }
-        if (alt && (pressed & XINPUT_GAMEPAD_A)) return true;
-        if (pressed & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B)) return false;
 
         const bool fail = (title.find(L"FAIL") != std::wstring::npos ||
                            title.find(L"CRASH") != std::wstring::npos);
@@ -4402,10 +4688,20 @@ static bool LauncherShowCrash(const std::wstring& title, const std::wstring& rea
         ch.statusRole = GH_ROLE_TEXT_ON_BG;
         // What follows is a log, and saying so is enough. Naming the file it
         // came out of told the user about our filesystem, not about their game.
-        ch.subline.set(logLabel ? logLabel : L"What the game reported, most recent last");
+        {
+            std::wstring sub = logLabel ? logLabel : L"What the game reported, most recent last";
+            // A sent report leaves a mark, or the person has no way to know it
+            // went and presses Y again (and the hint is gone, which on its own
+            // reads as the button having broken).
+            if (*repState == 1) sub += L" · report sent";
+            ch.subline.setElided(sub.c_str());
+        }
         if (alt) ch.addHint(GH_GLYPH_A, alt);
         if (alt) ch.addHint(GH_GLYPH_B, L"Back to library");
         else     ch.addHint(GH_GLYPH_A, L"Back to library");    // A or B, one hint
+        // Four hints is the cap, and with `alt` this is the fourth. Scroll is
+        // the one that goes if a fifth ever turns up: the D-pad is discoverable.
+        if (canReport && *repState != 1) ch.addHint(GH_GLYPH_Y, L"Send a report");
         ch.addHint(GH_GLYPH_UPDOWN, L"Scroll");
 
         // The chrome runs before the line count is known, so the viewport's
@@ -6128,14 +6424,23 @@ static bool LauncherApplyTheme(const char* id)
 // ---------------------------------------------------------------------------
 // §63d -- the Themes page. LB from the picker.
 //
-// THE PAGE IS ITS OWN PREVIEW. A on a theme row applies that theme for real, so
-// what the user sees next is this page redrawn by the new theme, in the new
-// theme's layout. The plan said "ListPage plus a live preview panel"; a panel
-// would have shown a postage stamp of one archetype, while applying for real
-// shows the chrome, the type scale, the row shape, the motifs and the structure
-// at once. It also means the page exercises the apply path -- the one that
-// re-bakes the overlay -- rather than a second, parallel rendering of a theme
-// that could drift out of step with it.
+// NOTHING HAS TO BE PRESSED. The page is a wall of live miniatures, one per
+// theme, each painted from that theme's own tokens by GhUiThemePreview
+// (gh_ui_themegrid.h). Pressing A still applies a theme for real, and the page
+// then redraws in it -- that path is unchanged, and it is still what exercises
+// the overlay re-bake -- but you no longer have to apply eight themes to find
+// out what eight themes look like.
+//
+// It replaced a plain list whose comment here argued that a preview panel would
+// only be "a postage stamp of one archetype". That was true of a panel showing
+// the SELECTED theme; it is not true of a wall, where the comparison between
+// themes is the thing on screen. What the miniature cannot show -- the real
+// font, the real type scale at reading size -- A still shows, immediately.
+//
+// The wall is drawn in every theme, including the five that name a layout with
+// no tile view. GhUiPageThemes takes the active layout's chrome and draws the
+// body itself; see the header comment in gh_ui_themegrid.h for why this one
+// page is allowed to.
 //
 // Text size and the safe-area inset live here too, because they are the other
 // two things that change how every screen looks, and because they are stored
@@ -6157,9 +6462,9 @@ static void LauncherThemes()
     GhThBuildRows(rows);
     GhThCtx ctx{ &rows };
 
-    // Open on the theme in use, not on the first row -- the list is a dozen
+    // Open on the theme in use, not on the first tile -- the wall is a dozen
     // long and the one the user came to change is the one they are looking at.
-    int sel = 1;
+    int sel = 0;
     for (size_t i = 0; i < rows.size(); ++i)
         if (rows[i].kind == GH_TH_THEME && rows[i].theme == g_ghThemeActive) { sel = (int)i; break; }
 
@@ -6170,9 +6475,48 @@ static void LauncherThemes()
     bool dirty = false;
     WORD prev = 0xFFFF;
 
-    auto step = [&](int dir) {
-        for (int i = sel + dir; i >= 0 && i < (int)rows.size(); i += dir)
-            if (rows[i].kind != GH_TH_HEAD) { sel = i; return; }
+    // The page is two regions. Indices [0, nTiles) are the wall of previews,
+    // where all four directions move; [nTiles, count) are the display settings
+    // strip, where UP/DOWN move and LEFT/RIGHT are the control.
+    const int nTiles = GhThStripFrom(rows);
+    const int nAll   = (int)rows.size();
+    // Which column to come back to when the user goes down into the strip and
+    // then up again. Without it, UP out of the strip always lands on column 0,
+    // which feels like the cursor was taken away from you.
+    // Read once per press rather than cached: the text-size row is two presses
+    // away and changing it changes the column count, so a cached value would be
+    // stale exactly when the user is looking at the wall reflow.
+    int lastCol = (nTiles > 0) ? (sel % GhThCols()) : 0;
+
+    // Returns true when the press was navigation, so the LEFT/RIGHT handler
+    // below knows not to also treat it as a nudge.
+    auto move = [&](int dx, int dy) -> bool {
+        const int cols = GhThCols();
+        if (sel < nTiles) {
+            if (dx < 0) { if (sel % cols) --sel; }
+            else if (dx > 0) { if (sel % cols != cols - 1 && sel + 1 < nTiles) ++sel; }
+            else if (dy < 0) { if (sel >= cols) sel -= cols; }
+            else if (dy > 0) {
+                if (sel + cols < nTiles) sel += cols;
+                else if (nAll > nTiles) sel = nTiles;   // off the bottom row, into the strip
+            }
+            if (sel < nTiles) lastCol = sel % cols;
+            return true;
+        }
+        // In the strip. LEFT/RIGHT is the control, not navigation.
+        if (dx != 0) return false;
+        if (dy < 0) {
+            if (sel > nTiles) --sel;
+            else if (nTiles > 0) {
+                // Back onto the LAST row of the wall, in the column we left from.
+                const int lastRowStart = ((nTiles - 1) / cols) * cols;
+                sel = lastRowStart + lastCol;
+                if (sel >= nTiles) sel = nTiles - 1;
+            }
+        } else if (dy > 0) {
+            if (sel + 1 < nAll) ++sel;
+        }
+        return true;
     };
 
     Diag("THEMES page open: " + std::to_string(g_ghThemes.size()) + " themes, active '" +
@@ -6192,11 +6536,15 @@ static void LauncherThemes()
                   if (g_padState.sThumbLX < -16000) b |= XINPUT_GAMEPAD_DPAD_LEFT; }
         const WORD pressed = b & ~prev; prev = b;
 
-        if (pressed & XINPUT_GAMEPAD_DPAD_UP)   step(-1);
-        if (pressed & XINPUT_GAMEPAD_DPAD_DOWN) step(+1);
+        if (pressed & XINPUT_GAMEPAD_DPAD_UP)   move(0, -1);
+        if (pressed & XINPUT_GAMEPAD_DPAD_DOWN) move(0, +1);
         if (pressed & (XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_RIGHT)) {
             const int dir = (pressed & XINPUT_GAMEPAD_DPAD_RIGHT) ? +1 : -1;
-            if (GhThNudge(rows[(size_t)sel], dir)) {
+            // On the wall this moves the cursor; in the strip it changes the
+            // value. `move` says which it was, so one press never does both.
+            if (move(dir, 0)) {
+                // navigation only
+            } else if (GhThNudge(rows[(size_t)sel], dir)) {
                 dirty = true;
                 GhUiApply(GhThemeCurrent());   // formats and the safe rect; the overlay waits
                 status.clear(); bad = false;
@@ -6235,7 +6583,11 @@ static void LauncherThemes()
         }
 
         g_lui.dc->BeginDraw();
-        GhUiPageList(GhThPageVM(rows, sel, ctx, status.c_str(), bad));
+        // Not GhUiPageList and not GhUiPageGrid: the Themes page draws its own
+        // body in every theme, because five of the eight name a layout with no
+        // tile view and a column of text rows cannot show what a theme looks
+        // like. See the header comment in gh_ui_themegrid.h.
+        GhUiPageThemes(GhThPageVM(rows, sel, ctx, status.c_str(), bad));
         g_lui.dc->EndDraw();
         LuiPresent();
         Sleep(16);
@@ -6928,6 +7280,7 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
             }
             LuiWorkshopSync(it);
             g_launcherSelectedApp = it.app;
+            g_launcherSelectedName = it.display;
             PickerOskHide();
             return it.guest;
         }

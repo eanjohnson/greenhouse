@@ -53,16 +53,54 @@ inline std::wstring GhThSafeLabel(float v)
     return b;
 }
 
+// How wide the wall is.
+//
+// Decided HERE and not in the renderer, because the page's own input handling
+// has to move by exactly one row and only the column count says how far that
+// is. A renderer that quietly chose three because the text was large would
+// leave DOWN skipping a tile, which is the kind of bug that is invisible in a
+// screenshot and infuriating on a sofa. Both the view-model and the input loop
+// call this one function.
+//
+// Four at normal text; three above 118%. "Greenhouse Light" in a quarter of the
+// width at 140% arrives as "Greenho...", and three tiles reading "Greenho..."
+// are not a choice between themes. The threshold is below 120% rather than at
+// it so that a user who nudges text size up by four presses gets the wider
+// tiles on the press that first makes them necessary.
+inline int GhThCols()
+{
+    return (GhThemeEffTextScale(GhThemeCurrent()) >= 1.18f) ? 3 : 4;
+}
+
+// The rows are [every theme] followed by [text size, screen edges], with no
+// group headings.
+//
+// The headings went when the page became a wall. "Themes" was already the page
+// title two inches above it, and the two display rows are now visibly a strip
+// of their own under the previews -- a heading over a two-row strip is a label
+// on a label. Dropping them also means every index below kGhThDisplayRows from
+// the end is a tile, which is what makes grid navigation a matter of
+// arithmetic instead of a search for the next non-header.
+inline const int kGhThDisplayRows = 2;
+
 inline void GhThBuildRows(std::vector<GhThRow>& rows)
 {
     rows.clear();
-    { GhThRow h; h.label.set(L"Themes"); rows.push_back(h); }
     for (size_t i = 0; i < g_ghThemes.size(); ++i) {
         GhThRow r; r.kind = GH_TH_THEME; r.theme = (int)i; rows.push_back(r);
     }
-    { GhThRow h; h.label.set(L"Display"); rows.push_back(h); }
     { GhThRow r; r.kind = GH_TH_TEXT; rows.push_back(r); }
     { GhThRow r; r.kind = GH_TH_SAFE; rows.push_back(r); }
+}
+
+// The index of the first strip row == the number of tiles. Both the renderer
+// and the input loop need it, so it is computed in one place.
+inline int GhThStripFrom(const std::vector<GhThRow>& rows)
+{
+    int n = 0;
+    for (size_t i = 0; i < rows.size(); ++i)
+        if (rows[i].kind == GH_TH_THEME) ++n;
+    return n;
 }
 
 struct GhThCtx { const std::vector<GhThRow>* rows = nullptr; };
@@ -85,12 +123,22 @@ inline void GhThFillRow(void* c, int i, GhUiRow& out)
         if (r.theme < 0 || r.theme >= (int)g_ghThemes.size()) return;
         const GhTheme& t = g_ghThemes[(size_t)r.theme];
         out.title.setElided(t.name);
-        if (t.desc[0]) out.sub.setElided(t.desc);
+        // The miniature. Borrowed from g_ghThemes, which outlives the frame.
+        out.preview = &t;
         // A theme naming a layout this build does not have still renders, in
         // `list` (GhUiLayoutActive). Name the layout it will actually get,
         // rather than the id it asked for, which the user cannot act on.
         const GhUiLayout* la = GhUiLayoutFind(t.layout);
-        out.right.set(la ? GhThemeWiden(la->name).c_str() : L"List");
+        const std::wstring lay = la ? GhThemeWiden(la->name) : std::wstring(L"List");
+        // The layout name, not the description, is the tile's caption. A tile is
+        // about 420px wide and the descriptions run 45 characters, so the
+        // description would arrive half-elided -- and the thing it would be
+        // explaining is the picture directly above it. The layout name is short,
+        // always fits, and names what the miniature is a miniature OF. The
+        // description still gets a full line of its own, in the caption under
+        // the wall, for the tile you are on.
+        out.sub.set(lay.c_str());
+        out.right.set(lay.c_str());
         if (std::strcmp(t.id, cur.id) == 0) {
             out.hasBadge = true;
             out.badge.label.set(L"IN USE");
@@ -122,6 +170,12 @@ inline GhUiListVM GhThPageVM(const std::vector<GhThRow>& rows, int sel,
     vm.sel   = sel;
     vm.fill  = &GhThFillRow;
     vm.ctx   = (void*)&ctx;
+
+    // The themes are a wall of previews; the two display settings are a strip
+    // under it. GhUiPageThemes (gh_ui_themegrid.h) is the only renderer that
+    // reads either field.
+    vm.gridCols  = GhThCols();
+    vm.stripFrom = GhThStripFrom(rows);
 
     const GhTheme& t = GhThemeCurrent();
     GhUiChrome& ch = vm.chrome;
@@ -156,10 +210,12 @@ inline GhUiListVM GhThPageVM(const std::vector<GhThRow>& rows, int sel,
     // The hints follow the selected row, because A does nothing on a setting
     // and LEFT/RIGHT does nothing on a theme. A footer that offers a button
     // which does not work is the dev-tool habit U6 is meant to remove.
-    ch.addHint(GH_GLYPH_UPDOWN, L"Move");
     if (r.kind == GH_TH_THEME) {
+        // Both axes move on the wall, so the glyph is ARROWS and not UPDOWN.
+        ch.addHint(GH_GLYPH_ARROWS, L"Move");
         if (r.theme != g_ghThemeActive) ch.addHint(GH_GLYPH_A, L"Use this theme");
     } else {
+        ch.addHint(GH_GLYPH_UPDOWN, L"Move");
         ch.addHint(GH_GLYPH_LEFTRIGHT, L"Change");
         const bool set = (r.kind == GH_TH_TEXT) ? g_ghThemeSettings.hasTextScale
                                                 : g_ghThemeSettings.hasSafePct;

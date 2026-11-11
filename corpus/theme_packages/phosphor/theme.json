@@ -13,9 +13,9 @@
     "a theme that already ships cannot test downloading one.",
     "It carries sweep.png so a theme package's BINARY asset path is exercised",
     "end to end on the console -- the manifest allow-list, the sha256, the",
-    "content check and the install. Nothing renders it yet: background.kind",
-    "\"image\" parses in gh_theme.h but no layout reads bgImage, so this theme",
-    "draws its gradient. That gap is U3's, not the package type's."
+    "content check and the install. Since 0.0.938.0 that asset is also DRAWN:",
+    "background.kind \"image\" is rendered by GhUiBackground, and the file is",
+    "authored at exactly 1920x1080 so its scanlines land 1:1 on the canvas."
   ],
 
   "colors": {
@@ -40,6 +40,6 @@
   },
 
   "metrics": { "radius": 0, "rowH": 72, "rowGap": 6, "gutter": 88, "stroke": 1.0 },
-  "background": { "kind": "gradient", "to": "#0A2314" },
+  "background": { "kind": "image", "image": "sweep.png", "to": "#0A2314" },
   "motifs": { "innerEdge": true, "gloss": false }
 }

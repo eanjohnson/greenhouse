@@ -101,6 +101,10 @@ constexpr int      kMaxCovers      = 44;
 constexpr int      kMaxHeroes      = 3;
 constexpr int      kDecodePerFrame = 2;      // D2D bitmaps created per frame
 constexpr int      kQueueMax       = 48;
+// The prefetch list is the whole owned library, not a screenful, so it gets a
+// bound of its own: 171 titles today, and a number big enough that growing the
+// library does not quietly truncate it.
+constexpr int      kPrefetchMax    = 512;
 constexpr uint64_t kMaxFetchBytes  = 6ull * 1024 * 1024;   // a capsule is ~90 KB; a hero ~400 KB
 // A title Steam has no asset for is remembered, so the console does not ask
 // again every launch -- but not forever, because art does get added.
@@ -135,6 +139,11 @@ struct Ctx {
     std::deque<std::pair<uint32_t, int>> queue;
     std::vector<uint32_t>   allowed;          // app ids the library reported
     bool                    allowAll = false; // only the preview harness sets this
+    // Covers to put on disk whether or not anything is drawing them, in the
+    // order the library reported -- which is the order the wall is in. Drained
+    // only when `queue` is empty, so a tile on screen is never behind a
+    // prefetch. See Prefetch() for why this is separate from `queue`.
+    std::deque<uint32_t>    prefetch;
 
     std::thread      worker;
     std::atomic<bool> stop{false};
@@ -182,14 +191,17 @@ inline bool FileAgeDays(const std::wstring& p, uint64_t* days)
 // touching a file every time a cover is drawn, and a wall draws eighteen of
 // them sixty times a second. Write time is a good enough proxy on a cache
 // nothing rewrites.
-inline void PruneDisk()
+// Returns how many files it deleted, which the prefetch below reads: a prune
+// during a prefetch means the cache is too small for the library, and carrying
+// on would delete the covers the same pass just wrote.
+inline int PruneDisk()
 {
     struct F { std::wstring name; uint64_t bytes; uint64_t when; };
     std::vector<F> f;
     uint64_t total = 0;
     WIN32_FIND_DATAW fd{};
     HANDLE h = FindFirstFileW((g_art.dir + L"*").c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
+    if (h == INVALID_HANDLE_VALUE) return 0;
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         ULARGE_INTEGER sz{}; sz.LowPart = fd.nFileSizeLow; sz.HighPart = fd.nFileSizeHigh;
@@ -199,7 +211,7 @@ inline void PruneDisk()
         total += sz.QuadPart;
     } while (FindNextFileW(h, &fd));
     FindClose(h);
-    if (total <= g_art.diskCap) return;
+    if (total <= g_art.diskCap) return 0;
 
     for (size_t i = 1; i < f.size(); ++i)          // insertion sort, oldest first
         for (size_t j = i; j > 0 && f[j - 1].when > f[j].when; --j) std::swap(f[j - 1], f[j]);
@@ -211,6 +223,7 @@ inline void PruneDisk()
     }
     if (gone) Log("cache pruned: " + std::to_string(gone) + " file(s), now " +
                   std::to_string(total / 1024) + " KB");
+    return gone;
 }
 
 // ---------------------------------------------------------------------------
@@ -369,39 +382,134 @@ inline void WorkerOne(uint32_t app, int kind)
     }
 }
 
+// ---------------------------------------------------------------------------
+// The prefetch (worker thread)
+// ---------------------------------------------------------------------------
+// One title's cover, and only as far as the disk.
+//
+// Deliberately NOT WorkerOne: this neither decodes nor creates an Item. The
+// whole library decoded at 360x540 would be 133 MB of pixel buffers with
+// nothing to consume them -- Provide() turns pixels into a bitmap only for rows
+// a layout is actually drawing, two a frame, and holds 44 of them at most. The
+// point of the prefetch is that the BYTES are local, so that when a row does
+// come on screen its fetch is a file read instead of a round trip to Steam.
+//
+// Everything that decides WHICH titles may be fetched has already happened:
+// Prefetch() is handed the list the library reported, which is the same list
+// Allowed() checks against.
+inline void StopPrefetch(const char* why)
+{
+    size_t left = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_art.mu);
+        left = g_art.prefetch.size();
+        g_art.prefetch.clear();
+    }
+    if (left) Log(std::string(why) + ": prefetch stopped with " + std::to_string(left) +
+                  " title(s) left, which stay on demand");
+}
+
+inline void PrefetchOne(uint32_t app)
+{
+    const int kind = GH_ART_COVER;
+    // Already here, or a fresh "Steam has nothing for this one". Both are a
+    // file-attribute call and no network at all, which is what makes it safe to
+    // re-queue the whole library after every enumeration.
+    if (GetFileAttributesW(CachePath(app, kind).c_str()) != INVALID_FILE_ATTRIBUTES) return;
+    uint64_t days = 0;
+    if (FileAgeDays(AbsentPath(app, kind), &days) && days < kAbsentDays) return;
+
+    const std::string url = std::string(kHost) + std::to_string(app) + "/" + AssetName(kind);
+    std::string why;
+    uint64_t got = 0;
+    std::vector<uint8_t> bytes;
+    if (!ghrepo::HttpGet(url, kMaxFetchBytes, &bytes, nullptr, nullptr, &got, why) ||
+        bytes.size() <= 64) {
+        if (why.compare(0, 6, "HTTP 4") == 0) {
+            // A miss is normal and permanent-ish: remember it exactly as the
+            // on-demand path does, so neither path asks again for 14 days.
+            g_art.missing.fetch_add(1);
+            HANDLE h = CreateFileW(AbsentPath(app, kind).c_str(), GENERIC_WRITE, 0, nullptr,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+            return;
+        }
+        // Not an absence -- the console could not reach Steam. One title
+        // failing this way means the rest will too, and a prefetch is a
+        // convenience: 171 doomed round trips on a dropped association would
+        // hold the worker for minutes and starve the tiles that ARE on screen.
+        if (g_art.failed.fetch_add(1) == 0)
+            Log("prefetch failed (app " + std::to_string(app) + "): " + why);
+        StopPrefetch("unreachable");
+        return;
+    }
+
+    HANDLE h = CreateFileW(CachePath(app, kind).c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    WriteFile(h, bytes.data(), (DWORD)bytes.size(), &w, nullptr);
+    CloseHandle(h);
+    DeleteFileW(AbsentPath(app, kind).c_str());
+    g_art.fetched.fetch_add(1);
+
+    // A prune here means the cache is smaller than the library, so the pass is
+    // now deleting its own head -- and the next launch would start the same
+    // treadmill. Stop instead, and let what is left be fetched on demand.
+    if (PruneDisk() > 0) StopPrefetch("cache full");
+}
+
 inline void WorkerLoop()
 {
     for (;;) {
-        uint32_t app = 0; int kind = 0;
+        uint32_t app = 0; int kind = 0; bool pre = false;
         {
             std::unique_lock<std::mutex> lk(g_art.mu);
-            g_art.cv.wait(lk, []{ return g_art.stop.load() || !g_art.queue.empty(); });
+            g_art.cv.wait(lk, []{ return g_art.stop.load() || !g_art.queue.empty() ||
+                                         !g_art.prefetch.empty(); });
             if (g_art.stop.load()) return;
-            // LIFO: the newest request is the one the user is looking at. A
-            // queue drained in order would spend its first second on the covers
-            // that scrolled off the top.
-            app = g_art.queue.back().first;
-            kind = g_art.queue.back().second;
-            g_art.queue.pop_back();
+            if (!g_art.queue.empty()) {
+                // LIFO: the newest request is the one the user is looking at. A
+                // queue drained in order would spend its first second on the covers
+                // that scrolled off the top.
+                app = g_art.queue.back().first;
+                kind = g_art.queue.back().second;
+                g_art.queue.pop_back();
+            } else {
+                // Nothing is waiting to be drawn, so fill the disk cache.
+                // FIFO, because unlike the on-screen queue this list has no
+                // "most recent" end: it is the library in library order.
+                app = g_art.prefetch.front();
+                g_art.prefetch.pop_front();
+                pre = true;
+            }
         }
-        WorkerOne(app, kind);
+        if (pre) PrefetchOne(app);
+        else     WorkerOne(app, kind);
 
         // Say once per drained queue what the wall is actually made of. Without
         // this a plate on the TV has no explanation in the diag at all: nothing
         // distinguished "Steam has no capsule for this title" from "the fetch
         // failed", and the counters existed but were never printed.
         bool drained = false;
+        size_t left = 0;
         {
             std::lock_guard<std::mutex> lk(g_art.mu);
             drained = g_art.queue.empty();
+            left    = g_art.prefetch.size();
         }
-        if (drained) {
+        // The prefetch moves these counters on every title, and a line each
+        // would be 171 of them in a diag that has a size budget. Say it every
+        // 25th, and always on the last one.
+        if (drained && (left == 0 || (g_art.fetched.load() % 25) == 0)) {
             const int f = g_art.fetched.load(), m = g_art.missing.load(),
                       x = g_art.failed.load();
             if (f != g_art.saidFetched || m != g_art.saidMissing || x != g_art.saidFailed) {
                 g_art.saidFetched = f; g_art.saidMissing = m; g_art.saidFailed = x;
                 Log("queue drained: " + std::to_string(f) + " fetched, " +
-                    std::to_string(m) + " with no asset, " + std::to_string(x) + " failed");
+                    std::to_string(m) + " with no asset, " + std::to_string(x) + " failed" +
+                    (left ? (", " + std::to_string(left) + " still to prefetch")
+                          : std::string()));
             }
         }
     }
@@ -524,6 +632,44 @@ inline void Allow(const std::vector<uint32_t>& apps)
     g_art.allowed = apps;
 }
 
+// Put every owned title's cover on disk, whether or not anything is drawing it.
+//
+// Provide() is demand-driven, and is only ever asked about the rows a layout is
+// DRAWING. That is right for memory -- 44 live bitmaps, not 171 -- but it meant
+// the BYTES were fetched at the moment a tile appeared, so scrolling the wall
+// showed a column of plates that filled in a beat later, and a title the user
+// never scrolled to had no art at all. Installed titles sort first, so what it
+// looked like from the sofa was "art only for the games that are installed".
+//
+// The disk is the right place to fix it and video memory is not: a capsule is
+// ~90 KB, so the whole library is ~17 MB against a 48 MB cap, while the same
+// library decoded would be 133 MB. So this fills the disk cache and stops
+// there; the in-memory LRU is untouched and still demand-driven.
+//
+// Called with the same list as Allow(), after every enumeration. Re-queueing a
+// title already on disk costs one file-attribute call and no network, which is
+// what makes calling it again cheap -- and is also how a title bought since the
+// last enumeration gets picked up.
+inline void Prefetch(const std::vector<uint32_t>& apps)
+{
+    if (!g_art.running.load()) return;
+    size_t added = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_art.mu);
+        for (uint32_t a : apps) {
+            if (!a) continue;
+            if ((int)g_art.prefetch.size() >= kPrefetchMax) break;
+            bool dup = false;
+            for (uint32_t q : g_art.prefetch) if (q == a) { dup = true; break; }
+            if (!dup) { g_art.prefetch.push_back(a); ++added; }
+        }
+    }
+    if (added) {
+        Log("prefetching " + std::to_string(added) + " cover(s) to disk");
+        g_art.cv.notify_one();
+    }
+}
+
 inline void AllowAll(bool on)                      // the preview harness only
 {
     std::lock_guard<std::mutex> lk(g_art.mu);
@@ -570,14 +716,17 @@ inline void Shutdown()
     std::lock_guard<std::mutex> lk(g_art.mu);
     g_art.items.clear();
     g_art.queue.clear();
+    g_art.prefetch.clear();
 }
 
 // One line for the diag, on demand: what the session actually fetched.
 inline std::string Stats()
 {
     int ready = 0, queued = 0, absent = 0;
+    size_t pre = 0;
     {
         std::lock_guard<std::mutex> lk(g_art.mu);
+        pre = g_art.prefetch.size();
         for (const auto& it : g_art.items) {
             if (it.state == kReady) ++ready;
             else if (it.state == kQueued || it.state == kPixels) ++queued;
@@ -585,6 +734,7 @@ inline std::string Stats()
         }
     }
     return "live=" + std::to_string(ready) + " pending=" + std::to_string(queued) +
+           " prefetch=" + std::to_string(pre) +
            " none=" + std::to_string(absent) + " fetched=" + std::to_string(g_art.fetched.load()) +
            " miss=" + std::to_string(g_art.missing.load()) +
            " baddecode=" + std::to_string(g_art.failed.load());

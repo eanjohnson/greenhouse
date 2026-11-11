@@ -35,14 +35,34 @@
 #include <vector>
 
 #include "gh_theme.h"
+#include "gh_compat.h"   // the real compatibility dataset, through the real parser
 #include "gh_ui_vm.h"
 #include "gh_ui.h"
 #include "gh_ui_layouts.h"
 #include "gh_ui_page_themes.h"
+#include "gh_ui_themegrid.h"   // the Themes page's wall of live previews
 #include "gh_ui_page_onboard.h"
 
 // ---------------------------------------------------------------------------
 static void LogLine(const std::string& s) { printf("%s\n", s.c_str()); }
+
+// The compatibility dataset (--compat), read with gh_compat.h -- the same header the
+// launcher uses, on the same corpus/compat/compat.json. So the dots and the title
+// line in these renders are not fixture decoration: if the dataset says a title
+// reaches only its menus, that is what the sheet shows, and a mistake in the data or
+// in the parse is visible here rather than on the console.
+static void LoadCompat(const std::wstring& path, ghcompat::Model model)
+{
+    ghcompat::Init(&LogLine);
+    ghcompat::SetModel(model);
+    if (path.empty()) return;
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) { printf("compat: cannot open the dataset\n"); return; }
+    std::string b; char buf[8192]; DWORD rd = 0;
+    while (ReadFile(f, buf, sizeof buf, &rd, nullptr) && rd) b.append(buf, rd);
+    CloseHandle(f);
+    ghcompat::Offer(b.data(), b.size(), "harness", false);
+}
 
 static std::wstring Widen(const std::string& s)
 {
@@ -321,6 +341,12 @@ static const PickRow kPickRows[] = {
     { L"Cheese Rolling",                   L"installed",   3809440, 0, false },
     { L"Ghost of Tsushima DIRECTOR'S CUT", L"incomplete",  2215430, 1, false },
     { L"Marvel's Spider-Man Remastered",   L"incomplete",  1817070, 1, false },
+    // Owned, and it will never run: a commercial packer fails before any game code
+    // does. The only row that can show the mark for that, and the one the title page
+    // has something worth saying about. It sits here, not at the end of the list,
+    // because the cabinet wall shows twelve tiles and a thirteenth row is a mark
+    // nobody reviewing a screenshot would ever see.
+    { L"SCP: Secret Laboratory",           L"owned",        700330, 2, false },
     { L"Fears to Fathom - Scratch Creek",  L"owned",       4121170, 2, false },
     { L"Gang Beasts",                      L"owned",        285900, 2, false },
     { L"FPS Chess",                        L"owned",       2021910, 2, false },
@@ -338,6 +364,17 @@ static void PickFillRow(void*, int i, GhUiRow& out)
     out.muted = (r.kind == 2);              // owned, not copied here yet
     if (r.kind == 1) out.tray.set(L"Part copied");
     out.flag = r.flag;
+    // The playability mark, exactly as LuiPickFillRow sets it.
+    const ghcompat::Dot cd = ghcompat::DotFor(r.app);
+    if (cd != ghcompat::DotNone) {
+        out.hasDot   = true;
+        out.dotRole  = cd == ghcompat::DotGood    ? GH_ROLE_ACCENT
+                     : cd == ghcompat::DotPartial ? GH_ROLE_TEXT_DIM
+                                                  : GH_ROLE_WARN;
+        out.dotShape = cd == ghcompat::DotGood    ? GH_DOT_FILLED
+                     : cd == ghcompat::DotPartial ? GH_DOT_RING
+                                                  : GH_DOT_BLOCK;
+    }
     // `progress` is deliberately left at -1: gh_install.txt records complete=0|1
     // and nothing persists a byte count, so a part-copied title says the words
     // and does not draw a bar it would have to invent.
@@ -404,6 +441,9 @@ static GhUiModalVM MakeTitleFixture()
     // playtime_forever, playtime_2weeks and rtime_last_played), so this line
     // costs no request on the console either.
     vm.detail.set(L"7.4 hours played  ·  38 min in the last two weeks  ·  played 3 days ago");
+    // The ONE line about what this title does here (LuiDrawTitlePage puts the same
+    // string in the same field; the dataset's prose note stays on the website).
+    vm.note.setElided(ghcompat::LineFor(vm.appId).c_str());
     vm.addChoice(L"Play");
     vm.addHint(GH_GLYPH_VIEW, L"Verify files");
     vm.addHint(GH_GLYPH_X,    L"Uninstall");
@@ -424,7 +464,34 @@ static GhUiModalVM MakeTitleOwnedFixture()
     vm.chip.filled = false;
     vm.hasChip     = true;
     vm.detail.set(L"Never played");
-    vm.note.set(L"On your Steam account. Installing copies it to this console.");
+    // A compat result beats the boilerplate, as it does on the console.
+    const std::wstring cl = ghcompat::LineFor(vm.appId);
+    if (!cl.empty()) vm.note.setElided(cl.c_str());
+    else             vm.note.set(L"On your Steam account. Installing copies it to this console.");
+    vm.addChoice(L"Install");
+    vm.addHint(GH_GLYPH_B, L"Back");
+    return vm;
+}
+
+// The other end of the dataset: a title we have run and will never get running.
+// It is its own page because the WONT_RUN line is the one worth reading before a
+// console deploy -- it is the only sentence the launcher says about a game that
+// is not an encouragement, and getting its tone wrong is a public mistake.
+static GhUiModalVM MakeTitleWallFixture()
+{
+    GhUiModalVM vm;
+    vm.overPage  = false;
+    vm.titlePage = true;
+    vm.appId     = 700330;
+    vm.heading.setElided(L"SCP: Secret Laboratory");
+    vm.chip.label.set(L"Not installed");
+    vm.chip.role   = GH_ROLE_TEXT_DIM;
+    vm.chip.filled = false;
+    vm.hasChip     = true;
+    vm.detail.set(L"Never played");
+    const std::wstring cl = ghcompat::LineFor(vm.appId);
+    if (!cl.empty()) vm.note.setElided(cl.c_str());
+    else             vm.note.set(L"On your Steam account. Installing copies it to this console.");
     vm.addChoice(L"Install");
     vm.addHint(GH_GLYPH_B, L"Back");
     return vm;
@@ -441,6 +508,46 @@ static GhUiModalVM MakeUninstallFixture()
     vm.note.set(L"The install folder will be deleted. This cannot be undone.");
     vm.addChoice(L"A  Yes, uninstall");
     vm.addChoice(L"B  Cancel");
+    return vm;
+}
+
+// §64. The crash-report consent modal, which is the one modal in the launcher
+// whose `note` is a real three-clause sentence rather than a line of fine print.
+// It is here because that note is the longest string any modal carries (160
+// characters is GhUiText's whole capacity), so this is the fixture that says
+// whether the consent text FITS -- and a consent the player cannot read is not
+// consent. Built from exactly the strings launcher_ui.h sets.
+static GhUiModalVM MakeReportFixture()
+{
+    GhUiModalVM vm;
+    vm.overPage = false;
+    vm.heading.set(L"SEND A REPORT");
+    vm.body.set(L"Send this log to the Greenhouse team?");
+    vm.detail.set(L"Dead as Disco");      // a long-ish real name, not "Game"
+    vm.note.set(L"Sends the end of this log, the game's name, the console model and the "
+                L"Greenhouse version. Account names, file paths and anything key-shaped "
+                L"are removed first.");
+    vm.addChoice(L"A  Send");
+    vm.addChoice(L"B  Cancel");
+    return vm;
+}
+
+// The failure half, which carries a reason string from the site or WinHTTP: the
+// one place a server's words reach the TV, so it has to survive being long.
+static GhUiModalVM MakeReportFailFixture()
+{
+    GhUiModalVM vm;
+    vm.overPage = false;
+    vm.danger = true;
+    vm.heading.set(L"NOT SENT");
+    vm.body.set(L"The report did not go through.");
+    // The reason lives in the NOTE, in dim text. It is deliberately NOT the
+    // detail: a modal draws its detail in ACCENT, the colour of success, and a
+    // green failure reason under a red headline is the exact mistake the crash
+    // screen's own `reason` line already made once.
+    vm.note.setElided(L"the site refused this build's token. "
+                      L"Nothing was sent. The log is still on screen behind this.");
+    vm.addChoice(L"A  Back, try again with Y");
     return vm;
 }
 
@@ -1004,9 +1111,9 @@ static void PaintTokenSheet(const GhTheme& t)
 // review before a deploy: every page the launcher draws, in one theme, in one
 // command. The caller owns BeginDraw/EndDraw, as the launcher's own pages do.
 static const char* kPages[] = {
-    "tokens", "picker", "title", "title-owned", "empty", "packages", "mods", "workshop",
+    "tokens", "picker", "title", "title-owned", "title-wall", "empty", "packages", "mods", "workshop",
     "progress", "busy", "qr", "ent", "status", "uninstall", "verify",
-    "entry", "crash", "themes", "themes-big",
+    "entry", "crash", "report", "report-fail", "themes", "themes-big",
     "onboard1", "onboard4",
 };
 static const int kPageCount = (int)(sizeof kPages / sizeof kPages[0]);
@@ -1022,6 +1129,7 @@ static bool PaintPage(const std::string& page, const GhTheme& t)
     // The title screen, which is a MODAL with `titlePage` -- see MakeTitleFixture.
     if (page == "title")       { GhUiPageModal(MakeTitleFixture()); return true; }
     if (page == "title-owned") { GhUiPageModal(MakeTitleOwnedFixture()); return true; }
+    if (page == "title-wall")  { GhUiPageModal(MakeTitleWallFixture()); return true; }
     if (page == "empty") {
         // The same page with nothing in it. An empty list is a state the device
         // reaches on a first run, before sign-in, and it is drawn by the layout
@@ -1046,7 +1154,7 @@ static bool PaintPage(const std::string& page, const GhTheme& t)
         GhThCtx ctx{ &rows };
         // Selected: the theme in use, so the IN USE badge and the caption for a
         // selected theme row are both on screen.
-        int sel = 1;
+        int sel = 0;
         for (size_t i = 0; i < rows.size(); ++i)
             if (rows[i].kind == GH_TH_THEME && rows[i].theme == g_ghThemeActive) { sel = (int)i; break; }
         // ...and, in the -big render, the "Text size" row instead, at the top of
@@ -1059,7 +1167,7 @@ static bool PaintPage(const std::string& page, const GhTheme& t)
             g_ghThemeSettings.textScale = 1.4f;
             GhUiApply(t);                       // the page draws at the size it reports
         }
-        GhUiPageList(GhThPageVM(rows, sel, ctx, nullptr, false));
+        GhUiPageThemes(GhThPageVM(rows, sel, ctx, nullptr, false));
         if (page == "themes-big") {             // leave the next render alone
             g_ghThemeSettings.hasTextScale = false;
             GhUiApply(t);
@@ -1090,6 +1198,8 @@ static bool PaintPage(const std::string& page, const GhTheme& t)
     if (page == "verify")    { GhUiPageModal(MakeVerifyFixture()); return true; }
     if (page == "entry")     { GhUiPageModal(MakeEntryFixture()); return true; }
     if (page == "crash")     { PaintCrashFixture(); return true; }
+    if (page == "report")      { GhUiPageModal(MakeReportFixture()); return true; }
+    if (page == "report-fail") { GhUiPageModal(MakeReportFailFixture()); return true; }
     return false;
 }
 
@@ -1100,6 +1210,8 @@ int wmain(int argc, wchar_t** argv)
     std::wstring out   = L".\\";
     std::string  want  = "all";
     std::string  page  = "tokens";
+    std::wstring compat;                        // corpus/compat/compat.json
+    ghcompat::Model model = ghcompat::MdOne;    // the console these renders stand for
     UINT w = 1920, h = 1080;
 
     for (int i = 1; i < argc; ++i) {
@@ -1110,11 +1222,18 @@ int wmain(int argc, wchar_t** argv)
         else if (a == L"--theme" && more) { const std::wstring t = argv[++i]; want.clear();
                                             for (wchar_t c : t) if (c < 0x80) want.push_back((char)c); }
         else if (a == L"--size" && more)  { swscanf(argv[++i], L"%ux%u", &w, &h); }
+        else if (a == L"--compat" && more)  { compat = argv[++i]; }
+        else if (a == L"--console" && more) { const std::wstring m = argv[++i];
+                                              model = m == L"SERIES_X" ? ghcompat::MdSeriesX
+                                                    : m == L"SERIES_S" ? ghcompat::MdSeriesS
+                                                    : m == L"NONE"     ? ghcompat::MdUnknown
+                                                                       : ghcompat::MdOne; }
         else if (a == L"--page" && more) { const std::wstring t = argv[++i]; page.clear();
                                             for (wchar_t c : t) if (c < 0x80) page.push_back((char)c); }
         else if (a == L"--help") {
             printf("gh_ui_host [--state <dir>] [--out <dir>] [--theme <id|all>] [--size WxH]\n"
-                   "           [--page <name>|all]\n"
+                   "           [--page <name>|all] [--compat <compat.json>]\n"
+                   "           [--console ONE|SERIES_S|SERIES_X|NONE]\n"
                    "pages:");
             for (int k = 0; k < kPageCount; ++k) printf(" %s", kPages[k]);
             printf("\n");
@@ -1132,6 +1251,7 @@ int wmain(int argc, wchar_t** argv)
     // and a third of the way along is where an indeterminate bar is visible.
     g_ghUiAnimPin = 0.35f;
 
+    LoadCompat(compat, model);
     GhThemeInit(state.c_str(), &LogLine);
     GhThemeLoad();
     GhUiLayoutsInit();

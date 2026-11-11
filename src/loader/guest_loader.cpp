@@ -160,6 +160,11 @@ static const wchar_t* kDevBake   = L"D:\\DevelopmentFiles\\ghbake\\";  // §47: 
 // RunGuest and the launcher_ui.h include in App::Run.
 static std::wstring g_launcherSelectedGuest;
 static uint32_t     g_launcherSelectedApp = 0;   // Steam appid of the picked row
+// The picked row's display name. Only a crash report uses it (§64): the site keys
+// its CrashReport on a title NAME, and the app id alone names nothing for the ~161
+// owned titles that are not in corpus/compat/compat.json -- which are exactly the
+// ones a stranger's report would be about.
+static std::wstring g_launcherSelectedName;
 static bool LuiEntAllowsLaunch();                 // launcher_ui.h (§43 membership gate)
 #endif
 

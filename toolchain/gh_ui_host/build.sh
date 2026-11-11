@@ -12,6 +12,7 @@
 #                                            before a console deploy
 #   GH_UI_OUT=/some/dir  ...                 where the PNGs go
 #   GH_UI_STATE=/some/dir ...                where gh_theme/<id>/theme.json is read from
+#   GH_UI_CONSOLE=SERIES_X ...               which console the compat marks stand for
 #
 # `gh_ui_host.exe --help` lists the page names.
 set -uo pipefail
@@ -70,7 +71,9 @@ WINEDEBUG="${WINEDEBUG:--all}" wine "$EXE" \
     --state "Z:${STATE//\//\\}\\" \
     --out   "Z:${OUT//\//\\}\\" \
     --theme "$THEME" \
-    --page  "${GH_UI_PAGE:-tokens}"
+    --page  "${GH_UI_PAGE:-tokens}" \
+    --compat "Z:${GH//\//\\}\\corpus\\compat\\compat.json" \
+    --console "${GH_UI_CONSOLE:-ONE}"
 rc=$?
 
 echo

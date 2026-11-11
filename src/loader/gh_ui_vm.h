@@ -293,6 +293,25 @@ struct GhUiRow {
     // and the layout draws whatever shape suits it.
     bool      hasDot    = false;
     int       dotRole   = GH_ROLE_ACCENT;
+    // ...and its SHAPE, which is what actually carries the meaning. A theme
+    // owns its accent: `catalogue` paints accent #B4462A and warn #9B2E12, two
+    // reds nobody tells apart as 10px dots, so a colour-coded "plays" and
+    // "never will" read identically there -- and that is before anyone
+    // colour-blind looks at it. Filled / ring / block is a silhouette, and a
+    // silhouette survives both the palette and the three metres to the sofa.
+    // Values are GhUiDotShape (gh_ui.h): 0 filled, 1 ring, 2 block.
+    int       dotShape  = 0;
+
+    // A theme to draw a live miniature OF, for the Themes page's wall of
+    // previews (gh_ui_themegrid.h). A borrowed pointer into g_ghThemes, which
+    // outlives any frame; null everywhere else.
+    //
+    // This is the one place the view-model carries a theme rather than tokens
+    // resolved from one, and it has to: the whole point of the row is that it
+    // shows a theme which is NOT the active one, so there is no amount of
+    // pre-resolved colour the page could hand over instead. gh_ui_vm.h already
+    // includes gh_theme.h, so this costs nothing in layering.
+    const GhTheme* preview = nullptr;
 
     void reset() { *this = GhUiRow{}; }
 };
@@ -329,6 +348,18 @@ struct GhUiListVM {
     // A grid layout's preference; a list layout ignores it. 0 lets the layout
     // choose from the theme's metrics.
     int        gridCols = 0;
+
+    // Rows at or after this index are not tiles: they are drawn as a full-width
+    // strip under the wall. -1, the default, means every row is a tile, so every
+    // page that already existed is unaffected.
+    //
+    // It exists because the Themes page is two kinds of thing on one screen: a
+    // catalogue of themes, which wants a wall, and two display settings, which
+    // want a row each with a value on the right and Left/Right to change it. A
+    // setting rendered as a tile would be a tile whose caption is a number, and
+    // a theme rendered as a row cannot show a preview. Only gh_ui_themegrid.h
+    // reads this.
+    int        stripFrom = -1;
 
     void getRow(int i, GhUiRow& out) const
     {

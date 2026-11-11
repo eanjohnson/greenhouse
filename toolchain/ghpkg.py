@@ -14,6 +14,11 @@
                    # a theme package: theme.json plus its fonts and images, and NOTHING
                    # executable. The id comes from theme.json; the allow-list is checked
                    # here and again, as the real boundary, on the console (§63e)
+  ghpkg.py compat  --repo DIR --version a.b.c.d [--id greenhouse-compat] [corpus/compat/compat.json]
+                   # the compatibility dataset (greenhouse.compat/1): what Greenhouse is known
+                   # to do with a title, keyed by Steam app id. ONE file, named compat.json,
+                   # and nothing else -- the same file toolchain/ghcompat.py pushes to the
+                   # website, so one edit reaches both surfaces. --auto keeps members current
   ghpkg.py corpus  --repo DIR --id ID --version a.b.c.d --dir corpus/redist/ghlo [--overlay DIR] [--pack-mb 64]
                    # a members-only data add-on of *.ghpak packs: every record AES-256-GCM under ONE
                    # package key (path "@package" in --keys-dir); the console keeps the packs
@@ -253,8 +258,8 @@ def add_package(repo, pid, ptype, version, name, min_loader, provides, requires,
                 auto=False, blobs=None):
     if not ID_RE.match(pid) or pid in ('.', '..'):
         die(f'id {pid!r} is not a safe id')
-    if ptype not in ('title', 'addon', 'theme'):
-        die('type must be title, addon or theme')
+    if ptype not in ('title', 'addon', 'theme', 'compat'):
+        die('type must be title, addon, theme or compat')
     ver_tuple(version)
     if min_loader:
         ver_tuple(min_loader)
@@ -276,6 +281,8 @@ def add_package(repo, pid, ptype, version, name, min_loader, provides, requires,
         else:
             with open(src, 'rb') as f:
                 b = f.read()
+        if ptype == 'compat' and rel != 'compat.json':
+            die(f'compat package file {rel!r} is not compat.json')
         if ptype == 'theme':
             theme_file_ok(rel, b)           # on the PLAINTEXT, which is what the console checks
         if sealed:
@@ -289,6 +296,8 @@ def add_package(repo, pid, ptype, version, name, min_loader, provides, requires,
         if sealed:
             e['sealed'] = True
         entries.append(e)
+    if ptype == 'compat' and len(entries) != 1:
+        die('a compat package holds exactly one file, compat.json')
     if ptype == 'theme':
         if sum(1 for e in entries if e['path'] == 'theme.json') != 1:
             die('a theme package holds exactly one top-level theme.json')
@@ -366,6 +375,38 @@ def cmd_theme(a):
             files.append(f'{src}={rel}')
     add_package(a.repo, pid, 'theme', a.version, t.get('name') or pid, a.min_loader,
                 ['theme:' + pid], [], files, a.sealed, a.keys_dir, a.auto)
+
+
+def cmd_compat(a):
+    """The compatibility dataset as a package: one compat.json, checked here against the
+    same rules gh_compat.h applies on the console, so a dataset the loader would refuse
+    cannot be published. The id is a package id, not something inside the file -- the
+    dataset has none, by design: it is one record of what we have run, not one per
+    publisher, and the console keeps whichever copy has the higher `serial`."""
+    path = a.file or os.path.join(REPO_ROOT, 'corpus', 'compat', 'compat.json')
+    with open(path, 'rb') as f:
+        raw = f.read()
+    if len(raw) > 1 << 20:
+        die(f'{path} is larger than 1 MiB, which the console refuses')
+    try:
+        d = json.loads(raw)
+    except Exception as e:
+        die(f'{path}: is not JSON ({e})')
+    if not isinstance(d, dict) or d.get('schema') != 'greenhouse.compat/1':
+        die(f'{path} is not greenhouse.compat/1')
+    # The authoritative check lives in toolchain/ghcompat.py (one copy of the rules);
+    # run it rather than restating them, so a package can never carry a dataset that
+    # `ghcompat.py check` would refuse.
+    import subprocess
+    chk = os.path.join(REPO_ROOT, 'toolchain', 'ghcompat.py')
+    r = subprocess.run([sys.executable, chk, 'check', '--file', path], capture_output=True, text=True)
+    sys.stdout.write(r.stdout); sys.stderr.write(r.stderr)
+    if r.returncode != 0:
+        die('ghcompat.py check refused the dataset; fix it before publishing')
+    serial = d.get('serial')
+    print(f'  compat: serial {serial}, {len(d.get("titles") or [])} title(s), {len(raw)} B')
+    add_package(a.repo, a.id, 'compat', a.version, a.name or 'Compatibility data', a.min_loader,
+                ['compat:data'], [], [f'{path}=compat.json'], False, None, a.auto)
 
 
 def corpus_records(dir_, overlay):
@@ -638,6 +679,10 @@ def main():
     s.add_argument('--dir', required=True); s.add_argument('--min-loader')
     s.add_argument('--sealed', action='store_true'); s.add_argument('--keys-dir'); s.add_argument('--auto', action='store_true')
     s.set_defaults(fn=cmd_theme)
+    s = sp.add_parser('compat'); s.add_argument('--repo', required=True); s.add_argument('--version', required=True)
+    s.add_argument('--id', default='greenhouse-compat'); s.add_argument('--name'); s.add_argument('--min-loader')
+    s.add_argument('--auto', action='store_true'); s.add_argument('file', nargs='?')
+    s.set_defaults(fn=cmd_compat)
     s = sp.add_parser('corpus'); s.add_argument('--repo', required=True); s.add_argument('--id', required=True)
     s.add_argument('--version', required=True); s.add_argument('--name'); s.add_argument('--min-loader')
     s.add_argument('--dir', required=True); s.add_argument('--overlay'); s.add_argument('--pack-mb', type=int, default=64)

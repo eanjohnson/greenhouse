@@ -18,6 +18,7 @@
 #pragma once
 #include <d2d1_1.h>
 #include <dwrite_3.h>
+#include <wincodec.h>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -66,6 +67,7 @@ struct GhUiState {
     GhCom<ID2D1SolidColorBrush>   brush[GH_ROLE_COUNT];
     GhCom<IDWriteTextFormat>      fmt[GH_TYPE_COUNT];
     GhCom<ID2D1LinearGradientBrush> gradBg;   // GH_BG_VGRADIENT (opaque stops only)
+    GhCom<ID2D1Bitmap>            bgBitmap;    // GH_BG_IMAGE, decoded once per apply
     GhCom<ID2D1SolidColorBrush>   brushGloss;  // the gloss motif, stacked in bands
     GhCom<ID2D1SolidColorBrush>   brushDim;    // the scrim behind a modal
 
@@ -154,7 +156,7 @@ inline bool GhUiLoadThemeFont(const GhTheme& t)
     if (FAILED(g_ghUi.dw->QueryInterface(__uuidof(IDWriteFactory5), (void**)dw5.put())) || !dw5)
         return false;
 
-    const std::wstring path = GhThemeOwnDir(t.id) + t.fontFile;
+    const std::wstring path = GhThemeAssetDir(t) + t.fontFile;
     GhCom<IDWriteFontFile> file;
     if (FAILED(dw5->CreateFontFileReference(path.c_str(), nullptr, file.put())) || !file) {
         GhThemeLog(std::string("THEME ") + t.id + ": font file would not open");
@@ -271,7 +273,11 @@ inline bool GhUiApply(const GhTheme& t)
     // The background gradient and the gloss sheen. Both are retargeted per draw
     // by moving their start and end points, so one brush each is enough.
     g_ghUi.gradBg.reset();
-    if (t.bgKind == GH_BG_VGRADIENT) {
+    // An image background that also names `to` gets the gradient built as well,
+    // so a theme whose picture would not decode degrades to its gradient rather
+    // than to a flat fill. That is the better of the two failures, and it costs
+    // one brush.
+    if (t.bgKind == GH_BG_VGRADIENT || (t.bgKind == GH_BG_IMAGE && t.bg2)) {
         const D2D1_GRADIENT_STOP stops[2] = {
             { 0.f, GhUiColorOf(t, GH_ROLE_BG) },
             { 1.f, D2D1::ColorF(t.bg2, 1.f) },
@@ -281,6 +287,37 @@ inline bool GhUiApply(const GhTheme& t)
             g_ghUi.dc->CreateLinearGradientBrush(
                 D2D1::LinearGradientBrushProperties(D2D1::Point2F(0, 0), D2D1::Point2F(0, g_ghUi.canvasH)),
                 sc.get(), g_ghUi.gradBg.put());
+    }
+
+    // A theme's background image. Decoded here, once per apply, rather than at
+    // every frame: it is the only bitmap this file owns, and it changes exactly
+    // when the theme does. A failure is never fatal -- the theme falls back to
+    // its gradient, or to its flat background colour, the same way a missing
+    // font falls back to the family chain -- because a package's image is the
+    // one asset a parser
+    // cannot vouch for.
+    g_ghUi.bgBitmap.reset();
+    if (t.bgKind == GH_BG_IMAGE && !t.builtin && !t.bgImage.empty() && g_ghUi.dc) {
+        const std::wstring path = GhThemeAssetDir(t) + t.bgImage;
+        GhCom<IWICImagingFactory> wic;
+        GhCom<IWICBitmapDecoder>  dec;
+        GhCom<IWICBitmapFrameDecode> frame;
+        GhCom<IWICFormatConverter>   conv;
+        if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                       __uuidof(IWICImagingFactory), (void**)wic.put())) && wic &&
+            SUCCEEDED(wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                                                     WICDecodeMetadataCacheOnDemand, dec.put())) && dec &&
+            SUCCEEDED(dec->GetFrame(0, frame.put())) && frame &&
+            SUCCEEDED(wic->CreateFormatConverter(conv.put())) && conv &&
+            SUCCEEDED(conv->Initialize(frame.get(), GUID_WICPixelFormat32bppPBGRA,
+                                       WICBitmapDitherTypeNone, nullptr, 0.f,
+                                       WICBitmapPaletteTypeCustom))) {
+            if (FAILED(g_ghUi.dc->CreateBitmapFromWicBitmap(conv.get(), nullptr,
+                                                            g_ghUi.bgBitmap.put())))
+                g_ghUi.bgBitmap.reset();
+        }
+        if (!g_ghUi.bgBitmap)
+            GhThemeLog(std::string("THEME ") + t.id + ": background image would not load");
     }
 
     // The gloss sheen is built from stacked translucent SOLID fills, not from a
@@ -567,7 +604,22 @@ inline void GhUiBackground()
 {
     if (!g_ghUi.dc) return;
     const GhTheme& t = GhThemeCurrent();
-    if (t.bgKind == GH_BG_VGRADIENT && g_ghUi.gradBg) {
+    if (t.bgKind == GH_BG_IMAGE && g_ghUi.bgBitmap) {
+        // Cover, not stretch: fill the canvas on the tighter axis and centre the
+        // overflow on the other, so a theme's background keeps its proportions on
+        // a 16:9 screen whatever shape the file is. Clear first, because a bitmap
+        // with alpha is a legitimate thing for a theme to ship over its own bg.
+        g_ghUi.dc->Clear(GhUiColorOf(t, GH_ROLE_BG));
+        const D2D1_SIZE_F px = g_ghUi.bgBitmap->GetSize();
+        if (px.width > 0.5f && px.height > 0.5f) {
+            const float sx = g_ghUi.canvasW / px.width, sy = g_ghUi.canvasH / px.height;
+            const float k  = sx > sy ? sx : sy;
+            const float w  = px.width * k, h = px.height * k;
+            const float x  = (g_ghUi.canvasW - w) * 0.5f, y = (g_ghUi.canvasH - h) * 0.5f;
+            g_ghUi.dc->DrawBitmap(g_ghUi.bgBitmap.get(), D2D1::RectF(x, y, x + w, y + h), 1.f,
+                                  D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        }
+    } else if (g_ghUi.gradBg && (t.bgKind == GH_BG_VGRADIENT || t.bgKind == GH_BG_IMAGE)) {
         // No SetStartPoint here either: the brush is built in GhUiApply with
         // the canvas height it will be used at, and GhUiApply runs again if the
         // canvas changes. Same reasoning as the gloss brush.
@@ -726,6 +778,79 @@ inline void GhUiDot(float cx, float cy, float rad, int role)
         g_ghUi.dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), rad, rad), b);
 }
 
+// A row's status mark. Three shapes, because colour alone cannot carry three
+// meanings through a themeable palette: a theme owns accent and warn, and
+// `catalogue` sets them to two reds (#B4462A, #9B2E12) that are the same mark
+// at this size. The shape is the meaning and the role is the emphasis, which
+// is also the only version of this that works for a colour-blind player.
+//
+//   GH_DOT_FILLED  a solid disc    -- it runs
+//   GH_DOT_RING    an open circle  -- it runs part way
+//   GH_DOT_BLOCK   a solid square  -- it does not run
+//
+// The ring is drawn as a stroked circle, so its hole shows whatever is behind
+// it: that is deliberate, since this mark lands on a themed panel in three
+// layouts and on a cover bitmap in the fourth, and there is no one colour that
+// would be right under both. The square is sized to carry the same visual
+// weight as the disc, not the same bounding box.
+enum GhUiDotShape { GH_DOT_FILLED = 0, GH_DOT_RING, GH_DOT_BLOCK };
+
+inline void GhUiStatusDot(float cx, float cy, float rad, int role, int shape)
+{
+    ID2D1Brush* b = GhUiBrush(role);
+    if (!b) return;
+    if (shape == GH_DOT_BLOCK) {
+        const float h = rad * 0.86f;
+        g_ghUi.dc->FillRectangle(D2D1::RectF(cx - h, cy - h, cx + h, cy + h), b);
+    } else if (shape == GH_DOT_RING) {
+        // Centre radius 0.75r with a 0.5r stroke: outer edge exactly rad, hole
+        // half of it. Thinner than that and the ring disappears on a TV.
+        g_ghUi.dc->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), rad * 0.75f, rad * 0.75f),
+                               b, rad * 0.5f);
+    } else {
+        g_ghUi.dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), rad, rad), b);
+    }
+}
+
+// A toggle row's state, drawn as a SWITCH rather than a tick box, and owned
+// here rather than copied into each layout -- all four had their own 20-22 px
+// square, and all four had the same problem on a television: at three metres a
+// filled square and an empty one are the same small bright mark, and the only
+// other thing distinguishing a turned-off mod from a turned-on one was that
+// same mark. A knob at the left end versus the right end is a position, and
+// position survives the distance. Rects only: there is no line primitive in
+// this file and a tick needs two rotated ones.
+//
+// `behind` is the role of whatever is painted underneath -- a row's panel in
+// `list` and `grid`, the page background in `blades` -- because the knob is a
+// hole punched in the pill and has to match what surrounds it. A square theme
+// (radius 0, e.g. NXE) gets a square switch; everything else gets a pill.
+//
+// Returns the width it occupied, so the caller advances its cursor by it.
+inline float GhUiSwitchW(){ return 22.f * g_ghUi.textScale * 1.9f; }
+
+inline float GhUiSwitch(float x, float cy, bool on, bool selected, int behind)
+{
+    const GhTheme& t = GhThemeCurrent();
+    const float s   = g_ghUi.textScale;
+    const float h   = 22.f * s, w = GhUiSwitchW();
+    const float rad = t.radius > 0.f ? h * 0.5f : 0.f;
+    const float kp  = 3.f * s, kd = h - kp * 2.f;
+    const float krad = rad > 0.f ? kd * 0.5f : 0.f;
+    const D2D1_RECT_F pill = D2D1::RectF(x, cy - h * 0.5f, x + w, cy + h * 0.5f);
+    const int   ink  = selected ? GH_ROLE_TEXT_ON_SEL : (on ? GH_ROLE_ACCENT : GH_ROLE_EDGE);
+    const float kx   = on ? pill.right - kp - kd : pill.left + kp;
+    const D2D1_RECT_F knob = D2D1::RectF(kx, pill.top + kp, kx + kd, pill.bottom - kp);
+    if (on) {
+        GhUiFill(pill, ink, rad);
+        GhUiFill(knob, selected ? GH_ROLE_SELECTION : behind, krad);
+    } else {
+        GhUiStroke(GhUiInset(pill, 0.5f, 0.5f), ink, rad, t.stroke);
+        GhUiFill(knob, ink, krad);
+    }
+    return w;
+}
+
 // Returns the width it used, so a caller can pack several.
 inline float GhUiBadgeDraw(const GhUiBadge& bd, float x, float cy)
 {
@@ -764,9 +889,15 @@ inline const wchar_t* GhUiGlyphCap(int glyph)
     case GH_GLYPH_UPDOWN:    return L"▲ ▼";
     case GH_GLYPH_LEFTRIGHT: return L"◀ ▶";
     // Moving around a GRID is both axes at once, and four arrows say that in
-    // the width of one keycap. The wall of covers is the only page that moves
-    // in two dimensions, so it is the only one that uses this.
-    case GH_GLYPH_ARROWS:    return L"↑↓←→";
+    // the width of one keycap. The wall of covers and the Themes page are the
+    // two that move in two dimensions.
+    //
+    // U+25B2/BC/C0/B6 (Geometric Shapes), NOT U+2190..2193 (Arrows): the arrow
+    // block is absent from the faces these themes name and from the console's
+    // own fallback, so the first version of this line rendered as four empty
+    // boxes on the TV. The two pairs above were always in Geometric Shapes and
+    // have always drawn; this now matches them.
+    case GH_GLYPH_ARROWS:    return L"▲▼◀▶";
     default: return nullptr;
     }
 }

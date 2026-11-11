@@ -1,0 +1,291 @@
+{
+  "schema": "greenhouse.compat/1",
+  "serial": 1,
+  "generated": "2026-11-09",
+
+  "//": [
+    "The one record of what Greenhouse actually runs. The website is pushed from this file",
+    "(toolchain/ghcompat.py push) and the console reads it out of a signed `compat` package,",
+    "so a result is written once, here, and both surfaces follow.",
+    "",
+    "Keyed by Steam app id: the website keys titles by name and the corpus keys them by id and",
+    "exe, and the app id is the only identifier the two can agree on. `name` is the PUBLIC name",
+    "as Steam spells it, which is what the website's Title rows use -- note that the corpus",
+    "calls app 2215430 plain \"Ghost of Tsushima\" while Steam and the site say",
+    "\"Ghost of Tsushima DIRECTOR'S CUT\". The app id is what joins them.",
+    "",
+    "Verified results only. Community reports live on the website and are never shipped to a",
+    "console. `status` and `console` are the website's own enums verbatim (CompatStatus,",
+    "ConsoleModel), so there is no mapping layer to drift.",
+    "",
+    "status: PERFECT  plays as it does on a PC",
+    "        PLAYABLE plays, with the caveats in the note",
+    "        MENU     reaches menus, or a little further, but is not playable through",
+    "        BOOT     starts and shows something, then stops",
+    "        WONT_RUN does not run; with `wall`, will not ever",
+    "wall:   steamstub | themida | eac -- a protection we will not defeat. Absent means the",
+    "        WONT_RUN is a bug we have not fixed, not a refusal.",
+    "",
+    "A title that is NOT in this file has no result, and both surfaces render that as silence",
+    "rather than as a guess. `version` is the loader the result was seen on; ghcompat.py check",
+    "warns when one falls too far behind the current build, because a stale version is the",
+    "whole symptom this file exists to cure.",
+    "",
+    "`id` links to corpus/titles/<id>.ghtitle.json where a config exists. Most titles have no",
+    "config -- nine do -- and the walls have none at all."
+  ],
+
+  "titles": [
+    {
+      "appId": 220,
+      "id": "hl2",
+      "name": "Half-Life 2",
+      "results": [
+        {
+          "console": "ONE",
+          "status": "PLAYABLE",
+          "version": "0.0.901.0",
+          "verified": "2026-11-07",
+          "note": "Plays on the 32-bit runtime: menus, maps, map transitions, sound, save and load, and the pad. Held 200 fps over a two-minute run."
+        }
+      ]
+    },
+    {
+      "appId": 70,
+      "id": "hl",
+      "name": "Half-Life",
+      "results": [
+        {
+          "console": "ONE",
+          "status": "PLAYABLE",
+          "version": "0.0.923.0",
+          "verified": "2026-11-08",
+          "note": "Plays on the 32-bit runtime at about 32 fps: the menu, a new game, the Black Mesa tram ride and three map changes on its own. The menu wants the pad used as a mouse."
+        }
+      ]
+    },
+    {
+      "appId": 4000,
+      "id": "garrysmod",
+      "name": "Garry's Mod",
+      "results": [
+        {
+          "console": "ONE",
+          "status": "PLAYABLE",
+          "version": "0.0.901.0",
+          "verified": "2026-11-07",
+          "note": "Plays, with the Steam Workshop addons you are subscribed to synced before launch. It is a keyboard-and-mouse game, so the pad arrives as keys and a mouse."
+        }
+      ]
+    },
+    {
+      "appId": 3809440,
+      "id": "cheeserolling",
+      "name": "Cheese Rolling",
+      "results": [
+        {
+          "console": "ONE",
+          "status": "PLAYABLE",
+          "version": "0.0.901.0",
+          "verified": "2026-11-07",
+          "note": "Downloads and launches through the Steam add-on. Online lobbies: browse, join and host all work."
+        }
+      ]
+    },
+    {
+      "appId": 4704690,
+      "name": "MECCHA CHAMELEON",
+      "results": [
+        {
+          "console": "ONE",
+          "status": "PLAYABLE",
+          "version": "0.0.901.0",
+          "verified": "2026-11-07",
+          "note": "Plays, and holds about 300 fps."
+        }
+      ]
+    },
+    {
+      "appId": 1966720,
+      "id": "lethalcompany",
+      "name": "Lethal Company",
+      "results": [
+        {
+          "console": "ONE",
+          "status": "PLAYABLE",
+          "version": "0.0.681.0",
+          "verified": "2026-10-18",
+          "note": "Online co-op works with a friend over Steam (needs the Steam add-on). Host, join and invites from the Greenhouse overlay."
+        }
+      ]
+    },
+    {
+      "appId": 3241660,
+      "id": "repo",
+      "name": "R.E.P.O.",
+      "results": [
+        {
+          "console": "ONE",
+          "status": "MENU",
+          "version": "0.0.681.0",
+          "verified": "2026-10-18",
+          "note": "Downloads through the Steam add-on and reaches the main menu; gameplay not yet verified."
+        }
+      ]
+    },
+    {
+      "appId": 2215430,
+      "id": "ghostoftsushima",
+      "name": "Ghost of Tsushima DIRECTOR'S CUT",
+      "results": [
+        {
+          "console": "ONE",
+          "status": "PLAYABLE",
+          "version": "0.0.697.0",
+          "verified": "2026-10-20",
+          "note": "Plays the open world on Texture Quality Low at a low frame rate (single digits to about 13 fps), with frequent hitches. The first launch after a console restart runs best."
+        },
+        {
+          "console": "SERIES_X",
+          "status": "PLAYABLE",
+          "version": "0.0.666.0",
+          "verified": "2026-10-11",
+          "note": "Plays the open world at up to about 30 fps in calm areas, but combat brings stalls of up to a second every few seconds. Each launch first spends about four minutes getting ready."
+        }
+      ]
+    },
+    {
+      "appId": 1817070,
+      "id": "spider-man",
+      "name": "Marvel's Spider-Man Remastered",
+      "results": [
+        {
+          "console": "ONE",
+          "status": "BOOT",
+          "version": "0.0.330.0",
+          "verified": "2026-09-06",
+          "note": "Launches and presents its first frames, then hangs. Work on it is paused."
+        }
+      ]
+    },
+    {
+      "appId": 3949040,
+      "name": "RV There Yet?",
+      "results": [
+        {
+          "console": "ONE",
+          "status": "PLAYABLE",
+          "version": "0.0.767.0",
+          "verified": "2026-10-25",
+          "note": "Plays, and takes Unreal pak mods through the Greenhouse mod loader."
+        }
+      ]
+    },
+    {
+      "appId": 285900,
+      "name": "Gang Beasts",
+      "results": [
+        {
+          "console": "ONE",
+          "status": "PLAYABLE",
+          "version": "0.0.860.0",
+          "verified": "2026-11-03",
+          "note": "Plays."
+        }
+      ]
+    },
+    {
+      "appId": 322110,
+      "name": "20XX",
+      "results": [
+        {
+          "console": "ONE",
+          "status": "PLAYABLE",
+          "version": "0.0.860.0",
+          "verified": "2026-11-03",
+          "note": "Plays."
+        }
+      ]
+    },
+    {
+      "appId": 1625450,
+      "name": "Muck",
+      "results": [
+        {
+          "console": "ONE",
+          "status": "BOOT",
+          "version": "0.0.860.0",
+          "verified": "2026-11-03",
+          "note": "Downloads and launches, then stops about 35 frames in inside the console's graphics driver. Not yet fixed."
+        }
+      ]
+    },
+    {
+      "appId": 2124100,
+      "name": "Transience",
+      "results": [
+        {
+          "console": "ONE",
+          "status": "MENU",
+          "version": "0.0.867.0",
+          "verified": "2026-11-04",
+          "note": "Reaches the menu and starts loading its first level, then runs out of memory, even with textures set to Low in the game's own graphics menu."
+        }
+      ]
+    },
+    {
+      "appId": 3763830,
+      "name": "Dead as Disco Demo",
+      "results": [
+        {
+          "console": "ONE",
+          "status": "MENU",
+          "version": "0.0.891.0",
+          "verified": "2026-11-07",
+          "note": "Launches and renders a few hundred frames of play, then its drawing stops and the game sits there. Not yet fixed."
+        }
+      ]
+    },
+    {
+      "appId": 1017180,
+      "name": "The Long Drive",
+      "results": [
+        {
+          "console": "ONE",
+          "status": "MENU",
+          "version": "0.0.873.0",
+          "verified": "2026-11-04",
+          "note": "Reaches the menu and loads into the world, but runs at about 5 fps and then runs out of memory. Not being worked on."
+        }
+      ]
+    },
+    {
+      "appId": 700330,
+      "name": "SCP: Secret Laboratory",
+      "results": [
+        {
+          "console": "ONE",
+          "status": "WONT_RUN",
+          "version": "0.0.873.0",
+          "verified": "2026-11-04",
+          "wall": "themida",
+          "note": "The game is wrapped in a commercial packer that fails before any game code runs. Defeating it is not something Greenhouse does."
+        }
+      ]
+    },
+    {
+      "appId": 823130,
+      "name": "Totally Accurate Battlegrounds",
+      "results": [
+        {
+          "console": "ONE",
+          "status": "WONT_RUN",
+          "version": "0.0.873.0",
+          "verified": "2026-11-04",
+          "wall": "eac",
+          "note": "The game starts through a kernel-level anti-cheat bootstrapper, which cannot load here. Going around it is not something Greenhouse does."
+        }
+      ]
+    }
+  ]
+}

@@ -314,19 +314,16 @@ inline void List(const GhUiListVM& vm, const D2D1_RECT_F& body)
 
         float titleLeft = box.left + (cur ? kRowBar * s : 0.f) + kRowPadX * s;
         if (row.hasCheck) {
-            const float side = 22.f * s;
-            const float cy   = (box.top + box.bottom) * 0.5f;
-            const D2D1_RECT_F bx = D2D1::RectF(titleLeft, cy - side * 0.5f,
-                                               titleLeft + side, cy + side * 0.5f);
-            if (row.checked) GhUiFill(bx, cur ? GH_ROLE_TEXT_ON_SEL : GH_ROLE_ACCENT, 0.f);
-            else             GhUiStroke(GhUiInset(bx, 0.5f, 0.5f),
-                                        cur ? GH_ROLE_TEXT_ON_SEL : GH_ROLE_EDGE, 0.f, t.stroke);
-            titleLeft += side + 14.f * s;
+            // An unselected blade row is NOT filled -- it sits straight on the
+            // page background -- so that is the role the switch's knob has to
+            // match. Same reasoning as the textOnBg note below.
+            titleLeft += GhUiSwitch(titleLeft, (box.top + box.bottom) * 0.5f,
+                                    row.checked, cur, GH_ROLE_BG) + 14.f * s;
         }
         if (row.hasDot) {
             const float rad = 5.f * s;
-            GhUiDot(titleLeft + rad, (box.top + box.bottom) * 0.5f, rad,
-                    cur ? GH_ROLE_TEXT_ON_SEL : row.dotRole);
+            GhUiStatusDot(titleLeft + rad, (box.top + box.bottom) * 0.5f, rad,
+                          cur ? GH_ROLE_TEXT_ON_SEL : row.dotRole, row.dotShape);
             titleLeft += rad * 2.f + 12.f * s;
         }
 
@@ -334,8 +331,10 @@ inline void List(const GhUiListVM& vm, const D2D1_RECT_F& body)
         // behind it -- so its text is the on-background pair. A selected row is
         // filled, so it is not. Getting this backwards is exactly the mistake
         // the textOnBg roles were added to make expressible.
+        const bool offRow   = row.hasCheck && !row.checked;
         const int titleRole = cur ? GH_ROLE_TEXT_ON_SEL
-                                  : (row.disabled ? GH_ROLE_TEXT_DIM_ON_BG : GH_ROLE_TEXT_ON_BG);
+                                  : ((row.disabled || offRow) ? GH_ROLE_TEXT_DIM_ON_BG
+                                                              : GH_ROLE_TEXT_ON_BG);
         const int subRole   = cur ? GH_ROLE_TEXT_ON_SEL : GH_ROLE_TEXT_DIM_ON_BG;
 
         // Two lines when the row has a sub-line and the height allows: this

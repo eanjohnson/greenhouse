@@ -260,25 +260,23 @@ inline void List(const GhUiListVM& vm, const D2D1_RECT_F& body)
             // into the row's text and mark the row `disabled`, which cost it
             // the selection highlight -- a turned-off mod is still something
             // the cursor lands on and A turns back on.
-            const float side = 22.f * s;
-            const float cy   = (box.top + box.bottom) * 0.5f;
-            const D2D1_RECT_F bx = D2D1::RectF(titleLeft, cy - side * 0.5f,
-                                               titleLeft + side, cy + side * 0.5f);
-            const float rad = t.radius * 0.4f;
-            if (row.checked) GhUiFill(bx, cur ? GH_ROLE_TEXT_ON_SEL : GH_ROLE_ACCENT, rad);
-            else             GhUiStroke(GhUiInset(bx, 0.5f, 0.5f),
-                                        cur ? GH_ROLE_TEXT_ON_SEL : GH_ROLE_EDGE, rad, t.stroke);
-            titleLeft += side + 14.f * s;
+            titleLeft += GhUiSwitch(titleLeft, (box.top + box.bottom) * 0.5f,
+                                    row.checked, cur, GH_ROLE_PANEL) + 14.f * s;
         }
         if (row.hasDot) {
             const float rad = 5.f * s;
-            GhUiDot(titleLeft + rad, (box.top + box.bottom) * 0.5f, rad,
-                    cur ? GH_ROLE_TEXT_ON_SEL : row.dotRole);
+            GhUiStatusDot(titleLeft + rad, (box.top + box.bottom) * 0.5f, rad,
+                          cur ? GH_ROLE_TEXT_ON_SEL : row.dotRole, row.dotShape);
             titleLeft += rad * 2.f + 12.f * s;
         }
 
+        // A turned-off toggle row dims its own name. The switch says the state
+        // precisely; the dim says it from across the room, which is where this
+        // page is actually read.
+        const bool offRow = row.hasCheck && !row.checked;
         const int titleRole = cur ? GH_ROLE_TEXT_ON_SEL
-                                  : (row.disabled ? GH_ROLE_TEXT_DIM : row.titleRole);
+                                  : ((row.disabled || offRow) ? GH_ROLE_TEXT_DIM
+                                                              : row.titleRole);
 
         // A row's sub-line, when the theme's rowH has room for two lines. This
         // layout's own rowH (64) does not, which is why the launcher's pages

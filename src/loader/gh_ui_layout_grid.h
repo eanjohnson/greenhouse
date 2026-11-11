@@ -301,24 +301,18 @@ inline void Grid(const GhUiListVM& vm, const D2D1_RECT_F& body)
             const D2D1_RECT_F in = GhUiInset(tile, 18.f * s, 14.f * s);
             if (row.hasDot) {
                 const float drad = 5.f * s;
-                GhUiDot(in.left + drad, in.top + drad + 2.f * s, drad,
-                        cur ? GH_ROLE_TEXT_ON_SEL : row.dotRole);
+                GhUiStatusDot(in.left + drad, in.top + drad + 2.f * s, drad,
+                              cur ? GH_ROLE_TEXT_ON_SEL : row.dotRole, row.dotShape);
             }
-            if (row.hasCheck) {
-                const float side = 20.f * s;
-                const D2D1_RECT_F bx = D2D1::RectF(in.right - side, in.top,
-                                                   in.right, in.top + side);
-                if (row.checked) GhUiFill(bx, cur ? GH_ROLE_TEXT_ON_SEL : GH_ROLE_ACCENT,
-                                          t.radius * 0.4f);
-                else             GhUiStroke(GhUiInset(bx, 0.5f, 0.5f),
-                                            cur ? GH_ROLE_TEXT_ON_SEL : GH_ROLE_EDGE,
-                                            t.radius * 0.4f, t.stroke);
-            }
+            if (row.hasCheck)
+                GhUiSwitch(in.right - GhUiSwitchW(), in.top + 11.f * s,
+                           row.checked, cur, GH_ROLE_PANEL);
 
             // Name centred in the tile's upper half, sub and trailing text under
             // it. The name is the tile: everything else is a caption to it.
             const int titleRole = cur ? GH_ROLE_TEXT_ON_SEL
-                                      : (row.disabled ? GH_ROLE_TEXT_DIM : row.titleRole);
+                                      : ((row.disabled || (row.hasCheck && !row.checked))
+                                             ? GH_ROLE_TEXT_DIM : row.titleRole);
             const int dimRole   = cur ? GH_ROLE_TEXT_ON_SEL : GH_ROLE_TEXT_DIM;
 
             const float th = GhUiLineHeight(GH_TYPE_ITEM);
@@ -450,21 +444,13 @@ inline void List(const GhUiListVM& vm, const D2D1_RECT_F& body)
         }
 
         float titleLeft = box.left + 26.f * s;
-        if (row.hasCheck) {
-            const float side = 22.f * s;
-            const float ccy  = (box.top + box.bottom) * 0.5f;
-            const D2D1_RECT_F bx = D2D1::RectF(titleLeft, ccy - side * 0.5f,
-                                               titleLeft + side, ccy + side * 0.5f);
-            const float rad = t.radius * 0.4f;
-            if (row.checked) GhUiFill(bx, cur ? GH_ROLE_TEXT_ON_SEL : GH_ROLE_ACCENT, rad);
-            else             GhUiStroke(GhUiInset(bx, 0.5f, 0.5f),
-                                        cur ? GH_ROLE_TEXT_ON_SEL : GH_ROLE_EDGE, rad, t.stroke);
-            titleLeft += side + 14.f * s;
-        }
+        if (row.hasCheck)
+            titleLeft += GhUiSwitch(titleLeft, (box.top + box.bottom) * 0.5f,
+                                    row.checked, cur, GH_ROLE_PANEL) + 14.f * s;
         if (row.hasDot) {
             const float drad = 5.f * s;
-            GhUiDot(titleLeft + drad, (box.top + box.bottom) * 0.5f, drad,
-                    cur ? GH_ROLE_TEXT_ON_SEL : row.dotRole);
+            GhUiStatusDot(titleLeft + drad, (box.top + box.bottom) * 0.5f, drad,
+                          cur ? GH_ROLE_TEXT_ON_SEL : row.dotRole, row.dotShape);
             titleLeft += drad * 2.f + 12.f * s;
         }
 
@@ -474,7 +460,8 @@ inline void List(const GhUiListVM& vm, const D2D1_RECT_F& body)
         GhUiTextDraw(row.title.c_str(), GH_TYPE_ITEM,
                      D2D1::RectF(titleLeft, box.top, titleRight, box.bottom),
                      cur ? GH_ROLE_TEXT_ON_SEL
-                         : (row.disabled ? GH_ROLE_TEXT_DIM : row.titleRole));
+                         : ((row.disabled || (row.hasCheck && !row.checked))
+                                ? GH_ROLE_TEXT_DIM : row.titleRole));
 
         if (row.hasBadge && !row.badge.label.empty()) {
             GhUiBadge bd = row.badge;

@@ -58,7 +58,17 @@ if [ "${GH_RELEASE:-0}" = "1" ]; then
   [ "${GH_STEAM_RUNTIME_FETCH:-1}" = "1" ] || bad="$bad GH_STEAM_RUNTIME_FETCH"
   [ -z "$bad" ] || { echo "GH_RELEASE=1 refuses a dev build: set${bad} (dev keys off, nothing bundled)"; exit 1; }
   [ -s "$GH/src/loader/gh_ent_keys.inc" ] || { echo "GH_RELEASE=1 needs the production gh_ent_keys.inc"; exit 1; }
+  # Not fatal: the site's POST /api/crash-report is OPEN when CRASH_INGEST_TOKEN
+  # is unset there, so an empty token is a legitimate configuration. Loud, though,
+  # because the other configuration -- site gated, build with no token -- makes
+  # every report 401 and nobody finds out until a member tries.
+  [ -n "${GH_CRASH_TOKEN:-}" ] || echo "WARN: GH_RELEASE=1 with no GH_CRASH_TOKEN: crash reports only work if the site's CRASH_INGEST_TOKEN is unset too"
 fi
+# §64: the crash-report ingest token, a WRITE-ONLY capability (it cannot read a
+# report back), which is why it can live in a client at all. From the environment
+# only -- never a file in the tree, never an argument, never echoed.
+CRASHDEF=()
+[ -z "${GH_CRASH_TOKEN:-}" ] || CRASHDEF=("/DGH_CRASH_TOKEN=\"$GH_CRASH_TOKEN\"")
 NSDEF=""
 [ "${GH_REPO_DEV_KEY:-1}" = "1" ] && NSDEF="/DGH_REPO_DEV_KEY"
 [ "${GH_ENT_DEV:-1}" = "1" ] && NSDEF="$NSDEF /DGH_ENT_DEV"
@@ -72,7 +82,7 @@ NSDEF=""
 [ "${GH_X86_GUEST:-1}" = "1" ] && NSDEF="$NSDEF /DGH_X86_GUEST"
 echo "== build launcher loader ($SRC)${NSDEF:+ $NSDEF} =="
 clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \
-  /std:c++20 /EHsc /MT /O2 "/DGH_PKG_FAMILY=\"$FAM\"" /DGH_LAUNCHER $NSDEF $EXTRACL \
+  /std:c++20 /EHsc /MT /O2 "/DGH_PKG_FAMILY=\"$FAM\"" /DGH_LAUNCHER $NSDEF $EXTRACL "${CRASHDEF[@]}" \
   /imsvc "$SDK/crt/include" /imsvc "$SDK/sdk/include/$SDKVER/ucrt" \
   /imsvc "$SDK/sdk/include/$SDKVER/um" /imsvc "$SDK/sdk/include/$SDKVER/shared" \
   /imsvc "$SDK/sdk/include/cppwinrt" /I "$GH/corpus/vendor/qrcodegen" \
@@ -265,6 +275,15 @@ for f in sys.argv[1:]:
     print("  theme %-12s layout %-8s %s" % (d["id"], d.get("layout", "list"), f.rsplit("/", 1)[-1]))
 PYEOF
 cp -r "$GH"/corpus/themes/. "$STAGE/themes/"
+
+# The compatibility dataset (greenhouse.compat/1): what Greenhouse is known to do with
+# a title, read at startup by gh_compat.h and shown as the library's playability marks.
+# Staged ALWAYS, not only in a bundle build -- it is six kilobytes of our own text with
+# no third-party content in it, and a build without it shows no marks at all. A signed
+# `compat` package (ghpkg.py compat) replaces it on a console with a higher serial.
+mkdir -p "$STAGE/guest"
+python3 "$GH/toolchain/ghcompat.py" check || { echo "FATAL: corpus/compat/compat.json is wrong"; exit 1; }
+cp "$GH/corpus/compat/compat.json" "$STAGE/guest/compat.json" || { echo "FATAL: missing corpus/compat/compat.json"; exit 1; }
 
 rm -rf "$STAGE/guest/titles" "$STAGE/guest/ghlo" "$TSEED/hive.txt"
 if [ "$BUNDLE" = "1" ]; then

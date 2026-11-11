@@ -72,3 +72,9 @@ tester_logs/
 PRODUCT-PLAN.md
 design/
 toolchain/wdk-inc/
+
+# Local API response dumps.
+# Never commit these.
+userpatreonapi
+patreonapicurrentuser
+patreonapi*

@@ -53,7 +53,12 @@
 #include <dpapi.h>
 
 #ifndef GH_ENT_SERVER
-#define GH_ENT_SERVER ""      // production site (https), set at the Patreon drop-in
+// The production site. This is the Patreon drop-in: it was "" until the domain
+// existed (2026-11-09), and an empty value means a console with no
+// gh_ent_url.txt has no membership server -- which is every console but ours,
+// so a release build must never ship with it empty. A dev console still points
+// somewhere else by dropping gh_ent_url.txt in LocalState.
+#define GH_ENT_SERVER "https://playgreenhouse.app"
 #endif
 
 namespace ghent {

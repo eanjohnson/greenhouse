@@ -133,6 +133,15 @@ struct GhTheme {
     uint32_t bg2     = 0;        // GH_BG_VGRADIENT: the bottom stop
     std::wstring bgImage;        // GH_BG_IMAGE: relative to the theme directory
 
+    // Where this theme's theme.json was read from, ending in a separator; empty
+    // for a built-in, which has no directory and may ship no files. Every
+    // relative asset a theme names -- its font file, its background image --
+    // resolves against THIS and not against the writable store. They are not
+    // the same place: a theme package lives at <themeRoot>\<id>\<version>\ and
+    // a shipped theme at <install>\themes\<id>\, so resolving against the store
+    // found nothing for either of them.
+    std::wstring srcDir;
+
     // Motifs. Cheap flags that buy a lot of visual distance for a layout that
     // is otherwise shared: Aero wants gloss + innerEdge, iOS 6 wants
     // separators, the current dark look wants none of them.
@@ -405,6 +414,14 @@ inline std::wstring GhThemeOwnDir(const char* id)
     std::wstring w = g_ghThemeStateDir;
     for (const char* p = id; p && *p; ++p) w.push_back((wchar_t)(unsigned char)*p);
     return w + L"\\";
+}
+
+// Where to resolve a theme's relative assets. The theme's own source directory
+// when it has one; the writable store otherwise, which is what a theme hand-made
+// in gh_theme\<id>\ wants and what this used to assume for everything.
+inline std::wstring GhThemeAssetDir(const GhTheme& t)
+{
+    return t.srcDir.empty() ? GhThemeOwnDir(t.id) : t.srcDir;
 }
 
 // ---------------------------------------------------------------------------
@@ -744,6 +761,7 @@ inline void GhThemeScanOne(const std::wstring& dir, const std::string& want)
         return;
     }
     for (const auto& e : g_ghThemes) if (std::strcmp(e.id, t.id) == 0) return;   // an earlier source won
+    t.srcDir = dir;              // so its font and background resolve where it lives
     g_ghThemes.push_back(t);
 }
 
