@@ -11,8 +11,9 @@
 //    the real runtime does, so a game's Release() sees the numbers it expects;
 //  - one recursive lock around every call (D3DCREATE_MULTITHREADED for all);
 //  - no fixed function: 9on12 has none (its SetTransform/SetLight are stubs and
-//    a null shader is E_INVALIDARG), so a draw with no pixel shader, or with no
-//    vertex shader and no POSITIONT, is skipped and counted;
+//    a null shader is E_INVALIDARG). A vs_1/vs_2 draw with no pixel shader gets a
+//    generated ps_2_0 doing texture stage 0 (gh_d9_ffps); any other draw with no
+//    pixel shader, or with no vertex shader and no POSITIONT, is skipped and counted;
 //  - Present is ours: Blt the back buffer into a 9on12 render target the size
 //    and format of the bridge's swapchain, transition it to COMMON, Flush1, and
 //    hand it to GfxPresent as guestRT12 -- the same copy a D3D12 guest gets.
@@ -858,7 +859,14 @@ struct Dev : Obj<IDirect3DDevice9> {
     UINT    palette = 0;
     D3DGAMMARAMP gamma{};
     bool    inScene = false;
-    uint64_t frames = 0, draws = 0, ffSkips = 0;
+    uint64_t frames = 0, draws = 0, ffSkips = 0, ffPsDraws = 0;
+    // gh_d9_ffps: draws with a vertex shader and no pixel shader get a generated
+    // ps_2_0 that does texture stage 0, as D3D9's fixed-function pixel pipe would.
+    std::map<uint64_t, HANDLE> ffPs;        // stage-0 state key -> driver PS
+    bool    ffC31 = false;                  // c31 holds TFACTOR, not the game's c31
+    std::set<uint64_t> ffSigs;              // skipped/emulated draw signatures logged
+    HANDLE FfPs(uint64_t key, DWORD texType);
+    void   FfSig(bool emulated, bool ok);
 
     ~Dev() override {}
 
@@ -1434,6 +1442,7 @@ struct Dev : Obj<IDirect3DDevice9> {
         if (!p || r + n > 224) return D3DERR_INVALIDCALL;
         Lk l;
         memcpy(psF[r], p, n * 16);
+        if (r <= 31 && r + n > 31) ffC31 = false;   // the game rewrote the c31 our ffps borrowed
         D3DDDIARG_SETPIXELSHADERCONST a{ r, n };
         DDI(this, pfnSetPixelShaderConst, &a, p);
         return D3D_OK;
@@ -2130,12 +2139,185 @@ static bool ShLogPair(VS* v, PS* p, bool preT)
     return true;
 }
 
+// ---------------------------------------------------- fixed-function pixel stage 0
+// A vs_1_x/vs_2_x draw with no pixel shader is legal D3D9: the fixed-function
+// pixel pipe combines the VS outputs (oD0, oD1, oTn) through the texture stages.
+// 9on12 has no such pipe and refuses a null PS, so these draws used to be skipped
+// -- Source issues them (Portal: ~4 a frame) and its portal views went black.
+// Stage 0 is generated here as ps_2_0 token streams, one per state combination.
+// Stages 1+ are not emulated; TFACTOR rides in c31 (restored before the game's
+// next shader draw), white for an unbound texture in a def'd c29.
+namespace ffps {
+enum : DWORD { kV0 = 0x90E40000, kV1 = 0x90E40001, kC29 = 0xA0E4001D, kC31 = 0xA0E4001F };
+static DWORD R(int n, DWORD mask = 0xF) { return 0x80000000u | (mask << 16) | (DWORD)n; }   // dst rN
+static DWORD Rs(int n) { return 0x80E40000u | (DWORD)n; }                                    // src rN
+// D3DTA_* -> a source token (or a temp it was materialised into, for COMPLEMENT).
+static DWORD Arg(std::vector<DWORD>& o, DWORD ta, bool hasTex, int& tmp)
+{
+    DWORD src;
+    switch (ta & D3DTA_SELECTMASK){
+    case D3DTA_SPECULAR: src = kV1; break;
+    case D3DTA_TEXTURE:  src = hasTex ? Rs(0) : kC29; break;
+    case D3DTA_TFACTOR:
+    case D3DTA_CONSTANT: src = kC31; break;
+    default:             src = kV0; break;      // DIFFUSE, CURRENT and TEMP at stage 0
+    }
+    if (ta & D3DTA_ALPHAREPLICATE) src = (src & ~0x00FF0000u) | 0x00FF0000u;
+    if (ta & D3DTA_COMPLEMENT){                  // ps_2_0 has no 1-x modifier: add rT, c29, -src
+        const int t = tmp++;
+        o.insert(o.end(), { 0x03000002u, R(t), kC29, src | 0x01000000u });
+        src = Rs(t);
+    }
+    return src;
+}
+static void Op(std::vector<DWORD>& o, DWORD op, int dst, DWORD mask, DWORD a1, DWORD a2)
+{
+    const DWORD d = R(dst, mask) | 0x00100000u;  // _sat: each stage clamps
+    const DWORD sd = mask == 0x8 ? (0x80FF0000u | (DWORD)dst) : Rs(dst);   // read back only what was written
+    switch (op){
+    case D3DTOP_SELECTARG1: o.insert(o.end(), { 0x02000001u, d, a1 }); break;
+    case D3DTOP_SELECTARG2: o.insert(o.end(), { 0x02000001u, d, a2 }); break;
+    case D3DTOP_ADD:        o.insert(o.end(), { 0x03000002u, d, a1, a2 }); break;
+    case D3DTOP_SUBTRACT:   o.insert(o.end(), { 0x03000002u, d, a1, a2 | 0x01000000u }); break;
+    case D3DTOP_MODULATE2X:
+    case D3DTOP_MODULATE4X:
+        o.insert(o.end(), { 0x03000005u, R(dst, mask), a1, a2 });
+        o.insert(o.end(), { 0x03000002u, op == D3DTOP_MODULATE2X ? d : R(dst, mask), sd, sd });
+        if (op == D3DTOP_MODULATE4X) o.insert(o.end(), { 0x03000002u, d, sd, sd });
+        break;
+    default:                o.insert(o.end(), { 0x03000005u, d, a1, a2 }); break;   // MODULATE and the rest
+    }
+}
+// key: colorop|carg1|carg2|alphaop|aarg1|aarg2 (8 bits each) | tci<<48 | hasTex<<51
+static std::vector<DWORD> Build(uint64_t key, DWORD texType)
+{
+    const DWORD cop = key & 0xFF, ca1 = (key >> 8) & 0xFF, ca2 = (key >> 16) & 0xFF;
+    const DWORD aop = (key >> 24) & 0xFF, aa1 = (key >> 32) & 0xFF, aa2 = (key >> 40) & 0xFF;
+    const DWORD tci = (key >> 48) & 7; const bool hasTex = (key >> 51) & 1;
+    auto uses = [&](DWORD sel){
+        auto u = [&](DWORD op, DWORD x1, DWORD x2){
+            if (op == D3DTOP_DISABLE) return false;
+            const bool one = (x1 & D3DTA_SELECTMASK) == sel, two = (x2 & D3DTA_SELECTMASK) == sel;
+            return op == D3DTOP_SELECTARG1 ? one : op == D3DTOP_SELECTARG2 ? two : (one || two);
+        };
+        return u(cop, ca1, ca2) || (cop != D3DTOP_DISABLE && u(aop, aa1, aa2));
+    };
+    std::vector<DWORD> o{ 0xFFFF0200u };
+    o.insert(o.end(), { 0x05000051u, 0xA00F001Du, 0x3F800000u, 0x3F800000u, 0x3F800000u, 0x3F800000u });   // def c29, 1,1,1,1
+    o.insert(o.end(), { 0x0200001Fu, 0x80000000u, 0x900F0000u });                   // dcl v0
+    if (uses(D3DTA_SPECULAR)) o.insert(o.end(), { 0x0200001Fu, 0x80000000u, 0x900F0001u });
+    const bool tex = hasTex && uses(D3DTA_TEXTURE);
+    if (tex){
+        const DWORD st = texType == D3DRTYPE_CUBETEXTURE ? 0x98000000u : texType == D3DRTYPE_VOLUMETEXTURE ? 0xA0000000u : 0x90000000u;
+        o.insert(o.end(), { 0x0200001Fu, 0x80000000u, 0xB00F0000u | tci });     // dcl tN
+        o.insert(o.end(), { 0x0200001Fu, st, 0xA00F0800u });                     // dcl_2d/cube/volume s0
+        o.insert(o.end(), { 0x03000042u, R(0), 0xB0E40000u | tci, 0xA0E40800u }); // texld r0, tN, s0
+    }
+    if (cop == D3DTOP_DISABLE){                  // stage 0 off: diffuse straight through
+        o.insert(o.end(), { 0x02000001u, 0x800F0800u, kV0, 0x0000FFFFu });
+        return o;
+    }
+    int tmp = 3;
+    const DWORD c1 = Arg(o, ca1, tex, tmp), c2 = Arg(o, ca2, tex, tmp);
+    Op(o, cop, 1, 0xF, c1, c2);
+    if (aop != D3DTOP_DISABLE){
+        const DWORD x1 = Arg(o, aa1, tex, tmp), x2 = Arg(o, aa2, tex, tmp);
+        Op(o, aop, 2, 0x8, x1, x2);
+        o.insert(o.end(), { 0x02000001u, R(1, 0x8), 0x80FF0002u });             // mov r1.w, r2.w
+    }
+    o.insert(o.end(), { 0x02000001u, 0x800F0800u, Rs(1), 0x0000FFFFu });        // mov oC0, r1; end
+    return o;
+}
+} // namespace ffps
+
+HANDLE Dev::FfPs(uint64_t key, DWORD texType)
+{
+    const uint64_t k = key | ((uint64_t)texType << 56);
+    auto it = ffPs.find(k);
+    if (it != ffPs.end()) return it->second;
+    const std::vector<DWORD> code = ffps::Build(key, texType);
+    D3DDDIARG_CREATEPIXELSHADER a{ (UINT)(code.size() * 4), nullptr };
+    const HRESULT hr = DDI(this, pfnCreatePixelShader, &a, (const UINT*)code.data());
+    HANDLE h = SUCCEEDED(hr) ? a.ShaderHandle : nullptr;
+    ffPs[k] = h;
+    Diag("D9 ffps #" + std::to_string(ffPs.size()) + " key=" + Hex(key) + " tex=" + std::to_string(texType)
+         + " dwords=" + std::to_string(code.size()) + (h ? " ok" : " FAILED hr=" + Hex((uint32_t)hr)));
+    return h;
+}
+
+// One line per distinct state signature of a draw with no pixel shader: enough to
+// tell a depth/stencil-only pass from a visible one.
+void Dev::FfSig(bool emulated, bool ok)
+{
+    const uint64_t hv = vs ? ShHash(vs) : 0;
+    uint64_t sig = hv;
+    const DWORD keys[] = { D3DRS_COLORWRITEENABLE, D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_ZFUNC,
+                           D3DRS_STENCILENABLE, D3DRS_STENCILFUNC, D3DRS_STENCILPASS, D3DRS_STENCILZFAIL,
+                           D3DRS_ALPHABLENDENABLE, D3DRS_ALPHATESTENABLE };
+    for (DWORD k : keys) sig = (sig ^ rs[k]) * 1099511628211ull;
+    sig = (sig ^ tss[0][D3DTSS_COLOROP] ^ (tss[0][D3DTSS_COLORARG1] << 8) ^ (tss[0][D3DTSS_ALPHAOP] << 16)) * 1099511628211ull;
+    sig ^= (tex[0] ? 1ull : 0) << 63;
+    if (ffSigs.size() >= 48 || !ffSigs.insert(sig).second) return;
+    auto n = [](DWORD v){ return std::to_string(v); };
+    std::string s = "D9 ffsig #" + n((DWORD)ffSigs.size()) + (emulated ? (ok ? " EMULATED" : " EMULATE-FAILED") : " SKIPPED")
+        + " vs=" + Hex(hv) + "/" + (vs ? Hex(vs->code[0]) : std::string("-")) + " decl=" + (decl ? (decl->preT ? "preT" : "y") : "n")
+        + " fvf=" + Hex(fvf) + " cwe=" + Hex(rs[D3DRS_COLORWRITEENABLE])
+        + " z=" + n(rs[D3DRS_ZENABLE]) + "/w" + n(rs[D3DRS_ZWRITEENABLE]) + "/f" + n(rs[D3DRS_ZFUNC])
+        + " st=" + n(rs[D3DRS_STENCILENABLE]) + "/f" + n(rs[D3DRS_STENCILFUNC]) + "/ref" + n(rs[D3DRS_STENCILREF])
+        + "/p" + n(rs[D3DRS_STENCILPASS]) + "/zf" + n(rs[D3DRS_STENCILZFAIL]) + "/fl" + n(rs[D3DRS_STENCILFAIL])
+        + "/m" + Hex(rs[D3DRS_STENCILMASK]) + "/wm" + Hex(rs[D3DRS_STENCILWRITEMASK])
+        + " ab=" + n(rs[D3DRS_ALPHABLENDENABLE]) + "/" + n(rs[D3DRS_SRCBLEND]) + "/" + n(rs[D3DRS_DESTBLEND])
+        + " at=" + n(rs[D3DRS_ALPHATESTENABLE]) + " cull=" + n(rs[D3DRS_CULLMODE])
+        + " s0=" + n(tss[0][D3DTSS_COLOROP]) + "(" + Hex(tss[0][D3DTSS_COLORARG1]) + "," + Hex(tss[0][D3DTSS_COLORARG2])
+        + ")/" + n(tss[0][D3DTSS_ALPHAOP]) + "(" + Hex(tss[0][D3DTSS_ALPHAARG1]) + "," + Hex(tss[0][D3DTSS_ALPHAARG2])
+        + ") tci=" + n(tss[0][D3DTSS_TEXCOORDINDEX]) + " s1=" + n(tss[1][D3DTSS_COLOROP])
+        + " tex0=" + (tex[0] ? n(tex[0]->GetType()) : std::string("-"))
+        + " rt0=" + (rt[0] ? n(rt[0]->c->LW(rt[0]->level)) + "x" + n(rt[0]->c->LH(rt[0]->level)) + "/" + n(rt[0]->c->fmt) : std::string("-"))
+        + " ds=" + (ds ? n(ds->c->LW(0)) + "x" + n(ds->c->LH(0)) : std::string("-"));
+    Diag(s);
+}
+
 bool Dev::DrawOk()
 {
     ++draws;
     pairNew = false;
     const bool preT = decl && decl->preT;
-    if (ps && (vs || preT)){ pairNew = ShLogPair(vs, ps, preT); return true; }
+    if (ps && (vs || preT)){
+        if (ffC31){                              // our TFACTOR went to c31; the game's comes back
+            ffC31 = false;
+            D3DDDIARG_SETPIXELSHADERCONST a{ 31, 1 };
+            DDI(this, pfnSetPixelShaderConst, &a, psF[31]);
+        }
+        pairNew = ShLogPair(vs, ps, preT);
+        return true;
+    }
+    static const bool ffOn = []{
+        const unsigned v = GhCfgNumZ(L"gh_d9_ffps.txt", "GH_D9_FFPS", 1);
+        Diag("CFG gh_d9_ffps.txt = " + std::to_string(v) + " (Z)");
+        return v != 0;
+    }();
+    // vs_3_0 needs a ps_3_0; a ps_2_0 here would be a link error, so those stay skipped.
+    if (ffOn && vs && !ps && !preT && (vs->code[0] & 0xFFFF) < 0x0300){
+        const DWORD tt = tex[0] ? (DWORD)tex[0]->GetType() : 0;
+        auto b = [](DWORD v){ return (uint64_t)(v & 0xFF); };
+        const uint64_t key = b(tss[0][D3DTSS_COLOROP]) | b(tss[0][D3DTSS_COLORARG1]) << 8 | b(tss[0][D3DTSS_COLORARG2]) << 16
+            | b(tss[0][D3DTSS_ALPHAOP]) << 24 | b(tss[0][D3DTSS_ALPHAARG1]) << 32 | b(tss[0][D3DTSS_ALPHAARG2]) << 40
+            | (uint64_t)(tss[0][D3DTSS_TEXCOORDINDEX] & 7) << 48 | (uint64_t)(tex[0] ? 1 : 0) << 51;
+        HANDLE h = FfPs(key, tt);
+        FfSig(true, h != nullptr);
+        if (h){
+            DDI(this, pfnSetPixelShader, h);
+            const DWORD c = rs[D3DRS_TEXTUREFACTOR];
+            const float tf[4] = { ((c >> 16) & 0xFF) / 255.f, ((c >> 8) & 0xFF) / 255.f, (c & 0xFF) / 255.f, ((c >> 24) & 0xFF) / 255.f };
+            D3DDDIARG_SETPIXELSHADERCONST a{ 31, 1 };
+            DDI(this, pfnSetPixelShaderConst, &a, tf);
+            ffC31 = true;
+            ++ffPsDraws;
+            if (ffPsDraws == 1 || (ffPsDraws & (ffPsDraws - 1)) == 0)
+                Diag("D9 fixed-function draw emulated #" + std::to_string(ffPsDraws));
+            return true;
+        }
+    } else FfSig(false, false);
     ++ffSkips;
     if (ffSkips == 1 || (ffSkips & (ffSkips - 1)) == 0)
         Diag("D9 fixed-function draw skipped #" + std::to_string(ffSkips) + " ps=" + (ps ? "y" : "n")
