@@ -1,4 +1,4 @@
-// gh_shbake.h -- the on-device shader bake (GREENHOUSE.md §47, #268).
+// gh_shbake.h -- the on-device shader bake (docs/architecture/dxil-backporter.md, #268).
 //
 // The console already holds every shader Tsushima needs: the player's own
 // install carries them as plain DXBC containers inside its DSAR/PSARC archives.
@@ -592,7 +592,7 @@ inline bool ParseRecipe(const std::string& text, std::vector<Entry>& out, std::s
 }
 
 // A shipped recipe shard (recipe.py shard): "GHLZ" | u32 raw size | LZ4 block,
-// one per first key byte, carried as gh_rcp_<xx> records of the keyed corpus add-on.
+// one per first key byte, carried as gh_rcp_<xx> records of the corpus add-on.
 inline bool UnpackShard(const std::vector<uint8_t>& in, std::string& out, std::string& why)
 {
     uint32_t n = 0;

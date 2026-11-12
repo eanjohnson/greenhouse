@@ -2,7 +2,7 @@
 # Build the N0 native-x86 probe (src/spikes/x86_n0_probe.cpp) as a plain x64 console PE.
 # The same exe runs on a desktop and, through ghguest.txt, as a Launcher guest on the console.
 set -euo pipefail
-GH=$HOME/greenhouse
+GH="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SDK="$GH/toolchain/xwin-sdk"; SDKVER=10.0.26100
 OUT="${1:-$GH/artifacts/x86native/n0probe.exe}"
 mkdir -p "$(dirname "$OUT")"

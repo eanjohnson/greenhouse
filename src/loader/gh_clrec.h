@@ -130,7 +130,7 @@ static unsigned GhClDup()    { return GhClDupRaw() & 0xFF; }
 static bool     GhClDupNoBarr(){ return (GhClDupRaw() & 256) != 0; }
 
 // gh_sub_census: record the guest's stream and MEASURE it, replaying and suppressing
-// nothing. GREENHOUSE.md:10806 names "a DMA buffer's allocation or patch-location list"
+// nothing. The project log names "a DMA buffer's allocation or patch-location list"
 // as the standard structure of the capacity it is hunting -- a fixed kernel-side table,
 // filled per distinct thing a command buffer references, reclaimed on a boundary the game
 // never reaches. Nobody ever counted one: "allocation list", "patch location" and

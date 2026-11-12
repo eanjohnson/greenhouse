@@ -81,7 +81,12 @@ static const char* g_mouseSource = "none";     // which channel last moved the c
 static bool g_gotEvtMove=false, g_gotEvtBtn=false, g_gotKey=false, g_gotRel=false, g_gotPollMove=false, g_gotPollBtn=false;
 // event/relative activity counters (proves a channel is live, not just first-seen)
 static unsigned g_nEvtMove=0, g_nEvtBtn=0, g_nKey=0, g_nRel=0, g_nPollMove=0, g_nGIMove=0, g_nNet=0;
-static const char* g_pcIp = "192.0.2.11";   // PC running mouse_stream.py
+// PC running mouse_stream.py. Set at build time: /DGH_MOUSE_PC_IP=\"10.0.0.2\".
+// Empty (the default) leaves the network mouse off.
+#ifndef GH_MOUSE_PC_IP
+#define GH_MOUSE_PC_IP ""
+#endif
+static const char* g_pcIp = GH_MOUSE_PC_IP;
 static const unsigned short g_pcPort = 55123;
 
 // GameInput (the candidate that actually works on Xbox where WinRT mouse doesn't)
@@ -289,6 +294,7 @@ static void NetMouseThread()
     WSADATA wsa;
     int r = WSAStartup(MAKEWORD(2,2), &wsa);
     if (r){ Diag("NET WSAStartup FAILED r=" + std::to_string(r)); return; }
+    if (!*g_pcIp){ Diag("NET no GH_MOUSE_PC_IP compiled in; network mouse off"); return; }
     Diag(std::string("NET WSAStartup ok, connecting to ") + g_pcIp + ":" + std::to_string(g_pcPort));
     bool everConnected=false, firstPkt=false, firstMove=false;
     for (;;){

@@ -6,9 +6,6 @@
   ghpkg.py add     --repo DIR --id ID --type title|addon|theme --version a.b.c.d [--name N]
                    [--min-loader a.b.c.d] [--provides X]... [--requires X]... FILE[=PATH] ...
   ghpkg.py title   --repo DIR --version a.b.c.d corpus/titles/<id>.ghtitle.json
-                   (add/title --sealed: members-only. Each file is AES-256-GCM encrypted with a
-                   fresh key; the key goes to --keys-dir, OUTSIDE the tree, for greenhouse-site's
-                   scripts/register-artifact.ts. Consoles get it from /api/payload, GREENHOUSE.md §43)
   ghpkg.py title   ... --seed-dir corpus/seed/<Name>   # + the title's settings seed (seed/<Name>/...)
   ghpkg.py theme   --repo DIR --version a.b.c.d --dir corpus/themes/<id>
                    # a theme package: theme.json plus its fonts and images, and NOTHING
@@ -18,13 +15,11 @@
                    # the compatibility dataset (greenhouse.compat/1): what Greenhouse is known
                    # to do with a title, keyed by Steam app id. ONE file, named compat.json,
                    # and nothing else -- the same file toolchain/ghcompat.py pushes to the
-                   # website, so one edit reaches both surfaces. --auto keeps members current
+                   # website, so one edit reaches both surfaces. --auto keeps consoles current
   ghpkg.py corpus  --repo DIR --id ID --version a.b.c.d --dir corpus/redist/ghlo [--overlay DIR] [--pack-mb 64]
-                   # a members-only data add-on of *.ghpak packs: every record AES-256-GCM under ONE
-                   # package key (path "@package" in --keys-dir); the console keeps the packs
-                   # encrypted and reads records through the key it got from /api/payload (§44)
-                   (add/title/corpus --auto: the Launcher installs and updates it by itself
-                   once the console's membership is live)
+                   # a data add-on of *.ghpak packs (the shader corpus, §44): a few big files
+                   # instead of ~13.5k small ones
+                   (add/title/corpus --auto: the Launcher installs and updates it by itself)
   ghpkg.py vendor  --repo DIR --version a.b.c.d [--zip LOCAL] corpus/addons/<id>/vendor.json
                    # an add-on whose files the console fetches from the vendor's own server:
                    # the repository gets hashes and byte ranges, never the vendor's bytes
@@ -43,13 +38,11 @@ import argparse, hashlib, http.server, io, json, os, re, shutil, socketserver, s
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature, encode_dss_signature
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidSignature
 
 REPO_ROOT = os.path.realpath(os.path.join(os.path.dirname(__file__), '..'))
 ID_RE = re.compile(r'^[a-z0-9_.-]{1,64}$')
 VER_RE = re.compile(r'^\d{1,5}\.\d{1,5}\.\d{1,5}\.\d{1,5}$')
-DEFAULT_KEYS_DIR = '~/.greenhouse-keys/artifacts'
 
 
 def outside_tree(path, what):
@@ -59,79 +52,35 @@ def outside_tree(path, what):
     return p
 
 
-def seal_file(b, pid, version, rel, keys_dir):
-    """AES-256-GCM under a fresh content key: iv(12) || ct || tag(16), aad binds the file to
-    its package/version/path (greenhouse-site src/lib/envelope.ts sealedFileAad). The key is
-    written 0600 under keys_dir and never printed."""
-    key, iv = os.urandom(32), os.urandom(12)
-    aad = b'greenhouse.sealed/1\0' + f'{pid}\0{version}\0{rel}'.encode()
-    blob = iv + AESGCM(key).encrypt(iv, b, aad)
-    kf = os.path.join(keys_dir, pid, version, rel.replace('/', '__') + '.key.json')
-    os.makedirs(os.path.dirname(kf), mode=0o700, exist_ok=True)
-    fd = os.open(kf, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, 'w') as f:
-        json.dump({'schema': 'greenhouse.artifact-key/1', 'package': pid, 'version': version, 'path': rel,
-                   'content_key': key.hex(), 'cipher_sha256': sha256(blob)}, f, indent=2); f.write('\n')
-    return blob, kf
-
-
 PAK_MAGIC = b'GHPAK/1\0'
-PACKAGE_KEY_PATH = '@package'
 
 
-def pak_aad(pid, version, name):
-    return b'greenhouse.pak/1\0' + f'{pid}\0{version}\0{name}'.encode()
-
-
-def write_package_key(keys_dir, pid, version, key, fingerprint):
-    """The one content key of a keyed package (every *.ghpak record). Same file shape as
-    seal_file's, path "@package"; cipher_sha256 is the package fingerprint (pack_fingerprint)."""
-    kf = os.path.join(keys_dir, pid, version, PACKAGE_KEY_PATH + '.key.json')
-    os.makedirs(os.path.dirname(kf), mode=0o700, exist_ok=True)
-    fd = os.open(kf, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, 'w') as f:
-        json.dump({'schema': 'greenhouse.artifact-key/1', 'package': pid, 'version': version,
-                   'path': PACKAGE_KEY_PATH, 'content_key': key.hex(), 'cipher_sha256': fingerprint}, f, indent=2)
-        f.write('\n')
-    return kf
-
-
-def pack_fingerprint(entries):
-    """sha256 over the pack files' "path\\0sha256\\n" lines, sorted: names one exact set of packs."""
-    return sha256(''.join(f'{e["path"]}\0{e["sha256"]}\n' for e in sorted(entries, key=lambda e: e['path'])).encode())
-
-
-def build_packs(records, pid, version, key, pack_bytes):
+def build_packs(records, pack_bytes):
     """records: [(name, bytes)] -> [bytes] (*.ghpak files). Layout (src/loader/gh_pak.h):
-    magic(8) | u32 count | u32 flags (1 = encrypted, 0 = plain) | count x (u16 nlen, name, u64 off, u32 len) | records.
-    An encrypted record is iv(12) || ct || tag(16) with aad pak_aad(pid, version, name);
-    key None writes plain records (the dev package's bundled corpus)."""
+    magic(8) | u32 count | u32 flags (0) | count x (u16 nlen, name, u64 off, u32 len) | records."""
     groups, cur, size = [], [], 0
     for name, b in records:
-        if cur and size + len(b) + 28 > pack_bytes:
+        if cur and size + len(b) > pack_bytes:
             groups.append(cur); cur, size = [], 0
-        cur.append((name, b)); size += len(b) + 28
+        cur.append((name, b)); size += len(b)
     if cur:
         groups.append(cur)
     out = []
     for g in groups:
-        sealed = []
+        recs = []
         for name, b in g:
             nb = name.encode('ascii')
             if not 0 < len(nb) < 256:
                 die(f'record name {name!r} must be 1..255 ASCII bytes')
-            if key is None:
-                if not b:
-                    die(f'record {name!r} is empty')
-                sealed.append((nb, b)); continue
-            iv = os.urandom(12)
-            sealed.append((nb, iv + AESGCM(key).encrypt(iv, b, pak_aad(pid, version, name))))
-        hdr = 16 + sum(2 + len(nb) + 12 for nb, _ in sealed)
+            if not b:
+                die(f'record {name!r} is empty')
+            recs.append((nb, b))
+        hdr = 16 + sum(2 + len(nb) + 12 for nb, _ in recs)
         table, body, off = [], [], hdr
-        for nb, rec in sealed:
+        for nb, rec in recs:
             table.append(struct.pack('<H', len(nb)) + nb + struct.pack('<QI', off, len(rec)))
             body.append(rec); off += len(rec)
-        out.append(PAK_MAGIC + struct.pack('<II', len(sealed), 0 if key is None else 1) + b''.join(table) + b''.join(body))
+        out.append(PAK_MAGIC + struct.pack('<II', len(recs), 0) + b''.join(table) + b''.join(body))
     return out
 
 
@@ -254,8 +203,7 @@ def theme_file_ok(rel, b):
         die(f'{rel}: its bytes are not {kind} (the console checks this too, and would refuse it)')
 
 
-def add_package(repo, pid, ptype, version, name, min_loader, provides, requires, files, sealed=False, keys_dir=None,
-                auto=False, blobs=None):
+def add_package(repo, pid, ptype, version, name, min_loader, provides, requires, files, auto=False, blobs=None):
     if not ID_RE.match(pid) or pid in ('.', '..'):
         die(f'id {pid!r} is not a safe id')
     if ptype not in ('title', 'addon', 'theme', 'compat'):
@@ -266,11 +214,8 @@ def add_package(repo, pid, ptype, version, name, min_loader, provides, requires,
     dest = os.path.join(repo, 'packages', pid, version)
     if os.path.exists(dest):
         die(f'{dest} exists: versions are immutable, bump the version')
-    if sealed:
-        keys_dir = outside_tree(keys_dir or DEFAULT_KEYS_DIR, 'artifact keys')
     os.makedirs(dest)
     entries = []
-    key_files = []
     for spec in files:
         src, _, rel = spec.partition('=')
         rel = rel or os.path.basename(src)
@@ -284,18 +229,12 @@ def add_package(repo, pid, ptype, version, name, min_loader, provides, requires,
         if ptype == 'compat' and rel != 'compat.json':
             die(f'compat package file {rel!r} is not compat.json')
         if ptype == 'theme':
-            theme_file_ok(rel, b)           # on the PLAINTEXT, which is what the console checks
-        if sealed:
-            b, kf = seal_file(b, pid, version, rel, keys_dir)
-            key_files.append(kf)
+            theme_file_ok(rel, b)           # the same check the console makes
         out = os.path.join(dest, rel)
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with open(out, 'wb') as f:
             f.write(b)
-        e = {'path': rel, 'size': len(b), 'sha256': sha256(b), 'url': rel}
-        if sealed:
-            e['sealed'] = True
-        entries.append(e)
+        entries.append({'path': rel, 'size': len(b), 'sha256': sha256(b), 'url': rel})
     if ptype == 'compat' and len(entries) != 1:
         die('a compat package holds exactly one file, compat.json')
     if ptype == 'theme':
@@ -311,19 +250,15 @@ def add_package(repo, pid, ptype, version, name, min_loader, provides, requires,
     m['provides'] = provides or []
     m['requires'] = requires or []
     m['files'] = entries
-    m['entitlement'] = 'member' if sealed else None
     if auto:
         m['auto'] = True
     with open(os.path.join(dest, 'manifest.json'), 'w') as f:
         json.dump(m, f, indent=2); f.write('\n')
-    print(f'added {pid} {version} ({ptype}, {len(entries)} file(s){", sealed" if sealed else ""}{", auto" if auto else ""}) -> {dest}')
-    for kf in key_files:
-        print(f'  content key -> {kf} (register it: greenhouse-site scripts/register-artifact.ts)')
+    print(f'added {pid} {version} ({ptype}, {len(entries)} file(s){", auto" if auto else ""}) -> {dest}')
 
 
 def cmd_add(a):
-    add_package(a.repo, a.id, a.type, a.version, a.name, a.min_loader, a.provides, a.requires, a.files,
-                a.sealed, a.keys_dir, a.auto)
+    add_package(a.repo, a.id, a.type, a.version, a.name, a.min_loader, a.provides, a.requires, a.files, a.auto)
 
 
 def cmd_title(a):
@@ -344,7 +279,7 @@ def cmd_title(a):
         if len(files) == 1:
             die(f'{a.seed_dir} has no files')
     add_package(a.repo, t['id'], 'title', a.version, t.get('name'), need,
-                ['title:' + t['id']], [], files, a.sealed, a.keys_dir, a.auto)
+                ['title:' + t['id']], [], files, a.auto)
 
 
 def cmd_theme(a):
@@ -374,7 +309,7 @@ def cmd_theme(a):
                 continue
             files.append(f'{src}={rel}')
     add_package(a.repo, pid, 'theme', a.version, t.get('name') or pid, a.min_loader,
-                ['theme:' + pid], [], files, a.sealed, a.keys_dir, a.auto)
+                ['theme:' + pid], [], files, a.auto)
 
 
 def cmd_compat(a):
@@ -406,7 +341,7 @@ def cmd_compat(a):
     serial = d.get('serial')
     print(f'  compat: serial {serial}, {len(d.get("titles") or [])} title(s), {len(raw)} B')
     add_package(a.repo, a.id, 'compat', a.version, a.name or 'Compatibility data', a.min_loader,
-                ['compat:data'], [], [f'{path}=compat.json'], False, None, a.auto)
+                ['compat:data'], [], [f'{path}=compat.json'], a.auto)
 
 
 def corpus_records(dir_, overlay):
@@ -426,40 +361,30 @@ def cmd_bundle(a):
     """The dev package's corpus as a few PLAIN packs (guest\\ghlo\\packNN.ghpak) instead of
     ~13.5k loose blobs: the MSIX registers per file, and those made a deploy take ~9 min."""
     recs = corpus_records(a.dir, a.overlay)
-    packs = build_packs(sorted(recs.items()), None, None, None, a.pack_mb << 20)
+    packs = build_packs(sorted(recs.items()), a.pack_mb << 20)
     os.makedirs(a.out, exist_ok=True)
     for i, b in enumerate(packs):
         with open(os.path.join(a.out, f'pack{i:02d}.ghpak'), 'wb') as f:
             f.write(b)
-    print(f'  bundle: {len(recs)} records in {len(packs)} plain pack(s), {sum(map(len, packs)) >> 20} MB')
+    print(f'  bundle: {len(recs)} records in {len(packs)} pack(s), {sum(map(len, packs)) >> 20} MB')
 
 
 def cmd_corpus(a):
-    """A members-only data add-on of *.ghpak packs (shader corpus). Records are named by their
+    """A data add-on of *.ghpak packs (shader corpus). Records are named by their
     file name without .bin (gh_lo_<key>, gh_tl_<key>); --overlay files win over --dir's."""
     pid, version = a.id, a.version
     if not ID_RE.match(pid) or pid in ('.', '..'):
         die(f'id {pid!r} is not a safe id')
     ver_tuple(version)
-    keys_dir = outside_tree(a.keys_dir or DEFAULT_KEYS_DIR, 'artifact keys')
     recs = corpus_records(a.dir, a.overlay)
-    key = os.urandom(32)
-    packs = build_packs(sorted(recs.items()), pid, version, key, a.pack_mb << 20)
+    packs = build_packs(sorted(recs.items()), a.pack_mb << 20)
     blobs = {f'pack{i:02d}.ghpak': b for i, b in enumerate(packs)}
     dest = os.path.join(a.repo, 'packages', pid, version)
     if os.path.exists(dest):
         die(f'{dest} exists: versions are immutable, bump the version')
     add_package(a.repo, pid, 'addon', version, a.name, a.min_loader, ['corpus:' + pid], [],
-                [f'{n}={n}' for n in blobs], False, None, a.auto, blobs)
-    mp = os.path.join(dest, 'manifest.json')
-    m = json.load(open(mp))
-    m['entitlement'] = 'member'
-    m['keyed'] = True
-    with open(mp, 'w') as f:
-        json.dump(m, f, indent=2); f.write('\n')
-    kf = write_package_key(keys_dir, pid, version, key, pack_fingerprint(m['files']))
-    print(f'  {len(recs)} records in {len(packs)} pack(s), {sum(map(len, packs)) >> 20} MB, keyed')
-    print(f'  package key -> {kf} (register it: greenhouse-site scripts/register-artifact.ts)')
+                [f'{n}={n}' for n in blobs], a.auto, blobs)
+    print(f'  {len(recs)} records in {len(packs)} pack(s), {sum(map(len, packs)) >> 20} MB')
 
 
 def cmd_vendor(a):
@@ -540,7 +465,6 @@ def cmd_vendor(a):
     m['provides'] = spec.get('provides', [])
     m['requires'] = spec.get('requires', [])
     m['files'] = entries
-    m['entitlement'] = None
     with open(os.path.join(dest, 'manifest.json'), 'w') as f:
         json.dump(m, f, indent=2); f.write('\n')
     print(f'added {pid} {version} (addon, {len(entries)} vendor file(s), no vendor bytes stored) -> {dest}')
@@ -670,14 +594,14 @@ def main():
     s = sp.add_parser('add'); s.add_argument('--repo', required=True); s.add_argument('--id', required=True)
     s.add_argument('--type', required=True); s.add_argument('--version', required=True); s.add_argument('--name')
     s.add_argument('--min-loader'); s.add_argument('--provides', action='append', help='repeatable'); s.add_argument('--requires', action='append', help='repeatable')
-    s.add_argument('--sealed', action='store_true'); s.add_argument('--keys-dir'); s.add_argument('--auto', action='store_true')
+    s.add_argument('--auto', action='store_true')
     s.add_argument('files', nargs='+'); s.set_defaults(fn=cmd_add)
     s = sp.add_parser('title'); s.add_argument('--repo', required=True); s.add_argument('--version', required=True)
-    s.add_argument('--sealed', action='store_true'); s.add_argument('--keys-dir'); s.add_argument('--auto', action='store_true')
+    s.add_argument('--auto', action='store_true')
     s.add_argument('--seed-dir'); s.add_argument('file'); s.set_defaults(fn=cmd_title)
     s = sp.add_parser('theme'); s.add_argument('--repo', required=True); s.add_argument('--version', required=True)
     s.add_argument('--dir', required=True); s.add_argument('--min-loader')
-    s.add_argument('--sealed', action='store_true'); s.add_argument('--keys-dir'); s.add_argument('--auto', action='store_true')
+    s.add_argument('--auto', action='store_true')
     s.set_defaults(fn=cmd_theme)
     s = sp.add_parser('compat'); s.add_argument('--repo', required=True); s.add_argument('--version', required=True)
     s.add_argument('--id', default='greenhouse-compat'); s.add_argument('--name'); s.add_argument('--min-loader')
@@ -686,7 +610,7 @@ def main():
     s = sp.add_parser('corpus'); s.add_argument('--repo', required=True); s.add_argument('--id', required=True)
     s.add_argument('--version', required=True); s.add_argument('--name'); s.add_argument('--min-loader')
     s.add_argument('--dir', required=True); s.add_argument('--overlay'); s.add_argument('--pack-mb', type=int, default=64)
-    s.add_argument('--keys-dir'); s.add_argument('--auto', action='store_true'); s.set_defaults(fn=cmd_corpus)
+    s.add_argument('--auto', action='store_true'); s.set_defaults(fn=cmd_corpus)
     s = sp.add_parser('bundle'); s.add_argument('--dir', required=True); s.add_argument('--overlay')
     s.add_argument('--out', required=True); s.add_argument('--pack-mb', type=int, default=64); s.set_defaults(fn=cmd_bundle)
     s = sp.add_parser('vendor'); s.add_argument('--repo', required=True); s.add_argument('--version', required=True)

@@ -1,8 +1,8 @@
 // Greenhouse P2 spike -- can a UWP app-container on Xbox Dev Mode create a real
 // D3D11 device, attach a swap chain to its CoreWindow, and Present?
 //
-// This is the graphics equivalent of the P0 exec-memory linchpin (GREENHOUSE.md
-// §10): a capability question about the *container*, deliberately tested with no
+// This is the graphics equivalent of the P0 exec-memory linchpin:
+// a capability question about the *container*, deliberately tested with no
 // guest loader involved, so a failure can only mean one thing. Every step logs
 // its HRESULT to LocalState so the answer is retrievable over WDP with no
 // debugger attached.

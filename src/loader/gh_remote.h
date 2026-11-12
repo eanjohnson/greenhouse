@@ -1,8 +1,12 @@
 // gh_remote.h -- §66 "Manage from anywhere": the console's half of managing its library
 // from a phone through playgreenhouse.app, end to end encrypted.
 //
-// The console only ever calls OUT: it polls POST /api/remote/poll on the site with its
-// entitlement token (or the short poll credential the site hands back). The site keeps
+// The console only ever calls OUT: it polls POST /api/remote/poll on the site with a
+// console credential (Host::token), or the short poll credential the site hands back.
+// That console credential is NOT DESIGNED YET: it used to be a token this file no
+// longer has, so the launcher compiles the relay out unless GH_REMOTE_RELAY is
+// defined (launcher_ui.h), and with it defined there is nothing to poll with until
+// a new console-auth scheme supplies Host::token. The site keeps
 // a mailbox of small encrypted messages and can read none of them:
 //
 //   pairing   the TV shows a QR of https://<site>/remote/pair#d=<device>&k=<console pub>&t=<token>.
@@ -28,10 +32,13 @@
 //                id where DPAPI is missing, and that is logged).
 //   phones.json  paired phones: public keys, credential id, sign counter, sequences.
 //
-// Win32 only (BCrypt + DPAPI + WinHTTP through gh_ent.h); the host test
+// Win32 only (BCrypt through gh_crypto.h, DPAPI, WinHTTP through the Host); the host test
 // (toolchain/test_gh_remote.cpp) runs it under wine against the site's vectors.
 #pragma once
-#include "gh_ent.h"
+#include "gh_repo.h"
+#include "gh_crypto.h"
+#include <dpapi.h>
+#include <mutex>
 #include "gh_json.h"
 #include <atomic>
 #include <condition_variable>
@@ -74,7 +81,7 @@ inline std::string B64Url(const std::string& s) { return B64Url((const uint8_t*)
 // Strict: canonical base64url only (no padding, no stray bits), so one value has one spelling.
 inline bool B64In(const std::string& s, std::string& out, size_t want = 0)
 {
-    if (!ghent::B64UrlDecode(s, out)) return false;
+    if (!ghcrypto::B64UrlDecode(s, out)) return false;
     if (B64Url(out) != s) return false;
     return want == 0 || out.size() == want;
 }
@@ -97,7 +104,7 @@ inline bool Sha256(const std::string& s, uint8_t out[32])
     ghrepo::Sha256 h; h.add(s.data(), s.size()); return h.finish(out);
 }
 
-// ---- AES-256-GCM seal (gh_ent.h has the open) ---------------------------------------
+// ---- AES-256-GCM seal (gh_crypto.h has the open) ---------------------------------------
 inline bool AesGcmSeal(const uint8_t key[32], const uint8_t iv[12], const std::string& aad,
                        const std::string& pt, std::string& ctTag)
 {
@@ -125,7 +132,7 @@ inline bool AesGcmSeal(const uint8_t key[32], const uint8_t iv[12], const std::s
 // ---- the console's identity ---------------------------------------------------------
 // An ECDH P-256 key that can also be exported (to be kept DPAPI-protected).
 struct Identity {
-    ghent::Ecdh ecdh;
+    ghcrypto::Ecdh ecdh;
     std::string pubB64;               // base64url of the 65-byte point (what the QR carries)
 };
 
@@ -171,14 +178,14 @@ inline std::string KeyInfo(const char* dir, const std::string& dev, const std::s
     return std::string("greenhouse.remote/1") + '\0' + dir + '\0' + dev + '\0' + phone;
 }
 
-inline bool DeriveKeys(ghent::Ecdh& mine, const uint8_t phonePub[65], const std::string& dev,
+inline bool DeriveKeys(ghcrypto::Ecdh& mine, const uint8_t phonePub[65], const std::string& dev,
                        const std::string& phone, DirKeys& k)
 {
     uint8_t shared[32];
     if (!mine.Shared(phonePub, shared)) return false;
     static const char salt[] = "greenhouse.remote/1";
-    bool ok = ghent::Hkdf32(shared, 32, (const uint8_t*)salt, sizeof salt - 1, KeyInfo("c2p", dev, phone), k.c2p) &&
-              ghent::Hkdf32(shared, 32, (const uint8_t*)salt, sizeof salt - 1, KeyInfo("p2c", dev, phone), k.p2c);
+    bool ok = ghcrypto::Hkdf32(shared, 32, (const uint8_t*)salt, sizeof salt - 1, KeyInfo("c2p", dev, phone), k.c2p) &&
+              ghcrypto::Hkdf32(shared, 32, (const uint8_t*)salt, sizeof salt - 1, KeyInfo("p2c", dev, phone), k.p2c);
     SecureZeroMemory(shared, sizeof shared);
     return ok;
 }
@@ -212,7 +219,7 @@ inline bool Open(const uint8_t key[32], const char* dir, const std::string& dev,
     std::string ivb, cb;
     if (!B64In(iv->s, ivb, 12) || !B64In(c->s, cb) || cb.size() < 16){ why = "malformed message"; return false; }
     std::vector<uint8_t> out;
-    if (!ghent::AesGcmOpen(key, (const uint8_t*)ivb.data(), MsgAad(dir, dev, phone, s->i, t->i),
+    if (!ghcrypto::AesGcmOpen(key, (const uint8_t*)ivb.data(), MsgAad(dir, dev, phone, s->i, t->i),
                            (const uint8_t*)cb.data(), cb.size() - 16, (const uint8_t*)cb.data() + cb.size() - 16, out)){
         why = "message does not decrypt"; return false;
     }
@@ -277,7 +284,7 @@ inline bool VerifyPair(const uint8_t token[16], const std::string& dev, const st
     if (r.ts < now - kSkewS || r.ts > now + kSkewS){ why = "pairing message too old"; return false; }
     const std::string t = PairTranscript(dev, kpubB64, r);
     uint8_t mac[32];
-    if (!ghent::Hmac256(token, 16, (const uint8_t*)t.data(), t.size(), mac)){ why = "hmac unavailable"; return false; }
+    if (!ghcrypto::Hmac256(token, 16, (const uint8_t*)t.data(), t.size(), mac)){ why = "hmac unavailable"; return false; }
     if (!ConstEq(std::string((const char*)mac, 32), r.mac)){ why = "pairing code does not match"; return false; }
     if (!ValidPoint(r.epub) || !ValidPoint(r.wpub)){ why = "phone key is not a P-256 point"; return false; }
     return true;
@@ -488,7 +495,7 @@ struct Session {
                 }
             } else if (b[0] == 'M' && b.size() == 1 + 97){
                 uint8_t m[32]; const std::string ent = Entropy();
-                if (ghent::Hkdf32((const uint8_t*)ent.data(), ent.size(), nullptr, 0, "mask", m)){
+                if (ghcrypto::Hkdf32((const uint8_t*)ent.data(), ent.size(), nullptr, 0, "mask", m)){
                     raw.assign((const char*)b.data() + 1, 97);
                     for (int i = 0; i < 32; ++i) raw[65 + i] ^= (char)m[i];
                     SecureZeroMemory(m, 32);
@@ -511,7 +518,7 @@ struct Session {
                 file = "D"; file.append((const char*)o.pbData, o.cbData); LocalFree(o.pbData);
             } else {
                 uint8_t m[32];
-                if (!ghent::Hkdf32((const uint8_t*)ent.data(), ent.size(), nullptr, 0, "mask", m)) return false;
+                if (!ghcrypto::Hkdf32((const uint8_t*)ent.data(), ent.size(), nullptr, 0, "mask", m)) return false;
                 file = "M" + raw; for (int i = 0; i < 32; ++i) file[1 + 65 + i] ^= (char)m[i];
                 SecureZeroMemory(m, 32);
                 Log("DPAPI unavailable: key masked to the device only");
@@ -799,8 +806,8 @@ struct Host {
     std::function<bool()> playing, downloading;
     std::function<void()> changed;                      // pairing prompt / phones changed: redraw
     std::function<bool(const std::string& path, const std::string& body, const std::string& bearer,
-                       std::string& resp, unsigned& status, std::string& why)> post;   // default: ghent::Post
-    std::function<std::string()> token;                 // the entitlement token (never logged)
+                       std::string& resp, unsigned& status, std::string& why)> post;   // the launcher's: ghsite::Post
+    std::function<std::string()> token;                 // the console's credential for the site (never logged)
 };
 
 struct Poller {
@@ -881,7 +888,7 @@ struct Poller {
         };
         std::string resp, why; unsigned status = 0;
         const std::string bearer = Bearer(now);
-        if (bearer.empty()){ restore(); s.Log("not linked: nothing to poll with"); return 5 * 60000; }
+        if (bearer.empty()){ restore(); s.Log("no console credential: nothing to poll with"); return 5 * 60000; }
         bool sent = host.post && host.post("/api/remote/poll", body, bearer, resp, status, why);
         if (!sent || status != 200){
             restore();

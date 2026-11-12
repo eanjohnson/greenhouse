@@ -7,7 +7,7 @@
 
   "_note": [
     "The 2008 dashboard, in Greenhouse's green rather than its blue. Ported from",
-    "design/mockups/nxe.html. Square, hairline-separated, with the page's",
+    "the nxe design mockup. Square, hairline-separated, with the page's",
     "navigation standing in a column down the left -- which is why this theme",
     "selects the `blades` layout and not `list`: the shape IS the theme.",
     "Titillium Web is the mockup's face and is not on the console; the chain ends",

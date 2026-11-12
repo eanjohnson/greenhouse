@@ -51,7 +51,7 @@ import ssl
 import sys
 import time
 
-HOST = os.environ.get("GH_XBOX", "192.0.2.12")
+HOST = os.environ.get("GH_XBOX", "")   # console IP; required for watch
 PORT = int(os.environ.get("GH_XBOX_PORT", "11443"))
 CTX = ssl._create_unverified_context()
 
@@ -113,6 +113,9 @@ def mb(pages, page_size=4096):
 
 
 def watch(args):
+    if not HOST:
+        print("witness: set GH_XBOX to the console IP", file=sys.stderr)
+        return 4
     w = Wdp()
     t_start = time.monotonic()
     tick = 0

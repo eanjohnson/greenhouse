@@ -5,6 +5,13 @@ lowered to something it can. Baked by `toolchain/dxil/lower.py`; consumed by the
 loader's `GhLoweredBlob`/`GhSubstShader` (knob `gh_shader_sub`), staged to the
 console's `LocalState` with `GH_LO_DIR`.
 
+**The lowered blobs are not in this repository.** They are derived from the
+game's own shaders, so `lowered/` and `exact/` are not shipped: bake them locally
+from your own copy of the game with the tools in `toolchain/dxil/`. What is
+tracked here is the wave-intrinsic `controls/` (our own shaders) and the JSON
+manifests, which carry only keys, file names and opcode counts so a local bake
+can be checked against them.
+
 **Filenames are keys, not labels.** `gh_lo_<key>.bin`, where `<key>` is the
 digest of the **original** SM 6.6 container — bytes `[4:20]`. Neither the baker
 nor the loader computes it independently, so they cannot disagree. Renaming a
@@ -12,8 +19,8 @@ file makes it invisible to the loader.
 
 | directory | count | what |
 |---|---|---|
-| `lowered/` | 381 | the complete corpus — all pass `dxv`, and the only wave op left anywhere is 113 `waveAnyTrue`, which the console compiles |
-| `exact/` | 56 | the un-approximated originals of the blobs `lowered/` holds a width-1 rewrite of |
+| `lowered/` | 381 | (bake locally) the complete corpus — all pass `dxv`, and the only wave op left anywhere is 113 `waveAnyTrue`, which the console compiles |
+| `exact/` | 56 | (bake locally) the un-approximated originals of the blobs `lowered/` holds a width-1 rewrite of |
 | `controls/` | 19 | one signed `cs_6_5` shader per wave intrinsic, for the #175 sweep |
 
 `manifest.json` names which 325 of `lowered/` are exact and which 56 are

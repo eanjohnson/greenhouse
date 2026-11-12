@@ -3,19 +3,22 @@
 #
 # The loader now LISTENS on the Xbox (0.0.0.0:55123). We connect to it and push
 # the physical mouse's relative motion + buttons. This is the direction that
-# routes when the Xbox is reached remotely via a Tailscale subnet router (same
+# routes when the Xbox is reached remotely via a VPN subnet router (same
 # path WDP uses), unlike the old model where the Xbox dialed out to a LAN PC.
 #
 # Packet: <B B h h h> = magic(0x5A), buttons, dx, dy, wheel  (little-endian)
 #   buttons bit0=Left bit1=Right bit2=Middle
 #
-# Usage: mouse_stream_client.py [xbox_ip] [port] [device]
-import socket, struct, threading, sys, time
+# Usage: mouse_stream_client.py <xbox_ip> [port] [device]
+#   xbox_ip may also come from GH_XBOX; device from GH_MOUSE_DEV.
+import os, socket, struct, threading, sys, time
 
-XBOX = sys.argv[1] if len(sys.argv) > 1 else "192.0.2.12"
+XBOX = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("GH_XBOX", "")
+if not XBOX:
+    sys.exit("usage: mouse_stream_client.py <xbox_ip> [port] [device]  (or set GH_XBOX)")
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 55123
 DEV  = sys.argv[3] if len(sys.argv) > 3 else \
-    "/dev/input/by-id/usb-Logitech_G502_HERO_Gaming_Mouse_146A33463431-event-mouse"
+    os.environ.get("GH_MOUSE_DEV", "/dev/input/by-id/usb-_Mouse_for_Windows-event-mouse")
 
 FMT = "qqHHi"; SZ = struct.calcsize(FMT)
 EV_SYN, EV_KEY, EV_REL = 0x00, 0x01, 0x02

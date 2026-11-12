@@ -31,7 +31,7 @@ PATCHES = {
     "mono-2.0-bdwgc.dll": {
         b"WINMM.dll": b"ghwmm.dll",
     },
-    # Steam engine trio (GREENHOUSE.md §21, Path X). steamclient64.dll statically
+    # Steam engine trio (Path X, docs/steam/README.md). steamclient64.dll statically
     # imports USER32!MapVirtualKeyExA, which the container's slim user32 lacks --
     # same missing export UnityPlayer hit -- so the whole DLL fails to load (err
     # 0x7E) before DllMain. Rename to the same loader-re-bedded placeholder. tier0/

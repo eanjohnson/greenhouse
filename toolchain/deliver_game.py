@@ -13,7 +13,10 @@
 #   e.g. deliver_game.py Greenhouse.LethalCo_0.0.1.0_x64__mgw46vk3ppz9w \
 #          artifacts/msix_stage_lethalco/guest/LethalCompany  game/LethalCompany
 import sys, os, time, uuid, http.client
-sys.path.insert(0, '$HOME/.claude/jobs/49fb5998/tmp')
+_tools = os.environ.get('GH_TOOLS')
+if not _tools:
+    sys.exit('set GH_TOOLS to the directory holding wdp.py (the Device Portal client)')
+sys.path.insert(0, _tools)
 import wdp
 from urllib.parse import quote
 

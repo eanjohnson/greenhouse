@@ -51,6 +51,7 @@
 #include "gh_x86_ddraw.h"
 #include "gh_x86_input.h"
 #include "gh_x86_wndq.h"
+#include "../gh_owned.h"   // Steam ownership from the user's own owned list
 
 namespace ghx86 {
 
@@ -2286,31 +2287,20 @@ inline void RegisterSourceGapBeds(ThunkRegistry& R)
 // builds of one interface version; the version strings come from the image, not
 // from an SDK header.
 //
-// `ret` is what the slot answers in EAX. It is 0 unless there is a reason, and
-// there is exactly one reason here: ISteamApps slots 0 and 6 are the engine
-// asking "do you own this game?", and a false answer is fatal in a way that
-// leaves no trace. The chain, read out of sw.dll:
+// `ret` is what the slot answers in EAX. It is 0 unless there is a reason.
+// ISteamApps slots 0 and 6 are the engine asking "do you own this game?", and a
+// false answer ends the run without a trace: GoldSrc's filesystem init ends in
+// `return SteamApps()->BIsSubscribedApp(appid)`, and every layer above turns a
+// false into ExitProcess(0) with no message and no fault. The appid comes from
+// a table in the engine mapping gamedir to app (valve->70, cstrike->10,
+// gearbox->50, bshift->130, ...).
 //
-//   hl.exe                      calls IEngineAPI::Run, exits with what it gets
-//   CEngineAPI::Run     1021ea20  __except returns 0 -> silent, clean exit
-//   RunListenServer     1021efb0  FileSystem_Init == 0 -> return 0
-//   FileSystem_Init     101c6610  tail call == 0 -> return 0
-//                       101b92e0  parses -basedir/-game, then
-//                       101c6840  the gamedir/appid setup, which ends in
-//                       10217330  if (!SteamApps()) return false;
-//                                 return SteamApps()->BIsSubscribedApp(appid)
-//
-// The appid comes from a table in sw.dll mapping gamedir to app: valve->70,
-// cstrike->10, gearbox->50, bshift->130, and so on. So "false" here means the
-// engine believes this account does not own Half-Life, and every layer above
-// turns that into ExitProcess(0) with no message, no log line and no fault.
-//
-// The x64 shim already reached this exact conclusion from the other direction:
-// cell ENGOFF2 watched a 64-bit guest call ISteamApps slots 0 and 6, get false
-// twice, and quit cleanly, and corpus/shims/steam_api64.cpp has answered TRUE
-// there ever since. This is the same answer on the 32-bit side, for the same
-// reason, and it is a true one: the title was downloaded from Steam with the
-// user's own sign-in, so the account does own it.
+// Those two slots are answered by gh_steam_owns below, from the signed-in user's
+// own owned list (LocalState\gh_owned.txt, src/loader/gh_owned.h) -- the same
+// rule the x64 shim (corpus/shims/steam_api64.cpp) follows. The project never
+// answers ownership on the user's behalf: an appid that is not in the list, or
+// no list at all, is not owned, and the game then exits as it would on a PC
+// whose Steam account does not own it.
 //
 // `retstr` is for the handful of slots that answer with a `const char*`. Zero
 // is NOT a safe answer for those: the caller hands the result straight to
@@ -2427,6 +2417,36 @@ inline uint64_t gh_steam_gs_connect_and_auth(Machine&, const uint32_t* a)
     return 1;
 }
 
+// Set by the loader (MapAndRun32) to LocalState\gh_owned.txt.
+inline std::wstring g_x86_owned_path;
+inline ghowned::Cache& gh_steam_owned_cache() { static ghowned::Cache c; return c; }
+inline bool gh_steam_owns(uint32_t app)
+{
+    return gh_steam_owned_cache().Owned(app, ghowned::CustomRun(),
+        [](ghowned::List& l) { ghowned::LoadW(g_x86_owned_path.c_str(), l); },
+        [](const char* line) { log(std::string("X86 ") + line); });
+}
+// The running game's own appid: what the launcher stamped into SteamAppId for
+// the picked title (from its library entry or the game's steam_appid.txt).
+inline uint32_t gh_steam_own_appid()
+{
+    char b[16];
+    DWORD n = GetEnvironmentVariableA("SteamAppId", b, sizeof b);
+    if (n == 0 || n >= sizeof b) n = GetEnvironmentVariableA("SteamGameId", b, sizeof b);
+    if (n == 0 || n >= sizeof b) return 0;
+    return (uint32_t)std::strtoul(b, nullptr, 10);
+}
+// ISteamApps::BIsSubscribed() -- slot 0, no arguments.
+inline uint64_t gh_steam_bissubscribed(Machine&, const uint32_t*)
+{
+    return gh_steam_owns(gh_steam_own_appid()) ? 1 : 0;
+}
+// ISteamApps::BIsSubscribedApp(AppId_t) -- slot 6, 4 argument bytes.
+inline uint64_t gh_steam_bissubscribedapp(Machine&, const uint32_t* a)
+{
+    return gh_steam_owns(a[0]) ? 1 : 0;
+}
+
 struct SteamSlotSpec {
     const char* iface; uint16_t slot; uint16_t argbytes; uint32_t ret;
     const char* retstr = nullptr;
@@ -2438,7 +2458,7 @@ inline constexpr SteamSlotSpec kSteamSlots[] = {
         // BIsSubscribed. No call site reaches it, but the signature is
         // certain and it asks the same question as slot 6, so it must not
         // answer differently if some path we did not find gets here.
-    { "STEAMAPPS_INTERFACE_VERSION008",   0,   0, 1 },
+    { "STEAMAPPS_INTERFACE_VERSION008",   0,   0, 0, nullptr, &gh_steam_bissubscribed },
         // BIsLowViolence(). Found at run time, not by the scan: cell 911 logged
         // it as an unknown slot called from 0x101c6923, inside the same gamedir
         // setup that holds the ownership gate. It takes no arguments, so the
@@ -2448,7 +2468,7 @@ inline constexpr SteamSlotSpec kSteamSlots[] = {
         // "english" when it is 0.
     { "STEAMAPPS_INTERFACE_VERSION008",   4,   0, 0 },
         // BIsSubscribedApp(AppId_t) -- the ownership gate. See above.
-    { "STEAMAPPS_INTERFACE_VERSION008",   6,   4, 1 },
+    { "STEAMAPPS_INTERFACE_VERSION008",   6,   4, 0, nullptr, &gh_steam_bissubscribedapp },
     { "STEAMAPPS_INTERFACE_VERSION008",  26,   8, 0 },
     // STEAMHTTP_INTERFACE_VERSION003
     { "STEAMHTTP_INTERFACE_VERSION003",   0,   8, 0 },
@@ -5125,8 +5145,8 @@ inline void RegisterStdBeds(Machine& m)
     //   1. BLOCKING. recv, accept, connect and select block the calling thread.
     //      Every guest thread lives on ONE host thread, so a blocking host call
     //      stops the entire guest -- including whichever thread was going to
-    //      feed that socket. This is bed-layer rule 9 (see GREENHOUSE.md
-    //      SS30.5) and it is the same trap SyncObj exists to avoid. Real
+    //      feed that socket. This is bed-layer rule 9 (see
+    //      docs/architecture/x86-guest.md) and it is the same trap SyncObj exists to avoid. Real
     //      sockets here means forcing every host socket non-blocking and
     //      re-entering through the scheduler's retry path, exactly as
     //      WaitForSingleObject does -- real work, worth doing only once the

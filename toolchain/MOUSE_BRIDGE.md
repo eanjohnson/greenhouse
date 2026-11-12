@@ -12,7 +12,7 @@ etc.) see real clicks without a controller.
   log out and back in.
 - Python 3 on that box (stdlib only, no deps).
 - Network route from the laptop to the Xbox on TCP 55123 (same LAN, or a
-  Tailscale subnet router, or anything else that lets a socket dial through).
+  VPN subnet router, or anything else that lets a socket dial through).
 - A Greenhouse guest already running on the Xbox with the mouse bridge listener
   compiled in — the loader listens on `0.0.0.0:55123` and accepts one connection
   at a time.
@@ -50,18 +50,18 @@ python3 mouse_stream_client.py <xbox-ip> [port] [device]
 ```
 
 Defaults: port `55123`, device `/dev/input/by-id/usb-_Mouse_for_Windows-event-mouse`
-(edit the top of the script to change the default; every argument is optional
-and positional). Typical:
+(or `GH_MOUSE_DEV`). The console IP is required: the first argument, or `GH_XBOX`.
+Arguments are positional. Typical:
 
 ```
-python3 mouse_stream_client.py 192.0.2.10
+python3 mouse_stream_client.py <console-ip>
 ```
 
 Expected output on connect:
 
 ```
 reading /dev/input/by-id/usb-_Mouse_for_Windows-event-mouse
-connected to Xbox 192.0.2.10:55123 -- move the mouse
+connected to Xbox <console-ip>:55123 -- move the mouse
 ```
 
 Move the mouse. On the Xbox, the cursor tracks in the game; left/right/middle

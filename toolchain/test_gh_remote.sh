@@ -3,7 +3,7 @@
 # greenhouse-site's §66 vectors (toolchain/vectors/remote_vectors.json, made by
 # greenhouse-site/scripts/gen-remote-vectors.ts with throwaway keys).
 set -euo pipefail
-GH=$HOME/greenhouse
+GH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SDK="$GH/toolchain/xwin-sdk"; SDKVER=10.0.26100
 W="${TMPDIR:-/tmp}/gh_remote_test.$$"; mkdir -p "$W/ls"
 trap 'rm -rf "$W"' EXIT

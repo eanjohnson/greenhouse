@@ -2,7 +2,7 @@
 # Build x86host.exe: the native x86 runtime (src/loader/x86/gh_x86_native.h) as a plain
 # x64 console PE. Runs on a desktop and, from gh_games\x86host, as a Launcher guest.
 set -euo pipefail
-GH=$HOME/greenhouse
+GH="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SDK="$GH/toolchain/xwin-sdk"; SDKVER=10.0.26100
 OUT="${1:-$GH/artifacts/x86native/x86host.exe}"
 mkdir -p "$(dirname "$OUT")"

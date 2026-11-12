@@ -27,6 +27,7 @@ static void gh_logf(const char*, ...);
 #define GH_ENGINE_LOG(...) gh_logf(__VA_ARGS__)
 #include "gh_steam_engine.h"
 #include "gh_steam_qr.h"
+#include "../../src/loader/gh_owned.h"   // ownership from the user's own owned list
 
 // ---- Minimal type stand-ins (avoid pulling in full SDK headers) ------------
 // HSteamPipe / HSteamUser now come from gh_steam_engine.h.
@@ -2456,8 +2457,7 @@ __declspec(dllexport) int      SteamAPI_ISteamFriends_GetPersonaState(void*) {
 // Friend-enumeration + invite plumbing (v0.0.13.0).
 // Public ISteamFriends017 slot layout is our working assumption (empirically verified
 // via on-device gh_shim.log — if friend_count == 0 or persona-state is garbage, the
-// slots need to be RE'd against this build's IClientFriends vtable, cf. GREENHOUSE.md
-// §21.6). Slots used here: 3 GetFriendCount, 4 GetFriendByIndex (CSteamID-return retptr
+// slots need to be RE'd against this build's IClientFriends vtable). Slots used here: 3 GetFriendCount, 4 GetFriendByIndex (CSteamID-return retptr
 // ABI, use gh_vcall_sid), 7 GetFriendPersonaName, 8 GetFriendPersonaState.
 __declspec(dllexport) int SteamAPI_ISteamFriends_GetFriendCount(void*, int flags) {
     if (g_gh_engine_state == 2 && g_gh_friends)
@@ -2654,11 +2654,55 @@ __declspec(dllexport) bool     SteamAPI_ISteamUtils_IsSteamInBigPictureMode(void
 __declspec(dllexport) bool     SteamAPI_ISteamUtils_IsSteamRunningOnSteamDeck(void*) { return false; }
 __declspec(dllexport) uint32_t SteamAPI_ISteamUtils_GetSteamUILanguage(void*) { return 1; }
 
+// ---- Ownership -----
+// The project never answers an ownership question on the user's behalf. When the
+// Steam add-on's real engine is up, a game that asks for ISteamApps / ISteamUser by
+// version gets the ENGINE's own object (gh_iface_for_version) and Steam answers;
+// that path is left alone. Everything below is OUR answer -- the flat exports and
+// the hand-written vtables used when the engine is not up -- and it comes from
+// LocalState\gh_owned.txt, the owned-games list Steam returned for the account that
+// signed in (src/loader/gh_owned.h). Not in the list, no list, or one of the user's
+// own non-Steam games (GH_CUSTOM_RUN=1): not owned.
+static ghowned::Cache g_gh_owned;
+static const char* gh_owned_path() {
+    static char path[MAX_PATH] = {0};
+    if (path[0]) return path;
+    strcpy_s(path, MAX_PATH, gh_log_path());
+    char* s = strrchr(path, '\\');
+    if (s) strcpy_s(s + 1, MAX_PATH - (size_t)(s + 1 - path), "gh_owned.txt");
+    else strcpy_s(path, MAX_PATH, "gh_owned.txt");
+    return path;
+}
+static bool gh_owns(AppId_t app) {
+    return g_gh_owned.Owned((uint32_t)app, ghowned::CustomRun(),
+        [](ghowned::List& l) { ghowned::LoadA(gh_owned_path(), l); },
+        [](const char* line) { gh_logf("[gh-shim] %s", line); });
+}
+// The signed-in user's SteamID, or 0 when nobody is signed in (an anonymous engine
+// session is nobody). Never kFakeSteamID: that is a placeholder, not an owner.
+static uint64_steamid gh_local_steamid() {
+    if (g_gh_engine_state == 2 && g_gh_client_user) {
+        uint64_t sid = gh_iu_getsteamid(g_gh_client_user);
+        if (sid && !gh_sid_is_anon(sid)) return sid;
+    }
+    return (uint64_steamid)g_gh_real_steamid;
+}
+// EUserHasLicenseForAppResult: 0 HasLicense, 1 DoesNotHaveLicense, 2 NoAuth. Only
+// the local user's licences are known (from their list); anyone else was never
+// authenticated by us, so NoAuth -- the same answer Steam gives for a user with no
+// auth session.
+static int gh_user_license(uint64_steamid who, AppId_t app) {
+    const uint64_steamid me = gh_local_steamid();
+    const bool local = who == kFakeSteamID || (me && who == me);
+    if (!local) return 2;
+    return gh_owns(app) ? 0 : 1;
+}
+
 // ---- ISteamApps -----
-__declspec(dllexport) bool SteamAPI_ISteamApps_BIsSubscribed(void*) { return true; }
-__declspec(dllexport) bool SteamAPI_ISteamApps_BIsSubscribedApp(void*, AppId_t) { return true; }
+__declspec(dllexport) bool SteamAPI_ISteamApps_BIsSubscribed(void*) { return gh_owns(gh_resolve_appid()); }
+__declspec(dllexport) bool SteamAPI_ISteamApps_BIsSubscribedApp(void*, AppId_t app) { return gh_owns(app); }
 __declspec(dllexport) bool SteamAPI_ISteamApps_BIsDlcInstalled(void*, AppId_t) { return false; }
-__declspec(dllexport) bool SteamAPI_ISteamApps_BIsAppInstalled(void*, AppId_t) { return true; }
+__declspec(dllexport) bool SteamAPI_ISteamApps_BIsAppInstalled(void*, AppId_t app) { return gh_owns(app); }
 __declspec(dllexport) bool SteamAPI_ISteamApps_BIsSubscribedFromFamilySharing(void*) { return false; }
 __declspec(dllexport) bool SteamAPI_ISteamApps_BIsSubscribedFromFreeWeekend(void*) { return false; }
 __declspec(dllexport) bool SteamAPI_ISteamApps_BIsTimedTrial(void*, uint32_t*, uint32_t*) { return false; }
@@ -2667,7 +2711,11 @@ __declspec(dllexport) bool SteamAPI_ISteamApps_BIsCybercafe(void*) { return fals
 __declspec(dllexport) bool SteamAPI_ISteamApps_BIsVACBanned(void*) { return false; }
 __declspec(dllexport) const char* SteamAPI_ISteamApps_GetCurrentGameLanguage(void*) { return "english"; }
 __declspec(dllexport) const char* SteamAPI_ISteamApps_GetAvailableGameLanguages(void*) { return "english"; }
-__declspec(dllexport) uint64_steamid SteamAPI_ISteamApps_GetAppOwner(void*) { return kFakeSteamID; }
+__declspec(dllexport) uint64_steamid SteamAPI_ISteamApps_GetAppOwner(void*) { return gh_local_steamid(); }
+// ISteamUser / ISteamGameServer::UserHasLicenseForApp(CSteamID, AppId_t). Were steam_stub
+// (0 == HasLicense for anyone and anything); now the same list answers them.
+__declspec(dllexport) int SteamAPI_ISteamUser_UserHasLicenseForApp(void*, uint64_steamid who, AppId_t app) { return gh_user_license(who, app); }
+__declspec(dllexport) int SteamAPI_ISteamGameServer_UserHasLicenseForApp(void*, uint64_steamid who, AppId_t app) { return gh_user_license(who, app); }
 __declspec(dllexport) uint32_t SteamAPI_ISteamApps_GetAppBuildId(void*) { return 1; }
 __declspec(dllexport) int      SteamAPI_ISteamApps_GetAppInstallDir(void*, AppId_t, char* buf, uint32_t cch) { if (buf && cch) buf[0]=0; return 0; }
 
@@ -2681,11 +2729,13 @@ __declspec(dllexport) int      SteamAPI_ISteamApps_GetAppInstallDir(void*, AppId
 // and then exited cleanly with code 1. Slot 0 of ISteamApps is BIsSubscribed()
 // and slot 6 is BIsSubscribedApp(AppId_t) -- the game asked "do you own this?",
 // the generic stub said false twice, and it quit. That is not a crash and it is
-// not a stub bug; it is the right question getting the wrong answer.
+// not a stub bug; it is the right question, and it deserves the user's real
+// answer rather than a blanket one.
 //
 // So these two interfaces get REAL vtables, in the g_rp_vtbl style, answering out
-// of the same flat exports above so there is one source of truth. Everything else
-// still falls through to the generic object.
+// of the same functions as the flat exports above so there is one source of truth:
+// ownership comes from the signed-in user's own owned list (gh_owns), never from a
+// constant. Everything else still falls through to the generic object.
 //
 // The slot ORDER is from Open Steamworks' ISteamApps007.h / ISteamUser017.h.
 // Those are older than the versions this game asks for (008 / 023), which is safe
@@ -2728,6 +2778,22 @@ static void*       gh_hw_steamid(void* self, void* ret) {
     if (ret) *(uint64_steamid*)ret = kFakeSteamID;
     return ret;
 }
+// GetAppOwner's CSteamID, through the same hidden pointer and with the same tripwire
+// as gh_hw_steamid; 0 (an invalid id) when nobody is signed in.
+static void*       gh_hw_appowner(void* self, void* ret) {
+    if (gh_iface_is_our_obj(ret)) {
+        static LONG once = 0;
+        if (InterlockedCompareExchange(&once, 1, 0) == 0)
+            gh_logf("[gh-shim] HWAPPOWNER refused: retptr %p is our own object (this=%p)", ret, self);
+        return ret;
+    }
+    if (ret) *(uint64_steamid*)ret = gh_local_steamid();
+    return ret;
+}
+// Ownership slots: the same answers as the flat exports above (one source of truth).
+static uint64_t    gh_hw_subscribed(void*)                    { return gh_owns(gh_resolve_appid()) ? 1 : 0; }
+static uint64_t    gh_hw_subscribed_app(void*, AppId_t app)   { return gh_owns(app) ? 1 : 0; }
+static uint64_t    gh_hw_license(void*, uint64_steamid who, AppId_t app) { return (uint64_t)(uint32_t)gh_user_license(who, app); }
 static uint64_t    gh_hw_buf2(void*, char* b, int)            { if (b) b[0] = 0; return 0; }
 static uint64_t    gh_hw_buf3(void*, AppId_t, char* b, uint32_t) { if (b) b[0] = 0; return 0; }
 static const char* gh_hw_emptystr(void*)                      { return ""; }
@@ -2737,13 +2803,13 @@ static const char* gh_hw_player(void*)                        { return "Player";
 static uint64_t    gh_hw_online(void*)                        { return 1; }  // k_EPersonaStateOnline
 
 static void* const g_apps_vtbl[64] = {
-    (void*)&gh_hw_one,   // 0  BIsSubscribed            -> TRUE. Cell ENGOFF2 proved this is the one
+    (void*)&gh_hw_subscribed,   // 0  BIsSubscribed      -> own appid in gh_owned.txt (ENGOFF2 found this slot)
     (void*)&gh_hw_zero,   // 1  BIsLowViolence
     (void*)&gh_hw_zero,   // 2  BIsCybercafe
     (void*)&gh_hw_zero,   // 3  BIsVACBanned
     (void*)&gh_hw_english,   // 4  GetCurrentGameLanguage   -> english, never nullptr
     (void*)&gh_hw_english,   // 5  GetAvailableGameLanguages
-    (void*)&gh_hw_one,   // 6  BIsSubscribedApp         -> TRUE. the other one ENGOFF2 named
+    (void*)&gh_hw_subscribed_app,   // 6  BIsSubscribedApp -> that appid in gh_owned.txt
     (void*)&gh_hw_zero,   // 7  BIsDlcInstalled          -> false, matching the flat export
     (void*)&gh_hw_zero,   // 8  GetEarliestPurchaseUnixTime
     (void*)&gh_hw_zero,   // 9  BIsSubscribedFromFreeWeekend
@@ -2756,8 +2822,8 @@ static void* const g_apps_vtbl[64] = {
     (void*)&gh_hw_zero,   // 16 MarkContentCorrupt
     (void*)&gh_hw_zero,   // 17 GetInstalledDepots
     (void*)&gh_hw_buf3,   // 18 GetAppInstallDir(id,char*,uint32) -> 0, empty
-    (void*)&gh_hw_one,   // 19 BIsAppInstalled          -> TRUE
-    (void*)&gh_hw_steamid,   // 20 GetAppOwner -> CSteamID through the hidden pointer in RDX
+    (void*)&gh_hw_subscribed_app,   // 19 BIsAppInstalled -> in gh_owned.txt, like the flat export
+    (void*)&gh_hw_appowner,   // 20 GetAppOwner -> signed-in user's CSteamID (or 0) through the hidden pointer in RDX
     (void*)&gh_hw_empty,   // 21 GetLaunchQueryParam -> empty string, never nullptr
     (void*)&gh_hw_zero,   // 22 GetDlcDownloadProgress
     (void*)&gh_hw_one,   // 23 GetAppBuildId            -> 1, matching the flat export
@@ -2821,7 +2887,7 @@ static void* const g_user_vtbl[64] = {
     (void*)&gh_hw_zero,   // 14 BeginAuthSession
     (void*)&gh_hw_zero,   // 15 EndAuthSession (void)
     (void*)&gh_hw_zero,   // 16 CancelAuthTicket (void)
-    (void*)&gh_hw_zero,   // 17 UserHasLicenseForApp -> 0 == k_EUserHasLicenseResultHasLicense
+    (void*)&gh_hw_license,   // 17 UserHasLicenseForApp -> from gh_owned.txt (0 has, 1 has not, 2 no auth)
     (void*)&gh_hw_zero,   // 18 BIsBehindNAT
     (void*)&gh_hw_zero,   // 19 AdvertiseGame (void)
     (void*)&gh_hw_zero,

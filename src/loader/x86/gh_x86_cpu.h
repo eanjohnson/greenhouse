@@ -515,7 +515,7 @@ struct Cpu {
     // pure interpretation (10M instructions, zero host calls) measured
     // 6.37-6.57 M insn/s across every build involved. The interpreter never
     // got slower. What grew was Boehm's conservative stack scan, which tracked
-    // the size of the arena -- see GREENHOUSE.md 30.20.
+    // the size of the arena.
     //
     // The #ifdef stays anyway: a clock read or a policy test per instruction is
     // not something a shipped build should carry on faith, and the tests build

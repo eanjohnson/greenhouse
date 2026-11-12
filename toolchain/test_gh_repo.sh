@@ -1,10 +1,12 @@
 #!/bin/bash
 # Build toolchain/test_gh_repo.cpp with clang-cl and run it under wine against a
-# freshly signed local repository. Needs the dev repo key (ghpkg.py keygen).
+# freshly signed local repository.
+#   GH_REPO_KEY  the dev repository signing key (.pem, from ghpkg.py keygen). Required:
+#                the test never guesses a key location.
 set -euo pipefail
-GH=$HOME/greenhouse
+GH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SDK="$GH/toolchain/xwin-sdk"; SDKVER=10.0.26100
-KEY="${GH_REPO_KEY:-$HOME/.greenhouse-keys/dev-repo-p256.pem}"
+KEY="${GH_REPO_KEY:?set GH_REPO_KEY to the dev repository signing key (.pem, from ghpkg.py keygen)}"
 W="${TMPDIR:-/tmp}/gh_repo_test.$$"; mkdir -p "$W"
 trap '[ -n "${SRV:-}" ] && kill $SRV 2>/dev/null; rm -rf "$W"' EXIT
 PORT=$((20000 + $$ % 20000))
@@ -45,18 +47,18 @@ run tampered x || rc=1
 rm -rf "$W/repo"/*; mk_repo "$W/repo"
 python3 "$GH/toolchain/ghpkg.py" index --repo "$W/repo" --key "$KEY" --serial 3 >/dev/null
 run rollback i || rc=1
-# §44: a keyed corpus add-on (encrypted packs) and a title package carrying its seed.
+# §44: a corpus add-on (record packs) and a title package carrying its seed.
 kill $SRV 2>/dev/null; wait $SRV 2>/dev/null || true
-rm -rf "$W/repo" "$W/k"; mkdir -p "$W/repo" "$W/blobs"
+rm -rf "$W/repo"; mkdir -p "$W/repo" "$W/blobs"
 for i in 1 2 3; do head -c 5000 /dev/urandom > "$W/blobs/gh_lo_000$i.bin"; done
 python3 "$GH/toolchain/ghpkg.py" corpus --repo "$W/repo" --id corpus-t --version 1.0.0.0 --dir "$W/blobs" \
-  --keys-dir "$W/keys" --auto >/dev/null
+  --auto >/dev/null
 python3 "$GH/toolchain/ghpkg.py" title --repo "$W/repo" --version 1.0.0.0 --auto \
   --seed-dir "$GH/corpus/seed/GhostOfTsushima" "$GH/corpus/titles/ghostoftsushima.ghtitle.json" >/dev/null
 python3 "$GH/toolchain/ghpkg.py" index --repo "$W/repo" --key "$KEY" --serial 6 >/dev/null
 python3 "$GH/toolchain/ghpkg.py" serve --repo "$W/repo" --port $PORT 2>/dev/null & SRV=$!
 sleep 1
-run keyed k || rc=1
+run corpus k || rc=1
 # Vendor files (needs the network: the bytes come from Valve's CDN over https).
 if [ "${GH_REPO_TEST_VENDOR:-1}" = 1 ]; then
   kill $SRV 2>/dev/null; wait $SRV 2>/dev/null || true

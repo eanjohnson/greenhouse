@@ -15,8 +15,8 @@
 // engine-independent amount of guest work, which is the only quantity that
 // means the same thing under both engines.
 //
-// The four phases are chosen to match where the real profile actually goes
-// (GREENHOUSE.md 30.21): dependent integer ALU, pointer-chasing loads, a byte
+// The four phases are chosen to match where the real profile actually goes:
+// dependent integer ALU, pointer-chasing loads, a byte
 // codec loop, and SSE float maths.
 
 #define GH_STDCALL __stdcall

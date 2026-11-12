@@ -3,7 +3,7 @@
 // It uses only standard D3D11 / DXGI APIs -- exactly what a real D3D11 title's
 // renderer bring-up does -- with no knowledge of Greenhouse. When run through the
 // loader, its D3D11CreateDeviceAndSwapChain call is intercepted and satisfied by
-// the D3D11On12 bridge (GREENHOUSE.md §13.4 / loader graphics bed), so it should:
+// the D3D11On12 bridge (docs/architecture/graphics.md / loader graphics bed), so it should:
 //   - receive a feature level of 11_1 (not the native path's 10_1),
 //   - see compute-shader support (denied on the native path),
 //   - and present an animated clear to the CoreWindow.

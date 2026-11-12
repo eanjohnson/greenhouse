@@ -1,5 +1,5 @@
 // Greenhouse Host shell -- minimal CoreApplication (no XAML) UWP entry point.
-// On launch it runs the P0 spike sequence (GREENHOUSE.md §10 / Appendix H.3 #4)
+// On launch it runs the P0 spike sequence
 // -- the same VirtualAlloc(RW) -> write x64 stub -> VirtualProtect(RX) -> call
 // sequence already validated off-console under Wine -- and writes the result
 // to LocalFolder so it can be pulled back over WDP without a live debugger

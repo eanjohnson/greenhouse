@@ -35,7 +35,7 @@ enum GhUiArch {
     GH_PAGE_LIST = 0,   // rows: picker, Packages, Mods, Workshop, Profiles, Layout
     GH_PAGE_GRID,       // tiles; a layout without a grid renders this as LIST
     GH_PAGE_MODAL,      // confirm / prompt / detail over a dimmed page
-    GH_PAGE_QR,         // Steam sign-in, membership
+    GH_PAGE_QR,         // Steam sign-in, Manage from a browser
     GH_PAGE_PROGRESS,   // download, verify, shader bake
     GH_PAGE_MESSAGE,    // status, crash, onboarding steps
     GH_PAGE_COUNT
@@ -127,7 +127,7 @@ inline const char* GhUiGlyphName(int g)
 }
 
 // ---------------------------------------------------------------------------
-// A badge: a short coloured tag. Status pills, "(theme)", "UPDATE", "MEMBER".
+// A badge: a short coloured tag. Status pills, "(theme)", "UPDATE".
 // ---------------------------------------------------------------------------
 struct GhUiBadge {
     GhUiTag label;
@@ -283,7 +283,7 @@ struct GhUiRow {
     GhUiBadge badge;           // optional; empty label = none
     bool      hasBadge  = false;
 
-    bool      disabled  = false;   // present but not selectable (not installed, no entitlement)
+    bool      disabled  = false;   // present but not selectable (not installed)
     bool      checked   = false;   // a toggle row's state (Mods enable, options)
     bool      hasCheck  = false;
     bool      header    = false;   // a non-selectable group heading inside the list
@@ -433,7 +433,7 @@ struct GhUiQrVM {
     GhUiChrome chrome;
 
     // A line above the code, centred, naming what is being signed in to:
-    // "Sign in to Steam", "Membership". The chrome's own status line is
+    // "Sign in to Steam", "Manage from a browser". The chrome's own status line is
     // left-aligned and belongs to the page; this belongs to the code.
     GhUiText       heading;
 

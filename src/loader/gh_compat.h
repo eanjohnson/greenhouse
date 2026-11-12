@@ -2,7 +2,7 @@
 //
 // WHY THIS EXISTS
 // ---------------
-// The record of what runs used to be prose (GREENHOUSE.md, a candidates table) and
+// The record of what runs used to be prose (a project log, a candidates table) and
 // six rows typed by hand into the website's seed script. The app kept none of it: the
 // site advertised loader 0.0.330.0-0.0.697.0 while the app shipped 0.0.938.0, and
 // `GhUiRow::hasDot` -- "the picker's playability indicator" -- was in the view-model

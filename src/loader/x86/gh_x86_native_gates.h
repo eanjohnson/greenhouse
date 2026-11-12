@@ -7,7 +7,7 @@
 // disassembled on the build host and every byte checked before it ever runs
 // (toolchain/x86native/gates_dump.cpp).
 //
-// What N0 established (GREENHOUSE.md §58), and what each piece below exists for:
+// What N0 established (docs/architecture/x86-guest.md), and what each piece below exists for:
 //
 //  - In compat mode GS is never reloaded and its base is low32(TEB64), so each
 //    thread's TEB32 lives at low32(TEB64), and a guest fs: access is turned into

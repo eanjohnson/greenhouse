@@ -8,7 +8,7 @@ opcode before it is written -- a control that lost its intrinsic measures the
 plain shader again and scores a false CREATED.
 """
 import os, re, subprocess, sys
-sys.path.insert(0, '$HOME/greenhouse/toolchain/dxil')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dxilhash
 
 DXC = os.environ['GH_DXC']

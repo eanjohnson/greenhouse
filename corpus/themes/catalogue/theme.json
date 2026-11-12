@@ -6,7 +6,7 @@
   "layout": "grid",
 
   "_note": [
-    "Ported from design/mockups/catalogue.html: paper, a serif, wide",
+    "Ported from the catalogue design mockup: paper, a serif, wide",
     "margins, one spot colour. It shares `grid` with ios6 and reads nothing like",
     "it -- the plainest proof that the structure is the layout's and the",
     "character is the theme's. Paper at both ends means the accent can be the",

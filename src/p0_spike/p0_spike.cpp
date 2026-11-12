@@ -1,4 +1,4 @@
-// P0 spike (GREENHOUSE.md §10 / Appendix H.3 #4): prove the exec-memory sequence
+// P0 spike: prove the exec-memory sequence
 // the whole Loader design depends on. This build targets plain Win32 so it can be
 // compiled and run entirely off-console (Wine/local Windows) to validate the code
 // itself; the real question -- whether Xbox Dev Mode's UWP container permits this

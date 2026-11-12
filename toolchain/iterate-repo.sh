@@ -7,8 +7,9 @@
 #   e.g. iterate-repo.sh 0.0.2.0 0.0.1.0
 set -euo pipefail
 NEW="$1"; OLD="$2"
-GH=$HOME/greenhouse
-TMP=$HOME/.claude/jobs/49fb5998/tmp
+GH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TMP="${GH_TOOLS:?set GH_TOOLS to a working directory holding wdp.py (the Device Portal client)}"
+XBOX="${GH_XBOX:?set GH_XBOX to your console Device Portal address, host:port}"
 SDK="$GH/toolchain/xwin-sdk"; SDKVER=10.0.26100
 FAM="Greenhouse.RepoSpike_mgw46vk3ppz9w"
 STAGE="$GH/artifacts/msix_stage_repo"
@@ -34,7 +35,7 @@ echo "== pack + sign =="
 LIBDIR="$GH/toolchain/msix-packaging-src/.vs/lib"
 rm -f "$GH/artifacts/GreenhouseRepoSpike.msix" "$GH/artifacts/GreenhouseRepoSpike.signed.msix"
 LD_LIBRARY_PATH="$LIBDIR" "$GH/toolchain/bin/makemsix" pack -d "$STAGE" -p "$GH/artifacts/GreenhouseRepoSpike.msix" >/dev/null
-osslsigncode sign -pkcs12 "$GH/toolchain/signing/greenhouse.pfx" -pass "$GH_PFX_PASS" -h sha256 \
+osslsigncode sign -pkcs12 "$GH/toolchain/signing/greenhouse.pfx" -pass "${GH_PFX_PASS:?set GH_PFX_PASS to the signing .pfx passphrase}" -h sha256 \
   -in "$GH/artifacts/GreenhouseRepoSpike.msix" -out "$GH/artifacts/GreenhouseRepoSpike.signed.msix" 2>&1 | grep -E "Succeeded|Failed"
 
 echo "== deploy (separate slot; leaves Cheese slot untouched) =="
@@ -45,7 +46,7 @@ sleep 8
 PFN="Greenhouse.RepoSpike_${NEW}_x64__mgw46vk3ppz9w"
 CSRF=$(python3 "$TMP/wdp.py" csrf | awk '{print $2}')
 curl -sk -b "$TMP/wdp_cookies.txt" -H "X-CSRF-Token: $CSRF" -H "Content-Length: 0" -X POST \
-  "https://192.0.2.10:11443/api/debug/dump/usermode/crashcontrol?packageFullName=$PFN" >/dev/null 2>&1 || true
+  "https://${XBOX}/api/debug/dump/usermode/crashcontrol?packageFullName=$PFN" >/dev/null 2>&1 || true
 echo "== launch =="
 python3 "$TMP/wdp.py" launch "${FAM}!App" "$FAM"
 echo "done: PFN=$PFN"

@@ -6,7 +6,7 @@
   "layout": "list",
 
   "_note": [
-    "Ported from design/mockups/aero.html: glass panels, a gloss over the",
+    "Ported from the aero design mockup: glass panels, a gloss over the",
     "top of everything, small radii, hairline edges. It keeps `list`, because",
     "that era's shape IS a list of rows in a window -- the theme's work here is",
     "all palette and motif, which is the case the token model has to handle as",

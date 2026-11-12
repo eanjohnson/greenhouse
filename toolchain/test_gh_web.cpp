@@ -31,7 +31,7 @@ static void TestParser()
 {
     ghweb::Request r;
     size_t hl = 0;
-    std::string s = "PUT /api/games/abc/files?path=a%2Fb.txt&offset=10 HTTP/1.1\r\nHost: 10.168.1.5:8880\r\n"
+    std::string s = "PUT /api/games/abc/files?path=a%2Fb.txt&offset=10 HTTP/1.1\r\nHost: 10.0.0.5:8880\r\n"
                     "Content-Length: 5\r\nX-GH-Session: t\r\n\r\nhello";
     CHECK(P(s, r, &hl) == Parse::Ok);
     CHECK(r.method == "PUT");
@@ -79,10 +79,10 @@ static ghweb::Request Req(const std::string& method, const std::string& host, co
 static void TestGates()
 {
     uint32_t ip = 0;
-    CHECK(ghweb::ParseIPv4("10.168.7.30", ip) && ip == 0x0AA8071E);
-    CHECK(!ghweb::ParseIPv4("10.168.7", ip));
-    CHECK(!ghweb::ParseIPv4("10.168.7.256", ip));
-    CHECK(!ghweb::ParseIPv4("10.168.07.1", ip));
+    CHECK(ghweb::ParseIPv4("10.0.7.30", ip) && ip == 0x0A00071E);
+    CHECK(!ghweb::ParseIPv4("10.0.7", ip));
+    CHECK(!ghweb::ParseIPv4("10.0.7.256", ip));
+    CHECK(!ghweb::ParseIPv4("10.0.07.1", ip));
     CHECK(!ghweb::ParseIPv4("1.2.3.4.5", ip));
     CHECK(!ghweb::ParseIPv4(" 1.2.3.4", ip));
     CHECK(!ghweb::ParseIPv4("0x7f.0.0.1", ip));
@@ -91,17 +91,17 @@ static void TestGates()
     CHECK(!priv("172.32.0.1") && !priv("8.8.8.8") && !priv("192.169.0.1") && !priv("11.0.0.1"));
 
     std::string why;
-    CHECK(ghweb::Gate(Req("GET", "10.168.1.5:8880", "10.168.1.20", nullptr), why) == 0);
-    CHECK(ghweb::Gate(Req("GET", "10.168.1.5:8880", "8.8.8.8", nullptr), why) == 403);
-    CHECK(ghweb::Gate(Req("GET", "console.evil.example:8880", "10.168.1.20", nullptr), why) == 421);   // rebinding
+    CHECK(ghweb::Gate(Req("GET", "10.0.0.5:8880", "10.0.0.20", nullptr), why) == 0);
+    CHECK(ghweb::Gate(Req("GET", "10.0.0.5:8880", "8.8.8.8", nullptr), why) == 403);
+    CHECK(ghweb::Gate(Req("GET", "console.evil.example:8880", "10.0.0.20", nullptr), why) == 421);   // rebinding
     CHECK(ghweb::Gate(Req("GET", "localhost:8880", "127.0.0.1", nullptr), why) == 421);
-    CHECK(ghweb::Gate(Req("GET", "10.168.1.5:88a0", "10.168.1.20", nullptr), why) == 400);
-    CHECK(ghweb::Gate(Req("POST", "10.168.1.5:8880", "10.168.1.20", "http://10.168.1.5:8880"), why) == 0);
-    CHECK(ghweb::Gate(Req("POST", "10.168.1.5:8880", "10.168.1.20", nullptr), why) == 403);
-    CHECK(ghweb::Gate(Req("POST", "10.168.1.5:8880", "10.168.1.20", "https://playgreenhouse.app"), why) == 403);
-    CHECK(ghweb::Gate(Req("PUT", "10.168.1.5:8880", "10.168.1.20", "http://10.168.1.5"), why) == 403);
-    CHECK(ghweb::Gate(Req("DELETE", "10.168.1.5:8880", "10.168.1.20", "null"), why) == 403);
-    CHECK(ghweb::Gate(Req("OPTIONS", "10.168.1.5:8880", "10.168.1.20", "http://10.168.1.5:8880"), why) == 403);
+    CHECK(ghweb::Gate(Req("GET", "10.0.0.5:88a0", "10.0.0.20", nullptr), why) == 400);
+    CHECK(ghweb::Gate(Req("POST", "10.0.0.5:8880", "10.0.0.20", "http://10.0.0.5:8880"), why) == 0);
+    CHECK(ghweb::Gate(Req("POST", "10.0.0.5:8880", "10.0.0.20", nullptr), why) == 403);
+    CHECK(ghweb::Gate(Req("POST", "10.0.0.5:8880", "10.0.0.20", "https://playgreenhouse.app"), why) == 403);
+    CHECK(ghweb::Gate(Req("PUT", "10.0.0.5:8880", "10.0.0.20", "http://10.0.0.5"), why) == 403);
+    CHECK(ghweb::Gate(Req("DELETE", "10.0.0.5:8880", "10.0.0.20", "null"), why) == 403);
+    CHECK(ghweb::Gate(Req("OPTIONS", "10.0.0.5:8880", "10.0.0.20", "http://10.0.0.5:8880"), why) == 403);
 }
 
 static void TestSha()
@@ -251,7 +251,7 @@ static void TestPe(const fs::path& w)
 // ---- the API, end to end ----------------------------------------------------------------
 struct Client {
     ghcustom::Api* api;
-    std::string host = "10.168.1.5:8880", peer = "10.168.1.20", token;
+    std::string host = "10.0.0.5:8880", peer = "10.0.0.20", token;
     ghweb::Response Do(const std::string& method, const std::string& target, const std::string& body = "",
                        const char* ctype = "application/json", bool withSession = true)
     {

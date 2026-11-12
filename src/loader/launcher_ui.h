@@ -33,16 +33,15 @@
 #include <winrt/windows.system.display.h>     // §66: DisplayRequest while a download runs
 #include "gh_shbake.h"
 // Steam sign-in, the owned library and the depot downloader live in the Steam
-// add-on (corpus/addons/steam, GREENHOUSE.md §40), not here: this file carries no
+// add-on (corpus/addons/steam, docs/steam/README.md), not here: this file carries no
 // Steam client code. Whether the engine side exists at all -- the shim's friends and
 // invites in the overlay, Verify -- is decided at run time by whether an installed
 // source provides "steam-runtime" (#261; it replaced the GH_NO_STEAM build).
 #include "gh_repo.h"         // package repository client (Step 3): Packages page, update check
-#include "gh_ent.h"          // membership entitlement (§43): token, heartbeat, QR link, sealed files
-#include "gh_pak.h"          // keyed packages' encrypted packs (§44): the shader corpus
+#include "gh_site.h"         // the project site: where the default repository and crash reports live
+#include "gh_pak.h"          // record packs (§44): the shader corpus
 #include "gh_mods.h"         // §51 M1: Thunderstore mods into r2modman-layout profiles
-#include "qrcodegen.h"       // the membership QR (corpus/vendor/qrcodegen, MIT)
-static std::wstring LuiEntBadge();   // membership section, below
+#include "qrcodegen.h"       // QR codes on the TV (corpus/vendor/qrcodegen, MIT)
 #include "gh_addon_abi.h"    // add-on DLL ABI (Step 4): an installed add-on is one more library source
 // Theming (U0/U1). gh_theme.h is the token model, gh_ui.h the primitives that
 // read it, gh_ui_layout*.h the renderers. A page built on these draws through
@@ -61,7 +60,15 @@ static std::wstring LuiEntBadge();   // membership section, below
 // this is the deliberate, consented exception to it, not a contradiction.
 #include "gh_crash.h"
 #include "gh_custom.h"       // §65: your own games, uploaded from a browser (gh_web.h server)
-#include "gh_remote.h"       // §66: manage the library from a phone, through the site
+// §66: manage the library from a phone, through the site's relay. Compiled OUT
+// unless GH_REMOTE_RELAY is defined: the relay's poll was authorised by a console
+// credential that no longer exists, and it needs a new console-auth scheme (and a
+// site that speaks it) before it can be switched on. Without the define there is
+// no Settings entry and no poller; "Manage from a browser" on the LAN (§65,
+// gh_web.h) needs neither and is always there.
+#ifdef GH_REMOTE_RELAY
+#include "gh_remote.h"
+#endif
 // Steam key art (covers and banners) for the owned library, behind the provider
 // seam in gh_ui.h. Launcher-only: it owns a worker thread, WinHTTP and a disk
 // cache, none of which the preview harness can have -- the harness supplies its
@@ -76,7 +83,7 @@ static std::wstring LuiEntBadge();   // membership section, below
 // Packages startup check (LuiRepoStartupCheck): -2 not started, -1 no repository /
 // failed, else the number of updates available. Read by the picker's header badge.
 static std::atomic<int> g_repoUpdates{-2};
-// Bumped by every package install/remove: GhReadPackBlob reopens the keyed stores, so a
+// Bumped by every package install/remove: GhReadPackBlob reopens the pack stores, so a
 // recipe or corpus add-on installed this session is read without a restart (§47).
 static std::atomic<uint32_t> g_packGen{0};
 static ghbake::Progress g_bake;                // §47: the on-device shader bake (LuiShaderBakeStart)
@@ -252,10 +259,8 @@ static ghcompat::Model LuiConsoleModel()
 // no id of its own, by design: it is one record, not one per publisher.
 static bool LuiRepoCheckCompat(const std::vector<uint8_t>& b, const std::string&, std::string& why)
 {
-    size_t n = b.size(); std::string lic;   // an unsealed file ends in its license (§46)
-    ghent::SplitLicense(b.data(), b.size(), n, lic);
     ghcompat::Data d;
-    return ghcompat::Parse((const char*)b.data(), n, d, why);
+    return ghcompat::Parse((const char*)b.data(), b.size(), d, why);
 }
 
 // Load the dataset: the copy in the package, then every installed `compat` package.
@@ -272,9 +277,7 @@ static void LuiLoadCompat()
         std::vector<uint8_t> b;
         if (!ReadWholeFile(path, b, true) || b.empty()) return false;
         if (b.size() > (1u << 20)) { Diag("COMPAT " + where + " REJECTED larger than 1 MiB"); return false; }
-        size_t n = b.size(); std::string lic;
-        ghent::SplitLicense(b.data(), b.size(), n, lic);
-        return ghcompat::Offer((const char*)b.data(), n, where, pkg);
+        return ghcompat::Offer((const char*)b.data(), b.size(), where, pkg);
     };
     offer(g_installDir + L"guest\\compat.json", "package", false);
     for (const ghrepo::Installed& p : ghrepo::LoadState(std::wstring(kLocalState) + L"gh_packages\\").pkgs) {
@@ -1093,16 +1096,16 @@ static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const s
     ch.statusDot  = true;
     ch.statusRole = GH_ROLE_ACCENT;
     ch.status.setElided(status.c_str());
-    {   // membership (§43), as a badge rather than more text in the status line
-        const std::wstring eb = LuiEntBadge();
-        if (!eb.empty()) ch.addBadge(eb.c_str(), GH_ROLE_ACCENT, false);
-    }
     // Themes. An action rather than a footer hint: the footer of the wall is
     // four controls by design, and a control that is always available belongs
     // with the header anyway.
     ch.addAction(GH_GLYPH_LB, L"Themes");
     // §65: the browser page -- your own games, added from a PC.
+#ifdef GH_REMOTE_RELAY
     ch.addAction(GH_GLYPH_RB, L"PC & phone");     // §66: Manage from anywhere is Y on that page
+#else
+    ch.addAction(GH_GLYPH_RB, L"From a PC");
+#endif
 
     // The drawers, and the breadcrumb naming the one in front. Three, not
     // four: there is no "Updates" drawer because nothing reports a game update
@@ -1323,7 +1326,7 @@ static void LuiDrawProgress()
 
 
 // ---------------------------------------------------------------------------
-// Library sources (step 2 of the library-source plan, GREENHOUSE.md §34-35).
+// Library sources (step 2 of the library-source plan, docs/launcher/library.md).
 // Each place a game can come from is one LibrarySource. LuiEnumerate runs every
 // source's enumerate in table order, then every enrich, then tags rows whose title
 // config needs a runtime service that no source provides. Steam is not built in:
@@ -1887,7 +1890,7 @@ static ghrepo::Config LuiRepoConfig();   // Packages page, below
 
 // #258: the Valve runtime the console fetched from Valve's own CDN (package
 // steam-runtime; its manifest pins each file by hash and names the byte range of
-// Valve's SteamCMD zip it comes from -- GREENHOUSE.md §38). The loader's engine
+// Valve's SteamCMD zip it comes from -- docs/steam/runtime-fetch.md). The loader's engine
 // RVAs (§25.5, §26.10) fit exactly one build, 10.41.26.25, so the hashes are pinned
 // here too: a file on D: that differs is never loaded, whatever installed.json says.
 // Two hashes are accepted per file, both of the SAME Valve build 10.41.26.25:
@@ -1951,23 +1954,10 @@ static std::wstring GhSteamRuntimeDir()
     return dir;
 }
 
-// §46: an installed title config or settings seed from LocalState\titles is honoured
-// only with a license naming this console (ghent::CheckLicense). `path` is the manifest
-// path it came from. On success `b` is cut back to the file's own bytes.
-static bool GhLicenseGate(std::vector<uint8_t>& b, const std::string& path, std::string& note, std::string& why)
-{
-    // Read here, not through ghent::DeviceId(): titles load at the first knob read,
-    // which can come before ghent::Boot.
-    static const std::string dev = ghent::ReadLine(std::wstring(kLocalState) + L"gh_device.txt", 64);
-    return ghent::CheckLicense(b, path, dev, note, why);
-}
-
-// §44: records of the installed keyed packages (the shader corpus add-on), read
-// last by the corpus lookup (GhReadPkgBlob's caller). Opened once per process,
-// at the first lookup -- after the entitlement gate let the launch through; a
-// package whose key will not load (LOCKED, another console's key file) is
-// skipped and logged, never fatal: a shader without its lowered copy takes the
-// same path as any other miss.
+// §44: records of the installed pack add-ons (the shader corpus), read last by the
+// corpus lookup (GhReadPkgBlob's caller). Opened once per process, at the first
+// lookup; a package whose packs will not open is skipped and logged, never fatal:
+// a shader without its lowered copy takes the same path as any other miss.
 static bool GhReadPackBlob(const std::wstring& wname, std::vector<uint8_t>& out, bool probe)
 {
     static std::shared_mutex mu;
@@ -1983,12 +1973,9 @@ static bool GhReadPackBlob(const std::wstring& wname, std::vector<uint8_t>& out,
             HANDLE f = FindFirstFileExW((d + L"*.ghpak").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
             if (f == INVALID_HANDLE_VALUE) continue;
             FindClose(f);
-            uint8_t key[32]; std::string why;
-            if (!ghent::LoadPackageKey(p.id, p.version, key, why)) { Diag("PACK " + p.id + " " + p.version + " REFUSED: " + why); continue; }
+            std::string why;
             auto s = std::make_unique<ghpak::Store>();
-            const bool ok = s->Open(d, p.id, p.version, key, why);
-            SecureZeroMemory(key, sizeof key);
-            if (!ok) { Diag("PACK " + p.id + " " + p.version + " FAILED: " + why); continue; }
+            if (!s->Open(d, why)) { Diag("PACK " + p.id + " " + p.version + " FAILED: " + why); continue; }
             Diag("PACK " + p.id + " " + p.version + " open: " + std::to_string(s->Count()) + " records in " +
                  std::to_string(s->Packs()) + " pack(s)");
             stores.push_back(std::move(s));
@@ -2019,7 +2006,7 @@ static bool GhReadPackBlob(const std::wstring& wname, std::vector<uint8_t>& out,
     return false;
 }
 
-// The dev package's bundled corpus: plain *.ghpak packs in <install>\guest\ghlo\
+// The Launcher package's bundled corpus: *.ghpak packs in <install>\guest\ghlo\
 // (gh_pak.h). Opened once; an older build's loose gh_*.bin has no packs, and
 // GhReadPkgBlob then reads the files as before. The package is immutable while
 // the process runs, so nothing here ever reopens.
@@ -2034,7 +2021,7 @@ static bool GhReadBundledBlob(const std::wstring& wname, std::vector<uint8_t>& o
         FindClose(f);
         auto* s = new ghpak::Store;
         std::string why;
-        if (!s->Open(d, "bundle", "", nullptr, why)) { Diag("PACK bundled corpus FAILED: " + why); delete s; return nullptr; }
+        if (!s->Open(d, why)) { Diag("PACK bundled corpus FAILED: " + why); delete s; return nullptr; }
         Diag("PACK bundled corpus open: " + std::to_string(s->Count()) + " records in " + std::to_string(s->Packs()) + " pack(s)");
         return s;
     }();
@@ -2360,14 +2347,14 @@ static uint64_t LauncherEngineWait(int timeoutSec)
 // add-ons land in D:\DevelopmentFiles\gh_packages\<id>\<version>\.
 // Network work runs on a worker thread so the page keeps drawing.
 // ---------------------------------------------------------------------------
-// §44: with no gh_repo_url.txt, the membership server's own /repo/index.json (the
-// site redirects it to the static repository host), so a member's console finds
-// its packages with no file to place.
+// §44: with no gh_repo_url.txt, the site's own /repo/index.json (gh_site.h; the
+// site redirects it to the static repository host), so a console finds its
+// packages with no file to place.
 static std::string LuiRepoUrl()
 {
     std::vector<uint8_t> b;
     if (!ReadWholeFile(std::wstring(kLocalState) + L"gh_repo_url.txt", b) || b.empty()) {
-        const std::string srv = ghent::Enabled() ? ghent::Server() : std::string();
+        const std::string srv = ghsite::Server();
         return srv.empty() ? std::string() : srv + "/repo/index.json";
     }
     std::string s(b.begin(), b.end());
@@ -2386,10 +2373,8 @@ static void LuiRepoLog(const std::string& s) { Diag(s); }
 // package's own id -- the same check GhTitles() applies when it loads it.
 static bool LuiRepoCheckTitle(const std::vector<uint8_t>& b, const std::string& id, std::string& why)
 {
-    size_t n = b.size(); std::string lic;   // an unsealed file ends in its license (§46)
-    ghent::SplitLicense(b.data(), b.size(), n, lic);
     ghjson::Value j; std::string err;
-    if (!ghjson::Parse((const char*)b.data(), n, j, err)) { why = err; return false; }
+    if (!ghjson::Parse((const char*)b.data(), b.size(), j, err)) { why = err; return false; }
     GhTitle t; std::string notes;
     if (!GhTitleFromJson(j, t, why, notes)) return false;
     if (t.id != id) { why = "title id " + t.id + " is not the package id " + id; return false; }
@@ -2415,29 +2400,14 @@ static ghrepo::Config LuiRepoConfig()
     c.log = LuiRepoLog;
     c.checkTitle = LuiRepoCheckTitle;
     c.checkCompat = LuiRepoCheckCompat;
-    // Members-only files: a loader with no entitlement keys cannot open them (Install refuses).
-    if (ghent::Enabled()) { c.unseal = ghent::Unseal; c.packageKey = ghent::StorePackageKey; }
     return c;
 }
 
-// §44: drop the stored key of every keyed package that is no longer installed.
-static void LuiKeepInstalledKeys(const ghrepo::Config& c)
-{
-    std::vector<std::string> keep;
-    for (const ghrepo::Installed& p : ghrepo::LoadState(c.stateDir).pkgs) keep.push_back(p.id + "@" + p.version);
-    ghent::KeepKeys(keep);
-}
-
-// §44: "auto" packages (the first-party title configs and the shader corpus) are
-// installed and kept current by the Launcher itself, for a member only. They are
-// no longer in the Launcher package; a title package takes effect at the next start.
+// §44: "auto" packages (newer first-party title configs, the shader corpus) are
+// installed and kept current by the Launcher itself. A title package takes effect
+// at the next start.
 static void LuiRepoAutoSync(const ghrepo::Config& c, const ghrepo::Index& idx)
 {
-    const ghent::St st = ghent::Evaluate().st;
-    if (st != ghent::St::Entitled && st != ghent::St::Grace) {
-        Diag(std::string("REPO auto: skipped, membership ") + ghent::StName(st));
-        return;
-    }
     int done = 0, failed = 0;
     for (const ghrepo::IndexEntry& e : idx.packages) {
         if (!e.autoInstall) continue;
@@ -2451,7 +2421,6 @@ static void LuiRepoAutoSync(const ghrepo::Config& c, const ghrepo::Index& idx)
         (ok ? done : failed)++;
     }
     if (done || failed) Diag("REPO auto: " + std::to_string(done) + " installed, " + std::to_string(failed) + " failed");
-    LuiKeepInstalledKeys(c);
 }
 
 
@@ -2465,11 +2434,10 @@ static void LuiRepoStartupCheck()
         CreateDirectoryW(c.themeRoot.c_str(), nullptr);
         CreateDirectoryW(c.compatRoot.c_str(), nullptr);
         ghrepo::CleanStaging(c);
-        if (ghent::Enabled()) LuiKeepInstalledKeys(c);
-        if (c.indexUrl.empty()) { Diag("REPO check: no repository (gh_repo_url.txt absent)"); g_repoUpdates = -1; return; }
+        if (c.indexUrl.empty()) { Diag("REPO check: no repository (no gh_repo_url.txt and no site)"); g_repoUpdates = -1; return; }
         ghrepo::Index idx; std::string why, key;
         if (!ghrepo::FetchIndex(c, idx, why, &key)) { Diag("REPO check FAILED: " + why); g_repoUpdates = -1; return; }
-        if (ghent::Enabled()) LuiRepoAutoSync(c, idx);
+        LuiRepoAutoSync(c, idx);
         int n = ghrepo::CountUpdates(ghrepo::LoadState(c.stateDir), idx);
         Diag("REPO check: " + std::to_string(n) + " update(s) available");
         g_repoUpdates = n;
@@ -3961,8 +3929,8 @@ static void LuiShaderBakeStart()
             if (!ok) { Diag("SHBAKE recipe: " + why); g_bake.phase = 3; return; }
         } else {
             from = "the corpus add-on";
-            // The boot's package check may be installing it right now (a first-time
-            // member, or a recipe update): read the add-on after the sync, not before.
+            // The boot's package check may be installing it right now (a first run,
+            // or a recipe update): read the add-on after the sync, not before.
             const DWORD w0 = GetTickCount();
             while (g_repoUpdates.load() == -2 && !g_bake.stop.load() && GetTickCount() - w0 < 600000) Sleep(250);
             if (GetTickCount() - w0 > 1000)
@@ -4022,7 +3990,6 @@ static void LuiShaderBakeStop()
 struct LuiPkgRow {
     std::string id, type, name, inst, repo; uint64_t instV = 0, repoV = 0;
     int addon = -1;          // g_luiAddons index of this package's loaded add-on when it can sign out
-    bool member = false;     // §43: the Membership row (not a package), first when the build has a gate
     std::wstring account;    // the account its saved sign-in belongs to (empty = none saved)
 };
 
@@ -4048,12 +4015,6 @@ static void LuiPkgFillRow(void* ctx, int index, GhUiRow& out)
     const LuiPkgCtx* c = (const LuiPkgCtx*)ctx;
     if (!c || !c->rows || index < 0 || index >= (int)c->rows->size()) return;
     const LuiPkgRow& r = (*c->rows)[index];
-
-    if (r.member) {                      // the Membership row is not a package
-        out.title.set(L"Membership");
-        out.right.setElided(LuiEntBadge().c_str());
-        return;
-    }
 
     out.title.setElided(ghrepo::Widen(r.name.empty() ? r.id : r.name).c_str());
     // The type used to be a "(add-on)" suffix glued onto the name. As a badge
@@ -4116,18 +4077,12 @@ static void LuiDrawPackages(const std::vector<LuiPkgRow>& rows, int sel, const s
     vm.emptyText.set(L"Nothing to install");
     vm.emptySub.set(L"Nothing is installed on this console, and there is nothing on offer yet.");
 
-    if (sel >= 0 && sel < total && rows[sel].member) {
-        vm.chrome.addHint(GH_GLYPH_A, L"Open");
-        vm.chrome.addHint(GH_GLYPH_Y, L"Refresh");
-        vm.chrome.addHint(GH_GLYPH_B, L"Back");
-    } else {
-        vm.chrome.addHint(GH_GLYPH_A, L"Install / update");
-        vm.chrome.addHint(GH_GLYPH_X, L"Remove");
-        vm.chrome.addHint(GH_GLYPH_Y, L"Refresh");
-        if (sel >= 0 && sel < total && rows[sel].addon >= 0 && !rows[sel].account.empty())
-            vm.chrome.addHint(GH_GLYPH_START, L"Sign out");
-        vm.chrome.addHint(GH_GLYPH_B, L"Back");
-    }
+    vm.chrome.addHint(GH_GLYPH_A, L"Install / update");
+    vm.chrome.addHint(GH_GLYPH_X, L"Remove");
+    vm.chrome.addHint(GH_GLYPH_Y, L"Refresh");
+    if (sel >= 0 && sel < total && rows[sel].addon >= 0 && !rows[sel].account.empty())
+        vm.chrome.addHint(GH_GLYPH_START, L"Sign out");
+    vm.chrome.addHint(GH_GLYPH_B, L"Back");
 
     g_lui.dc->BeginDraw();
     GhUiPageList(vm);
@@ -4149,32 +4104,13 @@ static void LuiDrawPackages(const std::vector<LuiPkgRow>& rows, int sel, const s
 }
 
 // ---------------------------------------------------------------------------
-// Membership (§43, gh_ent.h). Every launch needs a live membership: the site
-// signs a 7-day token for this console, a heartbeat renews it every 12 h, and
-// with no network the console keeps playing until the token runs out. Linking
-// is a QR code: the phone opens <site>/link?c=CODE, signs in with Patreon, and
-// the console's poll picks the token up. Network calls run on worker threads;
-// the screens keep presenting. B always leaves (the library stays browsable).
+// Small pieces the pages below share: the package version as text, a QR matrix,
+// the QR / two-line message screen, and the pad's edge-triggered buttons.
 // ---------------------------------------------------------------------------
 static std::string LuiVersionStr(uint64_t v)
 {
     return std::to_string((v >> 48) & 0xffff) + "." + std::to_string((v >> 32) & 0xffff) + "." +
            std::to_string((v >> 16) & 0xffff) + "." + std::to_string(v & 0xffff);
-}
-
-// Header badge text ("" = this build has no membership gate).
-static std::wstring LuiEntBadge()
-{
-    const ghent::Status s = ghent::Current();
-    switch (s.st) {
-    case ghent::St::Off:      return L"";
-    case ghent::St::Entitled: return L"Member \u2713";
-    case ghent::St::Grace: {
-        const int d = s.DaysLeft();
-        return L"Member \u00B7 offline, " + std::to_wstring(d) + (d == 1 ? L" day left" : L" days left");
-    }
-    default: return s.why == "not linked" ? L"Not linked" : L"Membership inactive";
-    }
 }
 
 static bool LuiQrMatrix(const std::string& text, std::vector<uint8_t>& m, int& size)
@@ -4189,35 +4125,16 @@ static bool LuiQrMatrix(const std::string& text, std::vector<uint8_t>& m, int& s
     return true;
 }
 
-// Boot: load the state, then heartbeat now and every 12 h (sooner after a miss).
-static void LuiEntStart()
-{
-    ghent::Config c;
-    c.dir = kLocalState;
-    c.loaderVersion = LuiVersionStr(GhOwnPackageVersion());
-    c.log = LuiRepoLog;
-    ghent::Boot(c);
-    if (!ghent::Enabled()) return;
-    std::thread([] {
-        for (;;) {
-            const ghent::Hb r = ghent::Heartbeat();
-            const DWORD ms = (r == ghent::Hb::Renewed || r == ghent::Hb::Skipped || r == ghent::Hb::Revoked)
-                           ? (DWORD)ghent::kHeartbeatS * 1000u : 30u * 60u * 1000u;
-            Sleep(ms);
-        }
-    }).detach();
-}
-
 // The sign-in archetype with a second, smaller line; with no QR the two lines
 // sit in the middle of the screen instead of under an empty panel, which the
 // QrPage layout does on its own once `modules` is null.
-static void LuiDrawEnt(const wchar_t* title, const uint8_t* m, int n,
+static void LuiDrawQr(const wchar_t* title, const uint8_t* m, int n,
                        const std::wstring& line1, const std::wstring& line2, const wchar_t* hint)
 {
     GhUiQrVM vm;
     vm.chrome.title.set(L"GREENHOUSE");
     vm.chrome.footer.set(hint ? hint : L"");
-    vm.heading.set(title ? title : L"Membership");
+    vm.heading.set(title ? title : L"");
     if (m && n > 0 && n <= 177) { vm.modules = m; vm.size = n; }
     vm.caption.setElided(line1.c_str());
     vm.sub.setElided(line2.c_str());
@@ -4228,7 +4145,7 @@ static void LuiDrawEnt(const wchar_t* title, const uint8_t* m, int n,
 }
 
 // The pad's newly pressed buttons this frame (B/A/X), with the events pumped.
-static WORD LuiEntPressed(WORD& prev)
+static WORD LuiPadPressed(WORD& prev)
 {
     if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
     PollGamepadOnUi();
@@ -4236,177 +4153,6 @@ static WORD LuiEntPressed(WORD& prev)
     WORD b; { std::lock_guard<std::mutex> lk(g_padMutex); b = g_padState.wButtons; }
     const WORD p = b & ~prev; prev = b;
     return p;
-}
-
-// Run fn on a worker thread while the screen keeps drawing `msg`. B abandons the
-// wait (the thread finishes on its own and its result is dropped). True = done.
-template <class F>
-static bool LuiEntWork(const std::wstring& msg, WORD& prev, F fn)
-{
-    auto done = std::make_shared<std::atomic<bool>>(false);
-    std::thread([done, fn]() mutable { fn(); done->store(true); }).detach();
-    while (!done->load()) {
-        if (LuiEntPressed(prev) & XINPUT_GAMEPAD_B) return false;
-        LuiDrawEnt(L"Membership", nullptr, 0, msg, L"", L"B  Back");
-        LuiPresent(); Sleep(30);
-    }
-    return true;
-}
-
-static std::wstring LuiEntDenied(const std::string& reason)
-{
-    if (reason == "not_member")   return L"That Patreon account has no active membership \u2014 join, then scan again";
-    if (reason == "device_limit") return L"This membership is on too many consoles \u2014 unlink one on your phone";
-    if (reason == "declined")     return L"Patreon declined the last payment \u2014 fix it, then scan again";
-    return L"Sign-in was not completed \u2014 scan again to retry";
-}
-
-// The QR link. True = this console is now entitled.
-static bool LuiEntLink(WORD& prev)
-{
-    std::vector<uint8_t> m; int size = 0;
-    if (ghent::Server().empty()) {   // dev build without gh_ent_url.txt: only a minted token links it
-        Diag("ENT link: no membership server configured");
-        for (;;) {
-            if (LuiEntPressed(prev) & XINPUT_GAMEPAD_B) return false;
-            // In a shipped build this state cannot be reached, so the sentence
-            // is about the service rather than about which binary is running.
-            LuiDrawEnt(L"Membership", nullptr, 0, L"Memberships are unavailable right now — try again later",
-                       L"", L"B  Back");
-            LuiPresent(); Sleep(30);
-        }
-    }
-    for (int attempt = 0; attempt < 20; ++attempt) {
-        auto link = std::make_shared<ghent::Link>();
-        auto err = std::make_shared<std::string>();
-        auto ok = std::make_shared<bool>(false);
-        if (!LuiEntWork(L"Connecting\u2026", prev, [link, err, ok] { *ok = ghent::StartLink(*link, *err); })) return false;
-        if (!*ok) {
-            Diag("ENT link start failed: " + *err);
-            for (int i = 0; i < 150; ++i) {   // ~5 s, then retry
-                if (LuiEntPressed(prev) & XINPUT_GAMEPAD_B) return false;
-                LuiDrawEnt(L"Membership", nullptr, 0, L"Can't reach the Greenhouse server \u2014 retrying\u2026", L"", L"B  Back");
-                LuiPresent(); Sleep(30);
-            }
-            continue;
-        }
-        if (!LuiQrMatrix(link->verifyUrl, m, size)) { Diag("ENT link: QR encode failed"); return false; }
-        std::string host = link->verifyUrl.substr(link->verifyUrl.find("//") + 2);
-        host = host.substr(0, host.find('/'));
-        const std::wstring codeLine = L"Code  " + ghrepo::Widen(link->userCode) + L"   \u00B7   " + ghrepo::Widen(host) + L"/link";
-        std::wstring note;                          // second line: why the last try did not link
-        const wchar_t* hint = L"Scan with your phone and sign in with Patreon   \u00B7   B  Back";
-        int interval = link->interval;
-        DWORD nextPoll = GetTickCount() + (DWORD)interval * 1000;
-        bool waiting = false;                       // a poll is on its worker thread
-        auto busy = std::make_shared<std::atomic<bool>>(false);
-        auto res = std::make_shared<ghent::Pr>(ghent::Pr::Pending);
-        auto detail = std::make_shared<std::string>();
-        bool renew = false;
-        while (!renew) {
-            if (LuiEntPressed(prev) & XINPUT_GAMEPAD_B) { Diag("ENT link: left by the user"); return false; }
-            if ((int64_t)time(nullptr) > link->expiresAt) { Diag("ENT link: code expired, new code"); break; }
-            if (!waiting && (int)(GetTickCount() - nextPoll) >= 0) {
-                waiting = true; busy->store(true);
-                std::thread([link, busy, res, detail] { *res = ghent::Poll(*link, *detail); busy->store(false); }).detach();
-            }
-            if (waiting && !busy->load()) {
-                waiting = false;
-                switch (*res) {
-                case ghent::Pr::Entitled:
-                    for (int i = 0; i < 45; ++i) {
-                        LuiDrawEnt(L"Membership", nullptr, 0, L"Linked \u2713  Member", L"", L"");
-                        LuiPresent(); Sleep(30);
-                    }
-                    return true;
-                case ghent::Pr::Expired:  Diag("ENT link: session expired, new code"); renew = true; break;
-                case ghent::Pr::SlowDown: if (interval < 10) ++interval; break;
-                case ghent::Pr::Denied:   note = LuiEntDenied(*detail); break;
-                case ghent::Pr::Error:
-                    Diag("ENT link poll: " + *detail);
-                    note = L"Can't reach the Greenhouse server \u2014 still trying";
-                    break;
-                default:
-                    if (note.find(L"Can't reach") == 0) note.clear();
-                    break;
-                }
-                nextPoll = GetTickCount() + (DWORD)interval * 1000;
-            }
-            LuiDrawEnt(L"Link this console to your membership", m.data(), size, codeLine, note, hint);
-            LuiPresent(); Sleep(30);
-        }
-    }
-    Diag("ENT link: gave up after 20 sessions");
-    return false;
-}
-
-// The membership screen (Packages row, a refused launch, or boot while locked).
-// Linked: shows the state; X then A unlinks (a user action, never a harness key).
-// Not linked: the QR link. True = entitled when it returns.
-static bool LuiMembershipScreen(const char* why)
-{
-    if (!ghent::Enabled() || !LuiInit()) return true;
-    Diag(std::string("ENT screen open (") + why + ") " + ghent::Describe(ghent::Evaluate()));
-    WORD prev = 0xFFFF;
-    bool askUnlink = false;
-    std::wstring note;
-    for (;;) {
-        const ghent::Status s = ghent::Current();
-        if (s.st == ghent::St::Locked) {
-            const bool ok = LuiEntLink(prev);
-            ghent::Evaluate();
-            Diag(std::string("ENT screen closed ") + ghent::Describe(ghent::Current()));
-            return ok;
-        }
-        const WORD p = LuiEntPressed(prev);
-        if (askUnlink) {
-            if (p & XINPUT_GAMEPAD_A) {
-                askUnlink = false;
-                auto ok = std::make_shared<bool>(false); auto err = std::make_shared<std::string>();
-                Diag("ENT unlink (user confirmed)");
-                if (LuiEntWork(L"Unlinking\u2026", prev, [ok, err] { *ok = ghent::Unlink(*err); }) && !*ok) {
-                    note = L"Unlink failed: " + ghrepo::Widen(*err);
-                    Diag("ENT unlink failed: " + *err);
-                }
-                if (ghent::Current().st == ghent::St::Locked) {   // unlinked: back to the picker
-                    Diag("ENT screen closed after unlink");
-                    return false;
-                }
-                continue;
-            }
-            if (p & XINPUT_GAMEPAD_B) { askUnlink = false; Diag("ENT unlink cancelled"); continue; }
-            LuiDrawEnt(L"Unlink this console?", nullptr, 0, L"Its slot on your membership is freed.",
-                       L"Linking it again needs the QR code and your phone.", L"A  Yes, unlink            B  Cancel");
-            LuiPresent(); Sleep(30);
-            continue;
-        }
-        if (p & XINPUT_GAMEPAD_B) { Diag("ENT screen closed"); return true; }
-        if (p & XINPUT_GAMEPAD_X) { askUnlink = true; note.clear(); Diag("ENT unlink prompt"); continue; }
-        std::wstring l2 = !note.empty() ? note
-                        : s.st == ghent::St::Grace ? L"Greenhouse could not reach its server. Games keep working until the days run out."
-                        : L"Renews automatically while this console is online.";
-        LuiDrawEnt(L"Membership", nullptr, 0, LuiEntBadge(), l2, L"X  Unlink this console      B  Back");
-        LuiPresent(); Sleep(30);
-    }
-}
-
-// Every launch passes here (App::Run, before the hand-off). A refused launch
-// opens the link screen; linking there lets the launch go ahead.
-static bool LuiEntGate(const std::wstring& guest)
-{
-    const ghent::Status s = ghent::Evaluate();
-    if (s.st != ghent::St::Locked) {
-        if (s.st != ghent::St::Off) Diag("ENT gate ok " + ghent::Describe(s));
-        return true;
-    }
-    Diag("ENT gate REFUSED " + ghent::Describe(s) + " guest='" + ghrepo::Narrow(guest) + "'");
-    return LuiMembershipScreen("launch") && ghent::Evaluate().st != ghent::St::Locked;
-}
-
-// RunGuest's own check (any path that reaches it without App::Run's gate).
-static bool LuiEntAllowsLaunch()
-{
-    return ghent::Evaluate().st != ghent::St::Locked;
 }
 
 // §47: the title the bake serves waits for it instead of stopping it -- the
@@ -4418,7 +4164,7 @@ static bool LuiShaderBakeGate(const std::wstring& guest)
     Diag("SHBAKE launch waits for the bake (baked=" + std::to_string(g_bake.baked.load()) + ")");
     WORD prev = 0xFFFF;
     while (g_bake.phase == 1) {
-        if (LuiEntPressed(prev) & XINPUT_GAMEPAD_B) { Diag("SHBAKE wait left (B)"); return false; }
+        if (LuiPadPressed(prev) & XINPUT_GAMEPAD_B) { Diag("SHBAKE wait left (B)"); return false; }
         const uint64_t tot = g_bake.scanTotal.load(), got = g_bake.scanBytes.load();
         g_dlProg.head = L"Preparing shaders for this console (once per game update)";
         g_dlProg.phase = g_bake.pending.load() == 0 ? std::wstring(L"Checking this install  ·  B to go back")
@@ -4459,7 +4205,6 @@ static void LauncherPackages()
 
     auto buildRows = [&] {
         rows.clear();
-        if (ghent::Enabled()) { LuiPkgRow r; r.member = true; r.id = "@membership"; rows.push_back(r); }
         ghrepo::State st = ghrepo::LoadState(cfg.stateDir);
         if (haveIdx) for (const auto& e : idx.packages) {
             LuiPkgRow r; r.id = e.id; r.type = e.type; r.name = e.name; r.repo = e.version; r.repoV = e.ver;
@@ -4492,26 +4237,15 @@ static void LauncherPackages()
                 std::lock_guard<std::mutex> lk(g_repoInstallMu);
                 job->ok = what == kInstall ? ghrepo::Install(c, cur, id, job->why) : ghrepo::Remove(c, id, job->why);
                 if (job->ok) ++g_packGen;
-                if (ghent::Enabled()) LuiKeepInstalledKeys(c);
             }
             job->done = true;
         }).detach();
     };
     auto fetch = [&] {
         if (cfg.indexUrl.empty()) {
-            // The old line told the user to create a file. The membership link
-            // is the only route a person has; the file is ours, for testing.
-            //
-            // But a MEMBER reading "link a membership" is being told to do a
-            // thing they have already done -- which is what 0.0.933.0 showed on
-            // the TV, because a dev-minted token carries no server claim. So ask
-            // the entitlement first: it knows whether the advice applies.
-            const ghent::St st = ghent::Current().st;
-            status = (st == ghent::St::Entitled || st == ghent::St::Grace)
-                       ? std::wstring(L"Nothing is on offer right now")
-                       : std::wstring(L"Link a membership to see what there is to install");
+            status = L"Nothing is on offer right now";
             bad = true;
-            Diag("REPO page: no repository (gh_repo_url.txt absent, no membership server)");
+            Diag("REPO page: no repository (no gh_repo_url.txt and no site)");
             buildRows(); return;
         }
         busy = L"Checking " + ghrepo::Widen(cfg.indexUrl) + L"\u2026";
@@ -4616,11 +4350,6 @@ static void LauncherPackages()
         if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) && sel < n - 1) ++sel;
         if (pressed & XINPUT_GAMEPAD_B) { Diag("REPO page closed"); return; }
         if (pressed & XINPUT_GAMEPAD_Y) { cfg = LuiRepoConfig(); fetch(); }
-        if ((pressed & XINPUT_GAMEPAD_A) && n > 0 && rows[sel].member) {
-            LuiMembershipScreen("packages");
-            prev = 0xFFFF; buildRows();
-            continue;
-        }
         if ((pressed & XINPUT_GAMEPAD_A) && n > 0 && !rows[sel].repo.empty()) {
             const LuiPkgRow& r = rows[sel];
             Diag("REPO page install " + r.id + " " + r.repo + (r.inst.empty() ? "" : " (installed " + r.inst + ")"));
@@ -4709,9 +4438,9 @@ static bool LauncherShowCrash(const std::wstring& title, const std::wstring& rea
     int rep = kOff;
     const std::string repTitle = LuiCrashTitleName();
     // The site must exist and the title must have a name, or there is nothing to
-    // offer -- a dev build with no GH_ENT_SERVER included. Decided once, so the
-    // hint does not appear and then fail.
-    const bool canReport = !ghent::Server().empty() && !repTitle.empty();
+    // offer -- a build with GH_SITE_URL set to "". Decided once, so the hint does
+    // not appear and then fail.
+    const bool canReport = !ghsite::Server().empty() && !repTitle.empty();
     auto repState = std::make_shared<std::atomic<int>>(0);     // 0 running, 1 ok, 2 failed
     auto repWhy   = std::make_shared<std::string>();
     auto repWhyMu = std::make_shared<std::mutex>();
@@ -5140,11 +4869,11 @@ static bool LuiModsStreakGate(const std::wstring& guest)
     Diag("MODS streak prompt: " + r.title + "/" + r.profile + " fails=" + std::to_string(r.fails));
     WORD prev = 0xFFFF;
     for (;;) {
-        const WORD p = LuiEntPressed(prev);
+        const WORD p = LuiPadPressed(prev);
         if (p & XINPUT_GAMEPAD_A){ Diag("MODS streak prompt: Start without mods"); g_modsSkipOnce = true; return true; }
         if (p & XINPUT_GAMEPAD_Y){ Diag("MODS streak prompt: start with mods anyway"); return true; }
         if (p & XINPUT_GAMEPAD_B){ Diag("MODS streak prompt: cancelled"); return false; }
-        LuiDrawEnt(L"Mods", nullptr, 0,
+        LuiDrawQr(L"Mods", nullptr, 0,
                    L"This game failed to start with the mod profile \u201C" + prof + L"\u201D " +
                    std::to_wstring(r.fails) + L" times in a row.",
                    L"Starting without mods leaves the profile selected for next time.",
@@ -5170,7 +4899,7 @@ enum { kOvlStNone = 0, kOvlStHostFirst, kOvlStSent, kOvlStFail };
 static volatile int  g_ovlSel = 0;       // menu: 0 remap, 1 input, 2 friends, 3 quit
 // Whether the BAKED menu panels carry the "Invite friends" row. Navigation reads
 // this, not the live steam-runtime flag: the panels are baked at the first
-// LuiInit, which runs (membership screen, add-on sign-in) before that flag is
+// LuiInit, which runs (add-on sign-in) before that flag is
 // known, and a cursor that follows the live flag lands on a row the picture
 // does not have -- selectable and invisible.
 static bool  g_ovlMenuHasInvite = false;
@@ -6982,10 +6711,10 @@ static void OverlayBlit(ID3D11Resource* dst)
 // A setting, off until the user turns it on (From your PC, RB on the wall), and
 // on until they turn it off. While it is on, gh_web.h listens on the home network
 // (port 8880, or the next free of four) and gh_custom.h answers the page in
-// guest\web\console.html. The site is told the address so
-// playgreenhouse.app/console can send the patron's browser straight here; none of
-// the traffic goes through the site. A browser is paired once, by a code shown on
-// both screens and an A press on the TV, and the TV can forget them all.
+// guest\web\console.html. Nothing leaves the home network and no account is
+// involved: the browser is given the address by the TV (text and a QR). A browser
+// is paired once, by a code shown on both screens and an A press on the TV, and
+// the TV can forget them all.
 //
 // The server runs on its own threads. Everything it needs from the launcher is a
 // hook below, and none of them touches the UI: the picker polls for a pairing
@@ -6996,7 +6725,6 @@ static const uint16_t kWebPort = 8880;
 static ghweb::Server              g_webServer;
 static std::atomic<bool>          g_webLibDirty{false};
 static std::atomic<ULONGLONG>     g_webPickerBeat{0};    // the wall's loop, every frame it runs
-static std::atomic<bool>          g_webAnnounceKick{false};
 static std::mutex                 g_webLaunchMu;
 static std::string                g_webLaunchId;         // under g_webLaunchMu
 static ULONGLONG                  g_webLaunchAt = 0;     // under g_webLaunchMu
@@ -7076,8 +6804,6 @@ static ghcrash::Custom LuiCustomReportInfo(const std::wstring& exePath, const st
     return c;
 }
 
-static void LuiWebAnnouncerStart();
-
 // The one Api, made the first time anything asks. Never destroyed: the server's
 // threads hold it, and the launcher lives as long as they do.
 static ghcustom::Api& LuiWebApi()
@@ -7144,58 +6870,12 @@ static bool LuiWebStart(std::string& why)
         return resp;
     }, why);
     Diag(ok ? "WEB listening on port " + std::to_string(g_webServer.Port()) : "WEB could not start: " + why);
-    g_webAnnounceKick = true;
-    LuiWebAnnouncerStart();
     return ok;
 }
 static void LuiWebStop()
 {
     g_webServer.Stop();
     Diag("WEB stopped");
-    g_webAnnounceKick = true;
-}
-
-// Keeps the site's record right: the address when it is on (and again when it
-// changes, checked every minute), "off" once when it goes off. Only ever a
-// private address and a port -- the site refuses anything else anyway.
-static void LuiWebAnnouncerStart()
-{
-    static std::atomic<bool> started{false};
-    if (started.exchange(true)) return;
-    std::thread([] {
-        std::string sent = "?";             // "?" = nothing said yet this run
-        ULONGLONG last = 0, wait = 60000, sentAt = 0;
-        unsigned fails = 0;
-        for (;;) {
-            Sleep(1000);
-            const ULONGLONG now = GetTickCount64();
-            const bool kick = g_webAnnounceKick.exchange(false);
-            if (!kick && now - last < wait) continue;
-            last = now;
-            wait = 60000;
-            // The site's /console only follows an address seen in the last 24 h, so an
-            // unchanged "on" is repeated every 6 h to keep it fresh.
-            if (!sent.empty() && sent != "?" && now - sentAt >= 6ull * 3600 * 1000) sent = "?";
-            std::string want;
-            if (g_webServer.Running()) {
-                const std::string lan = LuiWebLanAddr();
-                if (!lan.empty()) want = lan + ":" + std::to_string(g_webServer.Port());
-            }
-            // Say "off" only if this run said "on", or on the first pass after a
-            // switch-off (kick), so a console that never turned it on stays quiet.
-            if (want == sent) continue;
-            if (want.empty() && sent == "?" && !kick) continue;
-            std::string why;
-            const size_t c = want.find(':');
-            const bool ok = want.empty() ? ghent::Announce("", 0, why)
-                                         : ghent::Announce(want.substr(0, c), (unsigned)atoi(want.c_str() + c + 1), why);
-            Diag(std::string("WEB announce ") + (want.empty() ? "off" : "on") + (ok ? " ok" : " failed: " + why));
-            if (ok) { sent = want; sentAt = now; fails = 0; }
-            // Try again soon, then back off: 10 s, 20 s, 40 s ... capped at 10 minutes,
-            // so a console the site refuses (signed out, revoked) is not a 10 s drip.
-            else wait = (std::min<ULONGLONG>)(10000ull << (std::min<unsigned>)(fails++, 6), 600000);
-        }
-    }).detach();
 }
 
 // A browser asked to pair: the TV shows its code and asks. A counts only once the
@@ -7210,7 +6890,7 @@ static bool LuiWebPairModal()
     const ULONGLONG t0 = GetTickCount64();
     WORD prev = 0xFFFF;
     for (;;) {
-        const WORD p = LuiEntPressed(prev);
+        const WORD p = LuiPadPressed(prev);
         std::string c2, l2;
         if (!LuiWebApi().PairPending(c2, l2) || c2 != code) { Diag("WEB pair prompt gone (expired or replaced)"); return true; }
         if ((p & XINPUT_GAMEPAD_A) && GetTickCount64() - t0 >= 500) { LuiWebApi().PairAnswer(true);  return true; }
@@ -7237,6 +6917,11 @@ static bool LuiWebPairModal()
 // ===========================================================================
 // §66. Manage from anywhere: this console's library from a phone, through the site.
 //
+// COMPILED OUT unless GH_REMOTE_RELAY is defined. The poll was authorised by a
+// per-console credential the site issued; that scheme is gone, so the poller has
+// nothing to present (host.token below returns "") and the site will refuse it.
+// Design a new console-auth scheme for the relay before defining GH_REMOTE_RELAY.
+//
 // A setting, off until the user turns it on (PC & phone, RB on the wall, then Y).
 // While it is on, gh_remote.h's poller asks playgreenhouse.app for messages every
 // few seconds to few minutes; nothing ever connects TO the console. A phone is
@@ -7252,6 +6937,7 @@ static bool LuiWebPairModal()
 // leaves changes in a queue the wall runs when it is idle -- one at a time, never
 // while a game runs.
 // ===========================================================================
+#ifdef GH_REMOTE_RELAY
 static const wchar_t kRemoteOnFile[]     = L"gh_remote_on.txt";
 static const wchar_t kRemoteQueueFile[]  = L"gh_remote_queue.json";
 static const size_t  kRemoteQueueMax     = 32;
@@ -7286,31 +6972,22 @@ static void LuiRemoteSetEnabled(bool on)
     HANDLE h = CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h != INVALID_HANDLE_VALUE) { DWORD w = 0; WriteFile(h, "1", 1, &w, nullptr); CloseHandle(h); }
 }
-// Like every member feature: only while this console's membership is good.
-static bool LuiRemoteMember()
+// This console's name to the relay: 32 random hex in LocalState\gh_device.txt,
+// made on first use. Not a hardware id. Nothing else in the launcher reads it.
+static std::string LuiRemoteDeviceId()
 {
-    const ghent::St st = ghent::Current().st;
-    return st == ghent::St::Entitled || st == ghent::St::Grace;
+    const std::wstring p = std::wstring(kLocalState) + L"gh_device.txt";
+    std::string s = ghsite::ReadLine(p, 64);
+    if (ghrepo::IsHex(s, 32)) return s;
+    uint8_t r[16];
+    if (BCryptGenRandom(nullptr, r, sizeof r, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) return {};
+    s = ghrepo::Hex(r, 16);
+    return ghrepo::WriteFileAtomic(p, s + "\n") ? s : std::string();
 }
 
-// The site the phone opens, and the passkeys' relying party. A dev build may name
-// another (gh_remote_origin.txt, like gh_ent_url.txt) for a test site; a release
-// build always uses playgreenhouse.app.
-static std::string LuiRemoteOrigin()
-{
-#ifdef GH_ENT_DEV
-    std::string s = ghent::ReadLine(std::wstring(kLocalState) + L"gh_remote_origin.txt");
-    while (!s.empty() && s.back() == '/') s.pop_back();
-    const size_t p = s.rfind("https://", 0) == 0 ? 8 : s.rfind("http://", 0) == 0 ? 7 : 0;
-    bool ok = p && s.size() > p && s.size() < 200;
-    for (size_t i = p; ok && i < s.size(); ++i) {
-        const char c = s[i];
-        ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == ':';
-    }
-    if (ok) return s;
-#endif
-    return "https://playgreenhouse.app";
-}
+// The site the phone opens, and the passkeys' relying party: the project site
+// (gh_site.h), "" when the build has none.
+static std::string LuiRemoteOrigin() { return ghsite::Server(); }
 static std::string LuiRemoteRpId(const std::string& origin)
 {
     std::string h = origin.substr(origin.find("://") + 3);
@@ -7447,7 +7124,6 @@ static void LuiRemoteSetPlaying(const std::wstring& name)
 // ---- the poller's side (its own thread) -------------------------------------------
 static std::string LuiRemoteSnapshot()
 {
-    if (!LuiRemoteMember()) return "";
     LuiRemoteLib lib; std::vector<LuiRemoteQ> q; std::vector<LuiRemoteDone> done; std::wstring playing;
     {
         std::lock_guard<std::mutex> lk(g_remLibMu);
@@ -7583,7 +7259,6 @@ static void LuiRemoteCommand(const ghremote::Cmd& c)
         g_remote->s.AddResult(c.phone, c.seq, ok, msg);
         Diag("REMOTE " + opn + (c.arg.empty() ? "" : " " + c.arg) + (ok ? " -> " : " refused: ") + msg);
     };
-    if (!LuiRemoteMember()) return answer(false, "this console's membership is not active");
     if (c.op == ghremote::Op::Refresh) return answer(true, "");
     if (c.op == ghremote::Op::Cancel || c.op == ghremote::Op::Dequeue) {
         {
@@ -7619,7 +7294,7 @@ static ghremote::Poller& LuiRemoteP()
     if (g_remote) return *g_remote;
     auto* p = new ghremote::Poller();
     p->s.dir = std::wstring(kLocalState) + L"gh_remote\\";
-    p->s.dev = ghent::DeviceId();
+    p->s.dev = LuiRemoteDeviceId();
     p->s.origin = LuiRemoteOrigin();
     p->s.rpId = LuiRemoteRpId(p->s.origin);
     p->s.log = [](const std::string& s) { Diag(s); };
@@ -7632,19 +7307,18 @@ static ghremote::Poller& LuiRemoteP()
     p->host.post = [](const std::string& path, const std::string& body, const std::string& bearer,
                       std::string& resp, unsigned& st, std::string& why) {
         DWORD s = 0;
-        const bool ok = ghent::Post(path, body, bearer, resp, s, why, 1u << 20);
+        const bool ok = ghsite::Post(path, body, bearer, resp, s, why, 1u << 20);
         st = s;
         return ok;
     };
-    p->host.token = [] { return ghent::Token(); };
+    p->host.token = [] { return std::string(); };   // no console credential exists yet: see the note above
     g_remote = p;
     return *p;
 }
 
 static bool LuiRemoteTurnOn(std::string& why)
 {
-    if (!LuiRemoteMember()) { why = "it needs an active Greenhouse membership"; return false; }
-    if (ghent::Server().empty()) { why = "this build has no site to reach"; return false; }
+    if (ghsite::Server().empty()) { why = "this build has no site to reach"; return false; }
     ghremote::Poller& p = LuiRemoteP();
     if (p.s.dev.empty()) { why = "this console has no device id"; return false; }
     if (!p.s.Load(true)) { why = "could not make this console's key"; return false; }
@@ -7680,7 +7354,7 @@ static void LuiRemoteStartup()
     std::string why;
     if (!LuiRemoteTurnOn(why)) {
         Diag("REMOTE switch is on but not started: " + why);
-        // The switch stays on: the membership may come back (or the site be reachable) next run.
+        // The switch stays on: the site may be reachable next run.
         LuiRemoteSetEnabled(true);
     }
 }
@@ -7696,7 +7370,7 @@ static bool LuiRemotePairModal()
     const ULONGLONG t0 = GetTickCount64();
     WORD prev = 0xFFFF;
     for (;;) {
-        const WORD p = LuiEntPressed(prev);
+        const WORD p = LuiPadPressed(prev);
         ghremote::PairPrompt now;
         if (!g_remote->s.Prompt(now) || now.phone != pp.phone) { Diag("REMOTE pair prompt gone"); return true; }
         const bool a = (p & XINPUT_GAMEPAD_A) && GetTickCount64() - t0 >= 500;
@@ -7738,7 +7412,7 @@ static void LauncherRemote()
     Diag("LAUNCHER manage-from-anywhere page");
     for (;;) {
         if (LuiRemotePairModal()) { prev = 0xFFFF; link.clear(); qr.clear(); continue; }
-        const WORD p = LuiEntPressed(prev);
+        const WORD p = LuiPadPressed(prev);
         const int64_t now = (int64_t)::time(nullptr);
         const bool on = g_remote && g_remote->on.load() && LuiRemoteEnabled();
         if (!link.empty() && !(on && g_remote->s.PairingOpen(now))) { link.clear(); qr.clear(); }
@@ -7782,8 +7456,7 @@ static void LauncherRemote()
             if (left < 0) left = 0;
             wchar_t t[16]; swprintf(t, 16, L"%d:%02d", (int)(left / 60), (int)(left % 60));
             cap = L"Scan with your phone's camera  ·  this code works for " + std::wstring(t);
-            sub = L"Sign in with Patreon on the phone if it asks. Then check that the phone shows the same "
-                  L"code as the TV before you press A.";
+            sub = L"Check that the phone shows the same code as the TV before you press A.";
             foot = L"B  Stop pairing";
         } else if (on) {
             std::wstring names;
@@ -7800,15 +7473,11 @@ static void LauncherRemote()
                               : ghrepo::Widen(err);
             foot = std::wstring(phones.size() < (size_t)ghremote::kMaxPhones ? L"A  Pair a phone    " : L"") +
                    (phones.empty() ? L"" : L"X  Forget phones    ") + L"Y  Turn off    B  Back";
-        } else if (!LuiRemoteMember()) {
-            cap = L"Needs an active Greenhouse membership.";
-            sub = L"Manage this console's games from your phone, wherever you are.";
-            foot = L"B  Back";
         } else {
             cap = err.empty() ? std::wstring(L"Off. Turn it on to install, cancel and uninstall games from your phone, "
                                              L"wherever you are.")
                               : L"Could not turn on: " + ghrepo::Widen(err);
-            sub = L"Encrypted end to end through playgreenhouse.app; every change needs your phone's passkey. "
+            sub = L"Encrypted end to end through the site; every change needs your phone's passkey. "
                   L"Greenhouse must be open on the TV.";
             foot = L"A  Turn on    B  Back";
         }
@@ -7822,9 +7491,22 @@ static void LauncherRemote()
         Sleep(30);
     }
 }
+#else
+// The relay is compiled out (see the include at the top): what the rest of the
+// launcher calls is still here, and does nothing.
+static void LuiRemoteMirror(const std::vector<LauncherItem>&) {}
+static void LuiRemoteSetPlaying(const std::wstring&) {}
+static bool LuiRemotePairModal() { return false; }
+static void LuiRemoteStartup() {}
+#endif
 
 // From your PC (RB on the wall): the switch, the address and its QR, and the
 // paired browsers.
+#ifdef GH_REMOTE_RELAY
+#define LUI_REMOTE_HINT L"Y  Manage from anywhere    "
+#else
+#define LUI_REMOTE_HINT L""
+#endif
 static void LauncherFromPc()
 {
     if (!LuiInit()) return;
@@ -7840,7 +7522,7 @@ static void LauncherFromPc()
         // question has to be able to appear here too, not only on the wall.
         if (LuiWebPairModal()) { prev = 0xFFFF; continue; }
         if (LuiRemotePairModal()) { prev = 0xFFFF; continue; }                     // §66
-        const WORD p = LuiEntPressed(prev);
+        const WORD p = LuiPadPressed(prev);
         if (p & XINPUT_GAMEPAD_B) return;
         const bool on = g_webServer.Running();
         if (p & XINPUT_GAMEPAD_A) {
@@ -7851,14 +7533,14 @@ static void LauncherFromPc()
             continue;
         }
         if ((p & XINPUT_GAMEPAD_X) && !LuiWebApi().BrowserLabels().empty()) LuiWebApi().ForgetBrowsers();
+#ifdef GH_REMOTE_RELAY
         if (p & XINPUT_GAMEPAD_Y) { LauncherRemote(); prev = 0xFFFF; continue; }     // §66
+#endif
         if (GetTickCount64() - lanAt > 5000) { lan = LuiWebLanAddr(); lanAt = GetTickCount64(); }
         const std::string url = (on && !lan.empty()) ? "http://" + lan + ":" + std::to_string(g_webServer.Port()) + "/" : "";
         if (url != qrFor) { qrFor = url; qr.clear(); qn = 0; if (!url.empty()) LuiQrMatrix(url, qr, qn); }
 
         const size_t nb = LuiWebApi().BrowserLabels().size();
-        std::wstring site = ghrepo::Widen(ghent::Server());
-        if (site.rfind(L"https://", 0) == 0) site = site.substr(8);
         GhUiQrVM vm;
         vm.chrome.title.set(L"GREENHOUSE");
         vm.heading.set(L"Manage from a browser");
@@ -7867,21 +7549,20 @@ static void LauncherFromPc()
             vm.modules = qr.empty() ? nullptr : qr.data();
             vm.size = qn;
             cap = L"On  ·  " + ghrepo::Widen(url);
-            sub = (site.empty() ? std::wstring() : L"Or open " + site + L"/console  ·  ") +
-                  (nb == 0 ? std::wstring(L"no browsers paired yet")
-                           : std::to_wstring(nb) + (nb == 1 ? L" browser paired" : L" browsers paired"));
-            foot = nb ? L"A  Turn off    X  Forget browsers    Y  Manage from anywhere    B  Back"
-                      : L"A  Turn off    Y  Manage from anywhere    B  Back";
+            sub = nb == 0 ? std::wstring(L"no browsers paired yet")
+                          : std::to_wstring(nb) + (nb == 1 ? L" browser paired" : L" browsers paired");
+            foot = nb ? L"A  Turn off    X  Forget browsers    " LUI_REMOTE_HINT L"B  Back"
+                      : L"A  Turn off    " LUI_REMOTE_HINT L"B  Back";
         } else if (on) {
             cap = L"On, but this console has no home-network address right now.";
             sub = L"Check the network connection.";
-            foot = L"A  Turn off    Y  Manage from anywhere    B  Back";
+            foot = L"A  Turn off    " LUI_REMOTE_HINT L"B  Back";
         } else {
             cap = err.empty() ? std::wstring(L"Off. Turn it on to add your own games from a PC on the same network.")
                               : L"Could not turn on: " + ghrepo::Widen(err);
             sub = L"Greenhouse has not tested games you add, and they run without Steam. "
                   L"The page works only while Greenhouse is open on the TV.";
-            foot = L"A  Turn on    Y  Manage from anywhere    B  Back";
+            foot = L"A  Turn on    " LUI_REMOTE_HINT L"B  Back";
         }
         vm.caption.setElided(cap.c_str());
         vm.sub.setElided(sub.c_str());
@@ -7942,10 +7623,10 @@ static std::atomic<bool>          g_cmdPickerUp{false};
 static void LuiCmdStart()
 {
 #ifdef GH_RELEASE
-    // A channel that can delete a member's games does not ship unconditionally.
+    // A channel that can delete a user's games does not ship unconditionally.
     // On a dev-mode console WDP is already effectively root, so the channel costs
     // nothing there; on a distributed build there is no authenticated caller yet,
-    // so there is no channel. Revisit when one exists (membership token, §2/T4).
+    // so there is no channel.
     Diag("CMD channel disabled in this build");
     return;
 #else
@@ -8209,6 +7890,7 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
         }
     };
 
+#ifdef GH_REMOTE_RELAY
     // §66: one queued change from a phone, run here on the thread that owns `all`
     // when the wall is idle. Checked again against the rows as they are now.
     auto runRemote = [&]() -> bool {
@@ -8278,6 +7960,7 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
                       : name + L" did not finish  \u00B7  asked from " + by);
         return true;
     };
+#endif
 
     rebuild();
     Diag("LAUNCHER picker items=" + std::to_string(all.size()));
@@ -8322,7 +8005,9 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
         g_webPickerBeat = GetTickCount64();
         if (LuiWebPairModal()) { prev = 0xFFFF; continue; }
         if (LuiRemotePairModal()) { prev = 0xFFFF; continue; }          // §66
+#ifdef GH_REMOTE_RELAY
         if (runRemote()) { prev = 0xFFFF; lastNav = GetTickCount(); continue; }
+#endif
         if (!titleOpen && !uninstallAsk && !verifyAsk && g_webLibDirty.exchange(false)) {
             const std::wstring keep = (sel >= 0 && sel < (int)items.size()) ? items[sel].guest : std::wstring();
             rebuild();

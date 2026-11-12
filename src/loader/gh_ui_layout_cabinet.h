@@ -30,7 +30,7 @@
 // WHERE THE NUMBERS COME FROM
 // ---------------------------
 // They are the approved mockup's own, measured out of
-// design/mockups/app-cabinet.html at 1920x1080 and kept as literals here
+// the app-cabinet design mockup at 1920x1080 and kept as literals here
 // because they belong to this layout. What a THEME owns -- the palette, the
 // type scale, the corner radius, the stroke, the motifs, the safe area -- is
 // read from the theme, never written here. The bands that hold text scale with

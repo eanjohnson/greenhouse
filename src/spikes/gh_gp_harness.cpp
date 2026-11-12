@@ -1,8 +1,8 @@
 // gh_gp_harness.cpp — standalone VM harness to crack the games-played login wall.
 //
-// GREENHOUSE.md §26: on the real Xbox we send a byte-perfect CMsgClientGamesPlayed
+// On the real Xbox we send a byte-perfect CMsgClientGamesPlayed
 // (correct real SteamID in the header, valid client_sessionid, sendw=1, transmitted)
-// yet the test account's profile never flips to "playing Lethal Company". The wall is the
+// yet the account's profile never flips to "playing Lethal Company". The wall is the
 // LOGIN SESSION, not the message: our login upgrades an anonymous CreateLocalUser to
 // the real account via Authentication.BeginAuthSessionViaQR and LogOn's with the
 // REFRESH token. Leading hypothesis: Steam doesn't treat a QR-refresh-token upgrade
@@ -13,7 +13,7 @@
 // + QR login + games-played send as its OWN native process on the control VM (a full
 // Steam install), so compile -> scp -> run -> read-stdout is seconds. It answers:
 // is it our login, or is it Xbox-environment-specific?  Ported from the proven flow in
-// src/spikes/steamclient_probe.cpp (which logged in the test account on real Xbox) + the
+// src/spikes/steamclient_probe.cpp (which logged in a real account on real Xbox) + the
 // PATH-B send from corpus/shims/gh_steam_engine.h, retargeted to the VM's 10.87.82.64
 // steamclient64.dll RVAs.
 //
@@ -46,13 +46,13 @@ typedef int32_t HSteamUser;
 typedef struct _GH_MODULEINFO { LPVOID lpBaseOfDll; DWORD SizeOfImage; LPVOID EntryPoint; } GH_MODULEINFO, *GH_LPMODULEINFO;
 
 // ---- steamclient64.dll 10.87.82.64 RVAs (control VM) ------------------------
-// Send path (PATH B, live-validated on 10.87 — see memory lethalco-games-played-gap):
+// Send path (PATH B, live-validated on 10.87):
 namespace rva {
     // CProtoBufMsg<CMsgClientGamesPlayed> construct + populate + send. (For an EMPTY body these serialize to
     // nothing regardless of T, so this same scaffold sends a valid empty ClientChangeStatus (EMsg 0x2cc) too —
     // the header EMsg comes from Ctor, not the type-vtable.)
 #ifdef GH_SC1041
-    // 10.41.26.25 send-path RVAs (memory lethalco-games-played-gap "XBOX 10.41 RVAs"). WITHOUT these the 10.87
+    // 10.41.26.25 send-path RVAs (the Xbox build). WITHOUT these the 10.87
     // defaults jump into wrong code on 10.41 -> send_empty_emsg/send_gp_via were silently broken on 10.41.
     constexpr uintptr_t Ctor            = 0xcd8350;
     constexpr uintptr_t TypeVtbl        = 0x12fe6f0;
@@ -93,7 +93,9 @@ namespace rva {
     // (Recorded for the version guard; harmless if it drifts — we only warn.)
 }
 constexpr uint32_t kAppId   = 1966720;                    // Lethal Company
-constexpr uint64_t kAcctSid = 12345678901234567ULL;       // the test account "persona" (public id)
+// SteamID64 of the test account, used only to cross-check the message header in a log
+// line. Read from GH_ACCT_SID (decimal); unset prints 0.
+static uint64_t acct_sid(){ const char* s=getenv("GH_ACCT_SID"); return s ? _strtoui64(s,nullptr,10) : 0; }
 constexpr uint64_t kAnonSid = 0x01A0000000000000ULL;      // Public/AnonUser
 
 // ================= minimal protobuf wire codec (Authentication) =============
@@ -350,7 +352,7 @@ static void* find_connected_ccm(uintptr_t B, bool logAll){
 // game_id ENCODING (2026-08-09 fix): the real client writes CGameID to GamePlayed **field 1 as a
 // VARINT** — `[gp+0x78]`, has-bit `0x200` — yielding `0A 04 08 80 85 78`. The old PATH-B used field 2
 // fixed64 (`[gp+0x80]`, `0x400`), which the server ignores. That mis-field is why games-played never
-// surfaced despite a perfect session. See memory [[lethalco-games-played-gap]] line 298.
+// surfaced despite a perfect session.
 // Read the account name + public SteamID out of steamclient's own loginusers.vdf. Deliberately
 // reads nothing else: the credential itself lives in steamclient's store and must stay there, so
 // we take only the two non-secret fields needed to ask the engine to log on from that store.
@@ -360,7 +362,7 @@ static bool read_cached_account(char* nameOut, size_t cap, uint64_t* idOut){
     for(const char* p : paths){
         FILE* f=fopen(p,"rb"); if(!f) continue;
         static char buf[65536]; size_t n=fread(buf,1,sizeof(buf)-1,f); fclose(f); buf[n]=0;
-        // Blocks look like: "12345678901234567" { "AccountName" "the test account" ... }
+        // Blocks look like: "<steamid64>" { "AccountName" "<account>" ... }
         char* q=buf; uint64_t id=0;
         while((q=strchr(q,'"'))){
             char* e=strchr(q+1,'"'); if(!e) break;
@@ -494,7 +496,7 @@ static bool send_gp_via(uintptr_t B, void* ccm, uint32_t appid, bool dumpHdr){
             //   f2 game_id (fixed64) -> [gp+0x80], has-bit 0x400   (bit 10)
             //   f9 process_id (u32)  -> [gp+0x94], has-bit 0x4000  (bit 14)
             // (The earlier fieldno+8 guess was wrong: 0x20000 is f12, and +0x90 is not f9.)
-            // FULL field set, reconstructed to match a real launch (GREENHOUSE §26.6 capture).
+            // FULL field set, reconstructed to match a real launch (captured).
             // Cross-check: the has-bits below sum to 0x2247f603; the real launch's were
             // 0x2247f703 — identical except bit 8, the one field that needs a live string
             // object (a fresh message has none, so touching it faults).
@@ -529,7 +531,7 @@ static bool send_gp_via(uintptr_t B, void* ccm, uint32_t appid, bool dumpHdr){
                 uint64_t sid=0,r70=0; if(hdr){ probe_read((void*)(hdr+0x68),&sid,8); probe_read((void*)(hdr+0x70),&r70,8); }
                 uint32_t c168=probe_u32((void*)((uintptr_t)ccm+0x168));
                 printf("GPH HDR hdr=0x%llx sid@+0x68=%llu (acct=%llu?) r70@+0x70=0x%llx ccm168=0x%x\n",
-                       (unsigned long long)hdr,(unsigned long long)sid,(unsigned long long)kAcctSid,
+                       (unsigned long long)hdr,(unsigned long long)sid,(unsigned long long)acct_sid(),
                        (unsigned long long)r70,c168);
             }
         }

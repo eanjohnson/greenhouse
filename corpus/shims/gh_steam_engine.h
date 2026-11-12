@@ -1,6 +1,6 @@
 // gh_steam_engine.h -- shared, header-only helper that brings up the real
 // Valve steamclient64.dll engine inside a Greenhouse guest process (Path X /
-// GREENHOUSE.md §21). Used by both the steamclient_probe spike and the
+// docs/steam/README.md). Used by both the steamclient_probe spike and the
 // steam_api64.dll shim (loaded by the game). All state is static so each
 // translation unit that includes it gets its own copy — fine as long as one
 // TU per process does the init.
@@ -467,7 +467,7 @@ static void gh_advertise_game() {
 // AdvertiseGame (above) only sets local KeyValues, not this protobuf — insufficient. Here we hand-build
 // the exact message and send it through the same CM send-wrapper the client uses. Validated byte-for-byte
 // and end-to-end on a real Steam client (the test account showed "playing Lethal Company" with LC not running);
-// see GREENHOUSE §25. All addresses are steamclient64.dll 10.41.26.25 RVAs; SEH-guarded so any mismatch
+// All addresses are steamclient64.dll 10.41.26.25 RVAs; SEH-guarded so any mismatch
 // degrades to a no-op, never a crash.
 static void* gh_find_connected_ccm(uintptr_t B, bool logAll, uint64_t acctSid);   // heap-scan for the account's CCMInterface (fills g_gh_ccm_list)
 static void  gh_diag_writef(const char* fmt, ...);             // reliable-path logger (gh_ccm.txt)
@@ -482,8 +482,8 @@ static uint32_t  gh_probe_u32(const void* addr);
 // (vtRva 0x12b8938), NOT a CUser, so "g_gh_client_user + 0x48" was never a CM: its first qword
 // reads 0 in every DIAG-CCM dump. Handing it to sendw made steamclient read +0x168/+0x1ec/+0x1f4/
 // +0x5f4 of whatever heap block followed the interface, copy those into a live message header, and
-// look up a connection by the "session" found there -- once a minute for the whole game. On a tester's
-// Series X a Tsushima level load died in tier0 ("OUT OF MEMORY! attempted allocation size:
+// look up a connection by the "session" found there -- once a minute for the whole game. On a
+// tester's Series X a Tsushima level load died in tier0 ("OUT OF MEMORY! attempted allocation size:
 // 2010161232" = the low dword of the real CUser pointer) in the window of that re-send. Cached
 // g_gh_ccm_list entries are re-checked on every use for the same reason: the scan ran once, and a
 // CM freed by a reconnect is a dangling pointer by the next tick.
@@ -571,7 +571,7 @@ static bool gh_send_gp_via(void* ccm, uint32_t appid) {
                 for (int i = 0; i < 0xa0 && hok && ho < (int)sizeof(hh) - 4; i++)
                     ho += snprintf(hh + ho, sizeof(hh) - ho, "%02x ", hb[i]);
                 hh[ho] = 0;
-                gh_diag_writef("HDR hdr=0x%llx sid@+0x68=%llu (acct=12345678901234567?) r70@+0x70=0x%llx ccm168=0x%x hok=%d",
+                gh_diag_writef("HDR hdr=0x%llx sid@+0x68=%llu r70@+0x70=0x%llx ccm168=0x%x hok=%d",
                                (unsigned long long)hdr, (unsigned long long)sid, (unsigned long long)r70, c168, hok);
                 gh_diag_writef("HDR bytes[0..0xa0]= %s", hh);
             }
@@ -594,7 +594,7 @@ static bool gh_send_games_played(uint32_t appid) {
     // The CUser's OWN embedded CCMInterface (cu+0x48) IS the account's persona CM — control-VM proven
     // (InternalUpdateClientGame sends games-played through CUser+0x48). Its session comes and goes in our
     // Path-X engine (sess=0 some logins, live others), so ALWAYS try it first; gh_send_gp_via gate-fails
-    // harmlessly when its session is 0. This is the connection bound to the test account's server-side persona.
+    // harmlessly when its session is 0. This is the connection bound to the signed-in account's server-side persona.
     void* embedded = (void*)((uintptr_t)cu + 0x48);
     any = gh_send_gp_via(embedded, appid) || any;
     // Then fan out to any standalone live CMs the heap scan cached (backup, in case cu+0x48 is dead).
@@ -605,7 +605,7 @@ static bool gh_send_games_played(uint32_t appid) {
 }
 
 // ---- ClientChangeStatus(persona_state=Online): the persona announce that makes games-played SURFACE ----
-// OWNER-VERIFIED on the control VM (2026-08-14): with the harness live as the test account, sending a populated
+// OWNER-VERIFIED on the control VM (2026-08-14): with the harness live as a test account, sending a populated
 // CMsgClientChangeStatus(persona_state=1) through the connected CM BEFORE games-played made the owner's own
 // Steam client show the test account "in-game, Lethal Company". Without it, games-played is received but never
 // broadcast. Same send scaffold as gh_send_gp_via — only the EMsg (0x2cc), the CProtoBufMsg<CMsgClientChangeStatus>

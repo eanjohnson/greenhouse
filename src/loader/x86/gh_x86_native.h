@@ -7,7 +7,7 @@
 // is the other way, the one WoW64 takes: the guest runs in compatibility mode
 // (CS 0x23) at full speed, on real host threads, inside our own process, and we
 // only handle the edges -- calls into its imports, its fs: accesses and its
-// exceptions. N0 (GREENHOUSE.md §58) proved each edge on the console.
+// exceptions. N0 (docs/architecture/x86-guest.md) proved each edge on the console.
 //
 // What is shared with the interpreter is everything that is not about executing
 // instructions: the PE32 mapper, the Machine's address space and heap, the

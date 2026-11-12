@@ -7,12 +7,12 @@ The games-played harness (src/spikes/gh_gp_harness.cpp) writes its current Steam
 challenge URL to
   C:\gh\gh_qr_url.txt   (on the win11 control VM)
 and follows Steam's challenge rotation (~every 30s). This tool reads that file over SSH to
-gpu-host + the QEMU guest agent (the same path gexec.py uses; see memory win11-control-vm-access)
+the VM host + the QEMU guest agent (the same path gexec.py uses)
 and renders a scannable QR — as a PNG and/or directly in the terminal. Because the challenge
 rotates, the default mode WAITS for the next rotation so you scan a QR at the very start of its
 window (maximum time to scan).
 
-Requirements: `qrencode` on PATH here; SSH access to gpu-host with $HOME/gexec.py present
+Requirements: `qrencode` on PATH here; SSH access to the VM host with gexec.py in its home directory
 and the win11 VM running. No other deps (pure stdlib).
 
 Usage:
@@ -21,20 +21,20 @@ Usage:
   qrtool_harness.py --watch         # live mode: keep re-rendering each time it rotates (Ctrl-C to stop)
   qrtool_harness.py --png out.png   # also write the PNG here (default: ./steam_qr.png)
   qrtool_harness.py --no-term       # skip the terminal render (PNG only)
-  qrtool_harness.py --ssh gpu-host # SSH host that can reach the VM guest agent (default)
-Env overrides: GH_GPU_HOST=<ssh host>.
+  qrtool_harness.py --ssh <host>    # SSH host that can reach the VM guest agent
+Env: GH_VM_HOST=<ssh host> (required unless --ssh is given).
 Exit codes: 0 ok, 2 harness not at QR stage / no URL yet, 3 VM/SSH unreachable, 4 qrencode missing.
 """
 import sys, os, time, argparse, subprocess, shutil
 
-SSH_HOST = os.environ.get("GH_GPU_HOST", "gpu-host")
+SSH_HOST = os.environ.get("GH_VM_HOST", "")
 QR_GUEST_PATH = r"C:\gh\gh_qr_url.txt"
 
-# Runs ON gpu-host (fed to `python3 -` over SSH stdin, so no shell-quoting hell). Reads the
+# Runs ON the VM host (fed to `python3 -` over SSH stdin, so no shell-quoting hell). Reads the
 # guest file via the same gexec helper used everywhere else and prints the URL (or nothing).
 _REMOTE = r'''
-import sys
-sys.path.insert(0, "$HOME")
+import os, sys
+sys.path.insert(0, os.path.expanduser("~"))
 try:
     import gexec
     data = gexec.get(r"%s")
@@ -100,8 +100,11 @@ def main():
     ap.add_argument("--watch", action="store_true", help="live mode: re-render on every rotation until Ctrl-C")
     ap.add_argument("--png", default="steam_qr.png", help="PNG output path (default: ./steam_qr.png)")
     ap.add_argument("--no-term", action="store_true", help="do not render the QR in the terminal")
-    ap.add_argument("--ssh", default=SSH_HOST, help="SSH host that reaches the VM guest agent (default %(default)s)")
+    ap.add_argument("--ssh", default=SSH_HOST, help="SSH host that reaches the VM guest agent (default: $GH_VM_HOST)")
     args = ap.parse_args()
+    if not args.ssh:
+        print("ERROR: set GH_VM_HOST or pass --ssh <host> (the machine running the VM).", file=sys.stderr)
+        return 3
 
     if not shutil.which("qrencode"):
         print("ERROR: qrencode not found on PATH (install it: sudo pacman -S qrencode).", file=sys.stderr)
@@ -133,7 +136,7 @@ def main():
                 if nxt and nxt != cur:
                     cur = nxt
                     os.system("clear")
-                    print("[qrtool_harness] VM harness (the test account)\n[qrtool_harness] scan now — rotates in ~30s\n")
+                    print("[qrtool_harness] VM harness\n[qrtool_harness] scan now — rotates in ~30s\n")
                     render(cur, args.png, not args.no_term)
                     print(f"\nURL: {cur}\nPNG: {os.path.abspath(args.png)}")
                 time.sleep(2)

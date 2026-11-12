@@ -445,8 +445,8 @@ inline void Qr(const GhUiQrVM& vm, const D2D1_RECT_F& body)
                        (vm.sub.empty()     ? 0.f : 36.f * s) +
                        (vm.status.empty()  ? 0.f : 36.f * s) + 16.f * s;
 
-    // No code to show -- the membership screen before it has a link code, and
-    // every "working..." frame. The lines take the whole area and centre in it
+    // No code to show -- a page that is waiting for its code, and every
+    // "working..." frame. The lines take the whole area and centre in it
     // rather than hanging under an empty panel.
     if (!haveCode) {
         const float blockH = headH + (headH > 0.f ? 12.f * s : 0.f) + capH;

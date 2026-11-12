@@ -2,7 +2,7 @@
 # Build one Greenhouse add-on DLL (gh_addon_abi.h) for the console: x64, static CRT,
 # exports GhAddonInit. Usage: build-addon.sh SOURCE.cpp OUT.dll [extra clang-cl args]
 set -euo pipefail
-GH=$HOME/greenhouse
+GH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SDK="$GH/toolchain/xwin-sdk"; SDKVER=10.0.26100
 # --steam: also compile the Steam CM client (corpus/downloader/cm_downloader.h with its
 # zlib / zstd / LZMA decoders) and qrcodegen, and link WinHTTP / Winsock / BCrypt.

@@ -644,7 +644,7 @@ struct Machine {
     // every back edge and block boundary. It is right to within one partially
     // executed block, which is fine for driving checkpoints and useless as an
     // A/B metric; the JIT-versus-interpreter comparison is anchored on guest
-    // milestones and wall clock instead. See GREENHOUSE.md 30.23.
+    // milestones and wall clock instead.
     Status run_jit(GuestThread& me, uint64_t budget)
     {
         if (!me.jit_ctx) me.jit_ctx = ghjit::thread_new(me.id);
@@ -3692,8 +3692,8 @@ struct Machine {
             // the thing that faults.
             int nshow = cpu.ptr(cpu.gpr[REG_ESP] + 4, 16) ? 4 : 1;
             // Which thread. Only once there is more than one, so single-threaded
-            // traces stay exactly as they were and remain diffable against the
-            // logs already in GREENHOUSE.md.
+            // traces stay exactly as they were and remain diffable against
+            // earlier logs.
             tr = (threads.size() > 1 ? "[t" + std::to_string(cur_tid()) + "] " : "") + t.name + "(";
             for (int k = 0; k < nshow; ++k)
                 tr += (k ? ", " : "") + trace_arg(av[k]);

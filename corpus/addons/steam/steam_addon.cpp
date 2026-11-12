@@ -1,4 +1,4 @@
-// steam_addon.cpp -- Steam as a Greenhouse add-on (gh_addon_abi.h, GREENHOUSE.md §40).
+// steam_addon.cpp -- Steam as a Greenhouse add-on (gh_addon_abi.h, docs/steam/README.md).
 //
 // Everything the Launcher used to carry for Steam, outside the loader:
 //   - sign-in: QR device auth over our OWN CM client (ghdl::CmClient: anon logon,

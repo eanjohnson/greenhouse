@@ -39,7 +39,7 @@ Exit codes: 0 all commands ok, 1 at least one command failed ('!' or FAILED),
 import sys, os, ssl, json, http.client, time, uuid
 from urllib.parse import quote
 
-DEFAULT_HOST = os.environ.get("GH_XBOX", "192.0.2.12")
+DEFAULT_HOST = os.environ.get("GH_XBOX", "")   # console IP; required (env or --host)
 # Matched against PackageFullName, not PackageFamilyName: this console's Device
 # Portal reports the family as bare "Greenhouse.Launcher", with no publisher hash.
 IDENTITY = os.environ.get("GH_LAUNCHER_IDENTITY", "Greenhouse.Launcher_")
@@ -190,6 +190,8 @@ def main():
         print("ghcmd: bad options", file=sys.stderr); return 4
     if o is None:
         print(__doc__); return 0
+    if not o.host:
+        print("ghcmd: set GH_XBOX or pass --host <console-ip>", file=sys.stderr); return 4
 
     if o.file:
         text = sys.stdin.read() if o.file == "-" else open(o.file, encoding="utf-8").read()

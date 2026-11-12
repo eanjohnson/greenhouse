@@ -2,7 +2,7 @@
 # Build the BoxedWine JIT cut + its vendored libraries for the Xbox host.
 #
 # The output is a set of .obj files under $OUT that guest_loader.cpp links
-# against. Nothing here is Greenhouse code: it is upstream BoxedWine (GPL-2.0),
+# against. Nothing here is Greenhouse code: it is upstream BoxedWine (GPL-2.0-or-later),
 # asmjit (zlib) and Berkeley SoftFloat (BSD-3), compiled with our toolchain.
 # Our own divergence from upstream lives in toolchain/boxedwine.patch; the
 # shim that stands in for BoxedWine's kernel is src/loader/x86/jit/.
@@ -10,11 +10,11 @@ set -u
 cd "$(dirname "$0")/.."
 SDK=toolchain/xwin-sdk; SDKVER=10.0.26100
 BW=toolchain/boxedwine
-OUT=${OUT:-${CLAUDE_JOB_DIR:-/tmp/greenhouse}/jit/obj}
+OUT=${OUT:-${TMPDIR:-/tmp}/greenhouse/jit/obj}
 mkdir -p "$OUT"
 
 # --- upstream ---------------------------------------------------------------
-# BoxedWine is not vendored into this repository. It is 173 MB of GPL-2.0 source
+# BoxedWine is not vendored into this repository. It is 173 MB of GPL-2.0-or-later source
 # that we do not modify in spirit -- our whole divergence is 311 lines, kept in
 # toolchain/boxedwine.patch -- so the tree is fetched and patched here instead.
 # That keeps the repo small and keeps the licence line honest: the patch is ours,
@@ -63,7 +63,7 @@ for f in $SF/*.c $SF/8086-SSE/*.c; do
      /DINLINE_LEVEL=5 /I $SF/8086-SSE /I $SF/include
 done
 
-# --- BoxedWine: decoder, CPU state, normal interpreter, JIT (GPL-2.0) ------
+# --- BoxedWine: decoder, CPU state, normal interpreter, JIT (GPL-2.0-or-later) ------
 BWSRC="$BW/source/emulation/cpu/decoder.cpp
        $BW/source/emulation/cpu/common/cpu.cpp
        $BW/source/emulation/cpu/common/fpu.cpp

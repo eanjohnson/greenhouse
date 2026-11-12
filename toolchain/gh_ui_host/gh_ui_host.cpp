@@ -289,7 +289,7 @@ static GhUiListVM MakeListFixture()
     vm.chrome.title.set(L"Library");
     vm.chrome.status.set(L"7 titles installed - signed in");
     vm.chrome.counter.set(L"3 / 7");
-    vm.chrome.addBadge(L"MEMBER", GH_ROLE_ACCENT, true);
+    vm.chrome.addBadge(L"UPDATE", GH_ROLE_ACCENT, true);
     vm.chrome.addHint(GH_GLYPH_A, L"Play");
     vm.chrome.addHint(GH_GLYPH_Y, L"Details");
     vm.chrome.addHint(GH_GLYPH_VIEW, L"Packages");
@@ -390,7 +390,7 @@ static GhUiListVM MakePickerFixture()
     vm.chrome.status.set(L"signed in");
     vm.chrome.statusRole = GH_ROLE_ACCENT;
     vm.chrome.statusDot = true;
-    vm.chrome.addBadge(L"MEMBER", GH_ROLE_ACCENT, false);
+    vm.chrome.addBadge(L"UPDATE", GH_ROLE_ACCENT, false);
     vm.chrome.addAction(GH_GLYPH_LB, L"Themes");
 
     // The drawers, and the breadcrumb for the one in front. Three, not four:
@@ -594,14 +594,13 @@ static void MakeFakeQr(std::vector<uint8_t>& mods, int size)
 // actually happens.
 
 // ---- Packages -------------------------------------------------------------
-struct PkgFix { const wchar_t* name; const wchar_t* state; bool member; };
+struct PkgFix { const wchar_t* name; const wchar_t* state; };
 
 static const PkgFix kPkgRows[] = {
-    { L"Steam",            L"signed in \u00B7 update 0.0.4 \u2192 0.0.5", false },
-    { L"Greenhouse Dark",  L"installed 1.0.0  (theme)",                   false },
-    { L"Half-Life",        L"installed 0.0.2",                            false },
-    { L"BepInEx",          L"available 5.4.23",                           false },
-    { L"Membership",       L"Member \u2713  \u00B7  renews in 23 days",   true  },
+    { L"Steam",            L"signed in \u00B7 update 0.0.4 \u2192 0.0.5" },
+    { L"Greenhouse Dark",  L"installed 1.0.0  (theme)" },
+    { L"Half-Life",        L"installed 0.0.2" },
+    { L"BepInEx",          L"available 5.4.23" },
 };
 static const int kPkgRowCount = (int)(sizeof kPkgRows / sizeof kPkgRows[0]);
 
@@ -787,17 +786,18 @@ static GhUiQrVM MakeLoginFixture(const uint8_t* mods, int n)
     return vm;
 }
 
-// Membership with NO code: the layout is supposed to centre the two lines
-// rather than leave an empty panel, and this is the render that proves it.
-static GhUiQrVM MakeEntFixture()
+// A QR page with NO code (Manage from a browser, switched on with no network):
+// the layout is supposed to centre the two lines rather than leave an empty
+// panel, and this is the render that proves it.
+static GhUiQrVM MakeQrNoCodeFixture()
 {
     GhUiQrVM vm;
     vm.chrome.title.set(L"GREENHOUSE");
-    vm.chrome.addHint(GH_GLYPH_A, L"Try again");
-    vm.chrome.addHint(GH_GLYPH_B, L"Continue to the library");
-    vm.heading.set(L"Membership");
-    vm.caption.set(L"Checking this console's membership\u2026");
-    vm.sub.set(L"No network. The console keeps playing for 6 more days.");
+    vm.chrome.addHint(GH_GLYPH_A, L"Turn off");
+    vm.chrome.addHint(GH_GLYPH_B, L"Back");
+    vm.heading.set(L"Manage from a browser");
+    vm.caption.set(L"On, but this console has no home-network address right now.");
+    vm.sub.set(L"Check the network connection.");
     return vm;
 }
 
@@ -1112,7 +1112,7 @@ static void PaintTokenSheet(const GhTheme& t)
 // command. The caller owns BeginDraw/EndDraw, as the launcher's own pages do.
 static const char* kPages[] = {
     "tokens", "picker", "title", "title-owned", "title-wall", "empty", "packages", "mods", "workshop",
-    "progress", "busy", "qr", "ent", "status", "uninstall", "verify",
+    "progress", "busy", "qr", "qrnocode", "status", "uninstall", "verify",
     "entry", "crash", "report", "report-fail", "themes", "themes-big",
     "onboard1", "onboard4",
 };
@@ -1192,7 +1192,7 @@ static bool PaintPage(const std::string& page, const GhTheme& t)
         GhUiPageQr(MakeLoginFixture(mods.data(), 41));
         return true;
     }
-    if (page == "ent")       { GhUiPageQr(MakeEntFixture()); return true; }
+    if (page == "qrnocode")       { GhUiPageQr(MakeQrNoCodeFixture()); return true; }
     if (page == "status")    { GhUiPageMessage(MakeStatusFixture()); return true; }
     if (page == "uninstall") { GhUiPageModal(MakeUninstallFixture()); return true; }
     if (page == "verify")    { GhUiPageModal(MakeVerifyFixture()); return true; }

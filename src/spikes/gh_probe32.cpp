@@ -1,4 +1,4 @@
-// M0 probe for the 32-bit (x86) guest track -- GREENHOUSE.md §3.7 / plan M0.
+// M0 probe for the 32-bit (x86) guest track -- plan M0 (docs/architecture/x86-guest.md).
 //
 // Answers the three container questions the x86 plan is gated on, in order of
 // how much they change the plan:

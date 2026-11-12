@@ -7,7 +7,7 @@
 //
 // Everything lives in namespace ghdl to avoid symbol collisions with the loader.
 // The heavy lifting (crypto/protobuf/CM/CDN/manifest/chunk decode) is byte-exact
-// validated -- see GREENHOUSE.md 29.5/29.6 and the steam-cdn-download memory.
+// validated -- see docs/steam/library-and-downloads.md.
 //
 // Requires linking: winhttp.lib ws2_32.lib bcrypt.lib + a zlib inflate subset,
 // and zstd.exe / 7za.exe reachable via CreateProcess (the loader's surrogate).

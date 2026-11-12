@@ -1,27 +1,23 @@
-// gh_pak.h -- reader for *.ghpak, the record packs of a keyed package
-// (GREENHOUSE.md §44) and of the dev package's bundled corpus. Written by
-// toolchain/ghpkg.py (build_packs).
+// gh_pak.h -- reader for *.ghpak, the record packs of a corpus add-on package
+// and of the Launcher package's bundled corpus. Written by toolchain/ghpkg.py
+// (build_packs).
 //
-//   magic "GHPAK/1\0" | u32 count | u32 flags (1 = encrypted, 0 = plain)
+//   magic "GHPAK/1\0" | u32 count | u32 flags (0)
 //   count x (u16 nlen, name[nlen], u64 off, u32 len)          little-endian
-//   records: iv(12) || ciphertext || tag(16), AES-256-GCM,
-//            aad = "greenhouse.pak/1\0" pkg "\0" version "\0" name
-//            -- or, plain, the record's bytes as they are.
+//   records: the record's bytes as they are.
 //
-// Plain packs exist because the MSIX registers per FILE: 13.5k loose corpus
-// blobs under guest\ghlo\ made every deploy take ~9 minutes to register.
-// A store is all-plain or all-encrypted (Open with key == nullptr is plain);
-// a pack of the other kind is refused, so a plain pack can never stand in
-// for a keyed package's records.
+// Packs exist because the MSIX registers per FILE: 13.5k loose corpus blobs
+// under guest\ghlo\ made every deploy take ~9 minutes to register. A pack that
+// came from the repository was hashed against its signed manifest when it was
+// installed (gh_repo.h), so it is not hashed again at open.
 //
-// Every record of a package version is under ONE key (ghent::LoadPackageKey).
-// The packs stay encrypted on disk; a record is decrypted into memory when it
-// is read. GCM authenticates each record, so a pack is not hashed at open.
+// flags 1 was an encrypted pack; no build writes or reads one any more, and such
+// a pack is refused at open.
 //
-// Win32 only, like gh_ent.h.
+// Win32 only.
 
 #pragma once
-#include "gh_ent.h"
+#include "gh_repo.h"
 #include <map>
 
 namespace ghpak {
@@ -30,13 +26,6 @@ constexpr char     kMagic[8]   = {'G','H','P','A','K','/','1','\0'};
 constexpr uint32_t kMaxCount   = 1u << 20;
 constexpr uint32_t kMaxRecord  = 64u << 20;
 
-inline std::string Aad(const std::string& pkg, const std::string& version, const std::string& name)
-{
-    std::string s = "greenhouse.pak/1";
-    s.push_back('\0'); s += pkg; s.push_back('\0'); s += version; s.push_back('\0'); s += name;
-    return s;
-}
-
 class Store {
 public:
     Store() = default;
@@ -44,14 +33,10 @@ public:
     Store& operator=(const Store&) = delete;
     ~Store() { Close(); }
 
-    // Opens every *.ghpak in dir (trailing backslash). The key is copied;
-    // nullptr opens the plain packs of a bundled corpus instead.
-    bool Open(const std::wstring& dir, const std::string& pkg, const std::string& version,
-              const uint8_t key[32], std::string& why)
+    // Opens every *.ghpak in dir (trailing backslash).
+    bool Open(const std::wstring& dir, std::string& why)
     {
         Close();
-        pkg_ = pkg; version_ = version; plain_ = key == nullptr;
-        if (key) memcpy(key_, key, 32);
         WIN32_FIND_DATAW fd;
         HANDLE f = FindFirstFileExW((dir + L"*.ghpak").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
         if (f == INVALID_HANDLE_VALUE){ why = "no packs"; return false; }
@@ -68,7 +53,6 @@ public:
     {
         for (HANDLE h : files_) CloseHandle(h);
         files_.clear(); map_.clear();
-        SecureZeroMemory(key_, sizeof key_);
     }
 
     size_t Count() const { return map_.size(); }
@@ -82,19 +66,13 @@ public:
         auto it = map_.find(name);
         if (it == map_.end()) return false;
         const Entry& e = it->second;
-        std::vector<uint8_t> rec(e.len);
-        if (!ReadAt(files_[e.file], e.off, rec.data(), e.len)){ why = "read failed"; return false; }
-        if (plain_){ out.swap(rec); return true; }
-        if (!ghent::AesGcmOpen(key_, rec.data(), Aad(pkg_, version_, name), rec.data() + 12, e.len - 28,
-                               rec.data() + e.len - 16, out)){ why = "record does not decrypt (wrong key or tampered)"; out.clear(); return false; }
+        out.resize(e.len);
+        if (!ReadAt(files_[e.file], e.off, out.data(), e.len)){ why = "read failed"; out.clear(); return false; }
         return true;
     }
 
 private:
     struct Entry { uint32_t file; uint64_t off; uint32_t len; };
-    std::string pkg_, version_;
-    uint8_t key_[32] = {};
-    bool plain_ = false;
     std::vector<HANDLE> files_;
     std::map<std::string, Entry> map_;
 
@@ -117,7 +95,8 @@ private:
         }
         uint32_t count, flags;
         memcpy(&count, hdr + 8, 4); memcpy(&flags, hdr + 12, 4);
-        if (flags != (plain_ ? 0u : 1u) || count == 0 || count > kMaxCount){ CloseHandle(h); why = "bad pack header"; return false; }
+        if (flags == 1){ CloseHandle(h); why = "an encrypted pack; this build reads plain packs only"; return false; }
+        if (flags != 0 || count == 0 || count > kMaxCount){ CloseHandle(h); why = "bad pack header"; return false; }
         // The table is at most count * (2 + 255 + 12) bytes.
         const uint64_t tmax = std::min<uint64_t>((uint64_t)count * 269, (uint64_t)sz.QuadPart - 16);
         std::vector<uint8_t> t((size_t)tmax);
@@ -133,7 +112,7 @@ private:
             std::string name((const char*)&t[p], nl); p += nl;
             Entry e{idx, 0, 0};
             memcpy(&e.off, &t[p], 8); memcpy(&e.len, &t[p + 8], 4); p += 12;
-            if (e.len < (plain_ ? 1u : 28u) || e.len > kMaxRecord || e.off > (uint64_t)sz.QuadPart || e.len > (uint64_t)sz.QuadPart - e.off){
+            if (e.len < 1 || e.len > kMaxRecord || e.off > (uint64_t)sz.QuadPart || e.len > (uint64_t)sz.QuadPart - e.off){
                 why = "record " + name + " out of bounds"; return false;
             }
             map_[name] = e;   // a later pack wins, like an overlay

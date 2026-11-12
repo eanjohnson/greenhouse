@@ -242,8 +242,8 @@ inline void GhThemeMakeLight(GhTheme& t)
 
 // "Greenhouse" -- the default, and the identity the website shares.
 //
-// Ported from design/mockups/glasshouse.html, which is the concept the
-// user picked: a green-tinted glass look, gloss on the panels, generous radii.
+// Ported from the glasshouse design mockup, which is the concept the
+// owner picked: a green-tinted glass look, gloss on the panels, generous radii.
 // Two things changed on the way in, both for reasons the mockup did not have to
 // care about.
 //

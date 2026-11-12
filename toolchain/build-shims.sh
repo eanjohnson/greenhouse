@@ -9,7 +9,7 @@
 # e.g.  build-shims.sh REPO           -> msix_stage_repo/guest/REPO/REPO_Data/...
 #       GUEST_STAGE_ROOT=$GH/artifacts/msix_stage build-shims.sh CheeseRolling
 set -euo pipefail
-GH=$HOME/greenhouse
+GH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SDK="$GH/toolchain/xwin-sdk"; SDKVER=10.0.26100
 GAME="${1:-REPO}"
 DATA="${2:-${GAME}_Data}"
@@ -26,7 +26,7 @@ FAMILY_FLAG=""
 echo "== shim package family: ${PKG_FAMILY:-<default: Greenhouse.CheeseMP>} =="
 
 echo "== regenerate steam_api64.def =="
-python3 $HOME/.claude/jobs/49fb5998/tmp/gen_steamdef.py
+python3 "${GH_TOOLS:?set GH_TOOLS to the directory holding gen_steamdef.py}/gen_steamdef.py"
 
 echo "== build steam_api64.dll -> $STAGE =="
 clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \

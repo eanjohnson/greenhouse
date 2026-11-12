@@ -5,8 +5,8 @@
 # Usage: iterate-inputtest.sh <newversion> <oldversion>
 set -euo pipefail
 NEW="$1"; OLD="$2"
-GH=$HOME/greenhouse
-TMP=$HOME/.claude/jobs/49fb5998/tmp
+GH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TMP="${GH_TOOLS:?set GH_TOOLS to a working directory holding wdp.py (the Device Portal client)}"
 SDK="$GH/toolchain/xwin-sdk"; SDKVER=10.0.26100
 FAM="Greenhouse.InputTest_mgw46vk3ppz9w"
 STAGE="$GH/artifacts/msix_stage_inputtest"
@@ -35,7 +35,7 @@ echo "== pack + sign =="
 LIBDIR="$GH/toolchain/msix-packaging-src/.vs/lib"
 rm -f "$GH/artifacts/GreenhouseInputTest.msix" "$GH/artifacts/GreenhouseInputTest.signed.msix"
 LD_LIBRARY_PATH="$LIBDIR" "$GH/toolchain/bin/makemsix" pack -d "$STAGE" -p "$GH/artifacts/GreenhouseInputTest.msix" >/dev/null
-osslsigncode sign -pkcs12 "$GH/toolchain/signing/greenhouse.pfx" -pass "$GH_PFX_PASS" -h sha256 \
+osslsigncode sign -pkcs12 "$GH/toolchain/signing/greenhouse.pfx" -pass "${GH_PFX_PASS:?set GH_PFX_PASS to the signing .pfx passphrase}" -h sha256 \
   -in "$GH/artifacts/GreenhouseInputTest.msix" -out "$GH/artifacts/GreenhouseInputTest.signed.msix" 2>&1 | grep -E "Succeeded|Failed"
 
 echo "== deploy (separate slot) =="

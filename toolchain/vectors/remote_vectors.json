@@ -5,155 +5,155 @@
  "origin": "https://greenhouse.test",
  "now": 1800000000,
  "console": {
-  "pub": "BBOLeCOqV1_eSbZl1Nbrh5x9S8sXe6bm43-Zw7b9UzjbqMU6miYiEhcPmD3-iVerPT_v5Bd_VKr8JjHi4cQmIyM",
-  "d": "5a4d7e11d4d4680c1170078aaff59c4d59eb86f4771f299d8b416bc17121c7a6"
+  "pub": "BJ2__gd44_vyrtkGx7q4nwduggjyYD8t5yA2nXZYCNkDa1YfAg9Mh6eesjOaQJmftPjmE8uyXhKzqKv04Lz6Hes",
+  "d": "e3f8b867bd8c51a0c5252f64abb814474b47ea987c04f8b957957d6b5dc6ca46"
  },
- "token": "b08e0e74591b7e7c38cb8296563a1405",
- "pairId": "5b7ed5c6141d12fae62bf491ab3a34fc7f4beae1c6acfcd562d10727eaaab38e",
+ "token": "d9ca91997df461548103d4c17858951a",
+ "pairId": "6bd9925045ed9bf306c35c89e1f01858a4b01a8646f1fd50fd7b371bae57358d",
  "pair": {
-  "msg": "{\"v\":1,\"phone\":\"46e6c5b3625087000b1f26504615ac72\",\"epub\":\"BMBtANnAo4d6BN9aNJIagUkVpjEUt8ZEoSjym7Q-mPm0VO5Sw7gYJhdeISi8ngfZxtv9noJLQ_KcMCbgkeM482o\",\"cred\":\"PSG6XBv7eepXZLAYr_qqtw\",\"wpub\":\"BPSzecR7VXk7bqHs4jGnC3mXGY7cWjf02gYqs9CuWkiRcXtAVmKWKPix8J274kFQsAkLcoLsb2CafS8abrmOFVY\",\"label\":\"Owner's phone\",\"ts\":1799999995,\"mac\":\"avUg6gtlOO9vcEStlSF2iYeGO_WHffOa5fq5eKWTAbs\"}",
-  "badMac": "{\"v\":1,\"phone\":\"46e6c5b3625087000b1f26504615ac72\",\"epub\":\"BMBtANnAo4d6BN9aNJIagUkVpjEUt8ZEoSjym7Q-mPm0VO5Sw7gYJhdeISi8ngfZxtv9noJLQ_KcMCbgkeM482o\",\"cred\":\"PSG6XBv7eepXZLAYr_qqtw\",\"wpub\":\"BPSzecR7VXk7bqHs4jGnC3mXGY7cWjf02gYqs9CuWkiRcXtAVmKWKPix8J274kFQsAkLcoLsb2CafS8abrmOFVY\",\"label\":\"Someone else\",\"ts\":1799999995,\"mac\":\"avUg6gtlOO9vcEStlSF2iYeGO_WHffOa5fq5eKWTAbs\"}",
-  "phone": "46e6c5b3625087000b1f26504615ac72",
-  "sas": "416965"
+  "msg": "{\"v\":1,\"phone\":\"31d374e22f489bcb92c514b0ef7f681e\",\"epub\":\"BCnE22AiJiBa1YnW949Q4e-_Wdo1xgbgEWLziw8rVnHPDnQtCxPYdPPLSlnMUZnlUi9hmsMvEzdVbqvitelR1mw\",\"cred\":\"S3wuJOdFp3EVBa2JGTbGrA\",\"wpub\":\"BNbvnDx5XgpHX37RdtzWIrz-Vy1AfFSFX7uClBVi6q7ROgPoV4jYO8aNq61Ak1pVW-J3FTBDF2EaMbPm_nZe-pY\",\"label\":\"Test phone\",\"ts\":1799999995,\"mac\":\"rRbKdWgAYQxEo0JUOXXadIdfN5ZPpi3oi3Shfuy8Smg\"}",
+  "badMac": "{\"v\":1,\"phone\":\"31d374e22f489bcb92c514b0ef7f681e\",\"epub\":\"BCnE22AiJiBa1YnW949Q4e-_Wdo1xgbgEWLziw8rVnHPDnQtCxPYdPPLSlnMUZnlUi9hmsMvEzdVbqvitelR1mw\",\"cred\":\"S3wuJOdFp3EVBa2JGTbGrA\",\"wpub\":\"BNbvnDx5XgpHX37RdtzWIrz-Vy1AfFSFX7uClBVi6q7ROgPoV4jYO8aNq61Ak1pVW-J3FTBDF2EaMbPm_nZe-pY\",\"label\":\"Someone else\",\"ts\":1799999995,\"mac\":\"rRbKdWgAYQxEo0JUOXXadIdfN5ZPpi3oi3Shfuy8Smg\"}",
+  "phone": "31d374e22f489bcb92c514b0ef7f681e",
+  "sas": "181254"
  },
  "keys": {
-  "c2p": "7b71da068277a70388fb8bf4f03abf0cebb0ef2bf5995bd22eee3a5b0201d7fc",
-  "p2c": "c3e0bebc61436826cfbe123bdac89979738ab492c866bb8de87e022a9373dd4b"
+  "c2p": "ebd8195d4f291ece009c2f34b034f435919fae45ee805c285d4c26fd1f85162b",
+  "p2c": "01116a08e9f507ed2fb73e2a652b45b42a9ee680c1ac0914cd5efcf1abbc4369"
  },
  "c2p": {
-  "env": "{\"v\":1,\"p\":\"46e6c5b3625087000b1f26504615ac72\",\"s\":5000,\"t\":1800000000,\"iv\":\"B1uJzxBWk2r2HkuW\",\"c\":\"KrFIIbrDRCW0LJYj_ucmdlCpjGxsSV7fUYC1adZ_LMDgYWN9UWvxsb9f1eTkaeNGiw\"}",
+  "env": "{\"v\":1,\"p\":\"31d374e22f489bcb92c514b0ef7f681e\",\"s\":5000,\"t\":1800000000,\"iv\":\"QUD0AaKmcYBh5spq\",\"c\":\"iufEJ97uBEujfpTPsaojCTSOJFHgSsc9YGiqdLUYxTUcCrpsbEuHD5ea02fGS59lOA\"}",
   "pt": "{\"v\":1,\"free\":123,\"installed\":[]}"
  },
  "cmds": [
   {
    "name": "install, passkey ok",
-   "env": "{\"v\":1,\"p\":\"46e6c5b3625087000b1f26504615ac72\",\"s\":1000,\"t\":1800000000,\"iv\":\"X_t4UV1lLTG-RBMD\",\"c\":\"czUq4b7Tcq-wQN6GzrTPTQtBidvxoX2--mnTzbjObVJIJ1t1o4mTQ93PdzWFkJc4m092a2JWCHEdTNowtJY4SkX-AxLS2T6nLX2cyZ7eA1_pSZ1EZC7YxqbU08Kkd0KMhyhtls32cNUC3rRNtpU9Yv4uSzkd2UznuMVD81QLN33OGhiV1VDARbcLNh55S3ARPD3Y9CjlyE0tDBrUNp0IwQkvzf3h89q0prBrw_xV3sIO_PLkC9BWswNsTGpxEstFfpgLJobiaX-73SMI3eveVZrEcXYTxQ6WuDfem8K9m1cZcD-jpntHorHunKQq8YbYJ_vx3PtyHtebP6ZZ28vthlQ42aWYFb3kJjJ-4gWOUn2qw1X27Wh5bJDqwlL0Bd6WSm86eTUOLjamXkvS4TnPuB5dUfmu3hi_XMH5EEQDvKrftJX07D08JcpGO4aDEP4vsHzV_MzyNDFqmweQNETGrkND9K-Mat-B1JOpUA9Vb5ENz_e3Q7St4N0eiJpyurP9M-PRfr5K0if8fIQ76nGBZbKJqD655wMa9SchpN3vHjNZ6B-flfFwaAvl4dSTsvLzjqQ\"}",
+   "env": "{\"v\":1,\"p\":\"31d374e22f489bcb92c514b0ef7f681e\",\"s\":1000,\"t\":1800000000,\"iv\":\"4YAfrYNzVfdc5Zom\",\"c\":\"1F9kET9UpzuuIT2jFlFwu_Dz7N18G99cg2ONRisz8gQWHfFZrmvAkIi6BRJzzrZkVln24De0YuQ2u3y1b_fN3Oj6r1nctgcQ7VoWf6Sx_6hhiN7MLTNk2jFbA1k44nLV5frfYLVT05CnUlfZYEozZVB_C7ad4ajdMlw7JAj_fZnWhRydAHkP9Vq7AdJuMeF6icqmQdxs2TMtPs_-FM18WH9ogfY6dupax5hpfa3D8RVc_BBxe7QHHxQ_9cGK3IE_7kHftcVB1cb_Aeja60g08n8wkoatXgPLk2Xn7MGT_Bx7fJSlv4iXr0tlpT9QUBJruGccYDTQoH08OYKrUxAYboGFW3wgh9O094KH9JGT1Qjk8dfLm5nf9ifLrNklU5Krv551BpjEUFsLYqDarCLR58cR59aZ5ALD0Fgqq_LLkgc7mn8rfiIEsoWvrC6_pw5nrdjHiMztFCnS0yd4Elv428gvNpZ9K10GXYyiJZxZ89E8zOFNY3mWJF53Y9ncwC44_qyhAyRe3qlgFhCN3UFsOagqkTTLlrr2MctkWe9N2meoK-4g5pzEsp_AmhJQ_mWC7Cg7\"}",
    "expect": "ok",
    "op": "install",
    "arg": "220"
   },
   {
    "name": "the same message again",
-   "env": "{\"v\":1,\"p\":\"46e6c5b3625087000b1f26504615ac72\",\"s\":1000,\"t\":1800000000,\"iv\":\"X_t4UV1lLTG-RBMD\",\"c\":\"czUq4b7Tcq-wQN6GzrTPTQtBidvxoX2--mnTzbjObVJIJ1t1o4mTQ93PdzWFkJc4m092a2JWCHEdTNowtJY4SkX-AxLS2T6nLX2cyZ7eA1_pSZ1EZC7YxqbU08Kkd0KMhyhtls32cNUC3rRNtpU9Yv4uSzkd2UznuMVD81QLN33OGhiV1VDARbcLNh55S3ARPD3Y9CjlyE0tDBrUNp0IwQkvzf3h89q0prBrw_xV3sIO_PLkC9BWswNsTGpxEstFfpgLJobiaX-73SMI3eveVZrEcXYTxQ6WuDfem8K9m1cZcD-jpntHorHunKQq8YbYJ_vx3PtyHtebP6ZZ28vthlQ42aWYFb3kJjJ-4gWOUn2qw1X27Wh5bJDqwlL0Bd6WSm86eTUOLjamXkvS4TnPuB5dUfmu3hi_XMH5EEQDvKrftJX07D08JcpGO4aDEP4vsHzV_MzyNDFqmweQNETGrkND9K-Mat-B1JOpUA9Vb5ENz_e3Q7St4N0eiJpyurP9M-PRfr5K0if8fIQ76nGBZbKJqD655wMa9SchpN3vHjNZ6B-flfFwaAvl4dSTsvLzjqQ\"}",
+   "env": "{\"v\":1,\"p\":\"31d374e22f489bcb92c514b0ef7f681e\",\"s\":1000,\"t\":1800000000,\"iv\":\"4YAfrYNzVfdc5Zom\",\"c\":\"1F9kET9UpzuuIT2jFlFwu_Dz7N18G99cg2ONRisz8gQWHfFZrmvAkIi6BRJzzrZkVln24De0YuQ2u3y1b_fN3Oj6r1nctgcQ7VoWf6Sx_6hhiN7MLTNk2jFbA1k44nLV5frfYLVT05CnUlfZYEozZVB_C7ad4ajdMlw7JAj_fZnWhRydAHkP9Vq7AdJuMeF6icqmQdxs2TMtPs_-FM18WH9ogfY6dupax5hpfa3D8RVc_BBxe7QHHxQ_9cGK3IE_7kHftcVB1cb_Aeja60g08n8wkoatXgPLk2Xn7MGT_Bx7fJSlv4iXr0tlpT9QUBJruGccYDTQoH08OYKrUxAYboGFW3wgh9O094KH9JGT1Qjk8dfLm5nf9ifLrNklU5Krv551BpjEUFsLYqDarCLR58cR59aZ5ALD0Fgqq_LLkgc7mn8rfiIEsoWvrC6_pw5nrdjHiMztFCnS0yd4Elv428gvNpZ9K10GXYyiJZxZ89E8zOFNY3mWJF53Y9ncwC44_qyhAyRe3qlgFhCN3UFsOagqkTTLlrr2MctkWe9N2meoK-4g5pzEsp_AmhJQ_mWC7Cg7\"}",
    "expect": "replayed",
    "op": "install",
    "arg": "220"
   },
   {
    "name": "refresh needs no passkey",
-   "env": "{\"v\":1,\"p\":\"46e6c5b3625087000b1f26504615ac72\",\"s\":1001,\"t\":1800000000,\"iv\":\"cWl29SFUykv3qHf2\",\"c\":\"TFkOHkEigPzHScVKV-G0PF3iyZ6iVJeq8b5n05nw__uWiWAaTpdPgKU\"}",
+   "env": "{\"v\":1,\"p\":\"31d374e22f489bcb92c514b0ef7f681e\",\"s\":1001,\"t\":1800000000,\"iv\":\"aZmngvcb_AwG-9P4\",\"c\":\"UN76zXQvXyHLbEv7TrVrVt2dhAdnloyJpgAWRYBkH5kxZMXLugd3aAk\"}",
    "expect": "ok",
    "op": "refresh",
    "arg": ""
   },
   {
    "name": "install without the passkey",
-   "env": "{\"v\":1,\"p\":\"46e6c5b3625087000b1f26504615ac72\",\"s\":1002,\"t\":1800000000,\"iv\":\"kNqb8D5Wp5vw9E5O\",\"c\":\"lXmNXzXwLlGHliHRz1JpMan_35b6oCKpwPYGv7Kw93dvztwABvz9dzKKAeA\"}",
+   "env": "{\"v\":1,\"p\":\"31d374e22f489bcb92c514b0ef7f681e\",\"s\":1002,\"t\":1800000000,\"iv\":\"Agwg2mYhcSwOZzlh\",\"c\":\"rejHzmFbkjKyAYAgxvlCNzOmnjnUGLHcY_Wh8GtH8MdGpbYI-E2S9Xt6MGc\"}",
    "expect": "needs the passkey",
    "op": "install",
    "arg": "220"
   },
   {
    "name": "passkey from another origin",
-   "env": "{\"v\":1,\"p\":\"46e6c5b3625087000b1f26504615ac72\",\"s\":1003,\"t\":1800000000,\"iv\":\"CjNeHxhGTlhlfCAZ\",\"c\":\"g0NK6ymuv-W_6xiquEpmDYH3p-Z9Jt1JHqbcyAq7XQ0YEA_MCJtZSqlCC7jY6_hjY7B01SHC-9qozTQ54liRMcgQEGuruXIghT5xRjZvBTL0wjPAuagz1q1GPzlp2DVrTNTr5vnTchrtswABzKY81wtROEZSTxiqSPXmS6RPi7JfMm2McQQ3dwsZ8cF3bcbYYs_ULRZ1nmfJ-G-rgpkTxXbV5VraWCPaDrKWF5rduEQ2Jw3jKfAFFiji_-6CVKoyYbO79MoqkGQCox7Fsf9JbHGEhScl5-0yPdgq--zpaQeJVArSDS8jSGTjZwvlxaBmriPw07obUYBhnTmFtT-mzbwsoeDDVb7evvkEEPILBUB9yu3A6V8dDYp1ktPGr55PDiMKlgyoSpCot15vs8AR4Et9R9mX8OUNwtxFrIIVjF7mq5-jr1h3NTxj23gqreL1SAVBeM25i9TrjnVRDhqa5yV8QVWH6v-8J3SAsNy6ZBZKWoNAQ1tYWSe48qNs1qJ5mvk4Tc5PpThJDx2fC8yFxDQ39t5K1dkO8K8xF3XufiiprT3YjrVO2JU\"}",
+   "env": "{\"v\":1,\"p\":\"31d374e22f489bcb92c514b0ef7f681e\",\"s\":1003,\"t\":1800000000,\"iv\":\"ShAIYtbvkrqr4x5a\",\"c\":\"yfqJTLu3X-hoTbMZxlZZIWBqMgVWYdEzgYhsmR0YjKiT_Imh_hjfGb5wUS0dIf4BcYu6I_7m7lD1subnw_JPdhW3iQdzf9Pf6mneBFx8lZjX71eZwP9Cu1q_36lRl-PoRNs48yYy9v0H9nT1nRu7l1BKSt5Zf2fR2Hv_XwHB5l4BYOicVxJDmVk1iYgHzQBdM7sJe1khP7JcOE57uYMDADRQT9s_Bq0JDMZz92hgeGcq_6vtkZBf1HUdRp3eLreCCNaLerAzXrTHuakCaZpnCj96bkhzluY4YcLgxmfyv9tGGDPusFVvdBMsJk4DgcSODa1FOpOGKXlfwF9eLXPUVKtgAULFC7H5-QLlIywB8w6GNh5kxCrcNaeVyi6NA8hQ12KtAf5R19ZKqWTsWIwymFj-UAjQ_vad6iGH3c-vfGIqC1qPodnPVDvJO5LdqyQRlY8zS77PvoPj4HCTJju3MXlDq3uUl3CiTG8W1_b1pbQ2LcxJ1YGVwHihOI1sPcg6EH-dQrtK8QqlVNSM3OZMBTP9v5REmSiIuQV2Iad1kHe9D6HBbBvzU6o\"}",
    "expect": "another origin",
    "op": "install",
    "arg": "220"
   },
   {
    "name": "passkey for another rpId",
-   "env": "{\"v\":1,\"p\":\"46e6c5b3625087000b1f26504615ac72\",\"s\":1004,\"t\":1800000000,\"iv\":\"Kbw0E10gfPJXcybe\",\"c\":\"Wlwu653MQb2D7QcNQTE2mKM1grqBhJ0UjTfI28NxOnoHoI9pwAxgtu6NCHZzRi49yLXFJACAtRffMclR2sVx_gzyVJhOjkhW42kVKoWr9mfzzgoYNvKyaLCgv_cPab2oLBASejYXHZmwc-rRv-lN0wiWA9tNBud6E4jtBM0OndHhABX2k-aLXlkMImy83uglJzKPXtzo2RMxhy4Qln4-5cJ4B02iwwFjFl2ghV-yYL1-buxtijNpKWypE4YBEIC7XsIvHv4h9P0JlF78m4P49161Z8Z2kisFfvv8UuarTD59oI7gMZM1uSXiPsfUue3MU3wIDmSEUpLHo6qwCY4yZ8GSyIozbzd7_xfhW6Yuxc5J0wXCF-SiPGCP146Su1-Q-V1GPpce1k3pej0LGaHrvvv3ExO6tnhL_im7pkWikUYRfEvM8R6scaJwa_fWsjr8nf23rTYaA5v9y263BWthWsEZny7B8d06qCx72Ld0MiU8PIaurXEYOJZif8uASztKiQU00asIEVjPMisf7FFE54yi9ck9Yv2m-YlAtZp_96O682pGbzvvVmjidsY5G9-_ig\"}",
+   "env": "{\"v\":1,\"p\":\"31d374e22f489bcb92c514b0ef7f681e\",\"s\":1004,\"t\":1800000000,\"iv\":\"JU460ZrTLd1nJYeA\",\"c\":\"qWZSSBxwDsOCvjYlFambr6FK7pZSgYpyxnaWZYzBBm6VCOTQ1py9YZa1IYUskBUyN7NjVlHSwqYh-eEqp_vXUNnF5FB1Y68lP3ojCUS0GcOSMA5FleHGt3vEVBMzhpOHJlzHpidSZzmZ1cN60ggKRRXZIhciDuovcvcMa-6wASs7Ewxp3MSByYtXd2WETab4L1EgDaa_4BQ2WfuPzEUWplTZuqkZg5hcLElVA9Zes7iA_Mz5Xa13S2ytDm75xWjivoWmIT9BmslsU-AVyvdrsS9ayW4saMsJ6uj5LxfxdZJvI7JGWBCyD_OVBXUkZLW8UEpV0-hRwx290MPOCjnk2jkoYV5gwWm92VKlz4tjjbMrHU21YxK2SVZXpJiUs32e1TuhWlvuOeTARaxb0DNm_pylrs4ECNloRBLLaodV9R6UHkf4P_lgCPtgrN6R6AIcSXxCWsk7Mwcbzr9rNsruAG66TNjhKg1pp0JvTY5do2tqhT_H9UlB9CDXRapkAuVdygs13-zCkiSkcmfDIaX76N-6fXE-NDC9hhK1Z-MPgV_RhtlpW17zCmga9P7yk0h4Nw\"}",
    "expect": "another site",
    "op": "install",
    "arg": "220"
   },
   {
    "name": "user not verified",
-   "env": "{\"v\":1,\"p\":\"46e6c5b3625087000b1f26504615ac72\",\"s\":1005,\"t\":1800000000,\"iv\":\"oWj6i1JqzLECUApC\",\"c\":\"a2BFA2s-cqE-jSCR4G6NS3MjvjKDcvNLje1W3PFxZFeGfm23e8z9JlOD3L_0dnSpDerT6Oymv6H7ny02YfGIf1c4cUj-9IgDkXjC55l5MD8ALOSmybx8f_SIy6tZHrtP9xCIijNdbAWA6fZ4p2i_Se9gDZT3jGnDsSEnsv7qxzoRK2gYHQgRzoK-jtqvplyjrgzqNXc9MTVjF9oK9dVkqlAd7Mj8CCLWY20swcY8aiqcuK3LPFkYspc6jfAdDG6PztR_qt_SvWPq_ci4AEkBefiEIBlqfwB7Xrp60PA2JkApx6mWBIX8qeOJE4uBnaLuVfBiGJ_Y8GA3rvz5BBMiuaOW8YQzBStAPysRw_UuBdEG-Zbl8IJC_rAl0O2fLZPhVLhdHDRTcwSFTAyHWXc8e0iPShpphMwbW5xKAiHa0tZMhZFmHqyglOZmAmwan5cYTp3COYAedYHQ9ZlIEZmV-NnR-7qGVXBa-JTAbABMTsq13C9wQDVe6L622ES9S8CIkMA6WGdQdV8kMXhKpcprHgMdraXVjXQATKaKIvHtk6GzWVBa_HV8mq12OCiibggF_r4\"}",
+   "env": "{\"v\":1,\"p\":\"31d374e22f489bcb92c514b0ef7f681e\",\"s\":1005,\"t\":1800000000,\"iv\":\"WG8xSIS3XIFBXuPO\",\"c\":\"-Lu_-WZNyoHTecWC_aIPEQnPuluowiYM3PLfbC4to26_oc5VV80MnQUcfchnH-ShmSPFS0uVsmipTBPiimLUqjGR5IXtfNgkgpMuQVLHOBOisAJ-XGnBnkJ5W9TAmXjw-RICHcUkSQrgO1ag1zjhAk9wad0qgveWHWCsF3UePFTt0BBXYaCffhb_6DM7wRGxNtynEQL0KGbhVjPRikAKud2NyvtNQqjWI1HJzxU-S1Z8t8JYZ66tZu6HW8U2DTwpCh5kBm1oV00Rq-6OJ9NigTozlyBRmCjLjKW4P3CgOHTicLoFMDb-KtJNo9CE9kRcXtHYetYfzxwgLRfsZJgakxp-mzU1UHCVu-rsuVahtkrzV_ks50gCm6Bsp7xE_flH4rXQsxF5BIi6e2negiATc4ubO71JCYYHWP4XLF0nKdIACiehaJlWyRw9ENE8G-tVd9lzdmtcCzVxWxK9Ks6IIN0d_O2lyHqpjzIkMGz2n8sQtoLxoD2RLXnl4h2VH5UujWDZHyBjxCMu6CqvN1xsQej0xsrjGDsnpyBx06IcIb9W_14-gsCQsteFzu_dPg5IvCI\"}",
    "expect": "not verified",
    "op": "install",
    "arg": "220"
   },
   {
    "name": "passkey signed another app id",
-   "env": "{\"v\":1,\"p\":\"46e6c5b3625087000b1f26504615ac72\",\"s\":1006,\"t\":1800000000,\"iv\":\"rtuaARVfs4bbMn04\",\"c\":\"mZb8-n_tc6FdWrWtR1LtZg0sTW1dc9lxLD7exSkPfVbZXh36j2srVRM-s63MWePQMrwpYKGtVkYCAT0BVhCFtKPB13oNEyA0mdXF4Nt1QlSsvD4AMms4ohHv-aj76J4QWd6c7HWyTJnDxty0ORwWz3nTS42CgVS2eBgO3US9pI5GFO0Jm-0AtUSzUktKvjsyXarzpfUK5j0KILQK8WA2eApTxbMMKR0sUrXqjehjFmFStPs1hfDiq0nMaAXhGjwhZ1ucXCm2xl3kS4L0XVuT_yafRRtLI--2z8QAucMAaWGdBQ-LZMhlli1xRbHuEIr-eWwk00YjxaWFOo0TaZSUTgKO6_fn43r8aIU9yoa7-XoncoLGwoz9YfWHmqw70zSbC4jyZAkLgNJSD2bgIrs8CmIPv8ng0lcdEn6RmZ8VpX8ObGt-yhTuFxs6aSr_qpJFUD9fjC_-8DoJiAlKaosDGX-QschL5MvZykqZQmcYEMObphfMK_TIPr6p8BqOjEW2SGhMBN1j5Tbb0hLvWZq6D5pc0_vrCPke31HKzp4eN-yvs77Eu-2M-wPsAfPw9L3s9i6X\"}",
+   "env": "{\"v\":1,\"p\":\"31d374e22f489bcb92c514b0ef7f681e\",\"s\":1006,\"t\":1800000000,\"iv\":\"3q99dt4uLDvSOfBd\",\"c\":\"w9-CYNUEK0T-Ymu9yDlT6ZRdezBcnhC9iZdthuRcvjqTtsEUlc5rr4gmoel5lAwJ-CWMdeDI7Qvx4kCE7RjMFOnCnFBPuj0CZORbJiMAaEHSRSCA_dfvLxUeYCNS3INSDjCiCWD0w4DLGe4BvunXeNL7sTN5882ovLaZhVJ-gucyjETPVXCcCHSwy8kR9w9n5J7TfgHD0HG25oV5d6GBegVnlpN6QqVn5TNDhILow1awJzUKiUMBzgPin398hEK87l40p4ZpaTuJ6mnKbyZ4Z-N1zEGf9y3h-YX4WJRAWmZwfJBJOkjnk91-yHsSfxct5USw-2FgBjQiAzJkAOc75zYqoA6UVa5Hiihwq6ibw57gvmAlxhZ4PFVGnPEIn9gCNnNpwtEqx3iLxRCvgmVdDgpp-PCe66Hr_taDKi4ba_vS17d7kJcxvqgOoidEvzilEDzmfj1YVE8d4SEwiGSw8BoHa4nm7YYRcI4OwkfuppPy_t1CoXuB8lCiJFhNI1ZXFfa171V96axHVX7-TqYANl3mrbWZ9Bi_c2rVgaXsl1wdbSkRrE-8MYb1ULlCoBSOVVU\"}",
    "expect": "signed another command",
    "op": "install",
    "arg": "220"
   },
   {
    "name": "counter went backwards",
-   "env": "{\"v\":1,\"p\":\"46e6c5b3625087000b1f26504615ac72\",\"s\":1007,\"t\":1800000000,\"iv\":\"DX3Sh0lQV_FsAiKT\",\"c\":\"YAPBhMp93SZkp_MB3IMckvzFlIvjehgu1hGKFhuixS93oXbVyerfAYdTxhJh9P2N0-HuSys8t-MaLZes2p-RLCUlZC-0MajM-xLHRQnwNl4AYP33xRKeHOkRN6wg8_9mE9GyDFpmy_l2LUc4VzAoeEWsXj4FDqef9IE88BpWfeGbWuJFNcARQMNI8m7aigiGDHzAtQB0yQjUu6y9ewOKFijURUD2ZayCVi1Z6LJsvu-_afzjy9PS7Y6mtAH9X_Fov05MtXO5MgOOg5ZNZGnBb2ZtmBmsrYUmEaRlc5fM-vdSWbmT8X9j2vurM46A4glyBbt4CfpQtT4TBkMnY_ue62OgkcaBiT8xgIpyMP7n38N8j7FejbtPoXdZpRairfNriTplXKWsKRtH6mkRSz6qMF4LdMPaAIlyuYRJlmemj3BWkTiHdv5lOPFWvOAYMluQp1zEvN9Kupa7P9yOe9G_7adM5uB0CdOUqV0Wtr36lsnvKimSPnqGrFUjprdFQLO80mYh5xPpcf-ebVDbePXGcpMi47t8ZUwtsIDNpix9d0eufBq1XbiwSC83b2M9by12D8M\"}",
+   "env": "{\"v\":1,\"p\":\"31d374e22f489bcb92c514b0ef7f681e\",\"s\":1007,\"t\":1800000000,\"iv\":\"Yaab7RLIjXiqW5YJ\",\"c\":\"lxJXDtLL8xg0QrV7AMir_aKFkgUMgRWOlJBbGywhv-U2eCJOVX5c_ZpGCBJyEkb_6GXqNU43NiOidDCRSMNQ2AbEzxTxOU0iEl7SlwCQhhS7svO7qhnxcvaqPmBcnTUgRdJLwRfB7p1CNJvJNj_dhKWQNawX5on9iunh3S1djTUkSPVwVLnJmRJ3unZBsumpF9TIFEukb0nSZyXA0ugkn105ffRccS2bREVBVq7nXz2GBSqyf-4yh_aOmCZhDwIFhgdpvZgmmKbMZQmfsPksezfcZpxgGbkM__D__h46C0ojH08F0bKkFvA54UIS2Y_FdRsYyO3SNBxAFqLYEDLAUxm5ckbI4jjuf8_6y3wWEEcxuL_7zvxjZP1IuGLakXsR4XQ-n5GQaw-OrBkCu6DuNhSYjLHHPpwoy9Eu8sf8jSh7JzjULToY0fptZ-0b5Y4yTwd5RbNrtbPa47bypXb-GUCICHNJ8ez-0qcBXPgsdYNHdCoNkDlqpNGQQv8IiBAxYarLHK0IkZRMyeSj92nK8q_2zo42r1A1t-Tnz6HkA4zd1XENfa11lkSa1NY9x9z4KqU\"}",
    "expect": "counter",
    "op": "install",
    "arg": "220"
   },
   {
    "name": "signed by another key",
-   "env": "{\"v\":1,\"p\":\"46e6c5b3625087000b1f26504615ac72\",\"s\":1008,\"t\":1800000000,\"iv\":\"bsucWOs4hsIhxzcU\",\"c\":\"A7SWmx5ZrBFDjHORd7LsLapkAg1x3Ps4d9M2hk9myratRhiY3KH1XY-MENN56xUksC1K5prnSxIP4njJZnnDAazJxrxumKOa-OP0DtP6WAxMJfjRTfVqMWgbpPIPm8KCqM6-RstIEjZZseTTW_IjuG-f3_ukn0VvuUMCuqf-8ddxz1-sLXyFEke-B-dHj1bGQQfWWC5rEoWdw223QHyaF-3iOe745as934VkJA-NwVqYpKnDhGWLu36Moqab1y32tWMYrgYGKrwTpkx9D6jdUZFmNiiaeu8E1AOzXo4rqhPD8r0YZ5acMka59nb21vqUtpBQVsYYkiFwC7zUfxVmctLV14lkcbV8aWOcJDpnbG2hEurCmekKxTc3MkiELKuSlyCK7AOIMUbEmY5s3MBO7iCDmZ2Gylb6LrcSJNn_qg5pLYWG-Si7WFo8MJeHIil0laKn0Y2gujnw8FYxMQMI2tmDLk_ZR0qFzBvS1LNOdYqz3jxRso6kcBsXlOhXNJvmWatsVIrevRMUCJMI5eq36xjWAMEKz_Rn2hUlqrBoZ39rrGT-613p-OlLr7JPaon-UYjy\"}",
+   "env": "{\"v\":1,\"p\":\"31d374e22f489bcb92c514b0ef7f681e\",\"s\":1008,\"t\":1800000000,\"iv\":\"Bt9qcOFi_hzEKurg\",\"c\":\"9QCRqFcslXIzTCQOvh3nkJlxnBaE8-9yzMl1yZcECxaAtqRBJtC53Is5jjcsWB-8lzjn8a8tlzF-i1hbGBVoV89rLSZpdIlva0qteQCl3A96KYCJnR_AhQBMjIdaU8hXWISoSmZx0KoaN0R1w1GoOtt4phXdF4IDPJNesKYbGIQPKHXGTeAhf3tvW5hsudgHCHgu_LgLe_ckTHpaEWLSSiuYU_9-qSceSdgmUZKrccZV9a_6lpnEOmZ0r2fwH2A_fDbzFvbq_6nqGyj3wh5mPFiXZz9PVYrubKxlEecZElK78i5Ofa9Ax5O8qZ3AXk3tGYkX-9BrQH5V3lXI-hUuURXYJU5wYb0deS_UmLd9QUNocI_C6nUNBkTh0mQGcUXfYewnqpKz0kZf9oNU3QYSqnkNJ3M9HeqXCtCvFXcxIZHzV8cZcpZZhEmb5UnNvqAQbLHRLg3PiP3o60I96_Hst6S4aOdtTUvwUm7IYO6RfBzuG2gSOUROzqViAnIJ5_aXj7ZHm-15YIZGSL7cl-Dgnnih32omxzJlQt-M85YWzOXjfbkoJR1uHPdbUP5fLRM1rSR1\"}",
    "expect": "does not verify",
    "op": "install",
    "arg": "220"
   },
   {
    "name": "another credential id",
-   "env": "{\"v\":1,\"p\":\"46e6c5b3625087000b1f26504615ac72\",\"s\":1009,\"t\":1800000000,\"iv\":\"ZMyrw2s63h2q3AMg\",\"c\":\"t3iKyAsgV94scLpVIhJyAeNF7-G3D5yNsPg7k9OC8VJFEWlslVMhNepUYmvTvbwGaBZ-Fd16c33WdPSOBZ9FfNLP7hrPFCC17zreHL4OcBSnb9cXKSjB2UvcBA7SPER5GqNfMldLSkyLjU6kbKVK5DrLJsq61SYmfWqoBsQ0VRD6ktjd6Gm-RyPPsxWcUzG6Obgw-POsTIf3EvJSr67Jg7JgblcaxhHkSQg91AX_SMDyzyUktUpaCzaCg-kjpArEFSM5pQSPcxbn500PQrNeYhKXEZ0S5MkbWiirkmwg3TR1bwCwkE-GNhoxwGiRJulX0Nxi2xGDRCT9ivzHbB86m-EdjDjghLUhWokojGnqySyAFFD1RnlG2ji9AKi1EI22xe9X6YpWwZZj_gbgc2wIIlRFOXEPTQhG2ssrzKusReUBoOddBHGzZmRjxrxJFBPQ9wNXOqJiHobeEDtqhkUNlD0zkdVlWRapXTfwKZ5r-_hYrqeEftUOFtxl9BFkGWZZNQh9r9k6PQEHB3FV2V4hPfk7P3wttfGPmo_OUE8m1t5JOJ2GT2VqWDbRSnRo-W5TiOQ\"}",
+   "env": "{\"v\":1,\"p\":\"31d374e22f489bcb92c514b0ef7f681e\",\"s\":1009,\"t\":1800000000,\"iv\":\"dXP8s1bCyiCoYc_y\",\"c\":\"ffQPqBAEUOc6GJyxT-Ub5iIAeSrqLIpTNzOP3sKrn_TUREwvhfZri9dFA_wnkVMvU6z4BXy_fS86-vpii5jshkZeGllPClDMSB2xoBYkpsc48hPPclpDyxVskFb2-hXX0nol7z9Fs7JfXJqc8Cl9Xsj4u4x32jJic8X-NIGWLmLPfT0Ofa_rX3EQ17y69yUPfgeWC9fH7swHAUTYtA_hxxdMK__Os9Tht6kpqO7OuR0a2SI0LuQUSiaW9GZKuHrF034mIIrjMYr5i6RBSf9dyWd1OEgK8f0ergmmmdcRa35baAqZNTCp8eHHV6BxEG_Q4ijtxBLVHder1zr4ZEh7RCZSl4NU5v6JxWXjB-od9bPh4ucliztqy6dpKn6SY6-CHXsIHCbBuznb1eibw7oMBk0Gg_B0uOt6GTtjdchmvjhndmJic0LqcppxuyqhERgLQJDWDvcwEfm8PDrjtWJ6VeJNCdB8pHI4BOdTFkqe3_4GTUeUsl7lF9_hBn38OEYnIR-BSXIwfYPXyS5ufKb2O4H0zPMwl8U44tLLfFk3czBukEGoNdrhBpLlxaUgsKEj8Mo\"}",
    "expect": "another passkey",
    "op": "install",
    "arg": "220"
   },
   {
    "name": "not on the list",
-   "env": "{\"v\":1,\"p\":\"46e6c5b3625087000b1f26504615ac72\",\"s\":1010,\"t\":1800000000,\"iv\":\"oIZBfC2YCOV8lnr0\",\"c\":\"MHL4ciE2_mny35_VNiTvD2xi7QFIwJQz3OQOn6ndiqi_Z3ke0KJA-iQsCoZObj9HRuJFpBA4OISSCMQ32krVKEVnzXfRVuhhNVf-eWR9w6YWikTt-p2VerllMSNLBYh9C-07L_SR1DDJRxDIZtvKGgXXEgwLszotQTX2pNYGumQChsBC_pXk6y8W4pbyXKcKpuQN9cR_l5mdajeCMeE2TszFy5ZZrmqcDYwT33zjd2BfMlmWPdGv3qOnsHUNEtQ2vYFePFfe6WIZ4ulhXTZjgpFUueGrCm5rQVjFfNXTIQM8i8MJuYK9jepSJh4YgGN_YudCMgTZGXcL8LarDuqBdDP_ca9y9dH104CJFQFyPqPPBQ3EAlhHWpxSn39Sd5cs2XV0TECW0ijGz8NwdUs_j4bt7NsYSllIut6xk_GpTxccs235V5IKMjISphY79SBkJ1dbQ7Z54zwxlmNUBOgp6wBUNR9r4J6DfAEPgqv8YpK4O2u2kLd8Geeej4fAIF10E_sbz4ALe6KxTs_nrtnP4m5jS2928FIeGA8oBl4ww_bbR0QFdMV9s_jQCNekdYAJ\"}",
+   "env": "{\"v\":1,\"p\":\"31d374e22f489bcb92c514b0ef7f681e\",\"s\":1010,\"t\":1800000000,\"iv\":\"wclINzvmKQK1hrIM\",\"c\":\"aFzOXI7KZGbr8HMUV28HTWYChxYiDHv6mCqmY3ydQyzZDGbjofDX40AYS4ak4uhIlEpVK1vBziaWXSj0ORNZ1lJavW6YUHRZ72RF3_U0Nclb1-2ydK1XK5OYrQK8PR4jiZlmbnaOvDrjFYDy2c-2W0JmQNLSWJMpAPLh0RXP1aYi_gOWq3GBbg7vBkeg0mCAdzNqPl3I9f8xY1sUizNAFVLLSUgRXbfL95YimcXtgTkNghP8UZpSnw-Hw2RunZm-u7SZhWk5QxJGb8EI-L7_o0LqmprXECer2wXhv_GUsqYn4IpBqlulU_ZyJ-GH6XbER8Cb0nVXXJWBvq_LG08CXJifFO5gojY7wBv1f3DwyrJ9oSOsA7P97holYN8d1BbdU72R9Vw9Gn3S9ukC841NWQKLS8oo3AP1t1qs3weVAVyqDREcl4Ma0Sh8-nahJ959IwpHcqos0bNdNMUE9gFvsWZSD0Dm5xM2umyBm6_fgrjAg1SKhMK7DeT3aFKVqgjLdaARrKipZup0DgXghu_5eywzdg4CVLsMl7K_mp80_jEAZiv2c_tyZjZFtp-zOI9GPA\"}",
    "expect": "not something",
    "op": "launch",
    "arg": "220"
   },
   {
    "name": "leading zero app id",
-   "env": "{\"v\":1,\"p\":\"46e6c5b3625087000b1f26504615ac72\",\"s\":1011,\"t\":1800000000,\"iv\":\"A-axhowucKojO35x\",\"c\":\"tkTr9BU_JaHDl-jrF5t-pvPFGxIcDS5AoVqhVii36MheiIaTNGgFA9AN9kKSSt7_vj7Q7ClD8jFwjr2JMyJ9ha4axzixydxV058I3IwlZvtea_j2CHLg_p6quGrfr9f4AZZn3_DiZgb0pWNsRONc2HgoWQP9Jr9eNoKyVHPWUK_0QVpXK4HNqGdXiVsWXds3_6PpAkIcjDNWzGuJmYLteoLl21m4xK2E467nTe-QuG_YQgZ_Y1xpGkBv7JYy6W6GjIKaBE_kEcT70HYX_V66HFxL6pmGJLUCg2PpKM_wJVzjuvx58Kkz-M1nlyCD78KO4QRVUmt6d_Bdb0-n1Lov7_vW041VgEWxo1y3YBRx-HMOlkWdZzfvwEoWsCLaCnSaOpPuUQk4FSeduSWq275j8t0LYRLF6NPDSGf-xSi9YjQ-fAZD3Ow4ylLcV1pB2IMc6_4DL_mp5sF2m7Iyhkr3bPLMNZudO9HiNLsj7pqwCKv3RskXVINFQjFg_sIaKhbSkieVa6tpR0n03Kk0SY956JC_RGEJRcE7MMLmPgRG-emoRoENJ4DlvbrdZjeJDFYev-Y\"}",
+   "env": "{\"v\":1,\"p\":\"31d374e22f489bcb92c514b0ef7f681e\",\"s\":1011,\"t\":1800000000,\"iv\":\"ZV3DCIje3sk9Nmxz\",\"c\":\"I-xOjoQj7IU3jWWq0mTLIbn41T4CbqEBRuwl0_kIFoKfRXUcS5dk-YkNkMBHr-xJ0ZSgDj4q6nYa30qiz9NkFVAGwu5TSSYJhRoUmdfw3Z4G1r8vWjawDl6hIa5Me-t-oxDXOf3ljx2rgzuHKfaTliEtCfSrw-f32aZ_ormfso_14lSDNsgbcOHVt10QgjUSxJwlNqJEOH7V7X91IgkkP1kM0KlIXeisrSNhvpz0eZzCiElb4dqYfZ3RQbygVApe-zGt-H4oaxLrue49A4h5_ob0jhlfDtDNjPwEoEKBcEYR4svnckDYhZ0sCymWgnr0XKHwr0fpYtmWOcAqr90ZsAn7HWU8VL5ImY8X4u0jskannU1zK_MAD-scakfrPWvvmo67vBCG7T4BVJ7k9ynE3ibRbr0jm_yjVbNiVmw7Ca_xMDNtejjUiYeL7deAsAaLgHXy9oQSAWv8QJosiflrOJHXofF3SkXSdexGjrTw5N3nnjqHEQ9VRphhj3ck_TGRHQhwyiGq2d-rN0rKWuJTy6oRd0nlhPhqzTE2ocCaWvXC_Cnpli4-qjAMWitbeXIMBYfT\"}",
    "expect": "bad argument",
    "op": "install",
    "arg": "0220"
   },
   {
    "name": "an hour old",
-   "env": "{\"v\":1,\"p\":\"46e6c5b3625087000b1f26504615ac72\",\"s\":1012,\"t\":1799996400,\"iv\":\"xITWdDJ2F0HEbkFD\",\"c\":\"AgH5m4mLvarx1EJvidBLo4VW1kOM7IPWJszSl0ThouzimRlZtq8u2-Jq1wCtRnbCkrEQczxquvjQv9nITiuYMyiBFYx5Z_7jNjxMWztBEL2rhiHJFk39GTym7mcTyCPscN4Zt8WOON2UXO_mdliUfVyYbmkzuxm9FNsudq-U34I3lxl_83dTjcLNXZ39PmxeZOnW1Vpa0CM__dYSbJTarrgZiwm6JUxVYzSM8zEzp1AHe3b3mtXfQXrcQAaAErygLcoti4VOJTv_P8lrteTok_mItKu92CdGTR1Jh-kGCfkxiXcky7HEsSNWK0Pm1gyEn1CwNo9gb0pTs37rtsVW7gUL7iWNiUCHJe4xVLpaTW7vElVloVIy-NURRJW9oX3WiTMzqvT1V5rGLmLZWafLX0mRKktZQ98mxMfs0_SiAWVFKQaHQg-gv_cC47nHqSo7eUYdsAEPxsNqfuflCWe0FPWrCattb8nCjSYMqW1Gzfr4dAWbkDkleaSpUDdB3c4Nogct6IN_w-ItbZiZVCtuvpk6TQZ0a_uOIvofF6Kly5P-kh8TCMjAu4sEAmYA7VS7w8Xl\"}",
+   "env": "{\"v\":1,\"p\":\"31d374e22f489bcb92c514b0ef7f681e\",\"s\":1012,\"t\":1799996400,\"iv\":\"dmrS24Ti5HrqLbqG\",\"c\":\"gQ9pvAgnbl8yZunfdRPJOTnkuuRC09rNnu5YJK2B0SsojDelIcXDKBOfYvUhNQcwD7sxwxxe3A59xCZ7AEP4zEeYAtXnZs8xxtbRUHZx2fZbor5qgPbP5zJgd50ryYm-U4oEi5DjYIwyqw4t9gb5H2af6Psv8024rEPnrP0GfMsaCsm-yWwg_5S6_LBpUmLbfVbMHyXAg9hbpUeBH66A-O1ZPQwTnXs4mQTw6zKzEkaN6GtMGy7MiyQ5a-IEvy4SUNQySsfUodrMLzNZZEmGK_oP_zPPKJKkJEPrf25zS0i77G5EFb23rnP4m25N7LgFqnAnlR-a_C2cosKl8h7HT5r06stIgkFlw1lLhdfV9lTEn9peCzhFb0wPR5bJ5C0byHV5hApejnNM35Q6ICTtSCvROYTWsJMkuyUfqEZ0Nz6JahZyasbZCsxtUN-ZEcsA6_XjKNoCFKjanF7d4nNna9EuV8HW1fuxnTkhxl6Yt8pv0-BGSIPRNwWV973gzaP6lOKxr4CYlWyclKFiNMbjwZEA4AuUz4wL_z-W4aUmPK1bvSxRWgiFlNUdIiDlzv7G5BU\"}",
    "expect": "too old",
    "op": "install",
    "arg": "220"
   },
   {
    "name": "uninstall a custom game",
-   "env": "{\"v\":1,\"p\":\"46e6c5b3625087000b1f26504615ac72\",\"s\":1013,\"t\":1800000000,\"iv\":\"p9AXGjh-aK9Zeoi0\",\"c\":\"_p94DSAQVhXbjue2Ru6zn_Chst8NHS8dmLk9jsJxp9JA2CKeJFau94PeWqGULItWm6hbnSbUYlWB86mi13ux_8etFn12ida96gCQqNBVTSd9lXyv2XiSsoxRkquP0QulXI1BJ_Op6hSTeRZpqSqVvwxYC5L6jxFr9oQGaRcQDF0Dm_VRjR_OGmq47AVsbnBnOtHNFqOoetDHblrOrewyjUPDfx_oyu3A2iZDpzX9aIh25DB6uagmM3eQKQH4JWxh48zHpgEpfQEtES-0G7d0BuGoXkcYIBGIhy2iYVeVVLHX5cFfOXa2FPhtPIro-yMixUYAkA_d2AgIxfY8yIvtRnXyDTVnovSsor8N5i5kxr0rswNJTc6eKCWnCUmlfFnRB85quvCYDD_Rm1hXb8lrwpFzJR4yDvsEHFuRSykYjE7Su2uJjnDpxfXjxCSwOjiY1wfexyybDyxWbXvMnLUZgGlwEVnRZyXxsQW5VnNBYLRUKHieaW4GzS3PQIHzgSeEhNXNbU1A0Un-r6RMba1sxMts6IXstBoqymP2BSyiPS0aI_pTpGqIo0N3pOZGkHkhMDZqauxow23Yx36Rt_KNLw2SkBg\"}",
+   "env": "{\"v\":1,\"p\":\"31d374e22f489bcb92c514b0ef7f681e\",\"s\":1013,\"t\":1800000000,\"iv\":\"rTzKf05r3V_fjUyk\",\"c\":\"qvpuqfduIb0zteBq2G0SNo2DiBckBt3pT95bRJ-My0GneT5L9OauIBHZ7YluyrLPxfmqJjIgIfV8rV5Ymj4PYLOrp9S1bwd1gW0Ytiia6XEJPngnrkbGmMoScH0VqR2jUmwLstlzaL0BSO5-HKSwCj__kYfuoirXb8n76iqWVTCqZoehO1kioRNdJa8on-guEMkZiYAwL8bsYH6VZ9NDpNbDxvA1MXuW2pg3VXrEOyorkP5z5wVGqhuq2Qj60nAXpiW2KKa9AvjHl4D92-cxHxY962z5avSAsIkAjWbhHnOWr3-6PgQLYRo4IW4ToaWADaWtwhV6zxIx1D281R3_R3tzmYjkci4QE7X4gc77AkhY0IDR59tFKOzeL64Hi3jgrTtn1h6BoQtEgJt1pyC2rxRD66tWcQX64j58nYlI8mfVRYZBT18ndR_RB2aEJj5hrq8lmQO6eFOpz9wNLLAWxqLMM6-fDi1Y0aGz66m7OUx7LwI81Q8vZvNOQpoQnaAy6bJwgZj6NYKtZ2tFWaJ4znAn3mfw7cOoQ5tVfr2GoYhui19n7Sr-jO64mwshbM74pCNlnKagCZFk6DwgoZPDmneYnw\"}",
    "expect": "ok",
    "op": "uninstall",
    "arg": "custom:abcdef012345"
   },
   {
    "name": "tampered ciphertext",
-   "env": "{\"v\":1,\"p\":\"46e6c5b3625087000b1f26504615ac72\",\"s\":1014,\"t\":1800000000,\"iv\":\"gtnVLF_ISxp90omR\",\"c\":\"i0OgWT19g-9-CiY9Kub6cPEhPufP9vGNfSENGsF-OQMUYOcTnZ8zvTZfTjo8FMY4_3SueYsUlkN5m9f7ioqqhVYx9LXAfL5PPG5XoH6lU9GIKhrslketNnK37dAgKU9X79VF_ym22QkkonXQ5rUFd5Zr09QOlksX0eXY6-4VL-s1LQ-zzuHClXU29bJmiCNPzrEMSzkmwpxC06IuViEZALoFaUULMsRpyi9HR7Ldxy0otV4tduKdCK6UIpHVPHCmF61mIevccLAgKaso_RK5SCJ8eVos5AFpl0RYAvq8HJABfqhtbHoitdyfqCDI9fozPN94OLDVREase1u8P0j4GXfOeDCedR5bD6R0szNyUqUqYDdorWC7Y5b72z4bon2OT4Gxx86XEAiOG7h9k2igT6CmBJZuKlWwfBQBMHH0MDcxisWeCnKl2ybV-jaU6eYS80TFlTCaAP0v5NoWVPAuMzdka0bg9SdeoNNN-wuzdhIXOwOi8RgTs4NMD8F94fXXJoisdRob-_HXVfxeyfLEz97afweDynJ5FSmYlktyxGF8rb-AylSbny6M6v76nmasHQ\"}",
+   "env": "{\"v\":1,\"p\":\"31d374e22f489bcb92c514b0ef7f681e\",\"s\":1014,\"t\":1800000000,\"iv\":\"cO5hkbxI2rlu8oAs\",\"c\":\"AlVpWA1CV4obD_s3q_APA2d0_xK6K4aAMA1j0knmDwqHYj9TvYo7H9maXO0bRL77JGZV5-K_TnQdROgTZbAhhzAIYhuXi1chfCNkpzwDCiRORFmx4kg6a9g_wPUnDAbHpTgKKRpzQAXZH1A0GheF_HPAloXwJlbUiuVYEIoShERhZyFGeFMw-JScll-iZyLm-SQtWP34m__q5a9OvD4n1f3diI1yj37CwsR8hDYcnLny_KPdLuBYEknPxVKrMtgUDyodrAZPE2gmXgRvrYfmwolxHOrK3C88lzD2X_sr7CDPJg6c2PcFhTnWtDsYg8dTZShn_DAUbAO_dNI0JZUcbUJV-RhBzao9CT0Z2DuUrZ4ExYiMv0rRr6Eu3MAEmphVn2Bj-KvF6EM8HieTVMTfMrKbrC3DAIS90YYRrOT_8LjYtTwQnZgvEl_jqUjFN5QxdTKpeS6wLiQG3MurMMiww5ymXxu6f-UeB30X2qky7l7NJK_Q1BC977Fsd2SexIcsMfniSBW_ays6L1ekgU5O97KDgbrUXHxxpPs72medhPRUgN-qXpkcb8HOK5wdkMLgcw\"}",
    "expect": "does not decrypt",
    "op": "cancel",
    "arg": "220"
   },
   {
    "name": "cross-origin",
-   "env": "{\"v\":1,\"p\":\"46e6c5b3625087000b1f26504615ac72\",\"s\":1015,\"t\":1800000000,\"iv\":\"K1WRitl_YCC3G4bH\",\"c\":\"BoJdoAY582HHw0pRdtgCJ7MXS2pQnb_d4C0uIGF0Yqx_ozg9eEHguvQb9rnnYyT-fo5vfWYH61FlDBz_-9LkeaowzxyFnu-Fr2E1367dABBWU7FlWUrCW8J5trzmBOv4aNZkXi6_rPoSoCRRu9WIOpkRo4sO-PPZFvJ-_u5_Z2Y8g3uxwSlZ4T-qAUcyI6cEN4nsgmHRiIvdj3qomXI8m6kHrwrwphkvvXSPyU3Amt05JT8HLpyY8J_PAsM-LYKLqVtKzys2LFV_8Djp1CaX-e8j1WEqWvFCAe8-2UYl_4FkjJi694TXLF4e5iewwU9_kDb2DAH1hjpb2yYNHOGFHn2jhhcGiPMojLAYa3J8TPPekkVj8TH6NxZis6Lq47azf6yukqSBrjf2h_GH3kuQXB3vp4jQ3rqUTHTkZRVTzEUUwVnhl6Brukm0D-4BvRuKJWX-l5nJmIZ-JTgqsUkwjT81UqyHbP_9RO0vYVzr6u2qgczHkJrMvO-5XZwjveEqAykHWqsJqcJzfwSUfTFEeuvzs1zBTYMW0aNYWZUhs1E9az7tneZZl1Iaqr1cnA\"}",
+   "env": "{\"v\":1,\"p\":\"31d374e22f489bcb92c514b0ef7f681e\",\"s\":1015,\"t\":1800000000,\"iv\":\"SMpKDE17YuS6mapy\",\"c\":\"yqzu4HOAy8P5YUL8aB13EPRa565Os41PM6CgOLFJgC3KWc441-TxMhBDpP7idoh_0LNqNV4_IFXPpg0rIAQY5MIlX7kKHdqxibc1pkR5xNQIN7IsqZ6UyA4bgbLjL6N_TtuCmll_NRXSgF1Gx6uOJ-6xE0GfxDfZH7zLrBymlI6K2horf1QpZbItPUdED1cCGVa-t5CH3lBkwiL_nYJksALE60ORqQfEpMPcdnZCCjYDJRfjyEP0Qe_WGufLmxgQeGiamDSchUaJsrzokY8k01Y1HJsI2JYwFV_LUZdbYkeBe-KhofI5beLm6lD8OnqJdUiEzOe29_za-whcdjR7dhLx36FgwPX7KXQCkRMR2_vY2k1p3hjEanPVbs80MaM3bIx0tS7YjAiYJWLQcohqNm8t2tQZVWa5rN7HbvNU90EUYOkY-dvkbOISj1UuK5CiNTYI2sPW5UOQAJpycU7cfAlfrVX5XSYVLYfC9Augp_iJZrndrSoHQFZnDIT9MKzbzKODw7xVi96x25rm4UiqesYoXPzixCbye7ZqpHyuyXNfiZu1yUEDIzIctv7igOm0\"}",
    "expect": "cross-origin",
    "op": "cancel",
    "arg": "220"
   },
   {
    "name": "cancel, passkey ok",
-   "env": "{\"v\":1,\"p\":\"46e6c5b3625087000b1f26504615ac72\",\"s\":1016,\"t\":1800000000,\"iv\":\"FZlm4wpfM7DKZKa3\",\"c\":\"3GMWZ28UXEXCqr3qy7DAIw3ZiR_m08nClaztd9N2KQLXqkqsdnPWcZKJEx3GMhrNVLALIsDISaoiKklo8fyUoG305kuNuQU7A3JS3tndZzY1qvUlCNPZkpX0BcIbumWitk_XIn-qOHiriaEVhTye5ya6RTpv2gKKEgxkC5HXL_RQh5hcTrIzV1wrcYOTqr8pbDfEaxgmgsLhKVXzbQmN2QrufmV7UbnQsjycjxY3W08ICQz6IsFOy7w7C1byWPUOhcWZJRdDOLUO7EaXnTm6WvjP_WK2cH84KPw-3bxspjpXX0tG_czBfTMFcn9fNglh7OBKsxbJ0TspMjRgj1VzSCv3GF6L1qShYgGr-bxIHMo8HHD_6U9E3gdSpygNKeX9LF_UoT4_AnchBFgJB6ozcMPcpzfIPMzv70K1q57672ajWXIOSHcLG0TTHmoz2mx2UWJ7FDPQss5qeDQza0rtO6C5paduSMGVe_UJOSCVoIdePpRkNlr2YZUAAY5tHLb3ByA1mCJezqQb7FdXRlevpCg4nc7rL6a38Kc75TiOHR6jfHas8P0lgULhTw_lcZnbEQ\"}",
+   "env": "{\"v\":1,\"p\":\"31d374e22f489bcb92c514b0ef7f681e\",\"s\":1016,\"t\":1800000000,\"iv\":\"7kr1Y-HbQ_OLHgG7\",\"c\":\"4hHtOAl8lxdg1z2XaKVtDUg8MXcPFNSIkfFauXGTQ8PNUDQrJ0HbbVyNF-l1OVdt0pGttswxOsTS0X6zkKLXb8-Ve5VLxN51bifSv7Qc7Zuo5bNJF4QYux811TN9YyID888Ggoeza6ER_dtPR9Z19zjn4G3A-mMxXQjpWFUon8n37wj4bEUV7aZlO8KpMpo6kvalm0GJ-m03Q5YJ1F-SaXbaCKRaUes2G3IwSNk-4nobYEzcUJNknjhqHExRBA8r8RepiLSLymUY3WI5aA8j8xBA8OXLnVb7dQnV3rOft7vY5opYL91uJbpL3_g3F2oX4befSR8qMHm6ICETCQuMXK20gny-TBS454QfQw9_lLcLoJT8DupyGYopO_njvkkqbhsL5z8qpu7xidRX_7Nf5h7_-JRwYl46yQ3R8L5-lONKQWykPwkIEnFc03IXFSVbnRs4XtUU2PWrYiMh3TNI_3nySwLjhCVrQDkwAeam2ytsPyhm4XUsG7dYoXdXaugLcu6tkuqLiK0B70scFuxKjrGfNDA5RoqOoD5R5Jfs0cgaP3FE3RG9c5batTXyYoPG6Rc\"}",
    "expect": "ok",
    "op": "cancel",
    "arg": "220"
   },
   {
    "name": "path as an argument",
-   "env": "{\"v\":1,\"p\":\"46e6c5b3625087000b1f26504615ac72\",\"s\":1017,\"t\":1800000000,\"iv\":\"JLFazmjGrTLp45R9\",\"c\":\"cBF_vQxhTQXT3VofgYYA_VknT_znX4EPhXZ_rBvS_Ka7KslErmutr2hVg6sNGUIYBxDz8b7MEMjtM4ZfTgpI_Flw-jbfAwahxgEtquXMRyVslWRZaPnOBQj3Zh6tc1Og32Ez_H6l4lfMI8BFDp5g4bUF9rnR09Ejsukz5fj0nHSgsngdzhBPGssGLtitGwVfx390bilV2md1iKUPgKzvJ_lRzp44yMBKhVVGT8nm85Vt0Psnf6t9ucDfLkG0GdfkGr4Haa2yqbh2vLbYBgIPUjkIAnrKQcOGGi1sfWL-zaveNMVpRMPI8qRTvYrP_UfrO6encAJDgpfesmjz5FvQA5Qf6xVVqEpnd1ZSuKAYfnPCXClfPeDpZ22oENDIStQKy1Gha2wYrjSNMjHEJaMEaFJis2jsKibPiFfmSL2MCrE2pE_YvoBSMGSmo4YGoGAVGFsS7kaNI-fp2O4SuCoCsVY6KlZ8AclKbf1xg7n21zKX2DuB6t92-zJy_Ax3duDf2_WfYxefGxC_l4vERc4jlGxz-BZ3h1bM0Gs5DuxP0J3yW5b-sZ23heizOm3ZOgiOdBmzCFxsLQtemA\"}",
+   "env": "{\"v\":1,\"p\":\"31d374e22f489bcb92c514b0ef7f681e\",\"s\":1017,\"t\":1800000000,\"iv\":\"y1SgnrWobcWtk3Ne\",\"c\":\"s-wSpzOkwUvSv2yzjr8aWZcfU6RC8e7dZKKhs6S4EdPyWM5TtqxfuRNF4dD6nAu5Jl9BjO83N7py5OI1V8yFkvHwnBHzx7hUwtaiJbTYXU7MKe1VaiF4nqc7UPdjgePXXx9wE0GgFcCbFYuZyBJPxJ6DnAj1rRE3Kks75DmbBy_lnA215iMdld9HT0xDtOjQBWW29NMXv4kqn52kFhRUz7q-QdiDgqVvefCb7B1uzLdQnqGv9bfSmeuvf51w16pTUK3q3ZOoA6mKwAmaGktmoTLQfuueOMubEhHpj3LZVrOmu3SoVcFbD_eTIVLektmS2hNFzgOrXtrMQnc2ajHIitDUNxDApZoePFgG8nBhWCo2HfbK2TbvepPOZtTq1I-fO2UzbPbl5A4bxbNa9o9o_m3z-Y1HWfcAPqFXZVdRMQPWxGOIhS2xOHuceHC5VL8Fjg9AZrwiSuFWK4VBm63PgtvHmYhkJDogmSAuDYJGdNeylkyblwZ9OMsrBlg8FkpMUsaHdlf37EA3inLT1n8aV398IM6xnaxA8QyEPKVfF8hGnjkKl5i82GYw_CIJ5YQKkITw6ShQ14WNYA\"}",
    "expect": "bad argument",
    "op": "uninstall",
    "arg": "..\\..\\x"

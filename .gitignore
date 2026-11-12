@@ -20,7 +20,7 @@ corpus/redist/
 toolchain/msix-packaging-src/
 toolchain/sdk-buildtools/
 
-# BoxedWine clone (~173MB, GPL-2.0). Not vendored: our entire divergence from
+# BoxedWine clone (~173MB, GPL-2.0-or-later). Not vendored: our entire divergence from
 # upstream is toolchain/boxedwine.patch (311 lines, 8 files), and
 # toolchain/build_bwjit.sh clones the pinned commit and applies it. Keeps the
 # repo small and keeps the licence line honest -- the patch is ours, the tree
@@ -44,7 +44,7 @@ toolchain/winvm/*ed25519
 **/tier0_s64.dll
 **/vstdlib_s64.dll
 
-# Claude Code session-local state: a runtime lock holding a pid/sessionId, and
+# Coding-assistant session-local state: a runtime lock holding a pid/sessionId, and
 # machine-local tool permissions. Neither is repo content.
 .claude/
 
@@ -64,17 +64,54 @@ __pycache__/
 .venv/
 .grok/
 
-# Session status notes written for the user mid-run. Prose about the state of a
-# task, not repo content -- GREENHOUSE.md is where anything durable goes.
+# Session status notes written mid-run. Prose about the state of a task, not
+# repo content.
 claudeghostbtw
 claudespidey*
-tester_logs/
+/*_logs/
 PRODUCT-PLAN.md
 design/
 toolchain/wdk-inc/
 
-# Local API response dumps.
-# Never commit these.
+# Personal data dumps -- never commit.
 userpatreonapi
 patreonapicurrentuser
 patreonapi*
+
+# ---- Kept out of the public repository ----
+# Private engineering log and working notes.
+GREENHOUSE.md
+claude*
+GAME-CANDIDATES.md
+ISSUES-*.txt
+toolchain/lethalco-*.md
+# Scratch copies and probe dumps.
+*.orig
+/gates.bin
+/slot.bin
+src/loader/_gl*.cpp
+loader_diag*.txt
+*.log
+# Machine-specific tooling and keys.
+toolchain/wdp_relay.py
+toolchain/vm_qr.py
+toolchain/smb.conf
+toolchain/winvm/
+toolchain/bin/
+toolchain/open-steamworks/
+toolchain/NoSteamWebHelper/
+.env
+.env.*
+*.pem
+# Reverse-engineering notes on third-party binaries stay local.
+toolchain/steamclient_re/
+# Shaders lowered from games' own bytecode are derived from that game's files:
+# bake them on your own console from your own copy, never commit them.
+corpus/dxil/lowered/
+corpus/dxil/exact/
+# Brand working files stay local; only the chosen one-ink mark is published.
+logos/*
+!logos/patreon-covers/
+logos/patreon-covers/*
+!logos/patreon-covers/07_mono_dark_ink.svg
+!logos/patreon-covers/07_mono_dark_ink.png

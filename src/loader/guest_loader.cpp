@@ -165,7 +165,6 @@ static uint32_t     g_launcherSelectedApp = 0;   // Steam appid of the picked ro
 // owned titles that are not in corpus/compat/compat.json -- which are exactly the
 // ones a stranger's report would be about.
 static std::wstring g_launcherSelectedName;
-static bool LuiEntAllowsLaunch();                 // launcher_ui.h (§43 membership gate)
 #endif
 // §65. A game the user uploaded from a browser (gh_custom.h). Decided at the
 // handoff from the picked path alone (GhCustomBegin), so a restart marker or a
@@ -272,7 +271,7 @@ static void Diag(const std::string& s)
     // filling the console's storage. Counted, not stat()ed, so it costs nothing.
     //
     // TAIL. A cap that simply stops writing keeps the START of a run and loses its
-    // END, and the end is where the death is. a tester's Continue run (0.0.664.0) sat on
+    // END, and the end is where the death is. A tester's Continue run (0.0.664.0) sat on
     // the menu for 90 minutes, its periodic lines (~2.6 KB/s: RSBINDLESS,
     // GPUHEARTBEAT, MEMORY, FRAME) spent all 16 MB there, and the level load, the
     // ~1 fps thrash and the stack-overflow death were never written. So the budget
@@ -933,7 +932,7 @@ static std::wstring g_lastGameDir;  // last launched game dir (survives ResetGue
 // pager, keepalive, raw input and the PSO-cache hide are each decided once per
 // process, before the picker); those apply from startup whenever the title is
 // installed -- to every game that console runs, exactly as the reference
-// console's global files do. a tester's 0.0.659.0 log found the second group, and
+// console's global files do. A tester's 0.0.659.0 log found the second group, and
 // 0.0.660.0 the spill size (read at startup once the pager is on there), and
 // 0.0.661.0 the spill ring/stat and the blackbox that follow it. Any
 // other title knob read before the title is chosen is reported at GhTitleBegin
@@ -2318,7 +2317,7 @@ static HRESULT WINAPI Bed_SHGetFolderPathW(HWND hwnd, int csidl, HANDLE token, D
     return hr;
 }
 // ===========================================================================
-// Virtual registry -- small read/write in-memory hive (GREENHOUSE.md §21, Path X).
+// Virtual registry -- small read/write in-memory hive (docs/architecture/filesystem-registry.md; Steam Path X).
 // steamclient64.dll will not initialize its global engine without the cold-client
 // keys HKCU\Software\Valve\Steam\ActiveProcess (SteamClientDll64/Universe/...): it
 // can't deduce its "universe" and CreateSteamPipe returns 0. The container has no
@@ -2344,7 +2343,6 @@ static void RegMarkDirty();
 
 static std::wstring RegLower(const std::wstring& s){ std::wstring o=s; for(auto&c:o) if(c>=L'A'&&c<=L'Z') c=(wchar_t)(c+32); return o; }
 static std::string  RegNarrow(const std::wstring& s){ return std::string(s.begin(), s.end()); }
-static bool GhLicenseGate(std::vector<uint8_t>& b, const std::string& path, std::string& note, std::string& why);   // launcher_ui.h (§46)
 static std::wstring RegWiden(const char* s){ if(!s) return L""; int n=MultiByteToWideChar(CP_ACP,0,s,-1,nullptr,0); if(n<=0) return L""; std::wstring w(n-1,0); MultiByteToWideChar(CP_ACP,0,s,-1,&w[0],n); return w; }
 static std::wstring RegRootName(HKEY h){
     if(h==HKEY_CLASSES_ROOT)   return L"hkcr";
@@ -2636,19 +2634,13 @@ static void RegHiveLoad()
         // has one (Tsushima: the reference console's graphics settings, Texture
         // Low). The seed is only read; RegHiveSave writes the real file as usual.
         // §44: the title package's seed (LocalState\titles\seed\<base>\) first,
-        // then a bundled dev build's copy in the Launcher package.
+        // then the copy in the Launcher package.
         std::wstring seed;
         if (g_title){
             const std::wstring base = g_title->SeedName();
             EnsureInstallDir();
             seed = std::wstring(kLocalState) + L"titles\\seed\\" + base + L"\\hive.txt";
-            std::string lnote, why;
-            if (ReadWholeFile(seed, b, true) && !b.empty() &&
-                !GhLicenseGate(b, "seed/" + RegNarrow(base) + "/hive.txt", lnote, why)){
-                Diag("REG seed " + RegNarrow(seed) + " REJECTED " + why);
-                b.clear();
-            } else if (!b.empty() && !lnote.empty()) Diag("REG seed" + lnote);
-            if (b.empty())
+            if (!ReadWholeFile(seed, b, true) || b.empty())
                 seed = g_installDir + L"guest\\seed\\" + base + L"\\hive.txt";
         }
         if (seed.empty() || (b.empty() && !ReadWholeFile(seed, b, true)) || b.empty()){
@@ -2948,7 +2940,7 @@ static HMODULE WINAPI Bed_LoadLibraryExW(LPCWSTR n, HANDLE f, DWORD flags)
 // callbacks, CreateSteamPipe silently returns 0 ("Don't know Steam universe. Order
 // of init bug?"). We're the bootstrapper's stand-in, so we export the callbacks
 // ourselves and intercept those specific names in Bed_GetProcAddress below.
-// Ref: GREENHOUSE.md §21 (Path X), steamclient64.dll disasm at 0x138cb8ac0 (resolver).
+// Ref: Path X (docs/steam/README.md), steamclient64.dll disasm at 0x138cb8ac0 (resolver).
 static int __cdecl Bed_SteamBootstrapper_GetEUniverse()
 {
     return 1;   // k_EUniversePublic
@@ -4828,7 +4820,7 @@ static void RunGuestTlsCallbacksForThread()
 }
 
 // ===========================================================================
-// Graphics bed: the D3D11On12 bridge (GREENHOUSE.md §13.4).
+// Graphics bed: the D3D11On12 bridge (docs/architecture/graphics.md).
 //
 // A D3D11 guest that creates a device the normal way lands on the container's
 // legacy D3D11 runtime path -- feature level 10_1, NO compute shaders -- even
@@ -5159,7 +5151,7 @@ static void BuildBridgeOnUi()
                 // D3D12CreateDevice then fails E_FAIL on EVERY adapter, so the loader
                 // gets no device at all and the guest never launches (heap=0 sub=0).
                 // Verified 3/3 graphics inits in one run against a DBG=0 control on the
-                // same build. Do not spend another run on it; see GREENHOUSE.md.
+                // same build. Do not spend another run on it.
                 if (GhCfgNum(L"gh_d3d12_debug.txt", "GH_D3D12_DEBUG", 0) >= 2){
                     dbg1->SetEnableGPUBasedValidation(TRUE);
                     Diag("D3D12 GPU-based validation ENABLED");
@@ -5794,8 +5786,8 @@ static void GhRtTest(ID3D12Device* dev0, ID3D12CommandQueue* q0)
 
     // ---- #158: real draw work (gh_rttest_mode bit 1) --------------------------
     // Every previous run of this probe issued barriers and transitions ONLY -- no
-    // root signature, no PSO, no vertex data, no rasterisation. GREENHOUSE.md:9900
-    // later showed that regime does not predict this hang (barriers alone in a
+    // root signature, no PSO, no vertex data, no rasterisation. A later run
+    // showed that regime does not predict this hang (barriers alone in a
     // loader list survive 541,225 while the real frame dies in five executions), so
     // "the standalone repro does not reproduce" was only ever measured in the one
     // regime known not to reproduce it. This gives it work to contain.
@@ -10031,7 +10023,14 @@ static const std::wstring& GhPkgCorpusDir()
         EnsureInstallDir();
         std::wstring p = g_installDir + L"guest\\ghlo\\";
         const bool there = GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
-        Diag("CORPUSDIR package " + std::string(p.begin(), p.end()) + (there ? " present" : " ABSENT"));
+        // A release build ships no shader corpus (its blobs are derived from a game),
+        // so ABSENT is normal there and nothing fails on it: a lookup that finds no
+        // blob here goes on to the installed corpus add-on (GhReadPackBlob) and the
+        // console's own bake (§47, kDevBake), and a key none of them has is a miss
+        // that reaches the driver exactly as it did before any corpus existed.
+        Diag("CORPUSDIR package " + std::string(p.begin(), p.end()) +
+             (there ? " present" : " ABSENT -- no bundled shader corpus; using the corpus add-on"
+                                   " (if installed) and the on-device bake"));
         return there ? p : std::wstring();
     }();
     return d;
@@ -10047,9 +10046,9 @@ static bool GhCorpusBakeOnly()
 { static const bool v = GhCfgNumZ(L"gh_corpus_bake_only.txt", "GH_CORPUS_BAKE_ONLY", 0) != 0; return v; }
 static bool GhReadPackBlob(const std::wstring& name, std::vector<uint8_t>& out, bool probe = false);   // launcher_ui.h (§44)
 static bool GhReadBundledBlob(const std::wstring& name, std::vector<uint8_t>& out, bool probe = false); // launcher_ui.h
-// The package's corpus: guest\ghlo\ of a bundled dev build -- plain *.ghpak packs
+// The package's corpus: guest\ghlo\ of a build that bundles it -- *.ghpak packs
 // (iterate-launcher.sh), else loose gh_*.bin from an older build -- then the
-// encrypted packs of the installed corpus add-on (§44, members only).
+// packs of the installed corpus add-on (§44).
 static bool GhReadPkgBlob(const wchar_t* prefix, const std::wstring& wkey, std::vector<uint8_t>& out)
 {
     const std::wstring& d = GhPkgCorpusDir();
@@ -11432,7 +11431,7 @@ static void GhBillReport(const char* tag, const GhBillSnap& a, const GhBillSnap&
 // The second half of #211, and the half that matters if the first half says
 // every shape charges commit. #143 established that file-backed views escape
 // the commit cap on this console -- 1 GB dirtied cost 56 MB of budget -- and
-// [[arena-cap-is-our-own-number]] that the 1 GiB of live view is the
+// a later measurement that the 1 GiB of live view is the
 // container's own ceiling. If D3D12 will open a HEAP over a file mapping, the
 // game's heaps move off the container budget without changing one thing the
 // game asks for or one thing it receives.
@@ -14009,10 +14008,17 @@ static void GhDxilControl()
 //                      the certificate work altogether -- which is also the only
 //                      version that removes the stall.
 //
-// Both sites are checked byte-for-byte before anything is written. A different
-// build of the game must be left alone, not corrupted. This is not stepping
-// around a decision anyone made about this file: PsPcSdk.dll is Sony's own
-// signed DLL, staged by us, and the container has no trust provider to ask.
+// Scope, stated plainly:
+//   * OPT-IN PER TITLE. Off unless gh_pspc_trust is set -- in practice only by
+//     Ghost of Tsushima's title config (corpus/titles/ghostoftsushima.ghtitle.json).
+//   * ONLY THAT EXACT BUILD. Both sites are checked byte-for-byte against the
+//     expected bytes below before anything is written; a different build of the
+//     game is left alone, not corrupted.
+//   * ONLY BECAUSE THE CONTAINER HAS NO TRUST PROVIDER. The check is an
+//     Authenticode signature check of Sony's own signed PsPcSdk.dll; it cannot
+//     succeed in an app container whatever the file is.
+//   * NOT A LICENCE OR OWNERSHIP CHECK, and nothing here touches one. The game's
+//     Steam ownership is answered from the user's own owned list (gh_owned.h).
 static void GhPatchPsPcTrustCheck(uint8_t* base, DWORD imageSize)
 {
     const unsigned mode = GhCfgNum(L"gh_pspc_trust.txt", "GH_PSPC_TRUST", 0);
@@ -14071,25 +14077,24 @@ static void GhPatchPsPcTrustCheck(uint8_t* base, DWORD imageSize)
 // game exits deliberately, and what looked like a hang was our teardown waiting
 // for the shell to kill the app.
 //
-// The call site is plain, unobfuscated code (the SDK wrappers around it are not
-// -- 0x140d27c70 disassembles to garbage on disk, like the trust check):
-//
-//     140544542  call 0x140d27c70            ; scePsPcInitialize wrapper
-//     140544547  mov  %eax,%edi
-//     140544549  test %eax,%eax
-//     14054454b  je   0x14054456f            ; <- success path
-//     14054454d  ...  lea r8,"scePsPcInitialize failed: %x" ; log and give up
-//
-// One byte: `74` (je) -> `EB` (jmp). The displacement, the length and every
-// register are untouched, so nothing downstream shifts.
+// The call site is plain code: the wrapper's return value is tested and a
+// conditional jump at GUEST+0x54454B takes the success path; otherwise the game
+// logs "scePsPcInitialize failed" and gives up. One byte: `74` (je) -> `EB`
+// (jmp). The displacement, the length and every register are untouched, so
+// nothing downstream shifts.
 //
 // This does NOT make the SDK work. It cannot: the PS PC SDK wants a Windows
 // service, PSN and a TPM, none of which exist in an app container. It asserts
 // that the game can carry on without it, which is a claim to be TESTED, not
 // assumed -- and the success path is the right place to test it, because it
-// already tolerates its own next call failing (0x140544579 -> jne 0x1405445af,
-// straight to "mark initialised"). If the game instead needs real SDK state,
-// the next failure will say so, and it will say so somewhere new.
+// already tolerates its own next call failing. If the game instead needs real
+// SDK state, the next failure will say so, and it will say so somewhere new.
+//
+// Scope, as for gh_pspc_trust above: OPT-IN PER TITLE (gh_pspc_init, set only by
+// Ghost of Tsushima's title config), ONLY THAT EXACT BUILD (the expected bytes
+// are verified before the write), and only to work around what the container
+// lacks (no PS PC SDK service, PSN or TPM). It is not a licence or ownership
+// check and does not bypass one.
 static void GhPatchPsPcInit(uint8_t* base, DWORD imageSize)
 {
     if (!GhCfgNum(L"gh_pspc_init.txt", "GH_PSPC_INIT", 0)) return;
@@ -14474,13 +14479,13 @@ static bool GhScdxilPatchScDll()
 //                  2  + 0c, wrap the UMD's adapter open and log the negotiation
 //              bit 4  + 0b's HEAVY copies of the whole graphics stack. Separate
 //                     because that is ~40 MB into a ~35 MB LocalState quota the
-//                     GAME's log shares ([[localstate-quota-starves-diag]]), and
+//                     GAME's log shares, and
 //                     every one of those modules is already pulled to the host.
 //                     Only set it to re-pull after a console OS update.
 //                  3  + actually CALL the stage query. DELIBERATELY SEPARATE:
 //                     its prototype is not public, and a wrong ABI guess faults
-//                     into our own VEH, which has killed the app before
-//                     ([[guest-live-peek]]). Decode the bytes mode 1 prints
+//                     into our own VEH, which has killed the app before.
+//                     Decode the bytes mode 1 prints
 //                     FIRST, then come back and set 3.
 // ---------------------------------------------------------------------------
 static bool GhSafeReadCode(const void* p, unsigned char* out, int n);   // fwd
@@ -15062,7 +15067,7 @@ static void GhAuditModule(const char* name, DWORD codeRva, DWORD codeLen)
 }
 
 // Does this console's D3D12 refuse EVERY graphics PSO, or only Spider-Man's?
-// GREENHOUSE.md 31 concluded the former and short-circuits every PSO to E_FAIL,
+// An earlier investigation concluded the former and short-circuits every PSO to E_FAIL,
 // but our own launcher UI and D2D overlay draw through g_gfx.d11ctx -- the
 // D3D11On12 device sitting on this very g_gfx.d12 -- and those render fine on
 // the TV. 11on12 cannot draw a single triangle without the driver compiling its
@@ -19722,7 +19727,7 @@ static volatile LONG64 g_smpN = 0;
 // Series X (2026-10-09). The console's D3D12Core validates every sampler and
 // accepts a MINIMUM/MAXIMUM reduction filter (D3D12_FILTER 0x100-0x1D5) only when
 // TiledResourcesTier >= 2 -- the D3D rule that ties min/max filtering to tiled
-// tier 2. a tester's Series X reports tier 1, so Tsushima's first min/max sampler made
+// tier 2. A tester's Series X reports tier 1, so Tsushima's first min/max sampler made
 // the runtime remove the device with INVALID_CALL from inside CreateSampler
 // (D3D12Core+0x4B3A6, a CPU-side removal: no GPU work, DRED empty). The UMD under
 // it is byte-identical to the Xbox One's, which samples min/max natively.
@@ -26948,7 +26953,7 @@ static void GhCbvDumpEmit(LONG seq, UINT n, ID3D12CommandList* const* l)
 // the light submissions alongside the heavy ones and cannot tell "the fifth execution
 // of the heavy list" apart from "the Nth execution of anything non-empty". That is why
 // its K=2 row (three heavy executions, dead) sits in tension with the law drawn from
-// the skip cells. GREENHOUSE.md named a per-submission duplicate as the instrument
+// the skip cells. The investigation named a per-submission duplicate as the instrument
 // needed to settle it, and it was never built.
 //
 // The law says the GPU dies on the FIFTH EXECUTED heavy submission. Duplicate an early
@@ -27085,7 +27090,7 @@ static void GhD12CallWatchdog()
 // texture-only heaps (type=1 flags=0x44 align=64K, one per texture, recycled by
 // size class and never destroyed: 1,690 MB at SPILL12's death). Tier 2 tiled
 // resources are the one D3D12 primitive that separates a texture's ADDRESS from
-// its BACKING, and TILE0..TILE0e (GREENHOUSE.md 32.126) proved on this driver:
+// its BACKING, and TILE0..TILE0e proved on this driver:
 // a reserved texture bills +0.0, a 0x44 tile-pool heap bills its size once,
 // UpdateTileMappings bills 0, and a WHOLE-resource single-range map / unmap /
 // remap is honoured by reads and writes (per-tile changes are NOT, and a mapping
@@ -34853,8 +34858,7 @@ static void GhUmdVaDump(int want)
 //      resolves the nine exports lazily, and on failure latches "1" and skips every cache call
 //      IN SILENCE -- which is the only reason this project has never seen a cheap launch.
 //   2. does ShaderCache_Create SUCCEED in the container?  The store lives in the same
-//      per-container folder pool whose ~35 MB quota has starved our own diag before
-//      ([[localstate-quota-starves-diag]]).
+//      per-container folder pool whose ~35 MB quota has starved our own diag before.
 //   3. does the local store SURVIVE a relaunch?  That is the whole 2.4-hour question: if
 //      FindLocalValue starts hitting on launch N+1, the warm pass is minutes, not hours.
 //
@@ -34878,7 +34882,7 @@ static void GhUmdVaDump(int want)
 //
 // Scoring: `SCACHE install`, then `SCACHE intercept <fn>` x9, then the census counters.  A run
 // with the knob on and no `SCACHE install` line is VOID, not a negative -- grep `CFG gh_scache`
-// first ([[loader-knob-reads-are-logged]]).
+// first (knob reads are logged).
 // §56: 3 for every title, not only the one whose config asks. The driver's cache is one
 // process-global store that every game after the first shares, so a process that boots
 // without the guard leaves the next game unguarded too: RV booted with gh_scache=0, and
@@ -34937,8 +34941,8 @@ static void GhScacheCensus(const char* why)
 // now standing in front of.  gh_scache_x multiplies all five.  The store is a FILE written
 // through CreateFile2/WriteFile/SetFilePointerEx -- there is no CreateFileMapping in scache's
 // import table -- so a bigger store costs disk, not the 5 GiB commit budget.  What it MAY cost
-// is app-container quota, which is the same pool that has starved our own diag before
-// ([[localstate-quota-starves-diag]]); that is exactly what the cell measures.
+// is app-container quota, which is the same pool that has starved our own diag before;
+// that is exactly what the cell measures.
 static unsigned GhScacheX()
 {
     // §56: 128 for everyone, Tsushima's value: every title opens the same store, so it
@@ -35125,7 +35129,7 @@ static bool GhScNameIs(const wchar_t* w, const char* a)
 // took 32 MiB in the same minute.  Two volumes, and only one of them can hold a
 // shader cache sized for 16,192 pipelines.
 //
-// Read [[localstate-quota-starves-diag]] again in that light: the "~35 MB
+// Read the LocalState-quota finding again in that light: the "~35 MB
 // LocalState quota" was never a per-package quota, it is this 3.0 GB volume with
 // everything else already on it.  Diag is unbuffered -- one CreateFileW /
 // WriteFile / CloseHandle per line -- so when the volume fills, every loader line
@@ -35587,7 +35591,7 @@ static HRESULT WINAPI Bed_D3D11CreateDeviceAndSwapChain(
 }
 
 // ===========================================================================
-// Windowing bed: a USER32 surrogate (GREENHOUSE.md §0's hardest "no").
+// Windowing bed: a USER32 surrogate (docs/architecture/window-input.md).
 //
 // A classic Win32 game does RegisterClassEx -> CreateWindowEx -> gets an HWND ->
 // creates its swap chain against that HWND -> runs a PeekMessage loop. The
@@ -36680,10 +36684,38 @@ static int WINAPI Bed_MessageBoxA(HWND, const char* text, const char* cap, UINT 
 // walks the state handle afterwards (WTHelperProvDataFromStateData ->
 // GetProvSignerFromChain -> GetProvCertFromChain) to read the signer's
 // certificate -- a fabricated success with no state data would fail there
-// instead, one call later. Only a failed verification is turned into
-// ERROR_SUCCESS. This is not stepping around a decision anyone made about this
-// file: it is Sony's own signed DLL, staged by us, and there is no trust
-// provider in the container to ask.
+// instead, one call later.
+//
+// A failed verification is turned into ERROR_SUCCESS for exactly two files and
+// nothing else: PsPcSdk.dll and libScePad.dll (Sony's own signed PlayStation PC
+// SDK runtime), and only when the file being verified lives in the game's staged
+// PSPC_SDK folder (LocalState\ghprogramdata\...\PSPC_SDK\) or in the game's own
+// directory. That is a workaround for the container having no trust provider to
+// ask, not a licence or ownership check. Every other file -- any other name, or
+// these names anywhere else, or a call that is not about a file -- gets the real
+// result unchanged.
+static bool GhTrustPathAllowed(const std::wstring& raw, std::string* fileName)
+{
+    std::wstring p = raw;
+    if (p.rfind(L"\\\\?\\", 0) == 0) p = p.substr(4);
+    for (auto& c : p) if (c == L'/') c = L'\\';
+    if (p.find(L"..") != std::wstring::npos) return false;       // no climbing out of a folder
+    const size_t sl = p.find_last_of(L'\\');
+    const std::wstring base = sl == std::wstring::npos ? p : p.substr(sl + 1);
+    if (_wcsicmp(base.c_str(), L"PsPcSdk.dll") != 0 && _wcsicmp(base.c_str(), L"libScePad.dll") != 0)
+        return false;
+    *fileName = RegNarrow(base);
+    const std::wstring pspc = std::wstring(kLocalState) +
+        L"ghprogramdata\\Sony Interactive Entertainment Inc\\PSPC_SDK\\";
+    auto under = [&](const std::wstring& path) {
+        if (StartsWithNoCase(path, pspc)) return true;
+        if (!g_guestDir.empty() && StartsWithNoCase(path, g_guestDir)) return true;
+        if (!g_guestRootDir.empty() && StartsWithNoCase(path, g_guestRootDir)) return true;
+        return false;
+    };
+    // The guest may name the file by a virtual path; judge where it really is.
+    return under(p) || under(MapToReal(p.c_str()));
+}
 typedef LONG (WINAPI *PFN_WinVerifyTrust)(HWND, GUID*, LPVOID);
 static LONG WINAPI Bed_WinVerifyTrust(HWND hwnd, GUID* action, LPVOID data)
 {
@@ -36692,25 +36724,49 @@ static LONG WINAPI Bed_WinVerifyTrust(HWND hwnd, GUID* action, LPVOID data)
         return m ? (PFN_WinVerifyTrust)GetProcAddress(m, "WinVerifyTrust") : nullptr;
     }();
     LONG rv = real ? real(hwnd, action, data) : (LONG)0x800B0001; // TRUST_E_PROVIDER_UNKNOWN
-    // WINTRUST_DATA is versioned by cbStruct; read the two fields that say what
-    // this call was for, and only when the struct is big enough to hold them.
-    unsigned uiChoice = 0, stateAction = 0; void* state = nullptr;
+    // WINTRUST_DATA is versioned by cbStruct; read the fields that say what this
+    // call was for, and only when the struct is big enough to hold them. x64
+    // layout: dwUIChoice +24, dwUnionChoice +32, the union +40, dwStateAction
+    // +48, hWVTStateData +56. WTD_CHOICE_FILE (1) -> WINTRUST_FILE_INFO, whose
+    // pcwszFilePath is at +8. The guest owns these pointers, so every read is
+    // fault-guarded.
+    unsigned uiChoice = 0, unionChoice = 0, stateAction = 0; void* state = nullptr;
+    const wchar_t* pathPtr = nullptr;
+    wchar_t pathBuf[MAX_PATH * 2] = {};
     if (data){
-        const DWORD cb = *(const DWORD*)data;
-        if (cb >= 0x40){
+        GhSehCall([&]{
+            const DWORD cb = *(const DWORD*)data;
+            if (cb < 0x40) return;
             uiChoice    = *(const DWORD*)((const char*)data + 24);
+            unionChoice = *(const DWORD*)((const char*)data + 32);
             stateAction = *(const DWORD*)((const char*)data + 48);
             state       = *(void* const*)((const char*)data + 56);
-        }
+            if (unionChoice != 1) return;                                   // WTD_CHOICE_FILE
+            const char* fi = *(const char* const*)((const char*)data + 40);
+            if (!fi || *(const DWORD*)fi < 16) return;                      // WINTRUST_FILE_INFO.cbStruct
+            pathPtr = *(const wchar_t* const*)(fi + 8);
+            if (!pathPtr) return;
+            size_t i = 0;
+            for (; i + 1 < sizeof pathBuf / sizeof pathBuf[0] && pathPtr[i]; ++i) pathBuf[i] = pathPtr[i];
+            pathBuf[i] = 0;
+        });
     }
+    bool force = false;
+    std::string fileName;
+    if (rv && pathBuf[0]) force = GhTrustPathAllowed(pathBuf, &fileName);
     static volatile LONG n = 0;
     if (InterlockedIncrement(&n) <= 16)
         Diag("BED WinVerifyTrust action=" + Hex(action ? (uint32_t)action->Data1 : 0u) +
              " uichoice=" + std::to_string(uiChoice) +
+             " union=" + std::to_string(unionChoice) +
              " stateaction=" + std::to_string(stateAction) +
-             " real=" + Hex((uint32_t)rv) + " state=" + Hex((uint64_t)(uintptr_t)state) +
-             (rv ? " -> forcing ERROR_SUCCESS" : ""));
-    return rv ? 0 : rv;
+             " real=" + Hex((uint32_t)rv) + " state=" + Hex((uint64_t)(uintptr_t)state));
+    if (!force) return rv;
+    static volatile LONG forced = 0;
+    if (InterlockedIncrement(&forced) <= 16)
+        Diag("BED WinVerifyTrust " + fileName + ": the container has no trust provider -> forcing ERROR_SUCCESS"
+             " (PSPC runtime only)");
+    return 0;
 }
 // Focus/visibility queries Unity cross-checks when deciding gAppActive. All
 // report the game window as the active, focused, visible, non-minimized one so
@@ -38669,7 +38725,6 @@ static void KM_OnMouseDelta(winrt::Windows::Devices::Input::MouseEventArgs const
 // and feed g_kmCurX/Y + the mouse-button vkeys + WM_MOUSE* messages exactly as
 // the CoreWindow pointer handler would. This is the ONLY path that delivers a
 // hardware mouse to a sideloaded Xbox app; keyboard still comes via CoreWindow.
-static const char*          g_pcIp   = "192.0.2.11";   // PC running mouse_stream.py
 static const unsigned short g_pcPort = 55123;
 static unsigned             g_kmNetEvents = 0;
 
@@ -38741,9 +38796,8 @@ static void NetMouseThread(){
     // The Xbox is reached REMOTELY (Tailscale subnet router + SNAT), so only the
     // host->Xbox direction routes -- the Xbox cannot dial out to the dev host's
     // tailnet IP. So we LISTEN here and the PC mouse streamer CONNECTS to the Xbox
-    // (192.0.2.10:55123), exactly how WDP reaches us. (Old model had the Xbox
-    // connect out to a same-LAN PC at g_pcIp; that only worked when co-located.)
-    (void)g_pcIp;
+    // (<console-ip>:55123), exactly how WDP reaches us. (Old model had the Xbox
+    // connect out to a same-LAN PC; that only worked when co-located.)
     SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (ls == INVALID_SOCKET){ Diag("NETMOUSE listen-socket FAILED err=" + std::to_string(WSAGetLastError())); return; }
     { int one=1; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (char*)&one, sizeof(one)); }
@@ -39741,7 +39795,7 @@ static bool Bed_crs_start_handler()
 // question in this project's history. A knob that is uploaded, acknowledged 200
 // by WDP, printed by the harness and then NOT seen by the loader produces a run
 // that looks completely normal and measures the previous configuration
-// ([[wdp-harness-silent-failures]], [[ghcfgnum-cannot-express-zero]]). #209 lost
+// (a silent harness failure, or a knob that cannot express zero). #209 lost
 // three console runs to exactly that: gh_ddi_probe.txt was on disk with the
 // bytes 31 0a and GhDdiProbe() still came back 0, with nothing anywhere saying
 // which half was lying. One line per knob ends that class of question for good.
@@ -39961,11 +40015,6 @@ static void GhTitlesLoadDir(const std::wstring& dir, const char* where, std::vec
         std::vector<uint8_t> b;
         if (!ReadWholeFile(path, b, true) || b.empty()){ Diag("TITLE file " + pn + " REJECTED unreadable or empty"); continue; }
         if (b.size() > (1u << 20)){ Diag("TITLE file " + pn + " REJECTED larger than 1 MiB"); continue; }
-        std::string lnote;
-        if (strcmp(where, "LocalState") == 0){
-            std::string why;
-            if (!GhLicenseGate(b, RegNarrow(fd.cFileName), lnote, why)){ Diag("TITLE file " + pn + " REJECTED " + why); continue; }
-        }
         ghjson::Value j; std::string err;
         if (!ghjson::Parse((const char*)b.data(), b.size(), j, err)){ Diag("TITLE file " + pn + " REJECTED " + err); continue; }
         GhTitle t; std::string why, notes;
@@ -39989,7 +40038,7 @@ static void GhTitlesLoadDir(const std::wstring& dir, const char* where, std::vec
              " app=" + std::to_string(t.steamAppId) + " knobs=" +
              std::to_string(t.knobs.size() - nEarly) + " early=" + std::to_string(nEarly) +
              " psoDeny=" + (t.hasPsoDeny ? std::to_string(std::count(t.psoDeny.begin(), t.psoDeny.end(), '\n')) : std::string("-")) +
-             (same ? " (overrides " + same->from + ")" : std::string()) + notes + lnote);
+             (same ? " (overrides " + same->from + ")" : std::string()) + notes);
         if (same) *same = std::move(t); else out.push_back(std::move(t));
     } while (FindNextFileW(f, &fd));
     FindClose(f);
@@ -40336,14 +40385,117 @@ static std::wstring GhLaunchMarkerConsume()
     return g_launchMarker.guest;
 }
 
+// The PlayStation PC SDK runtime (PsPcSdk.dll + libScePad.dll) is Sony's, and a
+// release build does not ship it (iterate-launcher.sh, GH_RELEASE=1): the seed's
+// PSPC_SDK version folder then carries only what is ours or redistributable (the
+// VC++ runtime and our tbs.dll stand-in). So when a title's seed has a PSPC_SDK
+// folder and LocalState's copy of it lacks either DLL, take them from the user's
+// own install of the game: its directory and the redist-like folders under it,
+// shallow first. A dev build's seed still carries both, and a console that has
+// them already keeps its own copy (nothing is overwritten).
+//
+// The game enumerates S22\* and picks a version folder; the DLLs go into the
+// folder the seed names, which is the layout the title was brought up with.
+static bool GhPspcFindInGame(const std::wstring& root, std::wstring& sdk, std::wstring& pad)
+{
+    struct Dir { std::wstring path; int depth; };
+    std::vector<Dir> q{ { root, 0 } };
+    size_t seen = 0;
+    auto redisty = [](const std::wstring& n) {
+        std::wstring l = n; for (auto& c : l) c = (wchar_t)towlower(c);
+        return l.find(L"redist") != std::wstring::npos || l.find(L"pspc") != std::wstring::npos ||
+               l.find(L"playstation") != std::wstring::npos || l.find(L"sony") != std::wstring::npos ||
+               l.find(L"sdk") != std::wstring::npos;
+    };
+    auto has = [](const std::wstring& f) { return GetFileAttributesW(f.c_str()) != INVALID_FILE_ATTRIBUTES; };
+    for (size_t i = 0; i < q.size() && seen < 20000; ++i){
+        const Dir d = q[i];
+        const bool s = has(d.path + L"PsPcSdk.dll"), p = has(d.path + L"libScePad.dll");
+        if (s && p){ sdk = d.path + L"PsPcSdk.dll"; pad = d.path + L"libScePad.dll"; return true; }   // one folder wins
+        if (s && sdk.empty()) sdk = d.path + L"PsPcSdk.dll";
+        if (p && pad.empty()) pad = d.path + L"libScePad.dll";
+        if (d.depth >= 4) continue;
+        WIN32_FIND_DATAW fd;
+        HANDLE f = FindFirstFileExW((d.path + L"*").c_str(), FindExInfoBasic, &fd, FindExSearchLimitToDirectories, nullptr, 0);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        std::vector<Dir> first, rest;
+        do {
+            ++seen;
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+            const std::wstring n = fd.cFileName;
+            if (n == L"." || n == L"..") continue;
+            (redisty(n) ? first : rest).push_back({ d.path + n + L"\\", d.depth + 1 });
+        } while (FindNextFileW(f, &fd) && seen < 20000);
+        FindClose(f);
+        // _CommonRedist / Redist / PSPC-like folders are searched before the rest of their level.
+        q.insert(q.end(), first.begin(), first.end());
+        q.insert(q.end(), rest.begin(), rest.end());
+    }
+    return !sdk.empty() && !pad.empty();
+}
+
+static bool GhPspcEnsure(const std::wstring& seed, const std::wstring& exePath)
+{
+    const std::wstring rel = L"ghprogramdata\\Sony Interactive Entertainment Inc\\PSPC_SDK\\S22\\";
+    if (GetFileAttributesW((seed + rel).c_str()) == INVALID_FILE_ATTRIBUTES) return true;   // title does not use it
+    std::vector<std::wstring> need;                 // LocalState version folders missing a DLL
+    WIN32_FIND_DATAW fd;
+    HANDLE f = FindFirstFileW((seed + rel + L"*").c_str(), &fd);
+    if (f != INVALID_HANDLE_VALUE){
+        do {
+            const std::wstring n = fd.cFileName;
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || n == L"." || n == L"..") continue;
+            const std::wstring dst = std::wstring(kLocalState) + rel + n + L"\\";
+            if (GetFileAttributesW((dst + L"PsPcSdk.dll").c_str()) == INVALID_FILE_ATTRIBUTES ||
+                GetFileAttributesW((dst + L"libScePad.dll").c_str()) == INVALID_FILE_ATTRIBUTES)
+                need.push_back(dst);
+        } while (FindNextFileW(f, &fd));
+        FindClose(f);
+    }
+    if (need.empty()) return true;
+    // The game's install root: the exe's folder, less the title's "launch" subfolder.
+    size_t sl = exePath.find_last_of(L"\\/");
+    std::wstring root = sl == std::wstring::npos ? std::wstring() : exePath.substr(0, sl + 1);
+    if (g_title && !g_title->launch.empty()){
+        const size_t s2 = g_title->launch.find_last_of(L'\\');
+        if (s2 != std::wstring::npos){
+            const std::wstring sub = g_title->launch.substr(0, s2 + 1);
+            if (root.size() > sub.size() && _wcsicmp(root.c_str() + root.size() - sub.size(), sub.c_str()) == 0)
+                root.resize(root.size() - sub.size());
+        }
+    }
+    std::wstring sdk, pad;
+    if (root.empty() || !GhPspcFindInGame(root, sdk, pad)){
+        Diag("PSPC runtime not found: install the PlayStation PC SDK runtime that ships with the game");
+        return false;
+    }
+    Diag("PSPC runtime from the game's install: " + RegNarrow(sdk.substr(root.size())) + ", " +
+         RegNarrow(pad.substr(root.size())));
+    for (const std::wstring& dst : need){
+        CreateDirectoryW(dst.substr(0, dst.size() - 1).c_str(), nullptr);
+        for (const auto& [src, name] : { std::pair<std::wstring, const wchar_t*>{ sdk, L"PsPcSdk.dll" },
+                                         std::pair<std::wstring, const wchar_t*>{ pad, L"libScePad.dll" } }){
+            const std::wstring to = dst + name;
+            if (GetFileAttributesW(to.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+            if (!CopyFileW(src.c_str(), to.c_str(), TRUE)){
+                Diag("PSPC copy of " + RegNarrow(name) + " FAILED err=" + Hex(GetLastError()));
+                Diag("PSPC runtime not found: install the PlayStation PC SDK runtime that ships with the game");
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 // The guest has been chosen: pin its title defaults and stage what the package
 // carries for it. Runs before the hive is loaded and before any guest code.
+// False = the title cannot start (its PSPC runtime is missing); g_guestFailWhy says why.
 //
 // <install>\guest\seed\<exe base>\localstate\ mirrors LocalState. For Tsushima it
 // holds the PS PC SDK folder under ghprogramdata\ (PsPcSdk.dll + libScePad.dll,
 // the VC++ runtime it imports, and our tbs.dll stand-in -- pspc-sdk-in-container),
 // and the hive seed RegHiveLoad falls back to lives beside it.
-static void GhTitleBegin(const std::wstring& exePath)
+static bool GhTitleBegin(const std::wstring& exePath)
 {
     size_t s = exePath.find_last_of(L"\\/");
     const std::wstring exe = (s == std::wstring::npos) ? exePath : exePath.substr(s + 1);
@@ -40358,7 +40510,7 @@ static void GhTitleBegin(const std::wstring& exePath)
                 other = " (" + e->id + " claims this exe for app " + std::to_string(e->steamAppId) + ")";
         Diag("TITLE none for " + RegNarrow(exe) + " app=" + std::to_string(app) + other +
              " -- no per-title defaults");
-        return;
+        return true;
     }
     Diag("TITLE " + RegNarrow(exe) + ": " + std::to_string(g_title->knobs.size()) +
          " knob defaults (a LocalState file still wins) id=" + g_title->id + " from " + g_title->from +
@@ -40380,12 +40532,17 @@ static void GhTitleBegin(const std::wstring& exePath)
     const std::wstring seed = g_installDir + L"guest\\seed\\" + base + L"\\localstate\\";
     if (GetFileAttributesW(seed.c_str()) == INVALID_FILE_ATTRIBUTES){
         Diag("SEED none in the package for " + RegNarrow(base));
-        return;
+        return true;
     }
     int copied = 0, kept = 0, failed = 0;
     GhSeedCopyTree(seed, kLocalState, L"", copied, kept, failed);
     Diag("SEED " + RegNarrow(base) + ": copied=" + std::to_string(copied) + " kept=" +
          std::to_string(kept) + " failed=" + std::to_string(failed));
+    if (!GhPspcEnsure(seed, exePath)){
+        g_guestFailWhy = "PSPC runtime not found: install the PlayStation PC SDK runtime that ships with the game";
+        return false;
+    }
+    return true;
 }
 
 // 0 = report the truth. Otherwise the megabytes to report as installed/total.
@@ -40947,7 +41104,7 @@ static inline uint64_t GhArenaLiveMapped()
 // ceiling. Because the ratchet is monotonic-down and never recovers, every
 // slice after that is DECLINED -> "real reserve" -> real private commit at full
 // price. That is where ~625 MB of the container goes (see the attribution table
-// in GREENHOUSE.md 32.40).
+// in docs/architecture/memory.md).
 //
 // Erring high is strictly safer than erring low: a too-low ceiling GUARANTEES a
 // decline, while a too-high ceiling costs one failed MapViewOfFile3 call and
@@ -42075,7 +42232,7 @@ static volatile LONG64          g_lazyPromised  = 0;
 static volatile LONG64          g_lazyCommitted = 0;
 static volatile LONG            g_lazyFaults    = 0;
 static volatile LONG            g_lazyFailed    = 0;
-// a tester's Continue run (0.0.664.0): at the 5,120 MB ceiling a restore's commit was
+// A tester's Continue run (0.0.664.0): at the 5,120 MB ceiling a restore's commit was
 // refused, room-making freed too little, and the fault returned false after ONE
 // retry. Returning false at that point is certain death, not an honest report:
 // Tsushima's own VEH (GUEST+0x4403E0) is next in line, re-faults on the same
@@ -42978,7 +43135,7 @@ static const uint64_t kGhLockedRoomPad = 8ull << 20;
 static bool     GhLazySpillRoom(uint64_t need, const char* why);           // patch i: GhPhRestore needs it early
 
 // #213. `lazysaved` is the container's only free variable -- appused + lazysaved
-// is a constant ~5,089 MB (GREENHOUSE.md 32.41) -- and two runs of the SAME
+// is a constant ~5,089 MB -- and two runs of the SAME
 // binary with the SAME knobs land 493 MB apart on it. The counters above are
 // process-wide totals, so they can say how much was touched but never WHICH
 // promise or BY WHOM, and the promises are not interchangeable: one 548 MB
@@ -52286,7 +52443,7 @@ static void FlushGuestImageOnly()
 
 // 32-bit (PE32/i386) guests. Everything x64 above this line runs natively; a
 // PE32 cannot, so it is mapped into a sub-4GB region and interpreted instead.
-// See src/loader/x86/ and GREENHOUSE.md's 32-bit track.
+// See src/loader/x86/ and docs/architecture/x86-guest.md.
 static bool MapAndRun32(const std::vector<uint8_t>& file)
 {
     ghx86::g_log = [](const std::string& s) { Diag(s); };
@@ -52503,6 +52660,7 @@ static bool MapAndRun32(const std::vector<uint8_t>& file)
     const bool native = GhCfgNum(L"gh_x86_native.txt", "GH_X86_NATIVE", 0) != 0;
     Diag(std::string("X86 runtime: ") + (native ? "native (compat mode)" : "interpreter"));
     ghx86::g_x86_sys_dir = g_installDir + L"guest\\x86\\";
+    ghx86::g_x86_owned_path = std::wstring(kLocalState) + L"gh_owned.txt";   // Steam ownership (gh_owned.h)
     // gh_x86_steam.txt=1: answer steam_api.dll from our beds, bridged to the
     // loader's x64 Steam engine, instead of mapping the copy the game ships.
     // Half-Life's engine exits unless SteamAPI_Init succeeds, and Valve's
@@ -52848,7 +53006,7 @@ static bool MapAndRun(std::vector<uint8_t>& file)
 }
 
 // ===========================================================================
-// CreateProcess surrogate: in-process child PE (GREENHOUSE.md §0's last "no").
+// CreateProcess surrogate: in-process child PE.
 //
 // Multi-process is genuinely dead in the container -- CreateProcess against a
 // real binary path returns ACCESS_DENIED and there is no second process address
@@ -53206,7 +53364,7 @@ static BOOL WINAPI Bed_CreateProcessW(
             Diag("CP: refusing crash handler " + std::string(exe.begin(), exe.end()));
             SetLastError(ERROR_FILE_NOT_FOUND); return FALSE;
         }
-        // Path X (GREENHOUSE.md §21): steamclient64.dll tries to spawn the CEF UI
+        // Path X (docs/steam/README.md): steamclient64.dll tries to spawn the CEF UI
         // host (bin/cef/cef.win64/steamwebhelper.exe) -- the multi-process Chromium
         // wall that cannot run in the container. Refuse it explicitly and let the
         // engine degrade headless (it authenticates from a cached/seeded session,
@@ -54085,14 +54243,6 @@ static void PatchGuestTreeForContainer()
 static void RunGuest()
 {
     Diag("=== Greenhouse P1 loader ===");
-#ifdef GH_LAUNCHER
-    // §43: App::Run's LuiEntGate already ran; this catches any other way in.
-    if (!LuiEntAllowsLaunch()) {
-        Diag("ENT gate REFUSED in RunGuest");
-        g_guestFailWhy = "This console's membership is not active (Packages > Membership)";
-        return;
-    }
-#endif
 
     InitStdHandles();
 
@@ -54188,7 +54338,7 @@ static void RunGuest()
     Diag("guest=" + std::string(gp.begin(), gp.end()));
     g_guestExePath = gp;
     g_mainModule = GetModuleHandleW(nullptr);   // real host exe base; GetModuleFileName beds map it to the guest
-    GhTitleBegin(gp);                           // per-title knob defaults + package seeds, before any guest code
+    if (!GhTitleBegin(gp)) return;              // per-title knob defaults + package seeds, before any guest code
     // Read here, not in GhInitGuestDisplay: the launcher handoff runs that before the
     // title is chosen, so a title config's "knobs" would not reach it.
     g_gpuVendor = GhCfgNum(L"gh_gpu_vendor.txt", "GH_GPU_VENDOR", 0) & 0xFFFF;
@@ -54725,7 +54875,6 @@ static void ResetGuestForRelaunch()
 #ifndef GH_LAUNCHER
 static bool GhReadPackBlob(const std::wstring&, std::vector<uint8_t>&, bool) { return false; }   // §44: Launcher only
 static bool GhReadBundledBlob(const std::wstring&, std::vector<uint8_t>&, bool) { return false; }   // Launcher only
-static bool GhLicenseGate(std::vector<uint8_t>&, const std::string&, std::string&, std::string&) { return true; }   // §46: Launcher only
 #endif
 #ifdef GH_LAUNCHER
 #include "gh_input.h"
@@ -55140,10 +55289,7 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
         // in from that file with no scan of its own.
         Diag(std::string("LOCALSTATE ") + (g_localStateFromEnv ? "env " : "FALLBACK ") +
              std::string(kLocalState, kLocalState + wcslen(kLocalState)));
-        // §43: membership before anything else. Locked at boot shows the QR link;
-        // B goes on to the picker (the library is browsable, launches are gated).
-        LuiEntStart();
-        if (ghent::Current().st == ghent::St::Locked) LuiMembershipScreen("boot");
+        ghsite::Init(kLocalState);
         std::wstring loginStatus = LauncherAddonsSignIn();
         g_ghSteamRuntimeProvided = LuiServiceProvided("steam-runtime");
         OverlayRebakeMenuIfStale();   // the first LuiInit baked the menu before this was known
@@ -55221,7 +55367,9 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
                 }
             }
             GhCustomBegin(picked);              // §65: before anything asks for a title config
-            if (!LuiEntGate(picked)) continue;   // §43: no live membership, no launch
+            // One of the user's own games is not a Steam game: any Steam ownership
+            // question it asks of us is answered "not owned" (gh_owned.h).
+            SetEnvironmentVariableA("GH_CUSTOM_RUN", g_customRun ? "1" : nullptr);
             if (!LuiShaderBakeGate(picked)) continue;   // §47: its title waits for the bake
             LuiShaderBakeStop();                // §47: the game gets the cores back
             {

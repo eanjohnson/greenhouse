@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build toolchain/test_gh_ovl.cpp with clang-cl and run it under wine on a temp folder.
 set -euo pipefail
-GH=$HOME/greenhouse
+GH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SDK="$GH/toolchain/xwin-sdk"; SDKVER=10.0.26100
 W="${TMPDIR:-/tmp}/gh_ovl_test.$$"; mkdir -p "$W/d"; trap 'rm -rf "$W"' EXIT
 clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link /std:c++20 /EHsc /MT /O1 \

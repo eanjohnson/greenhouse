@@ -1,4 +1,4 @@
-// steamclient64.dll load-probe guest (GREENHOUSE.md §21 / Path X).
+// steamclient64.dll load-probe guest (Path X, docs/steam/README.md).
 //
 // A minimal x64 console PE the Greenhouse loader runs as its guest (ghguest.txt=
 // steamclient_probe.exe). Its job is pure reconnaissance: LoadLibrary the REAL

@@ -12,7 +12,10 @@
 #
 # Recipient stays exclusively in gh_invite_target.txt (single target, no fanout).
 import sys, time, os, importlib.util
-spec = importlib.util.spec_from_file_location('wdp', '$HOME/.claude/jobs/49fb5998/tmp/wdp.py')
+_tools = os.environ.get('GH_TOOLS')
+if not _tools:
+    sys.exit('set GH_TOOLS to the directory holding wdp.py (the Device Portal client)')
+spec = importlib.util.spec_from_file_location('wdp', os.path.join(_tools, 'wdp.py'))
 wdp = importlib.util.module_from_spec(spec); sys.argv = ['wdp']; spec.loader.exec_module(wdp)
 
 PFN = 'Greenhouse.LethalCo_0.0.16.0_x64__mgw46vk3ppz9w'
@@ -20,7 +23,7 @@ PFN = 'Greenhouse.LethalCo_0.0.16.0_x64__mgw46vk3ppz9w'
 # (the direct app dir). This is the path WDP-pushed files are reliably READABLE from (the
 # CheeseMP vfs-mirror path is write-redirected but external reads don't resolve back there).
 SHIM_DIR = '\\LocalState'
-TMP = '$HOME/.claude/jobs/49fb5998/tmp'
+TMP = _tools
 
 def put(destname, localpath):
     wdp.fsupload(PFN, SHIM_DIR, localpath, destname)

@@ -18,8 +18,8 @@
 set -euo pipefail
 
 NEW="$1"; OLD="$2"; GUEST="$3"
-GH=$HOME/greenhouse
-TMP=$HOME/.claude/jobs/49fb5998/tmp
+GH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TMP="${GH_TOOLS:?set GH_TOOLS to a working directory holding wdp.py (the Device Portal client)}"
 SDK="$GH/toolchain/xwin-sdk"; SDKVER=10.0.26100
 FAM="Greenhouse.P0Spike_mgw46vk3ppz9w"
 PFN_NEW="Greenhouse.P0Spike_${NEW}_x64__mgw46vk3ppz9w"
@@ -34,7 +34,7 @@ else
 fi
 
 # Extra defines for a measurement build, e.g. GHX86DEF=/DGH_X86_SPIN_YIELD to
-# compile in the PAUSE-yield knob (see GREENHOUSE.md 30.19). Empty by default so
+# compile in the PAUSE-yield knob. Empty by default so
 # a shipped build is the shipped build.
 # GHJIT=1 builds and links the BoxedWine JIT (see toolchain/build_bwjit.sh).
 # It adds ~150 objects to the link, so it is opt-in rather than always on.
@@ -104,7 +104,7 @@ echo "== pack + sign =="
 LIBDIR="$GH/toolchain/msix-packaging-src/.vs/lib"
 rm -f "$GH/artifacts/Probe32.msix" "$GH/artifacts/Probe32.signed.msix"
 LD_LIBRARY_PATH="$LIBDIR" "$GH/toolchain/bin/makemsix" pack -d "$S" -p "$GH/artifacts/Probe32.msix" >/dev/null
-osslsigncode sign -pkcs12 "$GH/toolchain/signing/greenhouse.pfx" -pass "$GH_PFX_PASS" -h sha256 \
+osslsigncode sign -pkcs12 "$GH/toolchain/signing/greenhouse.pfx" -pass "${GH_PFX_PASS:?set GH_PFX_PASS to the signing .pfx passphrase}" -h sha256 \
   -in "$GH/artifacts/Probe32.msix" -out "$GH/artifacts/Probe32.signed.msix" 2>&1 | grep -E "Succeeded|Failed"
 
 echo "== deploy =="

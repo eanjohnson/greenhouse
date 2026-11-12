@@ -73,7 +73,7 @@ refuse some wave intrinsics, it **takes the device down at compile time** on
 container whose `HASH` part is sixteen zero bytes, and the runtime rejects that.
 `dxilhash.py` is a pure-Python implementation of DXC's modified MD5
 (`lib/DxilHash/DxilHash.cpp`); it was verified against the console directly
-(GREENHOUSE.md, E1 / runs 82, 83, 85) and reproduces DXC's own digest
+(experiment E1, runs 82, 83, 85) and reproduces DXC's own digest
 byte-for-byte on containers DXC signed itself.
 
 ## The heap tier, and why the spaces are frozen
@@ -185,6 +185,7 @@ believing a staging run.
 **The 2,270 baked blobs are not in this repo.** They are 35.6 MB of *derived*
 output -- `bake.py` regenerates them from the dumps -- and committing them would
 more than double a 30 MB repository, which is the same trade the BoxedWine tree
-is kept out for. They live on the host at
-`~/.claude/jobs/49fb5998/tmp/_ghlo188` (baked) and `_miss188` (the dumps they
-came from), and on the console at `D:\DevelopmentFiles\ghlo`.
+is kept out for -- and they are derived from the game's own shaders. Bake them
+locally from your own copy: keep the baked output (e.g. `_ghlo188/`) next to the
+dumps it came from (e.g. `_miss188/`) in a working directory of your choice; on
+the console they live at `D:\DevelopmentFiles\ghlo`.

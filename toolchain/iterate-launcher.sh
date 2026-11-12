@@ -21,24 +21,30 @@
 # add-on is installed.
 # GH_STEAM_RUNTIME_FETCH=0  dev only: also stage the three Valve DLLs in the package
 #                (default 1: none are packaged; the console fetches them, §38).
-# GH_PACK_ONLY=1 stop after pack + sign: nothing is installed or launched.
+# GH_PACK_ONLY=1 stop after pack + sign: nothing is installed or launched (GH_XBOX
+#                is then not needed).
 # GH_REPO_DEV_KEY=0  leave the dev repository key (src/loader/gh_repo_devkey.inc) out,
-#                so only release keys verify a package index (default 1 = trust it).
-# GH_ENT_DEV=0   leave the dev entitlement key (src/loader/gh_ent_devkey.inc) and plain-http
-#                gh_ent_url.txt out (gh_ent.h, §43). Default 1: dev tokens from
-#                toolchain/ghent.py mint and the LAN mock site are trusted. With neither
-#                that key nor gh_ent_keys.inc the build has no membership gate at all.
-# GH_BUNDLE_FIRSTPARTY=0  stage none of OUR value in the package (§44): no title configs,
-#                no Tsushima hive seed, no shader corpus. A member's console gets them
-#                from the repository instead (sealed title packages + the keyed corpus
-#                add-on, auto-installed). Default 1 = bundled, for dev builds.
-# GH_RELEASE=1   a distribution build: refuses the dev keys and any bundling, so a
-#                release can only be the thin package (GH_REPO_DEV_KEY=0 GH_ENT_DEV=0
-#                GH_BUNDLE_FIRSTPARTY=0 GH_STEAM_RUNTIME_FETCH=1).
+#                so only the release key in src/loader/gh_repo_keys.inc verifies a package
+#                index (default 1 = also trust indexes signed with the dev key). Both
+#                files are written by `ghpkg.py pubinc`; a fork puts its own key there.
+# GH_BUNDLE_FIRSTPARTY=0  leave the shader corpus out of the package (§44); a console
+#                then gets it from the repository (the corpus add-on, auto-installed).
+#                Default 1 = bundled. Title configs, the hive seed and the browser page
+#                are small and are staged in every build.
+# GH_RELEASE=1   a distribution build: refuses the dev repository key and the packaged
+#                Valve DLLs (GH_REPO_DEV_KEY=0 GH_STEAM_RUNTIME_FETCH=1), compiles the
+#                launcher with /DGH_RELEASE (no diag disk writes, no command channel),
+#                and leaves out every file we may not redistribute: Sony's PSPC runtime
+#                (corpus/redist/pspc -- the console takes it from the user's own game
+#                install) and the game-derived shader corpus (corpus/redist/ghlo and
+#                ghlo_localstate -- the console uses the corpus add-on and its own bake).
+#                VC++ and DXC stay: they are redistributable, and DXC's licences ship.
+# EXTRACL=/DGH_REMOTE_RELAY  compile "Manage from anywhere" (§66) in. Off by default: the
+#                relay has no console-auth scheme (see launcher_ui.h).
 set -euo pipefail
 NEW="$1"; OLD="$2"
-GH=$HOME/greenhouse
-TMP=$HOME/.claude/jobs/49fb5998/tmp
+GH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TMP="${GH_TOOLS:?set GH_TOOLS to a working directory holding wdp.py (the Device Portal client)}"
 SDK="$GH/toolchain/xwin-sdk"; SDKVER=10.0.26100
 FAM="Greenhouse.Launcher_mgw46vk3ppz9w"
 STAGE="$GH/artifacts/msix_stage_launcher"
@@ -48,20 +54,25 @@ SRC="${3:-$GH/src/loader/guest_loader.cpp}"
 # winhttp/bcrypt: the package repository client (gh_repo.h).
 EXTRALIBS="${EXTRALIBS:-d3d11.lib d3d12.lib dxgi.lib ws2_32.lib d2d1.lib dwrite.lib gdi32.lib user32.lib windowscodecs.lib winhttp.lib bcrypt.lib}"
 EXTRACL="${EXTRACL:-}"
-XBOX="${GH_XBOX:-192.0.2.12:11443}"
+if [ "${GH_PACK_ONLY:-0}" = "1" ]; then
+  XBOX="${GH_XBOX:-}"
+else
+  XBOX="${GH_XBOX:?set GH_XBOX to your console Device Portal address, host:port (or GH_PACK_ONLY=1)}"
+fi
 BUNDLE="${GH_BUNDLE_FIRSTPARTY:-1}"
-if [ "${GH_RELEASE:-0}" = "1" ]; then
+RELEASE="${GH_RELEASE:-0}"
+RELDEF=""
+if [ "$RELEASE" = "1" ]; then
+  RELDEF="/DGH_RELEASE"
   bad=""
   [ "${GH_REPO_DEV_KEY:-1}" = "0" ] || bad="$bad GH_REPO_DEV_KEY"
-  [ "${GH_ENT_DEV:-1}" = "0" ] || bad="$bad GH_ENT_DEV"
-  [ "$BUNDLE" = "0" ] || bad="$bad GH_BUNDLE_FIRSTPARTY"
   [ "${GH_STEAM_RUNTIME_FETCH:-1}" = "1" ] || bad="$bad GH_STEAM_RUNTIME_FETCH"
-  [ -z "$bad" ] || { echo "GH_RELEASE=1 refuses a dev build: set${bad} (dev keys off, nothing bundled)"; exit 1; }
-  [ -s "$GH/src/loader/gh_ent_keys.inc" ] || { echo "GH_RELEASE=1 needs the production gh_ent_keys.inc"; exit 1; }
+  [ -z "$bad" ] || { echo "GH_RELEASE=1 refuses a dev build: set${bad} (dev key off, Valve DLLs fetched)"; exit 1; }
+  [ -s "$GH/src/loader/gh_repo_keys.inc" ] || { echo "GH_RELEASE=1 needs the release repository key in gh_repo_keys.inc"; exit 1; }
   # Not fatal: the site's POST /api/crash-report is OPEN when CRASH_INGEST_TOKEN
   # is unset there, so an empty token is a legitimate configuration. Loud, though,
   # because the other configuration -- site gated, build with no token -- makes
-  # every report 401 and nobody finds out until a member tries.
+  # every report 401 and nobody finds out until someone tries.
   [ -n "${GH_CRASH_TOKEN:-}" ] || echo "WARN: GH_RELEASE=1 with no GH_CRASH_TOKEN: crash reports only work if the site's CRASH_INGEST_TOKEN is unset too"
 fi
 # §64: the crash-report ingest token, a WRITE-ONLY capability (it cannot read a
@@ -71,7 +82,6 @@ CRASHDEF=()
 [ -z "${GH_CRASH_TOKEN:-}" ] || CRASHDEF=("/DGH_CRASH_TOKEN=\"$GH_CRASH_TOKEN\"")
 NSDEF=""
 [ "${GH_REPO_DEV_KEY:-1}" = "1" ] && NSDEF="/DGH_REPO_DEV_KEY"
-[ "${GH_ENT_DEV:-1}" = "1" ] && NSDEF="$NSDEF /DGH_ENT_DEV"
 # The 32-bit guest route is ON by default here, and was not: it used to be
 # reachable only by passing EXTRACL=/DGH_X86_GUEST by hand, and 0.0.925.0 and
 # 0.0.926.0 both shipped without it. Nothing complains at build time -- the
@@ -80,9 +90,9 @@ NSDEF=""
 # play are two titles that do not, from a forgotten flag. GH_X86_GUEST=0 opts
 # out (smaller package, x64 guests only); the JIT stays unlinked either way.
 [ "${GH_X86_GUEST:-1}" = "1" ] && NSDEF="$NSDEF /DGH_X86_GUEST"
-echo "== build launcher loader ($SRC)${NSDEF:+ $NSDEF} =="
+echo "== build launcher loader ($SRC)${NSDEF:+ $NSDEF}${RELDEF:+ $RELDEF} =="
 clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \
-  /std:c++20 /EHsc /MT /O2 "/DGH_PKG_FAMILY=\"$FAM\"" /DGH_LAUNCHER $NSDEF $EXTRACL "${CRASHDEF[@]}" \
+  /std:c++20 /EHsc /MT /O2 "/DGH_PKG_FAMILY=\"$FAM\"" /DGH_LAUNCHER $NSDEF $RELDEF $EXTRACL "${CRASHDEF[@]}" \
   /imsvc "$SDK/crt/include" /imsvc "$SDK/sdk/include/$SDKVER/ucrt" \
   /imsvc "$SDK/sdk/include/$SDKVER/um" /imsvc "$SDK/sdk/include/$SDKVER/shared" \
   /imsvc "$SDK/sdk/include/cppwinrt" /I "$GH/corpus/vendor/qrcodegen" \
@@ -144,7 +154,7 @@ sha256sum "$GH/artifacts/addon_steam/steam_api64.dll"
 # else LoadLibrary(steamclient64) fails ERROR_MOD_NOT_FOUND (0x7E) on the missing deps.
 ESRC="$GH/artifacts/msix_stage_cheesemp/guest"
 # GH_STEAM_RUNTIME_FETCH=1 (#258): stage none of the three; the console fetches them
-# from Valve's own CDN as the steam-runtime package (GREENHOUSE.md §38).
+# from Valve's own CDN as the steam-runtime package (docs/steam/runtime-fetch.md).
 RTFETCH="${GH_STEAM_RUNTIME_FETCH:-1}"
 if [ "$RTFETCH" = "1" ]; then
   echo "== Valve runtime NOT packaged (GH_STEAM_RUNTIME_FETCH=1): the console fetches it =="
@@ -221,14 +231,17 @@ mkdir -p "$STAGE/guest/x86"
 # same release as the host's Linux build, so its disassembly and assembly match
 # the recipe byte for byte) with the C++ runtime it imports beside it, because
 # LoadLibraryEx searches the DLL's own directory for its imports.
-mkdir -p "$STAGE/guest/dxc"
-cp "$RED/dxc/dxcompiler.dll" "$RED/dxc/LICENSE-LLVM.txt" "$RED/dxc/LICENCE-MIT.txt" "$STAGE/guest/dxc/" \
-  || { echo "FATAL: missing $RED/dxc/dxcompiler.dll (DXC v1.9.2607 x64)"; exit 1; }
 # Its own C++ runtime, NOT guest/vcrt's: DXC 1.9 is built with VS 17.10+, whose
 # constexpr std::mutex needs MSVCP140 >= 14.40; guest/vcrt's 14.27 AVs in _Mtx_lock
 # during dxcompiler's static init (0.0.688/689). 14.51.36247, Microsoft-signed.
-rm -f "$STAGE/guest/dxc/"*.dll
-cp "$RED/dxc/dxcompiler.dll" "$RED/dxc/msvcp140.dll" "$RED/dxc/vcruntime140.dll" "$RED/dxc/vcruntime140_1.dll" "$STAGE/guest/dxc/" \
+# DXC's two licence texts (LLVM's Apache-2.0-with-exceptions and the MIT notice)
+# go beside it in EVERY build: they are the terms it is redistributed under.
+rm -rf "$STAGE/guest/dxc"; mkdir -p "$STAGE/guest/dxc"
+cp "$RED/dxc/dxcompiler.dll" "$STAGE/guest/dxc/" \
+  || { echo "FATAL: missing $RED/dxc/dxcompiler.dll (DXC v1.9.2607 x64)"; exit 1; }
+cp "$RED/dxc/LICENSE-LLVM.txt" "$RED/dxc/LICENCE-MIT.txt" "$STAGE/guest/dxc/" \
+  || { echo "FATAL: missing DXC's licence texts (LICENSE-LLVM.txt, LICENCE-MIT.txt) in $RED/dxc/"; exit 1; }
+cp "$RED/dxc/msvcp140.dll" "$RED/dxc/vcruntime140.dll" "$RED/dxc/vcruntime140_1.dll" "$STAGE/guest/dxc/" \
   || { echo "FATAL: missing the 14.40+ C++ runtime in $RED/dxc/"; exit 1; }
 # M4.4: the same 14.51.36247 runtime for UE4SS (§55), which imports msvcp140 14.4x
 # plus msvcp140_atomic_wait / _codecvt_ids that guest/vcrt lacks. LoadGuestDll uses
@@ -240,10 +253,28 @@ done
 TSEED="$STAGE/guest/seed/GhostOfTsushima"
 PSPC="$TSEED/localstate/ghprogramdata/Sony Interactive Entertainment Inc/PSPC_SDK/S22/2.50.00.10"
 mkdir -p "$PSPC"
-for d in PsPcSdk.dll libScePad.dll; do
-  cp "$RED/pspc/$d" "$PSPC/$d" || { echo "FATAL: missing $RED/pspc/$d"; exit 1; }
-done
-cp "$RED/vcrt/"*.dll "$PSPC/"
+# Sony's PlayStation PC SDK runtime is not ours to redistribute. A release build
+# leaves it out (and clears any copy an earlier dev build left in this incremental
+# stage); the loader then takes PsPcSdk.dll + libScePad.dll from the user's own
+# game install (GhPspcEnsure). The folder itself still ships, with the VC++ runtime
+# and our tbs.dll, because the folder is how the loader knows the title needs it.
+if [ "$RELEASE" = "1" ]; then
+  rm -f "$PSPC/PsPcSdk.dll" "$PSPC/libScePad.dll"
+  echo "  GH_RELEASE=1: skipped corpus/redist/pspc (PsPcSdk.dll, libScePad.dll) -- taken from the user's game install"
+else
+  for d in PsPcSdk.dll libScePad.dll; do
+    cp "$RED/pspc/$d" "$PSPC/$d" || { echo "FATAL: missing $RED/pspc/$d"; exit 1; }
+  done
+fi
+if [ "$RELEASE" = "1" ]; then
+  # Redistributable, so still wanted -- but a release builder may not have the
+  # reference console's 14.27 set; without it the game's PsPcSdk.dll falls back to
+  # guest\vcrt (14.51, backward compatible). Warn, do not fail.
+  cp "$RED/vcrt/"*.dll "$PSPC/" 2>/dev/null \
+    || echo "  WARN: no $RED/vcrt (14.27) for the Tsushima PSPC folder; guest\vcrt serves it"
+else
+  cp "$RED/vcrt/"*.dll "$PSPC/"
+fi
 clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link /MT /O2 /LD \
   /imsvc "$SDK/crt/include" /imsvc "$SDK/sdk/include/$SDKVER/ucrt" \
   /imsvc "$SDK/sdk/include/$SDKVER/um" /imsvc "$SDK/sdk/include/$SDKVER/shared" \
@@ -285,8 +316,7 @@ mkdir -p "$STAGE/guest"
 python3 "$GH/toolchain/ghcompat.py" check || { echo "FATAL: corpus/compat/compat.json is wrong"; exit 1; }
 cp "$GH/corpus/compat/compat.json" "$STAGE/guest/compat.json" || { echo "FATAL: missing corpus/compat/compat.json"; exit 1; }
 
-rm -rf "$STAGE/guest/titles" "$STAGE/guest/ghlo" "$TSEED/hive.txt"
-if [ "$BUNDLE" = "1" ]; then
+rm -rf "$STAGE/guest/ghlo"
 cp "$GH/corpus/seed/GhostOfTsushima/hive.txt" "$TSEED/hive.txt" || { echo "FATAL: missing Tsushima hive seed"; exit 1; }
 # Per-title configs (greenhouse.title/1): the loader reads guest\titles\*.ghtitle.json
 # at startup (GhTitles); LocalState\titles\ overrides by id. Checked here so a
@@ -307,6 +337,12 @@ cp "$GH"/corpus/titles/*.ghtitle.json "$STAGE/guest/titles/"
 # §65: the browser page the console serves (Manage from a browser). One file.
 mkdir -p "$STAGE/guest/web"
 cp "$GH/corpus/web/console.html" "$STAGE/guest/web/" || { echo "FATAL: guest web page"; exit 1; }
+if [ "$RELEASE" = "1" ]; then
+  # Game-derived shader blobs are not ours to redistribute. The console falls back
+  # to the corpus add-on (if installed) and its own on-device bake (GhPkgCorpusDir).
+  rm -rf "$STAGE/guest/ghlo"
+  echo "  GH_RELEASE=1: skipped corpus/redist/ghlo and corpus/redist/ghlo_localstate (game-derived shader corpus)"
+elif [ "$BUNDLE" = "1" ]; then
 # Tsushima's shader corpus (2026-10-06): the reference console's
 # D:\DevelopmentFiles\ghlo, pulled byte-for-byte into corpus/redist/ghlo, with its
 # LocalState gh_tl_ blobs (the lane-solo NonUniform fixes, which win over ghlo
@@ -322,7 +358,7 @@ OVL=(); [ -d "$RED/ghlo_localstate" ] && OVL=(--overlay "$RED/ghlo_localstate")
 python3 "$GH/toolchain/ghpkg.py" bundle --dir "$GHLO" "${OVL[@]}" --out "$STAGE/guest/ghlo" \
   || { echo "FATAL: corpus bundle failed"; exit 1; }
 else
-  echo "  first-party value NOT bundled (GH_BUNDLE_FIRSTPARTY=0): title configs, hive seed and corpus come from the repository"
+  echo "  shader corpus NOT bundled (GH_BUNDLE_FIRSTPARTY=0): it comes from the repository"
 fi
 find "$STAGE/guest/vcrt" "$TSEED" -type f -printf '  %8s %P\n'
 
@@ -354,9 +390,17 @@ if [ "$RTFETCH" = "1" ]; then   # the stage is reused between builds: a leftover
   LEAK=$(find "$STAGE" -type f \( -iname 'steamclient64.dll' -o -iname 'tier0_s64.dll' -o -iname 'vstdlib_s64.dll' \))
   [ -z "$LEAK" ] || { echo "FATAL: Valve runtime in a GH_STEAM_RUNTIME_FETCH stage: $LEAK"; exit 1; }
 fi
+if [ "$RELEASE" = "1" ]; then   # same reason: nothing non-redistributable may survive in a reused stage
+  LEAK=$(find "$STAGE" \( -type f \( -iname 'PsPcSdk.dll' -o -iname 'libScePad.dll' -o -iname 'gh_lo_*.bin' \
+                                     -o -iname 'gh_tl_*.bin' -o -iname '*.ghpak' \) \) -o \( -type d -path "$STAGE/guest/ghlo" \))
+  [ -z "$LEAK" ] || { echo "FATAL: non-redistributable file in a GH_RELEASE stage: $LEAK"; exit 1; }
+  for f in LICENSE-LLVM.txt LICENCE-MIT.txt; do
+    [ -s "$STAGE/guest/dxc/$f" ] || { echo "FATAL: GH_RELEASE stage lacks guest/dxc/$f"; exit 1; }
+  done
+fi
 rm -f "$GH/artifacts/$MSIX.msix" "$GH/artifacts/$MSIX.signed.msix"
 LD_LIBRARY_PATH="$LIBDIR" "$GH/toolchain/bin/makemsix" pack -d "$STAGE" -p "$GH/artifacts/$MSIX.msix" >/dev/null
-osslsigncode sign -pkcs12 "$GH/toolchain/signing/greenhouse.pfx" -pass "$GH_PFX_PASS" -h sha256 \
+osslsigncode sign -pkcs12 "$GH/toolchain/signing/greenhouse.pfx" -pass "${GH_PFX_PASS:?set GH_PFX_PASS to the signing .pfx passphrase}" -h sha256 \
   -in "$GH/artifacts/$MSIX.msix" -out "$GH/artifacts/$MSIX.signed.msix" 2>&1 | grep -E "Succeeded|Failed"
 if [ "${GH_PACK_ONLY:-0}" = "1" ]; then
   ls -l "$GH/artifacts/$MSIX.signed.msix"; echo "GH_PACK_ONLY=1 -- not deploying"; exit 0

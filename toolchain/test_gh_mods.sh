@@ -6,7 +6,7 @@
 # out here in Python, independently of the C++ (for --zip: r2modman's rules for
 # the Lethal Company schema, as written in gh_mods.h's header).
 set -euo pipefail
-GH=$HOME/greenhouse
+GH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 W="${TMPDIR:-/tmp}/gh_mods_test.$$"; mkdir -p "$W"; trap 'rm -rf "$W"' EXIT
 g++ -std=c++17 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all "$GH/toolchain/test_gh_mods.cpp" -o "$W/t"
 args=()

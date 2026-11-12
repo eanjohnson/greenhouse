@@ -17,14 +17,14 @@ Usage:
   qrtool.py --watch         # live mode: keep re-rendering each time it rotates (Ctrl-C to stop)
   qrtool.py --png out.png    # also write the PNG here (default: ./steam_qr.png)
   qrtool.py --no-term        # skip the terminal render (PNG only)
-  qrtool.py --host 192.0.2.10:11443
+  qrtool.py --host <console-ip>:11443
 Env overrides: GH_XBOX=<host[:port]>, GH_CHEESEMP_FAMILY=<package family name>.
 Exit codes: 0 ok, 2 app not in QR stage / no URL yet, 3 device unreachable, 4 qrencode missing.
 """
 import sys, os, ssl, json, http.client, time, argparse, subprocess, shutil
 from urllib.parse import quote
 
-DEFAULT_HOST = os.environ.get("GH_XBOX", "192.0.2.10:11443")
+DEFAULT_HOST = os.environ.get("GH_XBOX", "")   # host:port; required (env or --host)
 FAMILY = os.environ.get("GH_CHEESEMP_FAMILY", "Greenhouse.CheeseMP_mgw46vk3ppz9w")
 CTX = ssl._create_unverified_context()
 
@@ -116,8 +116,11 @@ def main():
     ap.add_argument("--watch", action="store_true", help="live mode: re-render on every rotation until Ctrl-C")
     ap.add_argument("--png", default="steam_qr.png", help="PNG output path (default: ./steam_qr.png)")
     ap.add_argument("--no-term", action="store_true", help="do not render the QR in the terminal")
-    ap.add_argument("--host", default=DEFAULT_HOST, help="Xbox WDP host[:port] (default %(default)s)")
+    ap.add_argument("--host", default=DEFAULT_HOST, help="Xbox WDP host[:port] (default: $GH_XBOX)")
     args = ap.parse_args()
+    if not args.host:
+        print("ERROR: set GH_XBOX or pass --host <console-ip>:11443", file=sys.stderr)
+        return 3
 
     if not shutil.which("qrencode"):
         print("ERROR: qrencode not found on PATH (install it: sudo pacman -S qrencode).", file=sys.stderr)

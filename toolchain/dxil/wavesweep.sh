@@ -4,7 +4,7 @@
 #   quad 27 | ballot 6 | quadat 5 | countbits 5 | prefixbits 4 | readlaneat 2
 #   activebit / match / alltrue / allequal: 0-1 blobs, they only close the table.
 # DO NOT RUN while the console hold is in force.
-cd $HOME/.claude/jobs/49fb5998/tmp
+cd "${GH_TOOLS:?set GH_TOOLS to the working directory holding run286.py and _wavectl/}"
 export PYTHONPATH=$PWD LC_ALL=C
 for n in quad ballot quadat countbits prefixbits readlaneat activebit match alltrue allequal; do
   [ -f _wavectl/${n}_s.bin ] || { echo "$n: no control blob" >> _wavesweep2.txt; continue; }

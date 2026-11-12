@@ -4,7 +4,6 @@
 //
 // The vectors come from greenhouse-site (scripts/gen-remote-vectors.ts): the phone's side
 // built with WebCrypto. Every key in them is a throwaway made per run.
-#define GH_ENT_DEV 1
 #include "../src/loader/gh_remote.h"
 #include <cstdio>
 
@@ -82,7 +81,7 @@ static int Vectors(const char* path, const char* scratch)
     s.OnPair(Str(pr, "msg"), now);
     check(s.Prompt(pp) && pp.phone == Str(pr, "phone"), "a good pairing message becomes the TV prompt");
     check(pp.sas == Str(pr, "sas"), "the 6-digit code matches the phone's (" + pp.sas + ")");
-    check(pp.label == "Owner's phone", "the phone's name reaches the prompt");
+    check(pp.label == "Test phone", "the phone's name reaches the prompt");
     check(s.ResolvePair(true, now) && s.phones.size() == 1, "A on the TV pairs it");
     check(s.tokenExp == 0, "the QR is single-use");
     s.OnPair(Str(pr, "msg"), now);
@@ -164,7 +163,7 @@ static int Vectors(const char* path, const char* scratch)
                  ",\"cmds\":[{\"id\":\"m1\",\"phone\":\"" + s.phones[0].id + "\",\"env\":\"" + ghrepo::JsonEsc(Str(last, "env")) + "\"}]}";
         int64_t w = p.PollOnce(now, now * 1000);
         check(w == 2000 && p.watching, "after a command the next poll comes within 2 s (to carry the answer)");
-        check(bearer == "ENT", "the first poll uses the entitlement token");
+        check(bearer == "ENT", "the first poll uses the bearer the host supplies");
         check(got.size() == 1 && got[0].op == ghremote::Op::Cancel && got[0].arg == "220", "a verified command reaches the launcher");
         check(sent.find("\"states\":[{\"phone\":\"" + s.phones[0].id) != std::string::npos, "a sealed snapshot goes up");
         check(sent.find("\"free\":5") == std::string::npos, "the snapshot is not in the clear");

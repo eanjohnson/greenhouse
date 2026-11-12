@@ -16,6 +16,7 @@
 //     mode "themebad" a validly signed theme package whose files are not what their
 //                     names claim, or are not theme files at all: every one refused
 #include "../src/loader/gh_repo.h"
+#include "../src/loader/gh_pak.h"
 #include <cstdio>
 
 static int g_fail = 0;
@@ -74,7 +75,9 @@ static void Unit(const std::string& url)
     };
     for (const char* s : badMan){ CHECK(!ParseManifest(s, strlen(s), m, why)); printf("  refused manifest: %s\n", why.c_str()); }
     const char* badMan2[] = {
-        // §44: keyed needs a members-only add-on; a title's files are configs or seed/<Name>/...
+        // Encrypted packages of older builds ("keyed", a "sealed" file) are refused by name;
+        // a title's files are configs or seed/<Name>/...
+        "{\"schema\":\"greenhouse.package/1\",\"id\":\"a\",\"type\":\"addon\",\"version\":\"1.0.0.0\",\"files\":[{\"path\":\"x.bin\",\"size\":64,\"sealed\":true,\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}]}",
         "{\"schema\":\"greenhouse.package/1\",\"id\":\"a\",\"type\":\"addon\",\"version\":\"1.0.0.0\",\"keyed\":true,\"files\":[{\"path\":\"p.ghpak\",\"size\":1,\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}]}",
         "{\"schema\":\"greenhouse.package/1\",\"id\":\"a\",\"type\":\"title\",\"version\":\"1.0.0.0\",\"entitlement\":\"member\",\"keyed\":true,\"files\":[{\"path\":\"a.ghtitle.json\",\"size\":1,\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}]}",
         "{\"schema\":\"greenhouse.package/1\",\"id\":\"a\",\"type\":\"title\",\"version\":\"1.0.0.0\",\"files\":[{\"path\":\"seed/hive.txt\",\"size\":1,\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}]}",
@@ -146,7 +149,6 @@ static void Unit(const std::string& url)
     CHECK(!VerifyIndexSig(ib, "nonsense", why));
 }
 
-static int g_keyCalls = 0;
 
 int main(int argc, char** argv)
 {
@@ -230,22 +232,23 @@ int main(int argc, char** argv)
             if (ok) CHECK(done == total);
         }
     }
-    else if (mode == "keyed"){
-        // §44: a keyed corpus add-on and a title package with a seed.
+    else if (mode == "corpus"){
+        // §44: a corpus add-on (record packs) and a title package with a seed.
         ghrepo::Index idx;
         CHECK(ghrepo::FetchIndex(c, idx, why));
         bool autoSeen = false;
         for (const auto& p : idx.packages) if (p.id == "corpus-t") autoSeen = p.autoInstall;
         CHECK(autoSeen);
         const std::wstring dir = c.addonRoot + L"corpus-t\\1.0.0.0";
-        CHECK(!ghrepo::Install(c, idx, "corpus-t", why)); printf("  no key hook: %s\n", why.c_str());
-        CHECK(!Exists(dir) && !Exists(dir + L".part"));
-        c.packageKey = [](const std::string& pkg, const std::string& v, std::string& w){ ++g_keyCalls; w = "membership locked"; return false; };
-        CHECK(!ghrepo::Install(c, idx, "corpus-t", why)); printf("  key refused: %s\n", why.c_str());
-        CHECK(g_keyCalls == 1 && !Exists(dir) && !Exists(dir + L".part"));
-        c.packageKey = [](const std::string& pkg, const std::string& v, std::string& w){ ++g_keyCalls; return pkg == "corpus-t" && v == "1.0.0.0"; };
         CHECK(ghrepo::Install(c, idx, "corpus-t", why));
-        CHECK(g_keyCalls == 2 && Exists(dir + L"\\pack00.ghpak"));
+        CHECK(Exists(dir + L"\\pack00.ghpak") && !Exists(dir + L".part"));
+        // The installed packs open with the loader's reader and serve their records.
+        ghpak::Store st;
+        CHECK(st.Open(dir + L"\\", why));
+        CHECK(st.Count() == 3 && st.Has("gh_lo_0001") && !st.Has("gh_lo_0009"));
+        std::vector<uint8_t> rec;
+        CHECK(st.Read("gh_lo_0002", rec, why) && rec.size() == 5000);
+        st.Close();
         CHECK(ghrepo::Install(c, idx, "ghostoftsushima", why));
         CHECK(Exists(c.titleDir + L"ghostoftsushima.ghtitle.json"));
         CHECK(Exists(c.titleDir + L"seed\\GhostOfTsushima\\hive.txt"));

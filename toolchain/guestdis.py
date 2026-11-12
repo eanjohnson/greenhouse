@@ -19,13 +19,15 @@ Importable too: r2o/sec_of/fn_of/dis/cstr, plus SECS and the FN_BEG/FN tables.
 Finding a virtual: `xref` returning zero callers means the function is reached
 through a vtable -- scan .rdata for its 8-byte address, then read the COL at
 vtable-8 to name the class.  That is how GUEST+0x492490 was identified as
-nx::Input::GamepadWindowsInput::Poll (#214, GREENHOUSE.md §32.53).
+nx::Input::GamepadWindowsInput::Poll (#214).
 """
 import struct, sys, bisect
 import capstone
 
 import os
-PATH = os.environ.get('GH_GUEST_EXE', '$HOME/.claude/jobs/49fb5998/tmp/_got.exe')
+PATH = os.environ.get('GH_GUEST_EXE')
+if not PATH:
+    sys.exit('set GH_GUEST_EXE to the guest executable to disassemble')
 BASE = 0x140000000
 D = open(PATH, 'rb').read()
 

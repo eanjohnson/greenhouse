@@ -3,7 +3,7 @@
 # against Python's zlib: stored, fixed and dynamic blocks, levels 0-9, plus any
 # zip given as an argument (every entry is checked).
 set -euo pipefail
-GH=$HOME/greenhouse
+GH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 W="${TMPDIR:-/tmp}/gh_inflate_test.$$"; mkdir -p "$W"; trap 'rm -rf "$W"' EXIT
 g++ -std=c++17 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all "$GH/toolchain/test_gh_inflate.cpp" -o "$W/t"
 python3 - "$W" "$@" > "$W/names" <<'PY'

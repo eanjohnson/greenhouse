@@ -6,7 +6,7 @@
   "layout": "grid",
 
   "_note": [
-    "Ported from design/mockups/ios6.html: dark linen behind, bright cells",
+    "Ported from the ios6 design mockup: dark linen behind, bright cells",
     "in front, a bar at the top and a bar at the bottom. It selects `grid`,",
     "which is the layout that puts the library in a field of tiles and the",
     "settings in a centred grouped table -- the two shapes this era is actually",

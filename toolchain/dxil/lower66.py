@@ -591,7 +591,7 @@ if __name__ == '__main__':
 # ---------------------------------------------------------------------------
 # `switch` -> compare/branch chain.
 #
-# GREENHOUSE §32.125 (2026-09-18): an op census over the 5,485 blobs the console
+# 2026-09-18: an op census over the 5,485 blobs the console
 # created in one Tsushima run finds ZERO carrying an LLVM `switch` instruction,
 # while three of the four blobs the driver refuses outright (fa29971e:
 # sc::dxil::DxilError -> device removed; 4acdac3e / 86d22de2: access violation
@@ -699,7 +699,7 @@ def lower_switch(text, report=None):
 # ---------------------------------------------------------------------------
 # 64-bit raw buffer loads -> two 32-bit lanes.
 #
-# GREENHOUSE §32.125 (2026-09-18): the two Int64 soak blobs (4acdac3e / 86d22de2)
+# 2026-09-18: the two Int64 soak blobs (4acdac3e / 86d22de2)
 # fault the console's compiler (AV, device survives) and, once their `switch`
 # is lowered, the only constructs they use that no created blob uses are
 # `dx.op.rawBufferLoad.i64` and the i64 lshr/trunc that split its result.
@@ -769,7 +769,7 @@ def lower_i64load(text, report=None):
 # ---------------------------------------------------------------------------
 # i64 -> (lo, hi) i32 pairs.
 #
-# GREENHOUSE §32.125: with switch and the 64-bit loads lowered, the Int64 pair
+# With switch and the 64-bit loads lowered, the Int64 pair
 # still faults the driver and the only i64 forms left that no created blob uses
 # are `lshr i64` / `trunc i64` — the lo/hi split of a 64-bit lane mask. This
 # legalises every i64 SSA value in the function into two i32 values, for the

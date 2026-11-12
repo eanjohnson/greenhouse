@@ -18,7 +18,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', 'dxil'))
 import lower66, dxilhash
 
-DXC = os.environ.get('GH_DXC', '$HOME/dxc-linux_2026_07_29')
+DXC = os.environ.get('GH_DXC', '')   # a DXC release directory (bin/dxc, bin/dxa, lib/); required
 ENV = dict(os.environ, LD_LIBRARY_PATH=os.path.join(DXC, 'lib'))
 # Locals carry a % at uses but not at a label definition (`bbf0_7:`).
 LOCAL = re.compile(r'(?<![\w.$])(?:v|bb)f\d+_\d+\b')
@@ -266,7 +266,7 @@ def generate(orig_dir, corpus_dir, out_path, keys, jobs):
 def shard(recipe_path, out_dir):
     """Split a recipe into 256 shards by the key's first byte, each a complete
     ghbake/1 text, LZ4-block compressed as `GHLZ | u32 raw size | block`
-    (gh_shbake.h UnpackShard). They ship as gh_rcp_<xx> records of the keyed
+    (gh_shbake.h UnpackShard). They ship as gh_rcp_<xx> records of the
     corpus add-on: `ghpkg.py corpus --dir <out_dir>`."""
     import lz4.block, struct
     lines = open(recipe_path).read().split('\n')
@@ -298,6 +298,8 @@ def shard(recipe_path, out_dir):
 
 if __name__ == '__main__':
     import argparse, json
+    if not DXC:
+        sys.exit('set GH_DXC to a DXC release directory (holding bin/dxc and lib/)')
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest='cmd', required=True)
     one = sub.add_parser('one'); one.add_argument('orig'); one.add_argument('target')

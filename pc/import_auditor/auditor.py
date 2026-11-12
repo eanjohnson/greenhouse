@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""PE import-table auditor (GREENHOUSE.md §4.2 / Appendix D).
+"""PE import-table auditor.
 
 Scans a Win32 PE's import (and delay-import) tables and classifies every
 imported symbol against the Conservatory's three-tier resolution model:
 
   tier 1 "bed"    - intercepted by a specific Greenhouse Bed (may still call
                     through to the real export after path/data translation,
-                    or fully virtualize it -- see GREENHOUSE.md §3.3-3.6)
+                    or fully virtualize it -- see docs/architecture/api-shims.md)
   tier 2 "runtime" - forwarded to the real on-console export via runtime
                     LoadLibraryEx/GetProcAddress resolution (the uwp2win32-
                     style technique, §4.2)
@@ -35,7 +35,7 @@ import pefile
 #   2. per-DLL default
 #   3. fallback: unknown DLL -> tier "stub", bed "unknown"
 #
-# Bed names line up with GREENHOUSE.md src/conservatory/beds/*.
+# Bed names line up with the loader's beds (docs/architecture/api-shims.md).
 
 # (tier, bed) per DLL, used unless a function-specific override applies below.
 DLL_DEFAULTS = {

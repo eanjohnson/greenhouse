@@ -52,17 +52,15 @@ namespace ghrepo {
 // ---- trusted keys -----------------------------------------------------------
 struct Key { const char* id; const char* label; uint8_t xy[64]; };   // P-256 X||Y
 
-// GH_REPO_DEV_KEY: the development test key (private half on the dev host
-// only, ~/.greenhouse-keys). A release build must be compiled without it and
-// with the production key, whose custody is the maintainer's decision.
-// Trusted repository signing keys. The production key comes first so it is the
-// one a release build has; the dev key is additive and only in dev builds.
-//
-// This table used to hold ONLY the dev key, which meant a GH_RELEASE build --
-// where GH_REPO_DEV_KEY is required to be 0 -- trusted no signing key at all and
-// every index verify failed closed. A build with an empty table has no
-// repository: no themes, no title configs, no compat package. Fixed 2026-11-09
-// with the production drop-in, mirroring kEntKeys in gh_ent.h.
+// Trusted repository signing keys: the public halves of the keys whose index.sig
+// this build accepts. Two drop-in files, both written by `ghpkg.py pubinc`:
+//   gh_repo_keys.inc    the release key; compiled in whenever the file exists.
+//   gh_repo_devkey.inc  a development key; compiled in only with /DGH_REPO_DEV_KEY,
+//                       so a release build (built without the define) does not
+//                       trust indexes signed on a developer's machine.
+// A fork that publishes its own repository replaces gh_repo_keys.inc with its own
+// key and points GH_SITE_URL (gh_site.h) or LocalState\gh_repo_url.txt at its index.
+// A build with an empty table has no repository: every index verify fails closed.
 static const Key kGhRepoKeys[] = {
 #if __has_include("gh_repo_keys.inc")
 #include "gh_repo_keys.inc"
@@ -180,13 +178,11 @@ struct FromSource {                 // "from": a range of a third-party file (se
     uint64_t offset = 0, length = 0;    // byte range of the compressed member
     std::vector<Patch> patches;
 };
-struct FileEntry { std::string path, sha256, url; uint64_t size = 0; bool hasFrom = false, sealed = false; FromSource from; };
+struct FileEntry { std::string path, sha256, url; uint64_t size = 0; bool hasFrom = false; FromSource from; };
 
 struct Manifest {
     std::string id, type, version, name, publisher, minLoader;
-    std::string entitlement;                    // "" (free) | "member" (needs a live membership)
-    bool keyed = false;         // the files are *.ghpak packs under ONE package key (gh_pak.h), kept encrypted
-    bool autoInstall = false;   // "auto": the Launcher installs/updates it by itself for a member
+    bool autoInstall = false;   // "auto": the Launcher installs/updates it by itself
     std::vector<std::string> provides, needs;   // "provides" / "requires"
     std::vector<FileEntry> files;
     uint64_t ver = 0, minLoaderV = 0;
@@ -411,11 +407,13 @@ inline bool ParseManifest(const char* p, size_t n, Manifest& m, std::string& why
     if (!StrMember(j, "id", m.id, true, why) || !StrMember(j, "type", m.type, true, why) ||
         !StrMember(j, "version", m.version, true, why) || !StrMember(j, "name", m.name, false, why) ||
         !StrMember(j, "publisher", m.publisher, false, why) ||
-        !StrMember(j, "minLoader", m.minLoader, false, why) ||
-        !StrMember(j, "entitlement", m.entitlement, false, why)) return false;
-    if (!m.entitlement.empty() && m.entitlement != "member"){ why = "entitlement \"" + m.entitlement + "\" is not \"member\""; return false; }
-    if (!BoolMember(j, "keyed", m.keyed, why) || !BoolMember(j, "auto", m.autoInstall, why)) return false;
-    if (m.keyed && (m.entitlement.empty() || m.type != "addon")){ why = "a keyed package must be a members-only add-on"; return false; }
+        !StrMember(j, "minLoader", m.minLoader, false, why)) return false;
+    // Packages are plain. A manifest from before that ("keyed", or a "sealed" file
+    // below) names ciphertext this build has no key for, so it is refused by name
+    // rather than installed as garbage.
+    bool keyed = false;
+    if (!BoolMember(j, "keyed", keyed, why) || !BoolMember(j, "auto", m.autoInstall, why)) return false;
+    if (keyed){ why = "an encrypted package; this build installs plain packages only"; return false; }
     if (!SafeId(m.id)){ why = "manifest id is not a safe id"; return false; }
     if (!CheckType(m.type, why)) return false;
     if (!ParseVersion(m.version, &m.ver)){ why = "manifest version is not a.b.c.d"; return false; }
@@ -436,21 +434,14 @@ inline bool ParseManifest(const char* p, size_t n, Manifest& m, std::string& why
         if (!sz || !sz->isNum() || !sz->isInt || sz->i < 0 || (uint64_t)sz->i > kMaxFile){ why = f.path + ": bad size"; return false; }
         f.size = (uint64_t)sz->i;
         if (f.url.empty()) f.url = f.path;
-        if (const ghjson::Value* se = e.get("sealed")){
-            // Ciphertext iv(12)||ct||tag(16); the key comes from /api/payload (gh_ent.h).
-            if (!se->isBool()){ why = f.path + ": sealed is not a boolean"; return false; }
-            f.sealed = se->b;
-            if (f.sealed && m.entitlement.empty()){ why = f.path + ": sealed file in a package with no entitlement"; return false; }
-            if (f.sealed && f.size < 28){ why = f.path + ": sealed file is too small"; return false; }
-        }
+        if (const ghjson::Value* se = e.get("sealed"))
+            if (!se->isBool() || se->b){ why = f.path + ": an encrypted file; this build installs plain packages only"; return false; }
         if (const ghjson::Value* fr = e.get("from")){
             if (!ParseFrom(*fr, f, why)){ why = f.path + ": " + why; return false; }
             if (m.type != "addon"){ why = f.path + ": only an add-on file can come from a third party"; return false; }
-            if (f.sealed){ why = f.path + ": a third-party file cannot be sealed"; return false; }
         }
         for (const auto& o : m.files)
             if (_stricmp(o.path.c_str(), f.path.c_str()) == 0){ why = "file \"" + f.path + "\" listed twice"; return false; }
-        if (m.keyed && (f.sealed || f.hasFrom)){ why = f.path + ": a keyed package's files are packs, not sealed or third-party files"; return false; }
         if (m.type == "title"){
             // A title package is config only: flat *.ghtitle.json + its seed/<Name>/ files, small.
             if (!IsTitleConfigPath(f.path) && !IsTitleSeedPath(f.path)){
@@ -511,7 +502,7 @@ inline const Key* FindKey(const std::string& id)
 }
 
 // ECDSA P-256 over a SHA-256 digest, signature as raw r||s (what ghpkg.py, JOSE
-// ES256 and BCryptVerifySignature all use). Shared by index.sig and gh_ent.h tokens.
+// ES256 and BCryptVerifySignature all use).
 inline bool VerifyP256(const uint8_t xy[64], const uint8_t digest[32], const uint8_t sig[64], std::string& why)
 {
     BCRYPT_ALG_HANDLE alg = nullptr; BCRYPT_KEY_HANDLE key = nullptr;
@@ -649,8 +640,7 @@ done:
 
 // One request with any method, small body in and out. Unlike HttpGet, any HTTP
 // status counts as an answer: true means the server replied (status says what),
-// false means no reply at all (DNS, connect, TLS, timeout). gh_ent.h needs the
-// difference: a 401 locks the console, no answer keeps the offline grace.
+// false means no reply at all (DNS, connect, TLS, timeout).
 // extraHeaders is CRLF-separated. The body and the response are never logged.
 inline bool HttpRequest(const wchar_t* method, const std::string& url, const std::wstring& extraHeaders,
                         const std::string& reqBody, uint64_t maxBytes, std::string* respBody,
@@ -850,14 +840,6 @@ struct Config {
     // Progress for the UI: bytes done / total of the package being installed.
     volatile LONG64* progDone = nullptr; volatile LONG64* progTotal = nullptr;
     volatile LONG* cancel = nullptr;
-    // Decrypts a "sealed" file in place once its ciphertext matched the manifest
-    // (gh_ent.h: key from /api/payload). Not set = members-only packages are refused.
-    bool (*unseal)(const std::string& pkg, const std::string& version, const std::string& path,
-                   const std::wstring& part, std::string& why) = nullptr;
-    // Fetches and stores a keyed package's one key (gh_ent.h StorePackageKey). Asked
-    // BEFORE the download, so a console that may not have it never pulls the packs.
-    // Not set = keyed packages are refused.
-    bool (*packageKey)(const std::string& pkg, const std::string& version, std::string& why) = nullptr;
 };
 
 inline void Log(const Config& c, const std::string& s){ if (c.log) c.log(s); }
@@ -969,13 +951,6 @@ inline bool Install(const Config& c, const Index& idx, const std::string& id, st
     if (!ParseManifest((const char*)mb.data(), mb.size(), m, why)) return false;
     if (m.id != e->id || m.type != e->type || m.version != e->version){ why = id + ": manifest id/type/version differ from the index"; return false; }
     if (m.minLoaderV && c.loaderVersion && c.loaderVersion < m.minLoaderV){ why = id + " needs loader " + m.minLoader; return false; }
-    for (const auto& f : m.files)
-        if (f.sealed && !c.unseal){ why = id + " is members-only and this loader cannot open it"; return false; }
-    if (m.keyed){
-        if (!c.packageKey){ why = id + " is members-only and this loader cannot open it"; return false; }
-        if (!c.packageKey(m.id, m.version, why)){ why = id + ": " + why; return false; }
-        Log(c, "REPO package key ok " + m.id + " " + m.version);
-    }
 
     uint64_t total = 0; for (const auto& f : m.files) total += f.hasFrom ? f.from.length : f.size;   // bytes on the wire
     if (c.progTotal) *c.progTotal = (LONG64)total;
@@ -1036,7 +1011,6 @@ inline bool Install(const Config& c, const Index& idx, const std::string& id, st
         CloseHandle(h);
         if (!ok){ cleanup(); return false; }
         if (n != f.size || got != f.sha256){ why = f.path + ": size/sha256 do not match the manifest"; cleanup(); return false; }
-        if (f.sealed && !c.unseal(m.id, m.version, f.path, part, why)){ why = f.path + ": " + why; cleanup(); return false; }
         if (title && c.checkTitle && IsTitleConfigPath(f.path)){
             std::vector<uint8_t> tb;
             if (!ReadFileAll(part, tb, kMaxDoc) || !c.checkTitle(tb, m.id, why)){ why = f.path + ": " + why; cleanup(); return false; }
@@ -1049,15 +1023,13 @@ inline bool Install(const Config& c, const Index& idx, const std::string& id, st
         }
         if (theme){
             // The second half of the no-executables boundary, on the bytes that are
-            // about to be committed (after unseal, so a members-only theme is checked
-            // as plaintext too). The extension said what this is; now prove it.
+            // about to be committed. The extension said what this is; now prove it.
             std::vector<uint8_t> tb;
             if (!ReadFileAll(part, tb, kMaxThemeFile)){ why = f.path + ": cannot re-read the staged file"; cleanup(); return false; }
             if (!CheckThemeBytes(f.path, tb, why)){ why = f.path + " " + why; cleanup(); return false; }
         }
         done += n; if (c.progDone) *c.progDone = (LONG64)done;
-        Log(c, "REPO file ok " + m.id + "/" + f.path + " " + std::to_string(n) + " B sha256=" + got.substr(0, 16) +
-               (f.sealed ? " (sealed, opened)" : ""));
+        Log(c, "REPO file ok " + m.id + "/" + f.path + " " + std::to_string(n) + " B sha256=" + got.substr(0, 16));
     }
 
     // Commit. Everything is on disk and verified.

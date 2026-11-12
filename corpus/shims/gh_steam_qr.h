@@ -1,6 +1,6 @@
 // gh_steam_qr.h -- QR device-auth "anon -> real user" upgrade for the shim.
 // Ported from the proven flow in src/spikes/steamclient_probe.cpp (which logged
-// in the real account the test account on real Xbox). Runs on the shim's engine thread
+// in a real account on real Xbox). Runs on the shim's engine thread
 // AFTER anon LogOn (which is required so the engine's authed SendMethod path
 // works). Emits the PUBLIC challenge_url to LocalState\gh_qr_url.txt for the host
 // to render as a QR the user scans with the Steam mobile app.

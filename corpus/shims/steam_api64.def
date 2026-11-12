@@ -280,7 +280,7 @@ EXPORTS
     SteamAPI_ISteamGameServer_SetServerName=steam_stub
     SteamAPI_ISteamGameServer_SetSpectatorPort=steam_stub
     SteamAPI_ISteamGameServer_SetSpectatorServerName=steam_stub
-    SteamAPI_ISteamGameServer_UserHasLicenseForApp=steam_stub
+    SteamAPI_ISteamGameServer_UserHasLicenseForApp
     SteamAPI_ISteamGameServer_WasRestartRequested=steam_stub
     SteamAPI_ISteamHTMLSurface_AddHeader=steam_stub
     SteamAPI_ISteamHTMLSurface_AllowStartRequest=steam_stub
@@ -965,7 +965,7 @@ EXPORTS
     SteamAPI_ISteamUser_TerminateGameConnection=steam_stub
     SteamAPI_ISteamUser_TerminateGameConnection_DEPRECATED=steam_stub
     SteamAPI_ISteamUser_TrackAppUsageEvent=steam_stub
-    SteamAPI_ISteamUser_UserHasLicenseForApp=steam_stub
+    SteamAPI_ISteamUser_UserHasLicenseForApp
     SteamAPI_ISteamUtils_BOverlayNeedsPresent
     SteamAPI_ISteamUtils_CheckFileSignature=steam_stub
     SteamAPI_ISteamUtils_DismissFloatingGamepadTextInput=steam_stub

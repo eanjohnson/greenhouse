@@ -4,7 +4,7 @@
 // since the first scaffold, and NOTHING in the launcher ever called it. This is that
 // caller. It exists so a stranger's failure becomes a compatibility result instead of
 // a shrug, which is the only way corpus/compat/compat.json keeps up once people who
-// are not us are running games (PRODUCT-PLAN.md §6).
+// are not us are running games.
 //
 // ---------------------------------------------------------------------------------
 // THE SCRUB IS THE WHOLE POINT OF THIS FILE.
@@ -51,7 +51,7 @@
 // before this ships", and a scrub that can only be exercised on a console is a
 // scrub that does not get exercised.
 #ifndef GH_CRASH_SCRUB_ONLY
-#include "gh_ent.h"
+#include "gh_site.h"
 #include "gh_compat.h"
 #endif
 #include <string>
@@ -416,7 +416,7 @@ inline Result Upload(const std::string& titleName, const std::vector<std::string
                      const std::string& loaderVersion, const Custom& custom = Custom())
 {
     Result r;
-    const std::string srv = ghent::Server();
+    const std::string srv = ghsite::Server();
     if (srv.empty()) { r.why = "no site configured"; return r; }
     if (titleName.empty()) { r.why = "no title"; return r; }
 

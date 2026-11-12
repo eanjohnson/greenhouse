@@ -6,7 +6,7 @@
   "layout": "list",
 
   "_note": [
-    "Ported from design/mockups/bulletin.html: newsprint, one spot green,",
+    "Ported from the bulletin design mockup: newsprint, one spot green,",
     "rules instead of gaps, square corners. It shares `list` with aero and with",
     "the default, and the three are not mistakable for one another -- rowGap 0",
     "plus separators turns the same layout from floating cards into a ruled",

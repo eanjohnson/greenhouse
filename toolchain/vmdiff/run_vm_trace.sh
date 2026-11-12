@@ -4,7 +4,7 @@
 # Usage: run_vm_trace.sh [seconds] [outfile]
 set -euo pipefail
 SECS="${1:-60}"
-OUT="${2:-$CLAUDE_JOB_DIR/tmp/vmtrace.log}"
+OUT="${2:-${TMPDIR:-/tmp}/vmtrace.log}"
 
 # PowerShell is the VM's default shell, so `&` must be quoted and env vars are
 # set with $env:. Everything the injector needs comes through the environment --
