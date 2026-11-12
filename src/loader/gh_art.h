@@ -69,10 +69,33 @@
 
 namespace ghart {
 
-// Steam's store CDN. One host and one path shape, measured rather than
-// guessed: the `shared.cloudflare.steamstatic.com/store_item_assets/...` form
-// answers 301 and this one answers 200.
-constexpr const char* kHost = "https://cdn.cloudflare.steamstatic.com/steam/apps/";
+// Steam's store art lives at TWO path shapes, and a console needs both.
+//
+// The old one is flat and guessable: /steam/apps/<appid>/library_600x900.jpg.
+// It still answers 200 for most of a library and costs nothing to try, so it
+// is still what we ask for first.
+//
+// The new one is not guessable at all. Steam now files each asset under a
+// per-asset content hash --
+//   store_item_assets/steam/apps/<appid>/<40 hex>/library_capsule.jpg
+// -- and the filename moved too: `library_capsule.jpg` for most recent items,
+// still `library_600x900.jpg` for some, and `portrait.png` for a handful of
+// older republished ones. Measured on this library, 2026-11-10: 134 of 156
+// owned titles answer on the flat path and 22 only exist behind a hash, which
+// is why Dead as Disco, Cheese Rolling, RV There Yet?, Scratch Creek, PEAK,
+// Forza Horizon 6 and all three Disney Infinity Gold Editions came out as
+// typographic plates. No amount of guessing finds a 40-hex directory, so for
+// those we ASK: IStoreBrowseService/GetItems answers with `asset_url_format`
+// (the path, hash included) and the real filename per asset.
+//
+// Note the host differs too. `shared.cloudflare.steamstatic.com` 301s to
+// `shared.steamstatic.com`; we name the latter and save the hop.
+constexpr const char* kHost      = "https://cdn.cloudflare.steamstatic.com/steam/apps/";
+constexpr const char* kAssetHost = "https://shared.steamstatic.com/store_item_assets/";
+constexpr const char* kStoreApi  =
+    "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=";
+// A GetItems reply for one title is a few KB. This is a ceiling, not a size.
+constexpr uint64_t kMaxJsonBytes = 256ull * 1024;
 
 // The two assets the Cabinet layout draws. `logo.png` is deliberately not here:
 // the title screen sets the name in type over the hero, so a wordmark PNG would
@@ -80,6 +103,14 @@ constexpr const char* kHost = "https://cdn.cloudflare.steamstatic.com/steam/apps
 inline const char* AssetName(int kind)
 {
     return kind == GH_ART_HERO ? "library_hero.jpg" : "library_600x900.jpg";
+}
+
+// The same two assets, under the names the store API files them by. The API
+// gives the extension as part of the filename, so .png cases come out right
+// without us knowing which they are.
+inline const char* AssetKey(int kind)
+{
+    return kind == GH_ART_HERO ? "library_hero" : "library_capsule";
 }
 
 // What we decode to, NOT what Steam sends. A capsule is 600x900 and is drawn
@@ -101,6 +132,22 @@ constexpr int      kMaxCovers      = 44;
 constexpr int      kMaxHeroes      = 3;
 constexpr int      kDecodePerFrame = 2;      // D2D bitmaps created per frame
 constexpr int      kQueueMax       = 48;
+// How wide the warmed margin is lives with the seam, as kGhUiArtWarmRows in
+// gh_ui.h: it is the layout that knows what a row is. What matters HERE is that
+// it fits. The wall is 6 wide and 2 rows tall, so two rows of margin is 24
+// covers warmed around 12 drawn -- 36 live, inside the 44 a cover cache holds,
+// which is why kMaxCovers did not have to move. A third row would not fit.
+//
+// The warm lane's own bound. It is re-asked every frame for whatever is beside
+// the viewport, so it only ever holds one viewport's worth plus whatever the
+// last scroll position left behind.
+constexpr int      kWarmMax         = 64;
+// Bitmaps created per frame for covers that are NOT on screen yet. Separate
+// from kDecodePerFrame on purpose: a wall that is busy drawing must not starve
+// the warming that stops it being busy next time, and a wall that is idle
+// (which is most frames while reading the shelf) gets through a row in six
+// frames. Worst case the two budgets together are four uploads in a frame.
+constexpr int      kPromotePerFrame = 2;
 // The prefetch list is the whole owned library, not a screenful, so it gets a
 // bound of its own: 171 titles today, and a number big enough that growing the
 // library does not quietly truncate it.
@@ -137,6 +184,10 @@ struct Ctx {
     std::condition_variable cv;
     std::vector<Item>       items;
     std::deque<std::pair<uint32_t, int>> queue;
+    // Covers just outside the viewport: fetched and decoded exactly like the
+    // drawn ones, but drained only when `queue` is empty, so a tile the user is
+    // looking at is never behind one they might scroll to. See Warm().
+    std::deque<std::pair<uint32_t, int>> warm;
     std::vector<uint32_t>   allowed;          // app ids the library reported
     bool                    allowAll = false; // only the preview harness sets this
     // Covers to put on disk whether or not anything is drawing them, in the
@@ -151,7 +202,18 @@ struct Ctx {
     uint64_t         frame = 0;
     int              decodedThisFrame = 0;
     std::atomic<int> fetched{0}, missing{0}, failed{0};
+    // Of `fetched`, how many only existed behind the store API's hashed path.
+    std::atomic<int> resolved{0};
     int              saidFetched = -1, saidMissing = -1, saidFailed = -1;  // worker thread only
+    // FRAMES in which a cover was drawn as a typographic plate while its art
+    // was still on its way -- one cover plated for ten frames counts ten. This
+    // is the number the warming exists to hold still: it climbs once as a page
+    // fills and must then stop, because a cover that is ready before it is on
+    // screen never lands here. If it keeps climbing while someone scrolls, the
+    // margin is too small or the worker is not keeping up.
+    std::atomic<int> late{0};
+    int              saidLate = -1;           // UI thread only
+    uint64_t         saidLateFrame = 0;
 };
 
 inline Ctx g_art;
@@ -307,6 +369,104 @@ inline bool Allowed(uint32_t app)                // caller holds the lock
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// Where the art actually is
+// ---------------------------------------------------------------------------
+inline std::string UrlEncode(const std::string& in)
+{
+    static const char* hex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(in.size() * 3);
+    for (unsigned char c : in) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~')
+            out.push_back((char)c);
+        else {
+            out.push_back('%');
+            out.push_back(hex[c >> 4]);
+            out.push_back(hex[c & 15]);
+        }
+    }
+    return out;
+}
+
+// Ask Steam where this title's asset lives, for the titles whose art is behind
+// a content hash. Returns "" for "Steam does not have one", which the caller
+// treats exactly as a 404 on the flat path -- an absence, not a failure.
+//
+// One request per title, and only for titles the flat path has already refused,
+// so a library of 171 costs about 20 of these once and nothing afterwards: the
+// bytes land in the disk cache and neither path is walked again. GetItems does
+// take a batch of ids, and if this ever runs at a size where that matters, the
+// place to batch it is the prefetch queue, not here.
+inline std::string ResolveAssetUrl(uint32_t app, int kind)
+{
+    const std::string body =
+        "{\"ids\":[{\"appid\":" + std::to_string(app) + "}],"
+        "\"context\":{\"language\":\"english\",\"country_code\":\"US\"},"
+        "\"data_request\":{\"include_assets\":true}}";
+    std::vector<uint8_t> b;
+    std::string why;
+    uint64_t got = 0;
+    if (!ghrepo::HttpGet(std::string(kStoreApi) + UrlEncode(body), kMaxJsonBytes,
+                         &b, nullptr, nullptr, &got, why) || b.size() < 16)
+        return {};
+
+    ghjson::Value j;
+    std::string err;
+    if (!ghjson::Parse((const char*)b.data(), b.size(), j, err)) return {};
+    const ghjson::Value* r  = j.get("response");            if (!r)  return {};
+    const ghjson::Value* si = r->get("store_items");
+    if (!si || !si->isArr() || si->arr.empty()) return {};
+    const ghjson::Value* as = si->arr[0].get("assets");     if (!as) return {};
+    const ghjson::Value* fm = as->get("asset_url_format");
+    const ghjson::Value* nm = as->get(AssetKey(kind));
+    if (!fm || !fm->isStr() || !nm || !nm->isStr() || nm->s.empty()) return {};
+
+    // asset_url_format is "steam/apps/<id>/${FILENAME}?t=<stamp>" and the asset
+    // name is "<hash>/<file>". The stamp is Steam's own cache buster: keep it,
+    // so a title that changes its capsule is not served the old one forever.
+    const std::string tok = "${FILENAME}";
+    std::string path = fm->s;
+    const size_t at = path.find(tok);
+    if (at == std::string::npos) return {};
+    path.replace(at, tok.size(), nm->s);
+    return std::string(kAssetHost) + path;
+}
+
+// Fetch one asset: the flat path, then the hashed one, then give up.
+//
+// `absent` separates "Steam has no such asset" from "this console could not
+// ask", because only the first may be remembered -- a dropped association that
+// wrote absent markers would blank a wall for fourteen days. A 4xx from BOTH
+// paths is an absence; anything else is this attempt failing.
+inline bool FetchAsset(uint32_t app, int kind, std::vector<uint8_t>& bytes,
+                       bool& absent, std::string& why)
+{
+    absent = false;
+    bytes.clear();
+    uint64_t got = 0;
+    const std::string flat = std::string(kHost) + std::to_string(app) + "/" + AssetName(kind);
+    if (ghrepo::HttpGet(flat, kMaxFetchBytes, &bytes, nullptr, nullptr, &got, why) &&
+        bytes.size() > 64)
+        return true;
+
+    // Not a 4xx: the network, not the asset. Do not spend a second request on it.
+    if (why.compare(0, 6, "HTTP 4") != 0) return false;
+
+    const std::string url = ResolveAssetUrl(app, kind);
+    if (url.empty()) { absent = true; return false; }
+
+    bytes.clear();
+    if (ghrepo::HttpGet(url, kMaxFetchBytes, &bytes, nullptr, nullptr, &got, why) &&
+        bytes.size() > 64) {
+        g_art.resolved.fetch_add(1);
+        return true;
+    }
+    absent = (why.compare(0, 6, "HTTP 4") == 0);
+    return false;
+}
+
 inline void WorkerOne(uint32_t app, int kind)
 {
     const std::wstring path = CachePath(app, kind);
@@ -321,19 +481,14 @@ inline void WorkerOne(uint32_t app, int kind)
             if (Item* it = Find(app, kind)) it->state = kAbsent;
             return;
         }
-        const std::string url = std::string(kHost) + std::to_string(app) + "/" + AssetName(kind);
         std::string why;
-        uint64_t got = 0;
-        bytes.clear();
-        const bool ok = ghrepo::HttpGet(url, kMaxFetchBytes, &bytes, nullptr, nullptr, &got, why);
-        if (!ok || bytes.size() <= 64) {
-            // "Steam has no such asset" and "the console could not reach Steam"
-            // are NOT the same answer, and treating them the same was a bug: a
-            // dropped Wi-Fi association wrote the absent marker and blanked a
-            // title's art for fourteen days. Only the server's own 4xx is an
-            // absence; anything else is this attempt failing, and the next
-            // launch asks again.
-            const bool absent = why.compare(0, 6, "HTTP 4") == 0;
+        bool absent = false;
+        // The flat path, then the hashed one. "Steam has no such asset" and
+        // "the console could not reach Steam" are NOT the same answer, and
+        // treating them the same was a bug: a dropped Wi-Fi association wrote
+        // absent markers and blanked a wall for fourteen days.
+        const bool ok = FetchAsset(app, kind, bytes, absent, why);
+        if (!ok) {
             if (absent) {
                 // A miss is normal (not every title has a capsule) and is not an
                 // error worth a line per title: count them and say so once.
@@ -419,13 +574,11 @@ inline void PrefetchOne(uint32_t app)
     uint64_t days = 0;
     if (FileAgeDays(AbsentPath(app, kind), &days) && days < kAbsentDays) return;
 
-    const std::string url = std::string(kHost) + std::to_string(app) + "/" + AssetName(kind);
     std::string why;
-    uint64_t got = 0;
     std::vector<uint8_t> bytes;
-    if (!ghrepo::HttpGet(url, kMaxFetchBytes, &bytes, nullptr, nullptr, &got, why) ||
-        bytes.size() <= 64) {
-        if (why.compare(0, 6, "HTTP 4") == 0) {
+    bool absent = false;
+    if (!FetchAsset(app, kind, bytes, absent, why)) {
+        if (absent) {
             // A miss is normal and permanent-ish: remember it exactly as the
             // on-demand path does, so neither path asks again for 14 days.
             g_art.missing.fetch_add(1);
@@ -466,7 +619,7 @@ inline void WorkerLoop()
         {
             std::unique_lock<std::mutex> lk(g_art.mu);
             g_art.cv.wait(lk, []{ return g_art.stop.load() || !g_art.queue.empty() ||
-                                         !g_art.prefetch.empty(); });
+                                         !g_art.warm.empty() || !g_art.prefetch.empty(); });
             if (g_art.stop.load()) return;
             if (!g_art.queue.empty()) {
                 // LIFO: the newest request is the one the user is looking at. A
@@ -475,8 +628,17 @@ inline void WorkerLoop()
                 app = g_art.queue.back().first;
                 kind = g_art.queue.back().second;
                 g_art.queue.pop_back();
+            } else if (!g_art.warm.empty()) {
+                // Nothing on screen is waiting, so get ahead of the scroll.
+                // LIFO here too: the newest warm request is the margin beside
+                // where the user is NOW, and the oldest is beside where they
+                // were several rows ago.
+                app  = g_art.warm.back().first;
+                kind = g_art.warm.back().second;
+                g_art.warm.pop_back();
             } else {
-                // Nothing is waiting to be drawn, so fill the disk cache.
+                // Nothing is waiting to be drawn or scrolled to, so fill the
+                // disk cache.
                 // FIFO, because unlike the on-screen queue this list has no
                 // "most recent" end: it is the library in library order.
                 app = g_art.prefetch.front();
@@ -506,8 +668,11 @@ inline void WorkerLoop()
                       x = g_art.failed.load();
             if (f != g_art.saidFetched || m != g_art.saidMissing || x != g_art.saidFailed) {
                 g_art.saidFetched = f; g_art.saidMissing = m; g_art.saidFailed = x;
-                Log("queue drained: " + std::to_string(f) + " fetched, " +
-                    std::to_string(m) + " with no asset, " + std::to_string(x) + " failed" +
+                const int rv = g_art.resolved.load();
+                Log("queue drained: " + std::to_string(f) + " fetched" +
+                    (rv ? (" (" + std::to_string(rv) + " via the store API)") : std::string()) +
+                    ", " + std::to_string(m) + " with no asset, " +
+                    std::to_string(x) + " failed" +
                     (left ? (", " + std::to_string(left) + " still to prefetch")
                           : std::string()));
             }
@@ -538,12 +703,101 @@ inline void EvictLocked(int kind, int cap)
     }
 }
 
+// Turn a decoded item's pixels into a drawable D2D bitmap. The caller holds
+// `lk`; this unlocks around CreateBitmap, because that call can take a moment
+// and the worker should not be waiting on the UI thread's D2D.
+//
+// Both the drawn path and the warm path come through here, so there is one
+// implementation of "pixels become a bitmap" rather than two that could drift.
+// Returns the bitmap, or nullptr if it could not be made.
+inline ID2D1Bitmap* MakeReady(Item* it, std::unique_lock<std::mutex>& lk)
+{
+    if (!it || it->state != kPixels || !g_ghUi.dc) return nullptr;
+
+    std::vector<uint8_t> px = std::move(it->px);
+    const uint32_t w = it->w, h = it->h;
+    const uint32_t a = it->app; const int k = it->kind;
+    it->px.clear();
+    lk.unlock();
+
+    GhCom<ID2D1Bitmap> bmp;
+    const D2D1_BITMAP_PROPERTIES bp = D2D1::BitmapProperties(
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.f, 96.f);
+    const HRESULT hr = g_ghUi.dc->CreateBitmap(D2D1::SizeU(w, h), px.data(), w * 4, &bp, bmp.put());
+
+    lk.lock();
+    Item* again = Find(a, k);                 // the vector may have grown meanwhile
+    if (!again) return nullptr;
+    if (FAILED(hr) || !bmp) { again->state = kAbsent; return nullptr; }
+    again->bmp = bmp;
+    again->state = kReady;
+    again->used = g_art.frame;
+    // Eviction cannot take the one just made -- it is the most recently used of
+    // its kind -- but it can move the vector, so re-find.
+    EvictLocked(k, k == GH_ART_HERO ? kMaxHeroes : kMaxCovers);
+    again = Find(a, k);
+    return again ? again->bmp.get() : nullptr;
+}
+
 // Called once per frame by the page that draws art, before drawing it.
 inline void BeginFrame()
 {
-    std::lock_guard<std::mutex> lk(g_art.mu);
+    std::unique_lock<std::mutex> lk(g_art.mu);
     ++g_art.frame;
     g_art.decodedThisFrame = 0;
+    if (!g_ghUi.dc) return;
+
+    // Make bitmaps for covers that are decoded but not on screen yet, so the
+    // row below the fold is drawable the moment it scrolls up rather than
+    // starting its upload then. Most recently wanted first, which is the margin
+    // nearest the viewport; a warm item the user has scrolled away from falls
+    // behind on `used` and waits, which is what we want.
+    for (int n = 0; n < kPromotePerFrame; ++n) {
+        Item* best = nullptr;
+        for (auto& it : g_art.items)
+            if (it.state == kPixels && (!best || it.used > best->used)) best = &it;
+        if (!best) break;
+        MakeReady(best, lk);                  // unlocks and relocks; `best` dies here
+    }
+
+    // What the wall is costing, in frames where a cover that DOES exist was
+    // drawn as its plate because the art had not caught up. That is the one
+    // fault this file is here to prevent, and without a number the only
+    // instrument is somebody's eye on a television.
+    //
+    // It counts frames, not covers: one cover plated for ten frames is ten.
+    // That is deliberate -- what is noticeable is how long the wrong thing was
+    // on screen, not how many tiles were involved.
+    //
+    // Said when it moves, and otherwise every 1800 frames (~30 s) so there is
+    // always a current reading. An earlier version spoke ONLY when the number
+    // moved, which meant it went silent exactly when the warming was working:
+    // a healthy wall and a closed page looked identical in the diag, and the
+    // only reading on file was the one from before the margin had filled.
+    // Built under the lock but logged outside it: the worker should not wait on
+    // the diag's disk write.
+    std::string line;
+    const int lt = g_art.late.load();
+    const bool moved = (lt != g_art.saidLate);
+    if (g_art.frame >= g_art.saidLateFrame + (moved ? 300 : 1800)) {
+        int ready = 0, pend = 0, gone = 0;
+        for (const auto& it : g_art.items) {
+            if (it.state == kReady) ++ready;
+            else if (it.state == kQueued || it.state == kPixels) ++pend;
+            else if (it.state == kAbsent) ++gone;
+        }
+        line = "wall: late=" + std::to_string(lt) + " frame(s)" +
+               (moved ? " (+" + std::to_string(lt - (g_art.saidLate < 0 ? 0 : g_art.saidLate)) + ")"
+                      : std::string(" (steady)")) +
+               ", live=" + std::to_string(ready) +
+               " pending=" + std::to_string(pend) +
+               " warm=" + std::to_string(g_art.warm.size()) +
+               " none=" + std::to_string(gone);
+        g_art.saidLate = lt;
+        g_art.saidLateFrame = g_art.frame;
+    }
+    lk.unlock();
+    if (!line.empty()) Log(line);
 }
 
 // The GhUiArtFn the UI system calls. Never blocks, never touches the network,
@@ -568,36 +822,17 @@ inline ID2D1Bitmap* Provide(void* /*ctx*/, uint32_t app, int kind)
     case kReady:
         return it->bmp.get();
     case kAbsent:
+        return nullptr;                       // no art exists; the plate IS the answer
     case kQueued:
+        if (kind == GH_ART_COVER) g_art.late.fetch_add(1);
         return nullptr;
     case kPixels: {
-        if (g_art.decodedThisFrame >= kDecodePerFrame) return nullptr;
+        if (g_art.decodedThisFrame >= kDecodePerFrame) {
+            if (kind == GH_ART_COVER) g_art.late.fetch_add(1);
+            return nullptr;
+        }
         ++g_art.decodedThisFrame;
-        // Copy out and unlock: CreateBitmap can take a moment and the worker
-        // should not be waiting on the UI thread's D2D call.
-        std::vector<uint8_t> px = std::move(it->px);
-        const uint32_t w = it->w, h = it->h;
-        const uint32_t a = it->app; const int k = it->kind;
-        it->px.clear();
-        lk.unlock();
-
-        GhCom<ID2D1Bitmap> bmp;
-        const D2D1_BITMAP_PROPERTIES bp = D2D1::BitmapProperties(
-            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.f, 96.f);
-        const HRESULT hr = g_ghUi.dc->CreateBitmap(D2D1::SizeU(w, h), px.data(), w * 4, &bp, bmp.put());
-
-        lk.lock();
-        Item* again = Find(a, k);                 // the vector may have grown meanwhile
-        if (!again) return nullptr;
-        if (FAILED(hr) || !bmp) { again->state = kAbsent; return nullptr; }
-        again->bmp = bmp;
-        again->state = kReady;
-        again->used = g_art.frame;
-        // Eviction cannot take the one just made -- it is the most recently
-        // used of its kind -- but it can move the vector, so re-find.
-        EvictLocked(k, k == GH_ART_HERO ? kMaxHeroes : kMaxCovers);
-        again = Find(a, k);
-        return again ? again->bmp.get() : nullptr;
+        return MakeReady(it, lk);
     }
     case kUnknown:
     default:
@@ -616,8 +851,51 @@ inline ID2D1Bitmap* Provide(void* /*ctx*/, uint32_t app, int kind)
         it->state = kQueued;
         g_art.queue.push_back({ app, kind });
         g_art.cv.notify_one();
+        if (kind == GH_ART_COVER) g_art.late.fetch_add(1);
         return nullptr;
     }
+}
+
+// The GhUiArtWarmFn the UI system calls for tiles that are NOT being drawn --
+// the rows just outside the viewport. Same pipeline as Provide, one lane down:
+// fetch, decode, and (via BeginFrame) a bitmap, so that by the time the row
+// scrolls up there is nothing left to do but draw it.
+//
+// Called for every off-screen tile of every frame, so the common case -- we
+// already have it, or already asked -- has to be a lock and two compares.
+inline void Warm(void* /*ctx*/, uint32_t app, int kind)
+{
+    if (!app || !g_art.running.load()) return;
+    if (kind < 0 || kind >= GH_ART_KINDS) return;
+
+    std::lock_guard<std::mutex> lk(g_art.mu);
+    Item* it = Find(app, kind);
+    if (!it) {
+        if (!Allowed(app)) return;            // not the signed-in account's: never fetched
+        g_art.items.push_back(Item{});
+        it = &g_art.items.back();
+        it->app = app; it->kind = kind; it->state = kUnknown;
+    }
+    // Being beside the viewport counts as being used, or the LRU would drop the
+    // margin we just paid for. A cover the user scrolls away from stops being
+    // warmed, goes stale on `used` by itself, and is evicted in its turn.
+    it->used = g_art.frame;
+    if (it->state != kUnknown) return;        // ready, queued, decoding, or absent
+
+    if (!Allowed(app)) { it->state = kAbsent; return; }
+    if ((int)g_art.warm.size() >= kWarmMax) {
+        // Oldest loses its place, exactly as in Provide: back to kUnknown as it
+        // goes, or it would sit in kQueued for ever with nothing coming.
+        const auto drop = g_art.warm.front();
+        g_art.warm.pop_front();
+        if (Item* d = Find(drop.first, drop.second))
+            if (d->state == kQueued) d->state = kUnknown;
+        it = Find(app, kind);
+        if (!it) return;
+    }
+    it->state = kQueued;
+    g_art.warm.push_back({ app, kind });
+    g_art.cv.notify_one();
 }
 
 // ---------------------------------------------------------------------------
@@ -676,6 +954,39 @@ inline void AllowAll(bool on)                      // the preview harness only
     g_art.allowAll = on;
 }
 
+// An absent marker means "Steam has no such asset". Until 0.0.944.0 it meant
+// something weaker and wrong -- "the flat CDN path has no such asset" -- and
+// that is exactly the case the hashed path now answers. Every marker written
+// by an older build is therefore a claim this build can disprove, so they go,
+// once, the first time a build that knows about the store API starts. Without
+// this a console that already has the covers blanked keeps them blanked for
+// the fourteen days the markers are honoured for.
+//
+// The stamp is a file and not a setting because the cache is the only state
+// this decision concerns: delete the cache directory and the question is moot.
+inline void ForgetStaleAbsences()
+{
+    const std::wstring stamp = g_art.dir + L"absence.rule2";
+    if (GetFileAttributesW(stamp.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+
+    int gone = 0;
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((g_art.dir + L"*.none").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (DeleteFileW((g_art.dir + fd.cFileName).c_str())) ++gone;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    HANDLE t = CreateFileW(stamp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (t != INVALID_HANDLE_VALUE) CloseHandle(t);
+    if (gone)
+        Log("forgot " + std::to_string(gone) + " remembered absence(s): they were "
+            "recorded before the store API path existed");
+}
+
 // `dir` is a directory for the cache, with its trailing separator; `diskCap` is
 // what it may occupy (kDiskCapDev on D:\DevelopmentFiles, kDiskCapLocal in
 // LocalState -- see the budget note at the top). Failing to make the directory
@@ -696,11 +1007,13 @@ inline bool Init(const std::wstring& dir, uint64_t diskCap, void (*log)(const st
             return false;
         }
     }
+    ForgetStaleAbsences();
     PruneDisk();
     g_art.stop.store(false);
     g_art.running.store(true);
     g_art.worker = std::thread(&WorkerLoop);
     GhUiSetArtProvider(&Provide, nullptr);
+    GhUiSetArtWarmer(&Warm, nullptr);
     Log("ready, cache cap " + std::to_string(diskCap / (1024 * 1024)) + " MB");
     return true;
 }
@@ -713,9 +1026,11 @@ inline void Shutdown()
     if (g_art.worker.joinable()) g_art.worker.join();
     g_art.running.store(false);
     GhUiSetArtProvider(nullptr, nullptr);
+    GhUiSetArtWarmer(nullptr, nullptr);
     std::lock_guard<std::mutex> lk(g_art.mu);
     g_art.items.clear();
     g_art.queue.clear();
+    g_art.warm.clear();
     g_art.prefetch.clear();
 }
 
@@ -737,7 +1052,8 @@ inline std::string Stats()
            " prefetch=" + std::to_string(pre) +
            " none=" + std::to_string(absent) + " fetched=" + std::to_string(g_art.fetched.load()) +
            " miss=" + std::to_string(g_art.missing.load()) +
-           " baddecode=" + std::to_string(g_art.failed.load());
+           " baddecode=" + std::to_string(g_art.failed.load()) +
+           " late=" + std::to_string(g_art.late.load());
 }
 
 }  // namespace ghart

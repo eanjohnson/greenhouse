@@ -255,9 +255,14 @@ struct GhUiRow {
     // It is NOT a licence to fetch anything -- the provider has its own
     // ownership rule -- it is just the key.
     uint32_t  appId = 0;
-    // The row is present but not here yet (owned, not installed). A list layout
-    // already says so in words; a tile layout says it with the picture, which
-    // is the whole point of a wall of covers: dim it and the eye skips it.
+    // The row is present but not here yet (owned, not installed). A statement of
+    // fact, not an instruction to a layout: the Cabinet wall used to draw it by
+    // dimming the cover to 42%, and does not any more, because that showed a
+    // person a washed-out version of their own library and misrepresented art we
+    // did not author. The state is carried in words instead -- the "Not
+    // installed" drawer and its count, the breadcrumb, and the title screen's
+    // chip (LuiTitleState). A layout may still read this, but anything it draws
+    // from it has to be ADDED to the tile, never taken out of the picture.
     bool      muted = false;
     // A short word in a strip across the foot of a tile: "Part copied". It is a
     // word and not a bar because gh_install.txt records only `complete=0|1` --

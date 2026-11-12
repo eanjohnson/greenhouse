@@ -93,9 +93,9 @@ inline int di8_register(ComState& c, const char* name, const GUID* iid)
 
 inline void di8_bringup(Machine& m)
 {
-    static bool done = false;
-    if (done) return;
-    done = true;
+    // Once per session: x86_begin_session() empties the ComState these ids index.
+    static uint32_t stamp = 0;
+    if (!x86_session_changed(stamp)) return;
     com_bringup(m);
     di8_id_a() = di8_register(com(), "IDirectInput8A", &kIID_DI8A);
     di8_id_w() = di8_register(com(), "IDirectInput8W", &kIID_DI8W);

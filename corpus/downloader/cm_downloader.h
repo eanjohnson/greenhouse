@@ -830,7 +830,11 @@ inline bool sha1_handle_range(HANDLE h, uint64_t off, uint64_t len, uint8_t out[
                 if(!ReadFile(h,buf,n,&got,NULL) || got!=n){ fail=true; break; }
                 if(BCryptHashData(hH,buf,got,0)!=GHDL_STATUS_SUCCESS){ fail=true; break; }
                 left-=got; since+=got;
-                if(tick && since>=(8u<<20)){ tick(tctx, len-left, len); since=0; }
+                if(since>=(8u<<20)){
+                    if(tick) tick(tctx, len-left, len);
+                    since=0;
+                    if(cancelled()){ fail=true; break; }   // a cancel mid-hash ends this file now
+                }
             }
             if(!fail && BCryptFinishHash(hH,out,20,0)==GHDL_STATUS_SUCCESS) ok=true;
         }
@@ -904,6 +908,7 @@ inline bool fetch_decode_chunk(uint32_t depot, const Bytes& key, const Chunk& ck
 // multi-GB asset on the next pass.
 inline bool write_or_repair_file(const FileEntry& fe, const std::wstring& full, RepairCtx& x, bool trace){
     if(x.disk_full && *x.disk_full) return false;
+    if(cancelled()){ if(x.failures) (*x.failures)++; return false; }
     uint64_t before=existing_size(full);
     bool missing=(before==(uint64_t)-1);
     uint64_t have=missing?0:before;
@@ -929,6 +934,7 @@ inline bool write_or_repair_file(const FileEntry& fe, const std::wstring& full, 
             repair_cb(x, busy);
             return true;
         }
+        if(cancelled()){ if(x.failures) (*x.failures)++; return false; }
         if(trace) trace_exe("sha_content mismatch, repairing");
         ghlog(std::string("verify mismatch ")+fe.name);
     }
@@ -1170,11 +1176,13 @@ inline int DownloadApp(uint32_t app,const std::wstring& outdir,const std::string
     bool disk_full=false;
     for(auto& dw:work){
         if(disk_full) break;
+        if(cancelled()){ if(!failures) failures=1; break; }
         RepairCtx rx; rx.depot=dw.depot; rx.key=&dw.key; rx.servers=&servers; rx.verify=verify;
         rx.cb=cb; rx.cbctx=ctx; rx.totalChunks=totalChunks; rx.totalFiles=totalFiles;
         rx.nchunks=&nchunks; rx.nfiles=&nfiles; rx.failures=&failures; rx.totbytes=&totbytes; rx.disk_full=&disk_full;
         for(auto& fe:dw.files){
             if(disk_full) break;
+            if(cancelled()){ if(!failures) failures=1; break; }
             std::string rel=fe.name; for(char& ch:rel) if(ch=='/')ch='\\';
             std::wstring full=outdir+L"\\"+towide(rel);
             if(fe.flags&FLAG_DIRECTORY){ mkdirs(full+L"\\"); continue; }

@@ -584,13 +584,21 @@ inline int64_t JsonInt(const std::string& body, const char* key, int64_t dflt)
 }
 
 inline bool Post(const std::string& path, const std::string& json, const std::string& bearer,
-                 std::string& resp, DWORD& status, std::string& why)
+                 std::string& resp, DWORD& status, std::string& why, uint64_t maxResp = 64 * 1024)
 {
     std::string srv = Server();
     if (srv.empty()){ why = "no membership server configured"; return false; }
     std::wstring hdr = L"Content-Type: application/json\r\n";
     if (!bearer.empty()) hdr += L"Authorization: Bearer " + ghrepo::Widen(bearer) + L"\r\n";
-    return ghrepo::HttpRequest(L"POST", srv + path, hdr, json, 64 * 1024, &resp, &status, why);
+    return ghrepo::HttpRequest(L"POST", srv + path, hdr, json, maxResp, &resp, &status, why);
+}
+
+// The entitlement token as stored ("" = not linked). For §66's poller, which sends it
+// only to this same server; never logged.
+inline std::string Token()
+{
+    std::lock_guard<std::mutex> l(g_mu);
+    return ReadLine(g_cfg.dir + L"gh_ent.txt");
 }
 
 // ---- operations -------------------------------------------------------------------
@@ -635,6 +643,26 @@ inline Hb Heartbeat()
     }
     Log("ENT heartbeat: HTTP " + std::to_string(status) + ", keeping the token " + Describe(Evaluate()));
     return Hb::Refused;
+}
+
+// §65. Tell the site where this console's browser page is, so
+// playgreenhouse.app/console can send the patron's browser straight there. Only
+// a home-network address and a port go up (the site refuses anything that is not
+// RFC 1918), and `lan` empty means "switched off" -- the site then forgets both.
+// No traffic ever goes through the site. True = the site stored it.
+inline bool Announce(const std::string& lan, unsigned port, std::string& why)
+{
+    if (!Enabled() || Server().empty()) { why = "no membership server"; return false; }
+    std::string tok;
+    { std::lock_guard<std::mutex> l(g_mu); tok = ReadLine(g_cfg.dir + L"gh_ent.txt"); }
+    if (tok.empty()) { why = "not linked"; return false; }
+    const std::string body = lan.empty()
+        ? std::string("{\"enabled\":false}")
+        : "{\"enabled\":true,\"lan\":\"" + ghrepo::JsonEsc(lan) + "\",\"port\":" + std::to_string(port) + "}";
+    std::string resp; DWORD status = 0;
+    if (!Post("/api/auth/announce", body, tok, resp, status, why)) return false;
+    if (status != 200) { why = "HTTP " + std::to_string(status); return false; }
+    return true;
 }
 
 // The QR link. `session` is the console's poll secret: never logged.

@@ -1,0 +1,631 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Greenhouse on your console</title>
+<!--
+  Served by the console itself (gh_web.h / gh_custom.h, §65). Everything this page
+  does goes straight to the console on your home network; nothing passes through
+  playgreenhouse.app. The CSP allows no external anything, so this file must stay
+  self-contained: no fonts, scripts, images or styles from anywhere else.
+-->
+<style>
+:root {
+  --bg: #0e1411; --panel: #16201b; --panel2: #1c2922; --line: #2a3a31;
+  --text: #e8f0ea; --dim: #9db0a4; --faint: #6f8577;
+  --accent: #5fd38d; --accent-ink: #062614; --warn: #f2c14e; --bad: #ff7a6b;
+  --radius: 14px; --shadow: 0 1px 0 rgba(255,255,255,.03) inset, 0 8px 24px rgba(0,0,0,.25);
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f3f6f4; --panel: #ffffff; --panel2: #f0f4f1; --line: #d7e1da;
+    --text: #13201a; --dim: #4c6155; --faint: #7a8d81;
+    --accent: #1f9d55; --accent-ink: #ffffff; --warn: #9a6a00; --bad: #c0392b;
+    --shadow: 0 1px 2px rgba(0,0,0,.06), 0 8px 24px rgba(0,0,0,.05);
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); }
+body { font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 860px; margin: 0 auto; padding: 24px 16px 64px; }
+header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+.brand { font-weight: 700; font-size: 20px; letter-spacing: .2px; display: flex; align-items: center; gap: 10px; }
+.leaf { width: 26px; height: 26px; border-radius: 8px; background: var(--accent); display: grid; place-items: center; color: var(--accent-ink); font-weight: 800; }
+.spacer { flex: 1; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; background: var(--panel2); color: var(--dim); font-size: 13px; border: 1px solid var(--line); }
+.pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+.pill.busy .dot { background: var(--warn); }
+.pill.off .dot { background: var(--bad); }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; box-shadow: var(--shadow); margin-bottom: 16px; }
+h1 { font-size: 26px; margin: 0 0 6px; }
+h2 { font-size: 17px; margin: 0 0 12px; }
+p { margin: 0 0 10px; }
+.dim { color: var(--dim); }
+.faint { color: var(--faint); font-size: 13px; }
+.note { border-left: 3px solid var(--warn); padding: 8px 12px; background: var(--panel2); border-radius: 8px; color: var(--dim); font-size: 14px; }
+.err { border-left-color: var(--bad); color: var(--text); }
+button, .btn { font: inherit; border: 1px solid var(--line); background: var(--panel2); color: var(--text); padding: 8px 14px; border-radius: 10px; cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 600; }
+button.danger { color: var(--bad); }
+button.danger.solid { background: var(--bad); color: #fff; border-color: transparent; }
+button.link { background: none; border: none; color: var(--dim); padding: 4px 6px; text-decoration: underline; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+input[type=text], select { font: inherit; width: 100%; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+label { display: block; font-size: 13px; color: var(--dim); margin: 10px 0 4px; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.drop { border: 2px dashed var(--line); border-radius: var(--radius); padding: 28px 16px; text-align: center; transition: border-color .15s, background .15s; }
+.drop.over { border-color: var(--accent); background: var(--panel2); }
+.drop .big { font-size: 17px; font-weight: 600; margin-bottom: 4px; }
+.bar { height: 8px; background: var(--panel2); border-radius: 99px; overflow: hidden; border: 1px solid var(--line); }
+.bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+.code { font: 700 56px/1 ui-monospace, "Cascadia Mono", Menlo, monospace; letter-spacing: 12px; text-align: center; padding: 18px 0 8px; }
+.game { display: grid; grid-template-columns: 56px 1fr; gap: 14px; }
+.plate { width: 56px; height: 56px; border-radius: 12px; background: var(--panel2); border: 1px solid var(--line); display: grid; place-items: center; font-weight: 700; font-size: 20px; color: var(--dim); }
+.game h3 { margin: 0; font-size: 17px; overflow-wrap: anywhere; }
+.meta { color: var(--faint); font-size: 13px; }
+.result { font-size: 13px; margin-top: 2px; }
+.result.bad { color: var(--bad); }
+.result.ok { color: var(--accent); }
+.actions { margin-top: 10px; }
+.panel { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px; max-height: 320px; overflow: auto; font: 12px/1.45 ui-monospace, "Cascadia Mono", Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 0 10px; }
+.exe { font-family: ui-monospace, "Cascadia Mono", Menlo, monospace; font-size: 13px; overflow-wrap: anywhere; }
+ul.plain { margin: 6px 0 0; padding-left: 18px; color: var(--dim); font-size: 13px; }
+.hidden { display: none !important; }
+.tag { font-size: 11px; padding: 1px 7px; border-radius: 99px; border: 1px solid var(--line); color: var(--dim); margin-left: 6px; vertical-align: 2px; }
+@media (max-width: 520px) { .code { font-size: 44px; letter-spacing: 8px; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="brand"><span class="leaf" aria-hidden="true">G</span> Greenhouse</div>
+    <div class="spacer"></div>
+    <span id="status" class="pill hidden"><span class="dot"></span><span id="statusText"></span></span>
+  </header>
+
+  <!-- Pairing -->
+  <section id="pairView" class="card hidden">
+    <h1>Manage your console from this browser</h1>
+    <p class="dim">Add your own games, run them on the TV, and read what happened. Everything stays on your home network.</p>
+    <div id="pairStart">
+      <p>First, let your console know it's you.</p>
+      <button id="pairBtn" class="primary">Pair this browser</button>
+    </div>
+    <div id="pairWait" class="hidden">
+      <p>Your TV is showing this code. Check it matches, then press <b>A</b> on your controller to allow this browser.</p>
+      <div class="code" id="pairCode">----</div>
+      <p class="faint" style="text-align:center" id="pairHint">Waiting for your TV…</p>
+    </div>
+    <p id="pairErr" class="note err hidden"></p>
+  </section>
+
+  <!-- Main -->
+  <section id="mainView" class="hidden">
+    <div id="banner" class="note err hidden" style="margin-bottom:16px"></div>
+
+    <div class="card">
+      <h2>Add a game</h2>
+      <div id="addPick">
+        <div id="drop" class="drop">
+          <div class="big">Drop a game folder here</div>
+          <p class="dim">The installed game folder (the one with the game's .exe), not an installer.</p>
+          <button id="chooseBtn" class="primary">Choose a folder</button>
+          <input id="folderInput" type="file" webkitdirectory multiple class="hidden">
+        </div>
+        <p class="faint" style="margin-top:10px">Games you add yourself aren't tested by us, so they may not run. If one crashes, you can send us the report.</p>
+      </div>
+
+      <div id="addReview" class="hidden">
+        <label for="addName">Name on your TV</label>
+        <input id="addName" type="text" maxlength="80" autocomplete="off">
+        <p class="meta" id="addSummary" style="margin-top:8px"></p>
+        <div id="addWarn" class="note hidden" style="margin:10px 0"></div>
+        <div class="row" style="margin-top:12px">
+          <button id="uploadBtn" class="primary">Send to console</button>
+          <button id="cancelPickBtn">Cancel</button>
+        </div>
+      </div>
+
+      <div id="addProgress" class="hidden">
+        <p><b id="upName"></b> <span class="dim" id="upState">Sending…</span></p>
+        <div class="bar"><i id="upBar"></i></div>
+        <p class="meta" id="upDetail" style="margin-top:6px"></p>
+        <div class="row" style="margin-top:10px">
+          <button id="pauseBtn">Pause</button>
+        </div>
+      </div>
+
+      <div id="addExe" class="hidden">
+        <p><b id="exeName"></b> <span class="dim">has arrived.</span> Which program starts the game?</p>
+        <select id="exeSelect"></select>
+        <p class="faint" id="exeWhy" style="margin-top:6px"></p>
+        <div id="exeSteam" class="note hidden" style="margin:10px 0">This folder has Steam files in it. It will run as your own game, <b>without Steam</b>: no sign-in, achievements, cloud saves or online play through Steam.</div>
+        <div class="row" style="margin-top:12px">
+          <button id="finishBtn" class="primary">Add to my games</button>
+          <button id="discardBtn" class="danger">Discard upload</button>
+        </div>
+      </div>
+      <p id="addErr" class="note err hidden" style="margin-top:12px"></p>
+    </div>
+
+    <div id="uploadsCard" class="card hidden">
+      <h2>Unfinished uploads</h2>
+      <div id="uploadsList"></div>
+    </div>
+
+    <div class="card">
+      <h2>Your games</h2>
+      <div id="gamesList"><p class="dim">Loading…</p></div>
+    </div>
+
+    <p class="faint">Keep Greenhouse open on your TV while you use this page; the console pauses apps in the background.
+      <button id="forgetBtn" class="link">Unpair this browser</button></p>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const show = (el, on = true) => (typeof el === "string" ? $(el) : el).classList.toggle("hidden", !on);
+const TOKEN_KEY = "gh.session";
+let token = null;
+try { token = localStorage.getItem(TOKEN_KEY); } catch (e) {}
+let state = { running: false, free: 0, games: [], uploads: [] };
+
+// ---- formatting ----------------------------------------------------------------
+function fmtBytes(n) {
+  if (!(n >= 0)) return "";
+  const u = ["bytes", "KB", "MB", "GB", "TB"]; let i = 0;
+  while (n >= 1000 && i < u.length - 1) { n /= 1000; i++; }
+  return (i ? n.toFixed(n < 10 ? 1 : 0) : n) + " " + u[i];
+}
+function fmtAgo(t) {
+  const s = Math.max(0, Date.now() / 1000 - t);
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.floor(s / 60) + " min ago";
+  if (s < 86400) return Math.floor(s / 3600) + " h ago";
+  return new Date(t * 1000).toLocaleDateString();
+}
+function exitText(code) {
+  const u = (code >>> 0).toString(16).toUpperCase().padStart(8, "0");
+  const names = { "C0000005": "access violation", "C0000409": "stack buffer overrun", "C00000FD": "stack overflow",
+                  "C0000135": "a DLL was missing", "C0000139": "a DLL entry point was missing", "C000001D": "illegal instruction",
+                  "80000003": "breakpoint", "C0000374": "heap corruption", "E06D7363": "unhandled C++ exception" };
+  return "0x" + u + (names[u] ? " (" + names[u] + ")" : "");
+}
+function el(tag, attrs = {}, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") e.className = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else if (v === true) e.setAttribute(k, "");
+    else if (v !== false && v != null) e.setAttribute(k, v);
+  }
+  for (const k of kids) if (k != null) e.append(k.nodeType ? k : document.createTextNode(String(k)));
+  return e;
+}
+
+// ---- API -----------------------------------------------------------------------
+class ApiError extends Error { constructor(status, msg, body) { super(msg); this.status = status; this.body = body; } }
+async function api(method, path, body) {
+  const opt = { method, headers: {}, cache: "no-store" };
+  if (token) opt.headers["X-GH-Session"] = token;
+  if (body !== undefined) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
+  let r;
+  try { r = await fetch(path, opt); }
+  catch (e) { throw new ApiError(0, "Can't reach your console. Is Greenhouse open on the TV?"); }
+  let j = {};
+  try { j = await r.json(); } catch (e) {}
+  if (r.status === 401 && token) { forgetToken(); throw new ApiError(401, "This browser needs to be paired again."); }
+  if (!r.ok) throw new ApiError(r.status, j.error || ("The console answered " + r.status), j);
+  return j;
+}
+function forgetToken() {
+  token = null;
+  try { localStorage.removeItem(TOKEN_KEY); } catch (e) {}
+  enterPairing();
+}
+
+// ---- pairing -------------------------------------------------------------------
+function enterPairing() {
+  show("mainView", false); show("status", false); show("pairView");
+  show("pairStart"); show("pairWait", false); show("pairErr", false);
+}
+$("pairBtn").onclick = async () => {
+  show("pairErr", false);
+  let p;
+  try { p = await api("POST", "/api/pair", {}); }
+  catch (e) { $("pairErr").textContent = e.message; show("pairErr"); return; }
+  $("pairCode").textContent = p.code;
+  $("pairHint").textContent = "Waiting for your TV…";
+  show("pairStart", false); show("pairWait");
+  const deadline = Date.now() + (p.expires || 120) * 1000;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 1000));
+    let s;
+    try { s = await api("GET", "/api/pair/" + p.pairId); } catch (e) { continue; }
+    if (s.state === "allowed" && s.token) {
+      token = s.token;
+      try { localStorage.setItem(TOKEN_KEY, token); } catch (e) {}
+      enterMain();
+      return;
+    }
+    if (s.state === "denied") { $("pairErr").textContent = "The TV said no. You can try again."; break; }
+    if (s.state === "expired") { $("pairErr").textContent = "That code expired. Try again."; break; }
+  }
+  if ($("pairErr").classList.contains("hidden")) $("pairErr").textContent = "That code expired. Try again.";
+  show("pairErr"); show("pairWait", false); show("pairStart");
+};
+
+// ---- main view -------------------------------------------------------------------
+async function enterMain() {
+  show("pairView", false); show("mainView"); show("status");
+  await refresh();
+}
+function banner(msg) { $("banner").textContent = msg || ""; show("banner", !!msg); }
+
+async function refreshStatus() {
+  try {
+    const s = await api("GET", "/api/status");
+    state.running = s.running; state.free = s.free;
+    $("status").className = "pill" + (s.running ? " busy" : "");
+    $("statusText").textContent = s.running ? "A game is running" : "Ready · " + fmtBytes(s.free) + " free";
+    document.querySelectorAll("[data-needs-idle]").forEach((b) => (b.disabled = s.running || b.dataset.busy === "1"));
+  } catch (e) {
+    if (e.status !== 401) { $("status").className = "pill off"; $("statusText").textContent = "Not reachable"; }
+  }
+}
+async function refresh() {
+  await refreshStatus();
+  try {
+    const g = await api("GET", "/api/games");
+    state.games = g.games; state.uploads = g.uploads;
+    renderGames(); renderUploads();
+    banner("");
+  } catch (e) { if (e.status !== 401) banner(e.message); }
+}
+setInterval(() => { if (token && !document.hidden) refreshStatus(); }, 5000);
+
+function renderUploads() {
+  const list = $("uploadsList"); list.textContent = "";
+  const ups = state.uploads.filter((u) => !upload || u.id !== upload.id);
+  show("uploadsCard", ups.length > 0);
+  for (const u of ups) {
+    list.append(el("div", { class: "row", style: "justify-content:space-between;margin-bottom:8px" },
+      el("div", {}, el("b", {}, u.name), " ", el("span", { class: "meta" }, u.files + " files · " + fmtBytes(u.bytes) + " arrived")),
+      el("div", { class: "row" },
+        el("button", { "data-needs-idle": true, onclick: () => resumePrompt(u) }, "Continue"),
+        el("button", { class: "danger", "data-needs-idle": true, onclick: async () => {
+          try { await api("DELETE", "/api/games/" + u.id + "?confirm=" + u.id); } catch (e) { banner(e.message); }
+          refresh(); } }, "Discard"))));
+  }
+}
+
+function renderGames() {
+  const list = $("gamesList"); list.textContent = "";
+  if (!state.games.length) { list.append(el("p", { class: "dim" }, "No games yet. Add one above.")); return; }
+  for (const g of state.games) list.append(gameCard(g));
+}
+
+function gameCard(g) {
+  const card = el("div", { class: "card", style: "margin:0 0 12px;padding:14px;box-shadow:none;background:var(--panel2)" });
+  const initials = g.name.split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0].toUpperCase()).join("");
+  let res = null;
+  if (g.lastRun) {
+    res = g.lastRun.crashed
+      ? el("div", { class: "result bad" }, "Crashed " + fmtAgo(g.lastRun.when) + " · " + exitText(g.lastRun.exit))
+      : el("div", { class: "result ok" }, "Last played " + fmtAgo(g.lastRun.when) + (g.lastRun.exit ? " · exit " + exitText(g.lastRun.exit) : ""));
+  }
+  const panel = el("div", { class: "panel hidden" });
+  const openPanel = (which) => {
+    if (panel.dataset.which === which && !panel.classList.contains("hidden")) { show(panel, false); return; }
+    panel.dataset.which = which; panel.textContent = ""; show(panel);
+    ({ settings: settingsPanel, log: logPanel, del: deletePanel })[which](g, panel);
+  };
+  card.append(el("div", { class: "game" },
+    el("div", { class: "plate", "aria-hidden": "true" }, initials || "?"),
+    el("div", {},
+      el("h3", {}, g.name, el("span", { class: "tag" }, g.arch), g.steam ? el("span", { class: "tag" }, "runs without Steam") : null),
+      el("div", { class: "meta exe" }, g.exe + (g.args ? "  " + g.args : "")),
+      el("div", { class: "meta" }, fmtBytes(g.bytes) + " · added " + fmtAgo(g.added)),
+      res,
+      el("div", { class: "row actions" },
+        el("button", { class: "primary", "data-needs-idle": true, disabled: state.running, onclick: (ev) => play(g, ev.target) }, "Play on TV"),
+        el("button", { onclick: () => openPanel("settings") }, "Settings"),
+        el("button", { onclick: () => openPanel("log") }, g.lastRun && g.lastRun.crashed ? "Crash log" : "Last log"),
+        el("button", { class: "danger", onclick: () => openPanel("del") }, "Delete")),
+      panel)));
+  return card;
+}
+
+async function play(g, btn) {
+  btn.disabled = true; btn.dataset.busy = "1";
+  try {
+    await api("POST", "/api/games/" + g.id + "/play");
+    btn.textContent = "Starting on your TV…";
+    setTimeout(refreshStatus, 1500);
+    setTimeout(() => { btn.textContent = "Play on TV"; btn.dataset.busy = ""; refresh(); }, 6000);
+  } catch (e) {
+    banner(e.message); btn.dataset.busy = ""; btn.disabled = false;
+  }
+}
+
+async function settingsPanel(g, panel) {
+  const name = el("input", { type: "text", maxlength: 80, value: g.name });
+  const args = el("input", { type: "text", maxlength: 1024, value: g.args, placeholder: "for example -windowed" });
+  const exe = el("select", {}, el("option", {}, g.exe));
+  const msg = el("p", { class: "faint" });
+  panel.append(el("label", {}, "Name"), name, el("label", {}, "Program that starts the game"), exe,
+    el("label", {}, "Launch options"), args, msg,
+    el("div", { class: "row", style: "margin-top:10px" },
+      el("button", { class: "primary", "data-needs-idle": true, disabled: state.running, onclick: async () => {
+        try { await api("POST", "/api/games/" + g.id, { name: name.value, exe: exe.value, args: args.value }); refresh(); }
+        catch (e) { msg.textContent = e.message; msg.className = "note err"; }
+      } }, "Save")));
+  try {
+    const x = await api("GET", "/api/games/" + g.id + "/exes");
+    fillExes(exe, x, g.exe);
+  } catch (e) { msg.textContent = e.message; }
+}
+
+function fillExes(select, x, current) {
+  select.textContent = "";
+  for (const e of x.exes) {
+    const label = e.path + " · " + e.arch + " · " + fmtBytes(e.size) + (e.ok ? (e.helper ? " · helper" : "") : " — " + e.why);
+    select.append(el("option", { value: e.path, disabled: !e.ok, selected: e.path === current }, label));
+  }
+}
+
+async function logPanel(g, panel) {
+  panel.append(el("p", { class: "dim" }, "Loading…"));
+  let log = "";
+  try { log = (await api("GET", "/api/games/" + g.id + "/log")).log; } catch (e) { panel.textContent = e.message; return; }
+  panel.textContent = "";
+  if (!log) { panel.append(el("p", { class: "dim" }, "No log yet. Play the game once and its log appears here.")); return; }
+  const msg = el("p", { class: "faint" });
+  panel.append(
+    el("pre", { class: "log" }, log),
+    el("p", { class: "faint" }, "Sending a report sends exactly the text above, plus the program's file name, size and fingerprint (SHA-256), whether it's 32- or 64-bit, your console model and your Greenhouse version. Never the game's files or the name you gave it. Anything that could identify you was replaced with <x> before it was saved."),
+    el("div", { class: "row" },
+      el("button", { class: "primary", onclick: async (ev) => {
+        ev.target.disabled = true;
+        try { await api("POST", "/api/games/" + g.id + "/report"); msg.textContent = "Sent. Thank you, this helps."; msg.className = "result ok"; }
+        catch (e) { msg.textContent = e.message; msg.className = "note err"; ev.target.disabled = false; }
+      } }, "Send crash report")),
+    msg);
+}
+
+function deletePanel(g, panel) {
+  const input = el("input", { type: "text", autocomplete: "off", placeholder: g.name });
+  const btn = el("button", { class: "danger solid", disabled: true, "data-busy": "1" }, "Delete for good");
+  input.addEventListener("input", () => { btn.disabled = input.value.trim() !== g.name.trim() || state.running; btn.dataset.busy = btn.disabled ? "1" : ""; });
+  btn.onclick = async () => {
+    btn.disabled = true;
+    try { await api("DELETE", "/api/games/" + g.id + "?confirm=" + g.id); refresh(); }
+    catch (e) { banner(e.message); btn.disabled = false; }
+  };
+  panel.append(el("p", {}, "This deletes ", el("b", {}, g.name), " and every file in it from your console. It can't be undone; your PC's copy isn't touched."),
+    el("label", {}, "Type the game's name to confirm"), input, el("div", { class: "row", style: "margin-top:10px" }, btn));
+}
+
+$("forgetBtn").onclick = async () => {
+  try { await api("POST", "/api/session/forget"); } catch (e) {}
+  forgetToken();
+};
+
+// ---- choosing a folder -------------------------------------------------------------
+let picked = null;     // { name, files: [{rel, file}], bytes }
+let upload = null;     // { id, name, files, sent, total, paused }
+
+$("chooseBtn").onclick = () => $("folderInput").click();
+$("folderInput").onchange = (ev) => {
+  const files = [...ev.target.files].map((f) => ({ rel: f.webkitRelativePath || f.name, file: f }));
+  ev.target.value = "";
+  pickedFiles(files);
+};
+const drop = $("drop");
+drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("over"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+drop.addEventListener("drop", async (e) => {
+  e.preventDefault(); drop.classList.remove("over");
+  const entries = [...e.dataTransfer.items].map((i) => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean);
+  const out = [];
+  async function walk(entry, prefix) {
+    if (entry.isFile) {
+      const f = await new Promise((res, rej) => entry.file(res, rej));
+      out.push({ rel: prefix + entry.name, file: f });
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      for (;;) {
+        const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+        if (!batch.length) break;
+        for (const c of batch) await walk(c, prefix + entry.name + "/");
+      }
+    }
+  }
+  try { for (const en of entries) await walk(en, ""); } catch (err) { showAddErr("Couldn't read that folder: " + err.message); return; }
+  pickedFiles(out);
+});
+
+function showAddErr(msg) { $("addErr").textContent = msg || ""; show("addErr", !!msg); }
+
+// Paths arrive as "Folder/sub/file". The top folder becomes the game's name; the
+// rest is the path on the console.
+function pickedFiles(list) {
+  showAddErr("");
+  if (!list.length) { showAddErr("That folder is empty."); return; }
+  const tops = new Set(list.map((x) => x.rel.split("/")[0]));
+  let name = "", files;
+  if (tops.size === 1 && list.every((x) => x.rel.includes("/"))) {
+    name = [...tops][0];
+    files = list.map((x) => ({ rel: x.rel.slice(name.length + 1), file: x.file }));
+  } else {
+    files = list.map((x) => ({ rel: x.rel, file: x.file }));
+    name = "My game";
+  }
+  files = files.filter((x) => x.rel && !/(^|\/)(desktop\.ini|thumbs\.db|\.ds_store)$/i.test(x.rel));
+  const bytes = files.reduce((a, x) => a + x.file.size, 0);
+  const exes = files.filter((x) => /\.exe$/i.test(x.rel));
+  const msis = files.filter((x) => /\.msi$/i.test(x.rel));
+  picked = { name, files, bytes };
+  if (pendingResume) {      // continuing an unfinished upload
+    const u = pendingResume; pendingResume = null;
+    startUpload(u.id, u.name, files);
+    return;
+  }
+  $("addName").value = name;
+  $("addSummary").textContent = files.length + " files · " + fmtBytes(bytes) + " · " + exes.length + " program" + (exes.length === 1 ? "" : "s");
+  let warn = "";
+  if (!exes.length && msis.length) warn = "This folder has an installer (.msi), not a game. Install the game on your PC first, then add the folder it was installed to.";
+  else if (!exes.length) warn = "There's no .exe in this folder. Pick the folder the game was installed to.";
+  else if (exes.length === 1 && /^(setup|install)|installer|_setup|-setup/i.test(exes[0].rel.split("/").pop())) warn = "This looks like an installer. Install the game on your PC first, then add the folder it was installed to.";
+  else if (bytes > state.free - 1e9) warn = "This is bigger than the free space on your console (" + fmtBytes(state.free) + ").";
+  $("addWarn").textContent = warn; show("addWarn", !!warn);
+  $("uploadBtn").disabled = !exes.length || state.running;
+  show("addPick", false); show("addReview");
+}
+$("cancelPickBtn").onclick = () => { picked = null; show("addReview", false); show("addPick"); };
+
+let pendingResume = null;
+function resumePrompt(u) {
+  pendingResume = u;
+  showAddErr("");
+  $("addErr").textContent = "Choose the same folder (" + u.name + ") to carry on where it stopped.";
+  show("addErr");
+  $("folderInput").click();
+}
+
+$("uploadBtn").onclick = async () => {
+  const name = $("addName").value.trim();
+  if (!name) { showAddErr("Give the game a name."); return; }
+  let r;
+  try { r = await api("POST", "/api/games", { name }); }
+  catch (e) { showAddErr(e.message); return; }
+  startUpload(r.id, name, picked.files);
+};
+
+// ---- uploading ---------------------------------------------------------------------
+const CHUNK = 32 * 1024 * 1024;      // one PUT at most; a dropped connection costs this much
+const PARALLEL = 2;
+
+function putChunk(id, rel, offset, blob, onProgress) {
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open("PUT", "/api/games/" + id + "/files?path=" + encodeURIComponent(rel) + "&offset=" + offset);
+    x.setRequestHeader("X-GH-Session", token);
+    x.setRequestHeader("Content-Type", "application/octet-stream");
+    x.upload.onprogress = (e) => onProgress(e.loaded);
+    x.onload = () => {
+      let j = {}; try { j = JSON.parse(x.responseText); } catch (e) {}
+      if (x.status === 200) resolve(j);
+      else reject(new ApiError(x.status, j.error || ("The console answered " + x.status), j));
+    };
+    x.onerror = () => reject(new ApiError(0, "The connection to your console dropped."));
+    upload.xhrs.add(x);
+    x.onloadend = () => upload && upload.xhrs.delete(x);
+    x.send(blob);
+  });
+}
+
+async function startUpload(id, name, files) {
+  show("addPick", false); show("addReview", false); show("addExe", false); showAddErr(""); show("addProgress");
+  $("upName").textContent = name; $("upState").textContent = "Checking what's already there…";
+  upload = { id, name, files, sent: 0, total: files.reduce((a, x) => a + x.file.size, 0), paused: false, xhrs: new Set(), failed: [] };
+  renderUploads();
+  let have = {};
+  try { have = (await api("GET", "/api/games/" + id + "/files")).files || {}; }
+  catch (e) { showAddErr(e.message); return; }
+  const queue = [];
+  for (const f of files) {
+    const h = have[f.rel] || 0;
+    if (h > f.file.size) { upload.failed.push(f.rel + " (the console has a bigger copy)"); continue; }
+    upload.sent += h;
+    if (h < f.file.size || (f.file.size === 0 && !(f.rel in have))) queue.push({ f, offset: h });
+  }
+  $("upState").textContent = "Sending…";
+  $("pauseBtn").textContent = "Pause";
+  const inFlight = new Map();
+  const paint = () => {
+    let cur = upload.sent; for (const v of inFlight.values()) cur += v;
+    const pct = upload.total ? Math.min(100, (cur / upload.total) * 100) : 100;
+    $("upBar").style.width = pct.toFixed(1) + "%";
+    $("upDetail").textContent = fmtBytes(cur) + " of " + fmtBytes(upload.total) + " · " + queue.length + " files to go";
+  };
+  paint();
+  let stop = null;
+  async function worker(n) {
+    while (queue.length && !stop && !upload.paused) {
+      const job = queue.shift();
+      let off = job.offset;
+      try {
+        do {
+          const end = Math.min(job.f.file.size, off + CHUNK);
+          inFlight.set(n, 0);
+          await putChunk(id, job.f.rel, off, job.f.file.slice(off, end), (l) => { inFlight.set(n, l); paint(); });
+          inFlight.delete(n);
+          upload.sent += end - off; off = end; paint();
+        } while (off < job.f.file.size && !stop && !upload.paused);
+        if (off < job.f.file.size) queue.unshift({ f: job.f, offset: off });
+      } catch (e) {
+        inFlight.delete(n);
+        if (e.status === 422) { upload.failed.push(job.f.rel + ": " + e.message); continue; }
+        if (e.status === 409 && e.body && typeof e.body.have === "number") { queue.unshift({ f: job.f, offset: e.body.have }); upload.sent += e.body.have - off; continue; }
+        queue.unshift({ f: job.f, offset: off });
+        stop = e;
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: PARALLEL }, (_, i) => worker(i)));
+  if (upload.paused) { $("upState").textContent = "Paused"; $("pauseBtn").textContent = "Resume"; return; }
+  if (stop) {
+    $("upState").textContent = "Stopped";
+    showAddErr(stop.message + (stop.status === 409 ? "" : " Your upload is kept; press Resume to carry on."));
+    $("pauseBtn").textContent = "Resume"; upload.paused = true;
+    return;
+  }
+  show("addProgress", false);
+  if (upload.failed.length) showAddErr(upload.failed.length + " file(s) couldn't be stored: " + upload.failed.slice(0, 5).join("; ") + (upload.failed.length > 5 ? "…" : ""));
+  await chooseExe();
+}
+$("pauseBtn").onclick = () => {
+  if (!upload) return;
+  if (upload.paused) { showAddErr(""); startUpload(upload.id, upload.name, upload.files); return; }
+  upload.paused = true;
+  for (const x of upload.xhrs) x.abort();
+};
+
+async function chooseExe() {
+  show("addExe"); $("exeName").textContent = upload.name;
+  try {
+    const x = await api("GET", "/api/games/" + upload.id + "/exes");
+    fillExes($("exeSelect"), x, x.default);
+    show("exeSteam", !!x.steam);
+    const okCount = x.exes.filter((e) => e.ok).length;
+    $("exeWhy").textContent = okCount ? "We picked the likeliest one. Change it later in Settings if the game doesn't start." : "None of the programs in this folder can run here.";
+    $("finishBtn").disabled = !okCount;
+  } catch (e) { showAddErr(e.message); }
+}
+$("finishBtn").onclick = async () => {
+  $("finishBtn").disabled = true;
+  try {
+    await api("POST", "/api/games/" + upload.id + "/finish", { exe: $("exeSelect").value });
+    show("addExe", false); show("addPick"); showAddErr(""); upload = null; picked = null;
+    refresh();
+  } catch (e) { showAddErr(e.message); $("finishBtn").disabled = false; }
+};
+$("discardBtn").onclick = async () => {
+  try { await api("DELETE", "/api/games/" + upload.id + "?confirm=" + upload.id); } catch (e) {}
+  show("addExe", false); show("addPick"); showAddErr(""); upload = null; picked = null;
+  refresh();
+};
+
+// ---- start -------------------------------------------------------------------------
+if (token) enterMain(); else enterPairing();
+</script>
+</body>
+</html>

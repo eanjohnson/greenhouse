@@ -13,9 +13,14 @@ Only GH_ENT_DEV builds trust that key; a production loader refuses these tokens.
 A token is a credential: it is written to --out (0600), outside the source tree,
 and never printed. Push it to a console as LocalState\\gh_ent.txt.
 
---iss must match the console's server (gh_ent_url.txt) when it has one; with no
-server configured the console does not check iss and never heartbeats, so a dev
-token stays valid until its own exp.
+--iss must match the console's server. Since 2026-11-09 a console with no
+gh_ent_url.txt uses the production site (GH_ENT_SERVER in gh_ent.h), so there is
+no longer a "no server" mode: a dev-minted token on such a console fails the iss
+check, and its next heartbeat to production comes back 401 entitlement_revoked,
+which deletes gh_ent.txt. A minted token is only for a console whose
+gh_ent_url.txt points at a dev/test site whose --iss it carries. A console linked
+to the real site is restored by linking it again, never by putting back an older
+backed-up token (the site treats a superseded token as reuse).
 """
 import argparse, base64, hashlib, json, os, re, secrets, sys, time
 from cryptography.hazmat.primitives import hashes, serialization

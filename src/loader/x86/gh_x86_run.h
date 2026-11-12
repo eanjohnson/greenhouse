@@ -136,6 +136,7 @@ inline bool RunPe32Guest(const std::vector<uint8_t>& file, uint32_t& result, std
                          // the 256 MB that was ample for a test guest.
                          uint32_t region_bytes = 1024u << 20)
 {
+    x86_begin_session();
     Machine m;
     // Started before the reservation so that mapping, relocating and binding
     // are inside the measurement too -- they are one-off costs, but "the guest

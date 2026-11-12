@@ -167,6 +167,16 @@ static uint32_t     g_launcherSelectedApp = 0;   // Steam appid of the picked ro
 static std::wstring g_launcherSelectedName;
 static bool LuiEntAllowsLaunch();                 // launcher_ui.h (§43 membership gate)
 #endif
+// §65. A game the user uploaded from a browser (gh_custom.h). Decided at the
+// handoff from the picked path alone (GhCustomBegin), so a restart marker or a
+// mods recovery gets it too. While it is set: no title config matches the exe by
+// name (the generic Unreal default still does), the Steam singleton is never
+// handed out and our Steam client engine is never offered -- a Steam DLL loads
+// from the game's own folder or not at all -- and a crash report is filed under
+// the exe's name, never the name the user typed.
+static bool         g_customRun = false;
+static std::string  g_customId;           // 12 lowercase hex: the folder under gh_custom\.
+static std::wstring g_customArgs;         // the user's launch options, leading space included
 
 // ---------------------------------------------------------------------------
 // Diagnostics: append to the app's LocalState by absolute path (WDP-readable).
@@ -1490,6 +1500,27 @@ static std::wstring RedirectDriveRootSave(const std::wstring& raw)
         for (auto& c : low) if (c >= L'A' && c <= L'Z') c = (wchar_t)(c + 32);
         if (low.find(L"\\vfs\\d\\") != std::wstring::npos) return L"";
     }
+    // An ES3 leaf in a real folder is not a drive-root save, and it must land
+    // where every other API looks for that folder. Since #293 (764c54a) the
+    // GetFileAttributesExW bed maps through the VFS, so Unity's persistentDataPath
+    // check on AC\<company>\<product> now succeeds and ES3 saves THERE instead of
+    // at D:\. The opens below were still flattened into gamedata\ while
+    // File.Exists, File.Move's own source check and the move itself went to
+    // vfs\U\...: the .tmp was written where File.Move could not see it, ES3 set
+    // encounteredErrorDuringSave, and Lethal Company's LAUNCH MODE (Online / LAN)
+    // never advanced. Same class as a0d4d45 on D:, one drive over. Give the open
+    // MapToReal's answer so the open, the probes and the move agree.
+    if (!g_vfsRoot.empty() && IsEs3SaveLeaf(leaf) && !IsGuestDriveRootFile(dos) &&
+        dos.size() > 3 && dos[1] == L':' && dos[2] == L'\\' &&
+        dos.find(L'\\', 3) != std::wstring::npos){
+        std::wstring m = MapToReal(dos.c_str());
+        if (m.empty() || _wcsicmp(m.c_str(), dos.c_str()) == 0) return L"";
+        static volatile LONG n = 0;
+        if (InterlockedIncrement(&n) <= 40)
+            Diag("ES3PATH folder save " + std::string(dos.begin(), dos.end()) +
+                 " -> " + std::string(m.begin(), m.end()));
+        return m;
+    }
     bool hit = IsEs3SaveLeaf(leaf) || IsGuestDriveRootFile(dos);
     if (!hit) return L"";
     return std::wstring(kLocalState) + L"gamedata\\" + leaf;
@@ -1838,6 +1869,55 @@ static BOOL WINAPI Bed_MoveFileExW(LPCWSTR a, LPCWSTR b, DWORD flags){
     BOOL r = MoveFileExW(ra.c_str(), b ? rb.c_str() : nullptr, flags);
     if (a){ std::wstring g(a); Diag("MoveFileExW " + std::string(g.begin(),g.end()) + (r?" ok":(" err="+Hex(GetLastError())))); }
     return r; }
+// The CopyFile family was never bedded, so a guest copy ran on its own
+// unmapped path. Every other file API maps through the VFS, so the copy saw the
+// source as absent: the file the guest had just written and stat'ed lives under
+// LocalState\vfs\..., not at the package AC path the guest asked for.
+//
+// It is what kept R.E.P.O. on its photosensitivity warning. When the timer runs
+// out the splash saves its settings through Easy Save 3, and ES3IO.CommitBackup
+// keeps the old file with File.Copy(target, target + ".tmp.bak"), outside any try,
+// before it moves the new ".tmp" into place. Mono's File.Copy is kernel32
+// CopyFileW (mono-2.0-bdwgc.dll and UnityPlayer.dll both import it). It failed, the
+// throw left SplashScreenCompleted half-done, and the warning was never hidden.
+// The first-ever save of a file has no target to back up, so it worked, which is
+// why only the second save of each file failed. Any guest that copies a file
+// inside a mapped path has the same bug, so map both ends, as MoveFileExW does.
+// The source is a read, so it honours the same hides as a read-only CreateFileW:
+// a file the open says is absent must not be copyable.
+static bool GhCopySourceHidden(const std::wstring& real){
+    return GhHidePsoCache(real, GENERIC_READ) || GhHideCrashpad(real) || GhHideSymbolProbe(real, GENERIC_READ); }
+static BOOL WINAPI Bed_CopyFileW(LPCWSTR a, LPCWSTR b, BOOL failIfExists){
+    std::wstring ra=MapToReal(a), rb=MapToReal(b);
+    if (GhCopySourceHidden(ra)){ SetLastError(ERROR_FILE_NOT_FOUND); return FALSE; }
+    EnsureParentOf(rb);
+    BOOL r = CopyFileW(ra.c_str(), rb.c_str(), failIfExists);
+    if (a && b){ DWORD e=GetLastError(); std::wstring g(a), h(b);
+        Diag("CopyFileW " + std::string(g.begin(),g.end()) + " -> " + std::string(h.begin(),h.end()) + (r?" ok":(" err="+Hex(e))));
+        SetLastError(e); }
+    return r; }
+static BOOL WINAPI Bed_CopyFileA(LPCSTR a, LPCSTR b, BOOL failIfExists){
+    wchar_t wa[1024], wb[1024];
+    if (!a || !b || !MultiByteToWideChar(CP_ACP,0,a,-1,wa,1024) || !MultiByteToWideChar(CP_ACP,0,b,-1,wb,1024)){
+        SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    return Bed_CopyFileW(wa, wb, failIfExists); }
+static BOOL WINAPI Bed_CopyFileExW(LPCWSTR a, LPCWSTR b, LPPROGRESS_ROUTINE pr, LPVOID d, LPBOOL cancel, DWORD flags){
+    std::wstring ra=MapToReal(a), rb=MapToReal(b);
+    if (GhCopySourceHidden(ra)){ SetLastError(ERROR_FILE_NOT_FOUND); return FALSE; }
+    EnsureParentOf(rb);
+    BOOL r = CopyFileExW(ra.c_str(), rb.c_str(), pr, d, cancel, flags);
+    if (a && b){ DWORD e=GetLastError(); std::wstring g(a), h(b);
+        Diag("CopyFileExW " + std::string(g.begin(),g.end()) + " -> " + std::string(h.begin(),h.end()) + (r?" ok":(" err="+Hex(e))));
+        SetLastError(e); }
+    return r; }
+static HRESULT WINAPI Bed_CopyFile2(PCWSTR a, PCWSTR b, COPYFILE2_EXTENDED_PARAMETERS* params){
+    std::wstring ra=MapToReal(a), rb=MapToReal(b);
+    if (GhCopySourceHidden(ra)) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    EnsureParentOf(rb);
+    HRESULT hr = CopyFile2(ra.c_str(), rb.c_str(), params);
+    if (a && b){ std::wstring g(a), h(b);
+        Diag("CopyFile2 " + std::string(g.begin(),g.end()) + " -> " + std::string(h.begin(),h.end()) + (SUCCEEDED(hr)?" ok":(" hr="+Hex((DWORD)hr)))); }
+    return hr; }
 static BOOL WINAPI Bed_ReplaceFileW(LPCWSTR replaced, LPCWSTR replacement, LPCWSTR backup,
                                     DWORD flags, LPVOID exclude, LPVOID reserved){
     std::wstring rReplaced=MapToReal(replaced), rReplacement=MapToReal(replacement);
@@ -2683,6 +2763,7 @@ static BOOL WINAPI Bed_SetFileSecurityW(LPCWSTR, SECURITY_INFORMATION, PSECURITY
 // ---------------------------------------------------------------------------
 static const std::unordered_map<std::string, void*>& ShimTable();   // fwd
 static HMODULE LoadGuestDll(const char* dll);                       // fwd
+static const char* GhCustomSteamBase(const char* dll);              // fwd (§65)
 static void    RepublishGuestTls(const char* why);                  // fwd (see TLS section)
 static void    RunGuestTlsCallbacksForThread();                     // fwd (see TLS section)
 static std::wstring FindGuestSupportDll(const wchar_t* name);       // fwd (see support DLLs)
@@ -2827,6 +2908,8 @@ static HMODULE WINAPI Bed_LoadLibraryExW(LPCWSTR n, HANDLE f, DWORD flags)
             const char* b1 = strrchr(a, '\\'); const char* b2 = strrchr(a, '/');
             const char* base = (b1 && b2) ? (b1 > b2 ? b1 : b2) : (b1 ? b1 : b2);
             base = base ? base + 1 : a;
+            // §65: an uploaded game's Steam DLLs are its own or none (LoadGuestDll).
+            if (g_customRun && GhCustomSteamBase(a)) return LoadGuestDll(a);
             if (0 == _stricmp(base, "steam_api64.dll") || 0 == _stricmp(base, "steam_api64")){
                 if (HMODULE pre = GetModuleHandleA("steam_api64.dll")){
                     Diag(std::string("BED LoadLibraryExW(") + a + ") -> PRELOADED singleton " + Hex((uintptr_t)pre));
@@ -35564,8 +35647,19 @@ static void GhClassSelect(const std::wstring& n)
         if (it != g_wndClasses.end()) p = it->second;
     }
     if (!p){
+        // The kept proc can belong to someone else -- the launcher's own Steam engine
+        // registers SteamWinsockInitFakeClass_1 at boot, and by the time a later guest
+        // runs that thunk's page may no longer be executable (§65 cell 1b: the burst
+        // jumped into an RW heap page). Keep it only if it can still run.
+        MEMORY_BASIC_INFORMATION mbi{};
+        const DWORD kExec = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        const bool runnable = g_guestWndProc &&
+            VirtualQuery((LPCVOID)(uintptr_t)g_guestWndProc, &mbi, sizeof mbi) == sizeof mbi &&
+            mbi.State == MEM_COMMIT && (mbi.Protect & kExec) && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS));
         Diag("BED CreateWindowEx cls=" + std::string(n.begin(), n.end()) +
-             " has no registered proc -- keeping " + Hex((uint64_t)(uintptr_t)g_guestWndProc));
+             " has no registered proc -- " + (runnable ? "keeping " : "DROPPING non-executable ") +
+             Hex((uint64_t)(uintptr_t)g_guestWndProc));
+        if (!runnable) g_guestWndProc = nullptr;
         return;
     }
     const bool changed = (p != g_guestWndProc);
@@ -36047,26 +36141,70 @@ static ATOM   WINAPI Bed_RegisterClassW(const WNDCLASSW* wc){
     if (wc) GhClassRegister(wc->lpszClassName, wc->lpfnWndProc, "RegisterClassW");
     return (ATOM)1;
 }
-static ATOM   WINAPI Bed_RegisterClassExA(const void*){ return (ATOM)1; }
+// ANSI classes (§65: a user's own ANSI-only exe). RegisterClassA was not bedded at all
+// and RegisterClassExA dropped the proc, so CreateWindowExA found no class and the
+// activation burst went to whatever proc was left over. Names are byte-widened, the
+// same way Bed_CreateWindowExA widens the class it looks up.
+static void GhClassRegisterA(const char* name, WNDPROC proc, const char* which)
+{
+    if (name && (uintptr_t)name > 0xFFFF) {
+        const std::string a(name);
+        const std::wstring w(a.begin(), a.end());
+        GhClassRegister(w.c_str(), proc, which);
+    } else GhClassRegister(nullptr, proc, which);
+}
+static ATOM   WINAPI Bed_RegisterClassExA(const WNDCLASSEXA* wc){
+    if (wc) GhClassRegisterA(wc->lpszClassName, wc->lpfnWndProc, "RegisterClassExA");
+    return (ATOM)1;
+}
+static ATOM   WINAPI Bed_RegisterClassA(const WNDCLASSA* wc){
+    if (wc) GhClassRegisterA(wc->lpszClassName, wc->lpfnWndProc, "RegisterClassA");
+    return (ATOM)1;
+}
 // The requested rect is logged, not honoured -- there is one CoreWindow and the
 // guest always gets kFakeHwnd. It is logged because it is the cheapest way to tell
 // a guest that asked for a sane window (and derived a bad swap-chain size from
 // somewhere else) from one whose own window math was already wrong.
+//
+// A child or message-only window made AFTER the game window is a helper, not the
+// game: it must not take kFakeHwnd's procedure or its longs. Source's shaderapidx9
+// does RegisterClassA("shaderdx8") + CreateWindowExA(WS_CHILD, 0x0) once the engine
+// has subclassed Valve001 (vguimatsurface -> inputsystem -> engine -> Valve001, by
+// SetWindowLongPtr). Until 0.0.950 the A class had no proc on record, so the chain
+// survived by accident; once RegisterClassA was bedded (§65) GhClassSelect switched
+// the game proc to shaderdx8's, which handles only WM_COPYDATA, and every click, key,
+// WM_INPUT and the activation burst went there: GMod's menu stopped answering the
+// pad's mouse at all. The x86 track met the same window in HL2 (s867, 0.0.855) and
+// gave such windows sub HWNDs; here they keep kFakeHwnd as they did before 0.0.950,
+// but leave the game window's proc and style alone. The first window a guest makes
+// is still selected whatever its style, so nothing changes for a title whose only
+// window is a child.
+static bool g_gameWndMade = false;
+static bool GhHelperWindow(const std::wstring& cls, DWORD style, HWND parent)
+{
+    if (!g_gameWndMade || !((style & WS_CHILD) || parent == HWND_MESSAGE)) return false;
+    Diag("BED CreateWindowEx cls=" + std::string(cls.begin(), cls.end()) +
+         ((style & WS_CHILD) ? " is a child" : " is message-only") +
+         " of the game window -- game proc stays " + Hex((uint64_t)(uintptr_t)g_guestWndProc));
+    return true;
+}
 static HWND   WINAPI Bed_CreateWindowExW(DWORD, LPCWSTR cls, LPCWSTR, DWORD style,
                                          int x, int y, int w, int h,
-                                         HWND, HMENU, HINSTANCE, LPVOID){
+                                         HWND parent, HMENU, HINSTANCE, LPVOID){
     std::wstring c = (cls && (uintptr_t)cls > 0xFFFF) ? cls : L"(atom)";
     Diag("BED CreateWindowExW cls=" + std::string(c.begin(), c.end()) +
          " style=" + Hex((uint32_t)style) + " at " + std::to_string(x) + "," + std::to_string(y) +
          " size " + std::to_string(w) + "x" + std::to_string(h));
     if (HWND own = ghwnd2::Create(c, w, h)) return own;
+    if (GhHelperWindow(c, style, parent)) return kFakeHwnd;
     GhClassSelect(c);
+    g_gameWndMade = true;
     g_fakeWndStyle = (LONG_PTR)style;
     return kFakeHwnd;
 }
 static HWND   WINAPI Bed_CreateWindowExA(DWORD, LPCSTR cls, LPCSTR, DWORD style,
                                          int x, int y, int w, int h,
-                                         HWND, HMENU, HINSTANCE, LPVOID){
+                                         HWND parent, HMENU, HINSTANCE, LPVOID){
     Diag(std::string("BED CreateWindowExA cls=") +
          ((cls && (uintptr_t)cls > 0xFFFF) ? cls : "(atom)") +
          " style=" + Hex((uint32_t)style) + " at " + std::to_string(x) + "," + std::to_string(y) +
@@ -36075,8 +36213,10 @@ static HWND   WINAPI Bed_CreateWindowExA(DWORD, LPCSTR cls, LPCSTR, DWORD style,
         std::string a = (cls && (uintptr_t)cls > 0xFFFF) ? cls : "(atom)";
         const std::wstring wa(a.begin(), a.end());
         if (HWND own = ghwnd2::Create(wa, w, h)) return own;
+        if (GhHelperWindow(wa, style, parent)) return kFakeHwnd;
         GhClassSelect(wa);
     }
+    g_gameWndMade = true;
     g_fakeWndStyle = (LONG_PTR)style;
     return kFakeHwnd;
 }
@@ -36301,6 +36441,17 @@ static BOOL   WINAPI Bed_TranslateMessage(const MSG*){ return FALSE; }
 // [gh-clickdiag] Log button/wheel/key dispatches separately from the (chatty)
 // WM_MOUSEMOVE stream so a click is never masked by the move cap.
 static void ClickDiagDispatch(const MSG* m, const char* via){
+    // Mouse buttons get a cap of their own and say where they went: in GMod the
+    // shared cap below was spent on WASD key edges while the game still loaded,
+    // and the line never said WHICH proc took the click (it was shaderdx8's).
+    if (m->message >= WM_LBUTTONDOWN && m->message <= WM_MBUTTONDBLCLK){
+        static int nb = 0;
+        if (++nb <= 40)
+            Diag(std::string("CLICKDIAG button(") + via + ") msg=" + Hex(m->message) +
+                 " x=" + std::to_string((int)(short)LOWORD(m->lParam)) +
+                 " y=" + std::to_string((int)(short)HIWORD(m->lParam)) +
+                 " -> proc " + Hex((uint64_t)(uintptr_t)g_guestWndProc));
+    }
     bool interesting = (m->message == WM_INPUT) ||
         (m->message != WM_MOUSEMOVE && m->message >= WM_KEYFIRST && m->message <= WM_MOUSELAST);
     if (interesting){
@@ -39824,11 +39975,18 @@ static void GhTitlesLoadDir(const std::wstring& dir, const char* where, std::vec
         GhTitle* same = nullptr;
         for (GhTitle& e : out) if (e.id == t.id){ same = &e; break; }
         if (!same){
+            // Two configs may share an exe only when each names its own Steam app
+            // (Portal and Half-Life 2 are both hl2.exe): GhTitleMatch tells them
+            // apart by the app being launched. Without both ids nothing could.
             for (const GhTitle& e : out)
-                if (_wcsicmp(e.exe.c_str(), t.exe.c_str()) == 0){ why = "exe already claimed by id=" + e.id; break; }
+                if (_wcsicmp(e.exe.c_str(), t.exe.c_str()) == 0 &&
+                    (!t.steamAppId || !e.steamAppId || t.steamAppId == e.steamAppId)){
+                    why = "exe already claimed by id=" + e.id; break;
+                }
             if (!why.empty()){ Diag("TITLE file " + pn + " REJECTED " + why); continue; }
         }
-        Diag("TITLE file " + pn + " id=" + t.id + " exe=" + RegNarrow(t.exe) + " knobs=" +
+        Diag("TITLE file " + pn + " id=" + t.id + " exe=" + RegNarrow(t.exe) +
+             " app=" + std::to_string(t.steamAppId) + " knobs=" +
              std::to_string(t.knobs.size() - nEarly) + " early=" + std::to_string(nEarly) +
              " psoDeny=" + (t.hasPsoDeny ? std::to_string(std::count(t.psoDeny.begin(), t.psoDeny.end(), '\n')) : std::string("-")) +
              (same ? " (overrides " + same->from + ")" : std::string()) + notes + lnote);
@@ -39916,12 +40074,53 @@ static const GhTitle& GhUnrealDefault()
     return *t;
 }
 
-// The title for a guest exe basename: an exact config first, then the built-in
-// Unreal default for <Project>-Win64-Shipping.exe.
-static const GhTitle* GhTitleByExe(const std::wstring& exe)
+// The config for an exe basename launched as Steam app `app` (0 = not known).
+// The exe alone does not name a game: Portal (400) ships the very same hl2.exe
+// as Half-Life 2 (220), and matched on the exe it ran with HL2's "-game hl2" and
+// exited on "Setup file 'gameinfo.txt' doesn't exist in subdirectory 'hl2'". So a
+// config that names a steamAppId applies to that app only; one that names none
+// still matches on the exe for any app; and with no app known (a ghguest.txt
+// launch) the exe decides as it always did -- the first file loaded wins.
+static const GhTitle* GhTitleMatch(const std::wstring& exe, uint32_t app)
 {
-    for (const GhTitle& t : GhTitles())
-        if (_wcsicmp(t.exe.c_str(), exe.c_str()) == 0) return &t;
+    const GhTitle* loose = nullptr;     // exe matches, config names no app id
+    const GhTitle* first = nullptr;     // exe matches at all
+    for (const GhTitle& t : GhTitles()){
+        if (_wcsicmp(t.exe.c_str(), exe.c_str()) != 0) continue;
+        if (app && t.steamAppId == app) return &t;
+        if (!t.steamAppId && !loose) loose = &t;
+        if (!first) first = &t;
+    }
+    return app ? loose : first;
+}
+
+// The Steam app id a guest path is being launched as: the picked row's, else the
+// launcher's own scratch-folder name (...\gh_games\app_<id>\...) for a launch
+// that came without a row. 0 when neither says.
+static uint32_t GhTitleAppFor(const std::wstring& guest)
+{
+    if (g_launcherSelectedApp) return g_launcherSelectedApp;
+    size_t at = 0;
+    while ((at = guest.find(L"app_", at)) != std::wstring::npos){
+        const bool lead = at > 0 && (guest[at - 1] == L'\\' || guest[at - 1] == L'/');
+        size_t e = at + 4;
+        uint64_t v = 0;
+        while (e < guest.size() && guest[e] >= L'0' && guest[e] <= L'9' && v <= 0xFFFFFFFFull)
+            v = v * 10 + (guest[e++] - L'0');
+        if (lead && e > at + 4 && e < guest.size() && (guest[e] == L'\\' || guest[e] == L'/') &&
+            v && v <= 0xFFFFFFFFull) return (uint32_t)v;
+        at += 4;
+    }
+    return 0;
+}
+
+// The title for a guest exe basename launched as `app`: an exact config first,
+// then the built-in Unreal default for <Project>-Win64-Shipping.exe.
+static const GhTitle* GhTitleByExe(const std::wstring& exe, uint32_t app)
+{
+    // §65: an uploaded hl2.exe is not Half-Life 2 -- no title's knobs or services.
+    if (!g_customRun)
+        if (const GhTitle* t = GhTitleMatch(exe, app)) return t;
     static const wchar_t kUe[] = L"-Win64-Shipping.exe";
     const size_t n = wcslen(kUe);
     if (exe.size() > n && _wcsicmp(exe.c_str() + exe.size() - n, kUe) == 0) return &GhUnrealDefault();
@@ -40086,7 +40285,7 @@ static const GhTitle* GhTitleForGuest(const std::wstring& guest)
 {
     size_t s = guest.find_last_of(L"\\/");
     const std::wstring exe = (s == std::wstring::npos) ? guest : guest.substr(s + 1);
-    return GhTitleByExe(exe);
+    return GhTitleByExe(exe, GhTitleAppFor(guest));
 }
 
 static bool GhEarlyNeedsRelaunch(const std::wstring& guest, std::string* why)
@@ -40148,10 +40347,24 @@ static void GhTitleBegin(const std::wstring& exePath)
 {
     size_t s = exePath.find_last_of(L"\\/");
     const std::wstring exe = (s == std::wstring::npos) ? exePath : exePath.substr(s + 1);
-    g_title = GhTitleByExe(exe);
-    if (!g_title){ Diag("TITLE none for " + RegNarrow(exe) + " -- no per-title defaults"); return; }
+    const uint32_t app = GhTitleAppFor(exePath);
+    g_title = GhTitleByExe(exe, app);
+    if (!g_title){
+        // Name the config that the exe alone would have picked, so "Portal got no
+        // title" reads as "hl2.exe is claimed by app 220" rather than as a mystery.
+        std::string other;
+        if (app && !g_customRun)
+            if (const GhTitle* e = GhTitleMatch(exe, 0))
+                other = " (" + e->id + " claims this exe for app " + std::to_string(e->steamAppId) + ")";
+        Diag("TITLE none for " + RegNarrow(exe) + " app=" + std::to_string(app) + other +
+             " -- no per-title defaults");
+        return;
+    }
     Diag("TITLE " + RegNarrow(exe) + ": " + std::to_string(g_title->knobs.size()) +
-         " knob defaults (a LocalState file still wins) id=" + g_title->id + " from " + g_title->from);
+         " knob defaults (a LocalState file still wins) id=" + g_title->id + " from " + g_title->from +
+         " app=" + std::to_string(app) +
+         (g_title->steamAppId ? (g_title->steamAppId == app ? " (matched by app id)" : " (matched by exe)")
+                              : " (config names no app id)"));
     AcquireSRWLockExclusive(&g_titleLk);
     std::vector<std::wstring> early = g_titleEarly ? *g_titleEarly : std::vector<std::wstring>();
     ReleaseSRWLockExclusive(&g_titleLk);
@@ -46219,6 +46432,7 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"RegisterClassExW",   (void*)&Bed_RegisterClassExW},
         {"RegisterClassW",     (void*)&Bed_RegisterClassW},
         {"RegisterClassExA",   (void*)&Bed_RegisterClassExA},
+        {"RegisterClassA",     (void*)&Bed_RegisterClassA},
         {"CreateWindowExW",    (void*)&Bed_CreateWindowExW},
         {"CreateWindowExA",    (void*)&Bed_CreateWindowExA},
         {"DestroyWindow",      (void*)&Bed_DestroyWindow},
@@ -46456,6 +46670,10 @@ static const std::unordered_map<std::string, void*>& ShimTable()
         {"MoveFileWithProgressW",      (void*)&Bed_MoveFileWithProgressW},
         {"MoveFileExW",                (void*)&Bed_MoveFileExW},
         {"ReplaceFileW",               (void*)&Bed_ReplaceFileW},
+        {"CopyFileW",                  (void*)&Bed_CopyFileW},       // R.E.P.O. splash: ES3 backup copy
+        {"CopyFileA",                  (void*)&Bed_CopyFileA},
+        {"CopyFileExW",                (void*)&Bed_CopyFileExW},
+        {"CopyFile2",                  (void*)&Bed_CopyFile2},
         {"GetFileAttributesW",         (void*)&Bed_GetFileAttributesW},
         {"GetFileAttributesExW",       (void*)&Bed_GetFileAttributesExW},
         {"SetFileAttributesW",         (void*)&Bed_SetFileAttributesW},
@@ -46601,6 +46819,8 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"ShellExecuteExW", (void*)&Bed_ShellExecuteExW},
         {"DeleteFileW", (void*)&Bed_DeleteFileW}, {"MoveFileW", (void*)&Bed_MoveFileW},
         {"MoveFileExW", (void*)&Bed_MoveFileExW}, {"ReplaceFileW", (void*)&Bed_ReplaceFileW},
+        {"CopyFileW", (void*)&Bed_CopyFileW}, {"CopyFileA", (void*)&Bed_CopyFileA},    // ES3 backup copy (R.E.P.O.)
+        {"CopyFileExW", (void*)&Bed_CopyFileExW}, {"CopyFile2", (void*)&Bed_CopyFile2},
         {"CreateDirectoryW", (void*)&Bed_CreateDirectoryW}, {"RemoveDirectoryW", (void*)&Bed_RemoveDirectoryW},
         {"FindFirstFileW", (void*)&Bed_FindFirstFileW}, {"GetFullPathNameW", (void*)&Bed_GetFullPathNameW},
         {"FindFirstFileExW", (void*)&Bed_FindFirstFileExW},
@@ -46653,6 +46873,7 @@ static int PatchModuleForGuest(HMODULE h, const char* tag)
         {"RegisterClassW",     (void*)&Bed_RegisterClassW},
         {"RegisterClassExW",   (void*)&Bed_RegisterClassExW},
         {"RegisterClassExA",   (void*)&Bed_RegisterClassExA},
+        {"RegisterClassA",     (void*)&Bed_RegisterClassA},
         {"CreateWindowExW",    (void*)&Bed_CreateWindowExW},
         {"CreateWindowExA",    (void*)&Bed_CreateWindowExA},
         {"DestroyWindow",      (void*)&Bed_DestroyWindow},
@@ -47391,6 +47612,54 @@ static void GhMelonBoot(HMODULE unity)
          (after == before ? " (NOT hooked: MelonLoader will not start)" : " (hooked by MelonLoader)"));
 }
 
+// §65. The Steam modules a custom game must not be handed from this process:
+// the shim (the signed-in session's front door) and the client engine with its
+// two companions. Returns the request's base name when it is one of them.
+static const char* GhCustomSteamBase(const char* dll)
+{
+    const char* b1 = strrchr(dll, '\\'); const char* b2 = strrchr(dll, '/');
+    const char* base = (b1 && b2) ? (b1 > b2 ? b1 : b2) : (b1 ? b1 : b2);
+    base = base ? base + 1 : dll;
+    static const char* const kNames[] = {
+        "steam_api64", "steamclient64", "tier0_s64", "vstdlib_s64", "steamclient", "steam_api" };
+    for (const char* k : kNames) {
+        const size_t n = strlen(k);
+        if (0 == _strnicmp(base, k, n) && (base[n] == 0 || 0 == _stricmp(base + n, ".dll"))) return base;
+    }
+    return nullptr;
+}
+
+// The game's own copy, by full path: the request itself when it is absolute,
+// else beside the exe, else in a Unity player's Plugins\x86_64. A full-path load
+// is path-keyed (steam-api64-singleton-bug), so it never binds to our module of
+// the same name. Not in the folder -> not found, as on a PC with no Steam.
+static HMODULE GhCustomSteamLoad(const char* dll, const char* base)
+{
+    std::vector<std::wstring> cand;
+    auto widen = [](const std::string& s) {
+        wchar_t w[1024];
+        return MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, w, 1024) ? std::wstring(w) : std::wstring();
+    };
+    std::string file = base;
+    if (file.size() < 4 || 0 != _stricmp(file.c_str() + file.size() - 4, ".dll")) file += ".dll";
+    if (dll[0] && dll[1] == ':') cand.push_back(widen(dll));
+    if (!g_guestDir.empty()) cand.push_back(g_guestDir + widen(file));
+    if (!g_guestDataDir.empty()) cand.push_back(g_guestDataDir + L"Plugins\\x86_64\\" + widen(file));
+    for (const std::wstring& c : cand) {
+        if (c.empty() || GetFileAttributesW(c.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+        HMODULE m = nullptr;
+        if (GetModuleHandleExW(0, c.c_str(), &m) && m) return m;      // already ours to hand back
+        m = LoadLibraryExW(c.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        Diag(std::string("CUSTOM ") + base + " -> the game's own copy " + Hex((uintptr_t)m) +
+             (m ? "" : " err=" + Hex(GetLastError())));
+        if (m) { PatchModuleForGuest(m, "custom steam dll"); return m; }
+        return nullptr;
+    }
+    Diag(std::string("CUSTOM ") + base + " -> not in the game's folder: not found (no Steam for your own games)");
+    SetLastError(ERROR_MOD_NOT_FOUND);
+    return nullptr;
+}
+
 static HMODULE LoadGuestDll(const char* dll)
 {
     if (GuestDllDenied(dll)){ SetLastError(ERROR_MOD_NOT_FOUND); return nullptr; }
@@ -47408,6 +47677,9 @@ static HMODULE LoadGuestDll(const char* dll)
             break;
         }
     }
+    // §65: before the already-loaded lookup, which would find OUR steam_api64 and
+    // steamclient64 -- the signed-in session -- by bare name.
+    if (g_customRun) if (const char* sb = GhCustomSteamBase(dll)) return GhCustomSteamLoad(dll, sb);
     // A LoadLibrary of a module that is already loaded takes a reference, as the
     // real call does: Gang Beasts' baselib loaded steam_api64.dll by bare name
     // for every lookup and freed it again, and without the reference those
@@ -52235,7 +52507,8 @@ static bool MapAndRun32(const std::vector<uint8_t>& file)
     // loader's x64 Steam engine, instead of mapping the copy the game ships.
     // Half-Life's engine exits unless SteamAPI_Init succeeds, and Valve's
     // 32-bit steam_api.dll can only fail on a console. See g_x86_bed_only_steam.
-    ghx86::g_x86_bed_only_steam = GhCfgNum(L"gh_x86_steam.txt", "GH_X86_STEAM", 0) != 0;
+    // §65: never for an uploaded game -- the bridge is the signed-in session.
+    ghx86::g_x86_bed_only_steam = !g_customRun && GhCfgNum(L"gh_x86_steam.txt", "GH_X86_STEAM", 0) != 0;
     // gh_x86_seh_trace.txt=1: name every frame of the guest's FS:[0] chain as
     // it is walked. Off by default -- a fault the guest swallows on purpose
     // would otherwise cost a line per frame, every time it happens.
@@ -52249,6 +52522,9 @@ static bool MapAndRun32(const std::vector<uint8_t>& file)
     if (!ok) {
         Diag("STAGE=x86_guest_failed " + why);
         g_guestFailWhy = "32-bit guest: " + why;
+        // A fault in the guest's own code is a crash, not a failed load (§65: the crash
+        // screen's headline and the custom game's lastRun both read this).
+        if (why.rfind("FAULT ", 0) == 0) g_guestCrashed = true;
         g_guestExited = true;
         g_guestExitCode = -1;
         return false;
@@ -53087,7 +53363,12 @@ static std::wstring GuestExtraArgs(const std::wstring& exePath)
     size_t sl = exePath.find_last_of(L"\\/");
     std::wstring base = (sl == std::wstring::npos) ? exePath : exePath.substr(sl + 1);
     for (auto& c : base) if (c >= L'A' && c <= L'Z') c = (wchar_t)(c + 32);
-    if (const GhTitle* tp = GhTitleByExe(base)){
+    if (g_customRun){                       // §65: the user's own launch options, nothing else
+        if (!g_customArgs.empty())
+            Diag("CMDLINE custom launch options (" + std::to_string(g_customArgs.size()) + " chars)");
+        return g_customArgs;
+    }
+    if (const GhTitle* tp = GhTitleByExe(base, GhTitleAppFor(exePath))){
         const GhTitle& t = *tp;
         if (t.args.empty()) return L"";
         std::wstring args(t.args);
@@ -53101,7 +53382,7 @@ static std::wstring GuestExtraArgs(const std::wstring& exePath)
             static const unsigned jt = GhCfgNumZ(L"gh_job_threads.txt", "GH_JOB_THREADS", 0);
             if (jt) args += L" -job-threads " + std::to_wstring(jt);
         }
-        Diag("CMDLINE extra args for " + std::string(base.begin(), base.end()) + ":" +
+        Diag("CMDLINE extra args for " + std::string(base.begin(), base.end()) + " (title " + t.id + "):" +
              std::string(args.begin(), args.end()));
         return args;
     }
@@ -54171,7 +54452,11 @@ static void RunGuest()
         // Preloading here under the bare name registers the module so Mono's
         // LoadLibraryA("steam_api64") finds it in the loader's module list.
         GhWatchSteamLoads();
-        if (HMODULE already = GetModuleHandleA("steam_api64.dll")) {
+        if (g_customRun) {
+            // §65: an uploaded game gets no Steam from us; its own steam_api64,
+            // if it ships one, loads from its folder (GhCustomSteamLoad).
+            Diag("STAGE=preload_steam_api64 skipped -- your own game, no Steam");
+        } else if (HMODULE already = GetModuleHandleA("steam_api64.dll")) {
             // Launcher already preloaded the shim for QR login. Do not also
             // LoadLibrary the Valve copy from the Steam tree (second module).
             Diag(std::string("STAGE=preload_steam_api64 already_loaded ") +
@@ -54861,6 +55146,7 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
         if (ghent::Current().st == ghent::St::Locked) LuiMembershipScreen("boot");
         std::wstring loginStatus = LauncherAddonsSignIn();
         g_ghSteamRuntimeProvided = LuiServiceProvided("steam-runtime");
+        OverlayRebakeMenuIfStale();   // the first LuiInit baked the menu before this was known
         {
             std::wstring lsh = g_guestDir + L"steam_api64.dll";
             if (g_ghSteamRuntimeProvided) {
@@ -54913,6 +55199,7 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
         bool firstPick = true;
         for (;;) {
             ResetGuestForRelaunch();
+            g_customRun = false; g_customId.clear(); g_customArgs.clear();   // §65
             // §52: a Start-without-mods relaunch, or a modded start that took the
             // process down, comes before the picker.
             std::wstring picked;
@@ -54933,6 +55220,7 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
                     Sleep(50);
                 }
             }
+            GhCustomBegin(picked);              // §65: before anything asks for a title config
             if (!LuiEntGate(picked)) continue;   // §43: no live membership, no launch
             if (!LuiShaderBakeGate(picked)) continue;   // §47: its title waits for the bake
             LuiShaderBakeStop();                // §47: the game gets the cores back
@@ -54966,6 +55254,7 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
                 Diag("FPTRAP on: will report the first " + std::to_string(g_fpTrapMax) +
                      " SSE invalid-operation faults, then re-mask and run on");
             g_guestSessionLive = true;
+            LuiRemoteSetPlaying(g_launcherSelectedName);   // §66: a phone sees "Playing <name>"
             g_guestRunning = true;
             GhStartGuestWorker();
             // #165. Time every step of the pump. A step that never blocks never
@@ -55009,6 +55298,7 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
                 Sleep(20);
             }
             g_guestRunning = false;
+            LuiRemoteSetPlaying(L"");
             g_overlayOpen = false;
 #ifdef GH_LAUNCHER
             GhAudioStopCapture();
@@ -55029,6 +55319,7 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
             const bool modBad = modRun && !g_guestUserQuit &&
                 (g_guestCrashed || g_guestExitCode != 0 || !g_guestFailWhy.empty());
             GhModRunEnd(modBad);
+            GhCustomEnd();                      // §65: the run's result and log, for the browser page
             if (g_guestUserQuit) {
                 // Unity's allocator is process-global ("Memory manager is already
                 // initialized!" on the 0.0.58 relaunch). TerminateThread/FreeLibrary
@@ -55060,7 +55351,9 @@ struct App : implements<App, IFrameworkView, IFrameworkViewSource>
             for (const auto& l : lines)
                 if (l.find("STUB-CALLED") != std::string::npos) { stubbed = true; break; }
             bool bad = g_guestCrashed || g_guestExitCode == -999 || !g_guestFailWhy.empty() || stubbed;
-            std::wstring title = bad ? L"LAUNCH FAILED" : L"SESSION ENDED";
+            // A guest that faulted ran its own code, so it crashed; "launch failed" is
+            // for a load that never got going (a refused import, a stub, no entry).
+            std::wstring title = !bad ? L"SESSION ENDED" : g_guestCrashed ? L"GAME CRASHED" : L"LAUNCH FAILED";
             std::wstring reason;
             if (!g_guestFailWhy.empty())
                 // Not a byte-for-byte widen: these reasons are built by snprintf

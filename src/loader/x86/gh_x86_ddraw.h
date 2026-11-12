@@ -275,6 +275,15 @@ inline bool dd_present_565(const uint8_t* src, uint32_t w, uint32_t h, uint32_t 
     static IDirect3DSurface9* stage = nullptr;      // SYSTEMMEM, we write it
     static IDirect3DSurface9* mid   = nullptr;      // DEFAULT, only when scaling
     static uint32_t sw = 0, sh = 0;
+    // Both surfaces belong to the device that made them. A later session (or a
+    // renderer SDL rebuilt) borrows a different one, and UpdateSurface across
+    // two devices is not a copy anything promises.
+    static void* sdev = nullptr;
+    if (stage && sdev != (void*)dev) {
+        stage->Release(); stage = nullptr;
+        if (mid) { mid->Release(); mid = nullptr; }
+    }
+    sdev = (void*)dev;
     if (stage && (sw != w || sh != h)) {
         stage->Release(); stage = nullptr;
         if (mid) { mid->Release(); mid = nullptr; }
@@ -840,6 +849,8 @@ inline uint32_t dd_build_vtable(Machine& m, const char* what,
 inline uint32_t ddsurf_vtable(Machine& m)
 {
     static uint32_t vt = 0;
+    static uint32_t stamp = 0;                  // a guest address: one session's
+    if (x86_session_changed(stamp)) vt = 0;
     if (!vt) {
         uint32_t n = 0;
         const DDrawMethod* t = ddsurf_methods(n);
@@ -1178,6 +1189,8 @@ inline const DDrawMethod* ddraw_methods(uint32_t& count)
 inline uint32_t ddraw_vtable(Machine& m)
 {
     static uint32_t vt = 0;
+    static uint32_t stamp = 0;                  // a guest address: one session's
+    if (x86_session_changed(stamp)) vt = 0;
     if (!vt) {
         uint32_t n = 0;
         const DDrawMethod* t = ddraw_methods(n);

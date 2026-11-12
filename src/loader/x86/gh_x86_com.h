@@ -251,6 +251,11 @@ struct ComState {
     void log_poison_audit();
 };
 
+// One per SESSION, not per process, although it is a static: every vtable and
+// wrapper in it is a guest address, so x86_begin_session() (gh_x86_beds.h)
+// replaces it with an empty one before each guest runs. Kept across sessions,
+// `live` handed a second guest the first guest's wrapper for the process-global
+// IDirect3D9, and `vtbl` the first guest's thunks.
 inline ComState& com()
 {
     static ComState s;
@@ -264,7 +269,9 @@ inline ComState& com()
 // the same line sixty times a second and bury everything after it.
 inline uint64_t com_poisoned_call(Machine& m, const uint32_t*)
 {
-    static std::vector<uint32_t> seen;
+    static std::vector<uint32_t> seen;          // thunk addresses: this session's
+    static uint32_t stamp = 0;
+    if (x86_session_changed(stamp)) seen.clear();
     const uint32_t at = m.cpu.host_call_target;
     for (uint32_t s : seen) if (s == at) return 0x80004005u;   // E_FAIL
     seen.push_back(at);

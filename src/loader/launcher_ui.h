@@ -30,6 +30,7 @@
 #include <winrt/windows.ui.text.core.h>
 #include <winrt/windows.ui.viewmanagement.h>
 #include <winrt/windows.ui.viewmanagement.core.h>
+#include <winrt/windows.system.display.h>     // §66: DisplayRequest while a download runs
 #include "gh_shbake.h"
 // Steam sign-in, the owned library and the depot downloader live in the Steam
 // add-on (corpus/addons/steam, GREENHOUSE.md §40), not here: this file carries no
@@ -59,6 +60,8 @@ static std::wstring LuiEntBadge();   // membership section, below
 // what will be sent, and confirms. gh_compat.h above is read-only by design --
 // this is the deliberate, consented exception to it, not a contradiction.
 #include "gh_crash.h"
+#include "gh_custom.h"       // §65: your own games, uploaded from a browser (gh_web.h server)
+#include "gh_remote.h"       // §66: manage the library from a phone, through the site
 // Steam key art (covers and banners) for the owned library, behind the provider
 // seam in gh_ui.h. Launcher-only: it owns a worker thread, WinHTTP and a disk
 // cache, none of which the preview harness can have -- the harness supplies its
@@ -169,6 +172,7 @@ struct LauncherItem {
     uint32_t     playForever = 0;
     uint32_t     play2Weeks = 0;
     uint32_t     lastPlayed = 0;
+    std::wstring runLine;    // §65 custom rows: the last run, in place of a play record
 };
 
 static std::string LuiNarrow(const std::wstring& w) { return std::string(w.begin(), w.end()); }
@@ -424,11 +428,25 @@ static std::wstring LuiFolderOf(const std::wstring& guest)
     return (s == std::wstring::npos) ? std::wstring() : guest.substr(0, s);
 }
 
+// The title's whole install: under a Greenhouse root (gh_games\ or LocalState\game\)
+// that is the FIRST folder below the root, wherever the exe sits inside it. It used
+// to be the exe's own folder, which for a game that keeps its exe in a subfolder
+// (every Unreal title: <Game>\Binaries\Win64\) made uninstall delete only that
+// subfolder -- the rest of the game, gh_install.txt included, stayed behind -- and
+// made the phone list FPS Chess at 75.9 MB of its 1.9 GB (R5). Anywhere else it is
+// still the exe's folder, which LuiCanUninstall then refuses.
 static std::wstring LuiInstallFolder(const LauncherItem& it)
 {
     if (it.guest.empty() || it.guest[0] == L'@') return L"";
     size_t s = it.guest.find_last_of(L"\\/");
     if (s == std::wstring::npos || s == 0) return L"";
+    const std::wstring roots[2] = { kDevGames, std::wstring(kLocalState) + L"game\\" };
+    for (const std::wstring& root : roots) {
+        if (it.guest.size() <= root.size() || !StartsWithNoCase(it.guest, root)) continue;
+        const size_t e = it.guest.find_first_of(L"\\/", root.size());
+        if (e == std::wstring::npos || e == root.size()) return L"";   // an exe loose in the root
+        return it.guest.substr(0, e);
+    }
     return it.guest.substr(0, s);
 }
 
@@ -897,6 +915,7 @@ struct LuiWallState {
 // answer to "have I played this".
 static std::wstring LuiPlayLine(const LauncherItem& it)
 {
+    if (0 == strcmp(it.source, "custom")) return it.runLine;   // §65: no account record to show
     auto span = [](uint32_t mins) -> std::wstring {
         if (mins < 60) return std::to_wstring(mins) + L" min";
         const uint32_t h = mins / 60;
@@ -1008,7 +1027,10 @@ static void LuiDrawTitlePage(const LauncherItem& it, int promptKind, const wchar
     // where it replaces "Installing copies it to this console" on a title we know does
     // not run -- which was, until now, advice to spend forty gigabytes on nothing.
     const std::wstring compatLine = ghcompat::LineFor(it.app);
-    if (!it.blocked.empty())
+    if (0 == strcmp(it.source, "custom"))
+        // §65: the one thing to know about a file the user brought.
+        mv.note.set(L"Unverified — your own file. Greenhouse has not tested it, and it runs without Steam.");
+    else if (!it.blocked.empty())
         mv.note.setElided((it.display + L" " + it.blocked +
                            L".  Install it from Packages, then try again.").c_str());
     else if (!compatLine.empty())
@@ -1079,6 +1101,8 @@ static void LuiDrawMenu(const std::vector<LauncherItem>& items, int sel, const s
     // four controls by design, and a control that is always available belongs
     // with the header anyway.
     ch.addAction(GH_GLYPH_LB, L"Themes");
+    // §65: the browser page -- your own games, added from a PC.
+    ch.addAction(GH_GLYPH_RB, L"PC & phone");     // §66: Manage from anywhere is Y on that page
 
     // The drawers, and the breadcrumb naming the one in front. Three, not
     // four: there is no "Updates" drawer because nothing reports a game update
@@ -1195,8 +1219,65 @@ static void LuiDrawStatus(const std::wstring& msg)
 
 // Progress state shared with the download callback and the add-on host API
 // (same UI thread). Outside the Steam block: add-ons draw it in every build.
-struct LauncherDlProg { std::wstring name, phase, head, hint; int percent=0, fdone=0, ftot=0; unsigned long long bytes=0; bool verify=false; };   // head: replaces "Downloading <name>"
+struct LauncherDlProg {
+    std::wstring name, phase, head, hint;          // head: replaces "Downloading <name>"
+    int percent=0, fdone=0, ftot=0; unsigned long long bytes=0; bool verify=false;
+    uint32_t app = 0;                              // §66: the title being fetched (0 = not an acquire)
+    // §66: speed and time left. The rate is an average of bytes per second, sampled
+    // once a second (EMA, alpha 0.2). Time left comes from the byte total when the
+    // add-on gives one, else from how fast the percent has moved since the start.
+    // Nothing is shown for the first 10 s.
+    ULONGLONG tStart = 0, tRate = 0; unsigned long long bRate = 0, total = 0;
+    int p0 = 0; double rate = 0; int eta = -1;
+};
 static LauncherDlProg g_dlProg;
+
+// §66: what a phone sees of the download in progress. The UI thread writes it from
+// the progress callbacks; the remote poller reads it. Copies, under the mutex.
+struct LuiRemoteDl {
+    bool active = false, cancellable = false;
+    uint32_t app = 0;
+    std::string name, op, phase, by;               // UTF-8
+    int pct = 0; uint64_t done = 0, total = 0; double rate = 0; int eta = -1;
+};
+static std::mutex             g_remDlMu;
+static LuiRemoteDl            g_remDl;                // under g_remDlMu
+static std::atomic<uint32_t>  g_remCancelApp{0};      // the poller asks: cancel this app's download
+static std::atomic<bool>      g_remSignedIn{false};   // an add-on's signIn said yes (never the label)
+static std::wstring           g_remActBy;             // UI thread: the phone that asked for this acquire
+static ULONGLONG              g_remDlPushed = 0;      // UI thread: last mirror update
+
+static void LuiDlTick()
+{
+    LauncherDlProg& d = g_dlProg;
+    const ULONGLONG now = GetTickCount64();
+    if (!d.tStart) { d.tStart = d.tRate = now; d.bRate = d.bytes; d.p0 = d.percent; }
+    if (now - d.tRate >= 1000) {
+        const double inst = d.bytes >= d.bRate ? (double)(d.bytes - d.bRate) * 1000.0 / (double)(now - d.tRate) : 0.0;
+        d.rate = d.rate <= 0 ? inst : d.rate * 0.8 + inst * 0.2;
+        d.tRate = now; d.bRate = d.bytes;
+    }
+    d.eta = -1;
+    const ULONGLONG el = now - d.tStart;
+    if (el >= 10000 && d.percent < 100) {
+        if (d.total > d.bytes && d.rate > 1) d.eta = (int)((double)(d.total - d.bytes) / d.rate);
+        else if (d.percent > d.p0) d.eta = (int)((100 - d.percent) * (el / 1000.0) / (d.percent - d.p0));
+    }
+    if (!d.app || now - g_remDlPushed < 500) return;
+    g_remDlPushed = now;
+    std::lock_guard<std::mutex> lk(g_remDlMu);
+    g_remDl.phase = ghrepo::Narrow(d.phase);
+    g_remDl.pct = d.percent; g_remDl.done = d.bytes; g_remDl.total = d.total;
+    g_remDl.rate = d.rate; g_remDl.eta = d.eta;
+}
+static std::wstring LuiEtaText(int eta)
+{
+    if (eta < 0) return L"estimating time left\u2026";
+    if (eta < 60) return L"under a minute left";
+    const int m = (eta + 30) / 60;
+    if (m < 90) return L"about " + std::to_wstring(m) + L" min left";
+    return L"about " + std::to_wstring(m / 60) + L" h " + std::to_wstring(m % 60) + L" min left";
+}
 
 static void LuiDrawProgress()
 {
@@ -1219,9 +1300,20 @@ static void LuiDrawProgress()
     wchar_t buf[64];
     swprintf(buf, 64, L"%d%%   %.1f MB", g_dlProg.percent, g_dlProg.bytes / (1024.0 * 1024.0));
     vm.amount.set(buf);
+    // Each piece in its own field: `rate` and `eta` are 32-character tags, so the
+    // file count, speed and time left joined into `rate` were cut to "files 166 /
+    // 228 \u00B7 4.6 MB/s..." and the time left never showed (R5). The file count is
+    // the stage detail under the heading; every layout draws that.
     if (g_dlProg.ftot > 0) {                 // add-on progress has no file count
         swprintf(buf, 64, L"files %d / %d", g_dlProg.fdone, g_dlProg.ftot);
-        vm.rate.set(buf);
+        vm.detail.set(buf);
+    }
+    if (g_dlProg.app && g_dlProg.tStart && GetTickCount64() - g_dlProg.tStart >= 3000) {   // §66
+        if (g_dlProg.rate >= 1024) {
+            swprintf(buf, 64, L"%.1f MB/s", g_dlProg.rate / (1024.0 * 1024.0));
+            vm.rate.set(buf);
+        }
+        vm.eta.setElided(LuiEtaText(g_dlProg.eta).c_str());
     }
 
     g_lui.dc->BeginDraw();
@@ -1251,15 +1343,15 @@ struct LibrarySource {
 
 static const LibrarySource* LuiSources(size_t& n);
 
-// The title config (greenhouse.title/1) whose exe matches this row's guest, if any.
+// The title config (greenhouse.title/1) for this row: its exe, and its app id
+// when the row has one (Portal's row is hl2.exe too, and is not Half-Life 2).
 static const GhTitle* LuiTitleFor(const LauncherItem& it)
 {
     if (it.guest.empty() || it.guest[0] == L'@') return nullptr;
+    if (0 == strcmp(it.source, "custom")) return nullptr;     // §65: matched to no title
     size_t s = it.guest.find_last_of(L"\\/");
     std::wstring exe = (s == std::wstring::npos) ? it.guest : it.guest.substr(s + 1);
-    for (const GhTitle& t : GhTitles())
-        if (_wcsicmp(t.exe.c_str(), exe.c_str()) == 0) return &t;
-    return nullptr;
+    return GhTitleMatch(exe, it.app);
 }
 
 // Display name for an installed row: a library source's name for the title id
@@ -1372,11 +1464,45 @@ static void LuiSrcUsb(std::vector<LauncherItem>& out)
     }
 }
 
+// --- custom (§65): games the user uploaded from a browser, one folder each under
+// D:\DevelopmentFiles\gh_custom\<id>\ with its gh_custom.json. Never matched to a
+// title config, never given Steam art (app 0 draws the plate), no compat mark --
+// nothing we know about them is true. The title page says "Unverified".
+static std::wstring LuiCustomRoot() { return std::wstring(kDevRoot) + L"gh_custom\\"; }
+static std::wstring LuiCustomRunLine(const ghcustom::Game& g)
+{
+    if (!g.last.has) return L"Not run yet";
+    const int64_t d = ((int64_t)::time(nullptr) - g.last.when) / 86400;
+    std::wstring when = d <= 0 ? L"today" : d == 1 ? L"yesterday" : std::to_wstring(d) + L" days ago";
+    if (g.last.crashed) return L"Crashed " + when + L"  \u00B7  the log is on the browser page";
+    return L"Last run " + when + (g.last.exit ? L", exit code " + std::to_wstring(g.last.exit) : std::wstring());
+}
+static void LuiSrcCustom(std::vector<LauncherItem>& out)
+{
+    const std::wstring root = LuiCustomRoot();
+    if (GetFileAttributesW(root.c_str()) == INVALID_FILE_ATTRIBUTES) return;   // nothing uploaded, ever
+    ghcustom::Store st{std::filesystem::path(root)};
+    for (const ghcustom::Game& g : st.List()) {
+        LauncherItem it;
+        it.display = GhUtf8ToW(g.name);
+        std::wstring exe = GhUtf8ToW(g.exe);
+        for (auto& c : exe) if (c == L'/') c = L'\\';
+        it.guest = root + GhUtf8ToW(g.id) + L"\\" + exe;
+        it.sub = L"your file";
+        it.source = "custom";
+        it.runLine = LuiCustomRunLine(g);
+#ifndef GH_X86_GUEST
+        if (g.arch == "x86") it.blocked = L"is a 32-bit game, which this build does not run";
+#endif
+        out.push_back(it);
+    }
+}
 
 static const LibrarySource kLuiSources[] = {
     { "installed",  LuiSrcInstalled,  nullptr, nullptr, nullptr, nullptr, nullptr },
     { "configured", LuiSrcConfigured, nullptr, nullptr, nullptr, nullptr, nullptr },
     { "usb",        LuiSrcUsb,        nullptr, nullptr, nullptr, nullptr, nullptr },
+    { "custom",     LuiSrcCustom,     nullptr, nullptr, nullptr, nullptr, nullptr },
 };
 // ---------------------------------------------------------------------------
 // Add-on library sources (Step 4, gh_addon_abi.h). An installed add-on package
@@ -1524,13 +1650,17 @@ static bool LuiAddonUiLive(const char* what)
     if (!once) { once = true; Diag(std::string("ADDON host ") + what + " outside acquire() ignored"); }
     return false;
 }
+static void LuiAddonPollCancel();
 static void LuiAddonProgress(const wchar_t* phase, uint64_t done, uint64_t total)
 {
     if (!LuiAddonUiLive("progress")) return;
     g_dlProg.phase = phase ? phase : L"";
     g_dlProg.bytes = done;
+    g_dlProg.total = total;
     g_dlProg.percent = total ? (int)(done >= total ? 100 : done * 100 / total) : 0;
+    LuiDlTick();
     if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+    LuiAddonPollCancel();
     LuiDrawProgress();
     LuiPresent();
 }
@@ -1543,7 +1673,10 @@ static void LuiAddonStatus(const wchar_t* text)
 }
 // B on a cancellable progress screen (the workshop sync): latched until the next
 // cancellable call starts. Polled by every drawing call and by cancelRequested.
+// §66: also during a download, when the add-on says its acquire can stop
+// (acquireCancels), and from a phone through g_remCancelApp.
 static bool g_luiAddonCancellable = false, g_luiAddonCancel = false;
+static const wchar_t* g_luiCancelHint = L"Skipping \u2014 finishing the current request";
 static WORD g_luiCancelPrev = 0xFFFF;
 static void LuiAddonPollCancel()
 {
@@ -1553,10 +1686,17 @@ static void LuiAddonPollCancel()
     WORD b; { std::lock_guard<std::mutex> lk(g_padMutex); b = g_padState.wButtons; }
     if ((b & ~g_luiCancelPrev & XINPUT_GAMEPAD_B) && !g_luiAddonCancel) {
         g_luiAddonCancel = true;
-        g_dlProg.hint = L"Skipping \u2014 finishing the current request";
+        g_dlProg.hint = g_luiCancelHint;
         Diag("LAUNCHER progress: B -- cancel requested");
     }
     g_luiCancelPrev = b;
+    const uint32_t rc = g_remCancelApp.load();
+    if (rc && rc == g_dlProg.app && !g_luiAddonCancel) {
+        g_luiAddonCancel = true;
+        g_remCancelApp = 0;
+        g_dlProg.hint = L"Cancelled from a phone \u2014 finishing the current file";
+        Diag("LAUNCHER progress: cancel requested from a phone app=" + std::to_string(rc));
+    }
 }
 static int LuiAddonCancelRequested()
 {
@@ -1571,6 +1711,7 @@ static void LuiAddonProgressFiles(const wchar_t* phase, int percent, int fdone, 
     g_dlProg.phase = phase ? phase : L"";
     g_dlProg.percent = percent < 0 ? 0 : percent > 100 ? 100 : percent;
     g_dlProg.fdone = fdone; g_dlProg.ftot = ftot; g_dlProg.bytes = bytes;
+    LuiDlTick();
     if (g_dispatcher) g_dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
     LuiAddonPollCancel();
     LuiDrawProgress();
@@ -1622,17 +1763,68 @@ static uint32_t LuiAddonSteamSkipDepots(uint32_t app, uint32_t* out, uint32_t ca
     return 0;
 }
 
+// §66: keep the console awake while a download runs. Without it the idle timer
+// can turn the console off under a download nobody is watching (one started from
+// a phone). Balanced: one RequestActive per acquire, released when it returns.
+static void LuiKeepAwake(bool on)
+{
+    using DR = winrt::Windows::System::Display::DisplayRequest;
+    // Made once and never destroyed (no release at static teardown). Projected
+    // types refuse plain new; global placement new is the way to keep one alive.
+    alignas(DR) static unsigned char store[sizeof(DR)];
+    static DR* req = nullptr;
+    static int held = 0;
+    try {
+        if (!req) req = ::new (static_cast<void*>(store)) DR();
+        if (on) { req->RequestActive(); ++held; }
+        else if (held > 0) { req->RequestRelease(); --held; }
+    } catch (...) {
+        static bool once = false;
+        if (!once) { once = true; Diag("LAUNCHER DisplayRequest unavailable"); }
+    }
+}
+static bool g_luiLastAcqCancelled = false;   // UI thread: the last acquire ended by a cancel
 template <int K> static bool LuiAddonAcquire(const LauncherItem& it, int mode)
 {
     if (!g_luiAddons[K].api.acquire) return false;
     GhAddonRow r = LuiItemToAddonRow(it);
     const int m = mode == kAcqVerify ? GH_ACQ_VERIFY : mode == kAcqResume ? GH_ACQ_RESUME : GH_ACQ_NEW;
+    const bool cancels = GH_ADDON_HAS(&g_luiAddons[K].api, acquireCancels);
     g_dlProg = LauncherDlProg{};
     g_dlProg.name = it.display; g_dlProg.verify = (m == GH_ACQ_VERIFY);
+    g_dlProg.app = it.app;
+    const std::wstring by = g_remActBy.empty() ? std::wstring() : L"Started from " + g_remActBy;
+    if (cancels) {
+        g_dlProg.hint = (by.empty() ? std::wstring() : by + L"   \u00B7   ") +
+                        (m == GH_ACQ_NEW ? L"B  Cancel \u2014 you can resume it later" : L"B  Cancel");
+        g_luiAddonCancellable = true; g_luiAddonCancel = false; g_luiCancelPrev = 0xFFFF;
+        g_luiCancelHint = L"Cancelling \u2014 finishing the current file";
+    } else {
+        g_dlProg.hint = by;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_remDlMu);
+        g_remDl = LuiRemoteDl{};
+        g_remDl.active = it.app != 0;
+        g_remDl.cancellable = cancels;
+        g_remDl.app = it.app;
+        g_remDl.name = ghrepo::Narrow(it.display);
+        g_remDl.op = m == GH_ACQ_VERIFY ? "verify" : m == GH_ACQ_RESUME ? "resume" : "install";
+        g_remDl.by = ghrepo::Narrow(g_remActBy);
+    }
+    g_remDlPushed = 0;
+    LuiKeepAwake(true);
     g_luiAddonAcqTid = GetCurrentThreadId();
     g_luiAddonAcquiring = true;
     const bool ok = g_luiAddons[K].api.acquire(&r, m) != 0;
     g_luiAddonAcquiring = false;
+    LuiKeepAwake(false);
+    g_luiLastAcqCancelled = cancels && g_luiAddonCancel;
+    if (g_luiLastAcqCancelled) Diag("LAUNCHER acquire app=" + std::to_string(it.app) + " cancelled; the folder stays resumable");
+    g_luiAddonCancellable = false; g_luiAddonCancel = false;
+    g_luiCancelHint = L"Skipping \u2014 finishing the current request";
+    { std::lock_guard<std::mutex> lk(g_remDlMu); g_remDl = LuiRemoteDl{}; }
+    uint32_t want = it.app; g_remCancelApp.compare_exchange_strong(want, 0);
     return ok;
 }
 // Steam Workshop: before a title whose config says "workshop" launches, the add-on
@@ -2041,6 +2233,16 @@ static std::vector<LauncherItem> LuiEnumerate()
         }
     }
     for (size_t k = 0; k < n; ++k) if (src[k].enrich) src[k].enrich(out);
+    // §65: an add-on that claims rows by exe name must not claim an uploaded one --
+    // that would hand it an app id, Steam art and the owned game's play record.
+    {
+        const std::wstring croot = LuiCustomRoot();
+        for (auto& it : out) {
+            if (it.guest.size() <= croot.size() || _wcsnicmp(it.guest.c_str(), croot.c_str(), croot.size())) continue;
+            it.source = "custom"; it.app = 0; it.acq = nullptr;
+            it.playForever = it.play2Weeks = it.lastPlayed = 0;
+        }
+    }
 
     // A title config can say the game needs a runtime service ("steam-runtime"):
     // with no source providing it the row stays visible but does not launch.
@@ -2108,6 +2310,7 @@ static std::wstring LauncherAddonsSignIn()
         if (!signedIn && label[0]) header = label;
         if (ok) signedIn = true;
     }
+    g_remSignedIn = signedIn;            // §66: a phone is told yes/no, never the label
     return header.empty() ? std::wstring(L"not signed in") : header;
 }
 
@@ -2483,10 +2686,10 @@ static void LuiModsUiLog(const std::string& s)
 static const GhTitle* LuiModsTitle(const LauncherItem& it)
 {
     if (it.kind != LauncherItem::kLaunch || it.guest.empty()) return nullptr;
+    if (0 == strcmp(it.source, "custom")) return nullptr;   // §65: an uploaded exe is nobody's title
     const std::wstring exe = LuiExeBase(it.guest) + L".exe";
-    for (const GhTitle& t : GhTitles())
-        if (t.steamAppId && _wcsicmp(t.exe.c_str(), exe.c_str()) == 0) return &t;
-    return nullptr;
+    const GhTitle* t = GhTitleMatch(exe, it.app);
+    return (t && t->steamAppId) ? t : nullptr;
 }
 
 static bool LuiModsOffered(const LauncherItem& it)
@@ -4446,8 +4649,11 @@ static void LauncherPackages()
 //   ->  the mod run record's title id  ->  "app <id>".
 // Empty only when nothing at all was picked, and Upload() refuses that.
 // ---------------------------------------------------------------------------
+static std::string LuiCustomReportTitle(const std::wstring& exePath);   // §65, below
+static ghcrash::Custom LuiCustomReportInfo(const std::wstring& exePath, const std::string& arch);
 static std::string LuiCrashTitleName()
 {
+    if (g_customRun) return LuiCustomReportTitle(g_launcherSelectedGuest);   // §65: the exe, never the typed name
     std::string n;
     if (!g_launcherSelectedName.empty()) n = LuiNarrow(g_launcherSelectedName);
     if (n.empty()) {
@@ -4590,8 +4796,17 @@ static bool LauncherShowCrash(const std::wstring& title, const std::wstring& rea
                     // `entries`, not `lines`: Scrub() does its own splitting, and
                     // the copy is deliberate -- this thread outlives the frame.
                     std::thread([repState, repWhy, repWhyMu, repTitle,
-                                 ent = entries, ver = LuiVersionStr(GhOwnPackageVersion())]{
-                        ghcrash::Result r = ghcrash::Upload(repTitle, ent, ver);
+                                 ent = entries, ver = LuiVersionStr(GhOwnPackageVersion()),
+                                 custom = g_customRun, guest = g_launcherSelectedGuest, id = g_customId]{
+                        // §65: an uploaded game's report says so, with the exe's hash.
+                        ghcrash::Custom ci;
+                        if (custom) {
+                            ghcustom::Game g;
+                            ghcustom::Store st{std::filesystem::path(LuiCustomRoot())};
+                            st.Load(id, g);
+                            ci = LuiCustomReportInfo(guest, g.arch);
+                        }
+                        ghcrash::Result r = ghcrash::Upload(repTitle, ent, ver, ci);
                         { std::lock_guard<std::mutex> lk(*repWhyMu); *repWhy = r.why; }
                         *repState = r.ok ? 1 : 2;
                         Diag(std::string("CRASHREPORT ") + (r.ok ? "ok" : "failed: " + r.why));
@@ -4635,6 +4850,11 @@ static bool LauncherShowCrash(const std::wstring& title, const std::wstring& rea
                 // The consent: WHAT GOES, then what is taken out first. Both
                 // halves matter -- "we remove personal data" with no list is a
                 // promise the person cannot check.
+                if (g_customRun)    // §65: what goes for a file the user brought
+                    mv.note.set(L"Sends the end of this log, the program's file name and a fingerprint of it "
+                                L"(not the file), the console model and the Greenhouse version. Account names, "
+                                L"file paths and anything key-shaped are removed first.");
+                else
                 mv.note.set(L"Sends the end of this log, the game's name, the console model and the "
                             L"Greenhouse version. Account names, file paths and anything key-shaped "
                             L"are removed first.");
@@ -4948,6 +5168,12 @@ enum { kOvlMenu = 0, kOvlFriends = 1, kOvlIncoming = 2,
        kOvlOptions = 6, kOvlBind = 7 };
 enum { kOvlStNone = 0, kOvlStHostFirst, kOvlStSent, kOvlStFail };
 static volatile int  g_ovlSel = 0;       // menu: 0 remap, 1 input, 2 friends, 3 quit
+// Whether the BAKED menu panels carry the "Invite friends" row. Navigation reads
+// this, not the live steam-runtime flag: the panels are baked at the first
+// LuiInit, which runs (membership screen, add-on sign-in) before that flag is
+// known, and a cursor that follows the live flag lands on a row the picture
+// does not have -- selectable and invisible.
+static bool  g_ovlMenuHasInvite = false;
 static int   g_ovlPage = kOvlMenu;
 static int   g_ovlFriendSel = 0;
 static int   g_ovlFriendScroll = 0;
@@ -5448,13 +5674,13 @@ static void OverlayTick()
     // menu
     if ((pressed & XINPUT_GAMEPAD_DPAD_UP) || (ly_hi && navGate)) {
         if (g_ovlSel > 0) g_ovlSel--;
-        if (g_ovlSel == 2 && !GhSteamRuntimeProvided()) g_ovlSel = 1;   // no friends row without Steam
+        if (g_ovlSel == 2 && !g_ovlMenuHasInvite) g_ovlSel = 1;   // no friends row without Steam
         g_ovlLastNav = now;
         g_ovlDirty = true;
     }
     if ((pressed & XINPUT_GAMEPAD_DPAD_DOWN) || (ly_lo && navGate)) {
         if (g_ovlSel < 3) g_ovlSel++;
-        if (g_ovlSel == 2 && !GhSteamRuntimeProvided()) g_ovlSel = 3;
+        if (g_ovlSel == 2 && !g_ovlMenuHasInvite) g_ovlSel = 3;
         g_ovlLastNav = now;
         g_ovlDirty = true;
     }
@@ -5611,7 +5837,7 @@ static void OverlayPaintMenu(int sel, bool remapOn)
     const float rowH = 64.f;
     OverlayPaintRow(140.f, rowH, sel == 0, L"Controller remap", remapOn ? L"ON" : L"OFF", remapOn);
     OverlayPaintRow(208.f, rowH, sel == 1, L"Input settings", nullptr, false);
-    if (GhSteamRuntimeProvided()) {
+    if (g_ovlMenuHasInvite) {
         OverlayPaintRow(276.f, rowH, sel == 2, L"Invite friends", nullptr, false);
         OverlayPaintRow(344.f, rowH, sel == 3, L"Return to Greenhouse", nullptr, false);
     } else {
@@ -6248,6 +6474,7 @@ static void OverlayBakePanels()
 {
     if (!g_lui.dc || !g_gfx.d11) return;
     int ok = 0;
+    g_ovlMenuHasInvite = GhSteamRuntimeProvided();
     for (int sel = 0; sel < 4; ++sel) {
         for (int on = 0; on < 2; ++on) {
             if (!OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlMenu[sel][on])) continue;
@@ -6395,6 +6622,26 @@ static void LauncherRebakeOverlay()
     OverlayRefreshOptRows();
     if (!g_ovlFriends.empty()) OverlayBakeFriendsNow(true);
     g_lui.dc->SetTarget(g_lui.uiTarget.get());
+}
+
+// The menu panels alone, for when the steam-runtime flag is settled after the
+// first LuiInit already baked them without the "Invite friends" row. Boot-time,
+// launcher thread, no guest: the same ownership LuiInit had.
+static void OverlayRebakeMenuIfStale()
+{
+    if (!g_lui.ready || !g_lui.dc || !g_gfx.d11) return;
+    if (g_ovlMenuHasInvite == GhSteamRuntimeProvided()) return;
+    g_ovlMenuHasInvite = GhSteamRuntimeProvided();
+    int ok = 0;
+    for (int sel = 0; sel < 4; ++sel)
+        for (int on = 0; on < 2; ++on) {
+            if (!OverlayBakeTo((UINT)kOvlW, (UINT)kOvlH, g_lui.ovlMenu[sel][on])) continue;
+            OverlayPaintMenu(sel, on != 0);
+            ++ok;
+        }
+    g_lui.dc->SetTarget(g_lui.uiTarget.get());
+    Diag(std::string("OVERLAY menu re-baked invite=") + (g_ovlMenuHasInvite ? "1" : "0") +
+         " panels=" + std::to_string(ok));
 }
 
 static bool LauncherApplyTheme(const char* id)
@@ -6729,6 +6976,960 @@ static void OverlayBlit(ID3D11Resource* dst)
 // The poll thread only PARSES and hands the batch to the picker; the picker's UI
 // thread runs it. acquire() blocks and draws progress on that thread, and `all`
 // /`items` belong to it, so running commands anywhere else would race the render.
+// ===========================================================================
+// §65. Manage from a browser: your own games, added from a PC.
+//
+// A setting, off until the user turns it on (From your PC, RB on the wall), and
+// on until they turn it off. While it is on, gh_web.h listens on the home network
+// (port 8880, or the next free of four) and gh_custom.h answers the page in
+// guest\web\console.html. The site is told the address so
+// playgreenhouse.app/console can send the patron's browser straight here; none of
+// the traffic goes through the site. A browser is paired once, by a code shown on
+// both screens and an A press on the TV, and the TV can forget them all.
+//
+// The server runs on its own threads. Everything it needs from the launcher is a
+// hook below, and none of them touches the UI: the picker polls for a pairing
+// prompt, a library change and a "Play on TV", on its own thread.
+// ===========================================================================
+static const wchar_t kWebOnFile[] = L"gh_web_on.txt";
+static const uint16_t kWebPort = 8880;
+static ghweb::Server              g_webServer;
+static std::atomic<bool>          g_webLibDirty{false};
+static std::atomic<ULONGLONG>     g_webPickerBeat{0};    // the wall's loop, every frame it runs
+static std::atomic<bool>          g_webAnnounceKick{false};
+static std::mutex                 g_webLaunchMu;
+static std::string                g_webLaunchId;         // under g_webLaunchMu
+static ULONGLONG                  g_webLaunchAt = 0;     // under g_webLaunchMu
+
+static bool LuiWebEnabled()
+{
+    return GetFileAttributesW((std::wstring(kLocalState) + kWebOnFile).c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+static void LuiWebSetEnabled(bool on)
+{
+    const std::wstring p = std::wstring(kLocalState) + kWebOnFile;
+    if (!on) { DeleteFileW(p.c_str()); return; }
+    HANDLE h = CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) { DWORD w = 0; WriteFile(h, "1", 1, &w, nullptr); CloseHandle(h); }
+}
+
+// The address this console has on the home network: the source address of its
+// route to the internet. Connecting a UDP socket sends nothing; it only asks the
+// stack which interface it would use. Empty when that is not a private address.
+static std::string LuiWebLanAddr()
+{
+    static bool wsaOk = [] { WSADATA w; return WSAStartup(MAKEWORD(2, 2), &w) == 0; }();
+    if (!wsaOk) return "";
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return "";
+    sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_port = htons(53);
+    to.sin_addr.s_addr = htonl(0x01010101);          // any public address does
+    std::string out;
+    if (connect(s, (sockaddr*)&to, sizeof to) == 0) {
+        sockaddr_in me{};
+        int len = sizeof me;
+        if (getsockname(s, (sockaddr*)&me, &len) == 0) {
+            const uint32_t ip = ntohl(me.sin_addr.s_addr);
+            // RFC 1918 only: the site refuses anything else (a link-local 169.254 is
+            // what a console with no DHCP answer has, and no browser can reach it).
+            if (ip && (ip >> 24) != 127 && (ip >> 16) != ((169u << 8) | 254) && ghweb::IsPrivateV4(ip))
+                out = ghweb::FormatIPv4(ip);
+        }
+    }
+    closesocket(s);
+    return out;
+}
+
+// The name a custom game's crash report is filed under: never what the user typed
+// (that may be anything), only the exe's base name, through the same word scrub
+// the log goes through.
+static std::string LuiCustomReportTitle(const std::wstring& exePath)
+{
+    size_t sl = exePath.find_last_of(L"\\/");
+    std::wstring base = sl == std::wstring::npos ? exePath : exePath.substr(sl + 1);
+    if (base.size() > 4 && 0 == _wcsicmp(base.c_str() + base.size() - 4, L".exe")) base.resize(base.size() - 4);
+    std::string n = ghcrash::ScrubLine("custom:" + LuiNarrow(base));
+    if (n.size() < 8 || n.rfind("custom:", 0) != 0) n = "custom";
+    if (n.size() > 120) n.resize(120);
+    return n;
+}
+
+// The exe's hash, size and architecture: what lets reports about the same file
+// group together on the site without the file or its folder's name going anywhere.
+static ghcrash::Custom LuiCustomReportInfo(const std::wstring& exePath, const std::string& arch)
+{
+    ghcrash::Custom c;
+    c.on = true;
+    c.arch = arch;
+    HANDLE h = CreateFileW(exePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return c;
+    ghweb::Sha256 sh;
+    std::vector<uint8_t> buf(1 << 20);
+    DWORD got = 0;
+    uint64_t total = 0;
+    while (ReadFile(h, buf.data(), (DWORD)buf.size(), &got, nullptr) && got) { sh.Update(buf.data(), got); total += got; }
+    CloseHandle(h);
+    c.exeSize = total;
+    c.exeSha256 = sh.HexFinal();
+    return c;
+}
+
+static void LuiWebAnnouncerStart();
+
+// The one Api, made the first time anything asks. Never destroyed: the server's
+// threads hold it, and the launcher lives as long as they do.
+static ghcustom::Api& LuiWebApi()
+{
+    static ghcustom::Api* api = [] {
+        ghcustom::Hooks h;
+        h.guestRunning = [] { return (bool)g_guestRunning; };
+        h.pairShow = [](const std::string&, const std::string&) {};   // the wall polls PairPending
+        h.libraryChanged = [] { g_webLibDirty = true; };
+        h.requestLaunch = [](const std::string& id, std::string& why) {
+            if (g_guestRunning) { why = "a game is running on the TV"; return false; }
+            if (GetTickCount64() - g_webPickerBeat.load() > 1500) {
+                why = "the TV is not on the Greenhouse game list -- go back to it, then try again";
+                return false;
+            }
+            std::lock_guard<std::mutex> lk(g_webLaunchMu);
+            g_webLaunchId = id;
+            g_webLaunchAt = GetTickCount64();
+            return true;
+        };
+        h.sendReport = [](const std::string& id, std::string& why) {
+            ghcustom::Store st{std::filesystem::path(LuiCustomRoot())};
+            ghcustom::Game g;
+            std::string log;
+            if (!st.Load(id, g) || !st.LastLog(id, log) || log.empty()) { why = "there is no log from a run yet"; return false; }
+            std::wstring exe = GhUtf8ToW(g.exe);
+            for (auto& c : exe) if (c == L'/') c = L'\\';
+            const std::wstring path = LuiCustomRoot() + GhUtf8ToW(id) + L"\\" + exe;
+            // The log was scrubbed when the run ended, and that is the text the
+            // page showed. Scrub is idempotent, so Upload's own pass leaves it be.
+            const ghcrash::Result r = ghcrash::Upload(LuiCustomReportTitle(path), {log},
+                                                      LuiVersionStr(GhOwnPackageVersion()),
+                                                      LuiCustomReportInfo(path, g.arch));
+            Diag(std::string("WEB crash report ") + (r.ok ? "sent" : "failed: " + r.why));
+            why = r.why;
+            return r.ok;
+        };
+        h.pageHtml = [] {
+            static const std::string page = [] {
+                std::string s;
+                ghcustom::ReadText(std::filesystem::path(g_installDir + L"guest\\web\\console.html"), s, 4u << 20);
+                return s;
+            }();
+            return page;
+        };
+        h.version = [] { return LuiVersionStr(GhOwnPackageVersion()); };
+        h.log = [](const std::string& s) { Diag(s); };
+        return new ghcustom::Api(std::filesystem::path(LuiCustomRoot()),
+                                 std::filesystem::path(std::wstring(kLocalState) + L"gh_web_sessions.json"), h);
+    }();
+    return *api;
+}
+
+static bool LuiWebStart(std::string& why)
+{
+    if (g_webServer.Running()) return true;
+    EnsureInstallDir();
+    ghcustom::Api* api = &LuiWebApi();
+    const bool ok = g_webServer.Start(kWebPort, 5, 0, [api](const ghweb::Request& r, ghweb::Body& b) {
+        ghweb::Response resp = api->Handle(r, b);
+        // Changes and refusals only: the page polls status every few seconds.
+        if (resp.status >= 400 || (r.method != "GET" && r.method != "HEAD"))
+            Diag("WEB " + r.method + " " + r.path.substr(0, 48) + " -> " + std::to_string(resp.status));
+        return resp;
+    }, why);
+    Diag(ok ? "WEB listening on port " + std::to_string(g_webServer.Port()) : "WEB could not start: " + why);
+    g_webAnnounceKick = true;
+    LuiWebAnnouncerStart();
+    return ok;
+}
+static void LuiWebStop()
+{
+    g_webServer.Stop();
+    Diag("WEB stopped");
+    g_webAnnounceKick = true;
+}
+
+// Keeps the site's record right: the address when it is on (and again when it
+// changes, checked every minute), "off" once when it goes off. Only ever a
+// private address and a port -- the site refuses anything else anyway.
+static void LuiWebAnnouncerStart()
+{
+    static std::atomic<bool> started{false};
+    if (started.exchange(true)) return;
+    std::thread([] {
+        std::string sent = "?";             // "?" = nothing said yet this run
+        ULONGLONG last = 0, wait = 60000, sentAt = 0;
+        unsigned fails = 0;
+        for (;;) {
+            Sleep(1000);
+            const ULONGLONG now = GetTickCount64();
+            const bool kick = g_webAnnounceKick.exchange(false);
+            if (!kick && now - last < wait) continue;
+            last = now;
+            wait = 60000;
+            // The site's /console only follows an address seen in the last 24 h, so an
+            // unchanged "on" is repeated every 6 h to keep it fresh.
+            if (!sent.empty() && sent != "?" && now - sentAt >= 6ull * 3600 * 1000) sent = "?";
+            std::string want;
+            if (g_webServer.Running()) {
+                const std::string lan = LuiWebLanAddr();
+                if (!lan.empty()) want = lan + ":" + std::to_string(g_webServer.Port());
+            }
+            // Say "off" only if this run said "on", or on the first pass after a
+            // switch-off (kick), so a console that never turned it on stays quiet.
+            if (want == sent) continue;
+            if (want.empty() && sent == "?" && !kick) continue;
+            std::string why;
+            const size_t c = want.find(':');
+            const bool ok = want.empty() ? ghent::Announce("", 0, why)
+                                         : ghent::Announce(want.substr(0, c), (unsigned)atoi(want.c_str() + c + 1), why);
+            Diag(std::string("WEB announce ") + (want.empty() ? "off" : "on") + (ok ? " ok" : " failed: " + why));
+            if (ok) { sent = want; sentAt = now; fails = 0; }
+            // Try again soon, then back off: 10 s, 20 s, 40 s ... capped at 10 minutes,
+            // so a console the site refuses (signed out, revoked) is not a 10 s drip.
+            else wait = (std::min<ULONGLONG>)(10000ull << (std::min<unsigned>)(fails++, 6), 600000);
+        }
+    }).detach();
+}
+
+// A browser asked to pair: the TV shows its code and asks. A counts only once the
+// question has been on screen for half a second, so a press already on its way
+// (the player was choosing a game) cannot answer a question nobody read.
+static bool LuiWebPairModal()
+{
+    if (!g_webServer.Running()) return false;
+    std::string code, label;
+    if (!LuiWebApi().PairPending(code, label)) return false;
+    Diag("WEB pair prompt up");
+    const ULONGLONG t0 = GetTickCount64();
+    WORD prev = 0xFFFF;
+    for (;;) {
+        const WORD p = LuiEntPressed(prev);
+        std::string c2, l2;
+        if (!LuiWebApi().PairPending(c2, l2) || c2 != code) { Diag("WEB pair prompt gone (expired or replaced)"); return true; }
+        if ((p & XINPUT_GAMEPAD_A) && GetTickCount64() - t0 >= 500) { LuiWebApi().PairAnswer(true);  return true; }
+        if (p & XINPUT_GAMEPAD_B) { LuiWebApi().PairAnswer(false); return true; }
+        GhUiModalVM mv;
+        mv.overPage = false;
+        mv.heading.set(L"PAIR A BROWSER");
+        const std::wstring q = L"Let " + ghrepo::Widen(label) + L" manage your own games on this console?";
+        mv.body.setElided(q.c_str());
+        const std::wstring d = L"Code  " + ghrepo::Widen(code);
+        mv.detail.set(d.c_str());
+        mv.note.set(L"Only if your browser shows this same code. It can add, run and delete the games you "
+                    L"added from a PC — nothing else. Forget it any time under From your PC.");
+        mv.addChoice(L"A  Allow");
+        mv.addChoice(L"B  Deny");
+        g_lui.dc->BeginDraw();
+        GhUiPageModal(mv);
+        g_lui.dc->EndDraw();
+        LuiPresent();
+        Sleep(16);
+    }
+}
+
+// ===========================================================================
+// §66. Manage from anywhere: this console's library from a phone, through the site.
+//
+// A setting, off until the user turns it on (PC & phone, RB on the wall, then Y).
+// While it is on, gh_remote.h's poller asks playgreenhouse.app for messages every
+// few seconds to few minutes; nothing ever connects TO the console. A phone is
+// paired in front of the TV (a QR, a code on both screens, A on the TV) and
+// everything between them is end-to-end encrypted: the site relays ciphertext.
+// Each change a phone asks for carries its passkey's signature, which gh_remote.h
+// checks here. What a phone can ask for is the short list in gh_remote.h (install,
+// resume, verify, cancel, take out of the queue, uninstall); never a launch, a
+// path, a setting or a file.
+//
+// The poller runs on its own thread and never touches the UI. It reads two
+// mirrors the UI thread keeps (the wall's rows, the download in progress) and
+// leaves changes in a queue the wall runs when it is idle -- one at a time, never
+// while a game runs.
+// ===========================================================================
+static const wchar_t kRemoteOnFile[]     = L"gh_remote_on.txt";
+static const wchar_t kRemoteQueueFile[]  = L"gh_remote_queue.json";
+static const size_t  kRemoteQueueMax     = 32;
+static const uint64_t kRemoteInstallFree = 2ull << 30;    // an install needs 2 GB free to start
+
+struct LuiRemoteRow {
+    std::string id, name;              // id: Steam app id, or "custom:<12 hex>"
+    uint32_t app = 0, played = 0;
+    bool partial = false, canResume = false, canVerify = false;
+    std::wstring folder;
+};
+struct LuiRemoteLib { bool have = false; uint64_t gen = 0; std::vector<LuiRemoteRow> installed, owned, custom; };
+struct LuiRemoteQ { std::string op, arg, name, by, phone; int64_t seq = 0; };
+struct LuiRemoteDone { std::string id, name, op, msg, by; bool ok = false; int64_t at = 0; };
+
+static std::mutex                 g_remLibMu;
+static LuiRemoteLib               g_remLib;          // under g_remLibMu: the wall's rows at its last rebuild
+static std::vector<LuiRemoteQ>    g_remQueue;        // under g_remLibMu
+static std::vector<LuiRemoteDone> g_remDone;         // under g_remLibMu, newest last, at most 10
+static std::wstring               g_remPlaying;      // under g_remLibMu: the game running, "" = none
+static ghremote::Poller*          g_remote = nullptr; // made once, never destroyed (its thread outlives statics)
+static std::atomic<bool>          g_remoteDirty{false};
+
+static bool LuiRemoteEnabled()
+{
+    return GetFileAttributesW((std::wstring(kLocalState) + kRemoteOnFile).c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+static void LuiRemoteSetEnabled(bool on)
+{
+    const std::wstring p = std::wstring(kLocalState) + kRemoteOnFile;
+    if (!on) { DeleteFileW(p.c_str()); return; }
+    HANDLE h = CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) { DWORD w = 0; WriteFile(h, "1", 1, &w, nullptr); CloseHandle(h); }
+}
+// Like every member feature: only while this console's membership is good.
+static bool LuiRemoteMember()
+{
+    const ghent::St st = ghent::Current().st;
+    return st == ghent::St::Entitled || st == ghent::St::Grace;
+}
+
+// The site the phone opens, and the passkeys' relying party. A dev build may name
+// another (gh_remote_origin.txt, like gh_ent_url.txt) for a test site; a release
+// build always uses playgreenhouse.app.
+static std::string LuiRemoteOrigin()
+{
+#ifdef GH_ENT_DEV
+    std::string s = ghent::ReadLine(std::wstring(kLocalState) + L"gh_remote_origin.txt");
+    while (!s.empty() && s.back() == '/') s.pop_back();
+    const size_t p = s.rfind("https://", 0) == 0 ? 8 : s.rfind("http://", 0) == 0 ? 7 : 0;
+    bool ok = p && s.size() > p && s.size() < 200;
+    for (size_t i = p; ok && i < s.size(); ++i) {
+        const char c = s[i];
+        ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == ':';
+    }
+    if (ok) return s;
+#endif
+    return "https://playgreenhouse.app";
+}
+static std::string LuiRemoteRpId(const std::string& origin)
+{
+    std::string h = origin.substr(origin.find("://") + 3);
+    const size_t c = h.find(':');
+    return c == std::string::npos ? h : h.substr(0, c);
+}
+
+static uint64_t LuiRemoteFree()
+{
+    ULARGE_INTEGER fr{};
+    return GetDiskFreeSpaceExW(kDevRoot, &fr, nullptr, nullptr) ? fr.QuadPart : 0;
+}
+
+// Bytes under a folder. Poller thread only; reparse points are not followed.
+static uint64_t LuiTreeBytes(const std::wstring& dir, int depth = 0)
+{
+    if (depth > 24) return 0;
+    std::wstring root = dir;
+    if (root.empty()) return 0;
+    if (root.back() != L'\\') root += L'\\';
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileExW((root + L"*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr,
+                                FIND_FIRST_EX_LARGE_FETCH);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    uint64_t n = 0;
+    do {
+        const std::wstring f = fd.cFileName;
+        if (f == L"." || f == L"..") continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) n += LuiTreeBytes(root + f, depth + 1);
+        else n += ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return n;
+}
+
+// ---- the queue, kept across restarts --------------------------------------------
+static void LuiRemoteSaveQueueLocked()
+{
+    std::string j = "[";
+    for (size_t i = 0; i < g_remQueue.size(); ++i) {
+        const LuiRemoteQ& q = g_remQueue[i];
+        if (i) j += ',';
+        j += "{\"op\":\"" + q.op + "\",\"arg\":\"" + ghrepo::JsonEsc(q.arg) + "\",\"name\":\"" + ghrepo::JsonEsc(q.name) +
+             "\",\"by\":\"" + ghrepo::JsonEsc(q.by) + "\",\"phone\":\"" + q.phone + "\",\"seq\":" + std::to_string(q.seq) + "}";
+    }
+    j += "]";
+    const std::wstring p = std::wstring(kLocalState) + kRemoteQueueFile;
+    if (g_remQueue.empty()) DeleteFileW(p.c_str());
+    else if (!ghrepo::WriteFileAtomic(p, j)) Diag("REMOTE cannot write the queue");
+}
+static void LuiRemoteLoadQueue()
+{
+    std::string s;
+    if (!ghcustom::ReadText(std::filesystem::path(std::wstring(kLocalState) + kRemoteQueueFile), s, 256 * 1024)) return;
+    ghjson::Value v; std::string err;
+    if (!ghjson::Parse(s, v, err) || !v.isArr()) return;
+    std::lock_guard<std::mutex> lk(g_remLibMu);
+    g_remQueue.clear();
+    for (const ghjson::Value& x : v.arr) {
+        auto str = [&](const char* k) { const ghjson::Value* f = x.get(k); return f && f->isStr() ? f->s : std::string(); };
+        LuiRemoteQ q; q.op = str("op"); q.arg = str("arg"); q.name = str("name"); q.by = str("by"); q.phone = str("phone");
+        if (const ghjson::Value* f = x.get("seq"); f && f->isInt) q.seq = f->i;
+        const ghremote::OpInfo* oi = ghremote::FindOp(q.op);
+        if (!oi || (oi->op != ghremote::Op::Install && oi->op != ghremote::Op::Resume &&
+                    oi->op != ghremote::Op::Verify && oi->op != ghremote::Op::Uninstall)) continue;
+        if (!ghremote::ValidArg(oi->op, q.arg) || !ghrepo::IsHex(q.phone, 32)) continue;
+        if (q.name.size() > 200) q.name.resize(200);
+        if (q.by.size() > 40) q.by.resize(40);
+        if (g_remQueue.size() < kRemoteQueueMax) g_remQueue.push_back(q);
+    }
+    if (!g_remQueue.empty()) Diag("REMOTE " + std::to_string(g_remQueue.size()) + " queued change(s) from the last run");
+}
+
+static void LuiRemoteFinish(const LuiRemoteQ& q, bool ok, const std::string& msg)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_remLibMu);
+        g_remDone.push_back({q.arg, q.name, q.op, msg, q.by, ok, (int64_t)::time(nullptr)});
+        if (g_remDone.size() > 10) g_remDone.erase(g_remDone.begin());
+    }
+    Diag("REMOTE " + q.op + " " + q.arg + (ok ? " ok: " : " failed: ") + msg);
+    if (g_remote) g_remote->Kick();
+}
+
+// UI thread, from the wall's rebuild: what a phone may see and ask about. Only
+// Greenhouse-managed installs (never a USB root or a configured path), the owned
+// list, and the user's own games.
+static void LuiRemoteMirror(const std::vector<LauncherItem>& all)
+{
+    LuiRemoteLib lib; lib.have = true;
+    const std::wstring croot = LuiCustomRoot();
+    for (const LauncherItem& it : all) {
+        if (it.kind == LauncherItem::kPlaceholder) continue;
+        LuiRemoteRow r;
+        r.name = ghrepo::Narrow(it.display);
+        if (r.name.size() > 200) r.name.resize(200);
+        if (0 == strcmp(it.source, "custom")) {
+            if (it.guest.size() <= croot.size() || !StartsWithNoCase(it.guest, croot)) continue;
+            const std::wstring rest = it.guest.substr(croot.size());
+            const size_t sl = rest.find(L'\\');
+            if (sl == std::wstring::npos) continue;
+            r.id = "custom:" + ghrepo::Narrow(rest.substr(0, sl));
+            if (!ghremote::ValidArg(ghremote::Op::Uninstall, r.id)) continue;
+            r.folder = croot + rest.substr(0, sl);
+            lib.custom.push_back(r);
+            continue;
+        }
+        if (!it.app) continue;
+        r.app = it.app; r.id = std::to_string(it.app); r.played = it.lastPlayed;
+        if (it.kind == LauncherItem::kAcquire) {
+            if (it.acq && it.acq->acquire) lib.owned.push_back(r);
+            continue;
+        }
+        if (!LuiCanUninstall(it)) continue;
+        r.partial = it.incomplete;
+        r.folder = LuiInstallFolder(it);
+        r.canResume = it.acq && it.acq->acquire;
+        r.canVerify = r.canResume && !r.partial && it.acq->canVerify && it.acq->canVerify(it);
+        lib.installed.push_back(r);
+    }
+    std::lock_guard<std::mutex> lk(g_remLibMu);
+    lib.gen = g_remLib.gen + 1;
+    g_remLib = std::move(lib);
+}
+
+// From guest_loader.cpp: a game started ("" = it ended).
+static void LuiRemoteSetPlaying(const std::wstring& name)
+{
+    { std::lock_guard<std::mutex> lk(g_remLibMu); g_remPlaying = name; }
+    if (g_remote) g_remote->Kick();
+}
+
+// ---- the poller's side (its own thread) -------------------------------------------
+static std::string LuiRemoteSnapshot()
+{
+    if (!LuiRemoteMember()) return "";
+    LuiRemoteLib lib; std::vector<LuiRemoteQ> q; std::vector<LuiRemoteDone> done; std::wstring playing;
+    {
+        std::lock_guard<std::mutex> lk(g_remLibMu);
+        lib = g_remLib; q = g_remQueue; done = g_remDone; playing = g_remPlaying;
+    }
+    if (!lib.have) return "";                       // the wall has not listed anything yet
+    LuiRemoteDl dl; { std::lock_guard<std::mutex> lk(g_remDlMu); dl = g_remDl; }
+
+    // Folder sizes: walked once per wall rebuild, here, never on the UI thread.
+    static std::map<std::wstring, uint64_t> sizes;
+    static uint64_t sizesGen = 0;
+    if (sizesGen != lib.gen) { sizes.clear(); sizesGen = lib.gen; }
+    auto size = [&](const LuiRemoteRow& r) -> uint64_t {
+        auto f = sizes.find(r.folder);
+        if (f != sizes.end()) return f->second;
+        return sizes[r.folder] = LuiTreeBytes(r.folder);
+    };
+    auto E = [](const std::string& s) { return ghrepo::JsonEsc(s); };
+    // Free space moves a little all the time; rounding it keeps an idle console's
+    // snapshot from changing (and going up) for no reason.
+    const uint64_t freeB = LuiRemoteFree() & ~((256ull << 20) - 1);
+
+    std::string j = "{\"v\":1,\"free\":" + std::to_string(freeB) +
+                    ",\"steam\":" + (g_remSignedIn.load() ? "true" : "false") +
+                    ",\"playing\":" + (playing.empty() ? std::string("null") : "\"" + E(ghrepo::Narrow(playing)) + "\"");
+    if (dl.active) {
+        char rate[32]; snprintf(rate, sizeof rate, "%.0f", dl.rate < 0 ? 0.0 : dl.rate);
+        j += ",\"dl\":{\"id\":\"" + std::to_string(dl.app) + "\",\"name\":\"" + E(dl.name) + "\",\"op\":\"" + dl.op +
+             "\",\"phase\":\"" + E(dl.phase) + "\",\"pct\":" + std::to_string(dl.pct) + ",\"done\":" + std::to_string(dl.done) +
+             (dl.total ? ",\"total\":" + std::to_string(dl.total) : std::string()) + ",\"rate\":" + rate +
+             (dl.eta >= 0 ? ",\"eta\":" + std::to_string(dl.eta) : std::string()) +
+             ",\"cancel\":" + (dl.cancellable ? "true" : "false") +
+             (dl.by.empty() ? std::string() : ",\"by\":\"" + E(dl.by) + "\"") + "}";
+    } else j += ",\"dl\":null";
+    j += ",\"queue\":[";
+    for (size_t i = 0; i < q.size(); ++i)
+        j += std::string(i ? "," : "") + "{\"id\":\"" + E(q[i].arg) + "\",\"name\":\"" + E(q[i].name) + "\",\"op\":\"" + q[i].op +
+             "\",\"by\":\"" + E(q[i].by) + "\"}";
+    j += "],\"done\":[";
+    for (size_t i = 0; i < done.size(); ++i)
+        j += std::string(i ? "," : "") + "{\"id\":\"" + E(done[i].id) + "\",\"name\":\"" + E(done[i].name) + "\",\"op\":\"" +
+             done[i].op + "\",\"ok\":" + (done[i].ok ? "true" : "false") + ",\"msg\":\"" + E(done[i].msg) +
+             "\",\"by\":\"" + E(done[i].by) + "\",\"at\":" + std::to_string(done[i].at) + "}";
+    j += "],\"installed\":[";
+    bool first = true;
+    for (const LuiRemoteRow& r : lib.installed) {
+        j += std::string(first ? "" : ",") + "{\"id\":\"" + r.id + "\",\"name\":\"" + E(r.name) + "\",\"size\":" +
+             std::to_string(size(r)) + ",\"state\":\"" + (r.partial ? "partial" : "ok") + "\"" +
+             (r.played ? ",\"played\":" + std::to_string(r.played) : std::string()) +
+             (r.canVerify ? ",\"verify\":true" : "") + "}";
+        first = false;
+    }
+    j += "],\"custom\":[";
+    first = true;
+    for (const LuiRemoteRow& r : lib.custom) {
+        j += std::string(first ? "" : ",") + "{\"id\":\"" + r.id + "\",\"name\":\"" + E(r.name) + "\",\"size\":" +
+             std::to_string(size(r)) + "}";
+        first = false;
+    }
+    // The owned list last: on a very large library it is what gets cut to keep the
+    // sealed snapshot under the site's limit, and the page says so.
+    j += "],\"owned\":[";
+    const size_t cap = ghremote::kMaxSnapPt - 4096;   // room for results, the label and the time
+    size_t left = 0;
+    first = true;
+    for (const LuiRemoteRow& r : lib.owned) {
+        const std::string e = "{\"id\":\"" + r.id + "\",\"name\":\"" + E(r.name) + "\"" +
+                              (r.played ? ",\"played\":" + std::to_string(r.played) : std::string()) + "}";
+        if (left || j.size() + e.size() + 64 > cap) { ++left; continue; }
+        j += (first ? "" : ",") + e;
+        first = false;
+    }
+    j += "]";
+    if (left) j += ",\"owned_more\":" + std::to_string(left);
+    j += "}";
+    return j;
+}
+
+// A phone's change, checked against what the wall last listed. True = it may be
+// queued; the wall checks again before it runs it.
+static bool LuiRemoteCheck(ghremote::Op op, const std::string& arg, std::string& name, std::string& why)
+{
+    std::lock_guard<std::mutex> lk(g_remLibMu);
+    if (!g_remLib.have) { why = "the console has not listed its games yet"; return false; }
+    auto findIn = [&](const std::vector<LuiRemoteRow>& v) -> const LuiRemoteRow* {
+        for (const LuiRemoteRow& r : v) if (r.id == arg) return &r;
+        return nullptr;
+    };
+    const LuiRemoteRow* inst = findIn(g_remLib.installed);
+    {
+        std::lock_guard<std::mutex> dk(g_remDlMu);
+        if (g_remDl.active && std::to_string(g_remDl.app) == arg) { why = "it is downloading right now"; return false; }
+    }
+    for (const LuiRemoteQ& q : g_remQueue) if (q.arg == arg) { why = "it is already queued"; return false; }
+    if (g_remQueue.size() >= kRemoteQueueMax) { why = "the queue is full"; return false; }
+    switch (op) {
+    case ghremote::Op::Install: {
+        const LuiRemoteRow* own = findIn(g_remLib.owned);
+        if (!own) { why = "that game is not in this console's Steam library"; return false; }
+        if (inst) { why = "it is already installed"; return false; }
+        if (!g_remSignedIn) { why = "Steam is not signed in on the console"; return false; }
+        if (LuiRemoteFree() < kRemoteInstallFree) { why = "the console has less than 2 GB free"; return false; }
+        name = own->name; return true;
+    }
+    case ghremote::Op::Resume:
+        if (!inst) { why = "it is not installed"; return false; }
+        if (!inst->partial) { why = "it is already complete"; return false; }
+        if (!inst->canResume) { why = "nothing on the console can download it"; return false; }
+        if (!g_remSignedIn) { why = "Steam is not signed in on the console"; return false; }
+        name = inst->name; return true;
+    case ghremote::Op::Verify:
+        if (!inst) { why = "it is not installed"; return false; }
+        if (!inst->canVerify) { why = "it cannot be verified"; return false; }
+        if (!g_remSignedIn) { why = "Steam is not signed in on the console"; return false; }
+        name = inst->name; return true;
+    case ghremote::Op::Uninstall: {
+        const LuiRemoteRow* r = arg.rfind("custom:", 0) == 0 ? findIn(g_remLib.custom) : inst;
+        if (!r) { why = "it is not installed"; return false; }
+        if (!g_remPlaying.empty() && GhUtf8ToW(r->name) == g_remPlaying) { why = "it is running on the TV"; return false; }
+        name = r->name; return true;
+    }
+    default: why = "not something a phone can ask for"; return false;
+    }
+}
+
+static void LuiRemoteCommand(const ghremote::Cmd& c)
+{
+    if (!g_remote) return;
+    const ghremote::OpInfo* oi = nullptr;
+    for (const ghremote::OpInfo& o : ghremote::kOps) if (o.op == c.op) oi = &o;
+    const std::string opn = oi ? oi->name : "?";
+    auto answer = [&](bool ok, const std::string& msg) {
+        g_remote->s.AddResult(c.phone, c.seq, ok, msg);
+        Diag("REMOTE " + opn + (c.arg.empty() ? "" : " " + c.arg) + (ok ? " -> " : " refused: ") + msg);
+    };
+    if (!LuiRemoteMember()) return answer(false, "this console's membership is not active");
+    if (c.op == ghremote::Op::Refresh) return answer(true, "");
+    if (c.op == ghremote::Op::Cancel || c.op == ghremote::Op::Dequeue) {
+        {
+            std::lock_guard<std::mutex> lk(g_remLibMu);
+            for (size_t i = 0; i < g_remQueue.size(); ++i)
+                if (g_remQueue[i].arg == c.arg) {
+                    g_remQueue.erase(g_remQueue.begin() + i);
+                    LuiRemoteSaveQueueLocked();
+                    return answer(true, "taken out of the queue");
+                }
+        }
+        if (c.op == ghremote::Op::Dequeue) return answer(false, "it is not queued");
+        std::lock_guard<std::mutex> dk(g_remDlMu);
+        if (!g_remDl.active || std::to_string(g_remDl.app) != c.arg) return answer(false, "it is not downloading");
+        if (!g_remDl.cancellable) return answer(false, "this Steam add-on cannot stop a download: update it on the Packages page");
+        g_remCancelApp = g_remDl.app;
+        return answer(true, "cancelling; it can be resumed later");
+    }
+    std::string name, why;
+    if (!LuiRemoteCheck(c.op, c.arg, name, why)) return answer(false, why);
+    bool waits;
+    {
+        std::lock_guard<std::mutex> lk(g_remLibMu);
+        g_remQueue.push_back({opn, c.arg, name, c.label, c.phone, c.seq});
+        LuiRemoteSaveQueueLocked();
+        waits = !g_remPlaying.empty();
+    }
+    answer(true, waits ? "queued: it starts when the game on the TV is closed" : "queued");
+}
+
+static ghremote::Poller& LuiRemoteP()
+{
+    if (g_remote) return *g_remote;
+    auto* p = new ghremote::Poller();
+    p->s.dir = std::wstring(kLocalState) + L"gh_remote\\";
+    p->s.dev = ghent::DeviceId();
+    p->s.origin = LuiRemoteOrigin();
+    p->s.rpId = LuiRemoteRpId(p->s.origin);
+    p->s.log = [](const std::string& s) { Diag(s); };
+    p->host.snapshot = LuiRemoteSnapshot;
+    p->host.command = LuiRemoteCommand;
+    p->host.playing = [] { return (bool)g_guestRunning; };
+    p->host.downloading = [] { std::lock_guard<std::mutex> lk(g_remDlMu); return g_remDl.active; };
+    p->host.changed = [] { g_remoteDirty = true; };
+    // A poll's answer can carry up to 32 commands of 12 KB each: a 1 MB cap.
+    p->host.post = [](const std::string& path, const std::string& body, const std::string& bearer,
+                      std::string& resp, unsigned& st, std::string& why) {
+        DWORD s = 0;
+        const bool ok = ghent::Post(path, body, bearer, resp, s, why, 1u << 20);
+        st = s;
+        return ok;
+    };
+    p->host.token = [] { return ghent::Token(); };
+    g_remote = p;
+    return *p;
+}
+
+static bool LuiRemoteTurnOn(std::string& why)
+{
+    if (!LuiRemoteMember()) { why = "it needs an active Greenhouse membership"; return false; }
+    if (ghent::Server().empty()) { why = "this build has no site to reach"; return false; }
+    ghremote::Poller& p = LuiRemoteP();
+    if (p.s.dev.empty()) { why = "this console has no device id"; return false; }
+    if (!p.s.Load(true)) { why = "could not make this console's key"; return false; }
+    LuiRemoteLoadQueue();
+    p.Start();
+    LuiRemoteSetEnabled(true);
+    Diag("REMOTE on (" + std::to_string(p.s.PhoneList().size()) + " phone(s) paired)");
+    return true;
+}
+// Off: the phones and the key are forgotten here, the queue is dropped, and one
+// last poll tells the site to purge this console's mailbox.
+static void LuiRemoteTurnOff()
+{
+    LuiRemoteSetEnabled(false);
+    if (!g_remote) return;
+    g_remote->s.CancelPairing();
+    g_remote->SwitchOff();
+    g_remote->s.Wipe();
+    {
+        std::lock_guard<std::mutex> lk(g_remLibMu);
+        g_remQueue.clear(); g_remDone.clear();
+        LuiRemoteSaveQueueLocked();
+    }
+    Diag("REMOTE off");
+}
+// Once per process, from the wall.
+static void LuiRemoteStartup()
+{
+    static bool once = false;
+    if (once) return;
+    once = true;
+    if (!LuiRemoteEnabled()) return;
+    std::string why;
+    if (!LuiRemoteTurnOn(why)) {
+        Diag("REMOTE switch is on but not started: " + why);
+        // The switch stays on: the membership may come back (or the site be reachable) next run.
+        LuiRemoteSetEnabled(true);
+    }
+}
+
+// A phone asked to pair: the TV shows its name and code and asks. As with §65, A
+// counts only once the question has been up for half a second.
+static bool LuiRemotePairModal()
+{
+    if (!g_remote) return false;
+    ghremote::PairPrompt pp;
+    if (!g_remote->s.Prompt(pp)) return false;
+    Diag("REMOTE pair prompt up");
+    const ULONGLONG t0 = GetTickCount64();
+    WORD prev = 0xFFFF;
+    for (;;) {
+        const WORD p = LuiEntPressed(prev);
+        ghremote::PairPrompt now;
+        if (!g_remote->s.Prompt(now) || now.phone != pp.phone) { Diag("REMOTE pair prompt gone"); return true; }
+        const bool a = (p & XINPUT_GAMEPAD_A) && GetTickCount64() - t0 >= 500;
+        if (a || (p & XINPUT_GAMEPAD_B)) {
+            g_remote->s.ResolvePair(a, (int64_t)::time(nullptr));
+            g_remote->Kick();
+            return true;
+        }
+        GhUiModalVM mv;
+        mv.overPage = false;
+        mv.heading.set(L"PAIR A PHONE");
+        // The body is one line and the note two at most (R5: the longer wording was
+        // cut at "from a…" and "It cannot start"). Forgetting a phone is on the
+        // page this modal sits over, so it does not need saying here.
+        const std::wstring q = L"Pair “" + GhUtf8ToW(pp.label) + L"”?";
+        mv.body.setElided(q.c_str());
+        const std::wstring d = L"Code  " + ghrepo::Widen(pp.sas.substr(0, 3)) + L" " + ghrepo::Widen(pp.sas.substr(3));
+        mv.detail.set(d.c_str());
+        mv.note.set(L"Allow only if your phone shows this code. It can install, cancel and uninstall games, "
+                    L"each with Face ID or a fingerprint. It can't start games.");
+        mv.addChoice(L"A  Allow");
+        mv.addChoice(L"B  Deny");
+        g_lui.dc->BeginDraw();
+        GhUiPageModal(mv);
+        g_lui.dc->EndDraw();
+        LuiPresent();
+        Sleep(16);
+    }
+}
+
+// PC & phone -> Y: the switch, pairing (the QR), and the paired phones.
+static void LauncherRemote()
+{
+    if (!LuiInit()) return;
+    WORD prev = 0xFFFF;
+    std::string err, link;
+    std::vector<uint8_t> qr;
+    int qn = 0;
+    Diag("LAUNCHER manage-from-anywhere page");
+    for (;;) {
+        if (LuiRemotePairModal()) { prev = 0xFFFF; link.clear(); qr.clear(); continue; }
+        const WORD p = LuiEntPressed(prev);
+        const int64_t now = (int64_t)::time(nullptr);
+        const bool on = g_remote && g_remote->on.load() && LuiRemoteEnabled();
+        if (!link.empty() && !(on && g_remote->s.PairingOpen(now))) { link.clear(); qr.clear(); }
+        const bool pairing = !link.empty();
+        const auto phones = on ? g_remote->s.PhoneList() : std::vector<std::pair<std::string, std::string>>{};
+        if (p & XINPUT_GAMEPAD_B) {
+            if (pairing) { g_remote->s.CancelPairing(); link.clear(); qr.clear(); continue; }
+            return;
+        }
+        if (!on) {
+            if (p & XINPUT_GAMEPAD_A) { err.clear(); LuiRemoteTurnOn(err); prev = 0xFFFF; continue; }
+        } else if (!pairing) {
+            if (p & XINPUT_GAMEPAD_A) {
+                err.clear();
+                if (phones.size() >= (size_t)ghremote::kMaxPhones) err = "Five phones are paired already. Forget them first (X).";
+                else {
+                    link = g_remote->s.StartPairing(LuiRemoteOrigin(), now);
+                    if (link.empty()) err = "Could not start pairing.";
+                    else { qr.clear(); qn = 0; LuiQrMatrix(link, qr, qn); g_remote->Kick(); }
+                }
+                prev = 0xFFFF;
+                continue;
+            }
+            if ((p & XINPUT_GAMEPAD_X) && !phones.empty()) {
+                for (const auto& ph : phones) g_remote->s.Forget(ph.first, true);
+                g_remote->Kick();
+                continue;
+            }
+            if (p & XINPUT_GAMEPAD_Y) { LuiRemoteTurnOff(); err.clear(); prev = 0xFFFF; continue; }
+        }
+
+        GhUiQrVM vm;
+        vm.chrome.title.set(L"GREENHOUSE");
+        vm.heading.set(L"Manage from anywhere");
+        std::wstring cap, sub, foot;
+        if (pairing) {
+            vm.modules = qr.empty() ? nullptr : qr.data();
+            vm.size = qn;
+            int64_t left = 0;
+            { std::lock_guard<std::mutex> lk(g_remote->s.mu); left = g_remote->s.tokenExp - now; }
+            if (left < 0) left = 0;
+            wchar_t t[16]; swprintf(t, 16, L"%d:%02d", (int)(left / 60), (int)(left % 60));
+            cap = L"Scan with your phone's camera  ·  this code works for " + std::wstring(t);
+            sub = L"Sign in with Patreon on the phone if it asks. Then check that the phone shows the same "
+                  L"code as the TV before you press A.";
+            foot = L"B  Stop pairing";
+        } else if (on) {
+            std::wstring names;
+            for (const auto& ph : phones) names += (names.empty() ? L"" : L", ") + GhUtf8ToW(ph.second);
+            cap = phones.empty() ? std::wstring(L"On  ·  no phones paired yet")
+                                 : L"On  ·  " + std::to_wstring(phones.size()) +
+                                       (phones.size() == 1 ? L" phone: " : L" phones: ") + names;
+            const int64_t ok = g_remote->lastOk.load();
+            const std::wstring link2 = g_remote->fails.load() >= 2 ? L"Can't reach the site right now; it keeps trying."
+                                     : ok && now - ok < 15 * 60 ? L"Connected."
+                                     : L"Connecting…";
+            sub = err.empty() ? link2 + L"  Phones can install, cancel and uninstall games; each change needs the "
+                                        L"phone's passkey. Greenhouse must be open on the TV."
+                              : ghrepo::Widen(err);
+            foot = std::wstring(phones.size() < (size_t)ghremote::kMaxPhones ? L"A  Pair a phone    " : L"") +
+                   (phones.empty() ? L"" : L"X  Forget phones    ") + L"Y  Turn off    B  Back";
+        } else if (!LuiRemoteMember()) {
+            cap = L"Needs an active Greenhouse membership.";
+            sub = L"Manage this console's games from your phone, wherever you are.";
+            foot = L"B  Back";
+        } else {
+            cap = err.empty() ? std::wstring(L"Off. Turn it on to install, cancel and uninstall games from your phone, "
+                                             L"wherever you are.")
+                              : L"Could not turn on: " + ghrepo::Widen(err);
+            sub = L"Encrypted end to end through playgreenhouse.app; every change needs your phone's passkey. "
+                  L"Greenhouse must be open on the TV.";
+            foot = L"A  Turn on    B  Back";
+        }
+        vm.caption.setElided(cap.c_str());
+        vm.sub.setElided(sub.c_str());
+        vm.chrome.footer.set(foot.c_str());
+        g_lui.dc->BeginDraw();
+        GhUiPageQr(vm);
+        g_lui.dc->EndDraw();
+        LuiPresent();
+        Sleep(30);
+    }
+}
+
+// From your PC (RB on the wall): the switch, the address and its QR, and the
+// paired browsers.
+static void LauncherFromPc()
+{
+    if (!LuiInit()) return;
+    WORD prev = 0xFFFF;
+    std::string lan = LuiWebLanAddr(), err;
+    ULONGLONG lanAt = GetTickCount64();
+    std::vector<uint8_t> qr;
+    int qn = 0;
+    std::string qrFor;
+    Diag("LAUNCHER from-your-pc page");
+    for (;;) {
+        // This page is where someone stands when they scan its QR, so the pairing
+        // question has to be able to appear here too, not only on the wall.
+        if (LuiWebPairModal()) { prev = 0xFFFF; continue; }
+        if (LuiRemotePairModal()) { prev = 0xFFFF; continue; }                     // §66
+        const WORD p = LuiEntPressed(prev);
+        if (p & XINPUT_GAMEPAD_B) return;
+        const bool on = g_webServer.Running();
+        if (p & XINPUT_GAMEPAD_A) {
+            err.clear();
+            if (on) { LuiWebStop(); LuiWebSetEnabled(false); }
+            else if (LuiWebStart(err)) LuiWebSetEnabled(true);
+            prev = 0xFFFF;
+            continue;
+        }
+        if ((p & XINPUT_GAMEPAD_X) && !LuiWebApi().BrowserLabels().empty()) LuiWebApi().ForgetBrowsers();
+        if (p & XINPUT_GAMEPAD_Y) { LauncherRemote(); prev = 0xFFFF; continue; }     // §66
+        if (GetTickCount64() - lanAt > 5000) { lan = LuiWebLanAddr(); lanAt = GetTickCount64(); }
+        const std::string url = (on && !lan.empty()) ? "http://" + lan + ":" + std::to_string(g_webServer.Port()) + "/" : "";
+        if (url != qrFor) { qrFor = url; qr.clear(); qn = 0; if (!url.empty()) LuiQrMatrix(url, qr, qn); }
+
+        const size_t nb = LuiWebApi().BrowserLabels().size();
+        std::wstring site = ghrepo::Widen(ghent::Server());
+        if (site.rfind(L"https://", 0) == 0) site = site.substr(8);
+        GhUiQrVM vm;
+        vm.chrome.title.set(L"GREENHOUSE");
+        vm.heading.set(L"Manage from a browser");
+        std::wstring cap, sub, foot;
+        if (on && !url.empty()) {
+            vm.modules = qr.empty() ? nullptr : qr.data();
+            vm.size = qn;
+            cap = L"On  ·  " + ghrepo::Widen(url);
+            sub = (site.empty() ? std::wstring() : L"Or open " + site + L"/console  ·  ") +
+                  (nb == 0 ? std::wstring(L"no browsers paired yet")
+                           : std::to_wstring(nb) + (nb == 1 ? L" browser paired" : L" browsers paired"));
+            foot = nb ? L"A  Turn off    X  Forget browsers    Y  Manage from anywhere    B  Back"
+                      : L"A  Turn off    Y  Manage from anywhere    B  Back";
+        } else if (on) {
+            cap = L"On, but this console has no home-network address right now.";
+            sub = L"Check the network connection.";
+            foot = L"A  Turn off    Y  Manage from anywhere    B  Back";
+        } else {
+            cap = err.empty() ? std::wstring(L"Off. Turn it on to add your own games from a PC on the same network.")
+                              : L"Could not turn on: " + ghrepo::Widen(err);
+            sub = L"Greenhouse has not tested games you add, and they run without Steam. "
+                  L"The page works only while Greenhouse is open on the TV.";
+            foot = L"A  Turn on    Y  Manage from anywhere    B  Back";
+        }
+        vm.caption.setElided(cap.c_str());
+        vm.sub.setElided(sub.c_str());
+        vm.chrome.footer.set(foot.c_str());
+        g_lui.dc->BeginDraw();
+        GhUiPageQr(vm);
+        g_lui.dc->EndDraw();
+        LuiPresent();
+        Sleep(30);
+    }
+}
+
+// §65, the run itself. Called with the picked path before anything asks for a
+// title config (guest_loader.cpp's launch loop).
+static void GhCustomBegin(const std::wstring& picked)
+{
+    const std::wstring root = LuiCustomRoot();
+    if (picked.size() <= root.size() || _wcsnicmp(picked.c_str(), root.c_str(), root.size())) return;
+    const std::wstring rest = picked.substr(root.size());
+    const size_t sl = rest.find(L'\\');
+    const std::string id = sl == std::wstring::npos ? std::string() : LuiNarrow(rest.substr(0, sl));
+    // Anything under gh_custom\ runs as a custom game, manifest or not: the
+    // Steam rules are what matter, and they key on the folder.
+    g_customRun = true;
+    g_customId = ghcustom::ValidId(id) ? id : std::string();
+    g_customArgs.clear();
+    ghcustom::Game g;
+    ghcustom::Store st{std::filesystem::path(root)};
+    if (!g_customId.empty() && st.Load(g_customId, g) && !g.args.empty()) g_customArgs = L" " + GhUtf8ToW(g.args);
+    g_launcherSelectedApp = 0;
+    g_launcherSelectedName.clear();             // what the user typed is never sent anywhere
+    Diag("CUSTOM run id=" + (g_customId.empty() ? std::string("?") : g_customId) + " arch=" +
+         (g.arch.empty() ? std::string("?") : g.arch) + " options=" + std::to_string(g_customArgs.size()) + " chars");
+}
+
+// After the run: its result and scrubbed log, for the browser page's card.
+static void GhCustomEnd()
+{
+    if (!g_customRun || g_customId.empty()) return;
+    const bool crashed = !g_guestUserQuit &&
+        (g_guestCrashed || g_guestExitCode == -999 || !g_guestFailWhy.empty());
+    const int64_t code = g_guestUserQuit ? 0 : (int64_t)g_guestExitCode;
+    ghcustom::Store st{std::filesystem::path(LuiCustomRoot())};
+    const bool ok = st.RecordRun(g_customId, code, crashed, ghcrash::Scrub(DiagRingCopy()));
+    Diag("CUSTOM run recorded id=" + g_customId + (crashed ? " crashed" : "") + (ok ? "" : " (manifest write failed)"));
+    g_webLibDirty = true;
+}
+
 struct LuiCmdJob {
     std::string      text;            // the whole command file
     std::string      out;             // result lines, written back to gh_cmd_out.txt
@@ -6899,6 +8100,7 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
         }
         sel = 0; prev = 0xFFFF;
         applyFilter();
+        LuiRemoteMirror(all);           // §66: what a phone sees
     };
     // A short full-screen message, then back to the picker (about 2 s).
     auto notice = [&](const std::wstring& msg) {
@@ -7007,6 +8209,76 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
         }
     };
 
+    // §66: one queued change from a phone, run here on the thread that owns `all`
+    // when the wall is idle. Checked again against the rows as they are now.
+    auto runRemote = [&]() -> bool {
+        if (!g_remote || uninstallAsk || verifyAsk) return false;
+        LuiRemoteQ q;
+        {
+            std::lock_guard<std::mutex> lk(g_remLibMu);
+            if (g_remQueue.empty()) return false;
+            q = g_remQueue.front();
+            g_remQueue.erase(g_remQueue.begin());
+            LuiRemoteSaveQueueLocked();
+        }
+        PickerOskHide();
+        titleOpen = false;
+        const std::wstring by = GhUtf8ToW(q.by), name = GhUtf8ToW(q.name);
+        Diag("REMOTE running " + q.op + " " + q.arg);
+        if (q.op == "uninstall") {
+            bool ok = false;
+            std::string why = "it is no longer installed";
+            if (q.arg.rfind("custom:", 0) == 0) {
+                ghcustom::Store st{std::filesystem::path(LuiCustomRoot())};
+                ghcustom::Game g;
+                if (st.Load(q.arg.substr(7), g)) { ok = st.Delete(q.arg.substr(7)); if (!ok) why = "could not delete it"; }
+            } else {
+                const uint32_t app = (uint32_t)strtoul(q.arg.c_str(), nullptr, 10);
+                for (const auto& it : all) {
+                    if (it.app != app || it.kind != LauncherItem::kLaunch || !LuiCanUninstall(it)) continue;
+                    ok = LuiDeleteTree(LuiInstallFolder(it));
+                    if (!ok) why = "some files could not be deleted";
+                    break;
+                }
+            }
+            rebuild();
+            LuiRemoteFinish(q, ok, ok ? "uninstalled" : why);
+            notice(ok ? by + L" uninstalled " + name : L"Could not uninstall " + name + L" for " + by);
+            return true;
+        }
+        const uint32_t app = (uint32_t)strtoul(q.arg.c_str(), nullptr, 10);
+        const bool install = q.op == "install";
+        const LauncherItem* found = nullptr;
+        bool installed = false;
+        for (const auto& it : all) {
+            if (it.app != app || it.kind == LauncherItem::kPlaceholder) continue;
+            if (it.kind == LauncherItem::kAcquire) { if (install && !found) found = &it; }
+            else if (LuiCanUninstall(it)) { installed = true; if (!install && !found) found = &it; }
+        }
+        std::string why;
+        if (install && installed) why = "it is already installed";
+        else if (!found || !found->acq || !found->acq->acquire) why = install ? "it is no longer in the library" : "it is no longer installed";
+        else if (install && LuiRemoteFree() < kRemoteInstallFree) why = "the console has less than 2 GB free";
+        if (!why.empty()) { LuiRemoteFinish(q, false, why); return true; }
+        LauncherItem copy = *found;                 // acquire() + rebuild() invalidate `all`
+        const int mode = install ? kAcqNew : q.op == "resume" ? kAcqResume : kAcqVerify;
+        g_remActBy = by;
+        const bool ok = copy.acq->acquire(copy, mode);
+        g_remActBy.clear();
+        const bool cancelled = g_luiLastAcqCancelled;
+        rebuild();
+        const std::string msg = cancelled ? "cancelled; it can be resumed later"
+                              : !ok       ? "did not finish (the TV says why)"
+                              : install   ? "installed"
+                              : q.op == "resume" ? "finished downloading" : "verified";
+        LuiRemoteFinish(q, ok && !cancelled, msg);
+        if (!cancelled)
+            notice(ok ? name + (install ? L" is installed" : q.op == "resume" ? L" finished downloading" : L" is verified") +
+                            L"  \u00B7  asked from " + by
+                      : name + L" did not finish  \u00B7  asked from " + by);
+        return true;
+    };
+
     rebuild();
     Diag("LAUNCHER picker items=" + std::to_string(all.size()));
     LuiRepoStartupCheck();              // background index check -> "Packages · N update(s)" badge
@@ -7014,6 +8286,11 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
     LuiModsCmdStart();                  // §51 M1: LocalState\gh_mods_cmd.txt jobs
     LuiModsMapStart();                  // §51 M2: which titles offer Mods (RB)
     LuiCmdStart();                      // §303: LocalState\gh_cmd.txt game/package commands
+    {   // §65: the browser page, if the user turned it on (once per process)
+        static bool webOnce = false;
+        if (!webOnce) { webOnce = true; std::string why; if (LuiWebEnabled()) LuiWebStart(why); }
+    }
+    LuiRemoteStartup();                 // §66: the poller, if the user turned it on (once per process)
     struct PickerUp {
         PickerUp()  { g_modsPickerUp = true;  g_cmdPickerUp = true;  }
         ~PickerUp() { g_modsPickerUp = false; g_cmdPickerUp = false; }
@@ -7037,6 +8314,38 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
                 prev = 0xFFFF;          // drop anything held down while the batch ran
                 lastNav = GetTickCount();
                 continue;
+            }
+        }
+
+        // §65: the browser page's three asks of the TV, all answered here, on
+        // the thread that owns `all`.
+        g_webPickerBeat = GetTickCount64();
+        if (LuiWebPairModal()) { prev = 0xFFFF; continue; }
+        if (LuiRemotePairModal()) { prev = 0xFFFF; continue; }          // §66
+        if (runRemote()) { prev = 0xFFFF; lastNav = GetTickCount(); continue; }
+        if (!titleOpen && !uninstallAsk && !verifyAsk && g_webLibDirty.exchange(false)) {
+            const std::wstring keep = (sel >= 0 && sel < (int)items.size()) ? items[sel].guest : std::wstring();
+            rebuild();
+            for (int i = 0; i < (int)items.size(); ++i) if (items[i].guest == keep) { sel = i; break; }
+        }
+        {
+            std::string rid;
+            { std::lock_guard<std::mutex> lk(g_webLaunchMu);
+              if (!g_webLaunchId.empty() && GetTickCount64() - g_webLaunchAt < 5000) rid = g_webLaunchId;
+              g_webLaunchId.clear(); }
+            if (!rid.empty() && !uninstallAsk && !verifyAsk) {
+                std::vector<LauncherItem> cs;
+                LuiSrcCustom(cs);
+                const std::wstring tag = L"\\" + GhUtf8ToW(rid) + L"\\";
+                for (const LauncherItem& it : cs) {
+                    if (it.guest.find(tag) == std::wstring::npos) continue;
+                    if (!it.blocked.empty()) { notice(it.display + L" " + it.blocked + L"."); break; }
+                    Diag("LAUNCHER play from the browser id=" + rid);
+                    g_launcherSelectedApp = 0;
+                    g_launcherSelectedName = it.display;
+                    PickerOskHide();
+                    return it.guest;
+                }
             }
         }
 
@@ -7204,6 +8513,11 @@ static std::wstring LauncherPickGuest(const std::wstring& status)
             Diag("LAUNCHER mods '" + LuiNarrow(items[sel].display) + "' title=" + t->id);
             LauncherMods(*t);
             prev = 0xFFFF;              // buttons held when the Mods screen closed
+            continue;
+        }
+        if ((pressed & XINPUT_GAMEPAD_RIGHT_SHOULDER) && !titleOpen && !g_pickOskOpen) {
+            LauncherFromPc();           // §65
+            prev = 0xFFFF;
             continue;
         }
         if ((pressed & XINPUT_GAMEPAD_LEFT_SHOULDER) && !titleOpen && !g_pickOskOpen) {

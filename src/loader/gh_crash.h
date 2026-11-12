@@ -59,6 +59,7 @@
 #include <mutex>
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 
 namespace ghcrash {
 
@@ -227,8 +228,28 @@ inline std::string Word(const std::string& w)
 {
     size_t a = 0, b = w.size();
     std::string pre, post;
-    while (a < b && pre.size() < 3 && (w[a] == '(' || w[a] == '[' || w[a] == '{' || w[a] == '<')) pre += w[a++];
-    while (b > a && post.size() < 3 &&
+    while (a < b && pre.size() < 3 && (w[a] == '(' || w[a] == '[' || w[a] == '{' || w[a] == '<')) {
+        if (w.compare(a, 6, "<path>") == 0) break;
+        pre += w[a++];
+    }
+    // Our own placeholder from an earlier pass. Scrub must be idempotent -- the
+    // browser preview shows a stored, already-scrubbed log and the upload scrubs
+    // what it is handed again -- and stripping the '<' as a bracket here turned
+    // "<path>\x.dll" into "<<path>\x.dll" on every pass.
+    if (w.compare(a, 6, "<path>") == 0) {
+        const std::string rest = w.substr(a + 6);
+        if (rest.empty()) return pre + "<path>";
+        if (rest[0] == '\\' || rest[0] == '/') return pre + Word("x" + rest);
+        return pre + "<path>" + Word(rest);
+    }
+    auto endsWithPlaceholder = [&](size_t end) {
+        for (const char* ph : { "<x>", "<path>", "<user>" }) {
+            const size_t n = strlen(ph);
+            if (end >= a + n && w.compare(end - n, n, ph) == 0) return true;
+        }
+        return false;
+    };
+    while (b > a && post.size() < 3 && !endsWithPlaceholder(b) &&
            (w[b - 1] == ')' || w[b - 1] == ']' || w[b - 1] == '}' || w[b - 1] == '>' ||
             w[b - 1] == ',' || w[b - 1] == ';' || w[b - 1] == '.' || w[b - 1] == '!' || w[b - 1] == '?'))
         post.insert(post.begin(), w[--b]);
@@ -381,8 +402,18 @@ struct Result {
 #define GH_CRASH_TOKEN ""
 #endif
 
+// §65. A game the user uploaded: the report says so, and carries the exe's hash,
+// size and architecture -- so reports about the same file group together on the
+// site without anyone having to send the file, or its folder's name.
+struct Custom {
+    bool        on = false;
+    std::string exeSha256;          // 64 lowercase hex
+    uint64_t    exeSize = 0;
+    std::string arch;               // "x64" / "x86"
+};
+
 inline Result Upload(const std::string& titleName, const std::vector<std::string>& entries,
-                     const std::string& loaderVersion)
+                     const std::string& loaderVersion, const Custom& custom = Custom())
 {
     Result r;
     const std::string srv = ghent::Server();
@@ -396,7 +427,11 @@ inline Result Upload(const std::string& titleName, const std::vector<std::string
         std::string("{\"titleName\":\"") + ghrepo::JsonEsc(titleName) +
         "\",\"log\":\"" + ghrepo::JsonEsc(log) +
         "\",\"greenhouseVersion\":\"" + ghrepo::JsonEsc(loaderVersion) +
-        "\",\"consoleModel\":\"" + ghcompat::ModelName(ghcompat::GetModel()) + "\"}";
+        "\",\"consoleModel\":\"" + ghcompat::ModelName(ghcompat::GetModel()) + "\"" +
+        (custom.on ? ",\"origin\":\"custom\",\"exeSha256\":\"" + ghrepo::JsonEsc(custom.exeSha256) +
+                     "\",\"exeSize\":" + std::to_string((unsigned long long)custom.exeSize) +
+                     ",\"exeArch\":\"" + ghrepo::JsonEsc(custom.arch) + "\""
+                   : std::string()) + "}";
 
     std::wstring hdr = L"Content-Type: application/json\r\n";
     const std::string tok = GH_CRASH_TOKEN;

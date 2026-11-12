@@ -371,6 +371,8 @@ static void DlProgress(void*, const char* phase, int percent, int fdone, int fto
     else if (GH_HOST_HAS(g_host, progress)) g_host->progress(W(phase).c_str(), (uint64_t)percent, 100);
 }
 
+static int HostCancelled() { return GH_HOST_HAS(g_host, cancelRequested) ? g_host->cancelRequested() : 0; }
+
 static int Acquire(const GhAddonRow* row, int mode)
 {
     if (!row || !row->app) return 0;
@@ -398,8 +400,16 @@ static int Acquire(const GhAddonRow* row, int mode)
         ghdl::g_dlSkipDepots.assign(skip, skip + (n > 32 ? 32 : n));
         if (n) Log("acquire app=" + std::to_string(row->app) + " skips " + std::to_string(n) + " depot(s)");
     }
+    // Cancel (B on the TV, or a paired phone, §66) stops at the next file; the tree stays
+    // marked incomplete, so Resume picks it up later.
+    ghdl::g_cancelFn = HostCancelled;
     int rc = ghdl::DownloadApp(row->app, dir, branch, c.token, c.sid, c.account, DlProgress, nullptr, verify);
+    ghdl::g_cancelFn = nullptr;
     Scrub(c.token);
+    if (rc != 0 && HostCancelled()) {
+        Log(std::string(verify ? "verify" : "download") + " cancelled app=" + std::to_string(row->app));
+        return 0;                                  // no error frame to hold: the user asked
+    }
     Log(std::string(verify ? "verify" : "download") + " rc=" + std::to_string(rc) + " app=" + std::to_string(row->app));
     if (rc == 0) return 1;
     Sleep(3000);                                   // the host keeps the last progress frame (the error phase) up
@@ -451,7 +461,6 @@ static std::wstring WsContentRoot(uint32_t app)
 }
 static std::wstring WsStatePath(uint32_t app) { return g_ls + L"gh_workshop_" + std::to_wstring(app) + L".txt"; }
 
-static int HostCancelled() { return GH_HOST_HAS(g_host, cancelRequested) ? g_host->cancelRequested() : 0; }
 static int WorkshopSync(uint32_t app)
 {
     if (!app) return -1;
@@ -569,6 +578,8 @@ extern "C" __declspec(dllexport) int GhAddonInit(const GhHostApi* host, uint32_t
         out->workshopQuery = WorkshopQuery;
         out->workshopSubscribe = WorkshopSubscribe;
     }
+    if (out->size >= offsetof(GhAddonApi, acquireCancels) + sizeof(out->acquireCancels))
+        out->acquireCancels = 1;
     Log(std::string("GhAddonInit ok (host ") + (GH_HOST_HAS(host, signInScreen) ? "has" : "LACKS") + " signInScreen)");
     return 0;
 }

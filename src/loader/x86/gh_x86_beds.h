@@ -55,6 +55,36 @@
 namespace ghx86 {
 
 // ---------------------------------------------------------------------------
+// A new guest session
+// ---------------------------------------------------------------------------
+// Everything above that outlives a Machine and holds guest addresses, emptied
+// before the next guest runs (see x86_session() in gh_x86_win.h). Called by
+// both runners while no guest code is live. The HOST objects the last guest
+// never released -- its D3D9 device, its DirectSound buffers -- are left as
+// they are: that guest's process is gone, and releasing on its behalf is the
+// refcounting it never got to finish. Only our pointers to them are dropped.
+inline void x86_begin_session()
+{
+    ++x86_session();
+    com() = ComState{};                 // wrappers, vtables, thunks: all guest
+    com_live_d3d9() = nullptr;          // the device the LAST guest's SDL made
+    d9_bounces().clear();               // guest heap blocks
+    map_bounces().clear();
+#ifdef GH_LAUNCHER                         // dsound and dinput8 exist only there
+    ds_id_device() = ds_id_device8() = ds_id_buffer() = ds_id_buffer8() = -1;
+    di8_id_a() = di8_id_w() = -1;
+#endif
+    dd_mode() = DdMode{};
+    {
+        WndQ& q = wndq();
+        std::lock_guard<std::mutex> lk(q.mu);
+        q.timers.clear();               // guest HWNDs and TIMERPROCs, and
+        q.notes.clear();                // thread ids Windows reuses
+        q.broadcast = 0;                // a guest DEV_BROADCAST block
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SECURITY_ATTRIBUTES: 12 bytes on x86, 24 on x64
 // ---------------------------------------------------------------------------
 //   x86: { DWORD nLength; LPVOID lpSecurityDescriptor; BOOL bInheritHandle; }
@@ -2528,9 +2558,11 @@ inline uint64_t steam_slot_invoke(Machine& m, const uint32_t* args)
     uint32_t r = kSteamSlots[I].ret;
     if (kSteamSlots[I].retstr) {
         // One guest copy per slot, made on first use and kept for the life of
-        // the process: the guest may hold the pointer for as long as it likes.
+        // the session: the guest may hold the pointer for as long as it likes.
         // `static` here is per-instantiation, so each slot gets its own.
         static uint32_t cached = 0;
+        static uint32_t stamp = 0;
+        if (x86_session_changed(stamp)) cached = 0;
         if (!cached) {
             const size_t n = std::strlen(kSteamSlots[I].retstr) + 1;
             cached = m.heap_alloc((uint32_t)n, true);
@@ -2596,6 +2628,8 @@ inline uint32_t steam_stub_for(Machine& m, const char* ver)
 {
     if (!ver || !*ver) return 0;
     static std::vector<std::pair<std::string, uint32_t>> cache;
+    static uint32_t stamp = 0;                  // guest objects: one session's
+    if (x86_session_changed(stamp)) cache.clear();
     for (auto& e : cache) if (e.first == ver) return e.second;
 
     // An interface we know NO slot of is better left null, and that is measured,
@@ -5232,6 +5266,8 @@ inline void RegisterStdBeds(Machine& m)
             // the caller does not free it. Ours has to live in GUEST memory: one
             // heap block, allocated on first use and never released.
             static uint32_t buf = 0;
+            static uint32_t stamp = 0;          // a guest block: one session's
+            if (x86_session_changed(stamp)) buf = 0;
             if (!buf) buf = m.heap_alloc(24, true);
             if (!buf) return 0;
             const uint8_t* b = (const uint8_t*)&a[0];

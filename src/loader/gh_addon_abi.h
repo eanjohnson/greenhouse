@@ -179,6 +179,12 @@ typedef struct GhAddonApi {
     /* Subscribe (1) or unsubscribe (0) the signed-in account; 0 = done. The content
      * arrives (or leaves) on the next workshopSync. */
     int (*workshopSubscribe)(uint32_t app, uint64_t id, int subscribe);
+
+    /* Appended in loader 0.0.951.0 (still ABI 1): read only when size covers it.
+     * Nonzero = acquire() polls host->cancelRequested while it downloads and stops at
+     * the next file, leaving the install resumable (§66: B on the TV, or Cancel from
+     * a paired phone). The host offers cancelling an acquire only when this is set. */
+    uint32_t acquireCancels;
 } GhAddonApi;
 
 enum { GH_WS_SORT_POPULAR = 0, GH_WS_SORT_NEWEST = 1, GH_WS_SORT_TRENDING = 3, GH_WS_SORT_SUBSCRIBED = 9 };

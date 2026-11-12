@@ -142,6 +142,20 @@ int main(int argc, char** argv)
         else            std::printf("  ok    %-26s all 20 kept\n", "distinct lines kept");
     }
 
+    {
+        // The placeholders themselves must come back unchanged.
+        const char* again[] = { "DDIPROBE <path>\\scache.dll size=57344 -> <path>\\sys OK",
+                                "SCACHE exports=<x> ALL PRESENT", "label=<x> (<path>) [<user>]",
+                                "... <12 more like this>" };
+        for (const char* a : again) {
+            const std::string once = ghcrash::ScrubLine(a);
+            if (ghcrash::ScrubLine(once) != once) {
+                std::printf("  FAIL  %-26s %s -> %s\n", "placeholder is stable", once.c_str(), ghcrash::ScrubLine(once).c_str());
+                ++g_fail;
+            } else std::printf("  ok    %-26s %s\n", "placeholder is stable", once.c_str());
+        }
+    }
+
     if (argc < 2) {
         std::printf("\n(no real diag given; synthetic only)\n");
         std::printf("\n%s\n", g_fail ? "FAILED" : "all synthetic cases pass");
@@ -174,6 +188,10 @@ int main(int argc, char** argv)
         const std::string all = ghcrash::Scrub(lines);
         std::printf("  Scrub() total: %zu bytes (cap %zu)\n", all.size(), ghcrash::kMaxLogBytes);
         if (all.size() > ghcrash::kMaxLogBytes) { std::printf("  FAIL over cap\n"); ++g_fail; }
+        // Idempotent: the browser page previews a stored, already-scrubbed log and the
+        // upload scrubs whatever it is handed again, so a second pass must not change it.
+        if (ghcrash::Scrub({all}) != all) { std::printf("  FAIL  second Scrub() pass changed the text\n"); ++g_fail; }
+        else                                std::printf("  ok    Scrub(Scrub(x)) == Scrub(x)\n");
 
         // The tail is what a report is for: show the last few scrubbed lines so the
         // output can be eyeballed for readability. These are post-scrub, so safe.

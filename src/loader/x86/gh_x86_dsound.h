@@ -227,9 +227,9 @@ inline int ds_register_buffer(ComState& c, const char* name, const GUID* iid)
 // finds the 8 interfaces by IID; the host objects answer both.
 inline void ds_bringup(Machine& m)
 {
-    static bool done = false;
-    if (done) return;
-    done = true;
+    // Once per session: x86_begin_session() empties the ComState these ids index.
+    static uint32_t stamp = 0;
+    if (!x86_session_changed(stamp)) return;
     com_bringup(m);
     ComState& c = com();
     ds_id_device()  = ds_register_device(c, "IDirectSound", &ghds::kIID_DS);
@@ -260,6 +260,8 @@ inline uint64_t ds_enumerate(Machine& m, const uint32_t* a, bool wide)
     if (!a[0]) return kDsErrInvalidParam;
     static uint32_t desc_a = 0, desc_w = 0, empty = 0;
     static const char kName[] = "Primary Sound Driver";
+    static uint32_t stamp = 0;                  // guest blocks: one session's
+    if (x86_session_changed(stamp)) desc_a = desc_w = empty = 0;
     if (!empty) {
         empty = m.heap_alloc(4, true);
         desc_a = m.heap_alloc(sizeof(kName), true);

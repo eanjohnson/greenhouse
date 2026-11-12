@@ -1476,6 +1476,7 @@ inline bool RunPe32Native(const std::vector<uint8_t>& file, uint32_t& result, st
     if (S.stuck) { why = "an earlier guest could not be torn down"; return false; }
     if (S.m) { why = "a guest is already running"; return false; }
     reset_run();
+    x86_begin_session();
     Machine* mp = new Machine;
     Machine& m = *mp;
     S.m = mp;

@@ -1091,6 +1091,45 @@ inline void GhUiSetArtProvider(GhUiArtFn fn, void* ctx)
     g_ghUiArtFn = fn; g_ghUiArtCtx = ctx;
 }
 
+// Ask for art that is NOT being drawn yet.
+//
+// Drawing is the only thing that used to ask, so the first frame a cover was on
+// screen was also the first frame anyone had wanted it: the disk read, the JPEG
+// decode and the bitmap upload all started with the tile already visible, and
+// the plate showed until they finished. That is the pop-in you see when you
+// scroll. A provider that can fetch ahead gets told early instead, for the rows
+// just outside the viewport, so a cover is ready BEFORE it is on screen.
+//
+// Warming is advisory in both directions: a provider need not implement it
+// (the preview harness has its art in hand already and sets no warmer), and a
+// warmed cover is never guaranteed to be ready -- the caller still draws the
+// plate when GhUiArt answers nullptr. It must stay cheap enough to call for
+// every off-screen tile of every frame, so a provider is expected to ignore a
+// request for something it already has or has already queued.
+using GhUiArtWarmFn = void (*)(void* ctx, uint32_t app, int kind);
+inline GhUiArtWarmFn g_ghUiArtWarmFn  = nullptr;
+inline void*         g_ghUiArtWarmCtx = nullptr;
+
+inline void GhUiSetArtWarmer(GhUiArtWarmFn fn, void* ctx)
+{
+    g_ghUiArtWarmFn = fn; g_ghUiArtWarmCtx = ctx;
+}
+
+// Rows of tiles beyond the viewport a scrolling wall warms, on each side. Two
+// is one row of lead in each direction plus one in hand, which is what it takes
+// for a cover to be ready at the speed the stick moves the selection. It is
+// also what the cover cache has room for -- see kMaxCovers in gh_art.h before
+// raising it, because warming more than the cache holds would evict the rows
+// being warmed and the wall would redraw for ever.
+constexpr int kGhUiArtWarmRows = 2;
+
+inline void GhUiArtWarm(uint32_t app, int kind)
+{
+    if (!app || !g_ghUiArtWarmFn) return;
+    if (kind < 0 || kind >= GH_ART_KINDS) return;
+    g_ghUiArtWarmFn(g_ghUiArtWarmCtx, app, kind);
+}
+
 inline ID2D1Bitmap* GhUiArt(uint32_t app, int kind)
 {
     if (!app || !g_ghUiArtFn) return nullptr;
@@ -1106,10 +1145,12 @@ inline ID2D1Bitmap* GhUiArt(uint32_t app, int kind)
 // art puts its subject high and its ground low.
 //
 // Returns false when there is no art, which is the caller's cue to draw the
-// plate. `opacity` is how "not installed" is expressed: g_ghUi.dc is an
-// ID2D1RenderTarget on purpose (see GhUiState), so there is no D2D effect graph
-// here and therefore no true desaturation -- a quieter picture over a panel
-// fill is the honest equivalent, and it costs one draw call.
+// plate. `opacity` is a general knob and no caller uses it to mean a state any
+// more: the wall drew "not installed" by dimming the cover and stopped, because
+// a dimmed cover is a worse picture of something we did not author. Note also
+// that g_ghUi.dc is an ID2D1RenderTarget on purpose (see GhUiState), so there is
+// no effect graph here and therefore no true desaturation -- fading was only
+// ever standing in for one.
 inline bool GhUiArtDraw(const D2D1_RECT_F& dst, uint32_t app, int kind, float opacity = 1.f,
                         float topBias = 0.5f)
 {

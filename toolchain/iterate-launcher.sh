@@ -304,6 +304,9 @@ for f in sys.argv[1:]:
     print("  title %-18s %s" % (d["id"], f.rsplit("/", 1)[-1]))
 PYEOF
 cp "$GH"/corpus/titles/*.ghtitle.json "$STAGE/guest/titles/"
+# §65: the browser page the console serves (Manage from a browser). One file.
+mkdir -p "$STAGE/guest/web"
+cp "$GH/corpus/web/console.html" "$STAGE/guest/web/" || { echo "FATAL: guest web page"; exit 1; }
 # Tsushima's shader corpus (2026-10-06): the reference console's
 # D:\DevelopmentFiles\ghlo, pulled byte-for-byte into corpus/redist/ghlo, with its
 # LocalState gh_tl_ blobs (the lane-solo NonUniform fixes, which win over ghlo

@@ -115,9 +115,6 @@ constexpr float kMarkIn   = 11.f;
 constexpr float kSelRing  = 4.f;
 constexpr float kSelOff   = 3.f;
 constexpr float kWmPadX   = 15.f;
-// How much of a cover is left when the title is not installed. Measured against
-// the mockup's grayscale(.88) brightness(.52), which is what this stands in for.
-constexpr float kMutedArt = 0.42f;
 
 // --- the title screen ------------------------------------------------------
 constexpr float kHeroH  = 400.f;
@@ -478,8 +475,12 @@ inline void Poster(const D2D1_RECT_F& tile, const GhUiRow& row, bool cur)
     const float s = S();
 
     GhUiFill(tile, GH_ROLE_PANEL_ALT, 0.f);
-    const bool art = GhUiArtDraw(tile, row.appId, GH_ART_COVER,
-                                 row.muted ? kMutedArt : 1.f, 0.40f);
+    // Full opacity whatever the install state is. A cover is a photograph of a
+    // thing someone chose; dimming it shows them a worse version of their own
+    // library, and the colour it takes away is the cover's, not ours to spend.
+    // "Not installed" is said by the drawer, the breadcrumb and the title
+    // screen's chip -- none of which lie about what the art looks like.
+    const bool art = GhUiArtDraw(tile, row.appId, GH_ART_COVER, 1.f, 0.40f);
     if (!art) {
         if (t.gloss) GhUiGloss(tile, 0.f);
         Plate(tile, row.title.c_str());
@@ -646,6 +647,31 @@ inline void Grid(const GhUiListVM& vm, const D2D1_RECT_F& body)
                 tx,                field.top + (tileH + gap) * (float)rr,
                 tx + tileW,        field.top + (tileH + gap) * (float)rr + tileH);
             Poster(tile, row, i == vm.sel);
+        }
+    }
+
+    // Ask for the rows just off the top and bottom edges.
+    //
+    // Drawing used to be the only thing that asked for a cover, so a tile's
+    // disk read, decode and upload all began on the frame it became visible and
+    // the plate showed until they finished -- the draw you can see on every
+    // poster as you scroll. These rows are not drawn and nothing here is
+    // returned; the point is only that the provider is told early. It ignores
+    // anything it already holds or has queued, so this is cheap to do every
+    // frame, and when it cannot keep up the tile simply falls back to the plate
+    // as before.
+    for (int m = 1; m <= kGhUiArtWarmRows; ++m) {
+        const int above = firstRow - m;
+        const int below = firstRow + visRows + m - 1;
+        for (int cx = 0; cx < cols; ++cx) {
+            if (above >= 0) {
+                const int i = above * cols + cx;
+                if (i < vm.count) { vm.getRow(i, row); GhUiArtWarm(row.appId, GH_ART_COVER); }
+            }
+            if (below < totalRows) {
+                const int i = below * cols + cx;
+                if (i < vm.count) { vm.getRow(i, row); GhUiArtWarm(row.appId, GH_ART_COVER); }
+            }
         }
     }
 }

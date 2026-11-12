@@ -52,6 +52,27 @@ inline void log_capped(const std::string& key, const std::string& s) {
     else if ((n & (n - 1)) == 0) log(s + " (x" + std::to_string(n) + ")");
 }
 
+// -- one guest's lifetime -----------------------------------------------------
+// The loader runs many guests in one process, one at a time, and each gets a
+// fresh Machine: a fresh 32-bit address space at the SAME base and a fresh
+// thunk pool. A GUEST address kept in a static -- a vtable, a COM wrapper, a
+// string handed to a callback, a thunk -- is therefore good for exactly one
+// session; in the next one it names whatever that guest has put there since.
+// Half-Life launched after Portal in one launcher process called
+// IDirect3D9::GetAdapterCount through the wrapper Portal had been given, read a
+// null vtable out of HL1's own heap, and died inside SDL_CreateRenderer.
+//
+// x86_session() is bumped once per run, before any guest code
+// (x86_begin_session in gh_x86_beds.h). A function-local cache keeps a stamp
+// and asks x86_session_changed(stamp) before trusting what it holds.
+inline uint32_t& x86_session() { static uint32_t s = 1; return s; }
+inline bool x86_session_changed(uint32_t& stamp)
+{
+    if (stamp == x86_session()) return false;
+    stamp = x86_session();
+    return true;
+}
+
 inline std::string hex(uint64_t v)
 {
     char b[32];
@@ -4265,7 +4286,11 @@ struct Machine {
             case Status::Halt:     return "halt";
             case Status::Ok:       return "running";
             case Status::HostCall: return "hostcall " + hex(cpu.host_call_target);
-            default:               return "FAULT " + cpu.fault_why +
+            default:
+                // A fault found inside a turn is stored already formatted (see Turn::Fatal);
+                // wrapping it again printed "FAULT FAULT bad access at X eip=Y at X eip=Y".
+                if (cpu.fault_why.rfind("FAULT ", 0) == 0) return cpu.fault_why;
+                return "FAULT " + cpu.fault_why +
                                           " at " + hex(cpu.fault_addr) +
                                           " eip=" + hex(cpu.eip);
         }
