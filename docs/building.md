@@ -157,7 +157,7 @@ to break:
 | `GH_X86_JIT` | `iterate-x86spike.sh` with `GHJIT=1` | Links the BoxedWine JIT objects. Research only; the Launcher never links the JIT |
 | `GH_X86_EIPTRACE`, `GH_X86_SPIN_YIELD` | measurement builds | Instrumentation for the x86 interpreter |
 | `GH_REPO_DEV_KEY` | env `GH_REPO_DEV_KEY` (default `1`) | Trusts the development repository key in `src/loader/gh_repo_devkey.inc` in addition to the release key in `src/loader/gh_repo_keys.inc` (which is compiled in whenever the file exists) |
-| `GH_RELEASE` | `EXTRACL=/DGH_RELEASE` | Release behaviour in the loader: `Diag()` keeps only its in-memory ring and writes nothing to disk, the `gh_cmd.txt` command channel is disabled, and the Packages page does not show the index serial and key id. Note that the environment variable `GH_RELEASE=1` only runs the script's release checks (see [Environment variables](#environment-variables)) and does **not** pass this define; pass both for a distribution build |
+| `GH_RELEASE` | `EXTRACL=/DGH_RELEASE` | Release behaviour in the loader: `Diag()` keeps only its in-memory ring and writes nothing to disk, the `gh_cmd.txt` command channel is disabled, and the Packages page does not show the index serial and key id. `iterate-launcher.sh` passes this define itself when the environment variable `GH_RELEASE=1` is set (see [Environment variables](#environment-variables)) |
 | `GH_SITE_URL` | `EXTRACL='/DGH_SITE_URL=\"https://example.org\"'` | The project website (`src/loader/gh_site.h`). Default `https://playgreenhouse.app`; `""` builds with no site at all. See [Forking](#forking-your-own-site-and-package-repository) |
 | `GH_CRASH_TOKEN` | env `GH_CRASH_TOKEN` | Bearer token sent with crash reports (`src/loader/gh_crash.h`). Default empty |
 | `GH_REMOTE_RELAY` | `EXTRACL=/DGH_REMOTE_RELAY` | Compiles in "Manage from anywhere" (the phone relay, `gh_remote.h`). Off by default; see [launcher/remote-manage.md](launcher/remote-manage.md) |
@@ -276,7 +276,8 @@ tracked certificate. Notes:
 
 - The scripts read the `.pfx` passphrase from `GH_PFX_PASS` and pass it to
   `osslsigncode` on its command line, where other local users can see it in the
-  process list. Do not reuse a passphrase you care about.
+  process list. `iterate-launcher.sh` also accepts `GH_PFX_PASS_FILE` (a file
+  `osslsigncode` reads itself), which avoids that; use it for a key you care about.
 - The package family name ends in a hash of the publisher
   (`Greenhouse.Launcher_mgw46vk3ppz9w` for `CN=Greenhouse`). That suffix is
   hard-coded in scripts, in `GH_PKG_FAMILY` and in a few source paths. If you change
@@ -339,14 +340,16 @@ is unset stops the script with a message naming it.
 |---|---|---|
 | `GH_TOOLS` | **required** | Directory holding the out-of-tree helpers (`gen_steamdef.py`, `wdp.py`). Also used as scratch by some slots. See the [known gap](#known-gap-helpers-in-gh_tools-to-be-added) |
 | `GH_XBOX` | **required** | `<console-ip>:11443`, the console's Device Portal. Checked before the build starts, so it is needed even with `GH_PACK_ONLY=1` (any value will do then) |
-| `GH_PFX_PASS` | **required** | Passphrase of `toolchain/signing/greenhouse.pfx` |
+| `GH_PFX` | `toolchain/signing/greenhouse.pfx` | The signing key. Its certificate subject must be `CN=Greenhouse`, or the package becomes a different app instead of an update |
+| `GH_PFX_PASS_FILE` | empty | A file holding the `.pfx` passphrase. `osslsigncode` reads it itself (`-readpass`), so the passphrase never appears on a command line. Takes precedence over `GH_PFX_PASS` |
+| `GH_PFX_PASS` | **required** unless `GH_PFX_PASS_FILE` is set | Passphrase of the `.pfx`, passed on `osslsigncode`'s command line |
 | `GH_PACK_ONLY` | `0` | `1` = build, pack, sign, stop. No device contact |
 | `GH_CLEAN` | `0` | `1` = uninstall the old package before installing. This deletes the app's `LocalState` |
 | `GH_BUNDLE_FIRSTPARTY` | `1` | `1` = pack the lowered shader corpus from `corpus/redist/ghlo/` into the MSIX; fatal unless that directory holds at least 10,000 blobs. `0` = leave it out; a console then gets it from the package repository (see [packages.md](packages.md)). **A clean clone must set `0`.** Title configs, the settings seed, `console.html` and `compat.json` are staged either way |
 | `GH_STEAM_RUNTIME_FETCH` | `1` | Valve runtime DLLs are fetched on the device and never packaged. A pack-time check fails the build if one leaks into the stage. `0` is a development-only override |
 | `GH_X86_GUEST` | `1` | Compiles the 32-bit guest route (`/DGH_X86_GUEST`) |
 | `GH_REPO_DEV_KEY` | `1` | `1` = also trust the development repository key (`/DGH_REPO_DEV_KEY`). `0` = only the release key in `gh_repo_keys.inc` |
-| `GH_RELEASE` | `0` | `1` = distribution build checks. Refuses to build unless `GH_REPO_DEV_KEY=0` and `GH_STEAM_RUNTIME_FETCH=1`, and unless `src/loader/gh_repo_keys.inc` is non-empty. Warns when `GH_CRASH_TOKEN` is empty. It does not add `/DGH_RELEASE`; put that in `EXTRACL` |
+| `GH_RELEASE` | `0` | `1` = distribution build checks. Refuses to build unless `GH_REPO_DEV_KEY=0` and `GH_STEAM_RUNTIME_FETCH=1`, and unless `src/loader/gh_repo_keys.inc` is non-empty. Warns when `GH_CRASH_TOKEN` is empty. Adds `/DGH_RELEASE`, leaves Sony's PSPC runtime and the game-derived shader corpus out of the stage, and fails if any copy of them survives |
 | `GH_CRASH_TOKEN` | empty | Compiled in as `/DGH_CRASH_TOKEN`. A write-only bearer token sent with `POST <site>/api/crash-report`; it must match the site's `CRASH_INGEST_TOKEN`. Empty is fine when the site sets none. Read from the environment only, never from a file in the tree |
 | `EXTRACL` | empty | Extra compiler flags, for example `/DGH_REMOTE_RELAY` or `/DGH_SITE_URL=\"https://example.org\"` |
 | `EXTRALIBS` | the Launcher's import libraries | Replaces the extra linker inputs. Keep the defaults if you append |

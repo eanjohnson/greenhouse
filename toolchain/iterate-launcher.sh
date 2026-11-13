@@ -46,6 +46,11 @@ NEW="$1"; OLD="$2"
 GH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="${GH_TOOLS:?set GH_TOOLS to a working directory holding wdp.py (the Device Portal client)}"
 SDK="$GH/toolchain/xwin-sdk"; SDKVER=10.0.26100
+# Every compile maps the checkout's own path to "." -- header paths reach the binary
+# through __FILE__ and std::source_location (cppwinrt's error checks carry them), and
+# 0.0.957.0's first release build shipped "/home/<builder>/..." strings in
+# p0_spike_host.exe. A release must not say where or by whom it was built.
+PATHMAP=("/clang:-ffile-prefix-map=$GH/=./")
 FAM="Greenhouse.Launcher_mgw46vk3ppz9w"
 STAGE="$GH/artifacts/msix_stage_launcher"
 [ -z "${GH_NO_STEAM:-}" ] || { echo "GH_NO_STEAM is retired (#261): every build is the no-Steam package; Steam is the add-on"; exit 1; }
@@ -91,7 +96,7 @@ NSDEF=""
 # out (smaller package, x64 guests only); the JIT stays unlinked either way.
 [ "${GH_X86_GUEST:-1}" = "1" ] && NSDEF="$NSDEF /DGH_X86_GUEST"
 echo "== build launcher loader ($SRC)${NSDEF:+ $NSDEF}${RELDEF:+ $RELDEF} =="
-clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \
+clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link "${PATHMAP[@]}" \
   /std:c++20 /EHsc /MT /O2 "/DGH_PKG_FAMILY=\"$FAM\"" /DGH_LAUNCHER $NSDEF $RELDEF $EXTRACL "${CRASHDEF[@]}" \
   /imsvc "$SDK/crt/include" /imsvc "$SDK/sdk/include/$SDKVER/ucrt" \
   /imsvc "$SDK/sdk/include/$SDKVER/um" /imsvc "$SDK/sdk/include/$SDKVER/shared" \
@@ -133,7 +138,7 @@ rm -f "$STAGE/guest/zstd.exe" "$STAGE/guest/7za.exe"
 python3 "$TMP/gen_steamdef.py"
 mkdir -p "$GH/artifacts/addon_steam"
 build_shim() {   # $1 = output dll, $2 = extra define (or empty)
-  clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \
+  clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link "${PATHMAP[@]}" \
     /std:c++20 /EHsc /MT /O2 /LD "/DGH_PKG_FAMILY=\"$FAM\"" $2 \
     /imsvc "$SDK/crt/include" /imsvc "$SDK/sdk/include/$SDKVER/ucrt" \
     /imsvc "$SDK/sdk/include/$SDKVER/um" /imsvc "$SDK/sdk/include/$SDKVER/shared" \
@@ -171,7 +176,7 @@ fi
 echo "== build Unity support stubs =="
 for stub in opengl32_stub:opengl32 ghwmm:ghwmm; do
   src="${stub%%:*}"; dst="${stub##*:}"
-  clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \
+  clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link "${PATHMAP[@]}" \
     /std:c++20 /EHsc /MT /O2 /LD \
     /imsvc "$SDK/crt/include" /imsvc "$SDK/sdk/include/$SDKVER/ucrt" \
     /imsvc "$SDK/sdk/include/$SDKVER/um" /imsvc "$SDK/sdk/include/$SDKVER/shared" \
@@ -275,7 +280,7 @@ if [ "$RELEASE" = "1" ]; then
 else
   cp "$RED/vcrt/"*.dll "$PSPC/"
 fi
-clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link /MT /O2 /LD \
+clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link "${PATHMAP[@]}" /MT /O2 /LD \
   /imsvc "$SDK/crt/include" /imsvc "$SDK/sdk/include/$SDKVER/ucrt" \
   /imsvc "$SDK/sdk/include/$SDKVER/um" /imsvc "$SDK/sdk/include/$SDKVER/shared" \
   "$GH/corpus/shims/tbs_stub.c" \
@@ -369,7 +374,7 @@ find "$STAGE/guest/vcrt" "$TSEED" -type f -printf '  %8s %P\n'
 # guest module that needs an index; the loader loads only the ones it uses.
 echo "== build TLS index donors (ghtls0..15) =="
 for n in $(seq 0 15); do
-  clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link \
+  clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld-link "${PATHMAP[@]}" \
     /std:c++20 /EHsc /MT /O2 /LD \
     /imsvc "$SDK/crt/include" /imsvc "$SDK/sdk/include/$SDKVER/ucrt" \
     /imsvc "$SDK/sdk/include/$SDKVER/um" /imsvc "$SDK/sdk/include/$SDKVER/shared" \
@@ -400,7 +405,21 @@ if [ "$RELEASE" = "1" ]; then   # same reason: nothing non-redistributable may s
 fi
 rm -f "$GH/artifacts/$MSIX.msix" "$GH/artifacts/$MSIX.signed.msix"
 LD_LIBRARY_PATH="$LIBDIR" "$GH/toolchain/bin/makemsix" pack -d "$STAGE" -p "$GH/artifacts/$MSIX.msix" >/dev/null
-osslsigncode sign -pkcs12 "$GH/toolchain/signing/greenhouse.pfx" -pass "${GH_PFX_PASS:?set GH_PFX_PASS to the signing .pfx passphrase}" -h sha256 \
+# The signing key: GH_PFX (default toolchain/signing/greenhouse.pfx). Its passphrase
+# comes from GH_PFX_PASS_FILE when set -- read by osslsigncode itself, so it never
+# appears on a command line where `ps` could see it -- else from GH_PFX_PASS. The
+# certificate's subject must stay "CN=Greenhouse" (the manifest's Publisher): the
+# package family name is derived from it, and a different one is a different app, not
+# an update.
+PFX="${GH_PFX:-$GH/toolchain/signing/greenhouse.pfx}"
+[ -s "$PFX" ] || { echo "FATAL: no signing key at $PFX (set GH_PFX)"; exit 1; }
+if [ -n "${GH_PFX_PASS_FILE:-}" ]; then
+  [ -s "$GH_PFX_PASS_FILE" ] || { echo "FATAL: GH_PFX_PASS_FILE is empty or missing"; exit 1; }
+  PASSARG=(-readpass "$GH_PFX_PASS_FILE")
+else
+  PASSARG=(-pass "${GH_PFX_PASS:?set GH_PFX_PASS_FILE or GH_PFX_PASS to the signing .pfx passphrase}")
+fi
+osslsigncode sign -pkcs12 "$PFX" "${PASSARG[@]}" -h sha256 \
   -in "$GH/artifacts/$MSIX.msix" -out "$GH/artifacts/$MSIX.signed.msix" 2>&1 | grep -E "Succeeded|Failed"
 if [ "${GH_PACK_ONLY:-0}" = "1" ]; then
   ls -l "$GH/artifacts/$MSIX.signed.msix"; echo "GH_PACK_ONLY=1 -- not deploying"; exit 0
