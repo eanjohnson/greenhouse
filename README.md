@@ -1,8 +1,13 @@
-<!-- Draft of the top-level README.md. Paths assume it sits at the repository root. -->
-
-# Greenhouse
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-dark.png">
+    <img alt="Greenhouse" src="docs/images/logo-light.png" width="360">
+  </picture>
+</h1>
 
 Greenhouse runs unmodified Windows PC games on an Xbox console in Dev Mode.
+
+**Website:** [playgreenhouse.app](https://playgreenhouse.app)
 
 It is an ordinary UWP app. It does not modify the console, does not need an exploit
 and does not leave retail mode's protections disabled: Dev Mode is Microsoft's own
