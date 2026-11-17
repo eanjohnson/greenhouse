@@ -41,6 +41,33 @@ only:
 `ghpkg.py verify --fetch` re-fetches each range and checks it, so a moved or changed archive is caught
 at publishing time.
 
+## The published package: one package called Steam
+
+On the production repository the add-on (`addon.dll` plus the engine-enabled `steam_api64.dll`, see
+[README.md](README.md)) and the runtime recipe ship as **one package**. Its id is `steam-runtime` and its
+display name is **Steam**. Users install that one row and restart.
+
+The id is `steam-runtime` because `GhSteamRuntimeDir()` finds the runtime by that package id, and
+launchers already released (0.0.960.0 and 0.0.1008.0) cannot be changed. Those launchers also ignore
+`requires`, so two separate packages would mean two manual installs, which users missed. The add-on
+loader treats it like any add-on with code: it loads `addon.dll` from the package folder, and the
+runtime files sit beside it.
+
+The manifest is the union of the two file lists, with `provides` set to `library-source:steam`,
+`steam-runtime` and `runtime:steamclient`:
+
+1. `ghpkg.py vendor --repo STAGE --version a.b.c.d corpus/addons/steam-runtime/vendor.json` writes the
+   `from` entries;
+2. build the add-on (`toolchain/build-addon.sh --steam ...`) and take the engine-enabled
+   `steam_api64.dll` from the release build's `artifacts/addon_steam/`;
+3. add both files to the same package folder, with their `path`, `size` and `sha256`, ahead of the
+   `from` entries in `files`;
+4. `ghpkg.py index` with the production key and a serial above the live one, then
+   `ghpkg.py verify --inc src/loader/gh_repo_keys.inc --fetch` before publishing.
+
+A Steam package must never carry Valve's bytes: `verify` passing with `from` entries for the four
+runtime files is the check.
+
 ## On the console
 
 When the `steam-runtime` package is installed, `FetchFrom` in `gh_repo.h`, for each file:

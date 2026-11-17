@@ -38,8 +38,9 @@ Launcher lists only games already on the console, and titles that need Steam are
 as blocked.
 
 A package of type `addon` without an `addon.dll` is a **data add-on**: files for the
-loader, no code to call. Two exist: `steam-runtime` (Valve's runtime, fetched by the
-console from Valve's own CDN; see [steam/runtime-fetch.md](steam/runtime-fetch.md))
+loader, no code to call. Examples: a recipe-only `steam-runtime` (Valve's runtime,
+fetched by the console from Valve's own CDN; see [steam/runtime-fetch.md](steam/runtime-fetch.md);
+the published one also carries the Steam add-on's `addon.dll`, so it loads as an add-on with code)
 and the shader corpus (`*.ghpak` packs, opened by `GhReadPackBlob`). The add-on loader
 logs `ADDON <id> <version> data-only (no addon.dll) -- nothing to load` and moves on.
 The rest of this document is about add-ons with code.

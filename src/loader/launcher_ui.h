@@ -4293,8 +4293,11 @@ static void LauncherPackages()
                         status = (was == kInstall ? L"Install failed: " : L"Remove failed: ") + ghrepo::Widen(job->why);
                         Diag(std::string("REPO page ") + (was == kInstall ? "install " : "remove ") + target + " FAILED: " + job->why);
                     } else {
-                        bool title = false, theme = false, compat = false;
+                        bool title = false, theme = false, compat = false, addon = false;
+                        std::string shown = target;   // the row's name: the published Steam package's id is "steam-runtime"
                         for (const auto& r : rows) if (r.id == target) {
+                            if (!r.name.empty()) shown = r.name;
+                            if (r.type == "addon")  addon  = true;
                             if (r.type == "title")  title  = true;
                             if (r.type == "theme")  theme  = true;
                             if (r.type == "compat") compat = true;
@@ -4305,8 +4308,10 @@ static void LauncherPackages()
                         // marks are right on the way back to the wall.
                         if (theme)  LuiReloadThemes();
                         if (compat) LuiLoadCompat();
-                        status = (was == kInstall ? L"Installed " : L"Removed ") + ghrepo::Widen(target) +
-                                 (title ? L" \u00B7 applies the next time Greenhouse starts" : L"");
+                        status = (was == kInstall ? L"Installed " : L"Removed ") + ghrepo::Widen(shown) +
+                                 // Add-ons are loaded once, at start-up: Steam's sign-in
+                                 // code appears only after a restart, and nothing else said so.
+                                 ((title || (addon && was == kInstall)) ? L" \u00B7 applies the next time Greenhouse starts" : L"");
                         if (haveIdx) g_repoUpdates = ghrepo::CountUpdates(ghrepo::LoadState(cfg.stateDir), idx);
                     }
                 }

@@ -52,8 +52,9 @@ inline const GhOnbStep kGhOnbSteps[] = {
       L"Nothing you do not own shows up in the library." },
 
     { L"Signing in to Steam",
-      L"Open Packages from the picker with the Menu button, choose Steam, and "
-      L"scan the code with your phone.\n\n"
+      L"Open Packages from the picker with the Menu button and install Steam. "
+      L"The next time Greenhouse starts it shows a code: scan it with the Steam "
+      L"app on your phone.\n\n"
       L"You can skip this and come back to it later. Games already copied onto "
       L"the console play without signing in." },
 
