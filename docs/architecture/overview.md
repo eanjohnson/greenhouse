@@ -281,7 +281,7 @@ rather than reusing it, because several engines cannot start twice in one proces
 | `greenhouse_loader.cpp` | Historical spike (section 2.6). |
 | `gh_json.h` | Small dependency-free JSON reader; parses title configs. |
 | `gh_compat.h` | Reads the bundled compatibility record so the UI can say what is known about a title. |
-| `gh_crash.h` | Builds the opt-in crash report from the diag ring. Documented with the launcher. |
+| `gh_crash.h` | Builds the opt-in crash report from the diag ring. See [launcher/crash-report.md](../launcher/crash-report.md). |
 | `gh_site.h` | The project website as the console sees it: one base URL (`GH_SITE_URL`, or `""` for none; `LocalState\gh_site_url.txt` overrides) and a JSON POST. Used by the default repository URL and crash reports. |
 | `gh_crypto.h` | Shared Windows CNG helpers: base64url, HMAC-SHA256, HKDF, AES-GCM, ECDH. |
 

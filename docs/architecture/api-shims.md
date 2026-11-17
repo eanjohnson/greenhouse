@@ -14,6 +14,7 @@ Related: [overview.md](overview.md), [pe-loading.md](pe-loading.md),
 [../reference/knobs.md](../reference/knobs.md),
 [../reference/diagnostics.md](../reference/diagnostics.md),
 [../reference/known-limits.md](../reference/known-limits.md).
+How it was found: [feasibility-and-first-loader.md](../writeups/feasibility-and-first-loader.md) · [a-freeze-that-was-a-crash-dump.md](../writeups/a-freeze-that-was-a-crash-dump.md)
 
 ## 1. Model
 

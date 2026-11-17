@@ -8,6 +8,7 @@ Where the code is: `src/loader/gh_repo.h` (format, verification, install),
 `GhTitlesLoadDir`, `GhTitleMatch`, `GhCfgNum`), `src/loader/launcher_ui.h`
 (`LuiRepoConfig`, `LuiRepoAutoSync`), `corpus/titles/`, `corpus/themes/`,
 `corpus/addons/`.
+How it was found: [launcher-and-library.md](writeups/launcher-and-library.md)
 
 ## Why a repository
 

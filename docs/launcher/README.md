@@ -2,6 +2,7 @@
 
 What this covers: the controller-driven front end you see before a game starts (library wall, title screen, packages, mods, themes, sign-in), the in-game overlay, and the two "manage" features.
 Where the code is: `src/loader/launcher_ui.h` and the `gh_ui*.h`, `gh_theme.h`, `gh_art.h`, `gh_custom.h`, `gh_input.h`, `gh_web.h`, `gh_remote.h`, `gh_site.h` headers beside it.
+How it was found: [launcher-and-library.md](../writeups/launcher-and-library.md) · [theming-and-compat-data.md](../writeups/theming-and-compat-data.md)
 
 ## What the launcher is
 

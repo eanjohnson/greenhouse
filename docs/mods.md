@@ -6,6 +6,7 @@ Where the code is: `src/loader/gh_mods.h` (the mod engine, namespace `ghmods`),
 `src/loader/gh_ovl.h` (loose-file overlay), `src/loader/guest_loader.cpp` (search
 for `ghdoorstop`, `GhModProfileFor`, `GhUe4ssBoot`, `GhModsDotnet6`),
 `src/loader/launcher_ui.h` (search for `LuiMods`), `toolchain/test_gh_mods.cpp`.
+How it was found: [mods-in-the-container.md](writeups/mods-in-the-container.md)
 
 ## Rules
 
@@ -31,7 +32,9 @@ D:\DevelopmentFiles\gh_mods\<titleId>\<profile>\      one profile
     game\                                             loose files overlaid on the game
     _gh\<Owner-Name>.files                            what each package installed
 LocalState\gh_mod_profile.txt                         `<titleId>=<profile>` per line
-LocalState\gh_mod_crash.txt                           crash-recovery state
+LocalState\gh_mod_run.txt                             the last modded launch: title, profile, state, failure streak
+LocalState\gh_mod_crash.txt                           a crash screen saved for the restarted Launcher
+LocalState\gh_launch_once.txt                         "Start without mods" for the next launch only
 ```
 
 `<titleId>` is the `id` of the game's title config (see [packages.md](packages.md)),
@@ -51,8 +54,8 @@ names itself. Each loader is started another way, keeping the loader's own contr
 | Loader | Games | How it is started |
 |---|---|---|
 | BepInEx 5 (Mono) | Unity Mono | "ghdoorstop": the loader already owns the `GetProcAddress` that `UnityPlayer.dll` calls, so it wraps `mono_jit_init_version`, and once the root domain exists it loads `BepInEx\core\BepInEx.Preloader.dll` from the profile and invokes its entry point. BepInEx derives all its paths from the preloader's location, so everything stays in the profile |
-| BepInEx 6 (IL2CPP) | Unity IL2CPP | Hosts CoreCLR from a portable .NET 6 runtime unpacked into the profile's `dotnet\` (`GhModsDotnet6` / `ghmods::EnsureDotnet6` download a pinned archive from the upstream portable-runtime project and check its SHA-256, `kDotnet6Sha256`) and hooks IL2CPP initialisation |
-| MelonLoader | Unity Mono and IL2CPP | The profile's `version.dll` bootstrap is loaded directly; options go on the game's command line |
+| BepInEx 6 (IL2CPP) | Unity IL2CPP | Hosts CoreCLR from the `dotnet\` folder that the BepInEx 6 pack itself installs into the profile, and hooks IL2CPP initialisation |
+| MelonLoader | Unity Mono and IL2CPP | The profile's `version.dll` bootstrap is loaded directly; options go on the game's command line. On IL2CPP it is pointed at a shared portable .NET 6 runtime, unpacked once into `gh_mods\_runtime\dotnet6\dotnet\` (`GhModsDotnet6` / `ghmods::EnsureDotnet6` download a pinned archive from the upstream portable-runtime project and check its SHA-256, `kDotnet6Sha256`) |
 | UE4SS | Unreal Engine | `GhUe4ssBoot` loads the profile's `ue4ss.dll`; the profile's folders are mounted where the mod loader expects them |
 | Loose files | any | Files under the profile's `game\` folder are overlaid on the install folder by the file-system layer (`gh_ovl.h`: `Lookup`, `Merge`). `.shim-removed` tombstones hide a file |
 
@@ -115,11 +118,13 @@ to `LocalState\gh_mods_out.txt`.
 | `update <title> <profile>` | Update every package in the profile |
 | `import <title> <profile> <code>` | Import an r2modman profile code |
 | `importfile <title> <profile> <file.r2z>` | Import a profile file from the `DevelopmentFiles` root |
+| `addfile <title> <profile> <file.zip>` | Install a local mod zip from the `DevelopmentFiles` root by the title's install rules |
 | `list <title> <profile>` | List installed packages |
 | `arm <title> <profile>` | Make this the active profile |
 | `vanilla <title>` | Back to no mods |
 | `delprofile <title> <profile>` | Delete a profile |
 | `dotnet6` | Fetch the portable .NET 6 runtime |
+| `clrprobe` | Test: host CoreCLR in the Launcher and run `GhClrProbe.dll` from the `DevelopmentFiles` root; stop the app afterwards, the runtime stays loaded |
 
 A profile can also arrive as a zip: `D:\DevelopmentFiles\ghmod_<titleId>_<profile>.zip`
 is unpacked into the profile at launch and renamed `*.zip.done`.

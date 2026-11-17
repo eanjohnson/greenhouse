@@ -6,6 +6,7 @@
 
 What this covers: managing a console's library from a phone over the internet through a relay that cannot read or forge the messages: pairing, key agreement, message envelopes, signed commands, replay rules, and what each party can see.
 Where the code is: `src/loader/gh_remote.h` (protocol and poller), the remote section of `src/loader/launcher_ui.h` (what commands do), `toolchain/test_gh_remote.*` and `toolchain/vectors/remote_vectors.json` (tests). The relay and the phone's page live in the separate site repository (`src/lib/remote*.ts`, `src/app/api/remote/`).
+How it was found: [managing-from-a-browser.md](../writeups/managing-from-a-browser.md)
 
 ## Shape
 

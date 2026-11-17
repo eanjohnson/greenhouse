@@ -4,12 +4,13 @@ What this covers: how the loader stands in for USER32 on top of the app's single
 CoreWindow, and how gamepad, keyboard and mouse input reach a guest game.
 Where the code is: `src/loader/guest_loader.cpp` (window beds, message pump, XInput
 beds, display surrogate), `src/loader/gh_input.h` (pad-to-keyboard/mouse profiles),
-`toolchain/mouse_stream.py` and `toolchain/MOUSE_BRIDGE.md` (network mouse).
+`toolchain/mouse_stream_client.py` and `toolchain/MOUSE_BRIDGE.md` (network mouse).
 
 Related: [overview](overview.md), [API shims](api-shims.md),
 [engine notes](engine-notes.md), [graphics](graphics.md),
 [x86 guest](x86-guest.md), [knobs](../reference/knobs.md),
 [diagnostics](../reference/diagnostics.md).
+How it was found: [first-pixels-first-games.md](../writeups/first-pixels-first-games.md) · [tsushima-input-wall.md](../writeups/tsushima-input-wall.md)
 
 ## The situation
 
@@ -288,8 +289,9 @@ cursor for mouse-look does not get a crosshair pinned to the screen edge.
 
 For development without a USB mouse, `NetMouseThread` accepts mouse samples from a PC.
 
-- The console listens on TCP port 55123. The PC side is `toolchain/mouse_stream.py`
+- The console listens on TCP port 55123. The PC side is `toolchain/mouse_stream_client.py`
   (see `toolchain/MOUSE_BRIDGE.md`), which connects to `<console-ip>:55123`.
+  `toolchain/mouse_stream.py` is the older mode in which the PC listens and the console dials out.
 - Each frame is 8 bytes: `0x5A`, a button byte (bit 0 left, bit 1 right, bit 2 middle),
   then little-endian 16-bit `dx`, `dy` and `wheel`.
 - `ApplyMouseSample` is the single injection point. The pad-to-mouse remap uses it too,

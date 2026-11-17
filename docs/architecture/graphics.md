@@ -11,6 +11,7 @@ Related: [overview](overview.md) · [window and input](window-input.md) ·
 [DXIL backporter](dxil-backporter.md) · [memory](memory.md) · [x86 D3D9](x86-d3d9.md) ·
 [knobs](../reference/knobs.md) · [diagnostics](../reference/diagnostics.md) ·
 [known limits](../reference/known-limits.md)
+How it was found: [first-pixels-first-games.md](../writeups/first-pixels-first-games.md) · [spiderman-first-frame.md](../writeups/spiderman-first-frame.md) · [spiderman-gpu-hang.md](../writeups/spiderman-gpu-hang.md) · [shader-cache-and-bake.md](../writeups/shader-cache-and-bake.md)
 
 ---
 

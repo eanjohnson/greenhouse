@@ -9,6 +9,7 @@ hooks, the registry beds), `src/loader/gh_ovl.h` (mod overlay), `src/loader/gh_c
 Related: [overview](overview.md), [API shims](api-shims.md), [PE loading](pe-loading.md),
 [knobs](../reference/knobs.md), [diagnostics](../reference/diagnostics.md),
 [known limits](../reference/known-limits.md).
+How it was found: [a-freeze-that-was-a-crash-dump.md](../writeups/a-freeze-that-was-a-crash-dump.md) · [tsushima-loader-defects.md](../writeups/tsushima-loader-defects.md)
 
 ## Terms
 

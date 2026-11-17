@@ -105,6 +105,7 @@ running, for fixing a game, and for AI coding agents.
 | Packages and title configs | [docs/packages.md](docs/packages.md) |
 | Mods | [docs/mods.md](docs/mods.md) |
 | Compatibility list | [docs/compatibility.md](docs/compatibility.md) |
+| How it was figured out | [docs/writeups/README.md](docs/writeups/README.md) |
 
 ## Contributing
 

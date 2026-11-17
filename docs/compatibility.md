@@ -7,6 +7,7 @@ Where the code is: `corpus/compat/compat.json` (the data), `toolchain/ghcompat.p
 (check and publish), `src/loader/gh_compat.h` (console-side reader, namespace
 `ghcompat`), `src/loader/gh_ui.h` (`GhUiStatusDot`), `src/loader/launcher_ui.h`
 (`LuiLoadCompat`).
+How it was found: [theming-and-compat-data.md](writeups/theming-and-compat-data.md)
 
 ## One source of truth
 

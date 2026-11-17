@@ -3,6 +3,7 @@
 What this covers: how Greenhouse signs in to Steam, lists and downloads the games an account owns, and
 answers a running game's Steam calls. Where the code is: `corpus/addons/steam/` (the add-on),
 `corpus/downloader/` (the Steam network client), `corpus/shims/steam_api64.cpp` (what a game loads).
+How it was found: [steam-multiplayer.md](../writeups/steam-multiplayer.md) · [launcher-and-library.md](../writeups/launcher-and-library.md)
 
 ## Ground rules
 

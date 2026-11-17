@@ -13,6 +13,7 @@ Related pages: [overview](overview.md), [API shims](api-shims.md), [graphics](gr
 [DXIL backporter](dxil-backporter.md), [engine notes](engine-notes.md),
 [knob reference](../reference/knobs.md), [diagnostics](../reference/diagnostics.md),
 [known limits](../reference/known-limits.md).
+How it was found: [spiderman-first-frame.md](../writeups/spiderman-first-frame.md) · [the-commit-ceiling.md](../writeups/the-commit-ceiling.md) · [the-pagers.md](../writeups/the-pagers.md)
 
 ---
 
@@ -241,9 +242,10 @@ instruments in section 9.
 
 - The view ceiling is the operating system's, not ours. Raising `gh_arena_cap_mb` past about
   1 GiB of live view gets refusals, and the guest's own file mappings count against the same total.
-- The ceiling-learning code could ratchet down on a refusal that was really caused by something
-  else in the process. `gh_arena_ceilfix = 1` fixes that. The fix is correct and was worth zero
-  megabytes in practice.
+- The learned live-view ceiling can drop as far as 64 MB with no view mapped. That is not a bug:
+  once the container is full, the operating system refuses a 64 MB map with nothing mapped.
+  `gh_arena_ceilfix = 1` stops the ceiling learning from such refusals, but only
+  `gh_arena_lru` 2 or higher reads the ceiling, so at the shipped lru 1 it changes nothing.
 - Arena pages are spare physical memory, not commit. If physical memory runs short the cost
   appears as disk I/O.
 
@@ -440,8 +442,11 @@ file after use.
   `gh_pso_live_n` (live cap), `gh_pso_spill` (keep interned shader bytes on disk). Pipelines are
   wrapped (`GhPagerWrap`, `GhPsoProxy`), evicted when idle (`GhPagerTrim`) and rebuilt on next use
   (`GhPagerMaterialise`) at `SetPipelineState`, `Reset`, `ExecuteBundle` and command-list creation.
-  It is transparent to the game and **saves approximately nothing**: the shader bytes kept to
-  rebuild pipelines grow as fast as eviction frees. Not enabled in any shipped configuration.
+  It is transparent to the game and **saves approximately nothing**. The shader bytes kept to
+  rebuild pipelines first grew as fast as eviction freed; `gh_pso_spill` moved them to disk, and
+  the score stayed inside the noise floor. What remains is the driver: a released pipeline
+  returns only about 21 of its 38 KiB, so roughly 17 KiB per pipeline is out of the pager's
+  reach. Not enabled in any shipped configuration.
 
 ### 7.4 Loader caches cost more than their size
 
@@ -619,7 +624,7 @@ the opposite.
 | `HeapOptimizeResources` | Returned about 0.1 MB |
 | More file sections to get more mapped view | The view ceiling is per process |
 | "The arena cap is our own number" | **Retracted.** The ~1 GiB live-view ceiling is the operating system's |
-| "625 MB is recoverable by fixing the arena ceiling ratchet" | **Retracted.** The fix is real (`gh_arena_ceilfix`) and memory-neutral |
+| "625 MB is recoverable by fixing the arena ceiling ratchet" | **Retracted.** The ratchet was reporting the container correctly; `gh_arena_ceilfix` is inert at lru 1 |
 | Arena recycling levels 2 and 3 | Regressed. Level 1 is the working one |
 
 **D3D12**

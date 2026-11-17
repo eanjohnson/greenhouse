@@ -11,6 +11,7 @@ Related: [overview](overview.md), [window and input](window-input.md),
 [graphics](graphics.md), [memory](memory.md), [x86 guest](x86-guest.md),
 [x86 D3D9](x86-d3d9.md), [knobs](../reference/knobs.md),
 [known limits](../reference/known-limits.md).
+How it was found: [mods-in-the-container.md](../writeups/mods-in-the-container.md) · [source-on-d3d9on12.md](../writeups/source-on-d3d9on12.md) · [tsushima-loader-defects.md](../writeups/tsushima-loader-defects.md)
 
 Most fixes described here are written as class fixes: they apply to every game on the
 engine, not to one title. Game names appear only as the case where a behaviour was

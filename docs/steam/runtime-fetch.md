@@ -4,6 +4,7 @@ What this covers: how the Valve DLLs the engine build needs get onto the console
 in the repository or in a Greenhouse package. Where the code is: `corpus/addons/steam-runtime/vendor.json`,
 `cmd_vendor` in `toolchain/ghpkg.py`, `FetchFrom` in `src/loader/gh_repo.h`, `kSteamRuntimePin` and
 `GhSteamRuntimeDir` in `src/loader/launcher_ui.h`.
+How it was found: [launcher-and-library.md](../writeups/launcher-and-library.md)
 
 ## Why
 

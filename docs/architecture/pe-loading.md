@@ -11,6 +11,7 @@ Related: [overview.md](overview.md), [api-shims.md](api-shims.md),
 [filesystem-registry.md](filesystem-registry.md), [memory.md](memory.md),
 [x86-guest.md](x86-guest.md), [engine-notes.md](engine-notes.md),
 [../reference/diagnostics.md](../reference/diagnostics.md).
+How it was found: [feasibility-and-first-loader.md](../writeups/feasibility-and-first-loader.md) · [tsushima-loader-defects.md](../writeups/tsushima-loader-defects.md) · [x86-native.md](../writeups/x86-native.md)
 
 This document is about 64-bit (PE32+) guests. A PE32 image is detected in `MapAndRun` and
 handed to `MapAndRun32`; everything after that is in [x86-guest.md](x86-guest.md).
@@ -482,8 +483,8 @@ reading these:
 5. The child's `ExitProcess` becomes `ExitThread` (the exit beds check a per-thread child
    context).
 
-It is enough for the test guests in `corpus/proc/` and for shell scripts in the busybox
-test guest. Its limits are real: parent and child share one heap, one CRT, one set of
+It is enough for the test guests in `corpus/proc/`, including a five-tool shell script
+run by `corpus/proc/minishell.cpp` across three C runtimes. (busybox-w32 never ran.) Its limits are real: parent and child share one heap, one CRT, one set of
 globals in shared DLLs, one command line (it is not restored for the parent), and a child
 crash is a parent crash.
 

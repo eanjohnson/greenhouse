@@ -190,7 +190,7 @@ The variables `iterate-launcher.sh` reads are listed under
 
 ```
 export GH_TOOLS=$HOME/gh-tools            # holds gen_steamdef.py and wdp.py, see the known gap below
-export GH_XBOX=<console-ip>:11443         # checked before the build even with GH_PACK_ONLY=1
+export GH_XBOX=<console-ip>:11443         # only read when deploying; not needed with GH_PACK_ONLY=1
 export GH_PFX_PASS=<your .pfx passphrase>
 GH_PACK_ONLY=1 GH_BUNDLE_FIRSTPARTY=0 toolchain/iterate-launcher.sh 0.0.1.0 0.0.0.0
 ```
@@ -339,7 +339,7 @@ is unset stops the script with a message naming it.
 | Variable | Default | Meaning |
 |---|---|---|
 | `GH_TOOLS` | **required** | Directory holding the out-of-tree helpers (`gen_steamdef.py`, `wdp.py`). Also used as scratch by some slots. See the [known gap](#known-gap-helpers-in-gh_tools-to-be-added) |
-| `GH_XBOX` | **required** | `<console-ip>:11443`, the console's Device Portal. Checked before the build starts, so it is needed even with `GH_PACK_ONLY=1` (any value will do then) |
+| `GH_XBOX` | **required** to deploy | `<console-ip>:11443`, the console's Device Portal. Read only on the deploy path; not needed with `GH_PACK_ONLY=1` |
 | `GH_PFX` | `toolchain/signing/greenhouse.pfx` | The signing key. Its certificate subject must be `CN=Greenhouse`, or the package becomes a different app instead of an update |
 | `GH_PFX_PASS_FILE` | empty | A file holding the `.pfx` passphrase. `osslsigncode` reads it itself (`-readpass`), so the passphrase never appears on a command line. Takes precedence over `GH_PFX_PASS` |
 | `GH_PFX_PASS` | **required** unless `GH_PFX_PASS_FILE` is set | Passphrase of the `.pfx`, passed on `osslsigncode`'s command line |

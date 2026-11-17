@@ -5,6 +5,7 @@ What this covers: the loader's diagnostic log, what its line prefixes mean, the 
 Where the code is: `src/loader/guest_loader.cpp` (`Diag`, `GhDiagDir`, `CrashObserverVeh`,
 `ArmGuestTracepoints`, `HandleGuestTracepoint`, `SnapshotHostThreads`), with helpers in `toolchain/`
 (`ghsym.py`, `guestdis.py`, `ghwitness.py`).
+How it was found: [a-freeze-that-was-a-crash-dump.md](../writeups/a-freeze-that-was-a-crash-dump.md) · [spiderman-gpu-hang.md](../writeups/spiderman-gpu-hang.md)
 
 There is no debugger attached to a sideloaded app on a retail console in Dev Mode, and the process can
 disappear without an exception. Almost everything known about a failure comes from one text log, so the
@@ -114,7 +115,7 @@ Every line starts with a short upper-case tag. The common ones:
 | `X86` | 32-bit track | x86 guest loader, interpreter/JIT and native-mode events. |
 | `MODS`, `REPO`, `LAUNCHER`, `SCLIENT` | launcher side | Mod overlay, package repository, launcher, Steam client. Covered in the launcher and Steam docs. |
 
-Prefixes such as `RTTEST`, `XFW`, `TILEDPROBE`, `DXILSOAK`, `SCGQ` belong to investigation knobs (see
+Prefixes such as `RTTEST`, `XFW`, `TILEDPROBE`, `DXILSOAK`, `SCGQ`, `CLREC`, `SUBCENSUS` belong to investigation knobs (see
 `docs/reference/knobs.md`, section 5) and only appear when one is set.
 
 ## 4. The two periodic lines
@@ -242,6 +243,32 @@ instruction pointer. Consumed.
 
 Writes `LocalState\gh_snap.bmp`, a 480x270 copy of the current back buffer, and logs `SNAP n=... present=...`.
 A cheap way to see what is on screen without video capture. Consumed.
+
+### Command-list recorder (`gh_clrec.h`)
+
+`src/loader/gh_clrec.h` records the stream commands of the guest's D3D12 DIRECT command lists, in call
+order, with array arguments deep-copied into a per-list arena. It exists to localise a GPU hang by
+moving or measuring the game's own command stream without changing its content. It was built for the
+Spider-Man hang (see [../architecture/graphics.md](../architecture/graphics.md#13-diagnosing-a-gpu-hang-summary)).
+Four knobs drive it, all default 0 and read once, on first use (`docs/reference/knobs.md`, section 5):
+
+| Knob | Effect |
+|---|---|
+| `gh_cl_rec` = 1 | Replays each submission's recorded stream from one loader-owned list; the guest's own lists are submitted empty. Only the list object changes |
+| `gh_cl_split` = N | As `gh_cl_rec`, but cut into N consecutive lists (at most 32) on the guest's queue. N = 1 is the control |
+| `gh_cl_dup` = K | Runs each submission K extra times alongside the guest's own, which keeps its commands. Adding 256 drops barriers from the copies |
+| `gh_sub_census` = N | Changes nothing. Logs one `SUBCENSUS` line per submission before it is executed, so the fatal one still gets a line. N > 1 stops after N submissions; 1 means no limit |
+
+A `SUBCENSUS` line counts what one submission references: lists, recorded ops, draws, dispatches,
+barriers, and the distinct resources, GPU addresses, descriptor tables, heaps and pipeline states, with
+their address ranges. It ends with up to two `vs #N reuse...` comparisons against earlier submissions
+of the same shape. `gh_cl_split` logs a `CLSPLIT` line for the first eight submissions and every 64th after. At device removal,
+`CLRECSTATS` gives the totals (`ops=`, `replays=`, `pieces=`, `starved=`, `overflow=`, `broken=`).
+
+A run is void, not a negative result, when the log shows a `CLREC ... this run is VOID` line (a list
+went over 262144 ops or 32 MB of arguments, or a command the recorder does not handle) or
+`overflow=` or `broken=` is not 0. Compare every run with a same-build control, and use `gh_cl_census`
+first to see which command-list methods the game calls.
 
 ## 8. Reading a failed launch
 

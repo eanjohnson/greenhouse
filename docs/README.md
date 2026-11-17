@@ -1,7 +1,7 @@
 # Greenhouse developer documentation
 
 What this covers: an index of every document in `docs/`, and the order to read them
-in for three common goals.
+in for four common goals.
 Where the code is: `src/loader/` (the app), `corpus/` (data, shims, add-ons shipped
 with or beside it), `toolchain/` (build, packaging, deploy and test tools),
 `tests/` (host tests for the 32-bit track).
@@ -47,6 +47,16 @@ that core.
    deploy to, restart or send input to a device unless the person you work for has
    asked for that.
 
+### (d) I want to know how it was figured out
+
+1. [writeups/README.md](writeups/README.md) — the investigation write-ups, with a
+   suggested order.
+2. [writeups/notebook-sections.md](writeups/notebook-sections.md) — what the `§NN`
+   and `#NNN` citations in source comments mean, and where each is written up.
+3. [architecture/memory.md](architecture/memory.md) and
+   [reference/known-limits.md](reference/known-limits.md) — the outcomes those
+   investigations left behind.
+
 ## All documents
 
 ### Getting it running
@@ -71,6 +81,8 @@ that core.
 | [architecture/memory.md](architecture/memory.md) | The container's memory limit and what is done about it |
 | [architecture/x86-guest.md](architecture/x86-guest.md) | Running 32-bit games |
 | [architecture/engine-notes.md](architecture/engine-notes.md) | Per-engine notes (Unity, Unreal, Source and others) |
+| [architecture/mod-engine.md](architecture/mod-engine.md) | Inside the mod engine: loader start-up paths, IL2CPP and CoreCLR, the Unreal shimloader, safety and recovery |
+| [security.md](security.md) | One threat model: the package trust chain, inert themes, the LAN server, the relay, crash reports, what a custom game can reach |
 
 ### Reference
 
@@ -79,6 +91,7 @@ that core.
 | [reference/knobs.md](reference/knobs.md) | Every runtime setting and the title config format |
 | [reference/diagnostics.md](reference/diagnostics.md) | The diagnostic log and the instruments |
 | [reference/known-limits.md](reference/known-limits.md) | What does not work and why |
+| [reference/toolchain.md](reference/toolchain.md) | Every tracked script and test tool, what it needs, and whether it touches a device |
 
 ### Launcher
 
@@ -90,6 +103,7 @@ that core.
 | [launcher/library.md](launcher/library.md) | Library sources, how rows are found and resolved, art, play time |
 | [launcher/input.md](launcher/input.md) | Controller handling, on-screen keyboard, synthetic pad, pad-to-keyboard profiles |
 | [launcher/overlay.md](launcher/overlay.md) | The in-game overlay and QR pages |
+| [launcher/crash-report.md](launcher/crash-report.md) | The crash screen, the scrubber, and the opt-in crash report |
 | [launcher/web-manage.md](launcher/web-manage.md) | Managing the console from a browser on the local network |
 | [launcher/remote-manage.md](launcher/remote-manage.md) | Managing from outside the local network. Compiled out by default (`GH_REMOTE_RELAY`) until a new console authentication scheme exists |
 
@@ -108,6 +122,7 @@ that core.
 | File | Contents |
 |---|---|
 | [packages.md](packages.md) | Repository format and trust chain, `toolchain/ghpkg.py`, title configs and matching, add-ons, themes as packages, local overrides |
+| [addons.md](addons.md) | The add-on C ABI field by field, how an add-on is loaded and verified, writing one from the sample |
 | [mods.md](mods.md) | Mod loaders in the container, Thunderstore integration, profiles, rules |
 | [compatibility.md](compatibility.md) | The compatibility dataset, status marks, adding a result, the smoke matrix |
 
@@ -118,6 +133,13 @@ that core.
 | [contributing/fixing-a-game.md](contributing/fixing-a-game.md) | From a failing game to a verified fix; class fixes; test discipline |
 | [contributing/testing.md](contributing/testing.md) | Host tests, the x86 tests, UI and web harnesses, what needs a console |
 
+### Write-ups (how it was figured out)
+
+| File | Contents |
+|---|---|
+| [writeups/README.md](writeups/README.md) | Index of the twenty investigation write-ups, grouped by area, with a reading order |
+| [writeups/notebook-sections.md](writeups/notebook-sections.md) | Every `§NN` and `#NNN` cited in the code: its final conclusion and where it is written up |
+
 ## Conventions in these documents
 
 - Paths are relative to the repository root. Console paths use backslashes.
@@ -126,6 +148,10 @@ that core.
   not given because they change.
 - If a document and the source disagree, the source is right; please fix the
   document.
+- Source comments cite the project's lab notebook as `§NN` (a section) and `#NNN`
+  (an issue). The notebook itself is private and full of later-retracted working;
+  [writeups/notebook-sections.md](writeups/notebook-sections.md) is the public key
+  to those citations.
 
 ## Project rules that apply everywhere
 

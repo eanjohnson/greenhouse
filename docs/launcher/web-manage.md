@@ -2,6 +2,7 @@
 
 What this covers: the small web server the launcher can run on the home network so a PC browser can add, run and remove the user's own games; its endpoints, pairing, and security model.
 Where the code is: `src/loader/gh_web.h` (server), `src/loader/gh_custom.h` (store and API), the web section of `src/loader/launcher_ui.h`, the page `corpus/web/console.html`, and the host tools `toolchain/ghweb_host.*` and `toolchain/test_gh_web.*`.
+How it was found: [managing-from-a-browser.md](../writeups/managing-from-a-browser.md)
 
 ## What it is
 

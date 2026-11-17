@@ -10,6 +10,7 @@ Where the code is: `toolchain/dxil/` (the passes, host side, Python), `toolchain
 Related: [graphics](graphics.md) · [memory](memory.md) · [engine notes](engine-notes.md) ·
 [knobs](../reference/knobs.md) · [diagnostics](../reference/diagnostics.md) ·
 [known limits](../reference/known-limits.md)
+How it was found: [sm66-on-a-65-driver.md](../writeups/sm66-on-a-65-driver.md) · [shader-correctness.md](../writeups/shader-correctness.md) · [shader-cache-and-bake.md](../writeups/shader-cache-and-bake.md)
 
 ---
 
@@ -162,7 +163,7 @@ the machine keeps its real width.
 
 | Opcode | Intrinsic | Becomes |
 |---|---|---|
-| 110 | `WaveIsFirstLane` | `WaveGetLaneIndex() == 0` |
+| 110 | `WaveIsFirstLane` | `true` (every lane is the first lane of its own wave; the earlier `WaveGetLaneIndex() == 0` broke wave-aggregated atomics, because the other lanes then read an undefined base) |
 | 111, 113 | lane index, any true | left alone (they compile) |
 | 112 | lane count | 64 |
 | 114 | all true | the condition |

@@ -2,6 +2,7 @@
 
 What this covers: the `greenhouse.theme/1` format, where themes come from, the Themes page, and how to write a theme.
 Where the code is: `src/loader/gh_theme.h` (tokens, parser, store), `src/loader/gh_ui.h` (applies a theme), `corpus/themes/`, `corpus/theme_packages/`.
+How it was found: [theming-and-compat-data.md](../writeups/theming-and-compat-data.md)
 
 ## Model
 
