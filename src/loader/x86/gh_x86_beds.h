@@ -680,6 +680,13 @@ inline void install(Machine& m, Machine::GuestDll& d)
 // they are tagged the way thread and sync handles already are.
 constexpr uint32_t kWndTag   = 0x57480000u;   // 'WH'
 constexpr uint32_t kFakeHwnd = kWndTag | 1u;
+// The window input, focus and activation belong to: the most recent top-level
+// window made at the game's size. It starts as kFakeHwnd. Every top-level
+// window has its own HWND and procedure; until 0.0.978.0 they all shared
+// kFakeHwnd, and Adobe AIR's hidden "messaging" window lost its procedure to
+// the content window made after it, so the messages AIR posts to itself went
+// to the wrong procedure and the player waited for ever.
+inline std::atomic<uint32_t> g_x86_main_hwnd{kFakeHwnd};
 constexpr uint32_t kFakeHdc  = 0x44430001u;   // 'DC'
 constexpr uint32_t kFakeMonitor = 0x4D4E0001u;   // 'MN'
 
@@ -692,7 +699,7 @@ inline void write_msg32(uint32_t at, uint32_t message, uint32_t wparam, uint32_t
                         int32_t ptx = 0, int32_t pty = 0)
 {
     if (!at) return;
-    const uint32_t v[7] = { kFakeHwnd, message, wparam, lparam,
+    const uint32_t v[7] = { g_x86_main_hwnd.load(), message, wparam, lparam,
                             (uint32_t)GetTickCount(), (uint32_t)ptx, (uint32_t)pty };
     std::memcpy((void*)(uintptr_t)at, v, sizeof(v));
 }
@@ -731,6 +738,42 @@ inline uint32_t wndproc_for(Machine& m, uint32_t hwnd)
 {
     auto it = m.bed.sub_windows.find(hwnd);
     return it == m.bed.sub_windows.end() ? m.bed.wndproc : it->second.proc;
+}
+
+// WM_SIZE with the window's client size, which for a game window is the
+// framebuffer. Windows sends it from CreateWindowEx (after WM_CREATE) and
+// whenever SetWindowPos/MoveWindow/ShowWindow change the size; we sent it
+// never. Adobe AIR keeps stage.stageWidth/Height at its window's creation
+// size until a WM_SIZE says otherwise, so a stage that went full screen kept
+// its 800x500 size: SFPA's "resize" handler never ran, its HUD and its
+// fade-to-white layer stayed at 1:1 in the top-left 816x513 of the screen,
+// and the white of a finished fade covered that corner for good.
+// Every window we made is framebuffer-sized (GetClientRect says so for any
+// of them), so every one of them gets it. 0.0.1001 sent it only to the newest
+// top-level window, and AIR's stage window is not that: AIR makes a 550x400
+// window after it, so the SetWindowPos that takes the stage full screen sent
+// nothing and the stage stayed 800x500.
+// Only on the owner thread: a window procedure run on another thread is how
+// AIR's player lock was left held (peek_message32). Others get it posted.
+inline void x86_send_size(Machine& m, uint32_t hwnd, const char* why)
+{
+    if (hwnd != kFakeHwnd && !m.bed.sub_windows.count(hwnd)) return;   // not a window of ours
+    const uint32_t proc = wndproc_for(m, hwnd);
+    if (!proc) return;
+    const uint32_t lp = (m.bed.win_h << 16) | (m.bed.win_w & 0xFFFF);
+    static std::atomic<int> logged{0};
+    const DWORD owner = wndq_owner(hwnd);
+    const bool cross = owner && owner != GetCurrentThreadId();
+    if (logged.fetch_add(1) < 12)
+        log("X86 WM_SIZE " + std::to_string(m.bed.win_w) + "x" + std::to_string(m.bed.win_h) + " -> " + hex(hwnd)
+            + " (" + why + (cross ? ", posted to its thread)" : ")"));
+    if (cross) { wndq_post(hwnd, WM_SIZE, SIZE_RESTORED, lp); return; }
+    thread_local int depth = 0;           // a WM_SIZE handler that moves its own window
+    if (depth) return;
+    ++depth;
+    uint32_t sz[4] = { hwnd, WM_SIZE, SIZE_RESTORED, lp };
+    m.call_guest32(proc, sz, 4);
+    --depth;
 }
 
 // A class name as the key RegisterClass and CreateWindowEx agree on: lowercased,
@@ -802,14 +845,94 @@ inline uint64_t x86_create_window(Machine& m, const uint32_t* a, bool wide, cons
     if (child || (m.bed.main_window_made && !game_sized)) {
         hwnd = kWndTag | m.bed.next_sub_hwnd++;
         m.bed.sub_windows[hwnd].proc = proc;
+    } else if (m.bed.main_window_made) {
+        // A second game-sized top-level window (HL2's real 1920x1080 one after
+        // its CW_USEDEFAULT one; AIR's content window after its messaging
+        // window). It gets its own HWND and procedure and becomes the game
+        // window; the earlier one keeps kFakeHwnd and its own procedure.
+        hwnd = kWndTag | m.bed.next_sub_hwnd++;
+        m.bed.sub_windows[hwnd].proc = proc;
+        wndq_note_window(hwnd);               // owner known before peeks can see it
+        g_x86_main_hwnd = hwnd;
+        // And it is the one that is activated and focused, so the activation
+        // sequence (peek_message32) plays again, addressed to it. AIR's first
+        // window is a hidden messaging window and the sequence had already been
+        // spent on it: the content window, where every key and click arrives,
+        // never had WM_ACTIVATE or WM_SETFOCUS, and the stage ignored all input.
+        m.bed.inject_idx = 0;
     } else {
         if (proc) m.bed.wndproc = proc;
         m.bed.main_window_made = true;
+        g_x86_main_hwnd = kFakeHwnd;          // a new run's first window
     }
+    wndq_note_window(hwnd);
     log(std::string("X86 ") + who + " " + std::to_string(w) + "x" + std::to_string(h) +
         " style=" + hex(a[3]) + " proc=" + hex(proc) + " -> " +
-        (hwnd == kFakeHwnd ? "game HWND " : "sub HWND ") + hex(hwnd));
+        (hwnd == g_x86_main_hwnd.load() ? "game HWND " : "sub HWND ") + hex(hwnd));
+    // Windows sends WM_NCCREATE and WM_CREATE from inside CreateWindowEx, and
+    // ATL depends on it: its start procedure binds the C++ window object to
+    // the HWND (m_hWnd, and the thunk it installs with SetWindowLong) on the
+    // window's FIRST message. With no message here, every ATL window (all of
+    // Adobe AIR's) kept m_hWnd == 0 until something happened to dispatch to
+    // it. AIR's frame-tick thread posts WM_USER+1 to its player window's
+    // m_hWnd and waits for that tick to be handled before posting the next;
+    // a second player window made at level start, ticked before its first
+    // message, got the tick posted to HWND 0 -- the tick thread's own queue,
+    // which nobody reads -- and the game froze for good (SFPA, 1 run in 3).
+    // The frame is built from the guest's own arguments (CREATESTRUCTW and
+    // CreateWindowExW take the same twelve values, in reverse order).
+    if (proc) {
+        const uint32_t cs = m.heap_alloc(48, true);
+        if (cs) {
+            uint32_t* p = (uint32_t*)(uintptr_t)cs;
+            p[0] = a[11]; p[1] = a[10]; p[2] = a[9]; p[3] = a[8];      // lpCreateParams hInstance hMenu hwndParent
+            p[4] = a[7]; p[5] = a[6]; p[6] = a[5]; p[7] = a[4];        // cy cx y x
+            p[8] = a[3]; p[9] = a[2]; p[10] = a[1]; p[11] = a[0];      // style lpszName lpszClass dwExStyle
+            uint32_t nc[4] = { hwnd, WM_NCCREATE, 0, cs };
+            const uint64_t ok = m.call_guest32(wndproc_for(m, hwnd), nc, 4);
+            uint32_t cr[4] = { hwnd, WM_CREATE, 0, cs };
+            const uint64_t r = m.call_guest32(wndproc_for(m, hwnd), cr, 4);
+            // Windows fails the creation on WM_NCCREATE == FALSE or WM_CREATE
+            // == -1. Only the second is honoured: a FALSE from a procedure that
+            // passed WM_NCCREATE to a DefWindowProc we answer wrongly would
+            // otherwise cost the game its window, so it is logged instead.
+            if ((uint32_t)ok == 0 || (int32_t)r == -1)
+                log("X86 " + std::string(who) + " " + hex(hwnd) + " WM_NCCREATE -> " + hex((uint32_t)ok) +
+                    " WM_CREATE -> " + hex((uint32_t)r) + ((int32_t)r == -1 ? " (creation refused)" : ""));
+            if ((int32_t)r == -1) {
+                m.bed.sub_windows.erase(hwnd);
+                if (hwnd == g_x86_main_hwnd.load() && hwnd != kFakeHwnd) g_x86_main_hwnd = kFakeHwnd;
+                return 0;
+            }
+            x86_send_size(m, hwnd, "CreateWindowEx");
+        }
+    }
     return hwnd;
+}
+
+// RegisterWindowMessage: the same id for the same name (case-insensitive),
+// a new one in 0xC000..0xFFFF for each new name.
+inline uint64_t register_window_message(uint32_t name, bool wide)
+{
+    if (!name) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    std::string key;
+    for (uint32_t i = 0; i < 256; ++i) {
+        const uint32_t c = wide ? ((const uint16_t*)(uintptr_t)name)[i] : ((const uint8_t*)(uintptr_t)name)[i];
+        if (!c) break;
+        key += (char)((c < 0x80) ? std::tolower((int)c) : '?');
+        if (c >= 0x80) key += std::to_string(c);
+    }
+    if (key.empty()) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    static std::mutex mu;
+    static std::unordered_map<std::string, uint32_t> ids;
+    static uint32_t next = 0xC001;
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = ids.find(key);
+    if (it != ids.end()) return it->second;
+    if (next > 0xFFFF) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return 0; }
+    ids.emplace(key, next);
+    log("X86 RegisterWindowMessage " + key + " -> " + hex(next));
+    return next++;
 }
 
 inline uint64_t peek_message32(Machine& m, uint32_t msg_ptr, uint32_t mn, uint32_t mx, bool remove,
@@ -818,13 +941,28 @@ inline uint64_t peek_message32(Machine& m, uint32_t msg_ptr, uint32_t mn, uint32
     static const UINT kSeq[] = { WM_ACTIVATEAPP, WM_ACTIVATE, WM_SETFOCUS, WM_NCACTIVATE };
     if (!msg_ptr || !m.bed.wndproc) return 0;
     auto admits = [&](UINT msg) { return (!mn && !mx) || (msg >= mn && msg <= mx); };
-    if (m.bed.inject_idx < (int)(sizeof(kSeq) / sizeof(kSeq[0]))) {
+    // A filter that does not admit the next activation message (a window
+    // filter for another window, or a range like AIR's PeekMessage(0x401,0x401))
+    // sees the rest of the queue as usual; the sequence waits for an unfiltered
+    // read. It can now play mid-run, when a new game window appears.
+    // Only the thread that owns the window gets it, as on Windows, where these
+    // are sent to the window's own thread. AIR creates its stage windows on a
+    // second thread; when the main thread took the sequence instead, the
+    // window's handlers ran on the wrong thread, AIR's player lock was left
+    // owned by the window thread, and the main thread spun on it for good
+    // (SFPA stopped before its menu, about one start in two).
+    const uint32_t main_hwnd = g_x86_main_hwnd.load();
+    const DWORD main_owner = wndq_owner(main_hwnd);
+    if (m.bed.inject_idx < (int)(sizeof(kSeq) / sizeof(kSeq[0])) &&
+        admits(kSeq[m.bed.inject_idx]) &&
+        (hwnd_filter == 0 || hwnd_filter == main_hwnd) &&
+        (!main_owner || main_owner == GetCurrentThreadId())) {
         const UINT msg = kSeq[m.bed.inject_idx];
-        if (!admits(msg)) return 0;
         // WA_ACTIVE and TRUE are both 1, but they are different things being said.
         write_msg32(msg_ptr, msg, (msg == WM_ACTIVATE) ? (uint32_t)WA_ACTIVE : 1u, 0);
         if (remove) {
-            if (m.bed.inject_idx == 0) log("X86 injecting activation sequence -> guest WndProc");
+            if (m.bed.inject_idx == 0) log("X86 injecting activation sequence -> guest window " + hex(main_hwnd)
+                                           + " on tid " + std::to_string(GetCurrentThreadId()));
             ++m.bed.inject_idx;
         }
         return 1;
@@ -927,6 +1065,74 @@ struct RegApi {
     decltype(&::RegDeleteValueA)  DeleteValueA  = &::RegDeleteValueA;
 };
 inline RegApi g_reg;
+
+// The one display adapter SetupAPI reports, filled in by the Launcher from DXGI
+// (GhBuildSyntheticDisplayDevice, which also puts its driver key in the hive).
+// Unset on x86host, where the display class stays empty.
+struct X86DisplayDevice { std::wstring desc, inst_id, driver; };
+inline bool (*g_x86_display_device)(X86DisplayDevice&) = nullptr;
+// GUID_DEVCLASS_DISPLAY, spelled out to avoid needing an INITGUID unit.
+inline constexpr GUID kX86DisplayClassGuid =
+    { 0x4d36e968, 0xe325, 0x11ce, { 0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18 } };
+inline constexpr uint32_t kX86SynthDevInfo = 0x67480001;   // the set's HDEVINFO
+// The adapter's strings are ASCII (ids, a driver key, a DXGI description).
+inline std::string ascii_of(const std::wstring& w)
+{
+    std::string s;
+    for (wchar_t c : w) s += (c > 0 && c < 0x80) ? (char)c : '?';
+    return s;
+}
+
+template <bool wide>
+uint64_t setupdi_class_devs(Machine&, const uint32_t* a)
+{
+    X86DisplayDevice dev;
+    const GUID* cls = (const GUID*)(uintptr_t)a[0];
+    bool pci = false;
+    if (a[1]) pci = wide ? _wcsicmp((const wchar_t*)(uintptr_t)a[1], L"PCI") == 0
+                         : _stricmp((const char*)(uintptr_t)a[1], "PCI") == 0;
+    const bool display = cls && !(a[3] & DIGCF_DEVICEINTERFACE) &&
+                         std::memcmp(cls, &kX86DisplayClassGuid, sizeof(GUID)) == 0;
+    if ((display || pci) && g_x86_display_device && g_x86_display_device(dev)) {
+        static int logged = 0;
+        if (logged++ < 4) log("X86 SetupDiGetClassDevs(" + std::string(display ? "display class" : "PCI") +
+                              ") -> synthetic adapter, driver " + ascii_of(dev.driver));
+        return kX86SynthDevInfo;
+    }
+    SetLastError(ERROR_INVALID_DATA);
+    return 0xFFFFFFFFu;                     // INVALID_HANDLE_VALUE
+}
+
+template <bool wide>
+uint64_t setupdi_registry_property(Machine&, const uint32_t* a)
+{
+    X86DisplayDevice dev;
+    if (a[0] != kX86SynthDevInfo || !g_x86_display_device || !g_x86_display_device(dev)) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    std::wstring v;
+    switch (a[2]) {
+        case SPDRP_CLASS:        v = L"Display"; break;
+        case SPDRP_CLASSGUID:    v = L"{4d36e968-e325-11ce-bfc1-08002be10318}"; break;
+        case SPDRP_DEVICEDESC:
+        case SPDRP_FRIENDLYNAME: v = dev.desc; break;
+        case SPDRP_HARDWAREID:   v = dev.inst_id; break;
+        case SPDRP_DRIVER:       v = dev.driver; break;
+        case SPDRP_MFG:          v = L"Microsoft"; break;
+        default:
+            log("X86 SetupDiGetDeviceRegistryProperty prop=" + std::to_string(a[2]) + " unsupported");
+            SetLastError(ERROR_INVALID_DATA);
+            return 0;
+    }
+    std::string nv = ascii_of(v);
+    const uint32_t need = wide ? (uint32_t)((v.size() + 1) * 2) : (uint32_t)(nv.size() + 1);
+    if (a[3]) { const uint32_t t = REG_SZ; std::memcpy((void*)(uintptr_t)a[3], &t, 4); }
+    if (a[6]) std::memcpy((void*)(uintptr_t)a[6], &need, 4);
+    if (!a[4] || a[5] < need) { SetLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
+    std::memcpy((void*)(uintptr_t)a[4], wide ? (const void*)v.c_str() : (const void*)nv.c_str(), need);
+    return 1;
+}
 
 inline void RegisterPtrToPtrBeds(ThunkRegistry& R)
 {
@@ -1046,9 +1252,23 @@ inline void RegisterPtrToPtrBeds(ThunkRegistry& R)
             // that exists, and it is guest code -- reached through the same
             // call_guest32 path SendMessage uses.
             uint32_t r = 0;
-            if (m.bed.wndproc) {
-                uint32_t args[4] = { a[0], a[1], a[2], a[3] };
-                r = m.call_guest32(m.bed.wndproc, args, 4);
+            const uint32_t hwnd = a[0] == 0xFFFFu ? g_x86_main_hwnd.load() : a[0];   // HWND_BROADCAST
+            if (const uint32_t proc = wndproc_for(m, hwnd)) {
+                uint32_t args[4] = { hwnd, a[1], a[2], a[3] };
+                r = m.call_guest32(proc, args, 4);
+            }
+            if (a[6]) std::memcpy((void*)(uintptr_t)a[6], &r, 4);
+            return 1;
+        });
+
+    static_assert(thunk_bytes_of(&::SendMessageTimeoutW) == 28, "SendMessageTimeoutW");
+    GH_X86_BED(R, "user32.dll", "SendMessageTimeoutW", 28,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            uint32_t r = 0;
+            const uint32_t hwnd = a[0] == 0xFFFFu ? g_x86_main_hwnd.load() : a[0];   // HWND_BROADCAST
+            if (const uint32_t proc = wndproc_for(m, hwnd)) {
+                uint32_t args[4] = { hwnd, a[1], a[2], a[3] };
+                r = m.call_guest32(proc, args, 4);
             }
             if (a[6]) std::memcpy((void*)(uintptr_t)a[6], &r, 4);
             return 1;
@@ -1251,6 +1471,547 @@ inline uint64_t overlapped_io32(Machine& m, const uint32_t* a, bool write)
     signal_guest_event(m, g.event);
     if (!rc) SetLastError(err);
     return (uint32_t)rc;
+}
+
+// ---------------------------------------------------------------------------
+// Adobe AIR gaps (Super Fancy Pants Adventure, app 668210)
+// ---------------------------------------------------------------------------
+// An AIR "captive runtime" game is a 160 KB launcher exe plus the 20 MB
+// Adobe AIR.dll, which imports about 800 names. A static audit of the runtime
+// against this table found ~160 with no bed, forward or stub. They go in one
+// batch for the same reason the Half-Life 1 gap did: an unresolved import is
+// fatal only when called, and finding them one deploy at a time costs a
+// deploy per name. The honest-failure ones (menus, DDE, printing, the
+// clipboard, colour management...) are stubs in toolchain/genstubs.py; what
+// needs real behaviour is here.
+
+// The resource API over a guest PE32 image. The x86 track maps every section
+// of the exe and its DLLs, .rsrc included, so a resource is just a walk of the
+// image's own resource directory. HRSRC is the guest address of the leaf's
+// IMAGE_RESOURCE_DATA_ENTRY; LoadResource/LockResource return the data itself
+// (a module's resources stay mapped for its lifetime, as on Windows).
+inline bool rsrc_module_ok(Machine& m, uint32_t base)
+{
+    if (base == m.image_base) return true;
+    for (auto& d : m.dlls) if (d.base == base) return true;
+    return false;
+}
+inline uint32_t rsrc_root(uint32_t base, uint32_t* size_out = nullptr)
+{
+    const uint8_t* b = (const uint8_t*)(uintptr_t)base;
+    uint32_t lfanew = 0; std::memcpy(&lfanew, b + 0x3C, 4);
+    const uint8_t* nt = b + lfanew;
+    uint16_t magic = 0; std::memcpy(&magic, nt + 24, 2);
+    if (magic != 0x10B) return 0;                       // PE32 only on this track
+    uint32_t ndirs = 0; std::memcpy(&ndirs, nt + 24 + 92, 4);
+    if (ndirs < 3) return 0;
+    uint32_t rva = 0, sz = 0;
+    std::memcpy(&rva, nt + 24 + 96 + 2 * 8, 4);
+    std::memcpy(&sz,  nt + 24 + 96 + 2 * 8 + 4, 4);
+    if (size_out) *size_out = sz;
+    return rva ? base + rva : 0;
+}
+// A type or name argument: an integer id when the high word is zero, "#123"
+// for an id written as a string, otherwise a name compared case-insensitively
+// (the resource compiler stores names upper-cased).
+struct RsrcKey { bool is_id = true; uint32_t id = 0; std::wstring name; };
+inline RsrcKey rsrc_key_w(uint32_t p)
+{
+    RsrcKey k;
+    if ((p >> 16) == 0) { k.id = p; return k; }
+    const wchar_t* w = (const wchar_t*)(uintptr_t)p;
+    if (*w == L'#') { k.id = (uint32_t)std::wcstoul(w + 1, nullptr, 10); return k; }
+    k.is_id = false;
+    for (; *w; ++w) k.name += (wchar_t)towupper(*w);
+    return k;
+}
+inline RsrcKey rsrc_key_a(uint32_t p)
+{
+    RsrcKey k;
+    if ((p >> 16) == 0) { k.id = p; return k; }
+    const char* s = (const char*)(uintptr_t)p;
+    if (*s == '#') { k.id = (uint32_t)std::strtoul(s + 1, nullptr, 10); return k; }
+    k.is_id = false;
+    for (; *s; ++s) k.name += (wchar_t)towupper((unsigned char)*s);
+    return k;
+}
+// One level of the directory: the entry matching `k` (or, with any_lang, the
+// preferred language: `lang` if present, else neutral, else en-US, else the
+// first). Returns the entry's OffsetToData word, or ~0u.
+inline uint32_t rsrc_find(uint32_t root, uint32_t dir, const RsrcKey* k, int lang)
+{
+    const uint8_t* d = (const uint8_t*)(uintptr_t)(root + dir);
+    uint16_t nnamed = 0, nids = 0;
+    std::memcpy(&nnamed, d + 12, 2); std::memcpy(&nids, d + 14, 2);
+    const uint32_t n = (uint32_t)nnamed + nids;
+    uint32_t first = ~0u, neutral = ~0u, enus = ~0u;
+    for (uint32_t i = 0; i < n && i < 4096; ++i) {
+        uint32_t nm = 0, off = 0;
+        std::memcpy(&nm, d + 16 + i * 8, 4); std::memcpy(&off, d + 16 + i * 8 + 4, 4);
+        if (k) {
+            if (k->is_id) { if (!(nm & 0x80000000u) && nm == k->id) return off; continue; }
+            if (!(nm & 0x80000000u)) continue;
+            const uint8_t* s = (const uint8_t*)(uintptr_t)(root + (nm & 0x7FFFFFFFu));
+            uint16_t len = 0; std::memcpy(&len, s, 2);
+            if (len != k->name.size()) continue;
+            bool eq = true;
+            for (uint16_t j = 0; j < len && eq; ++j) {
+                uint16_t c = 0; std::memcpy(&c, s + 2 + j * 2, 2);
+                eq = (wchar_t)towupper(c) == k->name[j];
+            }
+            if (eq) return off;
+            continue;
+        }
+        if (first == ~0u) first = off;
+        if (lang >= 0 && nm == (uint32_t)lang) return off;
+        if (nm == 0 && neutral == ~0u) neutral = off;
+        if (nm == 0x409 && enus == ~0u) enus = off;
+    }
+    if (k) return ~0u;
+    return neutral != ~0u ? neutral : enus != ~0u ? enus : first;
+}
+// type -> name -> language -> IMAGE_RESOURCE_DATA_ENTRY. Returns its guest
+// address (the HRSRC) or 0.
+inline uint32_t rsrc_lookup(Machine& m, uint32_t module, const RsrcKey& type,
+                            const RsrcKey& name, int lang)
+{
+    const uint32_t base = module ? module : m.image_base;
+    if (!rsrc_module_ok(m, base)) return 0;
+    const uint32_t root = rsrc_root(base);
+    if (!root) return 0;
+    uint32_t o = rsrc_find(root, 0, &type, -1);
+    if (o == ~0u || !(o & 0x80000000u)) return 0;
+    o = rsrc_find(root, o & 0x7FFFFFFFu, &name, -1);
+    if (o == ~0u || !(o & 0x80000000u)) return 0;
+    o = rsrc_find(root, o & 0x7FFFFFFFu, nullptr, lang);
+    if (o == ~0u || (o & 0x80000000u)) return 0;
+    return root + o;
+}
+inline uint32_t rsrc_module_of(Machine& m, uint32_t va)
+{
+    if (va >= m.image_base && va - m.image_base < m.image_size) return m.image_base;
+    for (auto& d : m.dlls) if (va >= d.base && va - d.base < d.size) return d.base;
+    return 0;
+}
+
+// The shlwapi/kernel32 string helpers AIR binds. Locale-aware comparisons go
+// through CompareStringEx, which is what lstrcmp(i)W are on Windows.
+inline int cmp_w(uint32_t a, uint32_t b, DWORD flags)
+{
+    const wchar_t* p = (const wchar_t*)(uintptr_t)a;
+    const wchar_t* q = (const wchar_t*)(uintptr_t)b;
+    if (!p || !q) return p == q ? 0 : (p ? 1 : -1);
+    const int r = CompareStringEx(LOCALE_NAME_USER_DEFAULT, flags, p, -1, q, -1, nullptr, nullptr, 0);
+    return r ? r - 2 : std::wcscmp(p, q);
+}
+inline const wchar_t* wcs_find_i(const wchar_t* h, const wchar_t* n, const wchar_t* end, bool last)
+{
+    const size_t nl = std::wcslen(n);
+    const wchar_t* hit = nullptr;
+    for (const wchar_t* p = h; *p && (!end || p < end); ++p) {
+        size_t j = 0;
+        while (j < nl && p[j] && towlower(p[j]) == towlower(n[j])) ++j;
+        if (j == nl) { hit = p; if (!last) break; }
+    }
+    return hit;
+}
+
+// The guest's view of page protection in the guest region; see the
+// VirtualProtect bed in RegisterStdBeds for why it exists.
+struct ProtShadow {
+    std::mutex mu;
+    std::map<uint32_t, uint32_t> page;     // page -> protection, only where not PAGE_READWRITE
+    uint32_t get(uint32_t pg) {
+        auto it = page.find(pg);
+        return it == page.end() ? (uint32_t)PAGE_READWRITE : it->second;
+    }
+    void set(uint32_t first, uint32_t last, uint32_t prot) {
+        for (uint32_t pg = first; ; pg += 0x1000) {
+            if (prot == PAGE_READWRITE) page.erase(pg); else page[pg] = prot;
+            if (pg == last) break;
+        }
+    }
+};
+inline ProtShadow g_prot;
+
+// "adobe air.dll+0x1234" for a guest address, or the bare address.
+inline std::string guest_sym(Machine& m, uint32_t va)
+{
+    if (va >= m.image_base && va - m.image_base < m.image_size)
+        return "exe+" + hex(va - m.image_base);
+    for (auto& d : m.dlls)
+        if (va >= d.base && va - d.base < d.size) return d.name + "+" + hex(va - d.base);
+    return hex(va);
+}
+
+inline void RegisterAirGapBeds(ThunkRegistry& R)
+{
+    // Adobe AIR's File.exists() asks GetVolumeInformationW about the drive
+    // of any "X:..." path first and answers "no such file" if that fails, so
+    // the stub that used to sit here made every drive-letter path missing --
+    // the application descriptor included ("application descriptor could not
+    // be found"). The real call, where the container allows it, and otherwise
+    // the answer an NTFS volume gives: the caller wants to know the volume is
+    // there, not what it is called. The serial is fixed so anything the guest
+    // derives from it stays the same between runs.
+    GH_X86_BED(R, "kernel32.dll", "GetVolumeInformationW", 32,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            using Fn = BOOL(WINAPI*)(LPCWSTR, LPWSTR, DWORD, LPDWORD, LPDWORD, LPDWORD, LPWSTR, DWORD);
+            static Fn real = (Fn)dyn_resolve("kernel32.dll", "GetVolumeInformationW");
+            const wchar_t* root = (const wchar_t*)(uintptr_t)a[0];
+            auto* name = (wchar_t*)(uintptr_t)a[1];
+            auto* fs   = (wchar_t*)(uintptr_t)a[6];
+            if (real && real(root, name, a[2], (LPDWORD)(uintptr_t)a[3], (LPDWORD)(uintptr_t)a[4],
+                             (LPDWORD)(uintptr_t)a[5], fs, a[7]))
+                return 1;
+            const DWORD err = real ? GetLastError() : ERROR_CALL_NOT_IMPLEMENTED;
+            // Only a drive root ("X:\", "\\?\X:\") or the current drive (NULL).
+            const wchar_t* r = root;
+            if (r && !std::wcsncmp(r, L"\\\\?\\", 4)) r += 4;
+            const bool drive = !r || (((r[0] | 0x20) >= L'a' && (r[0] | 0x20) <= L'z') && r[1] == L':' &&
+                                      (r[2] == L'\\' || r[2] == L'/') && !r[3]);
+            log_capped("gvi", "X86 GetVolumeInformationW " + std::string(r ? std::string(1, (char)r[0]) : "(null)") +
+                ": host " + (real ? "refused err=" + std::to_string(err) : "has no export") +
+                (drive ? "; answered as NTFS" : "; not a drive root, failed") + " from " + guest_sym(m, a[-1]));
+            if (!drive) { SetLastError(err == ERROR_CALL_NOT_IMPLEMENTED ? ERROR_INVALID_NAME : err); return 0; }
+            if (name && a[2]) name[0] = 0;
+            if (a[3]) *(uint32_t*)(uintptr_t)a[3] = 0x6E480001u;
+            if (a[4]) *(uint32_t*)(uintptr_t)a[4] = 255;
+            // CASE_PRESERVED_NAMES | UNICODE_ON_DISK | PERSISTENT_ACLS | FILE_COMPRESSION | NAMED_STREAMS ...
+            if (a[5]) *(uint32_t*)(uintptr_t)a[5] = 0x03E700FFu;
+            if (fs && a[7]) {
+                if (a[7] < 5) { SetLastError(ERROR_BAD_LENGTH); return 0; }
+                std::wcscpy(fs, L"NTFS");
+            }
+            return 1;
+        });
+
+    // A guest DebugBreak forwarded to the host raised int3 in the host
+    // process: the Launcher died with it, and the backtrace ended at the
+    // thunk, so nothing said which guest code asked. Adobe AIR reached one at
+    // start-up on 0.0.962.0. With no debugger attached nobody is listening;
+    // log the guest call site and the return addresses on its stack, and
+    // carry on as a debugger that continues would.
+    GH_X86_BED(R, "kernel32.dll", "DebugBreak", 0,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            std::string s = "X86 guest DebugBreak from " + guest_sym(m, a[-1]) + "; stack:";
+            int n = 0;
+            const int lim = (int)readable_words(a, 128);
+            for (int i = 0; i < lim && n < 12; ++i) {
+                const uint32_t v = a[i];
+                const std::string g = guest_sym(m, v);
+                if (g.find('+') == std::string::npos) continue;
+                s += " " + g; ++n;
+            }
+            log_capped("dbgbrk", s);
+            return 0;
+        });
+    // -- resources ------------------------------------------------------------
+    // These replace the honest-failure stubs genstubs.py used to answer with:
+    // AIR reads its own localized strings and dialog templates this way, and a
+    // "no such resource" from every lookup is not honest -- the resources are
+    // right there in the mapped image.
+    GH_X86_BED(R, "kernel32.dll", "FindResourceW", 12,             // (hModule, lpName, lpType)
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            return rsrc_lookup(m, a[0], rsrc_key_w(a[2]), rsrc_key_w(a[1]), -1);
+        });
+    GH_X86_BED(R, "kernel32.dll", "FindResourceA", 12,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            return rsrc_lookup(m, a[0], rsrc_key_a(a[2]), rsrc_key_a(a[1]), -1);
+        });
+    GH_X86_BED(R, "kernel32.dll", "FindResourceExW", 16,           // (hModule, lpType, lpName, wLanguage)
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            return rsrc_lookup(m, a[0], rsrc_key_w(a[1]), rsrc_key_w(a[2]), (int)(a[3] & 0xFFFF));
+        });
+    GH_X86_BED(R, "kernel32.dll", "FindResourceExA", 16,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            return rsrc_lookup(m, a[0], rsrc_key_a(a[1]), rsrc_key_a(a[2]), (int)(a[3] & 0xFFFF));
+        });
+    GH_X86_BED(R, "kernel32.dll", "LoadResource", 8,               // (hModule, hResInfo)
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            if (!a[1]) return 0;
+            const uint32_t base = a[0] ? a[0] : rsrc_module_of(m, a[1]);
+            if (!base || !rsrc_module_ok(m, base)) return 0;
+            uint32_t rva = 0; std::memcpy(&rva, (void*)(uintptr_t)a[1], 4);
+            return base + rva;
+        });
+    GH_X86_BED(R, "kernel32.dll", "LockResource", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t { return a[0]; });
+    GH_X86_BED(R, "kernel32.dll", "FreeResource", 4,
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+    GH_X86_BED(R, "kernel32.dll", "SizeofResource", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (!a[1]) return 0;
+            uint32_t sz = 0; std::memcpy(&sz, (void*)(uintptr_t)(a[1] + 4), 4);
+            return sz;
+        });
+    // LoadStringW(hInstance, uID, lpBuffer, cchBufferMax). Strings live in
+    // RT_STRING blocks of sixteen: block (uID >> 4) + 1, entry uID & 15, each a
+    // length-prefixed UTF-16 run. cchBufferMax == 0 asks for a read-only
+    // pointer into the resource instead of a copy.
+    GH_X86_BED(R, "user32.dll", "LoadStringW", 16,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            RsrcKey type, name; type.id = 6; name.id = (a[1] >> 4) + 1;
+            const uint32_t h = rsrc_lookup(m, a[0], type, name, -1);
+            uint32_t len = 0, at = 0;
+            if (h) {
+                const uint32_t base = a[0] ? a[0] : m.image_base;
+                uint32_t rva = 0; std::memcpy(&rva, (void*)(uintptr_t)h, 4);
+                const uint8_t* p = (const uint8_t*)(uintptr_t)(base + rva);
+                for (uint32_t i = 0; i <= (a[1] & 15); ++i) {
+                    uint16_t n = 0; std::memcpy(&n, p, 2);
+                    if (i == (a[1] & 15)) { len = n; at = (uint32_t)(uintptr_t)(p + 2); break; }
+                    p += 2 + 2u * n;
+                }
+            }
+            if (!a[2]) return 0;
+            if (a[3] == 0) {
+                std::memcpy((void*)(uintptr_t)a[2], &at, 4);
+                return len;
+            }
+            const uint32_t n = len < a[3] - 1 ? len : a[3] - 1;
+            if (n) std::memcpy((void*)(uintptr_t)a[2], (void*)(uintptr_t)at, 2u * n);
+            ((wchar_t*)(uintptr_t)a[2])[n] = 0;
+            if (!len) SetLastError(ERROR_RESOURCE_NAME_NOT_FOUND);
+            return n;
+        });
+
+    // -- strings and paths ----------------------------------------------------
+    GH_X86_BED(R, "kernel32.dll", "lstrcmpiW", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t { return (uint32_t)cmp_w(a[0], a[1], NORM_IGNORECASE); });
+    GH_X86_BED(R, "shlwapi.dll", "StrCmpW", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t { return (uint32_t)cmp_w(a[0], a[1], 0); });
+    GH_X86_BED(R, "user32.dll", "CharNextW", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            const wchar_t* p = (const wchar_t*)(uintptr_t)a[0];
+            return p && *p ? a[0] + 2 : a[0];
+        });
+    GH_X86_BED(R, "kernel32.dll", "IsDBCSLeadByte", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t { return IsDBCSLeadByteEx(CP_ACP, (BYTE)a[0]) ? 1 : 0; });
+    GH_X86_BED(R, "shlwapi.dll", "StrStrIW", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (!a[0] || !a[1]) return 0;
+            const wchar_t* h = (const wchar_t*)(uintptr_t)a[0];
+            const wchar_t* r = wcs_find_i(h, (const wchar_t*)(uintptr_t)a[1], nullptr, false);
+            return r ? a[0] + (uint32_t)(r - h) * 2 : 0;
+        });
+    GH_X86_BED(R, "shlwapi.dll", "StrRStrIW", 12,                  // (lpSource, lpLast, lpSrch)
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (!a[0] || !a[2]) return 0;
+            const wchar_t* h = (const wchar_t*)(uintptr_t)a[0];
+            const wchar_t* r = wcs_find_i(h, (const wchar_t*)(uintptr_t)a[2],
+                                          a[1] ? (const wchar_t*)(uintptr_t)a[1] : nullptr, true);
+            return r ? a[0] + (uint32_t)(r - h) * 2 : 0;
+        });
+    GH_X86_BED(R, "shlwapi.dll", "StrDupW", 4,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            return a[0] ? guest_strdup_w(m, (const wchar_t*)(uintptr_t)a[0]) : 0;
+        });
+    // PathRemoveFileSpecW: drop the last component, keeping a root ("C:\").
+    GH_X86_BED(R, "shlwapi.dll", "PathRemoveFileSpecW", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            wchar_t* p = (wchar_t*)(uintptr_t)a[0];
+            if (!p || !*p) return 0;
+            wchar_t* cut = std::wcsrchr(p, L'\\');
+            if (!cut) { *p = 0; return 1; }
+            if (cut == p + 2 && p[1] == L':') { if (cut[1]) { cut[1] = 0; return 1; } return 0; }
+            if (cut == p) { if (p[1]) { p[1] = 0; return 1; } return 0; }
+            *cut = 0;
+            return 1;
+        });
+    GH_X86_BED(R, "shlwapi.dll", "PathAppendW", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            wchar_t* p = (wchar_t*)(uintptr_t)a[0];
+            const wchar_t* q = (const wchar_t*)(uintptr_t)a[1];
+            if (!p || !q) return 0;
+            while (*q == L'\\') ++q;
+            size_t n = std::wcslen(p);
+            const bool sep = n && p[n - 1] != L'\\' && *q;
+            if (n + sep + std::wcslen(q) + 1 > MAX_PATH) return 0;
+            if (sep) p[n++] = L'\\';
+            std::wcscpy(p + n, q);
+            return 1;
+        });
+    GH_X86_BED(R, "shlwapi.dll", "PathAppendA", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            char* p = (char*)(uintptr_t)a[0];
+            const char* q = (const char*)(uintptr_t)a[1];
+            if (!p || !q) return 0;
+            while (*q == '\\') ++q;
+            size_t n = std::strlen(p);
+            const bool sep = n && p[n - 1] != '\\' && *q;
+            if (n + sep + std::strlen(q) + 1 > MAX_PATH) return 0;
+            if (sep) p[n++] = '\\';
+            std::strcpy(p + n, q);
+            return 1;
+        });
+    // SHCreateDirectoryExW(hwnd, path, psa): every missing level, as the
+    // CreateDirectoryW forward would create them one at a time.
+    GH_X86_BED(R, "shell32.dll", "SHCreateDirectoryExW", 12,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (!a[1]) return ERROR_BAD_PATHNAME;
+            const std::wstring full = (const wchar_t*)(uintptr_t)a[1];
+            const DWORD at0 = GetFileAttributesW(full.c_str());
+            if (at0 != INVALID_FILE_ATTRIBUTES)
+                return (at0 & FILE_ATTRIBUTE_DIRECTORY) ? ERROR_ALREADY_EXISTS : ERROR_FILE_EXISTS;
+            for (size_t i = 3; i <= full.size(); ++i) {
+                if (i < full.size() && full[i] != L'\\' && full[i] != L'/') continue;
+                const std::wstring part = full.substr(0, i);
+                if (!CreateDirectoryW(part.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+                    const DWORD e = GetLastError();
+                    log_capped("shcd", "X86 SHCreateDirectoryExW failed at a level, error " + std::to_string(e));
+                    return e;
+                }
+            }
+            return ERROR_SUCCESS;
+        });
+    // A 32-bit process on 32-bit Windows: there is no WOW64 directory, and
+    // ERROR_CALL_NOT_IMPLEMENTED is exactly what that Windows answers.
+    GH_X86_BED(R, "kernel32.dll", "GetSystemWow64DirectoryW", 8,
+        [](Machine&, const uint32_t*) -> uint64_t { SetLastError(ERROR_CALL_NOT_IMPLEMENTED); return 0; });
+
+    // -- small structs ----------------------------------------------------------
+    GH_X86_BED(R, "user32.dll", "SetRect", 20,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (!a[0]) return 0;
+            std::memcpy((void*)(uintptr_t)a[0], &a[1], 16);
+            return 1;
+        });
+    GH_X86_BED(R, "user32.dll", "SetRectEmpty", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (!a[0]) return 0;
+            std::memset((void*)(uintptr_t)a[0], 0, 16);
+            return 1;
+        });
+    GH_X86_BED(R, "kernel32.dll", "CompareFileTime", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            uint64_t x = 0, y = 0;
+            std::memcpy(&x, (void*)(uintptr_t)a[0], 8); std::memcpy(&y, (void*)(uintptr_t)a[1], 8);
+            return (uint32_t)(x < y ? -1 : x > y ? 1 : 0);
+        });
+    GH_X86_BED(R, "user32.dll", "GetLastInputInfo", 4,               // LASTINPUTINFO {cbSize, dwTime}
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (!a[0]) return 0;
+            const uint32_t t = GetTickCount();
+            std::memcpy((void*)(uintptr_t)(a[0] + 4), &t, 4);
+            return 1;
+        });
+    GH_X86_BED(R, "winmm.dll", "timeGetDevCaps", 8,                   // TIMECAPS {wPeriodMin, wPeriodMax}
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (!a[0] || a[1] < 8) return 97;                         // TIMERR_NOCANDO
+            const uint32_t v[2] = { 1, 1000000 };
+            std::memcpy((void*)(uintptr_t)a[0], v, 8);
+            return 0;
+        });
+    GH_X86_BED(R, "user32.dll", "GetWindowDC", 4,
+        [](Machine&, const uint32_t*) -> uint64_t { return kFakeHdc; });
+    GH_X86_BED(R, "user32.dll", "ShowWindowAsync", 8,
+        [](Machine&, const uint32_t*) -> uint64_t { return 1; });
+    // WINDOWINFO has no pointers, so it is 60 bytes at both widths. The
+    // surrogate window is the framebuffer: client == window, no borders.
+    GH_X86_BED(R, "user32.dll", "GetWindowInfo", 8,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            if (!a[1]) return 0;
+            uint32_t w[15] = {};
+            w[0] = 60;
+            w[3] = m.bed.win_w; w[4] = m.bed.win_h;
+            w[7] = m.bed.win_w; w[8] = m.bed.win_h;
+            w[9] = WS_VISIBLE | WS_POPUP;
+            w[11] = 1;                                                  // WS_ACTIVECAPTION
+            std::memcpy((void*)(uintptr_t)a[1], w, 60);
+            return 1;
+        });
+    GH_X86_BED(R, "ole32.dll", "CoTaskMemRealloc", 8,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            if (!a[0]) return m.heap_alloc(a[1], false);
+            if (!a[1]) { m.heap_free(a[0]); return 0; }
+            const uint32_t have = m.heap_size_of(a[0]);
+            const uint32_t p = m.heap_alloc(a[1], false);
+            if (!p) return 0;
+            std::memcpy((void*)(uintptr_t)p, (void*)(uintptr_t)a[0], have < a[1] ? have : a[1]);
+            m.heap_free(a[0]);
+            return p;
+        });
+
+    // -- the rest of the MessageBox family, the locale walk, timers ------------
+    GH_X86_BED(R, "user32.dll", "MessageBoxExW", 20,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            auto narrow = [](uint32_t p) -> std::string {
+                std::string s;
+                for (const wchar_t* w = (const wchar_t*)(uintptr_t)p; p && *w; ++w)
+                    s += (char)(*w < 128 ? *w : '?');
+                return s;
+            };
+            log("X86 MessageBox: [" + narrow(a[2]) + "] " + narrow(a[1]));
+            return 1;                                                   // IDOK
+        });
+    GH_X86_BED(R, "kernel32.dll", "EnumSystemLocalesW", 8,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            if (!a[0]) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+            const uint32_t s = guest_strdup_w(m, L"00000409");
+            if (!s) return 0;
+            const uint32_t args[1] = { s };
+            m.call_guest32(a[0], args, 1);
+            m.heap_free(s);
+            return 1;
+        });
+    // A real host timer: the guest waits on it with the ordinary wait beds,
+    // and SetWaitableTimer (above) arms it. The SECURITY_ATTRIBUTES are
+    // dropped -- nothing in a single-process container inherits handles.
+    GH_X86_BED(R, "kernel32.dll", "CreateWaitableTimerW", 12,        // (lpsa, bManualReset, lpName)
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            HANDLE h = CreateWaitableTimerExW(nullptr, (LPCWSTR)(uintptr_t)a[2],
+                                              a[1] ? CREATE_WAITABLE_TIMER_MANUAL_RESET : 0,
+                                              TIMER_ALL_ACCESS);
+            return (uint32_t)(uintptr_t)h;
+        });
+    GH_X86_BED(R, "kernel32.dll", "CancelWaitableTimer", 4,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            return CancelWaitableTimer((HANDLE)(intptr_t)(int32_t)a[0]) ? 1 : 0;
+        });
+    // AIR looks this up by name before falling back to SetWaitableTimer. The
+    // wake context and tolerable delay are power hints; as with
+    // SetWaitableTimer, the completion routine is dropped and the timer still
+    // signals.
+    GH_X86_BED(R, "kernel32.dll", "SetWaitableTimerEx", 28,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (a[3]) log_capped("swtex", "X86 BED SetWaitableTimerEx drops its completion routine");
+            return SetWaitableTimer((HANDLE)(intptr_t)(int32_t)a[0],
+                                    (const LARGE_INTEGER*)(uintptr_t)a[1], (LONG)a[2],
+                                    nullptr, nullptr, FALSE);
+        });
+    GH_X86_FWD_DYN(R, "kernel32.dll", LCMapStringEx);
+
+    // -- network-ish calls with no header we can include ----------------------
+    // wininet.h and winhttp.h cannot share a translation unit, so these take
+    // written pop sizes, like the HttpQueryInfoA bed above.
+    GH_X86_BED(R, "wininet.dll", "InternetGetCookieW", 16,
+        [](Machine&, const uint32_t*) -> uint64_t { SetLastError(ERROR_NO_MORE_ITEMS); return 0; });
+    GH_X86_BED(R, "wininet.dll", "InternetSetCookieW", 12,
+        [](Machine&, const uint32_t*) -> uint64_t { SetLastError(ERROR_NOT_SUPPORTED); return 0; });
+    GH_X86_BED(R, "wininet.dll", "InternetErrorDlg", 20,
+        [](Machine&, const uint32_t*) -> uint64_t { return ERROR_CANCELLED; });
+    // DnsQuery_UTF8(name, WORD type, options, extra, ppResults, reserved).
+    GH_X86_BED(R, "dnsapi.dll", "DnsQuery_UTF8", 24,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (a[4]) { const uint32_t z = 0; std::memcpy((void*)(uintptr_t)a[4], &z, 4); }
+            return 9003;                                                // DNS_ERROR_RCODE_NAME_ERROR
+        });
+    // ntsecapi.h cannot be included next to the loader's own NT string types,
+    // so these two take written pop sizes as well.
+    GH_X86_BED(R, "secur32.dll", "LsaFreeReturnBuffer", 4,
+        [](Machine&, const uint32_t*) -> uint64_t { return 0; });         // STATUS_SUCCESS
+    GH_X86_BED(R, "secur32.dll", "LsaGetLogonSessionData", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (a[1]) { const uint32_t z = 0; std::memcpy((void*)(uintptr_t)a[1], &z, 4); }
+            return 0xC0000002u;                                         // STATUS_NOT_IMPLEMENTED
+        });
+    // The registry hive has no delete; "not there" is what a caller cleaning
+    // up a key it never wrote expects.
+    GH_X86_BED(R, "advapi32.dll", "RegDeleteKeyW", 8,
+        [](Machine&, const uint32_t*) -> uint64_t { return ERROR_FILE_NOT_FOUND; });
+    GH_X86_BED(R, "advapi32.dll", "RegDeleteValueW", 8,
+        [](Machine&, const uint32_t*) -> uint64_t { return ERROR_FILE_NOT_FOUND; });
 }
 
 inline void RegisterSourceGapBeds(ThunkRegistry& R)
@@ -1554,10 +2315,12 @@ inline void RegisterSourceGapBeds(ThunkRegistry& R)
     // heard of it: BeginPaint answered a NULL HDC and TrackMouseEvent FALSE.
     // The window is ours, so they are answered here instead -- the paint DC is
     // the same one GetDC hands out, and the whole window is always the paint
-    // rectangle because nothing here keeps an update region.
+    // rectangle because the update region (gh_x86_wndq.h) is all or nothing.
+    // BeginPaint validates it, as in user32.
     static_assert(GH_X86_POP(BeginPaint) == 8, "BeginPaint");
     GH_X86_BED(R, "user32.dll", "BeginPaint", 8,
         [](Machine& m, const uint32_t* a) -> uint64_t {
+            wndq_validate(a[0]);
             if (a[1]) {
                 uint8_t* d = (uint8_t*)(uintptr_t)a[1];
                 std::memset(d, 0, 64);
@@ -1725,9 +2488,39 @@ inline void RegisterSourceGapBeds(ThunkRegistry& R)
                 case SM_CYSCREEN: case SM_CYFULLSCREEN: case SM_CYVIRTUALSCREEN: return m.bed.win_h;
                 case SM_CMONITORS: return 1;
                 case SM_XVIRTUALSCREEN: case SM_YVIRTUALSCREEN: return 0;
-                default: return (uint32_t)GetSystemMetrics((int)a[0]);
+                default: {
+                    // The container's own answer: it has no desktop, so a size
+                    // metric from here is a guess at best. Logged once per index.
+                    const int v = GetSystemMetrics((int)a[0]);
+                    static std::mutex mu; static std::set<uint32_t> seen;
+                    bool first;
+                    { std::lock_guard<std::mutex> lk(mu); first = seen.size() < 64 && seen.insert(a[0]).second; }
+                    if (first) log("X86 GetSystemMetrics(" + std::to_string(a[0]) + ") -> " + std::to_string(v) + " (container)");
+                    return (uint32_t)v;
+                }
             }
         });
+    // The work area is the display: the container's own answer describes no
+    // desktop we show. Everything else goes to the real user32, as the
+    // generated forward did, and each action is logged once. (The A form, whose
+    // string actions differ, is still the generated forward.)
+    GH_X86_BED(R, "user32.dll", "SystemParametersInfoW", 16,
+            [](Machine& m, const uint32_t* a) -> uint64_t {
+                static std::mutex mu; static std::set<uint32_t> seen;
+                bool first;
+                { std::lock_guard<std::mutex> lk(mu); first = seen.size() < 64 && seen.insert(a[0]).second; }
+                if (a[0] == SPI_GETWORKAREA) {
+                    if (first) log("X86 SystemParametersInfo(SPI_GETWORKAREA) -> display");
+                    if (!a[2]) return 0;
+                    const int32_t v[4] = { 0, 0, (int32_t)m.bed.win_w, (int32_t)m.bed.win_h };
+                    std::memcpy((void*)(uintptr_t)a[2], v, sizeof(v));
+                    return 1;
+                }
+                const BOOL r = SystemParametersInfoW(a[0], a[1], (void*)(uintptr_t)a[2], a[3]);
+                if (first) log("X86 SystemParametersInfo(" + hex(a[0]) + ", " + std::to_string(a[1]) + ") -> " + std::to_string(r)
+                               + (a[2] ? " [0]=" + std::to_string(*(const int32_t*)(uintptr_t)a[2]) : std::string()));
+                return (uint32_t)r;
+            });
     // Any DC the guest holds is a DC on the one display (the x64 bed's #154
     // lesson: answer the physical size too, at 96 DPI, never a silent 0).
     static_assert(GH_X86_POP(GetDeviceCaps) == 8, "GetDeviceCaps");
@@ -1926,17 +2719,35 @@ inline void RegisterSourceGapBeds(ThunkRegistry& R)
     // -- setupapi -------------------------------------------------------------
     // SDL2, valvedeviceapi and xinput1_3 enumerate HID devices this way. Every
     // structure involved embeds pointers or ULONG_PTRs; the pad reaches the
-    // guest as keys instead (builtin-wasd), so the device list is empty.
+    // guest as keys instead (builtin-wasd), so their device list is empty.
+    //
+    // The display class is the exception. Adobe AIR will not use a Direct3D 9
+    // device until it has found the adapter's driver in SetupAPI and read that
+    // driver's DriverDateData out of HKLM\...\Control\Class\<SPDRP_DRIVER>: a
+    // missing driver, or one dated before 2006, sends it back to create the
+    // device again, about fifty times a second, and nothing is ever drawn. The
+    // Launcher supplies the same synthetic adapter x64 guests get
+    // (g_x86_display_device); the hive holds its driver key.
     static_assert(GH_X86_POP(SetupDiGetClassDevsA) == 16, "SetupDiGetClassDevsA");
-    for (const char* n : { "SetupDiGetClassDevsA", "SetupDiGetClassDevsW" })
-        GH_X86_BED(R, "setupapi.dll", n, 16,
-            [](Machine&, const uint32_t*) -> uint64_t {
-                SetLastError(ERROR_INVALID_DATA);
-                return 0xFFFFFFFFu;                     // INVALID_HANDLE_VALUE
-            });
+    GH_X86_BED(R, "setupapi.dll", "SetupDiGetClassDevsA", 16, setupdi_class_devs<false>);
+    GH_X86_BED(R, "setupapi.dll", "SetupDiGetClassDevsW", 16, setupdi_class_devs<true>);
+    // SP_DEVINFO_DATA is cbSize, ClassGuid, DevInst, ULONG_PTR Reserved: 28
+    // bytes in a 32-bit process, so the host struct is not used.
     static_assert(GH_X86_POP(SetupDiEnumDeviceInfo) == 12, "SetupDiEnumDeviceInfo");
     GH_X86_BED(R, "setupapi.dll", "SetupDiEnumDeviceInfo", 12,
-        [](Machine&, const uint32_t*) -> uint64_t { SetLastError(ERROR_NO_MORE_ITEMS); return 0; });
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (a[0] != kX86SynthDevInfo) { SetLastError(ERROR_NO_MORE_ITEMS); return 0; }
+            uint8_t* d = (uint8_t*)(uintptr_t)a[2];
+            uint32_t cb = 0;
+            if (d) std::memcpy(&cb, d, 4);
+            if (!d || cb != 28) { SetLastError(ERROR_INVALID_USER_BUFFER); return 0; }
+            if (a[1] != 0) { SetLastError(ERROR_NO_MORE_ITEMS); return 0; }
+            const uint32_t devinst = 1, reserved = 0;
+            std::memcpy(d + 4, &kX86DisplayClassGuid, 16);
+            std::memcpy(d + 20, &devinst, 4);
+            std::memcpy(d + 24, &reserved, 4);
+            return 1;
+        });
     static_assert(GH_X86_POP(SetupDiEnumDeviceInterfaces) == 20, "SetupDiEnumDeviceInterfaces");
     GH_X86_BED(R, "setupapi.dll", "SetupDiEnumDeviceInterfaces", 20,
         [](Machine&, const uint32_t*) -> uint64_t { SetLastError(ERROR_NO_MORE_ITEMS); return 0; });
@@ -1944,9 +2755,11 @@ inline void RegisterSourceGapBeds(ThunkRegistry& R)
     for (const char* n : { "SetupDiGetDeviceInterfaceDetailA", "SetupDiGetDeviceInterfaceDetailW" })
         GH_X86_BED(R, "setupapi.dll", n, 24,
             [](Machine&, const uint32_t*) -> uint64_t { SetLastError(ERROR_INVALID_HANDLE); return 0; });
+    // (DeviceInfoSet, DeviceInfoData, Property, PropertyRegDataType,
+    //  PropertyBuffer, PropertyBufferSize, RequiredSize). Sizes are in bytes.
     static_assert(GH_X86_POP(SetupDiGetDeviceRegistryPropertyA) == 28, "SetupDiGetDeviceRegistryPropertyA");
-    GH_X86_BED(R, "setupapi.dll", "SetupDiGetDeviceRegistryPropertyA", 28,
-        [](Machine&, const uint32_t*) -> uint64_t { SetLastError(ERROR_INVALID_HANDLE); return 0; });
+    GH_X86_BED(R, "setupapi.dll", "SetupDiGetDeviceRegistryPropertyA", 28, setupdi_registry_property<false>);
+    GH_X86_BED(R, "setupapi.dll", "SetupDiGetDeviceRegistryPropertyW", 28, setupdi_registry_property<true>);
     static_assert(GH_X86_POP(SetupDiDestroyDeviceInfoList) == 4, "SetupDiDestroyDeviceInfoList");
     GH_X86_BED(R, "setupapi.dll", "SetupDiDestroyDeviceInfoList", 4,
         [](Machine&, const uint32_t*) -> uint64_t { return 1; });
@@ -2447,6 +3260,322 @@ inline uint64_t gh_steam_bissubscribedapp(Machine&, const uint32_t* a)
     return gh_steam_owns(a[0]) ? 1 : 0;
 }
 
+// ISteamUser GetSteamID, SteamUser021 slot 2. A CSteamID comes back through a
+// hidden pointer (the one push at the call site; the caller then reads 8 bytes
+// from it), so the slot writes the id there and returns the pointer.
+inline uint64_t gh_steam_get_steamid(Machine&, const uint32_t* a)
+{
+    if (gh_guest_ptr_ok(a[0], 8))
+        std::memcpy((void*)(uintptr_t)a[0], &kGhAuthSteamID, 8);
+    return a[0];
+}
+// ISteamUtils GetAppID, SteamUtils010 slot 9: the running title's own app id.
+inline uint64_t gh_steam_appid_slot(Machine&, const uint32_t*)
+{
+    return gh_steam_own_appid();
+}
+
+// ---------------------------------------------------------------------------
+// Steam Input for a 32-bit guest: one controller, the console pad.
+// ---------------------------------------------------------------------------
+// Super Fancy Pants Adventure reads its pad only through Steam Input
+// (FRESteamWorks), every frame, by action name: "Move" (analog) and
+// "Action_Up" .. "Action_Pause" (digital). With no controller connected it has
+// no pad at all, and its keyboard path is not one a console player can use.
+// Steam would bind those names from the game's own input configuration; there
+// is no Steam client here, so the names are bound to a fixed Xbox layout
+// below. An action name not in the table gets a handle that is never pressed.
+//
+// Layouts, from FRESteamWorks' own reads (not from any SDK header): digital
+// data is 2 bytes {state, active}; analog data is {u32 mode, f32 x, f32 y,
+// u8 active} (16 bytes); both come back through a hidden result pointer, the
+// first argument. The handles array of GetConnectedControllers holds 8-byte
+// handles. Stick y is positive up, as XInput's is; the game reads y < -0.5 as
+// down.
+constexpr uint64_t kGhSteamPadHandle = 1;
+
+struct GhSteamAction { const char* name; bool analog; uint16_t buttons; uint8_t extra; };
+// extra: 1 = the right trigger also presses it.
+// The stick drives only "Move" and the D-pad only the four direction actions:
+// SFPA's menus act on both (analog past 0.5, and a digital press), so one
+// physical control feeding both moved the cursor twice per press (0.0.990).
+inline constexpr GhSteamAction kGhSteamActions[] = {
+    { "Move",           true,  0, 0 },
+    { "Action_Up",      false, 0x0001 /*DPAD_UP*/,    0 },
+    { "Action_Down",    false, 0x0002 /*DPAD_DOWN*/,  0 },
+    { "Action_Left",    false, 0x0004 /*DPAD_LEFT*/,  0 },
+    { "Action_Right",   false, 0x0008 /*DPAD_RIGHT*/, 0 },
+    { "Action_Jump",    false, 0x1000 /*A*/,          0 },
+    { "Action_Attack",  false, 0x4000 /*X*/,          0 },
+    { "Action_InkShot", false, 0x8000 /*Y*/,          1 },
+    { "Action_InkDash", false, 0x2000 /*B*/ | 0x0200 /*RB*/, 0 },
+    { "Action_Pause",   false, 0x0010 /*START*/,      0 },
+};
+constexpr uint32_t kGhSteamActionCount = sizeof kGhSteamActions / sizeof kGhSteamActions[0];
+// Handles are 1-based indexes into the table; names we do not know get
+// kGhSteamActionCount + 1, which nothing presses.
+inline uint64_t gh_steam_action_handle(uint32_t name_ptr, bool analog)
+{
+    char nm[64] = {};
+    if (!gh_guest_ptr_ok(name_ptr, 1)) return 0;
+    for (uint32_t i = 0; i + 1 < sizeof nm; ++i) {
+        if (!gh_guest_ptr_ok(name_ptr + i, 1)) break;
+        nm[i] = *(const char*)(uintptr_t)(name_ptr + i);
+        if (!nm[i]) break;
+    }
+    for (uint32_t i = 0; i < kGhSteamActionCount; ++i)
+        if (kGhSteamActions[i].analog == analog && std::strcmp(kGhSteamActions[i].name, nm) == 0) {
+            log(std::string("X86 STEAM input action \"") + nm + "\" -> handle " + std::to_string(i + 1));
+            return i + 1;
+        }
+    log(std::string("X86 STEAM input action \"") + nm + "\" is not bound");
+    return kGhSteamActionCount + 1;
+}
+
+inline bool gh_steam_pad(XINPUT_GAMEPAD& g)
+{
+#ifdef GH_LAUNCHER
+    XINPUT_STATE st{};
+    if (Bed_XInputGetState(0, &st) != ERROR_SUCCESS) return false;
+    g = st.Gamepad;
+    return true;
+#else
+    (void)g;
+    return false;
+#endif
+}
+
+inline float gh_steam_axis(SHORT v)
+{
+    // XInput's left-stick dead zone, then rescaled so the edge still reads 1.
+    constexpr float kDead = 7849.0f;
+    const float f = (float)v;
+    if (f > -kDead && f < kDead) return 0.0f;
+    const float s = f > 0 ? (f - kDead) / (32767.0f - kDead) : (f + kDead) / (32768.0f - kDead);
+    return s > 1.0f ? 1.0f : s < -1.0f ? -1.0f : s;
+}
+
+// GetConnectedControllers(handles_out) -- SteamInput006 slot 6.
+inline uint64_t gh_steam_connected_controllers(Machine&, const uint32_t* a)
+{
+    XINPUT_GAMEPAD g{};
+    if (!gh_steam_pad(g) || !gh_guest_ptr_ok(a[0], 8)) return 0;
+    std::memcpy((void*)(uintptr_t)a[0], &kGhSteamPadHandle, 8);
+    return 1;
+}
+// GetDigitalActionHandle(name) / GetAnalogActionHandle(name) -- slots 16 and 20.
+inline uint64_t gh_steam_digital_handle(Machine&, const uint32_t* a) { return gh_steam_action_handle(a[0], false); }
+inline uint64_t gh_steam_analog_handle(Machine&, const uint32_t* a)  { return gh_steam_action_handle(a[0], true); }
+
+// GetDigitalActionData(result, controller, action) -- slot 17.
+inline uint64_t gh_steam_digital_data(Machine&, const uint32_t* a)
+{
+    uint8_t out[2] = { 0, 0 };
+    const uint64_t ctl = a[1] | (uint64_t)a[2] << 32, act = a[3] | (uint64_t)a[4] << 32;
+    XINPUT_GAMEPAD g{};
+    if (ctl == kGhSteamPadHandle && act >= 1 && act <= kGhSteamActionCount &&
+        !kGhSteamActions[act - 1].analog && gh_steam_pad(g)) {
+        const GhSteamAction& s = kGhSteamActions[act - 1];
+        bool on = (g.wButtons & s.buttons) != 0;
+        if (s.extra == 1) on = on || g.bRightTrigger > 128;
+        out[0] = on ? 1 : 0;
+        out[1] = 1;
+    }
+    if (gh_guest_ptr_ok(a[0], 2)) std::memcpy((void*)(uintptr_t)a[0], out, 2);
+    return a[0];
+}
+
+// GetAnalogActionData(result, controller, action) -- slot 21.
+inline uint64_t gh_steam_analog_data(Machine&, const uint32_t* a)
+{
+    struct { uint32_t mode; float x, y; uint8_t active, pad[3]; } out = {};
+    const uint64_t ctl = a[1] | (uint64_t)a[2] << 32, act = a[3] | (uint64_t)a[4] << 32;
+    XINPUT_GAMEPAD g{};
+    if (ctl == kGhSteamPadHandle && act >= 1 && act <= kGhSteamActionCount &&
+        kGhSteamActions[act - 1].analog && gh_steam_pad(g)) {
+        out.x = gh_steam_axis(g.sThumbLX);
+        out.y = gh_steam_axis(g.sThumbLY);
+        out.active = 1;
+    }
+    static_assert(sizeof out == 16, "analog action data is 16 bytes");
+    if (gh_guest_ptr_ok(a[0], 16)) std::memcpy((void*)(uintptr_t)a[0], &out, 16);
+    return a[0];
+}
+
+// ---------------------------------------------------------------------------
+// ISteamRemoteStorage on local files (STEAMREMOTESTORAGE_INTERFACE_VERSION016)
+// ---------------------------------------------------------------------------
+// Super Fancy Pants Adventure keeps its save in Steam Cloud and nowhere else:
+// FRESteamWorks' FileWrite is its only save path, and the stub's "false" meant
+// a run's progress was gone when the game closed. There is no cloud sync on
+// the console, so the files live in D:\DevelopmentFiles\gh_saves\steam_remote\
+// <appid>\ -- the Dev Mode volume, which an uninstall of the Launcher (which
+// deletes LocalState) leaves alone. Names come from the game and are checked
+// strictly: relative, printable ASCII, no drive, no "." or ".." component.
+// Sizes are bounded by Steam's own per-file limit.
+
+constexpr uint32_t kGhRemoteMaxFile = 100u << 20;           // Steam's FileWrite limit
+constexpr uint64_t kGhRemoteQuota   = 1ull << 30;
+
+inline std::wstring gh_remote_root()
+{
+    const uint32_t app = gh_steam_own_appid();
+    if (!app) return {};
+    return L"D:\\DevelopmentFiles\\gh_saves\\steam_remote\\" + std::to_wstring(app) + L"\\";
+}
+
+// Guest file name -> full path, or empty when the name is not acceptable.
+inline std::wstring gh_remote_path(uint32_t name_ptr)
+{
+    if (!gh_guest_ptr_ok(name_ptr, 1)) return {};
+    const char* n = (const char*)(uintptr_t)name_ptr;
+    size_t len = 0;
+    while (len < 260 && n[len]) ++len;
+    if (len == 0 || len >= 260) return {};
+    std::wstring rel;
+    size_t comp_start = 0;
+    for (size_t i = 0; i <= len; ++i) {
+        const char c = i < len ? n[i] : '/';
+        if (c == '/' || c == '\\') {
+            const std::string comp(n + comp_start, i - comp_start);
+            if (comp.empty() || comp == "." || comp == ".." || comp.back() == '.' || comp.back() == ' ') return {};
+            if (i < len) rel += L'\\';
+            comp_start = i + 1;
+            continue;
+        }
+        if ((unsigned char)c < 0x20 || (unsigned char)c >= 0x7F || std::strchr("<>:\"|?*", c)) return {};
+        rel += (wchar_t)c;
+    }
+    const std::wstring root = gh_remote_root();
+    return root.empty() ? std::wstring() : root + rel;
+}
+
+inline void gh_remote_log(const char* op, uint32_t name_ptr, int64_t v, bool ok)
+{
+    static std::atomic<int> n{0};
+    if (n.fetch_add(1) >= 48) return;
+    std::string nm = gh_guest_ptr_ok(name_ptr, 1) ? std::string((const char*)(uintptr_t)name_ptr).substr(0, 80) : "?";
+    log(std::string("X86 STEAM remote ") + op + " '" + nm + "' " + std::to_string(v) + (ok ? " ok" : " FAILED"));
+}
+
+inline void gh_remote_mkdirs(const std::wstring& file)
+{
+    for (size_t i = std::wstring(L"D:\\").size(); i < file.size(); ++i)
+        if (file[i] == L'\\') CreateDirectoryW(file.substr(0, i).c_str(), nullptr);
+}
+
+// FileWrite(name, data, size) -> bool -- slot 0. Written beside the target and
+// moved over it, so a crash mid-write leaves the old save, not half of one.
+inline uint64_t gh_steam_remote_write(Machine&, const uint32_t* a)
+{
+    const std::wstring p = gh_remote_path(a[0]);
+    const int32_t size = (int32_t)a[2];
+    bool ok = false;
+    if (!p.empty() && size >= 0 && (uint32_t)size <= kGhRemoteMaxFile && (size == 0 || gh_guest_ptr_ok(a[1], (uint32_t)size))) {
+        gh_remote_mkdirs(p);
+        const std::wstring tmp = p + L".ghtmp";
+        HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f != INVALID_HANDLE_VALUE) {
+            DWORD wr = 0;
+            ok = size == 0 || (WriteFile(f, (const void*)(uintptr_t)a[1], (DWORD)size, &wr, nullptr) && wr == (DWORD)size);
+            ok = FlushFileBuffers(f) && ok;
+            CloseHandle(f);
+            ok = ok && MoveFileExW(tmp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+            if (!ok) DeleteFileW(tmp.c_str());
+        }
+    }
+    gh_remote_log("write", a[0], size, ok);
+    return ok ? 1 : 0;
+}
+
+inline int64_t gh_remote_size(const std::wstring& p)
+{
+    WIN32_FILE_ATTRIBUTE_DATA d{};
+    if (p.empty() || !GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &d) ||
+        (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) return -1;
+    return (int64_t)d.nFileSizeHigh << 32 | d.nFileSizeLow;
+}
+
+// FileRead(name, data, size) -> bytes read -- slot 1.
+inline uint64_t gh_steam_remote_read(Machine&, const uint32_t* a)
+{
+    const std::wstring p = gh_remote_path(a[0]);
+    const int32_t want = (int32_t)a[2];
+    DWORD got = 0;
+    if (!p.empty() && want > 0 && (uint32_t)want <= kGhRemoteMaxFile && gh_guest_ptr_ok(a[1], (uint32_t)want)) {
+        HANDLE f = CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f != INVALID_HANDLE_VALUE) {
+            if (!ReadFile(f, (void*)(uintptr_t)a[1], (DWORD)want, &got, nullptr)) got = 0;
+            CloseHandle(f);
+        }
+    }
+    gh_remote_log("read", a[0], got, got > 0);
+    return got;
+}
+
+// FileDelete(name) -> bool -- slot 6.
+inline uint64_t gh_steam_remote_delete(Machine&, const uint32_t* a)
+{
+    const std::wstring p = gh_remote_path(a[0]);
+    const bool ok = !p.empty() && DeleteFileW(p.c_str());
+    gh_remote_log("delete", a[0], 0, ok);
+    return ok ? 1 : 0;
+}
+
+// FileExists(name) -> bool -- slot 13.
+inline uint64_t gh_steam_remote_exists(Machine&, const uint32_t* a)
+{
+    const bool ok = gh_remote_size(gh_remote_path(a[0])) >= 0;
+    gh_remote_log("exists", a[0], ok, true);
+    return ok ? 1 : 0;
+}
+
+// GetFileSize(name) -> int32, 0 when absent -- slot 15.
+inline uint64_t gh_steam_remote_size(Machine&, const uint32_t* a)
+{
+    const int64_t n = gh_remote_size(gh_remote_path(a[0]));
+    return n > 0 && n <= kGhRemoteMaxFile ? (uint32_t)n : 0;
+}
+
+// Every file under the app's folder, with the folder's total size.
+inline uint32_t gh_remote_census(uint64_t* bytes)
+{
+    uint32_t count = 0; uint64_t total = 0;
+    const std::wstring root = gh_remote_root();
+    std::vector<std::wstring> dirs;
+    if (!root.empty()) dirs.push_back(root);
+    while (!dirs.empty() && count < 10000) {
+        const std::wstring d = dirs.back(); dirs.pop_back();
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW((d + L"*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            const std::wstring nm = fd.cFileName;
+            if (nm == L"." || nm == L"..") continue;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { dirs.push_back(d + nm + L"\\"); continue; }
+            if (nm.size() > 6 && nm.compare(nm.size() - 6, 6, L".ghtmp") == 0) continue;
+            ++count; total += (uint64_t)fd.nFileSizeHigh << 32 | fd.nFileSizeLow;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    if (bytes) *bytes = total;
+    return count;
+}
+
+// GetFileCount() -> int32 -- slot 18.
+inline uint64_t gh_steam_remote_count(Machine&, const uint32_t*) { return gh_remote_census(nullptr); }
+
+// GetQuota(uint64* total, uint64* available) -> bool -- slot 20.
+inline uint64_t gh_steam_remote_quota(Machine&, const uint32_t* a)
+{
+    uint64_t used = 0;
+    gh_remote_census(&used);
+    const uint64_t avail = used < kGhRemoteQuota ? kGhRemoteQuota - used : 0;
+    if (gh_guest_ptr_ok(a[0], 8)) std::memcpy((void*)(uintptr_t)a[0], &kGhRemoteQuota, 8);
+    if (gh_guest_ptr_ok(a[1], 8)) std::memcpy((void*)(uintptr_t)a[1], &avail, 8);
+    return 1;
+}
+
 struct SteamSlotSpec {
     const char* iface; uint16_t slot; uint16_t argbytes; uint32_t ret;
     const char* retstr = nullptr;
@@ -2464,9 +3593,10 @@ inline constexpr SteamSlotSpec kSteamSlots[] = {
         // setup that holds the ownership gate. It takes no arguments, so the
         // unknown-slot thunk's "pop nothing" happened to be right -- this time.
     { "STEAMAPPS_INTERFACE_VERSION008",   1,   0, 0 },
-        // GetCurrentGameLanguage. Null is safe: the call site falls back to
-        // "english" when it is 0.
-    { "STEAMAPPS_INTERFACE_VERSION008",   4,   0, 0 },
+        // GetCurrentGameLanguage. sw.dll falls back to "english" on a null,
+        // but FRESteamWorks (Super Fancy Pants Adventure) runs strlen on the
+        // result with no check, so the answer is the string itself.
+    { "STEAMAPPS_INTERFACE_VERSION008",   4,   0, 0, "english" },
         // BIsSubscribedApp(AppId_t) -- the ownership gate. See above.
     { "STEAMAPPS_INTERFACE_VERSION008",   6,   4, 0, nullptr, &gh_steam_bissubscribedapp },
     { "STEAMAPPS_INTERFACE_VERSION008",  26,   8, 0 },
@@ -2551,9 +3681,164 @@ inline constexpr SteamSlotSpec kSteamSlots[] = {
     // SteamUtils010
     { "SteamUtils010",  34,   0, 0 },
     { "SteamUtils010",  35,  20, 0 },
+
+    // ---- FRESteamWorks.dll, the Adobe AIR native extension (Super Fancy Pants
+    // Adventure). Every entry below comes from one call site in that DLL: the
+    // slot from the vtable offset, the pop count from the pushes before the
+    // call, and the comment from the AIRSteam_* function the site sits in (the
+    // extension's own export table names them). Where they overlap with sw.dll's
+    // entries above -- SteamInput 0/9/10, Friends 0/43, Utils 35, Apps 4/6 --
+    // the two binaries agree on every pop count, which is the cross-check.
+    //
+    // String returns carry `retstr`: the extension strlen()s every one of them
+    // without a null check. Everything else answers 0 ("no", "none", "failed"),
+    // which the extension passes up to ActionScript as a plain false or 0,
+    // except the few the game's start-up path needs to be true.
+    // STEAMAPPS_INTERFACE_VERSION008 (FRESteamWorks)
+    { "STEAMAPPS_INTERFACE_VERSION008",   5,   0, 0, "english" },        // GetAvailableGameLanguages
+    { "STEAMAPPS_INTERFACE_VERSION008",   7,   4, 0 },                   // IsDLCInstalled
+    { "STEAMAPPS_INTERFACE_VERSION008",  10,   0, 0 },                   // GetDLCCount
+    { "STEAMAPPS_INTERFACE_VERSION008",  12,   4, 0 },                   // InstallDLC
+    { "STEAMAPPS_INTERFACE_VERSION008",  13,   4, 0 },                   // UninstallDLC
+    // STEAMREMOTESTORAGE_INTERFACE_VERSION016 (FRESteamWorks)
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",   0,  12, 0, nullptr, &gh_steam_remote_write },   // FileWrite
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",   1,  12, 0, nullptr, &gh_steam_remote_read },    // FileRead
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",   6,   4, 0, nullptr, &gh_steam_remote_delete },  // FileDelete
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",   7,   4, 0 },          // FileShare
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  13,   4, 0, nullptr, &gh_steam_remote_exists },  // FileExists
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  15,   4, 0, nullptr, &gh_steam_remote_size },    // GetFileSize (FileRead asks it first)
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  18,   0, 0, nullptr, &gh_steam_remote_count },   // GetFileCount
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  20,   8, 0, nullptr, &gh_steam_remote_quota },   // GetQuota
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  22,   0, 1 },          // IsCloudEnabledForApp: yes, the local store above
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  23,   4, 0 },          // SetCloudEnabledForApp
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  24,  12, 0 },          // UGCDownload
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  25,  16, 0 },          // GetUGCDownloadProgress
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  27,  24, 0 },          // UGCRead
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  31,   8, 0 },          // CreatePublishedFileUpdateRequest
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  32,  12, 0 },          // UpdatePublishedFileFile
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  33,  12, 0 },          // UpdatePublishedFilePreviewFile
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  34,  12, 0 },          // UpdatePublishedFileTitle
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  35,  12, 0 },          // UpdatePublishedFileDescription
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  36,  12, 0 },          // UpdatePublishedFileVisibility
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  37,  12, 0 },          // UpdatePublishedFileTags
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  38,   8, 0 },          // CommitPublishedFileUpdate
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  39,  12, 0 },          // GetPublishedFileDetails
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  40,   8, 0 },          // DeletePublishedFile
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  41,   4, 0 },          // EnumerateUserPublishedFiles
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  42,   8, 0 },          // SubscribePublishedFile
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  43,   4, 0 },          // EnumerateUserSubscribedFiles
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  44,   8, 0 },          // UnsubscribePublishedFile
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  45,  12, 0 },          // UpdatePublishedFileSetChangeDescription
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  46,   8, 0 },          // GetPublishedItemVoteDetails
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  47,  12, 0 },          // UpdateUserPublishedItemVote
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  48,   8, 0 },          // GetUserPublishedItemVoteDetails
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  49,  20, 0 },          // EnumerateUserSharedWorkshopFiles
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  51,  12, 0 },          // SetUserPublishedFileAction
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  52,   8, 0 },          // EnumeratePublishedFilesByUserAction
+    { "STEAMREMOTESTORAGE_INTERFACE_VERSION016",  53,  24, 0 },          // EnumeratePublishedWorkshopFiles
+    // STEAMUSERSTATS_INTERFACE_VERSION012 (FRESteamWorks)
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",   0,   0, 1 },              // Init, RequestStats
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",   1,   8, 0 },              // GetStatFloat
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",   2,   8, 0 },              // GetStatInt
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",   3,   8, 1 },              // SetStatFloat
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",   4,   8, 1 },              // SetStatInt
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",   6,   8, 0 },              // IsAchievementEarned
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",   7,   4, 1 },              // SetAchievement
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",   8,   4, 1 },              // ClearAchievement
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  10,   0, 1 },              // StoreStats, and after SetAchievement, ClearAchievement, ResetAllStats
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  11,   4, 0 },              // GetAchievementIcon
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  12,   8, 0, "" },          // GetAchievementDisplayAttribute
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  13,  12, 0 },              // IndicateAchievementProgress
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  14,   0, 0 },              // GetNumAchievements
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  15,   4, 0, "" },          // GetAchievementName
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  21,   4, 0 },              // ResetAllStats
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  22,  12, 0 },              // FindOrCreateLeaderboard
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  23,   4, 0 },              // FindLeaderboard
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  24,   8, 0, "" },          // GetLeaderboardName
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  25,   8, 0 },              // GetLeaderboardEntryCount
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  26,   8, 0 },              // GetLeaderboardSortMethod
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  27,   8, 0 },              // GetLeaderboardDisplayType
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  28,  20, 0 },              // DownloadLeaderboardEntries
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  30,  24, 0 },              // DownloadLeaderboardEntriesResult
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  31,  24, 0 },              // UploadLeaderboardScore
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  37,   8, 0 },              // GetAchievementAchievedPercent
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  38,   4, 0 },              // RequestGlobalStats
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  39,   8, 0 },              // GetGlobalStatFloat
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  40,   8, 0 },              // GetGlobalStatInt
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  41,  12, 0 },              // GetGlobalStatHistoryFloat
+    { "STEAMUSERSTATS_INTERFACE_VERSION012",  42,  12, 0 },              // GetGlobalStatHistoryInt
+    // SteamFriends017 (FRESteamWorks)
+    { "SteamFriends017",   3,   4, 0 },                                  // GetFriendCount
+    { "SteamFriends017",   4,  12, 0 },                                  // GetFriendByIndex
+    { "SteamFriends017",   7,   8, 0, "Player" },                        // GetFriendPersonaName
+    { "SteamFriends017",  28,   4, 0 },                                  // ActivateGameOverlay
+    { "SteamFriends017",  29,  12, 0 },                                  // ActivateGameOverlayToUser
+    { "SteamFriends017",  30,   8, 0 },                                  // ActivateGameOverlayToWebPage
+    { "SteamFriends017",  31,   8, 0 },                                  // ActivateGameOverlayToStore
+    { "SteamFriends017",  33,   8, 0 },                                  // ActivateGameOverlayInviteDialog
+    { "SteamFriends017",  34,   8, 0 },                                  // GetSmallFriendAvatar
+    { "SteamFriends017",  35,   8, 0 },                                  // GetMediumFriendAvatar
+    { "SteamFriends017",  36,   8, 0 },                                  // GetLargeFriendAvatar
+    { "SteamFriends017",  44,   0, 0 },                                  // ClearRichPresence
+    // SteamInput006 (FRESteamWorks)
+    { "SteamInput006",   1,   0, 0 },                                    // SteamInputShutDown
+    { "SteamInput006",   3,   4, 0 },                                    // RunFrame
+    { "SteamInput006",   6,   4, 0, nullptr, &gh_steam_connected_controllers },   // GetConnectedControllers
+    { "SteamInput006",  16,   4, 0, nullptr, &gh_steam_digital_handle },  // GetDigitalActionHandle
+    { "SteamInput006",  17,  20, 0, nullptr, &gh_steam_digital_data },    // GetDigitalActionData
+    { "SteamInput006",  18,  28, 0 },                                    // GetDigitalActionOrigins
+    { "SteamInput006",  20,   4, 0, nullptr, &gh_steam_analog_handle },   // GetAnalogActionHandle
+    { "SteamInput006",  21,  20, 0, nullptr, &gh_steam_analog_data },     // GetAnalogActionData
+    { "SteamInput006",  22,  28, 0 },                                    // GetAnalogActionOrigins
+    { "SteamInput006",  23,  12, 0 },                                    // GetGlyphPNGForActionOrigin
+    { "SteamInput006",  24,   8, 0 },                                    // GetGlyphSVGForActionOrigin
+    { "SteamInput006",  26,   4, 0 },                                    // GetStringForActionOrigin
+    { "SteamInput006",  36,   8, 0 },                                    // ShowBindingPanel
+    { "SteamInput006",  38,   4, 0 },                                    // GetControllerForGamepadIndex
+    // SteamUser021 (FRESteamWorks)
+    { "SteamUser021",   1,   0, 1 },                                     // Init, RequestStats (logged on: the loader's engine is signed in)
+    { "SteamUser021",   2,   4, 0, nullptr, &gh_steam_get_steamid },     // GetUserID
+    { "SteamUser021",  13,  12, 0 },                                     // GetAuthSessionTicket
+    { "SteamUser021",  14,  16, 0 },                                     // BeginAuthSession
+    { "SteamUser021",  15,   8, 0 },                                     // EndAuthSession
+    { "SteamUser021",  16,   4, 0 },                                     // CancelAuthTicket
+    { "SteamUser021",  17,  12, 0 },                                     // UserHasLicenseForApp
+    { "SteamUser021",  20,   8, 0 },                                     // RequestEncryptedAppTicket
+    { "SteamUser021",  21,  12, 0 },                                     // GetEncryptedAppTicket
+    // SteamUtils010 (FRESteamWorks)
+    { "SteamUtils010",   4,   0, 0, "US" },                              // GetIPCountry
+    { "SteamUtils010",   5,  12, 0 },                                    // GetAchievementIcon, GetLargeFriendAvatar, GetMediumFriendAvatar, GetSmallFriendAvatar
+    { "SteamUtils010",   6,  12, 0 },                                    // GetAchievementIcon, GetLargeFriendAvatar, GetMediumFriendAvatar, GetSmallFriendAvatar
+    { "SteamUtils010",   9,   0, 0, nullptr, &gh_steam_appid_slot },     // Init
+    { "SteamUtils010",  10,   4, 0 },                                    // SetOverlayNotificationPosition
+    { "SteamUtils010",  17,   0, 0 },                                    // IsOverlayEnabled
+    { "SteamUtils010",  18,   0, 0 },                                    // OverlayNeedsPresent
+    { "SteamUtils010",  20,  20, 0 },                                    // ShowGamepadTextInput
+    { "SteamUtils010",  25,   8, 0 },                                    // SetOverlayNotificationInset
+    { "SteamUtils010",  26,   0, 0 },                                    // IsSteamInBigPictureMode
+    { "SteamUtils010",  37,   0, 0 },                                    // DismissFloatingGamepadTextInput
 };
 inline constexpr size_t kSteamSlotCount =
     sizeof(kSteamSlots) / sizeof(kSteamSlots[0]);
+
+// Interfaces a guest needs to be NON-NULL but never calls through. FRESteamWorks
+// fills 23 interface pointers in its context init and treats any null among them
+// as "Steam is not available"; Super Fancy Pants Adventure then calls
+// NativeApplication.exit() one frame after its menu appears (0.0.982.0). No call
+// site in the extension goes through any of these, so each gets the bare 80-slot
+// stub: every slot is the logging unknown-slot thunk, which is safe exactly as
+// long as nothing calls it, and says so loudly if something does. No title before
+// this one asked for any of them, so the 909/910 rule for interfaces it did ask
+// for (null rather than an unpoppable stub) is unchanged.
+inline constexpr const char* kSteamBareIfaces[] = {
+    "SteamClient020", "SteamMatchMaking009", "SteamMatchGameSearch001",
+    "SteamMatchMakingServers002", "SteamNetworking006",
+    "STEAMSCREENSHOTS_INTERFACE_VERSION003", "SteamController008",
+    "STEAMUGC_INTERFACE_VERSION016", "STEAMAPPLIST_INTERFACE_VERSION001",
+    "STEAMMUSIC_INTERFACE_VERSION001", "STEAMMUSICREMOTE_INTERFACE_VERSION001",
+    "STEAMHTMLSURFACE_INTERFACE_VERSION_005", "STEAMINVENTORY_INTERFACE_V003",
+    "STEAMVIDEO_INTERFACE_V002", "STEAMPARENTALSETTINGS_INTERFACE_VERSION001",
+};
 
 inline int g_steam_slot_hits[kSteamSlotCount] = { 0 };
 
@@ -2593,6 +3878,7 @@ inline uint64_t steam_slot_invoke(Machine& m, const uint32_t* args)
     }
     // Loud for the first few, then quiet: some of these sit in the frame loop
     // and the point of the log is to show WHICH slots a run reaches, once.
+    ++wndq_stats().steam;
     if (++g_steam_slot_hits[I] <= 4)
         log(std::string("X86 STEAM call ") + kSteamSlots[I].iface + " slot " +
             std::to_string(kSteamSlots[I].slot) + " (pops " +
@@ -2641,7 +3927,8 @@ inline const SteamInvokeFn* steam_invokes(std::index_sequence<Is...>)
 }
 
 // 80 slots covers every version here with room to spare; the largest index any
-// call site uses is 46, and a vtable costs four bytes a slot.
+// call site uses is 53 (FRESteamWorks, remote storage), and a vtable costs four
+// bytes a slot.
 inline constexpr uint32_t kSteamVtableSlots = 80;
 
 inline uint32_t steam_stub_for(Machine& m, const char* ver)
@@ -2663,6 +3950,8 @@ inline uint32_t steam_stub_for(Machine& m, const char* ver)
     int cover = 0;
     for (size_t i = 0; i < kSteamSlotCount; ++i)
         if (std::strcmp(kSteamSlots[i].iface, ver) == 0) ++cover;
+    for (const char* b : kSteamBareIfaces)
+        if (std::strcmp(b, ver) == 0) ++cover;
     if (!cover) {
         log(std::string("X86 STEAM ") + ver +
             ": no slot of this interface is in the table, so returning null "
@@ -2720,6 +4009,25 @@ inline void RegisterSteamBridgeBeds(ThunkRegistry& R)
         [](Machine&, const uint32_t*) -> uint64_t {
             log("X86 STEAM SteamAPI_Init -> true (bridged to the loader's x64 engine)");
             return 1;
+        });
+    // Older SDKs export the same call under this name (Super Fancy Pants
+    // Adventure's FRESteamWorks native extension imports only this one).
+    GH_X86_BED_CDECL(R, "steam_api.dll", "SteamAPI_InitSafe",
+        [](Machine&, const uint32_t*) -> uint64_t {
+            log("X86 STEAM SteamAPI_InitSafe -> true (bridged to the loader's x64 engine)");
+            return 1;
+        });
+    // SteamAPI_RestartAppIfNecessary(AppId_t). True means "Steam did not start
+    // this process: quit, Steam will relaunch you", and the game exits on it.
+    // Here the launcher plays Steam's part: it started the title from the
+    // signed-in account's library. So the answer is the same ownership answer
+    // BIsSubscribedApp gives -- "no restart needed" only for an owned app.
+    GH_X86_BED_CDECL(R, "steam_api.dll", "SteamAPI_RestartAppIfNecessary",
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            const bool owned = gh_steam_owns(a[0]);
+            log("X86 STEAM RestartAppIfNecessary(" + std::to_string(a[0]) + ") -> " +
+                (owned ? "false (owned; started by the launcher)" : "true (not owned)"));
+            return owned ? 0 : 1;
         });
     GH_X86_BED_CDECL(R, "steam_api.dll", "SteamAPI_Shutdown",
         [](Machine&, const uint32_t*) -> uint64_t { return 0; });
@@ -2827,6 +4135,14 @@ inline void RegisterSteamBridgeBeds(ThunkRegistry& R)
                     " user=" + std::to_string(a[0]));
                 return steam_stub_for(m, v);
             });
+    // SteamInternal_CreateInterface(const char* version): the older accessor
+    // (SteamClient() and friends), one argument instead of two. Same stubs.
+    GH_X86_BED_CDECL(R, "steam_api.dll", "SteamInternal_CreateInterface",
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            const char* v = (const char*)(uintptr_t)a[0];
+            log(std::string("X86 STEAM interface WANTED (CreateInterface): ") + (v ? v : "(null)"));
+            return steam_stub_for(m, v);
+        });
 }
 
 inline void RegisterStdBeds(Machine& m)
@@ -2909,6 +4225,29 @@ inline void RegisterStdBeds(Machine& m)
             HANDLE h = Bed_CreateFileW((LPCWSTR)(uintptr_t)a[0], a[1], a[2],
                                    sa32_translate(a[3]),
                                    a[4], a[5], (HANDLE)(uintptr_t)a[6]);
+            {
+                // Who opened what: a guest that opens a file and then gives up
+                // without reading it (AIR and its descriptor) leaves no other trace.
+                std::string p;
+                for (const wchar_t* w = (const wchar_t*)(uintptr_t)a[0]; w && *w; ++w)
+                    p += (char)(*w < 128 ? *w : '?');
+                const DWORD e = GetLastError();
+                log_capped("cfw:" + p, "X86 CreateFileW " + p + " access=" + hex(a[1]) + " share=" + hex(a[2]) +
+                    " disp=" + hex(a[4]) + " flags=" + hex(a[5]) + " -> " + hex((uint32_t)(uintptr_t)h) +
+                    " err=" + std::to_string(e) + " from " + m.describe_addr(a[-1]));
+                if (h != INVALID_HANDLE_VALUE) {
+                    // The opener's own caller is a thin wrapper; the frames that
+                    // decide what to do with the file are further up.
+                    std::string st;
+                    const int lim = (int)readable_words(a, 200);
+                    for (int i = 0, n = 0; i < lim && n < 14; ++i) {
+                        const std::string d = m.describe_addr(a[i]);
+                        if (d.find('+') != std::string::npos) { st += " " + d; ++n; }
+                    }
+                    log_capped("cfw-st:" + p, "X86 CreateFileW stack:" + st);
+                }
+                SetLastError(e);
+            }
             if (h != INVALID_HANDLE_VALUE && m.window_prof) {
                 std::string p;
                 for (const wchar_t* w = (const wchar_t*)(uintptr_t)a[0]; w && *w; ++w)
@@ -3017,6 +4356,7 @@ inline void RegisterStdBeds(Machine& m)
 
     GH_X86_BED(R, "kernel32.dll", "HeapFree", 12,
         [](Machine& m, const uint32_t* a) -> uint64_t {
+            if (!a[2]) return 1u;                       // HeapFree(NULL) succeeds on Windows
             return m.heap_free(a[2]) ? 1u : 0u;
         });
 
@@ -3051,17 +4391,78 @@ inline void RegisterStdBeds(Machine& m)
             // something else -- two allocators writing to one arena, which
             // surfaces as corruption arbitrarily far from here. Outside our
             // bump area the hint is refused and a fresh region substituted.
+            //
+            // A RESERVE at an address is different, and returning the hint for
+            // it was the same sharing bug by another door: below brk every
+            // address "is ours", so a guest heap growing its reservation by
+            // asking for the range just past its last one was told yes about
+            // memory already handed to someone else. Windows grants a reserve
+            // at an address only if the range is free and fails it otherwise,
+            // so that is what happens here: free means at or above brk, and
+            // the region is then placed exactly there.
+            if (a[0])
+                log_capped("va-hint", "X86 VirtualAlloc at " + hex(a[0]) + " +" + hex(a[1]) + " type=" +
+                           hex(a[2]) + " prot=" + hex(a[3]) + " from " + guest_sym(m, a[-1]) +
+                           (m.owns_bump(a[0], a[1] ? a[1] : 1) ? " (ours)" : " (not ours)"));
+            if (a[0] && (a[2] & MEM_RESERVE)) {
+                const uint32_t want = a[0] & ~0xFFFFu;           // reservations start on 64 KB
+                const uint32_t len = (uint32_t)((((uint64_t)a[0] + (a[1] ? a[1] : 1) + 0xFFF) & ~0xFFFull) - want);
+                const uint32_t got = want >= m.brk ? m.alloc(len, 0x1000, want) : 0;
+                if (!got) {
+                    log_capped("va-res", "X86 VirtualAlloc reserve at " + hex(a[0]) + " +" + hex(a[1]) +
+                               " refused: not free (brk " + hex(m.brk) + "), as Windows would");
+                    SetLastError(ERROR_INVALID_ADDRESS);
+                }
+                return got;
+            }
             if (a[0]) {
-                if (m.owns_bump(a[0], a[1] ? a[1] : 1)) return a[0];
+                if (m.owns_bump(a[0], a[1] ? a[1] : 1)) return a[0] & ~0xFFFu;
                 log("X86 VirtualAlloc hint " + hex(a[0]) + " +" + hex(a[1]) +
                     " is not memory we handed out (type=" + hex(a[2]) +
                     ") -- substituting a fresh region");
             }
-            return m.alloc(a[1] ? a[1] : 0x1000);
+            // No address: on the 64 KB allocation granularity GetSystemInfo
+            // reports, as Windows places them.
+            return m.alloc(a[1] ? a[1] : 0x1000, 0x10000);
         });
 
-    GH_X86_BED(R, "kernel32.dll", "VirtualFree", 12,
-        [](Machine&, const uint32_t*) -> uint64_t { return 1; });   // bump allocator: no-op
+    // The bump allocator never hands an address out twice, so freeing need not
+    // return address space. It must still return CONTENTS: a guest heap that
+    // decommits pages inside its own reservation and commits them again
+    // expects zeros, as Windows gives it. A no-op handed Adobe AIR's collector
+    // its old atoms back and it dereferenced a stale one (0.0.964.0, reading
+    // 0x3EC). So a decommit -- or the release of a whole allocation, which a
+    // guest may reserve again by address -- drops the host pages and commits
+    // them afresh: zero on next touch, the physical pages returned meanwhile,
+    // the commit charge unchanged, and the protection back to the default.
+    GH_X86_BED(R, "kernel32.dll", "VirtualFree", 12,             // (addr, size, freeType)
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            uint32_t base = a[0], len = a[1];
+            if (!(a[2] & (MEM_DECOMMIT | MEM_RELEASE))) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+            if ((a[2] & MEM_RELEASE) && len) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+            if (!len) {                                    // the whole allocation at base
+                for (const auto& b : m.blocks) if (b.base == base) { len = b.end - b.base; break; }
+                if (!len) return 1;
+            }
+            if (!m.owns_bump(base, len)) return 1;
+            const uint32_t first = base & ~0xFFFu;
+            const uint32_t stop = (uint32_t)(((uint64_t)base + len + 0xFFF) & ~0xFFFull);
+            log_capped("vfree1", "X86 VirtualFree returns contents: first " +
+                       std::string((a[2] & MEM_RELEASE) ? "release " : "decommit ") +
+                       hex(first) + " +" + hex(stop - first));
+            void* p = (void*)(uintptr_t)first;
+            if (!VirtualFree(p, stop - first, MEM_DECOMMIT) ||
+                !VirtualAlloc(p, stop - first, MEM_COMMIT, m.commit_protect)) {
+                log_capped("vfree", "X86 VirtualFree could not recommit " + hex(first) + " +" +
+                           hex(stop - first) + " error " + std::to_string(GetLastError()) +
+                           " -- zeroing in place");
+                VirtualAlloc(p, stop - first, MEM_COMMIT, m.commit_protect);
+                std::memset(p, 0, stop - first);
+            }
+            std::lock_guard<std::mutex> l(g_prot.mu);
+            if (!g_prot.page.empty()) g_prot.set(first, stop - 0x1000, PAGE_READWRITE);
+            return 1;
+        });
 
     // -- process/environment ---------------------------------------------
     GH_X86_BED(R, "kernel32.dll", "ExitProcess", 4,
@@ -3459,6 +4860,41 @@ inline void RegisterStdBeds(Machine& m)
             return f ? f->invoke(m, a) : 0;
         });
 
+    // -- page protection as the guest set it ------------------------------------
+    // The native runtime commits every guest page PAGE_EXECUTE_READWRITE (it
+    // runs guest code in place), and VirtualQuery below reports committed guest
+    // memory as PAGE_READWRITE. A forwarded VirtualProtect then answered with
+    // the host's truth, 0x40, as the old protection. A JIT that checks its own
+    // bookkeeping cannot survive that: Adobe AIR flips code pages between
+    // PAGE_READWRITE and PAGE_EXECUTE_READ and asserts both that VirtualQuery
+    // says what it last set and that VirtualProtect's old value agrees. On
+    // 0.0.963.0 every flip asserted, then the runtime fail-fasted.
+    //
+    // So the guest's view is kept here, per page, for pages inside the guest
+    // region: PAGE_READWRITE unless the guest said otherwise. The protection is
+    // still applied on the host for real -- a collector's write barrier
+    // (PAGE_NOACCESS, then catch the fault) depends on that.
+    static constexpr auto in_region = [](Machine& m, uint32_t addr, uint32_t len) {
+        return m.region_base && addr >= m.region_base &&
+               (uint64_t)addr + (len ? len : 1) <= (uint64_t)m.region_base + m.region_size;
+    };
+    GH_X86_BED(R, "kernel32.dll", "VirtualProtect", 16,      // (addr, size, newProtect, pOld)
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            DWORD host_old = 0;
+            if (!a[3]) { SetLastError(ERROR_NOACCESS); return 0; }
+            if (!VirtualProtect((void*)(uintptr_t)a[0], a[1], a[2], &host_old)) return 0;
+            uint32_t old = host_old;
+            if (in_region(m, a[0], a[1])) {
+                const uint32_t first = a[0] & ~0xFFFu;
+                const uint32_t last = (uint32_t)(((uint64_t)a[0] + (a[1] ? a[1] : 1) - 1) & ~0xFFFull);
+                std::lock_guard<std::mutex> l(g_prot.mu);
+                old = g_prot.get(first);
+                g_prot.set(first, last, a[2]);
+            }
+            std::memcpy((void*)(uintptr_t)a[3], &old, 4);
+            return 1;
+        });
+
     // -- VirtualQuery: 28 bytes on x86, 48 on x64 -----------------------------
     // Forwarded, the host sees dwLength=28 for a 48-byte structure and returns
     // 0 without writing anything. mono's Boehm collector uses this to find the
@@ -3475,6 +4911,28 @@ inline void RegisterStdBeds(Machine& m)
             {
                 uint32_t f[7];
                 if (m.guest_region_query(a[0], f)) {
+                    // Committed pages answer with the protection the guest last
+                    // set (see VirtualProtect above), and a run ends where that
+                    // protection changes. No protected pages: the coarse reply.
+                    if (f[4] == MEM_COMMIT) {
+                        const uint32_t pg = a[0] & ~0xFFFu;
+                        std::lock_guard<std::mutex> l(g_prot.mu);
+                        if (!g_prot.page.empty()) {
+                            const uint32_t prot = g_prot.get(pg);
+                            uint32_t run = 0x1000;
+                            while (run < f[3] && g_prot.get(pg + run) == prot) {
+                                if (prot == PAGE_READWRITE) {          // jump to the next shadowed page
+                                    auto it = g_prot.page.lower_bound(pg + run);
+                                    const uint64_t nxt = it == g_prot.page.end() ? (uint64_t)pg + f[3] : it->first;
+                                    run = (uint32_t)((nxt < (uint64_t)pg + f[3] ? nxt : (uint64_t)pg + f[3]) - pg);
+                                    break;
+                                }
+                                run += 0x1000;
+                            }
+                            f[3] = run < f[3] ? run : f[3];
+                            f[5] = prot;
+                        }
+                    }
                     std::memcpy((void*)(uintptr_t)a[1], f, sizeof(f));
                     return 28;
                 }
@@ -3692,6 +5150,30 @@ inline void RegisterStdBeds(Machine& m)
             std::memcpy(d, p.c_str(), n * 2);
             d[n] = 0;
             return n;
+        });
+    // Our own process only: the guest's exe path, as GetModuleFileNameW(NULL)
+    // gives it. Adobe AIR asks for this through GetProcAddress at start-up.
+    GH_X86_BED(R, "kernel32.dll", "QueryFullProcessImageNameW", 16,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            // (hProcess, dwFlags, lpExeName, PDWORD lpdwSize)
+            if (a[0] != 0xFFFFFFFFu && a[0] != GetCurrentProcessId()) {
+                if (GetProcessId((HANDLE)(intptr_t)(int32_t)a[0]) != GetCurrentProcessId()) {
+                    SetLastError(ERROR_ACCESS_DENIED);
+                    return 0;
+                }
+            }
+            if (!a[2] || !a[3]) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+            std::wstring p = module_path32(m, 0);
+            uint32_t* sz = (uint32_t*)(uintptr_t)a[3];
+            if (p.size() + 1 > *sz) { SetLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
+            wchar_t* d = (wchar_t*)(uintptr_t)a[2];
+            std::memcpy(d, p.c_str(), (p.size() + 1) * 2);
+            *sz = (uint32_t)p.size();
+            return 1;
+        });
+    GH_X86_BED(R, "user32.dll", "CharUpperBuffW", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            return a[0] ? CharUpperBuffW((wchar_t*)(uintptr_t)a[0], a[1]) : 0;
         });
     GH_X86_BED(R, "kernel32.dll", "GetModuleFileNameA", 12,
         [](Machine& m, const uint32_t* a) -> uint64_t {
@@ -4630,10 +6112,10 @@ inline void RegisterStdBeds(Machine& m)
     // CreateWindowExW takes 12 arguments; getting that count wrong is a silent
     // 4-byte stack drift per call, so it is asserted like the WS2_32 table.
     //
-    // The game window is kFakeHwnd and every guest window that IS the game
-    // shares it (HL2 makes one at CW_USEDEFAULT, then the real 1920x1080 one).
-    // A child, a message-only window, or a small window made once the game
-    // window exists is a SubWindow with an HWND of its own.
+    // The first game-sized top-level window is kFakeHwnd; a later one gets an
+    // HWND of its own and becomes the game window (g_x86_main_hwnd). A child,
+    // a message-only window, or a small window made once the game window
+    // exists is a SubWindow with an HWND of its own too.
     static_assert(thunk_bytes_of(&::CreateWindowExW) == 48, "CreateWindowExW");
     GH_X86_BED(R, "user32.dll", "CreateWindowExW", 48,
         [](Machine& m, const uint32_t* a) -> uint64_t { return x86_create_window(m, a, true, "CreateWindowExW"); });
@@ -4641,8 +6123,10 @@ inline void RegisterStdBeds(Machine& m)
         [](Machine& m, const uint32_t* a) -> uint64_t { return x86_create_window(m, a, false, "CreateWindowExA"); });
     GH_X86_BED(R, "user32.dll", "DestroyWindow", 4,
         [](Machine& m, const uint32_t* a) -> uint64_t {
+            log_capped("destroywnd", "X86 DestroyWindow " + hex(a[0]) + (a[0] == g_x86_main_hwnd.load() ? " (the main window)" : ""));
             m.bed.sub_windows.erase(a[0]);
             m.bed.win_props.erase(a[0]);
+            if (a[0] == g_x86_main_hwnd.load()) g_x86_main_hwnd = kFakeHwnd;
             return 1;
         });
 
@@ -4683,9 +6167,32 @@ inline void RegisterStdBeds(Machine& m)
     GH_X86_BED(R, "user32.dll", "SetWindowRgn", 12,
         [](Machine&, const uint32_t*) -> uint64_t { return 1; });
     GH_X86_BED(R, "user32.dll", "MoveWindow", 24,
-        [](Machine&, const uint32_t*) -> uint64_t { return 1; });
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1) < 12)
+                log("X86 MoveWindow " + hex(a[0]) + " " + std::to_string((int32_t)a[1]) + "," + std::to_string((int32_t)a[2])
+                    + " " + std::to_string((int32_t)a[3]) + "x" + std::to_string((int32_t)a[4]));
+            x86_send_size(m, a[0], "MoveWindow"); return 1;
+        });
+    // Owes the window a WM_PAINT (gh_x86_wndq.h). A player that draws only
+    // when painted (Adobe AIR) froze on its first frame while this was a no-op.
     GH_X86_BED(R, "user32.dll", "InvalidateRect", 12,
-        [](Machine&, const uint32_t*) -> uint64_t { return 1; });
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1) < 8)
+                log("X86 InvalidateRect hwnd=" + hex(a[0]) + " rect=" + hex(a[1]) + " from " + hex(a[-1]));
+            wndq_invalidate(a[0]);
+            return 1;
+        });
+    // RECT*, HRGN, then the flags: RDW_INVALIDATE 0x1, RDW_VALIDATE 0x8,
+    // RDW_UPDATENOW 0x100 (the paint then arrives through the queue, a few ms
+    // later, rather than inside this call).
+    GH_X86_BED(R, "user32.dll", "RedrawWindow", 16,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            if (a[3] & 0x1) wndq_invalidate(a[0]);
+            else if (a[3] & 0x8) wndq_validate(a[0]);
+            return 1;
+        });
     GH_X86_BED(R, "user32.dll", "SetLayeredWindowAttributes", 16,
         [](Machine&, const uint32_t*) -> uint64_t { return 1; });
     // Client space IS screen space here, so points pass through untouched and
@@ -4696,7 +6203,7 @@ inline void RegisterStdBeds(Machine& m)
         GH_X86_BED(R, "user32.dll", n, 4,
             [](Machine&, const uint32_t*) -> uint64_t { return 0; });
     GH_X86_BED(R, "user32.dll", "SetActiveWindow", 4,
-        [](Machine&, const uint32_t*) -> uint64_t { return kFakeHwnd; });
+        [](Machine&, const uint32_t*) -> uint64_t { return g_x86_main_hwnd.load(); });
     GH_X86_BED(R, "user32.dll", "SetCapture", 4,
         [](Machine&, const uint32_t*) -> uint64_t { return 0; });   // nobody had it
     GH_X86_BED(R, "user32.dll", "ReleaseCapture", 0,
@@ -4716,11 +6223,16 @@ inline void RegisterStdBeds(Machine& m)
             if (a[1]) *(uint32_t*)(uintptr_t)a[1] = GetCurrentProcessId();
             return GetCurrentThreadId();
         });
-    // Nothing is ever invalid: we do not paint through GDI, D3D presents.
+    // The update region is the whole window or nothing (gh_x86_wndq.h). SDL
+    // asks this inside WM_PAINT and validates only when it says non-empty.
     GH_X86_BED(R, "user32.dll", "GetUpdateRect", 12,
-        [](Machine&, const uint32_t* a) -> uint64_t {
-            if (a[1]) std::memset((void*)(uintptr_t)a[1], 0, 16);
-            return 0;
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            const bool dirty = wndq_paint_gen(a[0]) != 0;
+            if (a[1]) {
+                const uint32_t r[4] = { 0, 0, dirty ? m.bed.win_w : 0, dirty ? m.bed.win_h : 0 };
+                std::memcpy((void*)(uintptr_t)a[1], r, 16);
+            }
+            return dirty ? 1 : 0;
         });
     for (const char* n : { "GetWindowTextW", "GetWindowTextA" })
         GH_X86_BED(R, "user32.dll", n, 12,
@@ -4741,33 +6253,59 @@ inline void RegisterStdBeds(Machine& m)
 
     // The rest of the window lifecycle: there is nothing to do, and saying so
     // truthfully (TRUE, "it worked") is what keeps the guest on its happy path.
-    for (const char* n : { "UpdateWindow", "SetForegroundWindow",
-                           "IsWindowVisible", "ValidateRect" })
+    for (const char* n : { "SetForegroundWindow", "IsWindowVisible" })
         GH_X86_BED(R, "user32.dll", n, 4,
             [](Machine&, const uint32_t*) -> uint64_t { return 1; });
+    // (hwnd, RECT*): the region is all or nothing, so any rectangle clears it.
+    GH_X86_BED(R, "user32.dll", "ValidateRect", 8,
+        [](Machine&, const uint32_t* a) -> uint64_t { wndq_validate(a[0]); return 1; });
+    // Sends the pending WM_PAINT straight to the window procedure, as user32
+    // does; nothing to do for a window with nothing to repaint.
+    GH_X86_BED(R, "user32.dll", "UpdateWindow", 4,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            const uint32_t gen = wndq_paint_gen(a[0]);
+            if (!gen) return 1;
+            const uint32_t proc = wndproc_for(m, a[0]);
+            if (!proc) { wndq_validate(a[0]); return 1; }
+            uint32_t args[4] = { a[0], WM_PAINT, 0, 0 };
+            m.call_guest32(proc, args, 4);
+            wndq_painted(a[0], gen);
+            return 1;
+        });
+    // SW_HIDE (0) and the minimising commands (2, 6, 7) leave no client area to size.
     GH_X86_BED(R, "user32.dll", "ShowWindow", 8,
-        [](Machine&, const uint32_t*) -> uint64_t { return 1; });
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            if (a[1] != 0 && a[1] != 2 && a[1] != 6 && a[1] != 7) x86_send_size(m, a[0], "ShowWindow");
+            return 1;
+        });
     GH_X86_BED(R, "user32.dll", "EnableWindow", 8,
         [](Machine&, const uint32_t*) -> uint64_t { return 1; });
     GH_X86_BED(R, "user32.dll", "SetWindowTextW", 8,
         [](Machine&, const uint32_t*) -> uint64_t { return 1; });
     GH_X86_BED(R, "user32.dll", "SetWindowPos", 28,
-        [](Machine&, const uint32_t*) -> uint64_t { return 1; });
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1) < 12)
+                log("X86 SetWindowPos " + hex(a[0]) + " after=" + hex(a[1]) + " " + std::to_string((int32_t)a[2]) + "," + std::to_string((int32_t)a[3])
+                    + " " + std::to_string((int32_t)a[4]) + "x" + std::to_string((int32_t)a[5]) + " flags=" + hex(a[6]));
+            if (!(a[6] & SWP_NOSIZE)) x86_send_size(m, a[0], "SetWindowPos");
+            return 1;
+        });
     GH_X86_BED(R, "user32.dll", "IsIconic", 4,
         [](Machine&, const uint32_t*) -> uint64_t { return 0; });   // never minimised
     GH_X86_BED(R, "user32.dll", "SetFocus", 4,
-        [](Machine&, const uint32_t*) -> uint64_t { return kFakeHwnd; });
+        [](Machine&, const uint32_t*) -> uint64_t { return g_x86_main_hwnd.load(); });
     GH_X86_BED(R, "user32.dll", "GetFocus", 0,
-        [](Machine&, const uint32_t*) -> uint64_t { return kFakeHwnd; });
+        [](Machine&, const uint32_t*) -> uint64_t { return g_x86_main_hwnd.load(); });
     for (const char* n : { "GetDesktopWindow", "GetActiveWindow", "GetForegroundWindow" })
         GH_X86_BED(R, "user32.dll", n, 0,
-            [](Machine&, const uint32_t*) -> uint64_t { return kFakeHwnd; });
+            [](Machine&, const uint32_t*) -> uint64_t { return g_x86_main_hwnd.load(); });
     GH_X86_BED(R, "user32.dll", "GetParent", 4,
         [](Machine&, const uint32_t*) -> uint64_t { return 0; });   // top-level
     GH_X86_BED(R, "user32.dll", "GetAncestor", 8,
-        [](Machine&, const uint32_t*) -> uint64_t { return kFakeHwnd; });
+        [](Machine&, const uint32_t*) -> uint64_t { return g_x86_main_hwnd.load(); });
     GH_X86_BED(R, "user32.dll", "WindowFromPoint", 8,
-        [](Machine&, const uint32_t*) -> uint64_t { return kFakeHwnd; });
+        [](Machine&, const uint32_t*) -> uint64_t { return g_x86_main_hwnd.load(); });
 
     // A device context the guest can hold but never draw through. Unity asks for
     // one during display enumeration and releases it immediately; D3D is what
@@ -4776,6 +6314,24 @@ inline void RegisterStdBeds(Machine& m)
         [](Machine&, const uint32_t*) -> uint64_t { return kFakeHdc; });
     GH_X86_BED(R, "user32.dll", "ReleaseDC", 8,
         [](Machine&, const uint32_t*) -> uint64_t { return 1; });
+    // (HDC, RECT*) -> region type. On the window's DC the clip box is the
+    // whole window (SIMPLEREGION), which is also the paint rectangle BeginPaint
+    // reports. The generated stub said ERROR and wrote nothing, and Adobe AIR,
+    // which asks this inside WM_PAINT, then drew nothing. A real host DC (a
+    // memory DC) is asked of the host's gdi32.
+    GH_X86_BED(R, "gdi32.dll", "GetClipBox", 8,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            if (a[0] != kFakeHdc) {
+                using Fn = int (WINAPI*)(HDC, LPRECT);
+                static Fn fn = (Fn)(void*)GetProcAddress(GetModuleHandleW(L"gdi32.dll"), "GetClipBox");
+                if (fn) return (uint32_t)fn((HDC)(intptr_t)(int32_t)a[0], (LPRECT)(uintptr_t)a[1]);
+            }
+            if (a[1]) {
+                const uint32_t r[4] = { 0, 0, m.bed.win_w, m.bed.win_h };
+                std::memcpy((void*)(uintptr_t)a[1], r, 16);
+            }
+            return 2;                                            // SIMPLEREGION
+        });
 
     // Client == screen: the surrogate window is exactly the framebuffer, so
     // there is no non-client area and AdjustWindowRect has nothing to adjust.
@@ -4954,7 +6510,45 @@ inline void RegisterStdBeds(Machine& m)
     GH_X86_BED(R, "user32.dll", "IsDialogMessageW", 8,
         [](Machine&, const uint32_t*) -> uint64_t { return 0; });
     GH_X86_BED(R, "user32.dll", "PostQuitMessage", 4,
-        [](Machine& m, const uint32_t*) -> uint64_t { m.bed.quit_posted = true; return 0; });
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            m.bed.quit_posted = true;
+            wndq_post(0, WM_QUIT, a[0], 0);
+            return 0;
+        });
+    for (const char* n : { "PostMessageW", "PostMessageA" })
+        GH_X86_BED(R, "user32.dll", n, 16,
+            [](Machine& m, const uint32_t* a) -> uint64_t {
+                if (a[0] == 0xFFFFu) return TRUE;               // HWND_BROADCAST: no other windows here
+                // One line per message id (then powers of two): who drives a
+                // player's frames is usually a post from a timer thread. The
+                // first post of each id also names its callers -- a player
+                // that posts itself a private "close this window" (AIR's
+                // 0x40D) decided that several frames up, not in the poster.
+                log_capped("post" + std::to_string(a[1]), "X86 PostMessage " + hex(a[0]) + " msg=" + hex(a[1]));
+                {
+                    static std::mutex mu; static std::set<uint32_t> seen;
+                    bool first; { std::lock_guard<std::mutex> lk(mu); first = seen.size() < 64 && seen.insert(a[1]).second; }
+                    if (first) {
+                        std::string st;
+                        const int lim = (int)readable_words(a - 1, 400);
+                        for (int i = 0, k = 0; i < lim && k < 24; ++i) {
+                            const std::string d = m.describe_addr(a[i - 1]);
+                            if (d.find('+') != std::string::npos) { st += " " + d; ++k; }
+                        }
+                        log("X86 PostMessage msg=" + hex(a[1]) + " stack:" + st);
+                    }
+                }
+                if (wndq_post(a[0], a[1], a[2], a[3])) return TRUE;
+                SetLastError(ERROR_INVALID_WINDOW_HANDLE);
+                return FALSE;
+            });
+    for (const char* n : { "PostThreadMessageW", "PostThreadMessageA" })
+        GH_X86_BED(R, "user32.dll", n, 16,
+            [](Machine&, const uint32_t* a) -> uint64_t {
+                if (wndq_post(0, a[1], a[2], a[3], a[0])) return TRUE;
+                SetLastError(ERROR_NOT_ENOUGH_QUOTA);
+                return FALSE;
+            });
 
     // Dispatch is the whole reason RegisterClass had to be a bed: the window
     // procedure is GUEST code, so it is entered through call_guest32 rather
@@ -4970,16 +6564,30 @@ inline void RegisterStdBeds(Machine& m)
                     uint32_t targs[4] = { msg[0], WM_TIMER, msg[2], (uint32_t)GetTickCount() };
                     return m.call_guest32(msg[3], targs, 4);
                 }
+                if (!msg[0]) return 0;                                 // a thread message has no window
                 const uint32_t proc = wndproc_for(m, msg[0]);
                 if (!proc) return 0;
                 uint32_t args[4] = { msg[0], msg[1], msg[2], msg[3] };   // hwnd, message, wParam, lParam
                 log_input_hop("dispatch", msg[1], msg[2], proc, a[-1]);
+                {
+                    WndQStats& st = wndq_stats();
+                    ++(msg[1] == WM_PAINT ? st.paint : msg[1] == WM_TIMER ? st.timer :
+                       msg[1] == 0x401 ? st.tick : st.other);   // WM_USER+1: AIR's frame tick
+                }
+                if (msg[1] == WM_PAINT) {
+                    const uint32_t gen = wndq_paint_gen(msg[0]);
+                    const uint64_t r = m.call_guest32(proc, args, 4);
+                    wndq_painted(msg[0], gen);
+                    return r;
+                }
                 return m.call_guest32(proc, args, 4);
             });
+    // The default WM_PAINT handling is BeginPaint + EndPaint: it validates.
+    // WM_NCCREATE's default is TRUE ("go on creating"); CreateWindowEx sends it.
     GH_X86_BED(R, "user32.dll", "DefWindowProcW", 16,
-        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+        [](Machine&, const uint32_t* a) -> uint64_t { if (a[1] == WM_PAINT) wndq_validate(a[0]); return a[1] == WM_NCCREATE; });
     GH_X86_BED(R, "user32.dll", "DefWindowProcA", 16,
-        [](Machine&, const uint32_t*) -> uint64_t { return 0; });
+        [](Machine&, const uint32_t* a) -> uint64_t { if (a[1] == WM_PAINT) wndq_validate(a[0]); return a[1] == WM_NCCREATE; });
 
     // SendMessage delivers synchronously to the window procedure, so it is the
     // same host->guest hop as dispatch and cannot be a forward either.
@@ -5011,8 +6619,18 @@ inline void RegisterStdBeds(Machine& m)
     for (const char* n : { "GetMessagePos", "GetMessageTime", "GetMessageExtraInfo" })
         GH_X86_BED(R, "user32.dll", n, 0,
             [](Machine&, const uint32_t*) -> uint64_t { return 0; });
-    GH_X86_BED(R, "user32.dll", "RegisterWindowMessageA", 4,
-        [](Machine&, const uint32_t*) -> uint64_t { return 0xC001; });   // any private message id
+    // One id per name, case-insensitively, as user32 does. A single constant
+    // for every name made two private messages the same message: a player
+    // that registers several (Adobe AIR) dispatched one as the other.
+    for (int wide = 0; wide < 2; ++wide)
+        GH_X86_BED(R, "user32.dll", wide ? "RegisterWindowMessageW" : "RegisterWindowMessageA", 4,
+            wide ? +[](Machine&, const uint32_t* a) -> uint64_t { return register_window_message(a[0], true); }
+                 : +[](Machine&, const uint32_t* a) -> uint64_t { return register_window_message(a[0], false); });
+    // Clipboard formats and window messages share user32's string atom table.
+    for (int wide = 0; wide < 2; ++wide)
+        GH_X86_BED(R, "user32.dll", wide ? "RegisterClipboardFormatW" : "RegisterClipboardFormatA", 4,
+            wide ? +[](Machine&, const uint32_t* a) -> uint64_t { return register_window_message(a[0], true); }
+                 : +[](Machine&, const uint32_t* a) -> uint64_t { return register_window_message(a[0], false); });
 
     // -- the few names gh_x86_stubs.h must NOT answer with a constant -------
     // Everything else Chromium binds and nothing implements is answered by the
@@ -5550,6 +7168,8 @@ inline void RegisterStdBeds(Machine& m)
     RegisterPtrToPtrBeds(R);
     // What HL2's modules need that is neither of the above nor a forward.
     RegisterSourceGapBeds(R);
+    // What the Adobe AIR runtime needs that is not a stub (gh_x86_stubs.h).
+    RegisterAirGapBeds(R);
 
     // Only when the title asks for it: without the knob the guest keeps using
     // the steam_api.dll it ships, which is right for every title that does not

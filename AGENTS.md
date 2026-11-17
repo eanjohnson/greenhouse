@@ -1,5 +1,3 @@
-<!-- Draft of the top-level AGENTS.md. Paths assume it sits at the repository root. -->
-
 # AGENTS.md
 
 Orientation for AI coding agents. Humans: start at [docs/README.md](docs/README.md).
@@ -78,13 +76,13 @@ missing-helper list: [docs/building.md](docs/building.md#environment-variables).
 | Goal | Command |
 |---|---|
 | Does the launcher still compile? | `toolchain/check-launcher.sh` |
-| Build + pack + sign, no device | `GH_PACK_ONLY=1 toolchain/iterate-launcher.sh <new> <old>` (still needs `GH_TOOLS`, `GH_XBOX` and `GH_PFX_PASS` set) |
+| Build + pack + sign, no device | `GH_PACK_ONLY=1 toolchain/iterate-launcher.sh <new> <old>` (still needs `GH_TOOLS` and `GH_PFX_PASS` set) |
 | Build one PE | `toolchain/build.sh <src> <out.exe>` |
 | Build an add-on | `toolchain/build-addon.sh SRC.cpp OUT.dll` |
 | Validate the compatibility dataset | `toolchain/ghcompat.py check` |
 | Fast host tests (g++ only) | `toolchain/test_gh_mods.sh`, `test_gh_zip.sh`, `test_gh_inflate.sh`, `test_gh_web.sh` |
 | Host tests under Wine | `toolchain/test_gh_repo.sh`, `test_gh_ovl.sh`, `test_gh_dsound.sh`, `test_gh_cefwin.sh`, `test_gh_remote.sh` |
-| x86 interpreter tests | `g++ -O2 -std=c++20 -I src/loader/x86 tests/x86/test_cpu.cpp -o /tmp/test_cpu && /tmp/test_cpu` |
+| x86 interpreter tests | `gcc -O2 -c tests/x86/cases.c -o /tmp/cases.o && g++ -O2 -std=c++20 -I src/loader/x86 tests/x86/test_cpu.cpp /tmp/cases.o -o /tmp/test_cpu && /tmp/test_cpu` |
 | Render the UI off-console | `GH_UI_PAGE=all toolchain/gh_ui_host/build.sh` |
 | Resolve a crash address | `toolchain/ghsym.py <version> 0x<rva>` |
 | Build/sign/verify a package repository | `toolchain/ghpkg.py --help` |

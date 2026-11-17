@@ -15,6 +15,7 @@ Related pages: [overview.md](overview.md), [pe-loading.md](pe-loading.md),
 [../reference/knobs.md](../reference/knobs.md),
 [../reference/diagnostics.md](../reference/diagnostics.md),
 [../reference/known-limits.md](../reference/known-limits.md).
+How it was found: [x86-interpreter-and-jit.md](../writeups/x86-interpreter-and-jit.md) · [x86-native.md](../writeups/x86-native.md)
 
 ---
 
@@ -36,9 +37,9 @@ layer, and differ only in who executes guest instructions.
 
 History in one paragraph: the track started as a portable interpreter so the CPU core could be
 tested on a development machine against the host CPU. It was correct but too slow, so a JIT
-(BoxedWine's, GPL-2.0, fetched at build time and never vendored) was connected behind a small
-seam. It measured well but carries known x87 code-generation defects and a licence that keeps it
-out of default builds. The third approach removed the translator entirely: an x64 CPU can run
+(BoxedWine's, GPL-2.0-or-later, fetched at build time and never vendored) was connected behind a
+small seam. It measured well, but two suspected x87 code-generation defects were never re-verified,
+and the default Launcher build does not link it. The third approach removed the translator entirely: an x64 CPU can run
 32-bit code segments, so the guest's code is run as is, and only the boundary between 32-bit guest
 code and 64-bit host code is ours. That is the native runtime, and it is the one games run on.
 
@@ -478,6 +479,7 @@ Marshalling rules:
 | `gh_x86_com_d3d.h` | DXGI and D3D11 over the loader's 64-bit beds; struct overrides (`DXGI_SWAP_CHAIN_DESC` is 60 bytes on x86, 72 on x64); `Map`/`Unmap` bounce buffers |
 | `gh_x86_com_d3d9.h` | Direct3D 9; see [x86-d3d9.md](x86-d3d9.md) |
 | `gh_x86_dsound.h` | DirectSound |
+| `gh_x86_wave.h` | `waveOut` over XAudio2 (native track only) |
 | `gh_x86_input.h` | The empty `IDirectInput8` |
 | `gh_x86_ddraw.h` | DirectDraw (synthetic objects, not wrappers) |
 
@@ -509,6 +511,25 @@ x86 vtables over the loader's DirectSound-on-XAudio2 device (`src/loader/gh_dsou
 [audio-media.md](audio-media.md)). `DSBUFFERDESC` is translated (36 bytes on x86, 40 on x64);
 `Lock` hands out a guest-heap bounce buffer per sound buffer and copies on `Unlock`; capture
 returns `DSERR_NODRIVER`. Enabled per title with the `gh_dsound` knob (default 0).
+
+### 9.4 waveOut (`gh_x86_wave.h`)
+
+The console's `winmm.dll` has no wave output, and Adobe AIR plays every sound through
+`waveOut` (16-bit stereo PCM, `CALLBACK_FUNCTION`). On the native track each open device is one
+XAudio2 source voice on the same engine as DirectSound. A `WAVEHDR` is queued straight from
+guest memory and handed back with `WHDR_DONE` when XAudio2 finishes it.
+
+- **Callbacks.** XAudio2 reports a finished buffer on a thread with no guest context. For
+  `CALLBACK_FUNCTION` the device gets a guest thread of its own (started like any `CreateThread`,
+  with the `ghWaveOutPump` bed as its start routine), which calls the guest's `waveOutProc` with
+  `WOM_DONE`. `WOM_OPEN` and `WOM_CLOSE` are sent from inside `waveOutOpen` and `waveOutClose`.
+  `CALLBACK_EVENT`, `_WINDOW` and `_THREAD` are signalled or posted from the XAudio2 thread.
+- **Matching.** A finished buffer is matched to its header by a per-submission number, so a
+  late completion cannot finish a header the guest has already resubmitted.
+- **Reset.** `waveOutReset` replaces the voice rather than flushing it, because a flush keeps
+  the buffer that is playing, and returns every queued header in order.
+- Formats: PCM 8 or 16 bit and IEEE float, one or two channels. The interpreter track keeps
+  answering `MMSYSERR_NODRIVER`.
 
 ---
 
@@ -584,8 +605,16 @@ What this is and is not, stated plainly because the code comments and the log li
   fixed-format token (`gh_steam_initiate_game_connection`) that only its own game-server stub
   recognizes (`gh_steam_gs_connect_and_auth`). It is not a Steam ticket and means nothing to a
   real server.
-- Multiplayer, friends, achievements, cloud saves and overlay are not provided on the 32-bit
-  track.
+- Steam Cloud files (`ISteamRemoteStorage` v016: `FileWrite`, `FileRead`, `FileExists`,
+  `GetFileSize`, `FileDelete`, `GetFileCount`, `GetQuota`) are kept on the console in
+  `D:\DevelopmentFiles\gh_saves\steam_remote\<appid>\` (`gh_steam_remote_write` and its
+  neighbours). Nothing is synchronised with Steam: a save made on the console stays on the console,
+  and a PC's cloud save does not reach it. Names are checked (relative, printable ASCII, no `..`),
+  files are capped at 100 MB, and a write goes to a temporary file that replaces the old one, so an
+  interrupted write keeps the previous save. Trace: `X86 STEAM remote <op> '<name>' <n> ok|FAILED`
+  (first 48). Super Fancy Pants Adventure saves only this way.
+- Multiplayer, friends, achievements, cloud synchronisation and overlay are not provided on the
+  32-bit track.
 
 A wrong argument-byte count does not fault at the call. The guest stack is shifted and the game
 fails later with an unrelated-looking engine error; suspect the last `X86 STEAM call` lines.
@@ -625,7 +654,7 @@ Title configs are `corpus/titles/*.ghtitle.json` (schema `greenhouse.title/1`).
 | Executable | `hl2.exe` | `hl2.exe` | `hl.exe` |
 | Arguments | `-game hl2 -condebug -novid` | `-game portal -condebug -novid` | `-game valve -soft -condebug -novid` |
 | Knobs | `gh_x86_native`, `gh_dsound` | `gh_x86_native`, `gh_dsound` | `gh_x86_native`, `gh_dsound`, `gh_x86_steam` |
-| Input profile | `builtin-wasd` | (default) | `builtin-wasd` |
+| Input profile | `builtin-wasd` | `builtin-wasd` | `builtin-wasd` |
 | Renderer | Direct3D 9 ([x86-d3d9.md](x86-d3d9.md)) | Direct3D 9 | Software renderer over DirectDraw, presented through Direct3D 9 |
 | Steam | Game's own DLL; init fails; game continues | Same | Stand-in (section 11) |
 | CRT | Ships its own | Ships its own | `corpus/x86sys/ucrt` |

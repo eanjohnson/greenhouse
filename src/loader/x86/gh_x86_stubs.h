@@ -38,14 +38,20 @@
 // Headers for the declarations the bed table did not already need. They exist
 // only so GH_X86_POP can read a real prototype.
 #define SECURITY_WIN32
+#include <aclapi.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <ddeml.h>
 #include <evntrace.h>
+#include <icm.h>
 #include <iphlpapi.h>
 #include <ole2.h>
+#include <oleacc.h>
 #include <psapi.h>
 #include <sddl.h>
 #include <security.h>
+#include <shellapi.h>
+#include <shlobj.h>
 #include <urlmon.h>
 #include <userenv.h>
 #include <usp10.h>
@@ -195,10 +201,6 @@ inline void RegisterStubBeds(Machine& m)
     GH_X86_STUB(R, "kernel32.dll", AssignProcessToJobObject, 0);
     GH_X86_STUB(R, "kernel32.dll", CreateProcessW, 0);
     GH_X86_STUB(R, "kernel32.dll", FatalAppExitA, 0);
-    GH_X86_STUB(R, "kernel32.dll", FindResourceW, 0);
-    GH_X86_STUB(R, "kernel32.dll", LoadResource, 0);
-    GH_X86_STUB(R, "kernel32.dll", LockResource, 0);
-    GH_X86_STUB(R, "kernel32.dll", SizeofResource, 0);
     GH_X86_STUB(R, "kernel32.dll", GetCurrencyFormatW, 0);
     GH_X86_STUB(R, "kernel32.dll", GetNumberFormatW, 0);
     GH_X86_STUB(R, "kernel32.dll", GetDiskFreeSpaceExW, 0);
@@ -347,6 +349,162 @@ inline void RegisterStubBeds(Machine& m)
     GH_X86_STUB(R, "ws2_32.dll", WSARecv, (uint32_t)-1);
     GH_X86_STUB(R, "ws2_32.dll", WSASend, (uint32_t)-1);
     GH_X86_STUB(R, "ws2_32.dll", WSASendTo, (uint32_t)-1);
+
+    // ---- kernel32.dll ----
+    GH_X86_STUB(R, "kernel32.dll", QueueUserAPC, 0);
+    GH_X86_STUB(R, "kernel32.dll", SetNamedPipeHandleState, 0);
+    GH_X86_STUB(R, "kernel32.dll", ConnectNamedPipe, 0);
+    GH_X86_STUB(R, "kernel32.dll", CreateNamedPipeA, (uint32_t)-1);
+    GH_X86_STUB(R, "kernel32.dll", CreateNamedPipeW, (uint32_t)-1);
+    GH_X86_STUB(R, "kernel32.dll", BeginUpdateResourceW, 0);
+    GH_X86_STUB(R, "kernel32.dll", UpdateResourceW, 0);
+    GH_X86_STUB(R, "kernel32.dll", EndUpdateResourceW, 0);
+    GH_X86_STUB(R, "kernel32.dll", GetComputerNameExW, 0);
+    GH_X86_STUB(R, "kernel32.dll", GenerateConsoleCtrlEvent, 0);
+
+    // ---- user32.dll ----
+    GH_X86_STUB(R, "user32.dll", UpdateLayeredWindow, 0);
+    GH_X86_STUB(R, "user32.dll", CreateMenu, 0);
+    GH_X86_STUB(R, "user32.dll", SetMenu, 0);
+    GH_X86_STUB(R, "user32.dll", SetMenuItemInfoW, 0);
+    GH_X86_STUB(R, "user32.dll", GetMenuItemInfoW, 0);
+    GH_X86_STUB(R, "user32.dll", RemoveMenu, 0);
+    GH_X86_STUB(R, "user32.dll", DeleteMenu, 0);
+    GH_X86_STUB(R, "user32.dll", SetMenuInfo, 0);
+    GH_X86_STUB(R, "user32.dll", GetMenuInfo, 0);
+    GH_X86_STUB(R, "user32.dll", GetMenuBarInfo, 0);
+    GH_X86_STUB(R, "user32.dll", GetSystemMenu, 0);
+    GH_X86_STUB(R, "user32.dll", DrawMenuBar, 1);
+    GH_X86_STUB(R, "user32.dll", DdeInitializeW, 0x400F);
+    GH_X86_STUB(R, "user32.dll", DdeUninitialize, 1);
+    GH_X86_STUB(R, "user32.dll", DdeConnect, 0);
+    GH_X86_STUB(R, "user32.dll", DdeDisconnect, 1);
+    GH_X86_STUB(R, "user32.dll", DdeClientTransaction, 0);
+    GH_X86_STUB(R, "user32.dll", DdeCreateStringHandleA, 0);
+    GH_X86_STUB(R, "user32.dll", DdeFreeStringHandle, 1);
+    GH_X86_STUB(R, "user32.dll", ToAscii, 0);
+    GH_X86_STUB(R, "user32.dll", ShowCaret, 1);
+    GH_X86_STUB(R, "user32.dll", IsZoomed, 0);
+    GH_X86_STUB(R, "user32.dll", SetWindowPlacement, 1);
+    GH_X86_STUB(R, "user32.dll", FindWindowExW, 0);
+    GH_X86_STUB(R, "user32.dll", RegisterClipboardFormatA, 0);
+    GH_X86_STUB(R, "user32.dll", GetClipboardFormatNameA, 0);
+    GH_X86_STUB(R, "user32.dll", WaitForInputIdle, (uint32_t)-1);
+    GH_X86_STUB(R, "user32.dll", CloseWindow, 1);
+    GH_X86_STUB(R, "user32.dll", SendMessageTimeoutW, 0);
+    GH_X86_STUB(R, "user32.dll", GetDlgItemTextW, 0);
+    GH_X86_STUB(R, "user32.dll", GetDlgItemTextA, 0);
+
+    // ---- ole32.dll ----
+    GH_X86_STUB(R, "ole32.dll", CreateBindCtx, 0x80004001u);
+    GH_X86_STUB(R, "ole32.dll", MkParseDisplayName, 0x80004001u);
+    GH_X86_STUB(R, "ole32.dll", OleFlushClipboard, 0x800401D0u);
+    GH_X86_STUB(R, "ole32.dll", OleGetClipboard, 0x800401D0u);
+    GH_X86_STUB(R, "ole32.dll", OleSetClipboard, 0x800401D0u);
+    GH_X86_STUB(R, "ole32.dll", OleIsCurrentClipboard, 1);
+    GH_X86_STUB(R, "ole32.dll", CoFreeUnusedLibraries, 0);
+    GH_X86_STUB(R, "ole32.dll", CreateStreamOnHGlobal, 0x80004001u);
+    GH_X86_STUB(R, "ole32.dll", CoMarshalInterThreadInterfaceInStream, 0x80004001u);
+    GH_X86_STUB(R, "ole32.dll", CoGetInterfaceAndReleaseStream, 0x80004001u);
+
+    // ---- crypt32.dll ----
+    GH_X86_STUB(R, "crypt32.dll", CertGetEnhancedKeyUsage, 0);
+    GH_X86_STUB(R, "crypt32.dll", CryptFindLocalizedName, 0);
+    GH_X86_STUB(R, "crypt32.dll", CryptImportPublicKeyInfo, 0);
+    GH_X86_STUB(R, "crypt32.dll", CryptProtectData, 0);
+    GH_X86_STUB(R, "crypt32.dll", CryptUnprotectData, 0);
+    GH_X86_STUB(R, "crypt32.dll", CertFindCertificateInStore, 0);
+    GH_X86_STUB(R, "crypt32.dll", CertVerifySubjectCertificateContext, 0);
+    GH_X86_STUB(R, "crypt32.dll", CryptVerifyMessageSignature, 0);
+    GH_X86_STUB(R, "crypt32.dll", CryptGetMessageCertificates, 0);
+    GH_X86_STUB(R, "crypt32.dll", CertEnumCertificatesInStore, 0);
+    GH_X86_STUB(R, "crypt32.dll", CertCreateCertificateContext, 0);
+
+    // ---- winspool.drv ----
+    GH_X86_STUB(R, "winspool.drv", EnumPrintersW, 0);
+
+    // ---- winmm.dll ----
+    GH_X86_STUB(R, "winmm.dll", timeSetEvent, 0);
+    GH_X86_STUB(R, "winmm.dll", timeKillEvent, 11);
+    GH_X86_STUB(R, "winmm.dll", waveInGetPosition, 5);
+    GH_X86_STUB(R, "winmm.dll", waveInStop, 5);
+    GH_X86_STUB(R, "winmm.dll", mixerGetID, 6);
+    GH_X86_STUB(R, "winmm.dll", waveOutMessage, 6);
+
+    // ---- oleacc.dll ----
+    GH_X86_STUB(R, "oleacc.dll", AccessibleObjectFromWindow, 0x80004005u);
+
+    // ---- gdi32.dll ----
+    GH_X86_STUB(R, "gdi32.dll", GetTextCharacterExtra, 0x80000000u);
+    GH_X86_STUB(R, "gdi32.dll", SetTextCharacterExtra, 0x80000000u);
+    GH_X86_STUB(R, "gdi32.dll", GetBkMode, 0);
+    GH_X86_STUB(R, "gdi32.dll", GetTextAlign, 0);
+    GH_X86_STUB(R, "gdi32.dll", EnumFontFamiliesA, 1);
+    GH_X86_STUB(R, "gdi32.dll", LineTo, 1);
+    GH_X86_STUB(R, "gdi32.dll", PolyBezierTo, 1);
+    GH_X86_STUB(R, "gdi32.dll", FillPath, 1);
+    GH_X86_STUB(R, "gdi32.dll", SelectClipPath, 0);
+    GH_X86_STUB(R, "gdi32.dll", GetClipBox, 0);
+    GH_X86_STUB(R, "gdi32.dll", SelectPalette, 0);
+    GH_X86_STUB(R, "gdi32.dll", RealizePalette, (uint32_t)-1);
+    GH_X86_STUB(R, "gdi32.dll", GetSystemPaletteEntries, 0);
+    GH_X86_STUB(R, "gdi32.dll", GetICMProfileA, 0);
+    GH_X86_STUB(R, "gdi32.dll", CreateDCA, 0);
+    GH_X86_STUB(R, "gdi32.dll", CreateICW, 0);
+    GH_X86_STUB(R, "gdi32.dll", ResetDCW, 0);
+    GH_X86_STUB(R, "gdi32.dll", GetWorldTransform, 0);
+    GH_X86_STUB(R, "gdi32.dll", DPtoLP, 1);
+    GH_X86_STUB(R, "gdi32.dll", LPtoDP, 1);
+    GH_X86_STUB(R, "gdi32.dll", AbortDoc, (uint32_t)-1);
+
+    // ---- advapi32.dll ----
+    GH_X86_STUB(R, "advapi32.dll", SetEntriesInAclW, 120);
+    GH_X86_STUB(R, "advapi32.dll", SetSecurityInfo, 120);
+    GH_X86_STUB(R, "advapi32.dll", CryptEncrypt, 0);
+    GH_X86_STUB(R, "advapi32.dll", GetSidSubAuthorityCount, 0);
+    GH_X86_STUB(R, "advapi32.dll", IsValidSid, 0);
+    GH_X86_STUB(R, "advapi32.dll", SetSecurityDescriptorControl, 0);
+    GH_X86_STUB(R, "advapi32.dll", MakeSelfRelativeSD, 0);
+    GH_X86_STUB(R, "advapi32.dll", InitializeAcl, 0);
+
+    // ---- comdlg32.dll ----
+    GH_X86_STUB(R, "comdlg32.dll", PrintDlgW, 0);
+    GH_X86_STUB(R, "comdlg32.dll", PageSetupDlgW, 0);
+    GH_X86_STUB(R, "comdlg32.dll", GetOpenFileNameW, 0);
+    GH_X86_STUB(R, "comdlg32.dll", CommDlgExtendedError, 0);
+
+    // ---- shell32.dll ----
+    GH_X86_STUB(R, "shell32.dll", ShellExecuteExW, 0);
+    GH_X86_STUB(R, "shell32.dll", SHChangeNotify, 0);
+    GH_X86_STUB(R, "shell32.dll", Shell_NotifyIconW, 0);
+    GH_X86_STUB(R, "shell32.dll", SHGetSpecialFolderLocation, 0x80004005u);
+    GH_X86_STUB(R, "shell32.dll", SHGetFolderLocation, 0x80004005u);
+    GH_X86_STUB(R, "shell32.dll", SHGetDiskFreeSpaceExW, 0);
+    GH_X86_STUB(R, "shell32.dll", SHAppBarMessage, 0);
+    GH_X86_STUB(R, "shell32.dll", SHGetSettings, 0);
+    GH_X86_STUB(R, "shell32.dll", SHBrowseForFolderW, 0);
+
+    // ---- shlwapi.dll ----
+    GH_X86_STUB(R, "shlwapi.dll", AssocQueryStringW, 0x80070483u);
+
+    // ---- urlmon.dll ----
+    GH_X86_STUB(R, "urlmon.dll", CopyStgMedium, 0x80004001u);
+    GH_X86_STUB(R, "urlmon.dll", CoInternetCompareUrl, 1);
+    GH_X86_STUB(R, "urlmon.dll", CoInternetParseUrl, 0x800C0011u);
+
+    // ---- comctl32.dll ----
+    GH_X86_STUB(R, "comctl32.dll", ImageList_GetIconSize, 0);
+    GH_X86_STUB(R, "comctl32.dll", ImageList_Draw, 0);
+
+    // ---- mscms.dll ----
+    GH_X86_STUB(R, "mscms.dll", OpenColorProfileW, 0);
+    GH_X86_STUB(R, "mscms.dll", CloseColorProfile, 0);
+    GH_X86_STUB(R, "mscms.dll", CreateColorTransformW, 0);
+    GH_X86_STUB(R, "mscms.dll", DeleteColorTransform, 0);
+    GH_X86_STUB(R, "mscms.dll", TranslateBitmapBits, 0);
+
+    // ---- iphlpapi.dll ----
+    GH_X86_STUB(R, "iphlpapi.dll", GetAdaptersAddresses, 232);
 }
 
 #undef GH_X86_STUB

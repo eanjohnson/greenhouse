@@ -12,7 +12,8 @@
 //  - one recursive lock around every call (D3DCREATE_MULTITHREADED for all);
 //  - no fixed function: 9on12 has none (its SetTransform/SetLight are stubs and
 //    a null shader is E_INVALIDARG). A vs_1/vs_2 draw with no pixel shader gets a
-//    generated ps_2_0 doing texture stage 0 (gh_d9_ffps); any other draw with no
+//    generated ps_2_0 doing texture stage 0 (gh_d9_ffps), and so does a
+//    pre-transformed (POSITIONT) draw with neither shader; any other draw with no
 //    pixel shader, or with no vertex shader and no POSITIONT, is skipped and counted;
 //  - Present is ours: Blt the back buffer into a 9on12 render target the size
 //    and format of the bridge's swapchain, transition it to COMMON, Flush1, and
@@ -591,6 +592,14 @@ struct StateBlock : Obj<IDirect3DStateBlock9> {
 
 struct Swap : Obj<IDirect3DSwapChain9> {
     Dev* dev = nullptr;
+    // An additional swap chain (CreateAdditionalSwapChain) owns its own back
+    // buffers and parameters and holds a reference on the device; the implicit
+    // one is the device's bb/pp. Adobe AIR creates a 16x16 device on a hidden
+    // window and draws everything through one of these, sized to its stage.
+    bool extra = false;
+    D3DPRESENT_PARAMETERS xpp{};
+    std::vector<Surf*> xbb;
+    ~Swap() override;
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID r, void** pp) override
     {
         if (!pp) return E_POINTER;
@@ -866,6 +875,7 @@ struct Dev : Obj<IDirect3DDevice9> {
     bool    ffC31 = false;                  // c31 holds TFACTOR, not the game's c31
     std::set<uint64_t> ffSigs;              // skipped/emulated draw signatures logged
     HANDLE FfPs(uint64_t key, DWORD texType);
+    uint64_t PreTColours() const;
     void   FfSig(bool emulated, bool ok);
 
     ~Dev() override {}
@@ -883,6 +893,10 @@ struct Dev : Obj<IDirect3DDevice9> {
     void PushSs(DWORD samp, DWORD t, DWORD v)
     {
         if (t < 1 || t > 13) return;
+        // gh_d9_nomip=1 samples every texture from its top level only: a test
+        // for "the art is there but its smaller mip levels are not".
+        static const bool nomip = GhCfgNum(L"gh_d9_nomip.txt", "GH_D9_NOMIP", 0) != 0;
+        if (nomip && t == D3DSAMP_MIPFILTER) v = D3DTEXF_NONE;
         D3DDDIARG_TEXTURESTAGESTATE a{ samp, kSampToTss[t], v };
         DDI(this, pfnSetTextureStageState, &a);
     }
@@ -920,7 +934,7 @@ struct Dev : Obj<IDirect3DDevice9> {
     void Defaults();
     HRESULT MakeSwapchain();
     void DropSwapchain();
-    HRESULT DoPresent();
+    HRESULT DoPresent(Surf* from = nullptr, UINT interval = ~0u);
     bool DrawOk();
     bool pairNew = false;          // gh_d9_shlog: this draw is its pair's first
     void LogDraw(D3DPRIMITIVETYPE t, INT base, UINT minV, UINT numV, UINT start, UINT n);
@@ -962,11 +976,7 @@ struct Dev : Obj<IDirect3DDevice9> {
     HRESULT STDMETHODCALLTYPE SetCursorProperties(UINT, UINT, IDirect3DSurface9*) override { Once("SetCursorProperties ignored"); return D3D_OK; }
     void STDMETHODCALLTYPE SetCursorPosition(int, int, DWORD) override {}
     BOOL STDMETHODCALLTYPE ShowCursor(BOOL) override { return FALSE; }
-    HRESULT STDMETHODCALLTYPE CreateAdditionalSwapChain(D3DPRESENT_PARAMETERS*, IDirect3DSwapChain9**) override
-    {
-        Once("CreateAdditionalSwapChain refused");
-        return D3DERR_NOTAVAILABLE;
-    }
+    HRESULT STDMETHODCALLTYPE CreateAdditionalSwapChain(D3DPRESENT_PARAMETERS* p, IDirect3DSwapChain9** out) override;
     HRESULT STDMETHODCALLTYPE GetSwapChain(UINT i, IDirect3DSwapChain9** p) override
     {
         if (i || !p) return D3DERR_INVALIDCALL;
@@ -1587,8 +1597,11 @@ static HRESULT CoreCreate(Core& c, Dev* dev)
     fl.NotLockable  = c.Managed() ? 1 : 0;
     HRESULT hr = DDI(dev, pfnCreateResource2, &cr);
     {
+        // gh_d9_reslog raises the count for a game whose interesting
+        // resources come after its first 24 (SFPA's level textures do).
         static int logged = 0;
-        if (FAILED(hr) || logged < 24){
+        static const int cap = (int)GhCfgNum(L"gh_d9_reslog.txt", "GH_D9_RESLOG", 24);
+        if (FAILED(hr) || logged < cap){
             ++logged;
             Diag("D9 CreateResource type=" + std::to_string((int)c.type) + " fmt=" + Hex((uint32_t)c.fmt)
                  + " " + std::to_string(c.w) + "x" + std::to_string(c.hgt) + "x" + std::to_string(c.d)
@@ -1605,6 +1618,24 @@ static void CoreDestroy(Core& c)
 {
     if (c.h && c.dev && !c.dev->dead) DDI(c.dev, pfnDestroyResource, c.h);
     c.h = nullptr;
+}
+
+// A copy or upload the DDI refused. These used to return INVALIDCALL without a
+// word, and an engine that ignores the result (AIR does) simply shows a texture
+// that never received its pixels: a missing layer with nothing in the log.
+// Bounded, so a refusal per frame cannot flood the diag.
+static void CopyFailed(const char* op, HRESULT hr, const Core* c, UINT sub, const RECT* r)
+{
+    static std::atomic<int> n{0};
+    const int k = ++n;
+    if (k > 32) return;
+    std::string m = std::string("D9 ") + op + " failed hr=" + Hr(hr);
+    if (c) m += " type=" + std::to_string((int)c->type) + " fmt=" + Hex((uint32_t)c->fmt) + " " + std::to_string(c->w) + "x"
+                + std::to_string(c->hgt) + " lv=" + std::to_string(c->levels) + " pool=" + std::to_string((int)c->pool)
+                + " usage=" + Hex(c->usage) + " sub=" + std::to_string(sub);
+    if (r) m += " rect=" + std::to_string(r->left) + "," + std::to_string(r->top) + "-" + std::to_string(r->right) + "," + std::to_string(r->bottom);
+    if (k == 32) m += " (no more of these are logged)";
+    Diag(m);
 }
 
 static HRESULT CoreLock(Core& c, UINT sub, const RECT* rc, const D3DBOX* box, UINT off, UINT size,
@@ -1694,6 +1725,20 @@ static HRESULT CoreUnlock(Core& c, UINT sub)
         Core::MLock& m = c.mlk[sub];
         if (--m.count) return D3D_OK;
         HRESULT r = D3D_OK;
+        // gh_d9_uplog=N logs the first N managed uploads with how much of the
+        // buffer the game wrote: a texture that draws as nothing either got
+        // zeros here or lost them later in the copy.
+        static const int uplog = (int)GhCfgNum(L"gh_d9_uplog.txt", "GH_D9_UPLOG", 0);
+        static std::atomic<int> uplogged{0};
+        if (uplog > 0 && uplogged.load() < uplog && uplogged++ < uplog){
+            size_t nz = 0;
+            for (uint8_t v : m.buf) nz += v != 0;
+            Diag("D9 managed upload fmt=" + Hex((uint32_t)c.fmt) + " " + std::to_string(c.w) + "x" + std::to_string(c.hgt)
+                 + " lv=" + std::to_string(c.levels) + " sub=" + std::to_string(sub) + " rect=" + std::to_string(m.r.left) + ","
+                 + std::to_string(m.r.top) + "-" + std::to_string(m.r.right) + "," + std::to_string(m.r.bottom)
+                 + " pitch=" + std::to_string(m.pitch) + " bytes=" + std::to_string(m.buf.size()) + " nonzero=" + std::to_string(nz)
+                 + (m.ro ? " readonly" : ""));
+        }
         if (!m.ro && c.dev && !c.dev->dead){
             // A one-surface SYSTEMMEM resource over the buffer; d3d9on12 copies a
             // system-memory source into an upload heap inside the Blt, so the
@@ -1715,9 +1760,9 @@ static HRESULT CoreUnlock(Core& c, UINT sub)
                 b.hSrcResource = cr.hResource; b.SrcSubResourceIndex = 0; b.SrcRect = { 0, 0, rw, rh };
                 b.hDstResource = c.h; b.DstSubResourceIndex = sub; b.DstRect = m.r;
                 b.Flags.Point = 1;
-                if (FAILED(DDI(c.dev, pfnBlt, &b))) r = D3DERR_INVALIDCALL;
+                if (const HRESULT bh = DDI(c.dev, pfnBlt, &b); FAILED(bh)){ r = D3DERR_INVALIDCALL; CopyFailed("managed upload Blt", bh, &c, sub, &m.r); }
                 DDI(c.dev, pfnDestroyResource, cr.hResource);
-            } else r = D3DERR_INVALIDCALL;
+            } else { r = D3DERR_INVALIDCALL; CopyFailed("managed upload staging", E_FAIL, &c, sub, &m.r); }
         }
         std::vector<uint8_t>().swap(m.buf);
         return r;
@@ -1725,7 +1770,8 @@ static HRESULT CoreUnlock(Core& c, UINT sub)
     if (!c.dev || c.dev->dead) return D3D_OK;
     D3DDDIARG_UNLOCK u{};
     u.hResource = c.h; u.SubResourceIndex = sub;
-    return SUCCEEDED(DDI(c.dev, pfnUnlock, &u)) ? D3D_OK : D3DERR_INVALIDCALL;
+    if (const HRESULT uh = DDI(c.dev, pfnUnlock, &u); FAILED(uh)){ CopyFailed("Unlock", uh, &c, sub, nullptr); return D3DERR_INVALIDCALL; }
+    return D3D_OK;
 }
 
 // Full-chain level count for Levels == 0.
@@ -1884,7 +1930,18 @@ HRESULT STDMETHODCALLTYPE Dev::UpdateSurface(IDirect3DSurface9* src, const RECT*
     b.hDstResource = d->c->h; b.DstSubResourceIndex = d->sub;
     b.DstRect = { x, y, x + (b.SrcRect.right - b.SrcRect.left), y + (b.SrcRect.bottom - b.SrcRect.top) };
     b.Flags.Point = 1;
-    return SUCCEEDED(DDI(this, pfnBlt, &b)) ? D3D_OK : D3DERR_INVALIDCALL;
+    if (s->c->Sys() && !s->c->mem.empty()){
+        static std::atomic<int> logged{0};
+        if (logged++ < 4){
+            size_t nz = 0;
+            const uint8_t* m = s->c->mem.data() + s->c->off[s->sub];
+            for (size_t i = 0, e = s->c->slice[s->sub]; i < e; ++i) nz += m[i] != 0;
+            Diag("D9 UpdateSurface from sysmem " + std::to_string(s->c->w) + "x" + std::to_string(s->c->hgt)
+                 + " nonzero=" + std::to_string(nz) + "/" + std::to_string(s->c->slice[s->sub]));
+        }
+    }
+    if (const HRESULT hr = DDI(this, pfnBlt, &b); FAILED(hr)){ CopyFailed("UpdateSurface", hr, d->c, d->sub, &b.DstRect); return D3DERR_INVALIDCALL; }
+    return D3D_OK;
 }
 
 HRESULT STDMETHODCALLTYPE Dev::UpdateTexture(IDirect3DBaseTexture9* src, IDirect3DBaseTexture9* dst)
@@ -1896,14 +1953,15 @@ HRESULT STDMETHODCALLTYPE Dev::UpdateTexture(IDirect3DBaseTexture9* src, IDirect
         D3DDDIARG_VOLUMEBLT1 v{};
         v.hDstResource = d->h; v.hSrcResource = s->h;
         v.SrcBox = { 0, 0, s->w, s->hgt, 0, s->d };
-        return SUCCEEDED(DDI(this, pfnVolBlt1, &v)) ? D3D_OK : D3DERR_INVALIDCALL;
+        if (const HRESULT hr = DDI(this, pfnVolBlt1, &v); FAILED(hr)){ CopyFailed("UpdateTexture volume", hr, d, 0, nullptr); return D3DERR_INVALIDCALL; }
+        return D3D_OK;
     }
     HRESULT r = D3D_OK;
     for (UINT f = 0; f < s->faces; ++f){
         D3DDDIARG_TEXBLT1 t{};
         t.hDstResource = d->h; t.hSrcResource = s->h; t.CubeMapFace = f;
         t.SrcRect = { 0, 0, (LONG)s->w, (LONG)s->hgt };
-        if (FAILED(DDI(this, pfnTexBlt1, &t))) r = D3DERR_INVALIDCALL;
+        if (const HRESULT hr = DDI(this, pfnTexBlt1, &t); FAILED(hr)){ r = D3DERR_INVALIDCALL; CopyFailed("UpdateTexture", hr, d, f, &t.SrcRect); }
     }
     // An autogen destination gets only its top level; the driver builds the rest.
     if (d->usage & D3DUSAGE_AUTOGENMIPMAP) dst->GenerateMipSubLevels();
@@ -1920,7 +1978,7 @@ HRESULT STDMETHODCALLTYPE Dev::GetRenderTargetData(IDirect3DSurface9* src, IDire
     b.hDstResource = d->c->h; b.DstSubResourceIndex = d->sub; b.DstRect = SurfRect(d);
     b.Flags.Point = 1;
     HRESULT hr = DDI(this, pfnBlt, &b);
-    if (FAILED(hr)) return D3DERR_INVALIDCALL;
+    if (FAILED(hr)){ CopyFailed("GetRenderTargetData", hr, d->c, d->sub, &b.DstRect); return D3DERR_INVALIDCALL; }
     // The copy into system memory is GPU work; the game reads it right after.
     DDI(this, pfnFlush1, 0);
     return D3D_OK;
@@ -1935,7 +1993,8 @@ HRESULT STDMETHODCALLTYPE Dev::StretchRect(IDirect3DSurface9* src, const RECT* s
     b.hSrcResource = s->c->h; b.SrcSubResourceIndex = s->sub; b.SrcRect = sr ? *sr : SurfRect(s);
     b.hDstResource = d->c->h; b.DstSubResourceIndex = d->sub; b.DstRect = dr ? *dr : SurfRect(d);
     if (fl == D3DTEXF_LINEAR) b.Flags.Linear = 1; else b.Flags.Point = 1;
-    return SUCCEEDED(DDI(this, pfnBlt, &b)) ? D3D_OK : D3DERR_INVALIDCALL;
+    if (const HRESULT hr = DDI(this, pfnBlt, &b); FAILED(hr)){ CopyFailed("StretchRect", hr, d->c, d->sub, &b.DstRect); return D3DERR_INVALIDCALL; }
+    return D3D_OK;
 }
 
 HRESULT STDMETHODCALLTYPE Dev::ColorFill(IDirect3DSurface9* s, const RECT* r, D3DCOLOR c)
@@ -1945,7 +2004,8 @@ HRESULT STDMETHODCALLTYPE Dev::ColorFill(IDirect3DSurface9* s, const RECT* r, D3
     Surf* x = AsSurf(s);
     D3DDDIARG_COLORFILL a{};
     a.hResource = x->c->h; a.SubResourceIndex = x->sub; a.DstRect = r ? *r : SurfRect(x); a.Color = c;
-    return SUCCEEDED(DDI(this, pfnColorFill, &a)) ? D3D_OK : D3DERR_INVALIDCALL;
+    if (const HRESULT hr = DDI(this, pfnColorFill, &a); FAILED(hr)){ CopyFailed("ColorFill", hr, x->c, x->sub, &a.DstRect); return D3DERR_INVALIDCALL; }
+    return D3D_OK;
 }
 
 // D3D9 Clear covers the viewport, cut by the scissor when that test is on;
@@ -2147,20 +2207,27 @@ static bool ShLogPair(VS* v, PS* p, bool preT)
 // Stage 0 is generated here as ps_2_0 token streams, one per state combination.
 // Stages 1+ are not emulated; TFACTOR rides in c31 (restored before the game's
 // next shader draw), white for an unbound texture in a def'd c29.
+// Pre-transformed draws (POSITIONT, no vertex shader) take the same path: 9on12
+// supplies their vertex shader, so only the pixel half is missing. Adobe AIR
+// draws its whole software-rendered stage this way, as one XYZRHW|TEX1 quad.
+// Such a vertex may carry no colours; D3D9 then reads diffuse as white and
+// specular as black, so those come from c29 and a def'd c28 rather than from
+// a v register the vertex stage never writes.
 namespace ffps {
-enum : DWORD { kV0 = 0x90E40000, kV1 = 0x90E40001, kC29 = 0xA0E4001D, kC31 = 0xA0E4001F };
+enum : DWORD { kV0 = 0x90E40000, kV1 = 0x90E40001, kC28 = 0xA0E4001C, kC29 = 0xA0E4001D, kC31 = 0xA0E4001F };
+enum : uint64_t { kNoDiffuse = 1ull << 52, kNoSpecular = 1ull << 53 };
 static DWORD R(int n, DWORD mask = 0xF) { return 0x80000000u | (mask << 16) | (DWORD)n; }   // dst rN
 static DWORD Rs(int n) { return 0x80E40000u | (DWORD)n; }                                    // src rN
 // D3DTA_* -> a source token (or a temp it was materialised into, for COMPLEMENT).
-static DWORD Arg(std::vector<DWORD>& o, DWORD ta, bool hasTex, int& tmp)
+static DWORD Arg(std::vector<DWORD>& o, DWORD ta, bool hasTex, int& tmp, uint64_t key)
 {
     DWORD src;
     switch (ta & D3DTA_SELECTMASK){
-    case D3DTA_SPECULAR: src = kV1; break;
+    case D3DTA_SPECULAR: src = (key & kNoSpecular) ? kC28 : kV1; break;
     case D3DTA_TEXTURE:  src = hasTex ? Rs(0) : kC29; break;
     case D3DTA_TFACTOR:
     case D3DTA_CONSTANT: src = kC31; break;
-    default:             src = kV0; break;      // DIFFUSE, CURRENT and TEMP at stage 0
+    default:             src = (key & kNoDiffuse) ? kC29 : kV0; break;   // DIFFUSE, CURRENT and TEMP at stage 0
     }
     if (ta & D3DTA_ALPHAREPLICATE) src = (src & ~0x00FF0000u) | 0x00FF0000u;
     if (ta & D3DTA_COMPLEMENT){                  // ps_2_0 has no 1-x modifier: add rT, c29, -src
@@ -2189,6 +2256,7 @@ static void Op(std::vector<DWORD>& o, DWORD op, int dst, DWORD mask, DWORD a1, D
     }
 }
 // key: colorop|carg1|carg2|alphaop|aarg1|aarg2 (8 bits each) | tci<<48 | hasTex<<51
+//      | kNoDiffuse | kNoSpecular
 static std::vector<DWORD> Build(uint64_t key, DWORD texType)
 {
     const DWORD cop = key & 0xFF, ca1 = (key >> 8) & 0xFF, ca2 = (key >> 16) & 0xFF;
@@ -2203,9 +2271,11 @@ static std::vector<DWORD> Build(uint64_t key, DWORD texType)
         return u(cop, ca1, ca2) || (cop != D3DTOP_DISABLE && u(aop, aa1, aa2));
     };
     std::vector<DWORD> o{ 0xFFFF0200u };
+    const bool diffuse = !(key & kNoDiffuse), specular = !(key & kNoSpecular);
     o.insert(o.end(), { 0x05000051u, 0xA00F001Du, 0x3F800000u, 0x3F800000u, 0x3F800000u, 0x3F800000u });   // def c29, 1,1,1,1
-    o.insert(o.end(), { 0x0200001Fu, 0x80000000u, 0x900F0000u });                   // dcl v0
-    if (uses(D3DTA_SPECULAR)) o.insert(o.end(), { 0x0200001Fu, 0x80000000u, 0x900F0001u });
+    if (!specular) o.insert(o.end(), { 0x05000051u, 0xA00F001Cu, 0u, 0u, 0u, 0u });  // def c28, 0,0,0,0
+    if (diffuse) o.insert(o.end(), { 0x0200001Fu, 0x80000000u, 0x900F0000u });       // dcl v0
+    if (specular && uses(D3DTA_SPECULAR)) o.insert(o.end(), { 0x0200001Fu, 0x80000000u, 0x900F0001u });
     const bool tex = hasTex && uses(D3DTA_TEXTURE);
     if (tex){
         const DWORD st = texType == D3DRTYPE_CUBETEXTURE ? 0x98000000u : texType == D3DRTYPE_VOLUMETEXTURE ? 0xA0000000u : 0x90000000u;
@@ -2214,14 +2284,14 @@ static std::vector<DWORD> Build(uint64_t key, DWORD texType)
         o.insert(o.end(), { 0x03000042u, R(0), 0xB0E40000u | tci, 0xA0E40800u }); // texld r0, tN, s0
     }
     if (cop == D3DTOP_DISABLE){                  // stage 0 off: diffuse straight through
-        o.insert(o.end(), { 0x02000001u, 0x800F0800u, kV0, 0x0000FFFFu });
+        o.insert(o.end(), { 0x02000001u, 0x800F0800u, diffuse ? kV0 : kC29, 0x0000FFFFu });
         return o;
     }
     int tmp = 3;
-    const DWORD c1 = Arg(o, ca1, tex, tmp), c2 = Arg(o, ca2, tex, tmp);
+    const DWORD c1 = Arg(o, ca1, tex, tmp, key), c2 = Arg(o, ca2, tex, tmp, key);
     Op(o, cop, 1, 0xF, c1, c2);
     if (aop != D3DTOP_DISABLE){
-        const DWORD x1 = Arg(o, aa1, tex, tmp), x2 = Arg(o, aa2, tex, tmp);
+        const DWORD x1 = Arg(o, aa1, tex, tmp, key), x2 = Arg(o, aa2, tex, tmp, key);
         Op(o, aop, 2, 0x8, x1, x2);
         o.insert(o.end(), { 0x02000001u, R(1, 0x8), 0x80FF0002u });             // mov r1.w, r2.w
     }
@@ -2229,6 +2299,15 @@ static std::vector<DWORD> Build(uint64_t key, DWORD texType)
     return o;
 }
 } // namespace ffps
+
+// Which colours a pre-transformed vertex lacks, as ffps key bits.
+uint64_t Dev::PreTColours() const
+{
+    bool d = false, sp = false;
+    for (const auto& x : decl->el)
+        if (x.Stream != 0xFF && x.Usage == D3DDECLUSAGE_COLOR){ if (x.UsageIndex == 0) d = true; else if (x.UsageIndex == 1) sp = true; }
+    return (d ? 0 : ffps::kNoDiffuse) | (sp ? 0 : ffps::kNoSpecular);
+}
 
 HANDLE Dev::FfPs(uint64_t key, DWORD texType)
 {
@@ -2297,12 +2376,15 @@ bool Dev::DrawOk()
         return v != 0;
     }();
     // vs_3_0 needs a ps_3_0; a ps_2_0 here would be a link error, so those stay skipped.
-    if (ffOn && vs && !ps && !preT && (vs->code[0] & 0xFFFF) < 0x0300){
+    // A pre-transformed draw with no vertex shader gets 9on12's own VS.
+    const bool ffVs = vs && !preT && (vs->code[0] & 0xFFFF) < 0x0300, ffPreT = !vs && preT;
+    if (ffOn && !ps && (ffVs || ffPreT)){
         const DWORD tt = tex[0] ? (DWORD)tex[0]->GetType() : 0;
         auto b = [](DWORD v){ return (uint64_t)(v & 0xFF); };
         const uint64_t key = b(tss[0][D3DTSS_COLOROP]) | b(tss[0][D3DTSS_COLORARG1]) << 8 | b(tss[0][D3DTSS_COLORARG2]) << 16
             | b(tss[0][D3DTSS_ALPHAOP]) << 24 | b(tss[0][D3DTSS_ALPHAARG1]) << 32 | b(tss[0][D3DTSS_ALPHAARG2]) << 40
-            | (uint64_t)(tss[0][D3DTSS_TEXCOORDINDEX] & 7) << 48 | (uint64_t)(tex[0] ? 1 : 0) << 51;
+            | (uint64_t)(tss[0][D3DTSS_TEXCOORDINDEX] & 7) << 48 | (uint64_t)(tex[0] ? 1 : 0) << 51
+            | (ffPreT ? PreTColours() : 0);
         HANDLE h = FfPs(key, tt);
         FfSig(true, h != nullptr);
         if (h){
@@ -2540,9 +2622,11 @@ static void DropPresentTarget(Dev* d)
     d->present = nullptr;
 }
 
-HRESULT Dev::DoPresent()
+HRESULT Dev::DoPresent(Surf* from, UINT interval)
 {
     if (dead || bb.empty()) return D3DERR_DEVICELOST;
+    if (!from) from = bb[0];
+    if (interval == ~0u) interval = pp.PresentationInterval;
     ++frames;
     // The target matches the bridge swapchain exactly: GfxPresent's copy is a
     // CopyResource, which needs equal size and format.
@@ -2580,7 +2664,7 @@ HRESULT Dev::DoPresent()
              + " d12Fmt=" + std::to_string((int)rd.Format) + " swapFmt=" + std::to_string((int)bd.Format));
     }
     // Scale the game's frame into the output, keeping its aspect.
-    Surf* src = bb[0];
+    Surf* src = from;
     const UINT sw = src->c->w, sh = src->c->hgt;
     UINT dw = presentW, dh = (UINT)((uint64_t)presentW * sh / sw);
     if (dh > presentH){ dh = presentH; dw = (UINT)((uint64_t)presentH * sw / sh); }
@@ -2599,7 +2683,7 @@ HRESULT Dev::DoPresent()
     DDI(this, pfnFlush1, 0);
     if (frames == 1 || frames == 60 || frames % 3600 == 0)
         Diag("D9 present #" + std::to_string(frames) + " draws=" + std::to_string(draws) + " ffSkips=" + std::to_string(ffSkips));
-    const UINT sync = (pp.PresentationInterval == D3DPRESENT_INTERVAL_IMMEDIATE) ? 0 : 1;
+    const UINT sync = (interval == D3DPRESENT_INTERVAL_IMMEDIATE) ? 0 : 1;
     HRESULT hr = GfxPresent(sync);
     return FAILED(hr) ? D3DERR_DEVICELOST : D3D_OK;
 }
@@ -2639,10 +2723,74 @@ void Dev::Teardown()
     dead = true;
 }
 
-HRESULT STDMETHODCALLTYPE Swap::Present(const RECT*, const RECT*, HWND, const RGNDATA*, DWORD) { Lk l; return dev->DoPresent(); }
-HRESULT STDMETHODCALLTYPE Swap::GetBackBuffer(UINT i, D3DBACKBUFFER_TYPE t, IDirect3DSurface9** pp) { return dev->GetBackBuffer(0, i, t, pp); }
+HRESULT STDMETHODCALLTYPE Swap::Present(const RECT*, const RECT*, HWND, const RGNDATA*, DWORD)
+{
+    Lk l;
+    if (!extra) return dev->DoPresent();
+    if (xbb.empty()) return D3DERR_INVALIDCALL;
+    return dev->DoPresent(xbb[0], xpp.PresentationInterval);
+}
+HRESULT STDMETHODCALLTYPE Swap::GetBackBuffer(UINT i, D3DBACKBUFFER_TYPE t, IDirect3DSurface9** pp)
+{
+    if (!extra) return dev->GetBackBuffer(0, i, t, pp);
+    Lk l;
+    if (!pp || i >= xbb.size()) return D3DERR_INVALIDCALL;
+    xbb[i]->AddRef(); *pp = xbb[i];
+    return D3D_OK;
+}
 HRESULT STDMETHODCALLTYPE Swap::GetDisplayMode(D3DDISPLAYMODE* m) { return dev->GetDisplayMode(0, m); }
-HRESULT STDMETHODCALLTYPE Swap::GetPresentParameters(D3DPRESENT_PARAMETERS* p) { if (!p) return D3DERR_INVALIDCALL; *p = dev->pp; return D3D_OK; }
+HRESULT STDMETHODCALLTYPE Swap::GetPresentParameters(D3DPRESENT_PARAMETERS* p)
+{
+    if (!p) return D3DERR_INVALIDCALL;
+    *p = extra ? xpp : dev->pp;
+    return D3D_OK;
+}
+Swap::~Swap()
+{
+    for (Surf* s : xbb) s->IRel();
+    xbb.clear();
+    if (extra && dev) dev->Release();
+}
+
+// No depth buffer and no window of its own: D3D9 gives additional swap chains
+// neither, and every HWND here is the one screen, so its Present goes where the
+// device's would.
+HRESULT STDMETHODCALLTYPE Dev::CreateAdditionalSwapChain(D3DPRESENT_PARAMETERS* p, IDirect3DSwapChain9** out)
+{
+    Lk l;
+    if (!p || !out) return D3DERR_INVALIDCALL;
+    *out = nullptr;
+    if (dead) return D3DERR_DEVICELOST;
+    Swap* sc = new Swap;
+    sc->dev = this;
+    D3DPRESENT_PARAMETERS& q = sc->xpp;
+    q = *p;
+    if (!q.BackBufferWidth)  q.BackBufferWidth  = g_winW ? g_winW : g_ad.dispW;
+    if (!q.BackBufferHeight) q.BackBufferHeight = g_winH ? g_winH : g_ad.dispH;
+    if (q.BackBufferFormat == D3DFMT_UNKNOWN) q.BackBufferFormat = D3DFMT_X8R8G8B8;
+    if (!q.BackBufferCount) q.BackBufferCount = 1;
+    if (q.BackBufferCount > 3) q.BackBufferCount = 3;
+    q.MultiSampleType = D3DMULTISAMPLE_NONE; q.MultiSampleQuality = 0;
+    for (UINT i = 0; i < q.BackBufferCount; ++i){
+        Surf* s = nullptr;
+        HRESULT hr = NewSurf(q.BackBufferWidth, q.BackBufferHeight, q.BackBufferFormat, D3DPOOL_DEFAULT, D3DUSAGE_RENDERTARGET, D3DMULTISAMPLE_NONE, &s);
+        if (FAILED(hr)){
+            Diag("D9 CreateAdditionalSwapChain back buffer FAILED hr=" + Hr(hr));
+            delete sc;
+            return D3DERR_OUTOFVIDEOMEMORY;
+        }
+        s->implicitSurf = true; s->ext = 0; s->intl = 1;      // the swap chain's own reference
+        sc->xbb.push_back(s);
+    }
+    sc->extra = true;
+    AddRef();                                                 // the swap chain keeps the device
+    *p = q;
+    *out = sc;
+    Diag("D9 CreateAdditionalSwapChain " + std::to_string(q.BackBufferWidth) + "x" + std::to_string(q.BackBufferHeight)
+         + " fmt=" + Hex((uint32_t)q.BackBufferFormat) + " n=" + std::to_string(sc->xbb.size())
+         + " swap=" + std::to_string((int)q.SwapEffect) + " interval=" + Hex(q.PresentationInterval));
+    return D3D_OK;
+}
 
 HRESULT STDMETHODCALLTYPE D3D9::CreateDevice(UINT a, D3DDEVTYPE t, HWND wnd, DWORD flags, D3DPRESENT_PARAMETERS* pp, IDirect3DDevice9** out)
 {

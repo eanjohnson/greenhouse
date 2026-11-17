@@ -88,8 +88,6 @@ T = [
    ('AssignProcessToJobObject', S_FALSE),
    ('CreateProcessW',    S_FALSE),
    ('FatalAppExitA',     '0'),
-   ('FindResourceW',     S_FALSE), ('LoadResource', S_FALSE),
-   ('LockResource',      S_FALSE), ('SizeofResource', S_FALSE),
    ('GetCurrencyFormatW', S_FALSE), ('GetNumberFormatW', S_FALSE),
    ('GetDiskFreeSpaceExW', S_FALSE), ('GetDiskFreeSpaceW', S_FALSE),
    # A console the guest never had: reporting no buffer makes every caller
@@ -171,6 +169,83 @@ T = [
                     ('WSALookupServiceBeginW', SOCK_ERR), ('WSALookupServiceEnd', SOCK_ERR),
                     ('WSALookupServiceNextW', SOCK_ERR),
                     ('WSARecv', SOCK_ERR), ('WSASend', SOCK_ERR), ('WSASendTo', SOCK_ERR) ]),
+ # ---- the Adobe AIR runtime (Super Fancy Pants Adventure) ----------------
+ # What Adobe AIR.dll binds and a game never needs on a console: menus, DDE,
+ # the clipboard, printing, certificate stores, colour management, named
+ # pipes, tray icons. Each is the failure the real API gives when the thing is
+ # unavailable. The resource API and the string helpers it also binds are real
+ # beds (RegisterAirGapBeds in gh_x86_beds.h), as is GetVolumeInformationW.
+ ('kernel32.dll', [
+   ('QueueUserAPC', S_FALSE),
+   ('SetNamedPipeHandleState', S_FALSE), ('ConnectNamedPipe', S_FALSE),
+   ('CreateNamedPipeA', '(uint32_t)-1'), ('CreateNamedPipeW', '(uint32_t)-1'),   # INVALID_HANDLE_VALUE
+   ('BeginUpdateResourceW', S_FALSE), ('UpdateResourceW', S_FALSE), ('EndUpdateResourceW', S_FALSE),
+   ('GetComputerNameExW', S_FALSE), ('GenerateConsoleCtrlEvent', S_FALSE),
+ ]),
+ ('user32.dll', [
+   ('UpdateLayeredWindow', S_FALSE), ('CreateMenu', S_FALSE), ('SetMenu', S_FALSE),
+   ('SetMenuItemInfoW', S_FALSE), ('GetMenuItemInfoW', S_FALSE), ('RemoveMenu', S_FALSE),
+   ('DeleteMenu', S_FALSE), ('SetMenuInfo', S_FALSE), ('GetMenuInfo', S_FALSE),
+   ('GetMenuBarInfo', S_FALSE), ('GetSystemMenu', S_FALSE), ('DrawMenuBar', S_TRUE),
+   ('DdeInitializeW', '0x400F'),                                  # DMLERR_SYS_ERROR
+   ('DdeUninitialize', S_TRUE), ('DdeConnect', S_FALSE), ('DdeDisconnect', S_TRUE),
+   ('DdeClientTransaction', S_FALSE), ('DdeCreateStringHandleA', S_FALSE), ('DdeFreeStringHandle', S_TRUE),
+   ('ToAscii', S_FALSE), ('ShowCaret', S_TRUE), ('IsZoomed', S_FALSE), ('SetWindowPlacement', S_TRUE),
+   ('FindWindowExW', S_FALSE), ('RegisterClipboardFormatA', S_FALSE), ('GetClipboardFormatNameA', S_FALSE),
+   ('WaitForInputIdle', '(uint32_t)-1'),                          # WAIT_FAILED: no such process
+   ('CloseWindow', S_TRUE), ('SendMessageTimeoutW', S_FALSE),
+   ('GetDlgItemTextW', S_FALSE), ('GetDlgItemTextA', S_FALSE),
+ ]),
+ ('ole32.dll', [
+   ('CreateBindCtx', E_NOTIMPL), ('MkParseDisplayName', E_NOTIMPL),
+   ('OleFlushClipboard', '0x800401D0u'), ('OleGetClipboard', '0x800401D0u'),   # CLIPBRD_E_CANT_OPEN
+   ('OleSetClipboard', '0x800401D0u'), ('OleIsCurrentClipboard', '1'),          # S_FALSE
+   ('CoFreeUnusedLibraries', '0'), ('CreateStreamOnHGlobal', E_NOTIMPL),
+   ('CoMarshalInterThreadInterfaceInStream', E_NOTIMPL), ('CoGetInterfaceAndReleaseStream', E_NOTIMPL),
+ ]),
+ ('crypt32.dll', [(n, S_FALSE) for n in [
+   'CertGetEnhancedKeyUsage','CryptFindLocalizedName','CryptImportPublicKeyInfo',
+   'CryptProtectData','CryptUnprotectData','CertFindCertificateInStore',
+   'CertVerifySubjectCertificateContext','CryptVerifyMessageSignature',
+   'CryptGetMessageCertificates','CertEnumCertificatesInStore','CertCreateCertificateContext']]),
+ ('winspool.drv', [ ('EnumPrintersW', S_FALSE) ]),
+ ('winmm.dll', [
+   ('timeSetEvent', S_FALSE), ('timeKillEvent', '11'),           # MMSYSERR_INVALPARAM
+   ('waveInGetPosition', '5'), ('waveInStop', '5'),               # MMSYSERR_INVALHANDLE
+   ('mixerGetID', '6'), ('waveOutMessage', '6'),                  # MMSYSERR_NODRIVER
+ ]),
+ ('oleacc.dll', [ ('AccessibleObjectFromWindow', '0x80004005u') ]),
+ ('gdi32.dll', [
+   ('GetTextCharacterExtra', '0x80000000u'), ('SetTextCharacterExtra', '0x80000000u'),
+   ('GetBkMode', S_FALSE), ('GetTextAlign', S_FALSE), ('EnumFontFamiliesA', S_TRUE),
+   ('LineTo', S_TRUE), ('PolyBezierTo', S_TRUE), ('FillPath', S_TRUE), ('SelectClipPath', S_FALSE),
+   ('GetClipBox', S_FALSE), ('SelectPalette', S_FALSE), ('RealizePalette', '(uint32_t)-1'),
+   ('GetSystemPaletteEntries', S_FALSE), ('GetICMProfileA', S_FALSE),
+   ('CreateDCA', S_FALSE), ('CreateICW', S_FALSE), ('ResetDCW', S_FALSE),
+   ('GetWorldTransform', S_FALSE), ('DPtoLP', S_TRUE), ('LPtoDP', S_TRUE),
+   ('AbortDoc', '(uint32_t)-1'),                                  # SP_ERROR
+ ]),
+ ('advapi32.dll', [
+   ('SetEntriesInAclW', '120'), ('SetSecurityInfo', '120'),       # ERROR_CALL_NOT_IMPLEMENTED
+   ('CryptEncrypt', S_FALSE), ('GetSidSubAuthorityCount', S_FALSE), ('IsValidSid', S_FALSE),
+   ('SetSecurityDescriptorControl', S_FALSE), ('MakeSelfRelativeSD', S_FALSE), ('InitializeAcl', S_FALSE),
+ ]),
+ ('comdlg32.dll', [ ('PrintDlgW', S_FALSE), ('PageSetupDlgW', S_FALSE),
+                    ('GetOpenFileNameW', S_FALSE), ('CommDlgExtendedError', '0') ]),
+ ('shell32.dll', [
+   ('ShellExecuteExW', S_FALSE), ('SHChangeNotify', '0'), ('Shell_NotifyIconW', S_FALSE),
+   ('SHGetSpecialFolderLocation', '0x80004005u'), ('SHGetFolderLocation', '0x80004005u'),
+   ('SHGetDiskFreeSpaceExW', S_FALSE), ('SHAppBarMessage', S_FALSE), ('SHGetSettings', '0'),
+   ('SHBrowseForFolderW', S_FALSE),
+ ]),
+ ('shlwapi.dll', [ ('AssocQueryStringW', '0x80070483u') ]),     # HRESULT_FROM_WIN32(ERROR_NO_ASSOCIATION)
+ ('urlmon.dll', [ ('CopyStgMedium', E_NOTIMPL), ('CoInternetCompareUrl', '1'),   # S_FALSE: not equal
+                  ('CoInternetParseUrl', '0x800C0011u') ]),      # INET_E_DEFAULT_ACTION
+ ('comctl32.dll', [ ('ImageList_GetIconSize', S_FALSE), ('ImageList_Draw', S_FALSE) ]),
+ ('mscms.dll', [(n, S_FALSE) for n in [
+   'OpenColorProfileW','CloseColorProfile','CreateColorTransformW','DeleteColorTransform',
+   'TranslateBitmapBits']]),
+ ('iphlpapi.dll', [ ('GetAdaptersAddresses', '232') ]),          # ERROR_NO_DATA
 ]
 
 HEAD = '''// gh_x86_stubs.h -- the imports a 32-bit guest binds but that nothing here
@@ -213,14 +288,20 @@ HEAD = '''// gh_x86_stubs.h -- the imports a 32-bit guest binds but that nothing
 // Headers for the declarations the bed table did not already need. They exist
 // only so GH_X86_POP can read a real prototype.
 #define SECURITY_WIN32
+#include <aclapi.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <ddeml.h>
 #include <evntrace.h>
+#include <icm.h>
 #include <iphlpapi.h>
 #include <ole2.h>
+#include <oleacc.h>
 #include <psapi.h>
 #include <sddl.h>
 #include <security.h>
+#include <shellapi.h>
+#include <shlobj.h>
 #include <urlmon.h>
 #include <userenv.h>
 #include <usp10.h>

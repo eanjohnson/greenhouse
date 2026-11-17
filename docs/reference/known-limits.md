@@ -5,6 +5,7 @@ climb. It is meant to save you from re-discovering a limit that has already been
 Where the data is: per-title results in `corpus/compat/compat.json`; the mechanisms behind each limit in
 `docs/architecture/memory.md`, `docs/architecture/graphics.md`, `docs/architecture/dxil-backporter.md` and
 `docs/architecture/api-shims.md`.
+How it was found: [the write-ups index](../writeups/README.md)
 
 Numbers here were measured on retail consoles in Dev Mode with the loader versions recorded in
 `compat.json`. They are observations of a closed platform, not documented guarantees, and a console
@@ -68,7 +69,7 @@ The console's D3D12 runtime and driver are a console-specific build. These were 
 | Queue creation order | Creating a COPY queue after DIRECT queues removes the device. | COPY (and optionally COMPUTE) queues are created as DIRECT (`gh_copy_as_direct`). |
 | A removed device poisons the process | After device removal no new device can be created in the same process. | The host process has to be restarted. There is no in-process recovery. |
 | Results that differ from a desktop GPU | Buffer `GetDimensions` returns a constant; texture `GetDimensions` at a constant lod 0 is wrong; some typed UAV loads are unsupported. | Corrected by backporter passes (`gh_bufdims`, `gh_tbdims`, `gh_texlod0`). |
-| Tiled resources | Tier is low on the older console. | The GPU heap pager works within it; MIN/MAX sampler filters need `gh_minmax_samp`. |
+| Tiled resources | Series X reports Tier 1 (the Xbox One reports Tier 2), and its driver faults in `UpdateTileMappings`. | The GPU heap pager needs Tier 2, so it stands aside there and logs `GPUPAGE OFF`; MIN/MAX sampler filters need `gh_minmax_samp`. |
 | Debug tooling | The D3D12 debug layer and DRED give little: breadcrumbs come back empty. | Loader-owned breadcrumbs and fences (`gh_breadcrumb`, `gh_prog_fence`). |
 | Present | The swap chain is the app's CoreWindow chain at the console's output resolution. The guest renders to an intermediate target that is copied to it. | Guest-visible resolution can be changed with `gh_disp_w`/`gh_disp_h`; see `graphics.md` for what is and is not scaled. |
 
@@ -82,7 +83,7 @@ HDR output, Vulkan, real OpenGL (only a stub that lets engines fall back to Dire
 | Win32 coverage | Only what the tested games needed. An import with no shim is bound to a trampoline that logs the name and returns a failure value; a game that depends on the result will misbehave. Expect to add shims for any new title (`api-shims.md`). |
 | GDI / USER rendering | No GDI drawing to the screen, no native controls, no message boxes. Games that draw their launcher or UI with GDI show nothing. (GoldSrc's software renderer works through a DirectDraw path on the 32-bit track.) |
 | Networking | Ordinary sockets work within the app's network capabilities. Anything needing a local helper service or a system-installed runtime is unavailable. |
-| Audio | XAudio2 and WASAPI pass through. DirectSound is implemented over XAudio2 and is opt-in per title (`gh_dsound`). There is no `waveOut` implementation. |
+| Audio | XAudio2 and WASAPI pass through. DirectSound is implemented over XAudio2 and is opt-in per title (`gh_dsound`). `waveOut` is implemented over XAudio2 only for 32-bit games on the native x86 track. |
 | .NET / Mono | Unity Mono and IL2CPP titles run. A game needing a system-installed .NET Framework or desktop runtime does not. |
 | Launchers | Publisher launchers (separate executables, embedded browsers for sign-in) generally do not work; titles are started with arguments that skip them where the game supports that. |
 | Overlays and injectors | Third-party overlays and injected tools are not loaded. |
@@ -90,7 +91,7 @@ HDR output, Vulkan, real OpenGL (only a stub that lets engines fall back to Dire
 | 32-bit games | Run through a separate track (`x86-guest.md`). It has been brought up for a small number of engines (Source, GoldSrc). The interpreter/JIT path is slow; the native path depends on CPU compatibility-mode behaviour and is new. Expect a 32-bit title outside the tested set to need work. |
 | D3D9 | For 32-bit guests, a purpose-built runtime (`src/loader/gh_d3d9rt.h`) that covers what the tested Source games use. Fixed-function is only partially emulated (pixel stage 0; no fixed-function vertex pipeline in general). |
 | D3D10, D3D8, DirectDraw (general) | Not implemented beyond the specific DirectDraw surface contract the GoldSrc software renderer uses. |
-| Save data | Saves live in the app's storage. They are not synchronised with a cloud service by the loader. Uninstalling the app can remove them. |
+| Save data | Saves live in the app's storage. They are not synchronised with a cloud service by the loader. Uninstalling the app can remove them. A 32-bit game's Steam Cloud files are kept on the console only, in `gh_saves\steam_remote\` (which an uninstall leaves alone). |
 | Per-title configuration | Heavy titles only work with their title config (`corpus/titles/`). A new heavy title needs its own. |
 
 ## 5. Per-title state

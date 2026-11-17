@@ -132,7 +132,7 @@ how it resolved the path as a `LOCALSTATE env|FALLBACK` line.
 | `gh_site_url.txt` | Website override (an `https://` base URL), see [building.md](building.md#forking-your-own-site-and-package-repository) |
 | `gh_compat\` | Downloaded compatibility dataset |
 | `gh_theme\`, `gh_art\`, `gh_custom\`, `gh_input\` | Theme choice, cover art cache, user-added games, input profiles |
-| `gh_mod_profile.txt`, `gh_mods_cmd.txt`, `gh_mods_out.txt`, `gh_mod_crash.txt` | Mods (see [mods.md](mods.md)) |
+| `gh_mod_profile.txt`, `gh_mods_cmd.txt`, `gh_mods_out.txt`, `gh_mod_run.txt`, `gh_mod_crash.txt`, `gh_launch_once.txt` | Mods (see [mods.md](mods.md)) |
 | `gh_cmd.txt`, `gh_cmd_out.txt` | Launcher command channel |
 | `ghpad.txt` | Synthetic controller input |
 | `gh_*.txt` | Knob files, one number per file (see [reference/knobs.md](reference/knobs.md)) |
@@ -146,7 +146,7 @@ uninstall, and is where bulk data goes.
 |---|---|
 | `gh_games\app_<appid>\` | Installed games. `gh_games\workshop\content\` holds Workshop items |
 | `gh_diag\` | Diagnostic log (default location) |
-| `gh_saves\` | Redirected save data |
+| `gh_saves\` | Redirected save data. `gh_saves\steam_remote\<appid>\` holds Steam Cloud files of 32-bit games, kept locally |
 | `gh_mods\<titleId>\<profile>\` | Mod profiles |
 | `gh_packages\<id>\<version>\` | Installed add-ons |
 | `gh_themes\<id>\<version>\` | Downloaded themes |

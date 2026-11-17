@@ -283,8 +283,8 @@ See `docs/architecture/dxil-backporter.md`.
 | `gh_bufdims` | 0 | yes | Buffer `GetDimensions` correction mode for lowered shaders (bitmask). |
 | `gh_tbdims` | 0 | yes | Typed-buffer `GetDimensions` correction for lowered compute shaders. |
 | `gh_srvbuf_stride` | 0 | yes | Element stride assumed for the structured-buffer `GetDimensions` correction. |
-| `gh_scache` | 3 | no | Driver shader-cache shim mode. 3 (default for every title) quarantines the driver's process-global on-disk cache behind a shim. |
-| `gh_scache_x` | 128 | no | Geometry parameter the shimmed cache store is opened with; must be the same for every title. |
+| `gh_scache` | 3 | no | Driver shader-cache shim mode. 1 = pass-through shim; 2 = also enlarge the store by `gh_scache_x`; 3 (default for every title) = also move the driver's process-global store to `DevelopmentFiles\ghsc`, quarantining it. |
+| `gh_scache_x` | 128 | no | Multiplier on the store's size fields at mode 2 or 3 (64 = a 1 GiB value file, 128 = 2 GiB); must be the same for every title. |
 | `gh_shbake` | 1 | yes | On-console shader bake: 0 = off, 1 = bake whenever the title is installed, 2 = also dump originals named in `ghbake_dump.txt`. |
 | `gh_shbake_threads` | 0 | yes | Worker threads for the bake. 0 = automatic. |
 | `gh_shbake_scanners` | 2 | yes | Scanner threads for the bake. |
@@ -337,7 +337,7 @@ See `docs/architecture/memory.md`.
 | `gh_arena_site` | 0 | yes | Restrict the arena to allocations made from one guest call site, given as a guest RVA in decimal. 0 = any site. |
 | `gh_arena_retry` | 64 | yes | How many times a failed remap is retried. |
 | `gh_arena_ballast_mb` | 64 | no | Reserve released when a refault's remap hits the commit limit. |
-| `gh_arena_ceilfix` | 0 | yes | Stop the live-ceiling ratchet from learning a ceiling out of a container-wide commit shortage. Measured memory-neutral; default off. |
+| `gh_arena_ceilfix` | 0 | yes | Stop the live-ceiling ratchet from learning a ceiling out of a container-wide commit shortage. The ceiling is read only at `gh_arena_lru` 2 or higher, so this is inert at lru 1; default off. |
 
 ### Memory: GPU heap pager
 
@@ -371,6 +371,7 @@ See `docs/architecture/x86-guest.md` and `x86-d3d9.md`.
 | `gh_x86_steam` | 0 | no | 1 = answer `steam_api.dll` from the loader, bridged to the x64 Steam engine, instead of mapping the copy the game ships. |
 | `gh_x86_seh_trace` | 0 | no | Name every frame of the guest's `FS:[0]` SEH chain as it is walked. |
 | `gh_x86_sample` | 0 | no | Every N seconds, log where each guest thread is. |
+| `gh_x86_first_calls` | 0 | no | Log each API the first time the guest calls it, with the caller's address: the outline of a start-up that ends without an error. |
 | `gh_x86_host_stack_mb` | 32 | no | Host stack reserved for a 32-bit guest thread. |
 | `gh_d9_vendor` | 0x1002 | no | Adapter vendor id reported by the D3D9 runtime (AMD). |
 | `gh_d9_device` | 0x6798 | no | Adapter device id reported by the D3D9 runtime. |
@@ -378,6 +379,9 @@ See `docs/architecture/x86-guest.md` and `x86-d3d9.md`.
 | `gh_d9_ffps` | 1 | yes | Emulate fixed-function pixel stage 0 with a generated pixel shader for draws that have a vertex shader and no pixel shader. |
 | `gh_d9_psolog` | 0 | no | Log D3D9 pipeline creation. |
 | `gh_d9_shlog` | 0 | no | Log D3D9 shader translation. |
+| `gh_d9_uplog` | 0 | no | Log the first N managed-texture uploads, with how many bytes of each the game wrote. |
+| `gh_d9_nomip` | 0 | no | 1 = sample every D3D9 texture from its top mip level only (a test for missing smaller levels). |
+| `gh_d9_reslog` | 24 | no | How many D3D9 resource creations are logged (failures always are). Raise it when the resources that matter come late, as a level's textures do. |
 
 ### Instruments
 
@@ -533,7 +537,10 @@ knobs; the comment block at the call site is the documentation.
 | `gh_d9_device` | `GH_D9_DEVICE` | 0x6798 | no | `src/loader/gh_d3d9rt.h` | `D3D9` |
 | `gh_d9_ffps` | `GH_D9_FFPS` | 1 | yes | `src/loader/gh_d3d9rt.h` | `DrawOk` |
 | `gh_d9_psolog` | `GH_D9_PSOLOG` | 0 | no | `src/loader/gh_d3d9.h` | `InstallPsoLog` |
+| `gh_d9_reslog` | `GH_D9_RESLOG` | 24 | no | `src/loader/gh_d3d9rt.h` | `CoreCreate` |
 | `gh_d9_shlog` | `GH_D9_SHLOG` | 0 | no | `src/loader/gh_d3d9rt.h` | `ShLogPair` |
+| `gh_d9_uplog` | `GH_D9_UPLOG` | 0 | no | `src/loader/gh_d3d9rt.h` | `CoreUnlock` |
+| `gh_d9_nomip` | `GH_D9_NOMIP` | 0 | no | `src/loader/gh_d3d9rt.h` | `PushSs` |
 | `gh_d9_vendor` | `GH_D9_VENDOR` | 0x1002 | no | `src/loader/gh_d3d9rt.h` | `D3D9` |
 | `gh_d9_vram_mb` | `GH_D9_VRAM_MB` | 1536 | no | `src/loader/gh_d3d9rt.h` | `D3D9` |
 | `gh_dbgstr_max` | `GH_DBGSTR_MAX` | 256 | no | `src/loader/guest_loader.cpp` | `GhDbgStrMax` |
@@ -796,6 +803,7 @@ knobs; the comment block at the call site is the documentation.
 | `gh_wnd_threads` | `GH_WND_THREADS` | 1 | yes | `src/loader/guest_loader.cpp` | `Enabled` |
 | `gh_x86_host_stack_mb` | `GH_X86_HOST_STACK_MB` | 32 | no | `src/loader/guest_loader.cpp` | `MapAndRun32` |
 | `gh_x86_native` | `GH_X86_NATIVE` | 0 | no | `src/loader/guest_loader.cpp` | `MapAndRun32` |
+| `gh_x86_first_calls` | `GH_X86_FIRST_CALLS` | 0 | no | `src/loader/guest_loader.cpp` | `MapAndRun32` |
 | `gh_x86_sample` | `GH_X86_SAMPLE` | 0 | no | `src/loader/guest_loader.cpp` | `MapAndRun32` |
 | `gh_x86_seh_trace` | `GH_X86_SEH_TRACE` | 0 | no | `src/loader/guest_loader.cpp` | `MapAndRun32` |
 | `gh_x86_steam` | `GH_X86_STEAM` | 0 | no | `src/loader/guest_loader.cpp` | `MapAndRun32` |
@@ -819,6 +827,7 @@ These live in LocalState too, but carry text. "Consumed" means the loader delete
 | `ghpad.txt` | yes | One synthetic gamepad pulse. Tokens: `A B X Y LB RB START BACK LS RS LT RT`, d-pad `DUP DDOWN DLEFT DRIGHT`, left stick `UP DOWN LEFT RIGHT`, analog `LX= LY= RX= RY=`, hold time `T=<ms>` (default 400, clamped 50..5000). Note `DOWN` is the stick; the d-pad is `DDOWN`. |
 | `gh_remap.txt` | no | Input remapping table (`src/loader/gh_input.h`). |
 | `ghtrace.txt` | no | Tracepoints. See `docs/reference/diagnostics.md`. |
+| `gh_x86_trace.txt` | no | Tracepoints for a 32-bit guest on the native track (`gh_x86_native=1`), one per line: `<module> <hex addr> <label> [#hits] [^<next addr>] [?<spec>==<hex>] [><spec>:<n> ...]`. The module is a substring of the lowercased module name, `_` standing for a space (`adobe_air`). The address is a preferred-base VA or an RVA; `#N>1` needs `^NEXT` (the instruction after, where the breakpoint is re-armed). A spec is `[*...]reg[+off]` or `[*...]abs`, each `*` one dereference. Logged as `X86TRACE`. Parser: `src/loader/x86/gh_x86_trace.h`, tested by `toolchain/test_gh_x86_trace.cpp`. |
 | `gh_peek.txt` | no | Addresses to print next to each memory sample. |
 | `gh_poke.txt` | yes | `<hexaddr> <hexdword>`: write one dword into the guest. |
 | `gh_watchw.txt` | yes | Hardware write watchpoints (8-byte aligned addresses). |
@@ -827,6 +836,12 @@ These live in LocalState too, but carry text. "Consumed" means the loader delete
 | `gh_snap.txt` | yes | Writes `LocalState\gh_snap.bmp`, a 480x270 copy of the back buffer. |
 | `gh_activate.txt` | yes | Releases the activation message burst held by `gh_rawinput` bit 16. |
 | `gh_pso_deny.txt` | no | Pipeline digests to refuse, one 32-hex-digit digest per line. |
+| `gh_no_register.txt` | no | Presence turns off games-played registration in the Steam engine (the in-game presence that joinable invites need). A kill switch; normally absent. |
+| `gh_mods_cmd.txt` | yes | Mod commands, one per line; results go to `gh_mods_out.txt`. See [mods.md](../mods.md). |
+| `gh_mod_profile.txt` | no | `<titleId>=<profile>` per line: the mod profile each title starts with. |
+| `gh_mod_run.txt` | no | Written by the loader: the last modded launch (title, profile, state, failure streak). |
+| `gh_mod_crash.txt` | yes | Written when a modded game crashes: the crash screen for the restarted Launcher to draw. |
+| `gh_launch_once.txt` | yes | Start the run record's game once without mods. |
 | `gh_rt_keep.txt`, `gh_vs_skip_list.txt`, `gh_xfw_keys.txt`, `gh_var_sel.txt` | no | Lists of resource or shader keys for the investigation knobs of the same family. |
 | `gh_diag_local.txt` | no | Presence forces the diagnostic log into LocalState. |
 | `gh_diag_cap_mb.txt` | no | Diagnostic log size cap in MB (1..512). |

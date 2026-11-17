@@ -4,7 +4,10 @@ What this covers: every test that runs on the development machine, what each one
 needs, and what can only be checked on a console.
 Where the code is: `toolchain/test_gh_*.cpp` and `toolchain/test_gh_*.sh` (component
 tests), `tests/x86/` (32-bit guest track), `toolchain/gh_ui_host/` (off-console UI
-renderer), `toolchain/ghweb_host.*` (the web-manage server on localhost).
+renderer), `toolchain/ghweb_host.*` (the web-manage server on localhost),
+`corpus/downloader/` (Steam network client harnesses).
+Related: [../reference/toolchain.md](../reference/toolchain.md) lists every script and
+tool with what it needs and whether it touches a console.
 
 ## Why host tests exist
 
@@ -37,6 +40,7 @@ If you add a component, keep that split and add a test next to the others.
 | `toolchain/test_gh_ovl.sh` | `gh_ovl.h`: the loose-file mod overlay | `clang-cl`, Wine |
 | `toolchain/test_gh_dsound.sh` | `gh_dsound.h`: the DirectSound implementation | `clang-cl`, Wine |
 | `toolchain/test_gh_cefwin.sh` | `gh_cefwin.h`: the synthetic window layer used for embedded browsers | `clang-cl`, Wine |
+| `toolchain/test_gh_owned.sh` | `gh_owned.h`: the owned-games list that Steam ownership answers come from | `clang-cl`, Wine |
 | `toolchain/test_gh_remote.sh` | `gh_remote.h` against the fixed vectors in `toolchain/vectors/remote_vectors.json` | `clang-cl`, Wine |
 | `toolchain/test_gh_shbake.sh` | `gh_shbake.h`: the on-device shader bake recipe | `clang-cl`, Wine, the Linux DXC release (`GH_DXC`), a Windows DXC build holding `dxcompiler.dll` and `dxil.dll` (`GH_DXC_WIN`; set it, its fallback is a path on the original machine), original shader blobs (`GH_SHB_ORIG`) and the local shader corpus in `corpus/redist/ghlo/`, which is not in the repository. Skip it unless you work on the shader path |
 
@@ -63,10 +67,20 @@ directory and are portable.
 | `cases.c` + `build_cases.sh` | C test cases compiled to a freestanding i386 flat binary at `-O0`, `-O1` and `-O2` (SSE2 for float, so results are bit-exact against the host). Loaded and run by `test_cpu` |
 | `test_pe32.cpp` + `pe32guest.c` + `build_pe32.sh` | Builds a real PE32 with relocations and no CRT, maps it away from its preferred base, runs it under the interpreter, and compares with the same source compiled natively. `test_pe32 <some.exe>` also parses and reports on any 32-bit binary |
 | `test_coverage.cpp` + `toolchain/x86_opcode_corpus.py` | Lists every distinct instruction encoding in a real 32-bit binary and reports which ones the decoder rejects, most frequent first. Run this on a new 32-bit game before deploying it |
-| `m2guest.c`, `m3bguest.c`, `n1guest.c`, `d9guest.c`, `benchguest.c` + `build_*.sh` | Small PE32 guests used as console-side fixtures for milestones of the track: imports and thunks, floating point, the native runtime, Direct3D 9, and a benchmark |
+| `m2guest.c` + `build_m2guest.sh` | Console-side fixture: a file round trip through imported Win32 calls and a host-to-guest callback |
+| `m3bguest.c` + `build_m3bguest.sh` | Console-side fixture: threads, TLS, waits, events and critical sections; one exit-code bit per property |
+| `n1guest.c` + `build_n1guest.sh` | Console-side fixture for the native runtime: `fs:` segment, SEH, locks, FPU control word |
+| `d9guest.c` + `build_d9guest.sh` | Console-side fixture: Direct3D 9 through the 32-bit COM layer |
+| `benchguest.c` + `build_benchguest.sh` | Console-side benchmark: times fixed workloads and reports through `OutputDebugStringA` |
+
+The `build_*guest.sh` scripts cross-build with `clang-cl` and `lld-link` for i386 and
+make their import libraries with `llvm-dlltool`. They only build; run a guest on a
+console with `toolchain/iterate-x86spike.sh` (a deploy) or on Windows with
+`toolchain/x86native/build_host.sh`.
 
 ```
-g++ -O2 -std=c++20 -I src/loader/x86 tests/x86/test_cpu.cpp -o /tmp/test_cpu && /tmp/test_cpu
+gcc -O2 -c tests/x86/cases.c -o /tmp/cases.o    # the host side of the differential tests; C, not C++
+g++ -O2 -std=c++20 -I src/loader/x86 tests/x86/test_cpu.cpp /tmp/cases.o -o /tmp/test_cpu && /tmp/test_cpu
 
 bash tests/x86/build_pe32.sh
 gcc -O2 -c tests/x86/pe32guest.c -o /tmp/pe32guest_native.o
@@ -79,6 +93,20 @@ test are in the header of its source file.
 Related host tools: `toolchain/x86native/build_host.sh` builds the native x86
 runtime as a desktop console program; `toolchain/vmdiff/` cross-builds a
 differential tracer for comparing behaviour against a real Windows machine.
+
+## The Steam network client: `corpus/downloader/`
+
+Standalone Windows programs that exercise the project's own Steam client
+(`cm_downloader.h`). Build one with
+`corpus/downloader/build_cm_test.sh <file>.cpp <out.exe>` (`clang-cl`, xwin SDK, and
+the zlib sources in `toolchain/msix-packaging-src/`) and run it under Wine. All of
+them use the network; none needs a console.
+
+| File | What it does |
+|---|---|
+| `gh_downloader.cpp` | Downloads a depot manifest or an app. The regression harness for `cm_downloader.h`: run it after changing the download path. The file header has the arguments |
+| `cm_qr_test.cpp` | Starts a QR sign-in session and polls it. Prints only the URL's host and length, never the URL |
+| `cm_tcp_test.cpp`, `cm_ws_test.cpp` | Historical prototypes of the TCP and WebSocket transports, kept for reference |
 
 ## The UI without a console: `toolchain/gh_ui_host/`
 

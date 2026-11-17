@@ -42,6 +42,23 @@ inline void log(const std::string& s) { if (g_log) g_log(s); }
 // For lines a guest can repeat in a retry loop (HL2 calls SteamAPI_Init ~250
 // times a second, 55k diag lines in 30 s): the first kLogRepeats of each key,
 // then one line at every power-of-two count after that.
+// How many 32-bit words from p on are committed and readable, up to want.
+// Diagnostic stack scans read well above the current frame, and on a thread
+// that has only just started the top of its guest stack is the end of the
+// committed range: reading past it took the whole Launcher down (0.0.975.0).
+inline uint32_t readable_words(const void* p, uint32_t want)
+{
+    uintptr_t at = (uintptr_t)p;
+    const uintptr_t end = at + (uintptr_t)want * 4;
+    while (at < end) {
+        MEMORY_BASIC_INFORMATION mi{};
+        if (!VirtualQuery((const void*)at, &mi, sizeof mi) || mi.State != MEM_COMMIT ||
+            (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) || !mi.Protect)
+            break;
+        at = (uintptr_t)mi.BaseAddress + mi.RegionSize;
+    }
+    return (uint32_t)(((at < end ? at : end) - (uintptr_t)p) / 4);
+}
 inline void log_capped(const std::string& key, const std::string& s) {
     constexpr uint32_t kLogRepeats = 8;
     static std::mutex mu;
@@ -542,6 +559,10 @@ inline bool g_x86_bed_only_steam = false;
 // Off by default -- a fault the guest swallows would otherwise cost a diag
 // line per frame, every time.
 inline bool g_x86_seh_trace = false;
+// Told about each guest image once it is mapped and relocated: lowercased
+// name, actual base, preferred base, size. The native track's tracepoints
+// (gh_x86_trace.h) are placed from here, since a 32-bit DLL moves every run.
+inline void (*g_x86_module_mapped)(const std::string&, uint32_t, uint32_t, uint32_t) = nullptr;
 // Set by the host->guest call path when it REFUSES to run the guest (no guest
 // context on this thread, the thread is unwinding, or the nesting limit is
 // reached). Such a call returns 0, which an SEH walk would otherwise read as
@@ -1105,9 +1126,12 @@ struct Machine {
     // never needs PAGE_EXECUTE, and letting the interpreter (not the MMU) be the
     // arbiter keeps a guest write to a read-only page a guest-visible fault
     // rather than a host access violation.
-    uint32_t alloc(uint32_t bytes, uint32_t align = 0x1000)
+    // `at`, when non-zero, is an exact page-aligned address at or above brk:
+    // VirtualAlloc(addr, MEM_RESERVE) for a range nobody holds yet.
+    uint32_t alloc(uint32_t bytes, uint32_t align = 0x1000, uint32_t at = 0)
     {
         if (align < 0x1000) align = 0x1000;
+        if (at && ((at & 0xFFFu) || at < brk || at < region_base)) { err = "address not free"; return 0; }
         // See heap_alloc: the page round wraps for the top 4095 values of a
         // uint32_t, and would hand back a one-page block for a 4GB request.
         if (bytes > 0xFFFFF000u) {
@@ -1117,7 +1141,7 @@ struct Machine {
                     " bytes -- " + err);
             return 0;
         }
-        uint32_t base = (brk + align - 1) & ~(align - 1);
+        uint32_t base = at ? at : (brk + align - 1) & ~(align - 1);
         uint32_t size = (bytes + 0xFFF) & ~0xFFFu;
         if ((uint64_t)base + size > (uint64_t)region_base + region_size) {
             err = "guest address space exhausted";
@@ -1300,6 +1324,7 @@ struct Machine {
         exe_tls = tls_add_module(tls, image_base, "exe");
 
         entry = image_base + info.entry_rva;
+        if (g_x86_module_mapped) g_x86_module_mapped("exe", image_base, info.image_base, image_size);
         log("X86 image " + hex(image_base) + " size " + hex(image_size) +
             " entry " + hex(entry) + " reloc=" + std::to_string(nrel) +
             " imports=" + std::to_string(imports.size()) +
@@ -2896,7 +2921,11 @@ struct Machine {
             return 0;
         }
         d.size = (d.info.image_size + 0xFFF) & ~0xFFFu;
-        d.base = alloc(d.size);
+        // On the 64 KB allocation granularity, as Windows maps every module:
+        // an HMODULE is an allocation base, and code that recovers one by
+        // rounding an address down (or from VirtualQuery's AllocationBase)
+        // expects that.
+        d.base = alloc(d.size, 0x10000);
         if (!d.base) { log("X86 LoadLibrary(" + nm + "): no room"); return 0; }
 
         uint8_t* img = (uint8_t*)(uintptr_t)d.base;
@@ -2956,6 +2985,7 @@ struct Machine {
         // that module has a base. Before DllMain, since the CRT initialisation
         // a probe might be watching happens in there.
         if (dll_loaded_hook) dll_loaded_hook(*this, mod);
+        if (g_x86_module_mapped) g_x86_module_mapped(nm, mod.base, mod.info.image_base, mod.size);
 
         Pe32Tls dtls;
         if (pe32_tls(img, mod.info, dtls)) {

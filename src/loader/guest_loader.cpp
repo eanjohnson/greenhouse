@@ -9474,6 +9474,13 @@ static void GhBuildSyntheticDisplayDevice()
         { GhRegVal v; RegPutString(v, REG_SZ, L"31.0.101.4502"); key.values[L"driverversion"] = v; }
         { GhRegVal v; RegPutString(v, REG_SZ, g_synthDevDesc);   key.values[L"driverdesc"]    = v; }
         { GhRegVal v; RegPutString(v, REG_SZ, L"Microsoft");     key.values[L"providername"]  = v; }
+        // Adobe AIR refuses a Direct3D 9 device whose driver has no DriverDateData
+        // or one older than 2006 (it then recreates the device forever). The date
+        // matches the version above: 2023-06-15, as a FILETIME.
+        { GhRegVal v; RegPutString(v, REG_SZ, L"6-15-2023");     key.values[L"driverdate"]    = v; }
+        { GhRegVal v; const uint64_t ft = 0x01D99F1C53EBC000ull;
+          v.type = REG_BINARY; v.data.assign((const uint8_t*)&ft, (const uint8_t*)&ft + 8);
+          key.values[L"driverdatedata"] = v; }
         // The parent keys, so a guest that walks down to it does not stop one level up.
         g_regKeys[L"hklm\\system"];
         g_regKeys[L"hklm\\system\\currentcontrolset"];
@@ -9503,6 +9510,13 @@ static HDEVINFO WINAPI Bed_SetupDiGetClassDevsW(const GUID* cls, PCWSTR enumr, H
     if (enumr && _wcsicmp(enumr, L"PCI") == 0) {
         GhBuildSyntheticDisplayDevice();
         Diag("BED SetupDiGetClassDevsW(PCI) -> synthetic set");
+        return kGhSynthDevInfo;
+    }
+    // The display class itself (Adobe AIR's driver-date check) is the same question
+    // asked by class instead of by bus. Device-interface lookups keep the real tree.
+    if (cls && !(flags & DIGCF_DEVICEINTERFACE) && IsEqualGUID(*cls, kGhDisplayClassGuid)) {
+        GhBuildSyntheticDisplayDevice();
+        Diag("BED SetupDiGetClassDevsW(display class) -> synthetic set");
         return kGhSynthDevInfo;
     }
     auto fn = GhRealSetupApi<HDEVINFO (WINAPI*)(const GUID*, PCWSTR, HWND, DWORD)>("SetupDiGetClassDevsW");
@@ -52469,6 +52483,11 @@ static void FlushGuestImageOnly()
 static bool MapAndRun32(const std::vector<uint8_t>& file)
 {
     ghx86::g_log = [](const std::string& s) { Diag(s); };
+    ghx86::g_x86_display_device = [](ghx86::X86DisplayDevice& d) {
+        GhBuildSyntheticDisplayDevice();
+        d.desc = g_synthDevDesc; d.inst_id = g_synthDevInstId; d.driver = g_synthDevDriver;
+        return !d.driver.empty();
+    };
     // The guest's registry is the same virtual hive x64 guests get (loaded,
     // Steam-seeded and saved around MapAndRun by RunGuest).
     ghx86::g_reg = { Bed_RegOpenKeyExW, Bed_RegOpenKeyExA, Bed_RegOpenKeyA, Bed_RegCreateKeyW,
@@ -52695,7 +52714,20 @@ static bool MapAndRun32(const std::vector<uint8_t>& file)
     ghx86::g_x86_seh_trace = GhCfgNum(L"gh_x86_seh_trace.txt", "GH_X86_SEH_TRACE", 0) != 0;
     // gh_x86_sample.txt=N: every N s, log where each guest thread is (stalls).
     ghx86::native::S.sample_ms = (uint32_t)GhCfgNum(L"gh_x86_sample.txt", "GH_X86_SAMPLE", 0) * 1000u;
+    // gh_x86_first_calls.txt=1: log each API the first time the guest calls
+    // it, with the caller -- the outline of a start-up that ends silently.
+    ghx86::native::S.first_calls = GhCfgNum(L"gh_x86_first_calls.txt", "GH_X86_FIRST_CALLS", 0) != 0;
     ghx86::native::S.host_stack_mb = (uint32_t)GhCfgNum(L"gh_x86_host_stack_mb.txt", "GH_X86_HOST_STACK_MB", 32);
+    // gh_x86_trace.txt: int3 tracepoints in 32-bit guest code, placed per
+    // module (src/loader/x86/gh_x86_trace.h has the format). Absent = none.
+    {
+        std::vector<uint8_t> tb;
+        ghx86::trace::T.text.clear();
+        if (ReadWholeFile(std::wstring(kLocalState) + L"gh_x86_trace.txt", tb, true) && tb.size() <= 16384) {
+            for (uint8_t ch : tb) if (ch) ghx86::trace::T.text += (char)ch;   // UTF-16LE or ASCII
+            Diag("CFG gh_x86_trace.txt bytes=" + std::to_string(tb.size()));
+        }
+    }
     bool ok = native ? ghx86::native::RunPe32Native(file, result, why, g_guestExePath)
                      : ghx86::RunPe32Guest(file, result, why, g_guestExePath);
 

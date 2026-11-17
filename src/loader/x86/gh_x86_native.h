@@ -42,6 +42,9 @@
 #include <intrin.h>
 
 #include <algorithm>
+#include <unordered_map>
+#include <mutex>
+#include <deque>
 #include <atomic>
 #include <new>
 #include <string>
@@ -50,6 +53,7 @@
 #include "gh_x86_beds_gen.h"
 #include "gh_x86_stubs.h"
 #include "gh_x86_native_gates.h"
+#include "gh_x86_trace.h"
 
 namespace ghx86 {
 namespace native {
@@ -137,6 +141,14 @@ struct State {
     std::atomic<NativeThread*> roster[kRoster] = {};
     std::atomic<uint32_t> nroster{0};
     uint32_t    sample_ms = 0;                   // gh_x86_sample.txt, set by the caller
+    bool        first_calls = false;             // gh_x86_first_calls.txt, set by the caller
+    std::atomic<uint8_t>* called = nullptr;      // per thunk slot, when first_calls
+    // Per thunk slot call counts, when first_calls and sample_ms are both set:
+    // the sampler logs the busiest imports since its last sample. A guest
+    // that runs on but has stopped doing something (Adobe AIR ticking at
+    // 60 Hz and never drawing) is told apart by what it still calls.
+    std::atomic<uint32_t>* counts = nullptr;
+    uint32_t*   counts_prev = nullptr;
     uint32_t    host_stack_mb = 0;               // gh_x86_host_stack_mb.txt, set by the caller; 0 = 32
     bool        band_done = false;               // the TEB32 band outlives a run
     bool        stuck = false;                   // a run could not be torn down
@@ -177,6 +189,78 @@ inline thread_local std::string t_deferred_log;
 // instruction is a segment or a stale-eip question, and only these answer it.
 struct FaultDetail { uint16_t ss, ds, es, fs, gs; uint64_t info0, info1, rip; uint8_t code[12]; bool have_code; };
 inline thread_local FaultDetail t_fault;
+// The last host calls this guest thread made: slot index and guest return
+// address. A guest that dies on memory one of our beds wrote wrongly dies
+// far from the bed; the ring, printed with the fault, names the suspects.
+// Two stores per call, no lock: it is this thread's own.
+// The result is filled in when the call returns; a call still on the stack
+// (a callback re-entered the guest) shows as "?".
+struct CallRing {
+    static constexpr uint32_t kN = 16384;     // ~210 KB, heap, guest threads only
+    uint32_t idx[kN]; uint32_t ret[kN]; uint32_t res[kN]; bool done[kN]; uint32_t n;
+};
+inline thread_local CallRing* t_ringp = nullptr;   // made on a thread's first host call; never freed (a few per run)
+inline CallRing& ring() { if (!t_ringp) t_ringp = new CallRing{}; return *t_ringp; }
+
+// Frame-pointer-less code (ebp holds data) leaves dump_stack_at with one
+// frame; the module return addresses on the stack are the rest of it.
+inline std::string guest_stack_scan(Machine& m, uint32_t esp)
+{
+    auto in_module = [&m](uint32_t v) {
+        if (v >= m.image_base && v - m.image_base < m.image_size) return true;
+        for (auto& d : m.dlls) if (v >= d.base && v - d.base < d.size) return true;
+        return false;
+    };
+    std::string st = "X86N stack scan:";
+    const uint32_t* sp = (const uint32_t*)(uintptr_t)esp;
+    const int lim = (int)readable_words(sp, 160);
+    for (int i = 0, n = 0; i < lim && n < 16; ++i)
+        if (in_module(sp[i])) { st += " " + m.describe_addr(sp[i]); ++n; }
+    return st;
+}
+
+// Consecutive identical calls (same API, caller and result) print once
+// with a count, so a HeapFree loop does not push out what came before it.
+inline std::string host_call_ring(Machine& m, uint32_t want = 32)
+{
+    constexpr uint32_t M = CallRing::kN - 1;
+    if (!t_ringp) return "X86N no host calls recorded on this thread";
+    CallRing& t_ring = *t_ringp;
+    const uint32_t have = t_ring.n < CallRing::kN ? t_ring.n : CallRing::kN;
+    std::vector<std::string> items;
+    std::string last;
+    uint32_t reps = 0;
+    auto flush = [&]() { if (!last.empty()) items.push_back(reps > 1 ? last + " x" + std::to_string(reps) : last); };
+    for (uint32_t j = t_ring.n - have; j != t_ring.n; ++j) {
+        const uint32_t ix = t_ring.idx[j & M];
+        const HostFn* f = ix < m.thunks.size() ? m.thunks[ix].fn : nullptr;
+        // Allocator and TLS traffic outnumbers everything else a hundred to
+        // one and is never the story -- unless it failed.
+        // MMgc's commit/decommit loop (VirtualQuery + VirtualAlloc/VirtualFree
+        // per page run) is the same story for AIR.
+        static const char* const kNoise[] = { "GetProcessHeap", "HeapAlloc", "HeapFree", "HeapSize",
+            "HeapReAlloc", "TlsGetValue", "TlsSetValue", "FlsGetValue", "FlsSetValue",
+            "TryEnterCriticalSection", "GetCurrentThreadId", "QueryPerformanceCounter", "GetTickCount",
+            "timeGetTime", "VirtualQuery", "VirtualAlloc", "VirtualFree" };
+        // These return nothing, so their "result" is a stale EAX: never a failure.
+        static const char* const kVoid[] = { "EnterCriticalSection", "LeaveCriticalSection", "SetLastError" };
+        auto in = [f](const char* const* b, const char* const* e) {
+            return std::any_of(b, e, [f](const char* k) { return !std::strcmp(k, f->name); });
+        };
+        if (f && in(std::begin(kVoid), std::end(kVoid))) continue;
+        if (f && t_ring.done[j & M] && t_ring.res[j & M] != 0 && in(std::begin(kNoise), std::end(kNoise)))
+            continue;
+        std::string e = std::string(f ? f->name : ("#" + std::to_string(ix)).c_str()) + "@" +
+                        m.describe_addr(t_ring.ret[j & M]) + "=" + (t_ring.done[j & M] ? hex(t_ring.res[j & M]) : "?");
+        if (e == last) { ++reps; continue; }
+        flush(); last = e; reps = 1;
+    }
+    flush();
+    const size_t from = items.size() > want ? items.size() - want : 0;
+    std::string r = "X86N last host calls on this thread (oldest first, =result):";
+    for (size_t i = from; i < items.size(); ++i) r += " " + items[i];
+    return r;
+}
 inline void flush_deferred_log()
 {
     if (t_deferred_log.empty()) return;
@@ -385,6 +469,12 @@ inline uint32_t host_dispatch(NativeCtl* c)
         return abort_frames(c);
     }
     const uint32_t idx = c->idx;
+    CallRing& t_ring = ring();
+    const uint32_t rslot = t_ring.n & (CallRing::kN - 1);
+    t_ring.idx[rslot] = idx;
+    t_ring.ret[rslot] = ((const uint32_t*)(uintptr_t)c->esp)[0];
+    t_ring.done[rslot] = false;
+    ++t_ring.n;
     const HostFn* fn = idx < S.nslots ? S.fns[idx].load(std::memory_order_acquire) : nullptr;
     // A slot bound after start (LoadLibrary, GetProcAddress) is not in S.fns
     // yet. Look it up before choosing the path: a lockless bed taken the
@@ -396,6 +486,17 @@ inline uint32_t host_dispatch(NativeCtl* c)
         if (fn) S.fns[idx].store(fn, std::memory_order_release);
         S.gil.unlock();
     }
+
+    // gh_x86_first_calls: the order in which a guest first reaches each API
+    // is the outline of its start-up, and a guest that quits on its own
+    // (Adobe AIR returns from WinMain) gives no other account of how far it
+    // got. One line per API per run; the caller is a raw guest address
+    // because the module list may be changing under another thread.
+    if (S.counts && idx < S.nslots) S.counts[idx].fetch_add(1, std::memory_order_relaxed);
+    if (S.called && idx < S.nslots && !S.called[idx].exchange(1, std::memory_order_relaxed))
+        log("X86N first call " + std::string(fn ? fn->dll : "?") + "!" +
+            (fn ? std::string(fn->name) : "#" + std::to_string(idx)) + " from " +
+            hex(((const uint32_t*)(uintptr_t)c->esp)[0]) + " tid " + std::to_string(GetCurrentThreadId()));
 
     FpuGate fpu;
     fpu.enter();
@@ -418,6 +519,7 @@ inline uint32_t host_dispatch(NativeCtl* c)
         c->edx = (uint32_t)(r >> 32);
         c->esp += 4 + (fn->caller_cleans ? 0 : fn->stack_bytes);
         c->eip = ret;
+        if (t_ring.idx[rslot] == idx) { t_ring.res[rslot] = (uint32_t)r; t_ring.done[rslot] = true; }
         return 0;
     }
 
@@ -442,6 +544,7 @@ inline uint32_t host_dispatch(NativeCtl* c)
         request_exit(m.exit_code);                   // a std bed asked for the process to end
     }
     const bool retry = m.cpu.eip == slot;            // a green-thread bed asked to be re-run
+    if (!retry && t_ring.idx[rslot] == idx) { t_ring.res[rslot] = m.cpu.gpr[REG_EAX]; t_ring.done[rslot] = true; }
     std::memcpy(ctl_gpr(c), m.cpu.gpr, sizeof m.cpu.gpr);
     c->eflags = (m.cpu.eflags & 0xCD5u) | 0x202u;
     c->eip = m.cpu.eip;
@@ -542,6 +645,8 @@ inline uint32_t host_fault(NativeCtl* c)
         log(d);
     }
     m.dump_stack_at(c->f_eip, c->ebp, "unhandled guest exception");
+    log(guest_stack_scan(m, c->esp));
+    log(host_call_ring(m));
     request_exit(code);
     S.gil.unlock();
     fpu.leave();
@@ -600,6 +705,14 @@ inline LONG CALLBACK NativeVeh(EXCEPTION_POINTERS* ep)
     NativeCtl* c = ctl_here();
     const uint32_t eip = (uint32_t)x->Rip;
     const bool av = r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2;
+    // gh_x86_trace.txt: one of our int3s. Resume at the restored instruction.
+    if (r->ExceptionCode == EXCEPTION_BREAKPOINT && !trace::T.pts.empty()) {
+        if (const uint32_t at = trace::on_break(x)) {
+            c->resume_eip = at;
+            x->Rip = S.g.resume64;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
     if (av && r->ExceptionInformation[0] != 8 &&
         patch_fs(eip, (uint32_t)r->ExceptionInformation[1])) {
         c->resume_eip = eip;
@@ -797,6 +910,55 @@ inline DWORD WINAPI NativeThreadProc(void* p)
 
 inline HANDLE H(uint32_t v) { return (HANDLE)(intptr_t)(int32_t)v; }
 inline uint32_t G(HANDLE h) { return (uint32_t)(uintptr_t)h; }
+
+// ---------------------------------------------------------------------------
+// User APCs
+// ---------------------------------------------------------------------------
+// A guest APC is a guest function, so the host's own APC machinery cannot run
+// it. Each guest thread gets a queue and an auto-reset event; QueueUserAPC
+// appends and sets the event, and the alertable waits below wait on that event
+// too and run the queue on the waiting thread before returning
+// WAIT_IO_COMPLETION, which is the order Windows runs them in.
+//
+// Adobe AIR's condition variable depends on it: a waiter sleeps in
+// SleepEx(INFINITE, TRUE) and the notifier wakes it with QueueUserAPC on an
+// OpenThread handle. With QueueUserAPC answered by a stub that did nothing,
+// the waiter slept for ever and the content never loaded.
+struct GuestApc { uint32_t fn, data; };
+struct ApcQueue { HANDLE ev = nullptr; std::deque<GuestApc> q; };
+inline std::mutex g_apc_mu;
+inline std::unordered_map<DWORD, ApcQueue> g_apcs;
+
+inline HANDLE apc_event(DWORD tid)                    // caller holds g_apc_mu
+{
+    ApcQueue& a = g_apcs[tid];
+    if (!a.ev) a.ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    return a.ev;
+}
+inline HANDLE my_apc_event()
+{
+    std::lock_guard<std::mutex> lk(g_apc_mu);
+    return apc_event(GetCurrentThreadId());
+}
+// Runs this thread's queued APCs; how many ran.
+inline uint32_t run_guest_apcs(Machine& m)
+{
+    uint32_t n = 0;
+    for (;;) {
+        GuestApc a{};
+        {
+            std::lock_guard<std::mutex> lk(g_apc_mu);
+            auto it = g_apcs.find(GetCurrentThreadId());
+            if (it == g_apcs.end() || it->second.q.empty()) break;
+            a = it->second.q.front();
+            it->second.q.pop_front();
+        }
+        const uint32_t args[1] = { a.data };
+        native_call(m, a.fn, args, 1);
+        ++n;
+    }
+    return n;
+}
 
 // ---------------------------------------------------------------------------
 // Locks over guest memory
@@ -1023,6 +1185,8 @@ inline uint64_t wait_many(uint32_t n, uint32_t harr, BOOL all, DWORD ms, BOOL al
     return WaitForMultipleObjectsEx(n, hs, all, ms, alertable);
 }
 
+inline void RegisterWaveBeds(Machine& m);    // gh_x86_wave.h, included at the end
+
 inline void RegisterNativeBeds(Machine& m)
 {
     ThunkRegistry& R = m.registry;
@@ -1032,6 +1196,8 @@ inline void RegisterNativeBeds(Machine& m)
         S.wake_all = (State::WakeFn)GetProcAddress(kb, "WakeByAddressAll");
     }
     if (!S.wait_on_address) log("X86N WaitOnAddress missing: guest locks will spin");
+
+    RegisterWaveBeds(m);   // ahead of gh_x86_beds.h's "no driver" waveOut beds
 
     // -- threads -----------------------------------------------------------
     // Under the bed lock: it grows Machine::threads and allocates a stack.
@@ -1077,10 +1243,36 @@ inline void RegisterNativeBeds(Machine& m)
             t_abort = true; t_abort_code = a[0];
             return 0;
         });
-    GH_X86_NBED(R, "kernel32.dll", "ExitProcess", 4,
+    // Thread-pool code ends its worker threads with this. Nothing is ever
+    // unmapped (see the FreeLibrary bed), so it is ExitThread with a
+    // module argument to ignore -- and it must not return, which a stub would.
+    GH_X86_NBED(R, "kernel32.dll", "FreeLibraryAndExitThread", 8,
         [](Machine&, const uint32_t* a) -> uint64_t {
+            t_abort = true; t_abort_code = a[1];
+            return 0;
+        });
+    // RaiseFailFastException(record, context, flags) ends the process on the
+    // spot, with no handlers run. A stub that returned sent Adobe AIR on past
+    // its own fatal check into a null dereference, which then looked like the
+    // problem. The record's code is the exit code, as WER would report it.
+    GH_X86_NBED(R, "kernel32.dll", "RaiseFailFastException", 12,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            uint32_t code = 0xC0000602u;                    // STATUS_FAIL_FAST_EXCEPTION
+            if (a[0]) std::memcpy(&code, (void*)(uintptr_t)a[0], 4);
+            log("X86 guest RaiseFailFastException code " + hex(code) + " from " + hex(a[-1]) +
+                (a[-1] >= m.image_base && a[-1] - m.image_base < m.image_size ? " (exe)" : ""));
+            request_exit(code);
+            t_abort = true; t_abort_code = code;
+            return 0;
+        });
+    GH_X86_NBED(R, "kernel32.dll", "ExitProcess", 4,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
             log("X86N guest ExitProcess(" + std::to_string(a[0]) + ") on tid " +
                 std::to_string(GetCurrentThreadId()));
+            // A guest that quits on its own after a refused call says why
+            // only through who called this.
+            log(guest_stack_scan(m, (uint32_t)(uintptr_t)(a - 1)));
+            log(host_call_ring(m));
             request_exit(a[0]);
             return 0;
         });
@@ -1107,19 +1299,45 @@ inline void RegisterNativeBeds(Machine& m)
     GH_X86_NBED(R, "kernel32.dll", "Sleep", 4,
         [](Machine&, const uint32_t* a) -> uint64_t { Sleep(a[0]); return 0; });
     GH_X86_NBED(R, "kernel32.dll", "SleepEx", 8,
-        [](Machine&, const uint32_t* a) -> uint64_t { return SleepEx(a[0], a[1]); });
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            if (!a[1]) return SleepEx(a[0], FALSE);
+            if (run_guest_apcs(m)) return WAIT_IO_COMPLETION;
+            WaitForSingleObject(my_apc_event(), a[0]);
+            return run_guest_apcs(m) ? WAIT_IO_COMPLETION : 0u;
+        });
+    GH_X86_NBED(R, "kernel32.dll", "QueueUserAPC", 12,
+        [](Machine&, const uint32_t* a) -> uint64_t {
+            const DWORD tid = GetThreadId(H(a[1]));
+            if (!tid || !a[0]) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+            std::lock_guard<std::mutex> lk(g_apc_mu);
+            const HANDLE ev = apc_event(tid);
+            g_apcs[tid].q.push_back({ a[0], a[2] });
+            SetEvent(ev);
+            return 1;
+        });
     GH_X86_NBED(R, "kernel32.dll", "SwitchToThread", 0,
         [](Machine&, const uint32_t*) -> uint64_t { return SwitchToThread(); });
     GH_X86_NBED(R, "kernel32.dll", "WaitForSingleObject", 8,
         [](Machine&, const uint32_t* a) -> uint64_t { return WaitForSingleObject(H(a[0]), a[1]); });
     GH_X86_NBED(R, "kernel32.dll", "WaitForSingleObjectEx", 12,
-        [](Machine&, const uint32_t* a) -> uint64_t {
-            return WaitForSingleObjectEx(H(a[0]), a[1], a[2]);
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            if (!a[2]) return WaitForSingleObjectEx(H(a[0]), a[1], FALSE);
+            if (run_guest_apcs(m)) return WAIT_IO_COMPLETION;
+            const HANDLE hs[2] = { H(a[0]), my_apc_event() };
+            const DWORD w = WaitForMultipleObjects(2, hs, FALSE, a[1]);
+            if (w == WAIT_OBJECT_0 + 1)
+                return run_guest_apcs(m) ? WAIT_IO_COMPLETION : (uint64_t)WaitForSingleObject(hs[0], 0);
+            return w;
         });
     GH_X86_NBED(R, "kernel32.dll", "WaitForMultipleObjects", 16,
         [](Machine&, const uint32_t* a) -> uint64_t { return wait_many(a[0], a[1], a[2], a[3], FALSE); });
     GH_X86_NBED(R, "kernel32.dll", "WaitForMultipleObjectsEx", 20,
-        [](Machine&, const uint32_t* a) -> uint64_t { return wait_many(a[0], a[1], a[2], a[3], a[4]); });
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            // Alertable: APCs already queued run first, as on Windows. One
+            // queued while this waits is run by the thread's next alertable wait.
+            if (a[4] && run_guest_apcs(m)) return WAIT_IO_COMPLETION;
+            return wait_many(a[0], a[1], a[2], a[3], a[4]);
+        });
     // No message queue to wait on (the window is a surrogate), so: a signalled
     // handle if there is one, else "input arrived" -- the interpreter's answer,
     // which sends the guest back to PeekMessage.
@@ -1144,6 +1362,42 @@ inline void RegisterNativeBeds(Machine& m)
                     return a[0];
                 });
     }
+
+    // A guest that shows an error box is about to give up; the calls just
+    // before it are usually the reason (AIR's "application descriptor could
+    // not be found"). Native only, because the ring is the native dispatcher's.
+    GH_X86_NBED(R, "user32.dll", "MessageBoxW", 16,
+        [](Machine& m, const uint32_t* a) -> uint64_t {
+            std::string t, c;
+            for (const wchar_t* w = (const wchar_t*)(uintptr_t)a[1]; a[1] && *w && t.size() < 400; ++w) t += (char)(*w < 128 ? *w : '?');
+            for (const wchar_t* w = (const wchar_t*)(uintptr_t)a[2]; a[2] && *w && c.size() < 100; ++w) c += (char)(*w < 128 ? *w : '?');
+            log("X86 MessageBox: [" + c + "] " + t);
+            S.gil.lock();
+            log(guest_stack_scan(m, (uint32_t)(uintptr_t)(a - 1)));
+            log(host_call_ring(m, 250));
+            S.gil.unlock();
+            return 1;                                // IDOK
+        });
+
+    // GetMessage really waits here. The shared bed answers WM_QUIT at once,
+    // because under the interpreter a wait would stop every guest thread;
+    // natively it only stops this one, and a player whose main loop is
+    // GetMessage (Adobe AIR) took that WM_QUIT as the order to shut down
+    // a second after it started. The gil is held only to look at the queue.
+    for (const char* n : { "GetMessageW", "GetMessageA" })
+        GH_X86_NBED(R, "user32.dll", n, 16,
+            [](Machine& m, const uint32_t* a) -> uint64_t {
+                for (;;) {
+                    S.gil.lock();
+                    const uint64_t got = peek_message32(m, a[0], a[2], a[3], true, a[-1], a[1]);
+                    S.gil.unlock();
+                    if (got) return ((const uint32_t*)(uintptr_t)a[0])[1] == WM_QUIT ? 0 : 1;
+                    if (S.exiting) { write_msg32(a[0], WM_QUIT, 0, 0); return 0; }
+                    // Posts set the event; input and timers are picked up
+                    // within a few ms, which is all a frame needs.
+                    WaitForSingleObject(wndq().wake, 4);
+                }
+            });
 
     // -- events, mutexes, semaphores ---------------------------------------
     // SECURITY_ATTRIBUTES holds a pointer, so the guest's copy is not the
@@ -1404,9 +1658,14 @@ inline void end_run(Machine& m)
 
     for (NativeThread* nt : S.live) { if (nt->own) CloseHandle(nt->own); delete nt; }
     S.live.clear();
+    trace::stop();
+    g_x86_module_mapped = nullptr;
     if (S.veh) { RemoveVectoredExceptionHandler(S.veh); S.veh = nullptr; }
     if (S.exit_event) { CloseHandle(S.exit_event); S.exit_event = nullptr; }
     delete[] S.fns; S.fns = nullptr;
+    delete[] S.called; S.called = nullptr;
+    delete[] S.counts; S.counts = nullptr;
+    delete[] S.counts_prev; S.counts_prev = nullptr;
     S.nslots = 0; S.gates = 0;
     const uint32_t base = m.region_base;
     S.m = nullptr;
@@ -1451,6 +1710,30 @@ inline void sample_threads(Machine& m, ULONGLONG at_ms)
     }
     log("X86N sample t=" + std::to_string(at_ms / 1000) + "s: " + std::to_string(snaps.size()) +
         " live thread(s), gil owner " + std::to_string(S.gil.owner.load()));
+    {
+        WndQStats& st = wndq_stats();
+        if (S.counts) {
+            std::vector<std::pair<uint32_t, uint32_t>> hot;           // (calls since last sample, slot)
+            for (uint32_t i = 0; i < S.nslots; ++i) {
+                const uint32_t now = S.counts[i].load(std::memory_order_relaxed);
+                if (now != S.counts_prev[i]) hot.emplace_back(now - S.counts_prev[i], i);
+                S.counts_prev[i] = now;
+            }
+            std::sort(hot.begin(), hot.end(), [](auto& a, auto& b) { return a.first > b.first; });
+            std::string line = "X86N sample hot imports:";
+            for (size_t k = 0; k < hot.size() && k < 40; ++k) {
+                const HostFn* fn = S.fns[hot[k].second].load(std::memory_order_acquire);
+                line += " " + (fn ? std::string(fn->name) : "#" + std::to_string(hot[k].second)) +
+                        "=" + std::to_string(hot[k].first);
+            }
+            log(line);
+        }
+        log("X86N sample dispatched tick(0x401)=" + std::to_string(st.tick.load()) +
+            " paint=" + std::to_string(st.paint.load()) + " timer=" + std::to_string(st.timer.load()) +
+            " other=" + std::to_string(st.other.load()) + " invalidate=" + std::to_string(st.inval.load()) +
+            " steamcalls=" + std::to_string(st.steam.load()));
+        log("X86N sample queue " + wndq_describe());
+    }
     for (const Snap& sn : snaps) {
         const std::string who = "tid " + std::to_string(sn.tid) + " depth " + std::to_string(sn.depth) +
             (sn.hsize ? " hostfree " + std::to_string(sn.hfree >> 10) + "K/" + std::to_string(sn.hsize >> 20) + "M" : "");
@@ -1486,6 +1769,14 @@ inline bool RunPe32Native(const std::vector<uint8_t>& file, uint32_t& result, st
     S.band_done = true;
     m.commit_protect = PAGE_EXECUTE_READWRITE;
     if (!m.reserve(region_bytes)) { why = m.err; end_run(m); return false; }
+    // gh_x86_trace.txt: placed per module as each is mapped, live once the VEH is.
+    if (!trace::T.text.empty()) {
+        trace::T.logf = [](const std::string& s) { log(s); };
+        trace::T.write_byte = &write_code_byte;
+        const size_t n = trace::load(trace::T.text);
+        log("X86TRACE " + std::to_string(n) + " tracepoint(s) from gh_x86_trace.txt");
+        g_x86_module_mapped = n ? &trace::on_module : nullptr;
+    }
     if (!m.load_image(file))      { why = m.err; end_run(m); return false; }
     uint32_t stack = m.info.stack_reserve;
     if (stack < Machine::kDefaultStack) stack = Machine::kDefaultStack;
@@ -1523,11 +1814,17 @@ inline bool RunPe32Native(const std::vector<uint8_t>& file, uint32_t& result, st
     }
     FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
     S.fns = new std::atomic<const HostFn*>[S.nslots]();
+    if (S.first_calls) S.called = new std::atomic<uint8_t>[S.nslots]();
+    if (S.first_calls && S.sample_ms) {
+        S.counts = new std::atomic<uint32_t>[S.nslots]();
+        S.counts_prev = new uint32_t[S.nslots]();
+    }
     for (uint32_t i = 0; i < S.nslots && i < m.thunks.size(); ++i) S.fns[i] = m.thunks[i].fn;
     m.native_call = &native_call;
 
     S.exit_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     S.veh = AddVectoredExceptionHandler(1, NativeVeh);
+    trace::start();
     log("X86N native runtime: gates " + hex(S.gates) + " slots " + std::to_string(S.nslots) +
         " teb band " + std::to_string(band) + " granules, stack " + hex(stack));
 
@@ -1581,3 +1878,7 @@ inline bool RunPe32Native(const std::vector<uint8_t>& file, uint32_t& result, st
 
 }   // namespace native
 }   // namespace ghx86
+
+// waveOut over XAudio2. Native only: its WOM_DONE comes from a guest thread of
+// our own, which only this track can start.
+#include "gh_x86_wave.h"

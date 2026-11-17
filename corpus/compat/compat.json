@@ -65,6 +65,20 @@
       ]
     },
     {
+      "appId": 668210,
+      "id": "sfpa",
+      "name": "Super Fancy Pants Adventure",
+      "results": [
+        {
+          "console": "ONE",
+          "status": "PLAYABLE",
+          "version": "0.0.1007.0",
+          "verified": "2026-11-17",
+          "note": "Adobe AIR on the 32-bit runtime: the save menu, a new file, the hub room and the house, full screen at about 53 fps, with the pad through Steam Input and sound. Saves persist between sessions on the console; they are not synchronised with Steam Cloud."
+        }
+      ]
+    },
+    {
       "appId": 4000,
       "id": "garrysmod",
       "name": "Garry's Mod",

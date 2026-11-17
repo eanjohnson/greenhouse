@@ -11,6 +11,7 @@ Related: [overview](overview.md), [API shims](api-shims.md),
 [window and input](window-input.md), [engine notes](engine-notes.md),
 [x86 guest](x86-guest.md), [knobs](../reference/knobs.md),
 [known limits](../reference/known-limits.md).
+How it was found: [source-on-d3d9on12.md](../writeups/source-on-d3d9on12.md)
 
 ## Summary
 
@@ -20,7 +21,7 @@ Related: [overview](overview.md), [API shims](api-shims.md),
 | WASAPI / MMDevAPI | Present and working. | Nothing. Middleware that talks to WASAPI plays as-is. |
 | DirectSound (`dsound.dll`) | Absent. | Beds: "no sound card" by default, an XAudio2-backed device per title. |
 | `waveIn*` | Not usable. | Beds over a WinRT capture graph (microphone). |
-| `waveOut*` | Not bedded. | Nothing; see limits. |
+| `waveOut*` | Not usable. | 32-bit guests on the native track: beds over XAudio2 (`gh_x86_wave.h`). 64-bit guests: nothing; see limits. |
 | `timeSetEvent`, `timeKillEvent` | Missing from the reduced `WINMM.dll`. | `ghwmm.dll` shim. |
 | Media Foundation (`mf`, `mfplat`, `mfreadwrite`) | Present; software decoders only. | Thin tracing beds, plus a skip for undecodable video. |
 | `mfplay.dll` | Absent. | Aliased to `mfplat.dll`. |
@@ -258,8 +259,9 @@ the client runs without a UI.
 
 ## Limits
 
-- No `waveOut` emulation. A game whose only output path is `waveOut` is silent or fails
-  to initialise audio.
+- `waveOut` is emulated only for 32-bit guests on the native x86 track (Adobe AIR plays
+  through it; see [x86 guest](x86-guest.md)). A 64-bit game whose only output path is
+  `waveOut` is silent or fails to initialise audio.
 - No DirectSound capture.
 - DirectSound output is opt-in per title and tested mainly with one engine's mixer
   (single looping buffer). 3D buffers and effects are not implemented.

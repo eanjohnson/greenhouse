@@ -1,0 +1,21 @@
+{
+  "schema": "greenhouse.title/1",
+  "id": "sfpa",
+  "name": "Super Fancy Pants Adventure",
+  "match": {
+    "exe": "SFPA.exe",
+    "launch": "SFPA.exe",
+    "steamAppId": 668210
+  },
+  "requires": {
+    "loader": "0.0.1007.0",
+    "services": [
+      "steam-runtime"
+    ]
+  },
+  "knobs": {
+    "gh_dsound": 1,
+    "gh_x86_native": 1,
+    "gh_x86_steam": 1
+  }
+}
