@@ -336,6 +336,9 @@ def nodup(pairs):
 for f in sys.argv[1:]:
     d = json.load(open(f, encoding="utf-8"), object_pairs_hook=nodup)
     assert d.get("schema") == "greenhouse.title/1", f + ": schema"
+    for m, o in d.get("byConsole", {}).items():
+        assert m in ("ONE", "SERIES_S", "SERIES_X"), f + ": byConsole." + m + ": not a console model"
+        assert isinstance(o, dict) and isinstance(o.get("args", ""), str), f + ": byConsole." + m + ": shape"
     print("  title %-18s %s" % (d["id"], f.rsplit("/", 1)[-1]))
 PYEOF
 cp "$GH"/corpus/titles/*.ghtitle.json "$STAGE/guest/titles/"

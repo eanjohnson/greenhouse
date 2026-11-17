@@ -3210,7 +3210,8 @@ inline void RegisterStdBeds(Machine& m)
     GH_X86_BED(R, "kernel32.dll", "GetProcAddress", 8,
         [](Machine& m, const uint32_t* a) -> uint64_t {
             if ((a[1] & 0xFFFF0000u) == 0) {                // imported by ordinal
-                log("X86 GetProcAddress(ordinal #" + std::to_string(a[1]) + ") unsupported");
+                log_capped("gpa#" + std::to_string(a[1]),
+                           "X86 GetProcAddress(ordinal #" + std::to_string(a[1]) + ") unsupported");
                 return 0;
             }
             const char* nm = (const char*)(uintptr_t)a[1];
@@ -3220,14 +3221,19 @@ inline void RegisterStdBeds(Machine& m)
             // address inside real guest code, not a thunk.
             if (Machine::GuestDll* d = m.dll_by_base(a[0])) {
                 uint32_t addr = m.export_addr(*d, nm, 0);
-                if (!addr) log("X86 GetProcAddress(" + d->name + "!" + nm + ") -> 0 (not exported)");
+                if (!addr) log_capped("gpa:" + d->name + "!" + nm,
+                                      "X86 GetProcAddress(" + d->name + "!" + nm + ") -> 0 (not exported)");
                 return addr;
             }
             std::string dll;
             for (auto& mod : m.bed.modules) if (mod.handle == a[0]) dll = mod.name;
 
             uint32_t th = m.thunk_for(dll, undecorate(nm));
-            if (!th) log("X86 GetProcAddress(" + dll + "!" + nm + ") -> 0 (no bed)");
+            // Capped: Half-Life asks for hid.dll!HidD_GetAttributes ~110 times a
+            // second for its whole session (19,840 diag lines in three minutes),
+            // and an uncapped miss logged on every call is a hot-path log.
+            if (!th) log_capped("gpa:" + dll + "!" + nm,
+                                "X86 GetProcAddress(" + dll + "!" + nm + ") -> 0 (no bed)");
             return th;
         });
 

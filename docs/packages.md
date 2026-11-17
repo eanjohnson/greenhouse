@@ -219,11 +219,39 @@ It is data, not code. The parser is `GhTitleFromJson`; the shipped examples are 
 | `early` | The same, for knobs that are read before the game is known (applied through a relaunch) |
 | `psoDeny` | List of 32-hex-digit pipeline hashes to refuse |
 | `args` | Text appended to the game's command line |
+| `byConsole` | `{ "ONE" \| "SERIES_S" \| "SERIES_X": { "args": "..." } }`. On that console model, its `args` replace the top-level `args`. See below |
 | `input` | Id of an input profile for the overlay, for example `builtin-wasd` |
 | `seed` | Name of a seed folder to copy into `LocalState` where files are missing. Never overwrites |
 
 Unknown top-level keys are ignored and logged as `ignored-key=`. Knob names and
 their meanings are in [reference/knobs.md](reference/knobs.md).
+
+### Per-console arguments: `byConsole`
+
+Some settings are right for one console and wrong for another. Half-Life's software
+renderer draws every pixel on the CPU: on an Xbox One it averages about 15 fps at
+1920x1080 and about 27 fps at 1280x720 (0.0.958.0, a 3-minute window on the opening
+tram ride). A Series X does not need to pay that price, so `hl.ghtitle.json` lowers
+the resolution only on an Xbox One:
+
+```json
+"args": "-game valve -soft -condebug -novid",
+"byConsole": {
+  "ONE": { "args": "-game valve -soft -condebug -novid -w 1280 -h 720" }
+}
+```
+
+- The model names are the compatibility dataset's (`ghcompat::ModelName`). The
+  Launcher reads the model once from the graphics adapter's name
+  (`LuiConsoleModel`). It cannot tell an original Xbox One from a One S or One X, so
+  `ONE` covers all three.
+- The entry's `args` replace the top-level `args`; they are not appended. Write the
+  whole command line.
+- When an entry applies, the `CMDLINE` line says so:
+  `CMDLINE extra args for hl.exe (title hl, byConsole ONE): ...`.
+- A model name the loader does not know is skipped and logged as `ignored-console=`.
+  Loaders older than this key ignore `byConsole` entirely and use `args`, so adding
+  it does not need a higher `requires.loader`.
 
 ### Where configs are loaded from
 

@@ -954,6 +954,10 @@ struct GhTitle {
     std::wstring launch;          // exe path relative to the install folder, when the picker's guess is wrong
     std::wstring seed;            // guest\seed\<seed>\ in the package (default: exe base)
     std::wstring args;            // appended to the guest command line
+    // byConsole.<MODEL>.args: replaces `args` on that console model (ghcompat::ModelName
+    // spelling: ONE, SERIES_S, SERIES_X). Half-Life's software renderer is ~15 fps at
+    // 1080p on an Xbox One and ~27 at 720p, a cost a Series X need not pay.
+    std::vector<std::pair<std::string, std::wstring>> argsByConsole;
     std::vector<GhTitleKnob> knobs;
     bool hasPsoDeny = false;      // gh_pso_deny.txt stand-in when that file is absent
     std::string psoDeny;          // 32-hex keys, one per line
@@ -972,6 +976,7 @@ struct GhTitle {
     }
 };
 static const GhTitle* g_title = nullptr;      // set by GhTitleBegin for each guest, before it runs
+static const char* GhConsoleModelName();      // ghcompat::ModelName of this console (launcher_ui.h)
 static bool StartsWithNoCase(const std::wstring& s, const std::wstring& pre)
 {
     if (pre.empty() || s.size() < pre.size()) return false;
@@ -39979,6 +39984,23 @@ static bool GhTitleFromJson(const ghjson::Value& j, GhTitle& t, std::string& why
         }
     }
     if ((v = j.get("args"))){ if (!v->isStr()){ why = "args is not a string"; return false; } t.args = GhUtf8ToW(v->s); }
+    // Per-console overrides. A model name this loader does not know is skipped, not
+    // rejected, so a config written for a future console still loads here; a known
+    // one with the wrong shape rejects the file like any other malformed key.
+    if ((v = j.get("byConsole"))){
+        if (!v->isObj()){ why = "byConsole is not an object"; return false; }
+        for (const auto& kv : v->obj){
+            if (kv.first != "ONE" && kv.first != "SERIES_S" && kv.first != "SERIES_X"){
+                notes += " ignored-console=" + kv.first; continue;
+            }
+            if (!kv.second.isObj()){ why = "byConsole." + kv.first + " is not an object"; return false; }
+            for (const auto& ik : kv.second.obj){
+                if (ik.first != "args"){ notes += " ignored-key=byConsole." + kv.first + "." + ik.first; continue; }
+                if (!ik.second.isStr()){ why = "byConsole." + kv.first + ".args is not a string"; return false; }
+                t.argsByConsole.push_back({ kv.first, GhUtf8ToW(ik.second.s) });
+            }
+        }
+    }
     // Garry's Mod is a keyboard-and-mouse game: XInput is not on until the
     // player types "joystick 1", so the pad has to arrive as WASD + mouse.
     if ((v = j.get("input"))){
@@ -39991,7 +40013,7 @@ static bool GhTitleFromJson(const ghjson::Value& j, GhTitle& t, std::string& why
     }
 
     static const char* kKnown[] = { "schema", "id", "name", "match", "requires", "early", "knobs",
-                                    "psoDeny", "args", "seed", "input" };
+                                    "psoDeny", "args", "byConsole", "seed", "input" };
     for (const auto& kv : j.obj){
         bool known = false;
         for (const char* k : kKnown) if (kv.first == k){ known = true; break; }
@@ -53528,8 +53550,15 @@ static std::wstring GuestExtraArgs(const std::wstring& exePath)
     }
     if (const GhTitle* tp = GhTitleByExe(base, GhTitleAppFor(exePath))){
         const GhTitle& t = *tp;
-        if (t.args.empty()) return L"";
-        std::wstring args(t.args);
+        const std::wstring* chosen = &t.args;
+        std::string from;
+        if (!t.argsByConsole.empty()){
+            const char* model = GhConsoleModelName();
+            for (const auto& b : t.argsByConsole)
+                if (b.first == model){ chosen = &b.second; from = std::string(", byConsole ") + model; break; }
+        }
+        if (chosen->empty()) return L"";
+        std::wstring args(*chosen);
         // The command line is exe + args as they stand: "-condebug" without its
         // leading space became "gmod.exe-condebug".
         if (!iswspace(args[0])) args.insert(args.begin(), L' ');
@@ -53540,7 +53569,7 @@ static std::wstring GuestExtraArgs(const std::wstring& exePath)
             static const unsigned jt = GhCfgNumZ(L"gh_job_threads.txt", "GH_JOB_THREADS", 0);
             if (jt) args += L" -job-threads " + std::to_wstring(jt);
         }
-        Diag("CMDLINE extra args for " + std::string(base.begin(), base.end()) + " (title " + t.id + "):" +
+        Diag("CMDLINE extra args for " + std::string(base.begin(), base.end()) + " (title " + t.id + from + "):" +
              std::string(args.begin(), args.end()));
         return args;
     }
@@ -54875,6 +54904,7 @@ static void ResetGuestForRelaunch()
 #ifndef GH_LAUNCHER
 static bool GhReadPackBlob(const std::wstring&, std::vector<uint8_t>&, bool) { return false; }   // §44: Launcher only
 static bool GhReadBundledBlob(const std::wstring&, std::vector<uint8_t>&, bool) { return false; }   // Launcher only
+static const char* GhConsoleModelName() { return "UNKNOWN"; }   // launcher_ui.h reads the adapter
 #endif
 #ifdef GH_LAUNCHER
 #include "gh_input.h"

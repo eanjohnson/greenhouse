@@ -252,6 +252,9 @@ static ghcompat::Model LuiConsoleModel()
     }();
     return m;
 }
+// The same answer for a title config's byConsole block (GuestExtraArgs). It cannot
+// tell an original Xbox One from a One S or One X: all three report SraKmd.
+static const char* GhConsoleModelName() { return ghcompat::ModelName(LuiConsoleModel()); }
 
 // The extra check gh_repo.h runs on a downloaded compat.json before committing it:
 // the loader's own parser, so a dataset this build cannot read never replaces one it
